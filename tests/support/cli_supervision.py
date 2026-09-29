@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -106,13 +106,36 @@ def _parent_only_agents(path: Path) -> Path:
     )
     return path
 
-def _run_until_pending_window(
+_GATED_PENDING_RETRY = """
+import socket, sys
+from agent_run.cli import main
+from agent_run.external_supervision import ExternalSupervisor
+
+barrier = socket.socket(fileno=int(sys.argv[1]))
+barrier.settimeout(20)
+retries_before_interrupt = int(sys.argv[2])
+original = ExternalSupervisor.before_retry
+def before_retry(self, state, **kwargs):
+    global retries_before_interrupt
+    if state.get('status') == 'waiting_checks':
+        if retries_before_interrupt == 0:
+            barrier.sendall(b'1')
+            assert barrier.recv(1) == b'1', 'pending retry barrier was not released'
+        retries_before_interrupt -= 1
+    return original(self, state, **kwargs)
+ExternalSupervisor.before_retry = before_retry
+raise SystemExit(main(sys.argv[3:]))
+"""
+
+
+def _start_supervised_run(
     repo: Path,
     fixture: Path,
     agents: Path,
     *,
-    wait_for_retry_message: bool = False,
-) -> tuple[subprocess.Popen[str], dict[str, object]]:
+    barrier_fd: int | None = None,
+    allow_initial_retry: bool = False,
+) -> subprocess.Popen[str]:
     environment = os.environ.copy()
     source_path = str(PROJECT_ROOT / "src")
     environment["PYTHONPATH"] = (
@@ -120,11 +143,14 @@ def _run_until_pending_window(
         if not environment.get("PYTHONPATH")
         else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
     )
-    process = subprocess.Popen(
+    entrypoint = (
+        ["-m", "agent_run"] if barrier_fd is None
+        else ["-c", _GATED_PENDING_RETRY, str(barrier_fd), str(int(allow_initial_retry))]
+    )
+    return subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "agent_run",
+            *entrypoint,
             "run",
             "1",
             "--agent-fixture",
@@ -134,13 +160,51 @@ def _run_until_pending_window(
         ],
         cwd=repo,
         env=environment,
+        pass_fds=() if barrier_fd is None else (barrier_fd,),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def _interrupt_at_pending_retry(
+    repo: Path, fixture: Path, agents: Path, *, allow_initial_retry: bool = False,
+) -> dict[str, object]:
+    """Interrupt a real CLI with persisted backoff, before another retry starts.
+
+    A relayed progress message is not a barrier: the Executor keeps running
+    while its observer reads stderr. Block in the Executor itself so snapshot
+    reads and signal delivery cannot race with another backoff increment.
+    The initial process completes one retry to establish nonzero backoff;
+    the restarted process must expose that same backoff before any new retry.
+    """
+    observer, executor = socket.socketpair()
+    with observer, executor:
+        process = _start_supervised_run(
+            repo, fixture, agents, barrier_fd=executor.fileno(),
+            allow_initial_retry=allow_initial_retry,
+        )
+        executor.close()
+        try:
+            observer.settimeout(20)
+            assert observer.recv(1) == b"1", "Executor did not reach pending retry"
+            state = load_only_run_state(repo)
+            assert state["status"] == "waiting_checks"
+            assert state["supervision_window"]["retry_count"] > 0
+        finally:
+            _interrupt_run(process, repo)
+    stopped = load_only_run_state(repo)
+    assert stopped["supervision_window"] == state["supervision_window"]
+    return stopped
+
+
+def _run_until_pending_window(
+    repo: Path, fixture: Path, agents: Path,
+) -> tuple[subprocess.Popen[str], dict[str, object]]:
+    process = _start_supervised_run(repo, fixture, agents)
     # The process may still be preparing its Git and Runner state under CPU
     # contention; the poll exits immediately once the durable wait exists.
-    timeout = time.monotonic() + (20 if wait_for_retry_message else 15)
+    timeout = time.monotonic() + 15
     try:
         while time.monotonic() < timeout:
             try:
@@ -150,18 +214,7 @@ def _run_until_pending_window(
                 continue
             window = state.get("supervision_window")
             if state.get("status") == "waiting_checks" and isinstance(window, dict):
-                if not wait_for_retry_message:
-                    return process, state
-                assert process.stderr is not None
-                ready, _, _ = select.select([process.stderr], [], [], 0)
-                if ready and "等待进度: kind=required_checks" in process.stderr.readline():
-                    persisted = load_only_run_state(repo)
-                    persisted_window = persisted.get("supervision_window")
-                    if (
-                        persisted.get("status") == "waiting_checks"
-                        and isinstance(persisted_window, dict)
-                    ):
-                        return process, persisted
+                return process, state
             if process.poll() is not None:
                 stdout, stderr = process.communicate()
                 pytest.fail(

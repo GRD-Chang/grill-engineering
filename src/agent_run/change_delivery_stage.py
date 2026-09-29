@@ -24,6 +24,8 @@ class ChangeDeliveryStage(Protocol):
     adapter: ChangeDeliveryAdapter
     publisher: ChangeDeliveryPublisher
 
+    def require_agent_work(self, role: str) -> None: ...
+
     def save(self, state: dict[str, Any]) -> dict[str, Any]: ...
 
     def commit_required_checks_observation(

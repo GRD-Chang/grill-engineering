@@ -67,6 +67,7 @@ def publication(
                 ),
             )
             break
+        stage.require_agent_work("publication")
         semantic_attempt = pending_semantic_attempt(job, role="publication")
         if semantic_attempt is None:
             begin_publication_operation_attempt(job)

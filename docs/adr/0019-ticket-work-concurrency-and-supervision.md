@@ -22,6 +22,6 @@ Linux 继续由 systemd 托管 Executor；关闭发起终端不影响执行，Ex
 
 ## 交付状态
 
-Development–Review 已接入共同阶段循环与审核记账：Ticket、Parent-only 的 Dev-first，以及集成后完整 Parent 的 Review-first；Run Acceptance/Run Repair 的 Review Budget 采用唯一 owner。集成交付保持既有流程。
+Development–Review 已接入共同阶段循环与审核记账：Ticket、Parent-only 的 Dev-first，以及集成后完整 Parent 的 Review-first；Run Acceptance/Run Repair 的 Review Budget 采用唯一 owner。集成交付已提供共同的单步结果：ChangeDeliveryEngine 与 Final Run Publication 的完整入口都复用各自的 advance 核心，返回可继续、等待、需要 Agent、暂停或完成；既有 Job/Run 状态继续作为唯一持久依据。Ticket、Parent-only 与 Run Repair 共用审核前/发布前集成门禁，固定需求基线和各类预算保持独立。Publication 文案在推送和 CI 之前按需形成；相同已发布版本继续观测 CI 和合入无需再次调用 Agent。
 
 持续多线监督、运行中定向恢复、统一工作额度与单票立即停止仍是后继工作；当前实现不因本 ADR 接受或 Development–Review 共用化而被视为已具备这些能力。

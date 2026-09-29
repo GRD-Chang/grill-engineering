@@ -16,11 +16,12 @@ from typing import Any, Callable
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.development_review import advance_development_review
+from agent_run.delivery_step import AgentWorkRequired, DeliveryStep, DeliveryStepKind
+from agent_run.change_delivery_integration import prepare_delivery_integration
 from agent_run.change_development_review import ChangeDevelopmentReview
 from agent_run.ci_recovery_budget import (
     can_start_ci_repair,
     ci_limits_for_job,
-    ci_review_required,
     mark_ci_repair,
     refund_ci_repair_without_candidate,
 )
@@ -104,8 +105,8 @@ from agent_run.required_checks_observation import (
 from agent_run.state_contract import require_current_run_state
 from agent_run.ticket_integration import (
     integration_record_is_valid,
-    prepare_ticket_integration,
 )
+from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.ticket_queue import (
     acquire as acquire_ticket_slot,
     has_other_ticket_work,
@@ -114,18 +115,13 @@ from agent_run.ticket_queue import (
 from agent_run.parent_integration import (
     parent_integration_record_is_valid,
 )
-from agent_run.parent_only_integration import prepare_parent_integration
-from agent_run.run_repair_integration import (
-    needs_repair_integration,
-    prepare_repair_integration,
-)
 
 
 class ChangeDeliveryEngine:
     """One Development -> Candidate -> Review -> Publication -> Merge loop.
 
-    ``job`` uses the existing durable phase values so Ticket records remain
-    backward compatible.  Run Repair records use the same fields but have no
+    ``job`` retains the canonical durable phases without a second step state.
+    Run Repair records use the same fields but have no
     Ticket number and their ``after_merge`` callback never closes an Issue.
     """
 
@@ -150,6 +146,7 @@ class ChangeDeliveryEngine:
         self.state_store = state_store
         self.development_only = development_only
         self._current_job: dict[str, Any] | None = None
+        self._agent_work_allowed = True
 
     def _pause_ticket_if_requested(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -206,145 +203,122 @@ class ChangeDeliveryEngine:
     def run(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
+        """Complete the existing entry point using the same resumable steps."""
+        while self.advance(state, job, checkout, allow_agent=True).kind in {
+            DeliveryStepKind.CONTINUE, DeliveryStepKind.NEEDS_AGENT,
+        }:
+            pass
+        return state
+
+    def advance(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+        *, allow_agent: bool = False,
+    ) -> DeliveryStep:
+        """Advance one stage, yielding before Agent work without a work slot.
+
+        Waiting CI and merge reconciliation remain executable without an Agent.
+        No shadow phase or budget is persisted: the existing Job is resumable
+        through either this method or the complete ``run`` entry point.
+        """
+        if self.contract.label.startswith("ticket-"):
+            if state.get("active_ticket_job") is not job:
+                raise ValueError("Delivery step requires the active Ticket Job")
+            sync_active_ticket_job(state)
         self._current_job = job
+        self._agent_work_allowed = allow_agent
         try:
             ensure_budget(job, self.review_budget_policy())
-            while True:
-                if self._pause_ticket_if_requested(state, job):
-                    return state
-                self._require_ticket_publication_authorization(job)
-                phase = str(job["phase"])
-                if phase in {"completed", "blocked"}:
-                    return state
-                if phase == "ready_for_integration":
-                    if self.development_only:
-                        return state
-                    if not acquire_ticket_slot(state, job):
-                        return state
+            if self._pause_ticket_if_requested(state, job):
+                return self._step_result(state, job)
+            self._require_ticket_publication_authorization(job)
+            phase = str(job["phase"])
+            if phase in {"completed", "blocked", "stale", "publication_pending", "ready_for_approval"}:
+                return self._step_result(state, job)
+            if phase == "ready_for_integration":
+                if self.development_only or not acquire_ticket_slot(state, job):
+                    return DeliveryStep(DeliveryStepKind.WAITING, str(job["phase"]), "integration_queue")
+                self.save(state)
+                return self._step_result(state, job)
+            if phase == "escalating":
+                self.publisher.escalate(state, job, str(job["escalation_code"]))
+                job["phase"] = "blocked"
+                self.save(state)
+                return self._step_result(state, job)
+            if phase in {"developing", "repairing", "committing_candidate", "candidate", "reviewing"}:
+                progressing = advance_development_review(
+                    ChangeDevelopmentReview(self, state, job, checkout), single_step=True
+                )
+                return self._step_result(state, job, waiting=not progressing)
+            if phase == "accepted":
+                if self.development_only:
+                    return DeliveryStep(DeliveryStepKind.WAITING, phase, "development_complete")
+                if self._can_resume_integrated_publication(job):
+                    job["phase"] = "merged"
                     self.save(state)
-                    continue
-                if phase == "publication_pending":
-                    # Operation Retry exhaustion is an independent hard
-                    # boundary. Resume must not reset it or regenerate the
-                    # already-counted semantic narrative.
-                    return state
-                if phase == "merged":
-                    if self._publish_and_merge(state, job, checkout):
-                        return state
-                    continue
-                if phase == "escalating":
-                    self.publisher.escalate(state, job, str(job["escalation_code"]))
-                    job["phase"] = "blocked"
-                    return self.save(state)
-                if not advance_development_review(
-                    ChangeDevelopmentReview(self, state, job, checkout)
+                    return self._step_result(state, job)
+                if not prepare_delivery_integration(self, state, job, checkout):
+                    return self._step_result(state, job)
+                self._publication(state, job, checkout)
+                return self._step_result(state, job)
+            if phase in {"publishing", "waiting_checks", "waiting_merge", "merging", "merged"}:
+                if phase == "waiting_merge":
+                    job["phase"] = "merging"
+                    self.save(state)
+                terminal = self._publish_and_merge(state, job, checkout)
+                if (
+                    self.contract.label.startswith("ticket-")
+                    and job.get("phase") == "repairing"
+                    and state.get("ticket_integration_holder") != job.get("ticket_number")
+                    and has_other_ticket_work(state, int(job["ticket_number"]))
                 ):
-                    return state
-                if job["phase"] == "accepted":
-                    if self.development_only:
-                        return state
-                    if self._can_resume_integrated_publication(job):
-                        job["phase"] = "merged"
-                        self.save(state)
-                        continue
-                    if self.contract.label.startswith("ticket-"):
-                        if not acquire_ticket_slot(state, job):
-                            self.save(state)
-                            return state
-                        self.save(state)
-                        if not prepare_ticket_integration(self, state, job, checkout):
-                            continue
-                        if job.get("attempt_kind") == "ci_repair":
-                            if job["phase"] == "candidate":
-                                self._bind_ticket_ci_integration(state, job)
-                                continue
-                            record = job["ticket_integration"]
-                            review_needed = ci_review_required(job, is_ticket=True)
-                            current_review = (
-                                isinstance(job.get("acceptance_record"), dict)
-                                and self.adapter.acceptance_is_current(
-                                    state, job, job["acceptance_record"]
-                                )
-                            )
-                            if (
-                                job.get("candidate_sha") != record["head_sha"]
-                                or (review_needed and not current_review)
-                            ):
-                                self._bind_ticket_ci_integration(
-                                    state, job,
-                                    invalidate_review=review_needed and not current_review,
-                                )
-                                continue
-                    elif self.contract.label == "parent-only":
-                        if not prepare_parent_integration(self, state, job, checkout):
-                            continue
-                    elif self.contract.label.startswith("run-repair-"):
-                        if (
-                            not isinstance(job.get("integrated_sha"), str)
-                            and needs_repair_integration(self, job)
-                            and not prepare_repair_integration(self, state, job, checkout)
-                        ):
-                            continue
-                    self._publication(state, job, checkout)
-                    # Publication can discover a moving base and let the
-                    # consumer's stale boundary choose the next phase.
-                    # Continue with an active phase instead of falling
-                    # through to the unknown-phase guard.
-                    if job["phase"] in {"candidate", "developing", "repairing"}:
-                        continue
-                if job["phase"] == "escalating":
-                    continue
-                if job["phase"] in {
-                    "publishing",
-                    "waiting_checks",
-                    "waiting_merge",
-                    "merging",
-                }:
-                    if job["phase"] == "waiting_merge":
-                        job["phase"] = "merging"
-                        self.save(state)
-                    terminal = self._publish_and_merge(state, job, checkout)
-                    if terminal:
-                        return state
-                    if (
-                        self.contract.label.startswith("ticket-")
-                        and job.get("phase") == "repairing"
-                        and state.get("ticket_integration_holder") != job.get("ticket_number")
-                        and has_other_ticket_work(state, int(job["ticket_number"]))
-                    ):
-                        return state
-                    continue
-                if job["phase"] == "publication_pending":
-                    return state
-                if job["phase"] == "stale":
-                    return state
-                if job["phase"] in {"developing", "repairing"}:
-                    continue
-                if job["phase"] == "ready_for_integration":
-                    return state
-                if job["phase"] in {"completed", "blocked"}:
-                    return state
-                raise ValueError(f"unknown Ticket phase: {job['phase']}")
+                    terminal = True
+                return self._step_result(state, job, waiting=terminal)
+            raise ValueError(f"unknown Ticket phase: {job['phase']}")
+        except AgentWorkRequired as work:
+            return DeliveryStep(DeliveryStepKind.NEEDS_AGENT, str(job["phase"]), work.role)
         except _TerminalChangeJob:
-            return state
+            return self._step_result(state, job, waiting=True)
         except GitHubReadError as error:
-            # Reads outside the PR/check-specific handlers (for example the
-            # revision fence after creating a Publication Commit) must enter
-            # the same bounded wait, without discarding the saved job phase.
             if not is_github_convergence_error(error.code):
                 raise
             wait_for_github_convergence(
-                state,
-                code=error.code,
-                message=str(error),
-                waiting_for=self.contract.label,
+                state, code=error.code, message=str(error), waiting_for=self.contract.label,
             )
             ensure_supervision_window(state)
-            return self.save(state)
+            self.save(state)
+            return self._step_result(state, job, waiting=True)
         except InitialCredentialUnavailable as error:
             self._refund_unstarted_credential_invocation(state, job)
             self._wait_for_initial_credential(state, job, http_status=error.http_status)
-            return state
+            return self._step_result(state, job, waiting=True)
+        finally:
+            self._agent_work_allowed = True
+
+    def require_agent_work(self, role: str) -> None:
+        if not self._agent_work_allowed:
+            raise AgentWorkRequired(role)
+        self._agent_work_allowed = False
+
+    @staticmethod
+    def _step_result(
+        state: dict[str, Any], job: dict[str, Any], *, waiting: bool = False,
+    ) -> DeliveryStep:
+        phase = str(job["phase"])
+        reason = (
+            "awaiting_approval" if phase == "ready_for_approval"
+            else job.get("blocked_reason") or job.get("escalation_code")
+        )
+        if phase == "completed":
+            kind = DeliveryStepKind.COMPLETED
+        elif phase in {"blocked", "stale", "publication_pending", "ready_for_approval"} or (
+            waiting and state.get("terminal_kind") == "waiting_human"
+        ):
+            kind = DeliveryStepKind.PAUSED
+        elif phase == "ready_for_integration" or waiting:
+            kind = DeliveryStepKind.WAITING
+        else:
+            kind = DeliveryStepKind.CONTINUE
+        return DeliveryStep(kind, phase, str(reason) if reason else None)
 
     def _can_resume_integrated_publication(self, job: dict[str, Any]) -> bool:
         """Return whether an already merged publication can resume closeout."""
@@ -396,6 +370,7 @@ class ChangeDeliveryEngine:
                     "Development budget is exhausted for the current Review Budget Window",
                 )
                 return
+        self.require_agent_work("development")
         develop(self, state, job, checkout)
 
     def _wait_for_initial_credential(
@@ -510,6 +485,7 @@ class ChangeDeliveryEngine:
     def _review(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        self.require_agent_work("reviewer")
         review(self, state, job, checkout)
 
     def _complete_review(

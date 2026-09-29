@@ -17,9 +17,8 @@ from support.cli_payloads import ticket
 
 from support.cli_supervision import (
     _assert_public_wait_projection,
-    _interrupt_run,
+    _interrupt_at_pending_retry,
     _parent_only_agents,
-    _run_until_pending_window,
 )
 
 
@@ -369,10 +368,9 @@ def test_parent_only_pending_window_survives_process_restart(
     )
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
 
-    first_process, first_state = _run_until_pending_window(
-        git_repo, fixture, agents, wait_for_retry_message=True
+    first_state = _interrupt_at_pending_retry(
+        git_repo, fixture, agents, allow_initial_retry=True
     )
-    _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]
     assert isinstance(first_window, dict)
     first_invocations = first_state["agent_invocation_history"]
@@ -380,12 +378,7 @@ def test_parent_only_pending_window_survives_process_restart(
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock"] = first_window["started_at"] + 60
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    second_process, _ = _run_until_pending_window(
-        git_repo, fixture, agents, wait_for_retry_message=True
-    )
-    _interrupt_run(second_process, git_repo)
-
-    resumed_state = load_only_run_state(git_repo)
+    resumed_state = _interrupt_at_pending_retry(git_repo, fixture, agents)
     assert resumed_state["supervision_window"] == first_window
     assert resumed_state["agent_invocation_history"] == first_invocations
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
@@ -442,10 +435,9 @@ def test_final_run_pending_window_survives_process_restart(
     )
     agents = run_agents(git_repo / "agents.json")
 
-    first_process, first_state = _run_until_pending_window(
-        git_repo, fixture, agents, wait_for_retry_message=True
+    first_state = _interrupt_at_pending_retry(
+        git_repo, fixture, agents, allow_initial_retry=True
     )
-    _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]
     assert isinstance(first_window, dict)
     first_invocations = first_state["agent_invocation_history"]
@@ -453,12 +445,7 @@ def test_final_run_pending_window_survives_process_restart(
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock"] = first_window["started_at"] + 60
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    second_process, _ = _run_until_pending_window(
-        git_repo, fixture, agents, wait_for_retry_message=True
-    )
-    _interrupt_run(second_process, git_repo)
-
-    resumed_state = load_only_run_state(git_repo)
+    resumed_state = _interrupt_at_pending_retry(git_repo, fixture, agents)
     assert resumed_state["supervision_window"] == first_window
     assert resumed_state["agent_invocation_history"] == first_invocations
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]

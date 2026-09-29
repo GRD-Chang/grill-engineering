@@ -2632,6 +2632,9 @@ def test_ticket_ci_conflict_human_resume_returns_to_candidate(
         (2, "source", "integration"),
         (1, "source", "binding"),
         (2, "target", "binding"),
+        (2, None, "review_attempt"),
+        (2, "source", "review_attempt"),
+        (2, "target", "review_attempt"),
         (2, None, "review_result"),
         (2, "source", "review_result"),
     ],
@@ -2666,6 +2669,9 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
                 and record.get("head_sha") != candidate and job["phase"] == "candidate",
                 "binding": isinstance(record, dict) and record.get("candidate_sha") != candidate
                 and record.get("head_sha") == candidate and job["phase"] == "candidate",
+                "review_attempt": job["phase"] == "reviewing"
+                and isinstance(job.get("pending_semantic_attempt"), dict)
+                and "pending_review_result" not in job,
                 "review_result": job["phase"] == "reviewing"
                 and isinstance(job.get("pending_review_result"), dict),
             }[checkpoint]
@@ -2683,6 +2689,20 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     publisher.checks = ["fail", "pass"] if ci_round == 1 else ["fail", "fail", "pass"]
     run_branch = str(state["run_branch"])
 
+    def append_remote() -> None:
+        previous = (
+            str(publisher.live_head) if append_to == "source"
+            else GitRepository(git_repo).resolve(run_branch)
+        )
+        appended = _append_external_file(git_repo, tmp_path, previous, "external.txt")
+        if append_to == "source":
+            publisher.live_head = appended
+        else:
+            subprocess.run(
+                ["git", "update-ref", f"refs/heads/{run_branch}", appended, previous],
+                cwd=git_repo, check=True,
+            )
+
     class ExternalAppendAgents(CheckRepairAgents):
         ci_repairs = 0
 
@@ -2690,22 +2710,11 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
             result = super().develop(request)
             if request.get("ci_evidence"):
                 self.ci_repairs += 1
-                if self.ci_repairs == ci_round and append_to is not None:
-                    previous = (
-                        str(publisher.live_head)
-                        if append_to == "source"
-                        else GitRepository(git_repo).resolve(run_branch)
-                    )
-                    appended = _append_external_file(
-                        git_repo, tmp_path, previous, "external.txt"
-                    )
-                    if append_to == "source":
-                        publisher.live_head = appended
-                    else:
-                        subprocess.run(
-                            ["git", "update-ref", f"refs/heads/{run_branch}", appended, previous],
-                            cwd=git_repo, check=True,
-                        )
+                if (
+                    self.ci_repairs == ci_round and append_to is not None
+                    and checkpoint != "review_attempt"
+                ):
+                    append_remote()
             return result
 
         def review(self, request: dict[str, Any]) -> ReviewResult:
@@ -2722,6 +2731,14 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     interrupted = restored.load_current_run(state["run_id"])
     assert interrupted is not None
     assert interrupted["active_ticket_job"]["ci_recovery"]["rounds_used"] == ci_round
+    interrupted_job = interrupted["active_ticket_job"]
+    pending_review = deepcopy(interrupted_job.get("pending_semantic_attempt"))
+    if checkpoint == "review_attempt":
+        assert pending_review["role"] == "reviewer"
+        assert pending_review["ordinal"] == interrupted_job["validation_attempts"] == 2
+        assert interrupted_job["ci_recovery"]["reviewer_invocations"] == 0
+        if append_to is not None:
+            append_remote()
     completed = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=restored, github=publisher, agents=agents
     ).deliver(state["run_id"])
@@ -2735,6 +2752,28 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     assert agents.ci_repairs == ci_round
     assert agents.review_count == ci_round
     assert job["pr_number"] == publisher.pr_number
+    if checkpoint == "review_attempt":
+        attempts = job["semantic_attempt_history"]
+        original = next(
+            item for item in attempts
+            if item["attempt_id"] == pending_review["attempt_id"]
+        )
+        reviews = [item for item in attempts if item["role"] == "reviewer"]
+        fingerprint = "currentness_boundary_fingerprint"
+        if append_to is None:
+            assert job["candidate_sha"] == interrupted_job["candidate_sha"]
+            assert job["validation_attempts"] == pending_review["ordinal"]
+            assert original["outcome"] == "acceptance_artifact"
+            assert reviews[-1]["attempt_id"] == pending_review["attempt_id"]
+            assert reviews[-1][fingerprint] == pending_review[fingerprint]
+        else:
+            assert job["candidate_sha"] != interrupted_job["candidate_sha"]
+            assert original["outcome"] == "currentness_invalidated"
+            assert reviews[-1]["attempt_id"] != pending_review["attempt_id"]
+            assert reviews[-1][fingerprint] != pending_review[fingerprint]
+            assert job["validation_attempts"] == pending_review["ordinal"] + 1
+        assert job["ci_recovery"]["reviewer_invocations"] == 1
+        assert job["review_budget"] == interrupted_job["review_budget"]
     published_tree = GitRepository(git_repo).resolve(f"{job['publication_sha']}^{{tree}}")
     if ci_round == 1:
         assert job["publication_authority"] == "ci_repair"

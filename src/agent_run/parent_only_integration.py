@@ -190,6 +190,8 @@ def resolve_parent_conflict(
         return False
     if "development_summary" in conflict and attempt is None:
         return True
+    if "development_summary" not in conflict:
+        stage.require_agent_work("integration_conflict")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=attempt is None)
     request = stage.adapter.development_request(state, job, checkout)

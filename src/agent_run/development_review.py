@@ -80,7 +80,9 @@ class DevelopmentReviewWork(Protocol):
     def resume_review(self) -> bool: ...
 
 
-def advance_development_review(work: DevelopmentReviewWork) -> bool:
+def advance_development_review(
+    work: DevelopmentReviewWork, *, single_step: bool = False
+) -> bool:
     """Advance to a deliverable result or pause; False means yield to caller.
 
     Dev-first jobs start at developing; integrated full Parent starts pending.
@@ -103,3 +105,5 @@ def advance_development_review(work: DevelopmentReviewWork) -> bool:
             return True
         if not progressing:
             return False
+        if single_step:
+            return True

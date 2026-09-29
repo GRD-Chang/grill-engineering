@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.delivery_protocol import GitHubPublisher
+from agent_run.delivery_step import DeliveryStep
 from agent_run.git import GitRepository
 from agent_run.run_publication_approval import RunPublicationApproval
 from agent_run.run_publication_flow import RunPublicationFlow
@@ -36,6 +37,9 @@ class RunPublicationEngine:
 
     def publish(self, run_id: str) -> dict[str, Any]:
         return self._flow().publish(run_id)
+
+    def advance(self, run_id: str, *, allow_agent: bool = False) -> DeliveryStep:
+        return self._flow().advance(run_id, allow_agent=allow_agent)
 
     def approve(
         self,

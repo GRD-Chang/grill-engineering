@@ -19,6 +19,7 @@ from agent_run.ci_recovery_budget import (
 )
 from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.delivery_policy import invocation_deadline_for_state
+from agent_run.delivery_step import DeliveryStep, DeliveryStepKind
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -58,23 +59,48 @@ class RunPublicationFlow(RunPublicationShared):
     """Create and publish the PR for an already accepted Final Run."""
 
     def publish(self, run_id: str) -> dict[str, Any]:
+        while self.advance(run_id, allow_agent=True).kind == DeliveryStepKind.CONTINUE:
+            pass
+        return self._load(run_id)
+
+    def advance(self, run_id: str, *, allow_agent: bool = False) -> DeliveryStep:
+        """Advance publication once, yielding before work requiring an Agent slot."""
         state = self._load(run_id)
         publication = self._publication_state(state)
         try:
-            return self._publish(state, publication)
+            return self._advance(state, publication, allow_agent=allow_agent)
         except GitHubReadError as error:
-            return self._handle_github_error(state, publication, error)
+            return self._step(self._handle_github_error(state, publication, error))
 
-    def _publish(
-        self, state: dict[str, Any], publication: dict[str, Any]
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _step(state: dict[str, Any]) -> DeliveryStep:
+        publication = state.get("run_publication", {})
+        phase = str(publication.get("phase", "pending"))
+        status = state.get("status")
+        if status == "completed":
+            kind = DeliveryStepKind.COMPLETED
+        elif status == "run_acceptance_pending":
+            return DeliveryStep(DeliveryStepKind.NEEDS_AGENT, phase, "run_acceptance")
+        elif status in {"waiting_checks", "waiting_external", "parent_closeout_pending"}:
+            kind = DeliveryStepKind.WAITING
+        else:
+            kind = DeliveryStepKind.PAUSED
+        reason = (
+            "awaiting_approval" if phase == "ready_for_approval"
+            else publication.get("blocked_reason") or state.get("terminal_kind")
+        )
+        return DeliveryStep(kind, phase, reason)
+
+    def _advance(
+        self, state: dict[str, Any], publication: dict[str, Any], *, allow_agent: bool
+    ) -> DeliveryStep:
         if not self._refresh_currentness(state):
-            return self._save(state)
+            return self._step(self._save(state))
         run = self._mapping(state, "run_acceptance")
         if publication["phase"] in {"merged", "abandoned"}:
-            return state
-        if publication["phase"] == "ready_for_human":
-            return state
+            return self._step(state)
+        if publication["phase"] == "ready_for_human" or run.get("phase") == "ready_for_human":
+            return self._step(state)
         if publication["phase"] == "stale":
             existing_pr_number = publication.get("pr_number")
             if isinstance(existing_pr_number, int):
@@ -92,7 +118,7 @@ class RunPublicationFlow(RunPublicationShared):
                             "message": f"Final Run PR #{existing_pr_number} was closed; the existing PR cannot be replaced automatically",
                         }],
                     })
-                    return self._save(state)
+                    return self._step(self._save(state))
             attempt_audit = {
                 key: publication[key]
                 for key in (
@@ -109,15 +135,18 @@ class RunPublicationFlow(RunPublicationShared):
                 publication["pr_number"] = existing_pr_number
             publication["phase"] = "pending"
         if publication["phase"] == "publication_pending":
-            return state
+            return self._step(state)
         if publication["phase"] == "publishing":
-            if fail_interrupted_invocation(
-                state, role="final_publication", save=self._save
+            if (
+                not isinstance(publication.get("artifact"), dict)
+                and fail_interrupted_invocation(
+                    state, role="final_publication", save=self._save
+                )
             ):
-                return state
+                return self._step(state)
             publication["phase"] = "pending"
         if not self._acceptance_is_current(state, run):
-            return self._invalidate_for_fresh_acceptance(state)
+            return self._step(self._invalidate_for_fresh_acceptance(state))
         continue_accepted_publication = publication["phase"] in {
             "waiting_checks",
             "waiting_external",
@@ -125,59 +154,55 @@ class RunPublicationFlow(RunPublicationShared):
         }
         if not continue_accepted_publication and publication["phase"] != "pending":
             raise ValueError("unknown Final Run Publication phase")
-        while True:
-            if continue_accepted_publication:
-                continue_accepted_publication = False
-            else:
+        if not continue_accepted_publication:
+            stored_artifact = publication.get("artifact")
+            if not isinstance(stored_artifact, dict):
+                if not allow_agent:
+                    # Persist any stale-publication reset, but allocate no work or budget.
+                    self._save(state)
+                    return DeliveryStep(
+                        DeliveryStepKind.NEEDS_AGENT, str(publication["phase"]),
+                        "final_publication",
+                    )
                 publication["phase"] = "publishing"
-                stored_artifact = publication.get("artifact")
-                if isinstance(stored_artifact, dict):
-                    artifact = PublicationArtifact.from_stored(
-                        stored_artifact, delivery_run=str(state["run_id"])
-                    )
-                else:
-                    semantic_attempt = pending_semantic_attempt(
-                        publication, role="publication"
-                    )
-                    newly_allocated = semantic_attempt is None
-                    if semantic_attempt is None:
-                        begin_publication_operation_attempt(publication)
-                        ordinal = int(publication.get("publication_attempts", 0)) + 1
-                        publication["publication_attempts"] = ordinal
-                        semantic_attempt = allocate_semantic_attempt(
-                            publication,
-                            role="publication",
-                            work_subject=f"run-publication:{state['run_id']}",
-                            generation=int(run.get("acceptance_generation", 1)),
-                            currentness_boundary=self._publication_boundary(state),
-                            ordinal=ordinal,
-                        )
-                    self._save(state)
-                    created_artifact = self._create_publication_artifact(
-                        state,
+                semantic_attempt = pending_semantic_attempt(publication, role="publication")
+                newly_allocated = semantic_attempt is None
+                if semantic_attempt is None:
+                    begin_publication_operation_attempt(publication)
+                    ordinal = int(publication.get("publication_attempts", 0)) + 1
+                    publication["publication_attempts"] = ordinal
+                    semantic_attempt = allocate_semantic_attempt(
                         publication,
-                        semantic_attempt,
-                        newly_allocated=newly_allocated,
+                        role="publication",
+                        work_subject=f"run-publication:{state['run_id']}",
+                        generation=int(run.get("acceptance_generation", 1)),
+                        currentness_boundary=self._publication_boundary(state),
+                        ordinal=ordinal,
                     )
-                    if created_artifact is None:
-                        return self._save(state)
-                    artifact = created_artifact
-                    publication_result = {
-                        "commit_message": artifact.commit_message,
-                        "pr_title": artifact.pr_title,
-                        "pr_body_markdown": artifact.pr_body_markdown,
-                    }
-                    close_semantic_attempt(
-                        publication,
-                        semantic_attempt,
-                        outcome="publication_artifact",
-                        result={"publication": publication_result},
-                    )
-                    self._save(state)
-                    publication["artifact"] = publication_result
-            result = self._continue_accepted_publication(state, run, publication)
-            if result is not None:
-                return result
+                self._save(state)
+                artifact = self._create_publication_artifact(
+                    state, publication, semantic_attempt,
+                    newly_allocated=newly_allocated,
+                )
+                if artifact is None:
+                    return self._step(self._save(state))
+                publication_result = {
+                    "commit_message": artifact.commit_message,
+                    "pr_title": artifact.pr_title,
+                    "pr_body_markdown": artifact.pr_body_markdown,
+                }
+                publication["artifact"] = publication_result
+                close_semantic_attempt(
+                    publication, semantic_attempt, outcome="publication_artifact",
+                    result={"publication": publication_result},
+                )
+                publication["phase"] = "pending"
+                self._save(state)
+                return DeliveryStep(DeliveryStepKind.CONTINUE, "pending")
+        result = self._continue_accepted_publication(state, run, publication)
+        if result is None:
+            return DeliveryStep(DeliveryStepKind.CONTINUE, str(publication["phase"]))
+        return self._step(result)
 
     def _continue_accepted_publication(
         self,
@@ -756,7 +781,7 @@ class RunPublicationFlow(RunPublicationShared):
             self.git.fetch_remote_commit(branch, source)
         if source is None or not self.git.is_ancestor(published, source):
             run.update({"phase": "ready_for_human", "blocked_reason": "integration_history_rewritten"})
-            publication["phase"] = "ready_for_human"
+            publication["phase"] = "stale"
             state.update({
                 "status": "ready_for_human",
                 "terminal_kind": "waiting_human",

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
@@ -675,6 +676,9 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert pending is not None
     assert pending["run_publication"]["phase"] == "merged"
     assert pending["status"] == "parent_closeout_pending"
+    step = engine.advance(str(state["run_id"]))
+    assert step.kind == DeliveryStepKind.WAITING
+    assert step.reason == "parent_closeout_pending"
     assert (
         publisher.live_pull_request(int(published["run_publication"]["pr_number"]))[
             "state"

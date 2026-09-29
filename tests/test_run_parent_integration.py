@@ -166,6 +166,9 @@ def test_final_publication_rejects_rollback_before_repush(git_repo: Path) -> Non
     assert paused["run_acceptance"]["blocked_reason"] == "integration_history_rewritten"
     assert publisher.live_branch_heads(branch, "main")[0] == old_source
     assert paused["run_publication"]["published_head_sha"] == published
+    reloaded = states.load_current_run(str(state["run_id"]))
+    assert reloaded is not None
+    assert publication.publish(str(state["run_id"])) == reloaded
 
 
 def test_final_publication_append_requires_new_acceptance_and_reuses_pr(

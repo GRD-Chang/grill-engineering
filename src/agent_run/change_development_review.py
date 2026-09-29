@@ -7,10 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from agent_run.ci_recovery_budget import ci_review_required
 from agent_run.development_review import review_is_due
-from agent_run.parent_only_integration import prepare_parent_integration
-from agent_run.run_repair_integration import needs_repair_integration, prepare_repair_integration
-from agent_run.ticket_integration import prepare_ticket_integration
-from agent_run.ticket_queue import acquire as acquire_ticket_slot
+from agent_run.change_delivery_integration import prepare_delivery_integration
 
 if TYPE_CHECKING:
     from agent_run.change_delivery import ChangeDeliveryEngine
@@ -42,34 +39,10 @@ class ChangeDevelopmentReview:
 
     def review(self) -> bool:
         state, job, checkout = self.state, self.job, self.checkout
-        if (
-            self.engine.contract.label.startswith("ticket-")
-            and job.get("attempt_kind") == "ci_repair"
+        if not prepare_delivery_integration(
+            self.engine, state, job, checkout, before_review=True
         ):
-            if not acquire_ticket_slot(state, job):
-                self.engine.save(state)
-                return False
-            self.engine.save(state)
-            if not prepare_ticket_integration(self.engine, state, job, checkout):
-                return True
-            self.engine._bind_ticket_ci_integration(state, job)
-        if (
-            self.engine.contract.label == "parent-only"
-            # A no-change first integration reuses demand acceptance
-            # and does not open the separate integration review budget.
-            # Its record still makes every later CI Candidate cross
-            # the live snapshot boundary before Reviewer starts.
-            and isinstance(job.get("parent_integration"), dict)
-            and not prepare_parent_integration(self.engine, state, job, checkout)
-        ):
-            return True
-        if (
-            self.engine.contract.label.startswith("run-repair-")
-            and not isinstance(job.get("integrated_sha"), str)
-            and needs_repair_integration(self.engine, job)
-            and not prepare_repair_integration(self.engine, state, job, checkout)
-        ):
-            return True
+            return job.get("phase") != "ready_for_integration"
         if (
             job.get("attempt_kind") == "ci_repair"
             and job.get("repair_source") == "required_checks"

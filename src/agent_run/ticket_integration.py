@@ -348,6 +348,8 @@ def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: di
     if conflict["attempts"] >= 1 and existing_attempt is None and "development_summary" not in conflict:
         _pause(stage, state, job, "integration_conflict_unresolved", "Ticket conflict resolution already attempted")
         return False
+    if "development_summary" not in conflict:
+        stage.require_agent_work("integration_conflict")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=existing_attempt is None)
     request = stage.adapter.development_request(state, job, checkout)

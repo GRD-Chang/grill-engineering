@@ -114,6 +114,8 @@ _Avoid_: 内部验收、只审已提交 HEAD、遗漏未跟踪文件、把一轮
 **Development–Acceptance Engine（开发验收引擎）**:
 Controller 复用的单一自动变更循环：Development 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，正常 pass 或 Ticket 预算耗尽后的 Fallback Publication Receipt 允许 Publisher 推送普通 PR，随后等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并；兜底 Ticket 只有在准确 head 形成 Deterministic Integration Record 后才取得合并权限。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
 Development–Review 阶段由同一有限循环推进：Ticket 与 Parent-only 从 Development 开始，完整 Parent 在既有远端集成后从 Review 开始。候选提交、审核结果恢复、Findings 后修复和预算暂停共用推进与记账规则；完整 Parent 仍独立审查完整需求、Ticket Set、累计变化及准确预期合并结果。完整 Parent 的 Repair 保留既有集成、PR 与验收提升边界，当前候选通过不能自行代替最终交付。已返回的 Run Review 结果先与 Semantic Attempt、预算一同落盘；版本回读中断时续接该结果，边界变化则丢弃结论。
+
+集成交付提供单步推进结果（可继续、等待、需要 Agent、暂停、完成），完整交付入口调用同一能力。编排方未提供 Agent 名额时，程序仍可进行机械集成、已发布版本的 CI 观测和合入对账；真实冲突、适用审核或新文案在分配 Attempt 前交还编排。一轮准入最多执行一次 Agent 工作，后续工作再次交还。该接口不自行调度其他 Ticket，也不改变最终完成权威。
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
 
 **Review Optimization Policy（审查优化策略）**:
