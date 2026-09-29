@@ -10,6 +10,7 @@ import pytest
 
 from agent_run import runner_credentials
 from agent_run.credential_lifecycle import ReadCredential
+from agent_run.github import GitHubReadError
 from agent_run.github_identity import GitHubIdentityError, resolve_runner_identity, resolve_worker_identity
 from agent_run.runner_credentials import runner_credential_scope
 from agent_run.runner_transport import runner_environment, runner_git_environment
@@ -103,7 +104,7 @@ def test_runner_expired_app_never_uses_host(tmp_path: Path, monkeypatch: pytest.
     with runner_credential_scope():
         assert runner_environment(identity)["GH_TOKEN"] == "app-token"
         now[0] += 1001
-        with pytest.raises(GitHubIdentityError, match="resume"):
+        with pytest.raises(GitHubReadError, match="resume"):
             runner_environment(identity)
     assert cancelled.is_set()
 

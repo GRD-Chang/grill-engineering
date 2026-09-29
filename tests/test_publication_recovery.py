@@ -121,8 +121,15 @@ def test_publication_reconciles_completed_push_only_with_matching_write_intent(
     states.save_run(run_id, waiting)
 
     if intent == "foreign":
-        with pytest.raises(ValueError, match="remote PR identity mismatch"):
-            engine.deliver(run_id)
+        paused = engine.deliver(run_id)
+        assert paused["status"] == "blocked"
+        failed = paused["ticket_jobs"]["3"]
+        assert failed["ticket_number"] == 3
+        assert failed["phase"] == "blocked"
+        assert failed["blocked_reason"] == "ticket_execution_failed"
+        assert failed["execution_resume_phase"] == "publishing"
+        assert failed["execution_failure"] == "remote PR identity mismatch"
+        assert states.load_current_run(run_id)["ticket_jobs"]["3"] == failed
         assert publisher.writes == 1
         assert len(agents.publication_requests) == 1
         return

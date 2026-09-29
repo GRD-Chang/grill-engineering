@@ -54,10 +54,7 @@ def reconcile(state: dict[str, Any], job: dict[str, Any]) -> None:
     """Release on repair/pause, preserving the candidate only when still ready."""
     number = int(job["ticket_number"])
     phase = job.get("phase")
-    keep_slot = phase in INTEGRATION_HOLDER_PHASES and (
-        phase not in {"candidate", "reviewing"}
-        or job.get("attempt_kind") == "ci_repair"
-    )
+    keep_slot = requires_integration_seat(job)
     if state["ticket_integration_holder"] == number and not keep_slot:
         state["ticket_integration_holder"] = None
     if phase != "ready_for_integration":
@@ -65,6 +62,23 @@ def reconcile(state: dict[str, Any], job: dict[str, Any]) -> None:
             item for item in state["ticket_integration_queue"]
             if item["ticket_number"] != number
         ]
+
+
+def requires_integration_seat(job: dict[str, Any]) -> bool:
+    """An unresolved merge owns the seat even when its retries are paused."""
+    phase = job.get("phase")
+    if (
+        (phase == "publication_pending" or (
+            phase == "blocked"
+            and job.get("blocked_reason") == "ticket_supervision_timeout"
+        ))
+        and job.get("execution_resume_phase") in {"merging", "merged"}
+    ):
+        return True
+    return phase in INTEGRATION_HOLDER_PHASES and (
+        phase not in {"candidate", "reviewing"}
+        or job.get("attempt_kind") == "ci_repair"
+    )
 
 
 def reconcile_all(state: dict[str, Any]) -> None:

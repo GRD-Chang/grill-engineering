@@ -19,9 +19,15 @@ def safe_http_status(value: object) -> int | None:
 
 
 class WorkerCredentialError(RuntimeError):
-    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, http_status: int | None = None,
+        retryable: bool | None = False,
+        authorization_failed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.http_status = safe_http_status(http_status)
+        self.retryable = retryable
+        self.authorization_failed = authorization_failed
 
 
 class InitialCredentialUnavailable(WorkerCredentialError):
@@ -59,6 +65,8 @@ class RenewableCredential:
         self._renewal_thread: threading.Thread | None = None
         self._expiry_thread: threading.Thread | None = None
         self._last_status: int | None = None
+        self.failure_retryable: bool | None = None
+        self.failure_authorization_failed = False
         self._attempts = 0
 
     def start(self) -> None:
@@ -72,6 +80,8 @@ class RenewableCredential:
                     or isinstance(error, WorkerCredentialError) else "provider unavailable"
                 ),
                 http_status=getattr(error, "http_status", None),
+                retryable=getattr(error, "retryable", None),
+                authorization_failed=getattr(error, "authorization_failed", False) is True,
             ) from None
         with self._condition:
             if self._closed:
@@ -144,6 +154,8 @@ class RenewableCredential:
                 return
             # Serialize delivery and close so no token can be published after cleanup.
             self._on_update(value)
+            self.failure_retryable = None
+            self.failure_authorization_failed = False
             self._credential = value
             self._condition.notify_all()
 
@@ -176,6 +188,8 @@ class RenewableCredential:
                 self._update()
             except Exception as error:
                 self._last_status = safe_http_status(getattr(error, "http_status", None))
+                self.failure_retryable = getattr(error, "retryable", None)
+                self.failure_authorization_failed = getattr(error, "authorization_failed", False) is True
                 self._attempts += 1
                 now = self._clock()
                 if failure_deadline is None:

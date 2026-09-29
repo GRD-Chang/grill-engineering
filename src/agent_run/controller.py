@@ -962,8 +962,9 @@ class Controller:
         if (
             has_run_operator_gate(state)
             and state.get("status") != "execution_failed"
-            and not (runner_credential_failure and state.get("status") in {
-                "parent_approval_pending", "run_approval_pending",
+            and not (runner_credential_failure and state.get("terminal_kind") != "permanent_blocked" and state.get("status") in {
+                "parent_approval_pending", "run_approval_pending", "blocked",
+                "ready_for_human", "publication_pending", "progress_exhausted",
             })
         ):
             return False
@@ -1019,7 +1020,7 @@ class Controller:
             action_kind="execution_failure",
             reason=code,
             fallback_phase=str(state.get("status") or "execution_failed"),
-            bind_to_current_change_job=not invocation_owns_failure,
+            bind_to_current_change_job=runner_credential_failure or not invocation_owns_failure,
         )
         state.update(
             {
@@ -1299,7 +1300,12 @@ class Controller:
         if state.get("status") == "requeue_required" and not check_requeue_currentness:
             return
         subject, job, _ = current_change_job(state)
-        if job is None or job.get("phase") in {"completed", "merging"}:
+        if job is None:
+            return
+        phase = job.get("phase")
+        if phase == "publication_pending" and job.get("execution_resume_phase") in {"merging", "merged"}:
+            phase = job["execution_resume_phase"]
+        if phase in {"completed", "merging"}:
             return
         if not any(
             type(job.get(key)) is int
@@ -1319,7 +1325,7 @@ class Controller:
             # invocation-recovery checks, but cannot be mechanically labelled
             # stale solely because a required fact is absent.
             return
-        if job.get("phase") == "merged":
+        if phase == "merged":
             reason = stale_change_job_reason(state, subject, job, self.publisher.git)
             if reason is None:
                 return
@@ -2067,7 +2073,7 @@ def _resume_ticket_execution_failure(
     if phase in {"ready_for_integration", "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged"}:
         from agent_run.ticket_queue import enqueue
 
-        if phase != "ready_for_integration":
+        if phase != "ready_for_integration" and state["ticket_integration_holder"] != job["ticket_number"]:
             job["integration_resume_phase"] = phase
         enqueue(state, job)
     state["active_ticket_job"] = job
@@ -2108,8 +2114,12 @@ def _resume_ticket_publication_retry(
     history.append(deepcopy(retry))
     job.pop("publication_operation_retry", None)
     job.pop("last_publication_error", None)
-    job["integration_resume_phase"] = "publishing"
-    job["phase"] = "publishing"
+    phase = job.pop("execution_resume_phase", "publishing")
+    if phase not in {"publishing", "merging", "merged"}:
+        raise ValueError("Ticket publication pause has no recoverable phase")
+    if state["ticket_integration_holder"] != job["ticket_number"]:
+        job["integration_resume_phase"] = phase
+    job["phase"] = phase
     acquire_ticket_slot(state, job)
     state["active_ticket_job"] = job
     state.update({"status": "active", "terminal_kind": None, "diagnostics": []})

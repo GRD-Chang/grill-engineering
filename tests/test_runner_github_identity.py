@@ -269,9 +269,9 @@ class Provider:
             token = self.profile.private_key_path.read_text().strip()
         except OSError:
             renewal_failed.set()
-            raise github_auth.GitHubCredentialError("key unavailable", retryable=False) from None
+            raise github_auth.GitHubCredentialError("key unavailable", authorization_failed=True) from None
         if token not in ("first", "repaired"):
-            raise github_auth.GitHubCredentialError("invalid key")
+            raise github_auth.GitHubCredentialError("invalid key", authorization_failed=True)
         with Path(os.environ["APP_CAPTURE"]).open("a") as stream:
             stream.write(json.dumps({"token": token, "read_only": self.read_only,
                                      "repository": self.repository}) + "\\n")

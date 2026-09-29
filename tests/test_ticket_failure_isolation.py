@@ -114,3 +114,50 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
     assert result["ticket_jobs"]["2"] == other_job
     assert result["ticket_agent_invocations"]["2"] == other_invocation
     require_current_run_state(states.load_current_run(run_id))
+
+
+def test_foreground_integration_failure_keeps_candidate_and_delivers_sibling(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.delivery_facts import multi_ticket_progress
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3, 4), blocked_by={4: [2]})
+    run_id = str(state['run_id'])
+    agents = TicketAgents(git_repo, (2, 3, 4), lambda _: None)
+    ready = ticket_engine(git, states, fixture, agents, development_only=True).deliver(run_id)
+    original_job = deepcopy(ready['ticket_jobs']['2'])
+    original = git.prepare_ticket_checkout
+    original(branch=original_job['ticket_branch'], base_sha=original_job['base_sha'],
+             checkout=states.root / 'worktrees' / run_id / 'ticket-2')
+
+    def fail_first(**kwargs: Any) -> Any:
+        if str(kwargs.get('checkout', '')).endswith('ticket-2'):
+            raise OSError('controlled integration checkout failure')
+        return original(**kwargs)
+
+    monkeypatch.setattr(git, 'prepare_ticket_checkout', fail_first)
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    engine = ticket_engine(git, states, fixture, agents)
+    paused = engine.deliver(run_id)
+    job = paused['ticket_jobs']['2']
+    assert job['blocked_reason'] == 'ticket_execution_failed'
+    assert job['execution_resume_phase'] == 'ready_for_integration'
+    result = DeliveryRunEngine(controller=controller, tickets=engine).deliver(run_id)
+    assert result['ticket_jobs']['3']['phase'] == 'completed'
+    assert '4' not in result['ticket_jobs']
+    assert result['ticket_integration_holder'] is None
+    assert job['candidate_sha'] == original_job['candidate_sha']
+    assert job['review_budget'] == original_job['review_budget']
+    assert (states.root / 'worktrees' / run_id / 'ticket-2').exists()
+    progress = multi_ticket_progress(result, executor_activity='exited')
+    assert progress is not None
+    details = {item['ticket_number']: item for item in progress['tickets']}
+    assert details[2]['blocked_reason'] == 'ticket_execution_failed'
+    assert details[4]['blocked_by'] == [2]
+    assert details[2]['recovery_action'].endswith('--ticket 2')
+    monkeypatch.setattr(git, 'prepare_ticket_checkout', original)
+    resumed, _ = controller.resume(run_id, explicit_resume=True, ticket_number=2)
+    assert resumed['ticket_jobs']['2']['candidate_sha'] == original_job['candidate_sha']
+    completed = DeliveryRunEngine(controller=controller, tickets=engine).deliver_from_state(run_id, resumed)
+    assert all(completed['ticket_jobs'][str(n)]['phase'] == 'completed' for n in (2, 3, 4))
+    require_current_run_state(states.load_current_run(run_id))

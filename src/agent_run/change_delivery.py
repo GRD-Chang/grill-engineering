@@ -682,6 +682,8 @@ class ChangeDeliveryEngine:
     ) -> bool:
         exhausted = record_publication_operation_failure(job, error)
         if exhausted:
+            if self.contract.label.startswith("ticket-") and job.get("phase") in {"merging", "merged"}:
+                job["execution_resume_phase"] = job["phase"]
             job["phase"] = "publication_pending"
             state.update(
                 {

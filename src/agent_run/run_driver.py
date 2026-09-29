@@ -34,6 +34,7 @@ from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import SimulatedProcessCrash, StateStore
@@ -92,7 +93,9 @@ class RunController(Protocol):
 
     def finalize_requeue(self, run_id: str) -> dict[str, Any]: ...
 
-    def record_execution_failure(self, run_id: str, message: str) -> bool: ...
+    def record_execution_failure(
+        self, run_id: str, message: str, *, runner_credential_failure: bool = False,
+    ) -> bool: ...
 
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
@@ -785,6 +788,16 @@ class RunDriver:
             # state store retries its own commit boundary; any remaining
             # contention must reach the caller without changing Run status.
             raise
+        except RunnerCredentialError as error:
+            if not self.operations.controller.record_execution_failure(
+                run_id, str(error), runner_credential_failure=True,
+            ):
+                raise
+            failed = self.states.load_current_run(run_id)
+            if failed is None:  # pragma: no cover - Controller just wrote it
+                raise
+            return failed
+
         except (CodexProcessError, OSError, ValueError) as error:
             if not self.operations.controller.record_execution_failure(run_id, str(error)):
                 raise

@@ -36,7 +36,7 @@ from agent_run.state_errors import (
     IncompatibleRunStateError as IncompatibleRunStateError,
 )
 from agent_run.ticket_phase import TicketPhase
-from agent_run.ticket_queue import INTEGRATION_HOLDER_PHASES
+from agent_run.ticket_queue import requires_integration_seat
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
 )
@@ -1070,11 +1070,7 @@ def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
             not isinstance(job, dict)
             or type(job.get("ticket_number")) is not int
             or job["ticket_number"] != holder
-            or job.get("phase") not in INTEGRATION_HOLDER_PHASES
-            or (
-                job.get("phase") in {"candidate", "reviewing"}
-                and job.get("attempt_kind") != "ci_repair"
-            )
+            or not requires_integration_seat(job)
         ):
             raise IncompatibleRunStateError(
                 "legacy state has a Ticket integration holder/Job mismatch"
@@ -1101,7 +1097,7 @@ def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 "legacy state has an unqueued ready Ticket Job"
             )
-        if phase in INTEGRATION_HOLDER_PHASES - {"candidate", "reviewing"} and number != holder:
+        if requires_integration_seat(job) and phase not in {"candidate", "reviewing"} and number != holder:
             raise IncompatibleRunStateError(
                 "legacy state has a Ticket Job outside its integration seat"
             )

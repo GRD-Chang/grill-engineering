@@ -445,6 +445,25 @@ def test_public_cli_recovers_after_external_response_loss(
         str(first_agents),
     )
 
+    if action in {"squash_merge", "sync_run_branch", "close"}:
+        # An uncertain merge/close keeps its intent and is reconciled inside
+        # this Executor. No Run-wide execution-failure gate is needed.
+        assert interrupted.returncode == 0, interrupted.stdout
+        assert load_only_run_state(git_repo)["ticket_jobs"]["2"]["phase"] == "completed"
+        resumed = run_cli(
+            git_repo, fixture, "run", "1", "--agent-fixture", str(first_agents),
+        )
+        assert resumed.returncode == 0, resumed.stdout
+        _assert_exactly_once_delivery(git_repo, fixture)
+        fixture_before = fixture.read_bytes()
+        repeated = run_cli(
+            git_repo, fixture, "run", "1", "--agent-fixture", str(first_agents),
+        )
+        assert stdout_json(repeated)["status"] == "run_approval_pending"
+        assert fixture.read_bytes() == fixture_before
+        _assert_exactly_once_delivery(git_repo, fixture)
+        return
+
     assert interrupted.returncode == 2
     interrupted_state = load_only_run_state(git_repo)
     active = interrupted_state.get("active_ticket_job")
@@ -470,14 +489,11 @@ def test_public_cli_recovers_after_external_response_loss(
         str(recovery_agents),
     )
     assert held.returncode == 2
-    assert stdout_json(held)["status"] == (
-        "execution_failed" if action == "close" else "blocked"
+    assert stdout_json(held)["status"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["2"]["phase"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["2"]["blocked_reason"] == (
+        "ticket_execution_failed"
     )
-    if action != "close":
-        assert interrupted_state["ticket_jobs"]["2"]["phase"] == "blocked"
-        assert interrupted_state["ticket_jobs"]["2"]["blocked_reason"] == (
-            "ticket_execution_failed"
-        )
     assert load_only_run_state(git_repo) == interrupted_state
     assert fixture.read_text(encoding="utf-8") == fixture_before
 
@@ -507,8 +523,22 @@ def test_public_cli_recovers_after_external_response_loss(
 
 
 def test_abandon_recovers_ticket_after_close_response_loss(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from agent_run.github_fixture import FixtureGitHubPublisher
+    from agent_run.state import SimulatedProcessCrash
+
+    close = FixtureGitHubPublisher.close_primary_ticket
+
+    def crash_after_close(self: FixtureGitHubPublisher, **kwargs: Any) -> Any:
+        try:
+            return close(self, **kwargs)
+        except OSError as error:
+            # A real Executor loss still requires explicit recovery; ordinary
+            # response loss now reconciles automatically in the same Executor.
+            raise SimulatedProcessCrash(str(error)) from error
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "close_primary_ticket", crash_after_close)
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket()},

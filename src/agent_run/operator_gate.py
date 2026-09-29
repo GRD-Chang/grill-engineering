@@ -200,6 +200,15 @@ def _local_gate_matches_top_status(
         and state.get("terminal_kind") == "waiting_human"
     ):
         return True
+    if (
+        location.startswith("ticket:")
+        and status == "execution_failed"
+        and (evidence := operator_gate_evidence(state)) is not None
+        and evidence["reason"] == "runner_credential_failed"
+        and evidence["action_kind"] == "execution_failure"
+    ):
+        # A shared identity failure stops the Run without consuming Ticket gates.
+        return True
     if status == "operator_stopped":
         return True
     if status in {"waiting_external", "supervision_timeout", "abandonment_pending"}:

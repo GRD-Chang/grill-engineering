@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
 
+from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
@@ -14,6 +15,7 @@ from agent_run.delivery_loop import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github_identity import GitHubIdentityError
 from agent_run.revisions import effective_revision
 from agent_run.review_budget import new_budget
 from agent_run.delivery_policy import policy_snapshot_for_state
@@ -28,7 +30,7 @@ from agent_run.ticket_phase import (
     sync_active_ticket_job,
 )
 from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
-from agent_run.ticket_state import TicketState
+from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
 from agent_run.task_control import TaskControlBusyError
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.state_contract import IncompatibleRunStateError
@@ -78,7 +80,28 @@ class TicketDeliveryEngine:
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         if isinstance(self.states, TicketState):
-            return self._deliver_loaded(run_id, state)
+            # Corrupt persisted phases are a state-contract failure, not a
+            # resumable Worker failure with an invented recovery phase.
+            phase = state["active_ticket_job"].get("phase")
+            if phase is not None:
+                parse_ticket_phase(phase)
+            try:
+                return self._deliver_loaded(run_id, state)
+            except RunnerCredentialError as error:
+                self.states.block_shared_failure(error)
+                failed = self.states.load_current_run(run_id)
+                assert failed is not None
+                return failed
+            except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError,
+                    SimulatedProcessCrash, GitHubIdentityError):
+                raise
+            except Exception as error:
+                # Foreground delivery, development and supervision use the
+                # same owner and failure boundary, including pre-Agent work.
+                self.states.block_execution_failure(error)
+                paused = self.states.load_current_run(run_id)
+                assert paused is not None
+                return paused
         active = state.get("active_ticket_job")
         if not isinstance(active, dict):
             raise ValueError("Delivery Run has no selected Ticket")
@@ -97,7 +120,7 @@ class TicketDeliveryEngine:
         # Restore the in-memory mirror before shared stages save a recovered
         # Job; merge recovery intentionally performs no branch-intent write.
         sync_active_ticket_job(state)
-        if state.get("status") in {"blocked", "requeue_required"}:
+        if state.get("status") in RUN_STOP_STATUSES | {"blocked"}:
             return state
         if job.get("phase") in {
             "accepted",

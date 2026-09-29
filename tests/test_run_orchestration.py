@@ -2260,6 +2260,7 @@ def test_run_recovers_after_process_failure_between_tickets(
     failed_state = load_only_run_state(git_repo)
     assert failed_state["status"] == "progress_exhausted"
     assert failed_state["terminal_kind"] == "waiting_human"
+    assert failed_state["ticket_jobs"]["3"]["execution_resume_phase"] == "developing"
     assert failed_state["ticket_jobs"]["2"]["phase"] == "completed"
     assert failed_state["ticket_jobs"]["3"]["phase"] == "blocked"
     assert failed_state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_execution_failed"
@@ -2340,8 +2341,24 @@ def test_inflight_ticket_revision_requires_a_fresh_requeue(
     assert agents.review_requests == []
 
 
+@pytest.fixture
+def close_executor_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provisional-close recovery tests at an explicit Executor-loss boundary."""
+    from agent_run.state import SimulatedProcessCrash
+
+    close = FixtureGitHubPublisher.close_primary_ticket
+
+    def crash_after_close(self: FixtureGitHubPublisher, **kwargs: Any) -> Any:
+        try:
+            return close(self, **kwargs)
+        except OSError as error:
+            raise SimulatedProcessCrash(str(error)) from error
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "close_primary_ticket", crash_after_close)
+
+
 def test_close_response_loss_recovers_completed_job_without_duplicates(
-    git_repo: Path,
+    git_repo: Path, close_executor_crash: None,
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json",
@@ -2425,7 +2442,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     ],
 )
 def test_provisional_close_intent_can_abandon(
-    git_repo: Path, recovery_case: str
+    git_repo: Path, recovery_case: str, close_executor_crash: None,
 ) -> None:
     crash_flag = {
         "response_loss": "crash_after_close_once",

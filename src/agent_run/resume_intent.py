@@ -136,6 +136,9 @@ def bind_resume_intent(
         # the exact interrupted Invocation. Its Agent identity is the target.
         subjects = []
     invocation = state.get("active_agent_invocation")
+    if ticket_number is not None:
+        invocations = state.get("ticket_agent_invocations")
+        invocation = invocations.get(str(ticket_number)) if isinstance(invocations, Mapping) else None
     invocation = invocation if isinstance(invocation, Mapping) else {}
     if (
         ticket_number is not None

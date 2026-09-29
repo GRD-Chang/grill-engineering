@@ -5,7 +5,8 @@ from support.delivery_publisher import ScriptedPublisher, _tree
 
 import json
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, fields, replace
 from inspect import signature
@@ -1574,8 +1575,8 @@ def test_fresh_validation_human_resume_rejects_an_older_reviewer_thread(
         str(state["run_id"]), resume_human_blocker=True
     )
 
-    with pytest.raises(
-        ValueError, match="Human Blocker resume requires the latest Reviewer Thread"
+    with _ticket_failure(
+        states, state["run_id"], "Human Blocker resume requires the latest Reviewer Thread"
     ):
         engine.deliver(str(state["run_id"]))
 
@@ -2194,8 +2195,11 @@ def test_resume_reconciles_pr_merged_before_state_save(
         agents=ScriptedAgents(checkout),
     )
 
-    with pytest.raises(OSError, match="after remote merge"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "after remote merge" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     resumed = engine.deliver(state["run_id"])
 
     assert resumed["status"] == "ticket_completed"
@@ -3441,7 +3445,7 @@ def test_fresh_validation_rejects_development_thread_identity(
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
 
-    with pytest.raises(ValueError, match="Development Thread"):
+    with _ticket_failure(states, state["run_id"], "Development Thread"):
         TicketDeliveryEngine(
             git=GitRepository(git_repo),
             states=states,
@@ -3467,7 +3471,7 @@ def test_fresh_reviewer_identity_is_persisted_before_artifact_parsing(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="checks has missing fields"):
+    with _ticket_failure(states, state["run_id"], "checks has missing fields"):
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
@@ -3477,7 +3481,8 @@ def test_fresh_reviewer_identity_is_persisted_before_artifact_parsing(
     ] == 0
     assert interrupted["active_ticket_job"]["review_budget"]["review_artifacts"] == []
 
-    with pytest.raises(ValueError, match="new Reviewer Thread"):
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
+    with _ticket_failure(states, state["run_id"], "new Reviewer Thread"):
         engine.deliver(state["run_id"])
 
 
@@ -3492,7 +3497,7 @@ def test_fresh_validation_rejects_historical_development_thread(
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
 
-    with pytest.raises(ValueError, match="Development Thread"):
+    with _ticket_failure(states, state["run_id"], "Development Thread"):
         TicketDeliveryEngine(
             git=GitRepository(git_repo),
             states=states,
@@ -3547,7 +3552,7 @@ def test_publication_replacement_thread_is_rejected(
     agents = PublicationReplacementAgents(checkout)
     publisher = ScriptedPublisher(git_repo)
 
-    with pytest.raises(ValueError, match="cannot replace"):
+    with _ticket_failure(states, state["run_id"], "cannot replace"):
         TicketDeliveryEngine(
             git=GitRepository(git_repo),
             states=states,
@@ -3805,8 +3810,11 @@ def test_merge_window_base_drift_is_rejected_after_response_loss(
         agents=PassAgents(checkout),
     )
 
-    with pytest.raises(OSError, match="remote merge"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "remote merge" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     result = engine.deliver(state["run_id"])
 
     assert result["status"] == "blocked"
@@ -3832,8 +3840,11 @@ def test_merged_recovery_syncs_local_run_branch_before_ticket_close(
     )
     original_run_head = GitRepository(git_repo).resolve(str(state["run_branch"]))
 
-    with pytest.raises(OSError, match="before local Run Branch sync"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "before local Run Branch sync" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     assert (
         GitRepository(git_repo).resolve(str(state["run_branch"])) == original_run_head
     )
@@ -3866,8 +3877,11 @@ def test_post_merge_revision_drift_requires_explicit_requeue(
     )
     old_run_head = GitRepository(git_repo).resolve(str(state["run_branch"]))
 
-    with pytest.raises(OSError, match="revision-drifted merge"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "revision-drifted merge" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
     interrupted_job = interrupted["active_ticket_job"]
@@ -3937,8 +3951,11 @@ def test_revision_drift_after_merged_save_waits_for_explicit_requeue(
         agents=RevisionAgents(checkout),
     )
 
-    with pytest.raises(OSError, match="before Primary Ticket close"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "before Primary Ticket close" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
     old_job = interrupted["active_ticket_job"]
@@ -4012,8 +4029,11 @@ def test_transient_sync_git_error_remains_recoverable(
         agents=PassAgents(checkout),
     )
 
-    with pytest.raises(GitError, match="transient fetch failure"):
-        engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert "transient fetch failure" in waiting["diagnostics"][0]["message"]
+    assert waiting["ticket_integration_holder"] == 3
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
     job = interrupted["active_ticket_job"]
@@ -4043,13 +4063,14 @@ def test_publication_worker_failure_resumes_from_persisted_candidate(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="simulated Publication timeout"):
+    with _ticket_failure(states, state["run_id"], "simulated Publication timeout"):
         engine.deliver(state["run_id"])
 
     failed = states.load_run(str(state["run_id"]))
     assert failed is not None
-    assert failed["active_ticket_job"]["phase"] == "accepted"
+    assert failed["active_ticket_job"]["execution_resume_phase"] == "accepted"
 
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
@@ -4075,13 +4096,14 @@ def test_publication_worker_failure_is_not_retried_or_marked_pending(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="simulated Publication timeout"):
+    with _ticket_failure(states, state["run_id"], "simulated Publication timeout"):
         engine.deliver(state["run_id"])
 
     failed = states.load_run(str(state["run_id"]))
     assert failed is not None
     job = failed["active_ticket_job"]
-    assert job["phase"] == "accepted"
+    assert job["phase"] == "blocked"
+    assert job["execution_resume_phase"] == "accepted"
     assert job["publication_attempts"] == 1
     assert job["modification_attempts"] == 1
     assert job["acceptance_artifact"]["checks"] == {
@@ -4358,7 +4380,7 @@ def test_publication_worker_failure_rechecks_base_before_resume(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="simulated Publication timeout"):
+    with _ticket_failure(states, state["run_id"], "simulated Publication timeout"):
         engine.deliver(state["run_id"])
     failed = states.load_run(str(state["run_id"]))
     assert failed is not None
@@ -4366,6 +4388,7 @@ def test_publication_worker_failure_rechecks_base_before_resume(
     new_base = _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     agents.fail = False
 
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = engine.deliver(state["run_id"])
 
     job = completed["active_ticket_job"]
@@ -4397,8 +4420,9 @@ def test_publication_resume_rechecks_base_before_next_attempt(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="simulated Publication timeout"):
+    with _ticket_failure(states, state["run_id"], "simulated Publication timeout"):
         engine.deliver(state["run_id"])
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     result = engine.deliver(state["run_id"])
 
     job = result["active_ticket_job"]
@@ -4502,8 +4526,8 @@ def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(
         agents=agents,
     )
 
-    with pytest.raises(
-        ValueError, match="simulated acceptance repair Publication timeout"
+    with _ticket_failure(
+        states, state["run_id"], "simulated acceptance repair Publication timeout"
     ):
         engine.deliver(state["run_id"])
     failed = states.load_run(str(state["run_id"]))
@@ -4511,6 +4535,7 @@ def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(
     assert failed["active_ticket_job"]["repair_source"] == "acceptance"
     _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     agents.fail_publication = False
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
@@ -4568,11 +4593,12 @@ def test_candidate_commit_crash_recovers_without_new_development_attempt(
         agents=agents,
     )
 
-    with pytest.raises(OSError, match="after Candidate"):
+    with _ticket_failure(states, state["run_id"], "after Candidate"):
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
-    assert interrupted["active_ticket_job"]["phase"] == "committing_candidate"
+    assert interrupted["active_ticket_job"]["execution_resume_phase"] == "committing_candidate"
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
@@ -4680,7 +4706,7 @@ def test_initial_ticket_ref_crash_recovers_external_append_before_any_pr(
         github=FixtureGitHubPublisher(fixture, GitRepository(git_repo)),
         agents=PassAgents(checkout),
     )
-    with pytest.raises(OSError, match="simulated lost response"):
+    with _ticket_failure(states, state["run_id"], "simulated lost response"):
         engine.deliver(state["run_id"])
     saved = states.load_run(state["run_id"])
     assert saved is not None
@@ -4695,6 +4721,7 @@ def test_initial_ticket_ref_crash_recovers_external_append_before_any_pr(
     data["delivery"]["published_branches"][job["ticket_branch"]] = appended
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states,
         github=FixtureGitHubPublisher(fixture, GitRepository(git_repo)),
@@ -4718,7 +4745,7 @@ def test_lost_ticket_push_response_does_not_charge_external_resync(
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     agents = PassAgents(checkout)
-    with pytest.raises(OSError, match="simulated lost response"):
+    with _ticket_failure(states, state["run_id"], "simulated lost response"):
         TicketDeliveryEngine(
             git=GitRepository(git_repo), states=states,
             github=FixtureGitHubPublisher(fixture, GitRepository(git_repo)),
@@ -4729,6 +4756,7 @@ def test_lost_ticket_push_response_does_not_charge_external_resync(
     publication_sha = saved["active_ticket_job"]["publication_sha"]
     assert saved["active_ticket_job"]["ticket_write_intent"]["head_sha"] == publication_sha
 
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states,
         github=FixtureGitHubPublisher(fixture, GitRepository(git_repo)),
@@ -5071,7 +5099,7 @@ def test_ticket_resolves_source_and_target_conflicts_in_one_integration(
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     )
-    with pytest.raises(ValueError, match="simulated Publication timeout"):
+    with _ticket_failure(states, state["run_id"], "simulated Publication timeout"):
         engine.deliver(state["run_id"])
     agents.fail = False
     collaborator = tmp_path / "collaborator"
@@ -5096,6 +5124,7 @@ def test_ticket_resolves_source_and_target_conflicts_in_one_integration(
     subprocess.run(["git", "update-ref", f"refs/heads/{run_branch}", target, base],
                    cwd=git_repo, check=True)
     publisher.live_head = source
+    _resume_failed_ticket(git_repo, fixture, states, str(state["run_id"]))
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed", completed.get("diagnostics")
@@ -5320,3 +5349,21 @@ def test_resume_preserves_local_gate_while_selecting_independent_frontier(
     assert integration["acceptance_record"]["artifact"]["checks"]["e2e"][
         "status"
     ] == "pass"
+
+
+@contextmanager
+def _ticket_failure(states: StateStore, run_id: str, message: str) -> Iterator[None]:
+    """Assert the public Ticket failure result without auto-authorizing recovery."""
+    yield
+    failed = states.load_current_run(run_id)
+    assert failed is not None
+    job = failed['active_ticket_job']
+    assert job['phase'] == 'blocked'
+    assert job['blocked_reason'] == 'ticket_execution_failed'
+    assert message in job['execution_failure']
+
+
+def _resume_failed_ticket(git_repo: Path, fixture: Path, states: StateStore, run_id: str) -> None:
+    Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states).resume(
+        run_id, explicit_resume=True, ticket_number=3,
+    )

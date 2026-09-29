@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from typing import Any
 
 from agent_run.external_supervision import (
     CHECKS_BUDGET_SECONDS,
@@ -537,6 +538,32 @@ def test_nonblocking_retry_persists_schedule_and_expires_without_sleep() -> None
     assert not supervisor.retry_due(persisted)
     assert persisted['status'] == 'supervision_timeout'
     assert sleeps == []
+
+
+def test_unknown_checks_read_does_not_restart_the_same_objects_deadline() -> None:
+    from agent_run.external_supervision import wait_for_github_convergence
+
+    clock = [100.25]
+    supervisor = ExternalSupervisor(now=lambda: clock[0], sleeper=lambda _: None)
+    state: dict[str, Any] = {
+        'run_id': 'run-1', 'status': 'waiting_checks',
+        'active_ticket_job': {'ticket_number': 2, 'pr_number': 20,
+                              'phase': 'waiting_checks', 'publication_sha': 'head-a'},
+    }
+    window = supervisor.observe(state)
+    assert window is not None
+    original = dict(window)
+    clock[0] += 500
+    wait_for_github_convergence(state, code='github_read_failed', message='network unknown', waiting_for='ticket-2')
+    supervisor.observe(state)
+    assert state['supervision_window']['deadline'] == original['deadline']
+    clock[0] += 500
+    state['status'] = 'waiting_checks'
+    supervisor.observe(state)
+    assert state['supervision_window']['started_at'] == original['started_at']
+    clock[0] = float(original['deadline'])
+    assert not supervisor.retry_due(state)
+    assert state['supervision_wait']['deadline'] == original['deadline']
 
 
 def test_nested_delivery_uses_driver_clock_without_leaking_between_runs(monkeypatch: pytest.MonkeyPatch) -> None:

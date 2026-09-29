@@ -87,8 +87,10 @@ def test_ticket_recovery_reconciles_successful_merge_before_old_base_ref_check(
     publisher = InterruptedMergePublisher(fixture, git)
     engine = TicketDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
 
-    with pytest.raises(OSError, match="lost response after remote merge"):
-        engine.deliver(run_id)
+    waiting = engine.deliver(run_id)
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert waiting["ticket_integration_holder"] == 3
     interrupted = states.load_current_run(run_id)
     assert interrupted is not None
     job = interrupted["active_ticket_job"]

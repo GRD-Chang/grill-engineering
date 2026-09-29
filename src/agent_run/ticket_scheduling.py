@@ -8,13 +8,9 @@ from time import monotonic
 from typing import Any, Callable, TYPE_CHECKING
 
 from agent_run.external_supervision import ExternalSupervisor
-from agent_run.revisions import TicketGraphDriftError
 from agent_run.runner_credentials import runner_credential_scope
-from agent_run.state import SimulatedProcessCrash
-from agent_run.state_contract import IncompatibleRunStateError
-from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
-from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
+from agent_run.ticket_state import RUN_STOP_STATUSES
 from agent_run.ticket_supervision import development_wait_due
 from agent_run.ticket_work import TicketWorkAdmission, capacity
 
@@ -62,17 +58,11 @@ def develop_frontier(
         return False
 
     def advance(number: int) -> None:
-        scoped = TicketState(engine.states, run_id, number)
-        try:
-            with runner_credential_scope():
-                TicketDeliveryEngine(
-                    git=engine.git, states=scoped,  # type: ignore[arg-type]
-                    github=engine.github, agents=engine.agents, development_only=True,
-                ).deliver(run_id)
-        except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError, SimulatedProcessCrash):
-            raise
-        except Exception as error:
-            scoped.block_execution_failure(error)
+        with runner_credential_scope():
+            TicketDeliveryEngine(
+                git=engine.git, states=engine.states,
+                github=engine.github, agents=engine.agents, development_only=True,
+            ).deliver_ticket(run_id, number)
 
     def observe(lanes: frozenset[int]) -> None:
         assert supervise is not None

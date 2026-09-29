@@ -188,13 +188,20 @@ def test_partial_checkout_is_cleaned_when_preparation_fails(
     )
     partial_git = PartialCheckoutGit(git_repo)
 
-    with pytest.raises(OSError, match="partial checkout"):
-        TicketDeliveryEngine(
-            git=partial_git,
-            states=states,
-            github=ScriptedPublisher(git_repo),
-            agents=PassAgents(checkout),
-        ).deliver(state["run_id"])
+    result = TicketDeliveryEngine(
+        git=partial_git,
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=PassAgents(checkout),
+    ).deliver(state["run_id"])
+    assert result["status"] == "blocked"
+    job = result["ticket_jobs"]["3"]
+    assert job["ticket_number"] == 3
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_execution_failed"
+    assert job["execution_resume_phase"] == "developing"
+    assert "partial checkout" in job["execution_failure"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"]["3"] == job
 
     assert partial_git.cleanup_called
     assert not checkout.exists()
@@ -213,13 +220,20 @@ def test_preexisting_inconsistent_ticket_checkout_is_preserved(
     evidence = checkout / "unsaved.txt"
     evidence.write_text("must survive\n", encoding="utf-8")
 
-    with pytest.raises(GitError, match="existing ticket checkout does not match"):
-        TicketDeliveryEngine(
-            git=GitRepository(git_repo),
-            states=states,
-            github=ScriptedPublisher(git_repo),
-            agents=PassAgents(checkout),
-        ).deliver(state["run_id"])
+    result = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=PassAgents(checkout),
+    ).deliver(state["run_id"])
+    assert result["status"] == "blocked"
+    job = result["ticket_jobs"]["3"]
+    assert job["ticket_number"] == 3
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_execution_failed"
+    assert job["execution_resume_phase"] == "developing"
+    assert "existing ticket checkout does not match" in job["execution_failure"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"]["3"] == job
 
     assert evidence.read_text(encoding="utf-8") == "must survive\n"
 

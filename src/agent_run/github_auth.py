@@ -37,10 +37,15 @@ _WRITE_ONLY_INSTALLATION_PERMISSIONS = frozenset({"workflows", "profile"})
 
 
 class GitHubCredentialError(RuntimeError):
-    def __init__(self, message: str, *, http_status: int | None = None, retryable: bool | None = None) -> None:
+    def __init__(
+        self, message: str, *, http_status: int | None = None,
+        retryable: bool | None = None, authorization_failed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.http_status = safe_http_status(http_status)
         self.retryable = (self.http_status is not None and (self.http_status >= 500 or self.http_status in {408, 429})) if retryable is None else retryable
+        # Retry policy alone is not evidence that the shared identity is invalid.
+        self.authorization_failed = authorization_failed or self.http_status in {401, 403}
 
 
 class _SigningProcessRegistry:
@@ -196,13 +201,13 @@ def _app_headers(
             metadata = os.fstat(key_file.fileno())
             if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077
                     or metadata.st_size > 64 * 1024):
-                raise GitHubCredentialError("GitHub App private key must be a private, bounded regular file")
+                raise GitHubCredentialError("GitHub App private key must be a private, bounded regular file", authorization_failed=True)
             key_bytes = key_file.read(64 * 1024 + 1)
             if len(key_bytes) > 64 * 1024:
-                raise GitHubCredentialError("GitHub App private key is too large")
+                raise GitHubCredentialError("GitHub App private key is too large", authorization_failed=True)
             private_key = key_bytes.decode("utf-8")
     except (GitHubAuthProfileError, OSError, UnicodeDecodeError) as error:
-        raise GitHubCredentialError("GitHub App private key is unavailable or unsafe") from None
+        raise GitHubCredentialError("GitHub App private key is unavailable or unsafe", authorization_failed=True) from None
     if process_registry is None:
         app_jwt = _create_app_jwt(app_id, private_key)
     else:
@@ -431,11 +436,13 @@ def _create_app_jwt(
                 process_registry=process_registry,
             )
         if signed.returncode != 0:
-            raise GitHubCredentialError("could not sign GitHub App JWT")
+            raise GitHubCredentialError("could not sign GitHub App JWT", authorization_failed=True)
         signature = base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode()
         return f"{signing_input}.{signature}"
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise GitHubCredentialError("OpenSSL is required to sign App JWTs") from error
+    except subprocess.TimeoutExpired as error:
+        raise GitHubCredentialError("GitHub App signing timed out", retryable=True) from error
+    except OSError as error:
+        raise GitHubCredentialError("OpenSSL is required to sign App JWTs", authorization_failed=True) from error
     finally:
         if key_fd is not None:
             os.close(key_fd)

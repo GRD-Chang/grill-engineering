@@ -143,6 +143,8 @@ class TicketState:
                 job["execution_failure"] = bounded_error(str(
                     invocation.get("error") or diagnostics[0]["message"]
                 ))
+                if "prior_human_blockers" in job:
+                    job.pop("human_blockers", None)
                 state["status"] = "blocked"
                 state["terminal_kind"] = None
             holder = state["ticket_integration_holder"]
@@ -220,10 +222,14 @@ class TicketState:
 
         if isinstance(error, GitHubReadError) and is_proven_github_state_contradiction(error.code):
             raise error
-        # A close response can be lost after the external mutation. Preserve
-        # the existing close-intent recovery/abandonment boundary at Run level.
-        if self._last_job and self._last_job.get("phase") in {"merged", "completed"}:
+        # A merge/close response can be lost after the external mutation.
+        # Preserve its recovery boundary and seat until the result is known.
+        if self._last_job and self._last_job.get("phase") == "completed":
             raise error
+        if self._last_job and self._last_job.get("phase") in {"merging", "merged"}:
+            # The write may have succeeded. Keep its intent and integration
+            # seat while the normal Published-Head path observes the result.
+            error = GitHubReadError("merge_reconciliation_pending", bounded_error(str(error)))
         if isinstance(error, GitHubReadError):
             # Branch preparation can fail before entering the shared Change
             # Delivery loop. Keep that unknown observation bounded as well.
@@ -263,6 +269,8 @@ class TicketState:
             job["phase"] = "blocked"
             job["blocked_reason"] = "ticket_execution_failed"
             job["execution_failure"] = bounded_error(str(error))
+            if "prior_human_blockers" in job:
+                job.pop("human_blockers", None)
             invocation = latest["ticket_agent_invocations"].get(number)
             if isinstance(invocation, dict) and invocation.get("status") in {
                 "running", "resuming",
@@ -287,6 +295,40 @@ class TicketState:
                     "message": job["execution_failure"],
                     "ticket_number": self.ticket_number,
                 }]
+            self.states._save_run_and_notify_unlocked(self.run_id, latest)
+
+        self.states._commit_run(commit)
+
+    def block_shared_failure(self, error: Exception) -> None:
+        """Fence the Run before other lanes can commit after proven auth loss."""
+        from agent_run.agent_invocation import fail_interrupted_invocation
+        from agent_run.controller import _operator_gate_diagnostic
+
+        def commit() -> None:
+            latest = self.states.load_current_run(self.run_id)
+            if latest is None:
+                raise ValueError("Delivery Run disappeared during credential failure")
+            if latest.get("status") in RUN_STOP_STATUSES or latest.get("terminal_kind") == "permanent_blocked":
+                return
+            number = str(self.ticket_number)
+            job = latest["ticket_jobs"].get(number)
+            if _execution_job(job) != _execution_job(self._last_job):
+                raise TaskControlBusyError("Ticket changed before credential failure")
+            latest["active_ticket_job"] = job
+            latest["active_agent_invocation"] = latest["ticket_agent_invocations"].get(number)
+            invocation = latest["active_agent_invocation"]
+            if isinstance(invocation, dict):
+                fail_interrupted_invocation(
+                    latest, role=str(invocation["role"]), save=lambda _: None,
+                )
+            latest.update({
+                "status": "execution_failed", "terminal_kind": "execution_failed",
+                "diagnostics": [_operator_gate_diagnostic(
+                    latest, code="runner_credential_failed", message=str(error),
+                    action_kind="execution_failure", reason="runner_credential_failed",
+                    fallback_phase="active",
+                )],
+            })
             self.states._save_run_and_notify_unlocked(self.run_id, latest)
 
         self.states._commit_run(commit)

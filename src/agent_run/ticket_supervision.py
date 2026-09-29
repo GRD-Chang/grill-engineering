@@ -7,10 +7,6 @@ from typing import Any, TYPE_CHECKING
 
 from agent_run.external_supervision import ExternalSupervisor, is_supervised_wait
 from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
-from agent_run.revisions import TicketGraphDriftError
-from agent_run.state import SimulatedProcessCrash
-from agent_run.state_contract import IncompatibleRunStateError
-from agent_run.task_control import TaskControlBusyError
 
 if TYPE_CHECKING:
     from agent_run.delivery import TicketDeliveryEngine
@@ -68,19 +64,8 @@ def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset
         return False
     if is_supervised_wait(projected) and not _retry_due(scoped, projected):
         return False
-    from agent_run.delivery import TicketDeliveryEngine
-
-    try:
-        result = TicketDeliveryEngine(
-            git=engine.git, states=scoped,  # type: ignore[arg-type]
-            github=engine.github, agents=engine.agents,
-        ).deliver(run_id)
-        return bool(result["active_ticket_job"].get("phase") == "completed")
-    except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError, SimulatedProcessCrash):
-        raise
-    except Exception as error:
-        scoped.block_execution_failure(error)
-        return False
+    result = engine.deliver_ticket(run_id, number)
+    return bool(result["active_ticket_job"].get("phase") == "completed")
 
 
 def pause_ticket_supervision(scoped: TicketState, state: dict[str, Any]) -> None:

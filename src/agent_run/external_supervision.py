@@ -47,7 +47,16 @@ def waiting_boundary(state: dict[str, Any]) -> WaitingBoundary | None:
     """Return the current externally-converging boundary, if any."""
 
     status = state.get("status")
-    if status == "waiting_checks":
+    window = state.get("supervision_window")
+    # A transient read is still an observation of the same checks. Alternating
+    # pending/error results must not buy a fresh window on every poll.
+    checks_read_failed = (
+        status == "waiting_external"
+        and isinstance(window, dict)
+        and window.get("kind") == "required_checks"
+        and _phase(state) == "waiting_checks"
+    )
+    if status == "waiting_checks" or checks_read_failed:
         return WaitingBoundary(
             kind="required_checks",
             budget_seconds=CHECKS_BUDGET_SECONDS,
@@ -291,7 +300,7 @@ def is_github_refresh_wait(state: dict[str, Any]) -> bool:
 def wait_for_github_convergence(
     state: dict[str, Any], *, code: str, message: str, waiting_for: str
 ) -> None:
-    """Persist a recoverable 10-minute GitHub convergence boundary."""
+    """Persist a bounded read wait, retaining any active checks deadline."""
 
     state.update(
         {
