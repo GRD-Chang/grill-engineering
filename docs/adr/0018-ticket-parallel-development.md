@@ -4,6 +4,8 @@ status: accepted
 
 # 同 Parent Ticket 开发与审核有界并行
 
+后续需求修订：[ADR 0019](0019-ticket-work-concurrency-and-supervision.md) 将并发额度扩大到 Ticket 的实际 Agent 工作，要求 CI 监督独立于其他 Ticket 的长调用，允许运行中定向 Resume 排队，并将单票 Stop 改为立即中断准确归属的 Agent。该修订已确认、尚未实施；下文仅计算需求开发和原有 Review lane 的范围，以及等待 Agent 返回安全边界才暂停的规则由其取代，其余未修订决定继续适用。
+
 ## 决定
 
 一个 Delivery Run 的有效策略固定 `ticket_development_workers`，默认 3，正整数，1 为串行。该额度只计算独立 Ticket 的需求开发和原有 Review lane；队列等待、CI 观测、集成及 Agent 内部子进程不占 lane。依赖只由已完成合入和收尾记录解除。Ticket 的开发及 Review 在各自固定工作区并行；集成、发布、CI 与合并继续沿用共享交付 Engine 和单一 Run Branch 集成席位。

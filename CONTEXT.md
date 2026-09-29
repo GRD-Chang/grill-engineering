@@ -4,6 +4,8 @@
 
 Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。
 
+持续多线监督、统一 Ticket 工作并发额度、运行中定向 Resume 排队和单票立即 Stop 是已确认、尚未实施的需求修订，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文对应术语描述目标合同，不代表当前版本已具备这些能力。
+
 ## 静态 Prompt 资源与个人方法
 
 新 Delivery Run 在首次持久化前一次读取并固定语言、四份角色正文及代码定义的对应语言内部静态文案。
@@ -256,10 +258,11 @@ _Avoid_: 删除 Delivery Run、删除 GitHub App 配置、删除非受管 shell 
 
 **Run 内部监督（In-Run Supervision）**:
 Run Executor Session 在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
-_Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
+监督持续覆盖所有需要自动观测的工作；一个 Ticket 的 Development、Review 或其他 Agent 工作不能阻止另一个 Ticket 的 CI 观测及满足条件后的交付推进。
+_Avoid_: 维护者轮询 CI、等待其他 Ticket 结束才观测、常驻的第二套控制器、自动越过 Final Human Acceptance
 
 **Run Executor Session（运行执行会话）**:
-一个 Delivery Run 中连续推进所有无需新增人工授权工作的活动执行区间。它先且只先消费一个已接受的 Lifecycle Action，再从最新持久状态使用同一确定性 Driver 推进 Development、Acceptance、Publication 与 Run 内部监督，直到到达人类边界、Operator Stop、可恢复失败、监督超时或终态后结束。同一 Local Delivery Workspace 中的同一 Delivery Task 同一时刻最多有一个 Run Executor Session；同一工作区内不同 Delivery Task 可以并行，并由各自的 Managed Development Checkout 与任务控制边界隔离。agent-run 不为这种并行增加仓库级 Git 锁或跨 Worktree Git 协调层；Git 自身的并发规则仍由 Git 负责，agent-run 只处理自己发起的 Git 命令结果。Run Executor Session 不属于发起命令的终端，也不等同于整个 Delivery Run：终端离开不结束它，等待人工期间也不要求它继续存在。
+一个 Delivery Run 中连续推进已获授权自动工作的活动执行区间。它由已接受的 Lifecycle Action 启动，覆盖 Development、Acceptance、Publication 与 Run 内部监督，期间可接受局部 Ticket Resume；单 Ticket 的人工门禁、失败或监督超时不结束仍有独立工作的会话。整个 Run 已无自动工作、出现全局门禁或到达终态时，会话结束。同一 Delivery Task 同时最多有一个 Run Executor Session，不同 Delivery Task 可以并行。会话不属于发起命令的终端，也不等同于整个 Delivery Run：终端离开不结束它，所有剩余工作均等待人工时不要求它继续存在。运行中定向恢复及局部退出边界的需求修订见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。
 _Avoid_: 终端拥有执行权、整个 Run 常驻进程、workspace 全局 daemon、把一次意图重复应用于自动循环、全局串行、同一本地任务多执行者、仓库级 Git 并发协调
 
 **Executor Host（执行会话宿主）**:
@@ -320,7 +323,7 @@ _Avoid_: 以启动握手冒充 Delivery Run 或 Agent 完成、仅凭进程启�
 _Avoid_: 字段转储、内部状态码、SHA、哈希式身份、Executor Host 术语、把命令接受写成交付完成、无下一步的错误
 
 **执行失败（Execution Failure）**:
-Delivery Run 身份已经确定后，当前自动步骤因 Agent 进程、凭据、sandbox、timeout、signal 或其他不能安全继续的执行问题而形成的持久化可恢复暂停。Run Executor Session 必须先保留准确 Work Subject、Semantic Attempt、Thread、Managed Development Checkout 与 Failure Diagnostic Evidence，再停止并等待显式 `resume`；它不自动重试，不等同于 Action Completion Observation 离开。只有无法确定 Run 身份或无法安全持久化状态的故障才保留为命令级进程错误，并由 Host Diagnostic Log 提供最后的排查入口。
+Delivery Run 身份已经确定后，当前自动步骤因 Agent 进程、凭据、sandbox、timeout、signal 或其他不能安全继续的执行问题而形成的持久化可恢复暂停。失败对象保留准确 Work Subject、Semantic Attempt、Thread、Managed Development Checkout 与 Failure Diagnostic Evidence 并等待显式 `resume`；单 Ticket 失败不结束仍有独立工作的 Run Executor Session，也不等同于 Action Completion Observation 离开。只有无法确定 Run 身份或无法安全持久化状态的故障才保留为命令级进程错误，并由 Host Diagnostic Log 提供最后的排查入口。
 _Avoid_: 自动重试、监督超时、Human Blocker、无诊断证据的失败、丢弃未提交成果
 
 **Failure Diagnostic Evidence（故障诊断证据）**:
@@ -332,7 +335,7 @@ Executor Host 交给操作系统日志设施保存的进程级诊断信息，用
 _Avoid_: 第二套 Run state、业务历史、完整 Agent 输出归档、无限保留、跨平台核心依赖
 
 **Agent 执行所有权（Agent Execution Ownership）**:
-一次 Agent 执行必须隶属于准确 Local Delivery Workspace、Delivery Task、Delivery Run、Run Executor Session 与当前执行代次，并由该任务唯一的 Executor 启动和回收。Executor 意外消失后，新 Executor 只有在确认旧执行者已不存在后才能开始新的 Agent 执行；无法确认时 fail closed。旧 Agent 执行被确认为已中断时，其 Invocation 先保存为 `execution_failed/session_interrupted` 并等待显式 `resume`，不自动重放；纯外部监督可继续原等待窗口，结果未知的 Publisher 写操作须先根据远端权威事实对账。本机进程身份只是所有权证据，不授权依据裸 PID 终止未经证明的进程，也不形成跨主机租约。
+一次 Agent 执行必须隶属于准确 Local Delivery Workspace、Delivery Task、Delivery Run、Run Executor Session 与当前执行代次，并由该任务唯一的 Executor 启动和回收。Executor 意外消失后，新 Executor 只有在确认旧执行者已不存在后才能开始新的 Agent 执行；无法确认时 fail closed。因 Executor 意外消失而中断的旧 Agent 执行被确认后，其 Invocation 先保存为 `execution_failed/session_interrupted` 并等待显式 `resume`，不自动重放；纯外部监督可继续原等待窗口，结果未知的 Publisher 写操作须先根据远端权威事实对账。本机进程身份只是所有权证据，不授权依据裸 PID 终止未经证明的进程，也不形成跨主机租约。
 _Avoid_: 旧 Worker 存活时启动新 Worker、自动重放中断的 Agent、盲目重放未知的远端写入、裸 PID 猜测、自动杀死无法证明归属的进程、终端持有所有权
 
 **Worker Lifecycle Isolation（Worker 生命周期隔离）**:
@@ -341,11 +344,16 @@ _Avoid_: 只靠 Prompt 自律、Worker 自我批准、Publisher 凭证继承、�
 
 **公开生命周期命令（Public Lifecycle Command）**:
 维护者用于创建或推进 Delivery Run 的稳定交互入口。`run` 是创建或恢复 Run 的唯一普通入口，也是不携带新增恢复或批准意图的自动入口：不存在未完成 Run 且 Parent 当前可执行时创建后继 Run；已有准确 Executor 正常运行且没有未完成 Action 时只返回现有状态，不提供单独的公开 `start` 或额外 `--new-run`。`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 都只提交一次对应 Lifecycle Action，确保该任务唯一的 Run Executor Session 存在，并在取得准确 Action Receipt 后返回；它们不各自在调用进程内形成不同推进路径。`run`、普通 `resume`、`revise` 与 `requeue` 在命令意图准确应用并完成启动握手后返回；`stop` 与 `abandon` 默认通过可离开的 Action Completion Observation 等待各自目标状态后返回。`approve` 及恢复原最终批准操作的 `resume` 通过同一观察方式等待完整操作的准确结果后返回，执行期间不可由其他生命周期动作取消。`stop` 是可恢复的中止意图，停止后必须显式 `resume`；`abandon` 是不可恢复的终止、对账与受限收口。Development、Acceptance、Publication 与内部等待只是 Controller 阶段，不要求也不允许维护者把它们作为独立流程手工串接；普通外部监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复；最终批准操作失败或超时后须显式 `resume`，沿用其不可取消与等待实际结果的合同。
+带 `--ticket` 的 Stop/Resume 只作用于指定 Ticket；不以结束或重启整个 Executor 作为局部命令的完成条件。
 _Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
 
 **Operator Stop（人工停止）**:
-维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交，但不能取消执行中的最终批准操作，包括经 resume 恢复的该操作；意图获准并持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
+维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的 Run 级明确 Lifecycle Action；定向停止单票的范围见 Ticket Stop。Stop 可从任意终端提交，但不能取消执行中的最终批准操作，包括经 resume 恢复的该操作；意图获准并持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
 _Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、已有暂停或终态时重复制造 Stop 历史
+
+**Ticket Stop（单票停止）**:
+通过 `stop --ticket` 立即中断指定 Ticket 的准确 Agent 或取消其待执行排队、保留已落盘成果与恢复依据的局部暂停；确认执行停止后释放工作名额，其他 Ticket 及其 CI 监督继续。后续需显式 Resume，持有的集成席位按异常暂停规则释放、在途远端操作先按实际结果收口，停止不清除预算等独立门禁，也不形成 Run 级停止；已确认的行为修订见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。
+_Avoid_: 全局 Operator Stop、等待 Agent 完成本轮、结束其他 Ticket、撤回已完成远端操作、清空预算门禁
 
 **No-progress Guard（无进展保护）**:
 Run Executor Session 对一次自动步骤执行前后的确定性进展身份进行机械比较；若状态、当前 Work Subject、Generation、phase、Semantic Attempt、Invocation、Candidate、PR、准确 head、等待边界、cleanup 与下一步骤均未变化，则保存 `execution_failed/controller_no_progress` 并停止，而不以相同输入忙循环。时间戳、timeline、日志、展示字段与重试计数不构成进展；`waiting_checks`、`waiting_external` 与 `waiting_merge` 由 Run 内部监督负责，不属于无进展。
@@ -356,7 +364,7 @@ Run 内部监督按远端状态类别采用有限等待预算。预算内保持�
 _Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
 
 **监督超时暂停（Supervision Timeout Pause）**:
-可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据，当前 Run Executor Session 退出并等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示使用 Lifecycle Parent Selector 的 `agent-run resume <parent-issue>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃 Executor 仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
+可自动判定的远端异步状态在其监督截止时间内仍未收敛时，受影响对象保留最后的权威证据并等待维护者显式继续；Ticket 自身超时只暂停该 Ticket，其他独立工作及其监督继续，整个 Run 无自动工作时 Executor 才退出。它不要求维护者提供额外产品决策、权限或凭据；`status` 与 `history` 指向准确对象的恢复动作，Ticket 定向恢复使用 `agent-run resume <parent-issue> --ticket <number>`，Run 级监督沿用显式 `run` 或 `resume` 恢复其等待窗口，恢复监督本身不创建新的 Agent 工作或代表交付完成。
 _Avoid_: execution_failed、Human Blocker、常驻 watcher、无界单次进程
 
 **Ticket 关闭归属（Ticket Close Ownership）**:
@@ -525,8 +533,16 @@ _Avoid_: Ticket 自动修复、Run 暂停、默认分支回滚
 _Avoid_: Ticket、Attempt、Codex Thread
 
 **Active Ticket Job（活跃 Ticket 任务）**:
-Controller 当前交给共享 Engine 推进的 Ticket Job 指针。一个 Run 可保存多个独立 Ticket Job，并在有效依赖解除后并行推进最多达到 Run Policy Snapshot 中 `ticket_development_workers` 上限的开发及原有审核工作；内置默认值为 3，配置为 1 时顺序推进。该上限计 Ticket 开发/审核 lane，不计所有子进程。排队等待、CI 观测与集成席位不占开发 Worker。`ticket_jobs` 与 `ticket_agent_invocations` 保存按 Ticket 隔离的事实，`active_ticket_job` 与 `active_agent_invocation` 是当前选中 Ticket 的兼容投影；StateStore 在单一提交边界归并独立 Ticket，集成仍持单席位。
+Controller 当前选中推进的 Ticket Job，不代表 Run 中唯一正在执行或接受监督的 Ticket。一个 Run 可保存多个独立 Ticket Job，实际 Agent 工作受 Ticket Work Concurrency 约束，集成交付受单一 Ticket Integration Holder 约束。
 _Avoid_: 把当前指针当成唯一 Ticket Job、让等待 CI 占开发 Worker、由 Agent 决定调度
+
+**Ticket Work Concurrency（Ticket 工作并发额度）**:
+同一 Delivery Run 允许同时调用 Agent 执行工作的 Ticket 数上限；需求开发、Review、CI 修复、冲突处理等实际 Agent 工作共用此额度，纯 CI 等待、排队与程序监督不占名额。它限制 Ticket 工作并发，不表示 Agent 内部子进程的总数上限；已确认的范围调整见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。
+_Avoid_: 仅限制需求开发、修复另开无限额度、CI 等待占用名额、Agent 子进程总数上限
+
+**Ticket Work Queue（Ticket 工作队列）**:
+已获授权、满足执行条件且等待 Ticket Work Concurrency 名额的工作集合，包含新开发、修复和已接受的人工恢复。按就绪后的等待顺序分配空出的名额，不因工作类型自动插队，不抢占当前工作；恢复请求在无名额时持久排队，名额可用且执行条件仍满足时自动开始，无需再次 Resume。
+_Avoid_: Ticket 集成队列、把人工阻塞当成排队、自动续期次数预算、Resume 自动插队、重复恢复生成重复工作
 
 **Ticket Integration Queue（Ticket 集成队列）**:
 Ticket 满足开发及原有审核条件后进入的 Run 级持久队列。规范记录为 `ticket_integration_queue` 中的 Ticket number 与 `ready_at`；先按进入待集成时间、同时时按编号排序。代码修复或异常暂停使 Ticket 释放席位并离队，修复后以新的 `ready_at` 重新排队。队列中和审核通过都不是 Ticket Completion。
@@ -537,7 +553,7 @@ Run Branch 同一时刻唯一获准执行 Ticket 集成及后续交付的 Ticket
 _Avoid_: 第二个 Ticket 同时提交 Run Branch、等待 CI 时释放、把席位当开发 Worker
 
 **Ticket Selection Order（Ticket 选择顺序）**:
-多个 Ticket 同时具备执行资格时使用的确定性顺序：优先采用 Parent Spec 的 GitHub 原生 `subIssues` 顺序，缺少稳定顺序时按 Issue number 升序。Codex Worker 不决定该优先级。
+多个 Ticket 同时具备执行资格时使用的确定性选择顺序。分配工作并发名额时优先遵循 Ticket Work Queue 的就绪等待顺序；同批新就绪 Ticket 沿用 Parent Spec 的 GitHub 原生 `subIssues` 顺序，缺少稳定顺序时按 Issue number 升序。Codex Worker 不决定该优先级。
 _Avoid_: Agent 自主排序、依赖边、人工逐票选择
 
 **Ticket Branch（Ticket 分支）**:
@@ -796,8 +812,8 @@ _Avoid_: 把 CI 修复计入普通需求开发次数、隐式额外 Reviewer
 _Avoid_: 同一失败 head 重复计轮、把 CI 修复记作需求修复、无证据跳过 Reviewer
 
 **Ticket Resume Command（Ticket 恢复命令）**:
-维护者通过 `agent-run resume <parent-issue>` 恢复当前 failed 或 Human Blocker Invocation；多个 Ticket 各自等待人工处理时，通过 `--ticket <number>` 指定其中一个 Ticket，恢复只解除该 Ticket 的局部门禁，其他 Ticket 的阻塞与预算保持原状。在
-`modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window，；CI 恢复额度保持独立。Ticket 用尽有效 Run Policy Snapshot 的 `N` 次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
+维护者通过 `agent-run resume <parent-issue>` 恢复当前 failed 或 Human Blocker Invocation；通过 `--ticket <number>` 指定一个 Ticket 时，其他 Ticket 仍在执行不妨碍接受该局部恢复。恢复只解除目标 Ticket 的局部门禁，保留适用成果与预算记录；无工作并发名额时进入 Ticket Work Queue，名额可用且执行条件仍满足时自动继续，其他 Ticket 的工作、阻塞与预算保持原状。在
+`modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window；CI 恢复额度保持独立。Ticket 用尽有效 Run Policy Snapshot 的 `N` 次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
 若该边界保存了 Reviewer Finding、Git Integrity 或 Required Checks 失败证据，新窗口先启动普通 Development Attempt，并将准确原始证据交给按 Development Thread Policy 选择的开发会话；只有产出新 Candidate 后才由新窗口 Reviewer 1 建立基线。准确新 head 的可修复 CI 失败进入独立 CI 恢复轮次，不审查未修改的失败 Candidate。
 若 preflight
 发现 Ticket Content Revision、Parent Revision 或其他需求身份已变化，Controller 不启动 Codex，也不
@@ -807,7 +823,7 @@ Thread；它不重置既有窗口的消耗记录。
 _Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
 **Progress Exhaustion（推进耗尽）**:
-Delivery Run 已不存在可自动推进的 Ticket Job，但 Ticket Set 尚未全部完成的状态。它汇总 DAG dependency、triage、局部 Human Blocker 和其他已持久化的 Ticket 停顿；独立 Ticket 会先继续推进。需求或图谱合同变化、明确全局停止及 Run 级门禁仍即时阻止整个 Run。局部人工门禁保留准确 Ticket 身份、原始证据与恢复动作，不能借 Progress Exhaustion 使其自动恢复。
+Delivery Run 已不存在可自动推进的 Ticket Job，但 Ticket Set 尚未全部完成的状态。它汇总 DAG dependency、triage、局部 Human Blocker、单 Ticket 执行失败、预算耗尽及自身 CI 监督超时；独立 Ticket 会先继续推进。仍有正在执行、等待自动监督或已获授权排队的工作时，不因另一 Ticket 暂停而判定推进耗尽。需求或图谱合同变化、明确全局停止及已证实的全 Run 共享授权失效等 Run 级门禁仍即时阻止整个 Run。局部人工门禁保留准确 Ticket 身份、原始证据与恢复动作，不能借 Progress Exhaustion 使其自动恢复。
 _Avoid_: 把局部门禁升级为全局停止、把待集成或 CI pass 当完成、最终整体验收
 
 **Ticket Content Revision（Ticket 内容版本）**:

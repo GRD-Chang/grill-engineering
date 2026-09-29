@@ -4,6 +4,8 @@ status: accepted
 
 # 每个 Delivery Task 由操作系统托管一个短生命周期 Executor
 
+后续需求修订：[ADR 0019](0019-ticket-work-concurrency-and-supervision.md) 允许其他 Ticket 执行期间接受定向 Resume；已授权工作可等待并发名额，单 Ticket 故障或监督超时不结束仍有独立工作的 Executor。定向 Stop 只暂停目标 Ticket，不形成 Run 级停止；下文停止并结束 Executor 的规则仅适用于 Run 级 Stop。该修订已确认、尚未实施，仅取代相关局部操作的准入和退出限制，不建立通用 Lifecycle Action 队列，也不改变同一任务最多一个 Executor 的约束。
+
 后续修订：[ADR 0013](0013-runner-owned-delivery-workspace.md) 将 Local Delivery Workspace 改为 Runner 独立克隆，并将同一 Repository/Parent 的唯一性收敛到本机当前用户。下文以用户仓库根区分任务、要求维护者自行协调不同 clone 的规则由该 ADR 取代；Executor、Action 与任务级短锁合同继续适用。
 
 后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 仍存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并明确失联状态的耗时展示。Executor 自身消失后不自动重放、等待显式恢复的规则继续适用。
