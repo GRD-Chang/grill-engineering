@@ -114,6 +114,38 @@ class ExternalSupervisor:
         self._expire(state, boundary, window)
         return False
 
+    def retry_due(self, state: dict[str, Any]) -> bool:
+        """Plan a bounded retry without sleeping in a multi-Ticket observer.
+
+        The deadline and next observation are durable, so selection changes or
+        rereading the Run cannot restart a Ticket's waiting budget.
+        """
+        boundary = waiting_boundary(state)
+        if boundary is None:
+            return True
+        window = self.observe(state)
+        assert window is not None
+        now = self.now()
+        deadline = window["deadline"]
+        if not isinstance(deadline, (int, float)):
+            raise ValueError("supervision window is missing its deadline")
+        if now >= deadline:
+            self._expire(state, boundary, window)
+            return False
+        due = window.get("next_retry_at")
+        if isinstance(due, (int, float)) and now < due:
+            return False
+        previous = window.get("retry_count")
+        retries = (previous if isinstance(previous, int) else 0) + 1
+        delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), deadline - now)
+        window.update({
+            "retry_count": retries,
+            "last_retry_delay_seconds": delay,
+            "next_retry_at": now + delay,
+            "latest_observation": _last_external_error(state),
+        })
+        return True
+
     def _expire(
         self, state: dict[str, Any], boundary: WaitingBoundary, window: dict[str, object]
     ) -> None:
@@ -513,6 +545,12 @@ def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def _run_recovery_action(state: dict[str, Any]) -> str | None:
     run_id = state.get("run_id")
+    job = state.get("active_ticket_job")
+    if (
+        isinstance(job, dict) and job.get("blocked_reason") == "ticket_supervision_timeout"
+        and type(job.get("ticket_number")) is int and isinstance(run_id, str)
+    ):
+        return f"agent-run resume {run_id} --ticket {job['ticket_number']}"
     if (state.get("status") == "supervision_timeout" or has_final_approval(state)) and isinstance(run_id, str):
         return f"agent-run resume {run_id}"
     parent = state.get("parent")

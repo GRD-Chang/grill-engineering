@@ -67,7 +67,7 @@ def multi_ticket_progress(
 ) -> dict[str, Any] | None:
     """Project the persisted Ticket queue and local Job facts for status only."""
 
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 2:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 3:
         return None
     if state.get("delivery_type") == "parent_only":
         return None
@@ -152,7 +152,7 @@ def multi_ticket_progress(
                 "modification_budget_exhausted", "review_budget_exhausted",
                 "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
                 "integration_resync_exhausted",
-                "ticket_execution_failed",
+                "ticket_execution_failed", "ticket_supervision_timeout",
                 "ticket_paused",
             }:
                 action = "resume"
@@ -171,6 +171,8 @@ def multi_ticket_progress(
             "phase": phase,
             "queue_position": queued.get(number),
             "holds_integration": number == holder,
+            "required_checks": job_data.get("required_checks_evidence"),
+            "supervision": _ticket_supervision_snapshot(state, job_data),
             "blocked_reason": reason,
             "pause_requested": number in {
                 int(item) for item in state.get("ticket_pause_requests", {})
@@ -350,3 +352,14 @@ def current_delivery_identity(state: dict[str, object]) -> dict[str, object]:
             "pr_number": publication.get("pr_number"),
         }
     return {"candidate_sha": None, "pr_number": None}
+
+
+def _ticket_supervision_snapshot(state: dict[str, Any], job: dict[str, Any]) -> dict[str, object] | None:
+    from agent_run.external_supervision import public_supervision_snapshot
+
+    wait = job.get("external_wait")
+    if not isinstance(wait, dict) and not isinstance(job.get("supervision_wait"), dict):
+        return None
+    projected = {**state, **(wait or {}), "active_ticket_job": job,
+                 "supervision_wait": job.get("supervision_wait")}
+    return public_supervision_snapshot(projected)

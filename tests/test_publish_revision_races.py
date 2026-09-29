@@ -603,7 +603,7 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
-    save_run = StateStore.save_run
+    save_run = StateStore._save_run_unlocked
     crashed = False
 
     def crash_after_revision_mismatch_save(
@@ -622,7 +622,9 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
             raise SimulatedProcessCrash("after durable revision mismatch")
 
     with monkeypatch.context() as crash_patch:
-        crash_patch.setattr(StateStore, "save_run", crash_after_revision_mismatch_save)
+        crash_patch.setattr(
+            StateStore, "_save_run_unlocked", crash_after_revision_mismatch_save
+        )
         interrupted = run_internal_stage(
             git_repo,
             fixture,

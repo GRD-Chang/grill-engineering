@@ -109,7 +109,7 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
     from agent_run.messages import presentation_language
 
     state = {
-        "multi_ticket_protocol": 2,
+        "multi_ticket_protocol": 3,
         "policy_snapshot": {
             "ticket_development_workers": 2,
             "ticket_review_rounds": 3,
@@ -163,7 +163,7 @@ def test_multi_ticket_status_does_not_offer_unsupported_resume() -> None:
     from agent_run.delivery_facts import multi_ticket_progress
 
     state = {
-        "multi_ticket_protocol": 2,
+        "multi_ticket_protocol": 3,
         "repository": "example/project", "parent": {"number": 1},
         "ticket_graph": {"tickets": {"2": {"blocked_by": []}}},
         "ticket_jobs": {"2": {

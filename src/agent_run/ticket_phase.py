@@ -5,6 +5,7 @@ from typing import Any
 
 
 BLOCKED_MESSAGES = {
+    "ticket_supervision_timeout": "Ticket external supervision timed out; explicit resume is required",
     "ticket_execution_failed": "Ticket development failed; explicit resume is required",
     "ticket_paused": "Ticket was paused by the operator; explicit resume is required",
     "ticket_pr_closed_unmerged": "Current Ticket PR was closed without merging",

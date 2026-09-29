@@ -425,6 +425,14 @@ class RunPublicationApproval(RunPublicationShared):
                     "diagnostics": [],
                 }
             )
+            # Delivery waiting has ended. Abandonment owns subsequent remote
+            # reconciliation, including close responses that may be lost.
+            for job in [*state.get("ticket_jobs", {}).values(), state.get("active_ticket_job")]:
+                if isinstance(job, dict):
+                    job.pop("external_wait", None)
+                    job.pop("supervision_wait", None)
+            for key in ("supervision_window", "supervision_wait", "credential_availability"):
+                state.pop(key, None)
             self._save(state)
         for ticket in _obligation_list(abandonment, "tickets"):
             if ticket.get("eligible") is None:

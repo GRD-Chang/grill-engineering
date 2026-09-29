@@ -66,6 +66,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
     waiting = engine.deliver(run_id)
     assert waiting["status"] == "waiting_external"
     job = deepcopy(waiting["active_ticket_job"])
+    original_wait = job.pop("external_wait")
     assert job["phase"] == "publishing"
     assert job["publication_sha"]
     assert waiting["diagnostics"][0]["code"] == "github_timeout"
@@ -78,7 +79,14 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
     while supervisor.before_retry(waiting):
         states.save_run(run_id, waiting)
         waiting = engine.deliver(run_id)
-        assert waiting["active_ticket_job"] == job
+        retried_job = deepcopy(waiting["active_ticket_job"])
+        retried_wait = retried_job.pop("external_wait")
+        assert retried_job == job
+        assert retried_wait["status"] == "waiting_external"
+        assert retried_wait["supervision_window"]["deadline"] == deadline
+        assert retried_wait["supervision_window"]["identity"] == (
+            original_wait["supervision_window"]["identity"]
+        )
     assert now[0] == deadline
     assert waiting["status"] == "supervision_timeout"
     assert waiting["diagnostics"][0]["last_error"]["code"] == "github_timeout"
@@ -346,15 +354,18 @@ def test_driver_supervises_initial_branch_outage_before_shared_delivery_loop(
         assert now[0] == 0
         assert not agents.development_thread_ids
         return
-    assert paused["status"] == "supervision_timeout"
+    assert paused["status"] == "blocked"
     assert paused["diagnostics"][0]["last_error"]["code"] == "github_write_failed"
     assert now[0] == 600
     assert not agents.development_thread_ids
     assert not agents.publication_requests
     assert paused["active_ticket_job"]["ticket_number"] == 3
-    assert paused["active_ticket_job"]["phase"] == "developing"
+    assert paused["active_ticket_job"]["phase"] == "blocked"
+    assert paused["active_ticket_job"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert paused["active_ticket_job"]["execution_resume_phase"] == "developing"
+    assert paused["active_ticket_job"]["review_budget"]["development_attempts"] == 0
     publisher.offline = False
-    controller.resume(run_id)
+    controller.resume(run_id, explicit_resume=True)
     completed = TicketDeliveryEngine(
         git=git, states=states, github=publisher, agents=agents
     ).deliver(run_id)

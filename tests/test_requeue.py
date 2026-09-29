@@ -836,6 +836,8 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
     assert persisted["github_refresh_pending"] is True
     assert persisted["diagnostics"][0]["code"] == "supervision_timeout"
     assert persisted["diagnostics"][0]["last_error"]["code"] == "github_read_failed"
+    assert persisted["ticket_jobs"]["7"] == job
+    assert persisted["supervision_wait"]["resume_status"] == "waiting_external"
 
 
 def test_deliver_cannot_restart_a_stale_generation_without_requeue(

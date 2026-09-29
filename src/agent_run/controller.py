@@ -353,6 +353,12 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        if explicit_resume and (new_thread or human_response is not None) and any(
+            isinstance(job, dict) and job.get("blocked_reason") == "ticket_supervision_timeout"
+            and (ticket_number is None or job.get("ticket_number") == ticket_number)
+            for job in existing.get("ticket_jobs", {}).values()
+        ):
+            raise ValueError("supervision timeout resume does not accept Agent or Human Blocker options")
         retry_window = None
         if (
             validate_resume_state is not None
@@ -478,13 +484,6 @@ class Controller:
         if human_response is not None:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
-        existing_invocation = existing.get("active_agent_invocation")
-        resume_completed_invocation = (
-            existing.get("status") == "execution_failed"
-            and isinstance(existing_invocation, dict)
-            and existing_invocation.get("status") == "completed"
-            and invocation_attempt_is_pending(existing, existing_invocation)
-        )
         if resuming_supervision_timeout:
             if new_thread or human_response is not None:
                 raise ValueError(
@@ -573,6 +572,7 @@ class Controller:
         if hold_operator_gate:
             return existing, True
         resuming_run_acceptance = False
+        ticket_execution_resumed = False
         budget_resumed = (
             _resume_review_budget_window(
                 state,
@@ -589,9 +589,10 @@ class Controller:
                 state, ticket_number=ticket_number
             )
         if explicit_resume and not budget_resumed:
-            budget_resumed = _resume_ticket_execution_failure(
+            ticket_execution_resumed = _resume_ticket_execution_failure(
                 state, ticket_number=ticket_number
             )
+            budget_resumed = ticket_execution_resumed
         if explicit_resume and not budget_resumed:
             budget_resumed = _resume_ticket_pause(
                 state, ticket_number=ticket_number
@@ -683,11 +684,20 @@ class Controller:
                 raise ValueError("--message requires a current Human Blocker")
         elif human_response is not None:
             raise ValueError("--message requires Human Blocker resume")
+        # A targeted resume may replace the previously selected Ticket. Bind
+        # completed-result recovery to that final owner and its pending Attempt.
+        invocation = state.get("active_agent_invocation")
+        resume_completed_invocation = (
+            (resume_pause["status"] == "execution_failed" or ticket_execution_resumed)
+            and isinstance(invocation, dict)
+            and invocation.get("status") == "completed"
+            and invocation_attempt_is_pending(state, invocation)
+        )
         invocation_already_resuming = (
             isinstance(state.get("active_agent_invocation"), dict)
             and state["active_agent_invocation"].get("status") == "resuming"
         )
-        if new_thread and not budget_resumed:
+        if new_thread and (not budget_resumed or ticket_execution_resumed):
             if resuming_run_acceptance:
                 _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
             else:
@@ -1493,7 +1503,7 @@ class Controller:
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
-            "multi_ticket_protocol": 2,
+            "multi_ticket_protocol": 3,
             "ticket_agent_invocations": {},
             "ticket_pause_requests": {},
             "semantic_attempt_protocol": 1,
@@ -2025,7 +2035,7 @@ def _resume_ticket_execution_failure(
         job for job in jobs.values()
         if isinstance(job, dict)
         and job.get("phase") == "blocked"
-        and job.get("blocked_reason") == "ticket_execution_failed"
+        and job.get("blocked_reason") in {"ticket_execution_failed", "ticket_supervision_timeout"}
         and (ticket_number is None or job.get("ticket_number") == ticket_number)
     ]
     if not paused:
@@ -2036,11 +2046,23 @@ def _resume_ticket_execution_failure(
     phase = job.pop("execution_resume_phase", None)
     if phase not in {
         "developing", "repairing", "committing_candidate", "candidate", "reviewing",
+        "ready_for_integration", "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged",
     }:
         raise ValueError("Ticket execution failure has no recoverable phase")
+    if job.get("blocked_reason") == "ticket_supervision_timeout":
+        job.pop("supervision_wait", None)
+        job.pop("external_wait", None)
+        state.pop("supervision_window", None)
+        state.pop("supervision_wait", None)
     job["phase"] = phase
     job.pop("blocked_reason", None)
     job.pop("execution_failure", None)
+    if phase in {"ready_for_integration", "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged"}:
+        from agent_run.ticket_queue import enqueue
+
+        if phase != "ready_for_integration":
+            job["integration_resume_phase"] = phase
+        enqueue(state, job)
     state["active_ticket_job"] = job
     invocations = state.get("ticket_agent_invocations")
     if isinstance(invocations, dict):

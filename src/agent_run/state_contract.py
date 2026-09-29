@@ -164,7 +164,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Semantic Agent Attempt protocol"
         )
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 2:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 3:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Multi Ticket protocol"
         )
@@ -968,6 +968,23 @@ def _require_ticket_agent_invocations(state: dict[str, Any]) -> None:
             )
     invocations = state["ticket_agent_invocations"]
     jobs = state["ticket_jobs"]
+    for job in jobs.values():
+        wait = job.get("external_wait") if isinstance(job, dict) else None
+        if wait is None:
+            continue
+        if (
+            not isinstance(wait, dict)
+            or wait.get("status") not in {"waiting_checks", "waiting_external", "waiting_merge"}
+            or not isinstance(wait.get("diagnostics"), list)
+            or not isinstance(wait.get("supervision_window"), dict)
+        ):
+            raise IncompatibleRunStateError("Ticket external wait has an invalid supervision record")
+        from agent_run.external_supervision import supervision_window_matches
+
+        if not supervision_window_matches(
+            {**state, **wait, "active_ticket_job": job}, wait["supervision_window"]
+        ):
+            raise IncompatibleRunStateError("Ticket external wait has a stale supervision identity")
     for key, invocation in invocations.items():
         if (
             not isinstance(key, str)
@@ -1068,11 +1085,9 @@ def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
         resume_phase = job.get("integration_resume_phase")
         if resume_phase is not None and (
             phase != "ready_for_integration"
-            or resume_phase not in {"accepted", "waiting_checks", "publishing"}
-            or (
-                resume_phase == "publishing"
-                and not job.get("publication_operation_retry_history")
-            )
+            or resume_phase not in {
+                "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged",
+            }
         ):
             raise IncompatibleRunStateError(
                 "legacy state has an invalid Ticket integration resume phase"
@@ -2020,6 +2035,14 @@ def _change_owner_phase_is_current(
 ) -> bool:
     if not isinstance(job, dict):
         return False
+    if (
+        job.get("phase") == "ready_for_integration"
+        and job.get("integration_resume_phase") == "accepted"
+        and invocation.get("status") in {"failed", "completed", "resuming"}
+    ):
+        # A resumed Publication/conflict attempt retains its exact owner while
+        # waiting for the single integration seat; it cannot run in the queue.
+        job = {**job, "phase": "accepted"}
     role = invocation["role"]
     phase = invocation["phase"]
     if role == "development":
@@ -2047,7 +2070,10 @@ def _change_owner_phase_is_current(
         # Publication generation begins while the accepted Candidate is still
         # intact.  ``publishing`` is written only after the Agent returned a
         # valid artifact and its commit was created.
-        return job.get("phase") == "accepted"
+        return job.get("phase") == "accepted" or (
+            job.get("blocked_reason") == "ticket_execution_failed"
+            and job.get("execution_resume_phase") == "accepted"
+        )
     return False
 
 

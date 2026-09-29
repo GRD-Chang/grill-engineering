@@ -34,7 +34,7 @@ from agent_run.attempt_evidence import (
     invocation_attempt_view,
 )
 from agent_run.acceptance_facts import acceptance_lanes, artifact_findings as _artifact_findings
-from agent_run.delivery_facts import role_family as _role_family, ticket_phase_execution_activity
+from agent_run.delivery_facts import role_family as _role_family, ticket_phase_execution_activity, multi_ticket_progress
 from agent_run.execution_timing import (
     invocation_activity, invocation_execution_seconds,
     run_elapsed_seconds,
@@ -62,9 +62,12 @@ def history_progress_view(
     execution_activity = ticket_phase_execution_activity(
         state, audit, invocation_activity(state.get("active_agent_invocation"), audit)
     )
+    control = audit.get("executor_control")
+    executor_activity = str(control.get("activity", "unknown")) if isinstance(control, dict) else "unknown"
     return {
         "events": events,
         "execution_activity": execution_activity,
+        "multi_ticket": multi_ticket_progress(state, executor_activity=executor_activity),
         "summary": {
             "rounds": _round_summary(audit.get("semantic_agent_attempts")),
             "elapsed_seconds": _elapsed_seconds(state, events),

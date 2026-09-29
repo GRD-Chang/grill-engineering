@@ -1692,14 +1692,14 @@ def test_fallback_pending_observation_is_one_contract_valid_commit(
             super().__init__(root)
             self.observation_commits: list[dict[str, Any]] = []
 
-        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
             job = state.get("active_ticket_job")
             if isinstance(job, dict) and isinstance(
                 job.get("required_checks_evidence"), dict
             ):
                 require_current_run_state(state)
                 self.observation_commits.append(deepcopy(state))
-            super().save_run(run_id, state)
+            super()._save_run_unlocked(run_id, state)
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = ObservationRecordingStateStore(git_repo / ".agent-run")
@@ -1732,7 +1732,7 @@ def test_first_ci_repair_candidate_save_clears_receipt_observation_before_resume
     class CrashAfterCiRepairCandidateSave(StateStore):
         crashed = False
 
-        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
             job = state.get("active_ticket_job")
             is_ci_repair_candidate = (
                 not self.crashed
@@ -1740,7 +1740,7 @@ def test_first_ci_repair_candidate_save_clears_receipt_observation_before_resume
                 and job.get("phase") == "candidate"
                 and job.get("attempt_kind") == "ci_repair"
             )
-            super().save_run(run_id, state)
+            super()._save_run_unlocked(run_id, state)
             if is_ci_repair_candidate:
                 self.crashed = True
                 raise SimulatedProcessCrash(
@@ -1834,7 +1834,7 @@ def test_fallback_observation_commit_resumes_without_duplicate_work(
     class CrashAroundObservationStateStore(StateStore):
         crashed = False
 
-        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
             job = state.get("active_ticket_job")
             is_observation_commit = (
                 not self.crashed
@@ -1846,7 +1846,7 @@ def test_fallback_observation_commit_resumes_without_duplicate_work(
                 raise SimulatedProcessCrash(
                     "simulated crash before atomic Observation commit"
                 )
-            super().save_run(run_id, state)
+            super()._save_run_unlocked(run_id, state)
             if is_observation_commit:
                 self.crashed = True
                 raise SimulatedProcessCrash(
@@ -2398,8 +2398,8 @@ def test_ticket_outer_ci_resume_reviews_and_publishes_new_repair(
 
 
 class ValidatingCiStateStore(StateStore):
-    def save_run(self, run_id: str, state: dict[str, Any]) -> None:
-        super().save_run(run_id, state)
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+        super()._save_run_unlocked(run_id, state)
         job = state.get("active_ticket_job")
         if isinstance(job, dict) and job.get("attempt_kind") == "ci_repair":
             assert self.load_current_run(run_id) is not None
@@ -2646,8 +2646,8 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     class CrashAtIntegrationCheckpoint(ValidatingCiStateStore):
         crashed = False
 
-        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
-            super().save_run(run_id, state)
+        def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+            super()._save_run_unlocked(run_id, state)
             job = state.get("active_ticket_job")
             if not isinstance(job, dict) or job.get("attempt_kind") != "ci_repair":
                 return
@@ -4117,11 +4117,11 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
             super().__init__(root)
             self.snapshot_failure_commits: list[dict[str, Any]] = []
 
-        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
             job = state.get("active_ticket_job")
             if isinstance(job, dict) and state.get("status") == "waiting_external":
                 self.snapshot_failure_commits.append(deepcopy(state))
-            super().save_run(run_id, state)
+            super()._save_run_unlocked(run_id, state)
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = SnapshotRecordingStateStore(git_repo / ".agent-run")

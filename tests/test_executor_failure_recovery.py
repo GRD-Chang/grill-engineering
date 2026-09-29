@@ -95,11 +95,13 @@ raise SystemExit(main(sys.argv[1:]))
 
     assert failed.returncode == 2, failed.stderr
     state = load_only_run_state(git_repo)
-    assert state["status"] == "execution_failed"
+    assert state["status"] == "blocked"
     assert "transport socket timed out before push" in str(state["diagnostics"])
     job = state["active_ticket_job"]
     assert job["ticket_number"] == 3
-    assert job["phase"] == "publishing"
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_execution_failed"
+    assert job["execution_resume_phase"] == "publishing"
     candidate = job["candidate_sha"]
     publication = job["publication_sha"]
     budget = dict(job["review_budget"])

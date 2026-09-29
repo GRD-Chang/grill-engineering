@@ -17,6 +17,7 @@ class NextAction:
     kind: str
     command: str | None = None
     selector: object = None
+    ticket_number: int | None = None
 
 
 def action_command(state: dict[str, Any], verb: str, selector: object, *, human: bool) -> str:
@@ -36,7 +37,8 @@ def render_next_action(
 ) -> str:
     if action.kind == "command":
         assert action.command is not None
-        return action_command(state, action.command, action.selector, human=human)
+        command = action_command(state, action.command, action.selector, human=human)
+        return command if action.ticket_number is None else f"{command} --ticket {action.ticket_number}"
     parent = state.get("parent")
     number = parent.get("number", "?") if isinstance(parent, dict) else "?"
     key = f"guidance.action.{action.kind}"
@@ -103,6 +105,15 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
     if status == "supervision_timeout" and isinstance(run_id, str):
         return NextAction("command", "resume", run_id)
     current = current_work_subject(state)
+    pauses = [
+        job for job in state.get("ticket_jobs", {}).values()
+        if isinstance(job, dict) and job.get("blocked_reason") in {
+            "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
+        }
+    ]
+    pause = current[1] if current and current[1] in pauses else pauses[0] if len(pauses) == 1 else None
+    if status in {"blocked", "progress_exhausted"} and pause is not None and isinstance(run_id, str):
+        return NextAction("command", "resume", run_id, int(pause["ticket_number"]))
     execution_audit = {"executor_control": state.get("_executor_control")}
     if (
         isinstance(run_id, str)

@@ -731,6 +731,11 @@ class RunDriver:
                         state,
                         persist_before_sleep=lambda: self.states.save_run(run_id, state),
                     ):
+                        if self._pause_ticket_supervision(run_id, state):
+                            state, _ = self.operations.controller.resume(run_id)
+                            outcome = self.operations.classify(state)
+                            previous_marker = None
+                            continue
                         self.states.save_run(run_id, state)
                         return state
                     # Persist each throttled retry so concurrent status/history
@@ -785,6 +790,35 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+
+    def _pause_ticket_supervision(self, run_id: str, state: dict[str, Any]) -> bool:
+        job = state.get("active_ticket_job")
+        if (
+            not isinstance(job, dict) or state.get("multi_ticket_protocol") != 3
+            or state.get("github_refresh_pending")
+            or job.get("phase") in {"blocked", "completed"}
+        ):
+            return False
+        owned = job.get("external_wait")
+        window = owned.get("supervision_window") if isinstance(owned, dict) else None
+        expired = state.get("supervision_wait")
+        if (
+            not isinstance(window, dict) or not isinstance(expired, dict)
+            or window.get("identity") != expired.get("identity")
+            or window.get("deadline") != expired.get("deadline")
+        ):
+            return False
+        from agent_run.ticket_state import TicketState
+        from agent_run.ticket_supervision import pause_ticket_supervision
+
+        scoped = TicketState(self.states, run_id, int(job["ticket_number"]))
+        current = scoped.load_current_run(run_id)
+        if current is None or current["active_ticket_job"] != job:
+            raise TaskControlBusyError("Ticket changed before supervision timeout")
+        current["supervision_wait"] = state["supervision_wait"]
+        current["diagnostics"] = state["diagnostics"]
+        pause_ticket_supervision(scoped, current)
+        return True
 
     def _before_external_step(self) -> None:
         fence = getattr(self.operations, "before_external_step", None)

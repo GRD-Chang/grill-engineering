@@ -45,7 +45,7 @@ class DeliveryCleanupEngine:
             expected_head_sha=self._completed_source_head(job),
             checkout=self._worktree(state, f"ticket-{self._integer(job, 'ticket_number')}")
         )
-        return self._attempt(state)
+        return self._attempt(state, only_branch=str(job["ticket_branch"]))
 
     def complete_run_repair(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -256,7 +256,7 @@ class DeliveryCleanupEngine:
             },
         )
 
-    def _attempt(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _attempt(self, state: dict[str, Any], *, only_branch: str | None = None) -> dict[str, Any]:
         cleanup = self._cleanup(state)
         items = self._mapping(cleanup, "items")
         self.states.save_run(str(state["run_id"]), state)
@@ -265,6 +265,8 @@ class DeliveryCleanupEngine:
             if not isinstance(item, dict) or item.get("status") == "completed":
                 continue
             branch = self._string(item, "branch")
+            if only_branch is not None and branch != only_branch:
+                continue
             checkout = Path(self._string(item, "checkout"))
             if not is_managed_delivery_branch(branch):
                 error = f"refusing to delete unmanaged branch {branch!r}"

@@ -75,7 +75,7 @@ def bind_resume_intent(
     ticket_failure = [
         (location, subject) for location, subject in gates
         if location.startswith("ticket:")
-        and subject.get("blocked_reason") == "ticket_execution_failed"
+        and subject.get("blocked_reason") in {"ticket_execution_failed", "ticket_supervision_timeout"}
     ]
     ticket_pause = [
         (location, subject) for location, subject in gates
@@ -114,7 +114,7 @@ def bind_resume_intent(
         reason, authorization = "publication_operation_retry", "renew_publication_operation_retry"
         subjects = publication_retry
     elif ticket_failure:
-        reason, authorization = "ticket_execution_failed", "continue_ticket"
+        reason, authorization = str(ticket_failure[0][1]["blocked_reason"]), "continue_ticket"
         subjects = ticket_failure
     elif ticket_pause:
         reason, authorization = "ticket_paused", "continue_ticket"

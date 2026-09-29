@@ -24,4 +24,8 @@ Linux 继续由 systemd 托管 Executor；关闭发起终端不影响执行，Ex
 
 Development–Review 已接入共同阶段循环与审核记账：Ticket、Parent-only 的 Dev-first，以及集成后完整 Parent 的 Review-first；Run Acceptance/Run Repair 的 Review Budget 采用唯一 owner。集成交付已提供共同的单步结果：ChangeDeliveryEngine 与 Final Run Publication 的完整入口都复用各自的 advance 核心，返回可继续、等待、需要 Agent、暂停或完成；既有 Job/Run 状态继续作为唯一持久依据。Ticket、Parent-only 与 Run Repair 共用审核前/发布前集成门禁，固定需求基线和各类预算保持独立。Publication 文案在推送和 CI 之前按需形成；相同已发布版本继续观测 CI 和合入无需再次调用 Agent。
 
-持续多线监督、运行中定向恢复、统一工作额度与单票立即停止仍是后继工作；当前实现不因本 ADR 接受或 Development–Review 共用化而被视为已具备这些能力。
+持续多线监督已接入同一 Executor 的有界工作线程：开发与审核占用既有名额时，单独的程序监督持续推进当前集成席位，不需要其他 Agent 返回。只有一个候选或并发为 1 时使用同一路径。已准入开发票的外部等待保留原批次名额，按退避继续或到期局部暂停；本地到期判断独立于集成侧外部读取。Required Checks 的重试时间和绝对截止时间按 Ticket 保存；重试判断不 sleep，调度等待与外部操作不占共享状态锁。同一发布 head 继续使用现有发布结果通过共同交付 Engine 合入与收尾。
+
+开发、集成与 CI 共用 `TicketState` 的单票事务：校验 Job、Invocation、需求身份及集成席位，按票归并历史、恢复关联和准确分支清理项。删除 StateStore 的“从整 Run 快照补回其他 lane”回写路径；Controller 的远端刷新仍用已有乐观并发检查。状态协议升为 `multi_ticket_protocol=3`，不迁移旧 Run。局部 CI 监督超时释放席位，显式 Resume 保留同一候选、PR 与业务预算。
+
+运行中定向恢复、统一所有角色额度、FIFO 动态补位与单票立即停止仍是后继工作。当前开发批次仍按既有上限准入，不宣称已具备完整工作队列。

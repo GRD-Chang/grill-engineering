@@ -542,7 +542,7 @@ def test_run_supervises_pending_ticket_checks_in_one_call(git_repo: Path) -> Non
     assert state["run_publication"]["phase"] == "ready_for_approval"
 
 
-def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
+def test_explicit_resume_recovers_a_persisted_check_deadline_without_duplicate_delivery(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -557,7 +557,9 @@ def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
 
     assert paused.returncode == 2
     paused_state = load_only_run_state(git_repo)
-    assert paused_state["status"] == "supervision_timeout"
+    assert paused_state["status"] == "blocked"
+    assert paused_state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert paused_state["ticket_jobs"]["3"]["execution_resume_phase"] == "waiting_checks"
     wait = paused_state["supervision_wait"]
     assert wait["kind"] == "required_checks"
     assert wait["deadline"] == wait["started_at"] + 45 * 60
@@ -570,8 +572,12 @@ def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
     fixture_data["delivery"]["check_position"] = 0
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
+    held = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert held.returncode == 2
+    assert load_only_run_state(git_repo) == paused_state
+
     recovered = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+        git_repo, fixture, "resume", "1", "--agent-fixture", str(agents)
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -603,7 +609,7 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
     paused_state.pop("human_response_audit_protocol")
     paused_state.pop("human_response_audit")
     run_file.write_text(json.dumps(paused_state), encoding="utf-8")
-    expected_action = f"agent-run resume {run_id}"
+    expected_action = f"agent-run resume {run_id} --ticket 3"
     for command in ("status", "history"):
         output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
         wait = output["supervision"]
@@ -643,9 +649,10 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
     resumed = run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents))
 
     assert resumed.returncode == 2
-    assert stdout_json(resumed)["status"] == "supervision_timeout"
+    assert stdout_json(resumed)["status"] == "blocked"
     state = load_only_run_state(git_repo)
-    assert state["supervision_wait"]["started_at"] > wait["started_at"]
+    assert state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert state["supervision_wait"]["started_at"] > wait["started_at"], resumed.stdout + resumed.stderr
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert len(delivery["pull_requests"]) == 1
     assert delivery["closed_issues"] == []
@@ -755,8 +762,10 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert paused.returncode == 2
-    assert stdout_json(paused)["status"] == "supervision_timeout"
+    assert stdout_json(paused)["status"] == "blocked"
     state = load_only_run_state(git_repo)
+    assert state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert state["ticket_jobs"]["3"]["execution_resume_phase"] == "developing"
     availability = {
         "change_job": "ticket-3",
         "failure_class": "credential_unavailable",
@@ -781,12 +790,12 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
     for command in ("status", "history"):
         output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
         assert output["next_action"] == (
-            "agent-run resume 1 --repo example/project"
+            "agent-run resume 1 --repo example/project --ticket 3"
         )
         snapshot = output["supervision"]
         assert snapshot["credential_failure_class"] == "credential_unavailable"
         assert snapshot.get("credential_http_status") == http_status
-        assert snapshot["next_action"] == f"agent-run resume {run_id}"
+        assert snapshot["next_action"] == f"agent-run resume {run_id} --ticket 3"
         text = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
         assert "等待工作凭据恢复可用" in text.stdout
@@ -1545,7 +1554,8 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     held = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert held.returncode == 2
-    assert stdout_json(held)["status"] == "execution_failed"
+    assert stdout_json(held)["status"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_execution_failed"
     assert load_only_run_state(git_repo) == interrupted_state
     assert fixture.read_text(encoding="utf-8") == fixture_before
 
@@ -1682,7 +1692,8 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
 
     held = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
     assert held.returncode == 2
-    assert stdout_json(held)["status"] == "execution_failed"
+    assert stdout_json(held)["status"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_execution_failed"
     assert load_only_run_state(git_repo) == interrupted_state
     assert fixture.read_text(encoding="utf-8") == fixture_before
 

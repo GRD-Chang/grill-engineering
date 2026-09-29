@@ -39,16 +39,6 @@ def test_run_state_reads_pretty_json_and_saves_the_same_data_compactly(
     assert len(path.read_bytes()) < len(original.encode("utf-8"))
 
 
-def test_parallel_lane_context_only_affects_its_run(tmp_path: Path) -> None:
-    store = StateStore(tmp_path / "state")
-    store.save_run("other", {"version": 1})
-
-    with store.preserve_parallel_ticket_lanes("parallel", frozenset({2})):
-        store.save_run("other", {"version": 2})
-
-    assert store.load_run("other") == {"version": 2}
-
-
 def test_controller_refresh_rejects_a_concurrent_run_write(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     store.save_run("run-1", {"version": 1})

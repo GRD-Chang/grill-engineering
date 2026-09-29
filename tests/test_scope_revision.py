@@ -45,7 +45,7 @@ def test_noncurrent_ticket_revision_stops_run_before_independent_delivery(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
-        delivery={"required_checks": ["pending", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     blocked_review = {

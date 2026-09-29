@@ -70,6 +70,13 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
     if has_non_invocation_execution_failure(state):
         return True
+    gates = operator_gate_subjects(state)
+    if status in {"blocked", "progress_exhausted"} and len(gates) == 1:
+        location, subject = gates[0]
+        if location.startswith("ticket:") and subject.get("blocked_reason") in {
+            "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
+        }:
+            return True
     return (
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1

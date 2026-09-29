@@ -38,17 +38,18 @@ def waiting_presentation(
 ) -> WaitingPresentation | None:
     """Describe the current external wait without inferring Agent activity."""
     status = state.get("status")
+    selected = current_work_subject(state)
+    subject = selected[1] if selected is not None else {}
+    ticket_timeout = status == "blocked" and subject.get("blocked_reason") == "ticket_supervision_timeout"
     if status not in {
         "waiting_checks", "waiting_external", "waiting_merge", "supervision_timeout",
-    }:
+    } and not ticket_timeout:
         return None
     raw = state.get("supervision_wait") or state.get("supervision_window")
     window = raw if isinstance(raw, dict) else {}
     snapshot = audit.get("supervision")
     wait = snapshot if isinstance(snapshot, dict) else {}
     checks = status == "waiting_checks" or window.get("kind") == "required_checks"
-    selected = current_work_subject(state)
-    subject = selected[1] if selected is not None else {}
     number = subject.get("pr_number")
     target = f"PR #{number}" if type(number) is int else "GitHub"
     work = (
@@ -61,7 +62,7 @@ def waiting_presentation(
         work = display_text('presentation.status.waiting_for_working_credentials_to_become_available')
     control = audit.get("executor_control")
     activity = control.get("activity") if isinstance(control, dict) else "unknown"
-    timed_out = status == "supervision_timeout"
+    timed_out = status == "supervision_timeout" or ticket_timeout
     if timed_out:
         description = display_text('presentation.status.automatic_waiting_timed_out_for_this_round')
         guidance = display_text('presentation.status.run_the_following_command_to_resume_waiting')

@@ -518,3 +518,22 @@ def test_unproven_github_read_failures_remain_reconcilable(code: str) -> None:
 )
 def test_proven_github_state_contradictions_do_not_enter_supervision(code: str) -> None:
     assert not is_github_convergence_error(code)
+
+
+def test_nonblocking_retry_persists_schedule_and_expires_without_sleep() -> None:
+    from copy import deepcopy
+    clock = [100.0]
+    state = {'status': 'waiting_checks'}
+    sleeps = []
+    supervisor = ExternalSupervisor(now=lambda: clock[0], sleeper=sleeps.append)
+    assert supervisor.retry_due(state)
+    persisted = deepcopy(state)
+    assert not supervisor.retry_due(persisted)
+    assert persisted == state
+    clock[0] += 5
+    assert supervisor.retry_due(persisted)
+    assert persisted['supervision_window']['retry_count'] == 2
+    clock[0] = persisted['supervision_window']['deadline']
+    assert not supervisor.retry_due(persisted)
+    assert persisted['status'] == 'supervision_timeout'
+    assert sleeps == []

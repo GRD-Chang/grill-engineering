@@ -1965,7 +1965,7 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
-        delivery={"required_checks": ["pending", "pass", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(
@@ -1989,10 +1989,11 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -
         delivery_policy=DeliveryPolicy(ticket_development_workers=1),
     )
     state, _ = controller.start(1)
+    publisher = FixtureGitHubPublisher(fixture, git)
     engine = DeliveryRunEngine(
         controller=controller,
         tickets=TicketDeliveryEngine(
-            git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+            git=git, states=states, github=publisher,
             agents=FixtureAgentBackend(agent_fixture),
         ),
     )
@@ -2004,6 +2005,10 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -
     assert [entry["ticket_number"] for entry in waiting["ticket_integration_queue"]] == [3]
     assert "3" not in {str(number) for number in json.loads(fixture.read_text())["delivery"].get("closed_issues", [])}
 
+    checks = json.loads(fixture.read_text())
+    checks["delivery"]["required_checks"] = ["pass"]
+    fixture.write_text(json.dumps(checks))
+    publisher.data = checks
     completed = engine.deliver(state["run_id"])
     assert completed["ticket_integration_holder"] is None
     assert completed["ticket_integration_queue"] == []
@@ -2017,7 +2022,7 @@ def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> 
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
-        delivery={"required_checks": ["pending", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(json.dumps({
@@ -2038,10 +2043,11 @@ def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> 
         delivery_policy=DeliveryPolicy(ticket_development_workers=1),
     )
     state, _ = controller.start(1)
+    publisher = FixtureGitHubPublisher(fixture, git)
     engine = DeliveryRunEngine(
         controller=controller,
         tickets=TicketDeliveryEngine(
-            git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+            git=git, states=states, github=publisher,
             agents=FixtureAgentBackend(agent_fixture),
         ),
     )
@@ -2051,6 +2057,10 @@ def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> 
     assert waiting["ticket_integration_holder"] == 2
     assert waiting["ticket_jobs"]["3"]["phase"] == "blocked"
 
+    checks = json.loads(fixture.read_text())
+    checks["delivery"]["required_checks"] = ["pass"]
+    fixture.write_text(json.dumps(checks))
+    publisher.data = checks
     progressed = engine.deliver(state["run_id"])
     assert progressed["ticket_jobs"]["2"]["phase"] == "completed"
     assert progressed["ticket_jobs"]["3"]["phase"] == "blocked"
@@ -2064,7 +2074,7 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
-        delivery={"required_checks": ["pending", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(json.dumps({
@@ -2085,10 +2095,11 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
         delivery_policy=DeliveryPolicy(ticket_development_workers=1),
     )
     state, _ = controller.start(1)
+    publisher = FixtureGitHubPublisher(fixture, git)
     engine = DeliveryRunEngine(
         controller=controller,
         tickets=TicketDeliveryEngine(
-            git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+            git=git, states=states, github=publisher,
             agents=FixtureAgentBackend(agent_fixture),
         ),
     )
@@ -2126,6 +2137,10 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
         ]
         assert resumed["ticket_jobs"]["2"]["phase"] == "ready_for_integration"
 
+    checks = json.loads(fixture.read_text())
+    checks["delivery"]["required_checks"] = ["pass"]
+    fixture.write_text(json.dumps(checks))
+    publisher.data = checks
     progressed = engine.deliver(state["run_id"])
     assert progressed["ticket_jobs"]["3"]["phase"] == "completed"
     if resume_before_other_ticket:
@@ -2146,7 +2161,7 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
 def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket(2), "3": _ticket(3)},
-        delivery={"required_checks": ["pending", "fail", "pass", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(json.dumps({
@@ -2168,10 +2183,11 @@ def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
         delivery_policy=DeliveryPolicy(ticket_development_workers=1),
     )
     state, _ = controller.start(1)
+    publisher = FixtureGitHubPublisher(fixture, git)
     engine = DeliveryRunEngine(
         controller=controller,
         tickets=TicketDeliveryEngine(
-            git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+            git=git, states=states, github=publisher,
             agents=FixtureAgentBackend(agent_fixture),
         ),
     )
@@ -2179,6 +2195,11 @@ def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
     assert waiting["ticket_integration_holder"] == 2
     assert waiting["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
 
+    checks = json.loads(fixture.read_text())
+    checks["delivery"]["required_checks"] = ["fail", "pass", "pass"]
+    checks["delivery"]["check_position"] = 0
+    fixture.write_text(json.dumps(checks))
+    publisher.data = checks
     delivered = engine.deliver(state["run_id"])
     assert delivered["ticket_jobs"]["3"]["phase"] == "completed"
     assert delivered["ticket_jobs"]["2"]["phase"] == "completed"

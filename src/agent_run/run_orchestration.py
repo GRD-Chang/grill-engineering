@@ -8,7 +8,7 @@ from agent_run.operator_gate import (
 )
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.ticket_queue import next_ticket
-from agent_run.ticket_development_state import parallel_delivery_state_lock
+from agent_run.ticket_state import RUN_STOP_STATUSES
 
 
 class RunController(Protocol):
@@ -16,11 +16,14 @@ class RunController(Protocol):
 
 
 class TicketEngine(Protocol):
+    def supervise(self, run_id: str, lanes: frozenset[int]) -> None: ...
+
     def deliver(self, run_id: str) -> dict[str, Any]: ...
 
     def develop_frontier(
         self, run_id: str, state: dict[str, Any],
         *, after_lane: Callable[[frozenset[int]], None] | None = None,
+        supervise: Callable[[frozenset[int]], None] | None = None,
     ) -> bool: ...
 
 
@@ -42,11 +45,18 @@ class DeliveryRunEngine:
     ) -> dict[str, Any]:
         idle_tickets: set[int] = set()
         while state.get("active_ticket_job") is not None:
+            if state.get("status") in RUN_STOP_STATUSES:
+                return state
             parallel = getattr(self.tickets, "develop_frontier", None)
-            if callable(parallel) and parallel(
-                run_id, state,
-                after_lane=lambda lanes: self._integrate_ready_ticket(run_id, lanes),
-            ):
+            try:
+                developed = callable(parallel) and parallel(
+                    run_id, state,
+                    supervise=lambda lanes: self.tickets.supervise(run_id, lanes),
+                )
+            except TicketGraphDriftError:
+                state, _ = self.controller.resume(run_id)
+                return state
+            if developed:
                 state, _ = self.controller.resume(run_id)
                 if state.get("status") in {
                     "requeue_required", "operator_stopped", "execution_failed",
@@ -54,6 +64,8 @@ class DeliveryRunEngine:
                 }:
                     return state
                 if state.get("active_ticket_job") is None:
+                    return state
+                if state["active_ticket_job"].get("phase") == "blocked":
                     return state
             active_before = state["active_ticket_job"]
             number = active_before.get("ticket_number")
@@ -116,21 +128,3 @@ class DeliveryRunEngine:
             ):
                 return state
         return state
-
-    def _integrate_ready_ticket(
-        self, run_id: str, lanes: frozenset[int]
-    ) -> None:
-        """Use a freed integration seat while other development lanes run."""
-        with parallel_delivery_state_lock:
-            state, _ = self.controller.resume(run_id)
-            job = state.get("active_ticket_job")
-        if (
-            isinstance(job, dict)
-            and job.get("phase") == "ready_for_integration"
-            and state.get("ticket_integration_holder") is None
-        ):
-            deliver_parallel = getattr(self.tickets, "deliver_with_parallel_lanes", None)
-            if callable(deliver_parallel):
-                deliver_parallel(run_id, lanes)
-            else:
-                self.tickets.deliver(run_id)

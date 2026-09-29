@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from threading import Barrier, Event, Lock, Thread
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -16,7 +16,6 @@ from agent_run import cli
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
 from agent_run.delivery_history import history_progress_view
-from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
 from agent_run.guidance_actions import next_action_fact
 from agent_run.executor_host import HostObservation
@@ -26,7 +25,7 @@ from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlBusyError
 from agent_run.resume_intent import bind_resume_intent
 from agent_run.run_orchestration import DeliveryRunEngine
-from agent_run.ticket_development_state import TicketDevelopmentState
+from agent_run.ticket_state import TicketState
 from agent_run.ticket_pause import request_ticket_pause
 from agent_run.user_defaults import UserDefaultsStore
 from support.cli_payloads import (
@@ -41,98 +40,11 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
 
 
-class _TicketAgents:
-    def __init__(
-        self, root: Path, numbers: tuple[int, ...],
-        before_develop: Callable[[int], None],
-        before_publication: Callable[[int], None] | None = None,
-        before_review: Callable[[int], None] | None = None,
-    ) -> None:
-        self.before_develop = before_develop
-        self.before_publication = before_publication
-        self.before_review = before_review
-        self.backends: dict[int, FixtureAgentBackend] = {}
-        for number in numbers:
-            path = root / f"ticket-{number}-agents.json"
-            path.write_text(json.dumps({
-                "developments": [{
-                    "thread_id": f"developer-{number}",
-                    "summary": f"Ticket {number}",
-                    "write_files": {f"ticket-{number}.txt": "done\n"},
-                }],
-                "reviews": [passing_acceptance(
-                    f"reviewer-{number}", f"Ticket {number} passed."
-                )],
-                "publications": [{**publication(), "thread_id": f"developer-{number}"}],
-            }), encoding="utf-8")
-            self.backends[number] = FixtureAgentBackend(path)
-
-    @staticmethod
-    def _number(request: dict[str, Any]) -> int:
-        return int(request["ticket"]["number"])
-
-    def develop(self, request: dict[str, Any]) -> Any:
-        number = self._number(request)
-        self.before_develop(number)
-        return self.backends[number].develop(request)
-
-    def review(self, request: dict[str, Any]) -> Any:
-        number = self._number(request)
-        if self.before_review is not None:
-            self.before_review(number)
-        return self.backends[number].review(request)
-
-    def publication(self, request: dict[str, Any]) -> Any:
-        number = self._number(request)
-        if self.before_publication is not None:
-            self.before_publication(number)
-        return self.backends[number].publication(request)
-
-
-def _run(
-    git_repo: Path, numbers: tuple[int, ...],
-    *, blocked_by: dict[int, list[int]] | None = None,
-    workers: int = 3,
-    ci_repairs_per_round: int = 3,
-) -> tuple[dict[str, Any], StateStore, GitRepository, Path]:
-    fixture = write_fixture(git_repo / "github.json", issues={
-        str(number): {
-            "number": number,
-            "title": f"Deliver ticket {number}",
-            "body": f"Implement ticket {number}.",
-            "state": "OPEN",
-            "labels": ["ready-for-agent"],
-            "blocked_by": [
-                {"number": blocker, "state": "OPEN"}
-                for blocker in (blocked_by or {}).get(number, [])
-            ],
-        }
-        for number in numbers
-    })
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
-    controller = Controller(
-        FixtureGitHubReader(fixture), git, states,
-        delivery_policy=DeliveryPolicy(
-            ticket_development_workers=workers,
-            ci_repairs_per_round=ci_repairs_per_round,
-        ),
-    )
-    state, _ = controller.start(1)
-    return state, states, git, fixture
-
-
-def _engine(
-    git: GitRepository, states: StateStore, fixture: Path,
-    agents: _TicketAgents,
-    *, development_only: bool = False,
-) -> TicketDeliveryEngine:
-    return TicketDeliveryEngine(
-        git=git, states=states,
-        github=FixtureGitHubPublisher(fixture, git),
-        agents=agents,
-        development_only=development_only,
-    )
+from support.ticket_parallel import (
+    TicketAgents as _TicketAgents,
+    ticket_run as _run,
+    ticket_engine as _engine,
+)
 
 
 def test_fixture_revision_read_does_not_erase_parallel_ticket_branch(
@@ -446,7 +358,7 @@ def test_lane_rejects_real_concurrent_changes(
             str(state["run_id"]), state
         )
     run_id = str(state["run_id"])
-    lane = TicketDevelopmentState(states, run_id, 2)
+    lane = TicketState(states, run_id, 2)
     snapshot = lane.load_current_run(run_id)
     assert snapshot is not None
     latest = states.load_current_run(run_id)
@@ -539,7 +451,7 @@ def test_lane_rejects_label_qualification_change_after_refresh(
 ) -> None:
     state, states, _, fixture = _run(git_repo, (2, 3))
     run_id = str(state["run_id"])
-    lane = TicketDevelopmentState(states, run_id, 2)
+    lane = TicketState(states, run_id, 2)
     snapshot = lane.load_current_run(run_id)
     assert snapshot is not None
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -779,92 +691,6 @@ def test_pausing_integration_holder_requeues_original_phase(
     assert resumed["ticket_integration_holder"] is None
     assert resumed["ticket_integration_queue"][0]["ticket_number"] == 2
     require_current_run_state(resumed)
-
-
-def test_completed_lane_drives_integration_while_another_lane_is_running(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state, states, git, fixture = _run(git_repo, (2, 3))
-    first_ready = Event()
-    release_second = Event()
-    resume_loaded = Event()
-    second_save_attempted = Event()
-    allow_resume_save = Event()
-    observed: list[tuple[str, str]] = []
-
-    original_save = TicketDevelopmentState.save_run
-
-    def track_save(
-        scoped: TicketDevelopmentState, run_id: str, current: dict[str, Any]
-    ) -> None:
-        if scoped.ticket_number == 3 and release_second.is_set():
-            second_save_attempted.set()
-        original_save(scoped, run_id, current)
-
-    monkeypatch.setattr(TicketDevelopmentState, "save_run", track_save)
-
-    class ControllerView:
-        def resume(self, run_id: str) -> tuple[dict[str, Any], bool]:
-            current = states.load_current_run(run_id)
-            assert current is not None
-            if not resume_loaded.is_set():
-                resume_loaded.set()
-                assert second_save_attempted.wait(timeout=10)
-                assert allow_resume_save.wait(timeout=10)
-            states.save_run(run_id, current)
-            return current, True
-
-    class IntegrationView:
-        def deliver(self, run_id: str) -> dict[str, Any]:
-            current = states.load_current_run(run_id)
-            assert current is not None
-            observed.append((
-                current["ticket_jobs"]["2"]["phase"],
-                current["ticket_jobs"].get("3", {}).get("phase", "new"),
-            ))
-            return current
-
-    orchestrator = DeliveryRunEngine(
-        controller=ControllerView(), tickets=IntegrationView(),  # type: ignore[arg-type]
-    )
-
-    def hold(number: int) -> None:
-        if number == 3:
-            assert release_second.wait(timeout=10)
-
-    def after_lane(lanes: frozenset[int]) -> None:
-        orchestrator._integrate_ready_ticket(str(state["run_id"]), lanes)
-        first_ready.set()
-
-    agents = _TicketAgents(git_repo, (2, 3), hold)
-    errors: list[BaseException] = []
-
-    def advance() -> None:
-        try:
-            assert _engine(git, states, fixture, agents).develop_frontier(
-                str(state["run_id"]), state, after_lane=after_lane
-            )
-        except BaseException as error:
-            errors.append(error)
-
-    thread = Thread(target=advance)
-    thread.start()
-    try:
-        assert resume_loaded.wait(timeout=10)
-        release_second.set()
-        assert second_save_attempted.wait(timeout=10)
-        allow_resume_save.set()
-        assert first_ready.wait(timeout=10)
-        assert observed[0] == ("ready_for_integration", "developing")
-    finally:
-        release_second.set()
-        allow_resume_save.set()
-        thread.join(timeout=10)
-    assert not thread.is_alive()
-    assert not errors, errors
-    saved = states.load_current_run(str(state["run_id"]))
-    assert saved is not None
-    assert saved["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
 
 
 def test_real_orchestrator_reaches_ci_while_other_ticket_develops(
@@ -1387,16 +1213,14 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> N
     assert observed["ticket_jobs"]["2"]["ci_recovery"]["repairs_used"] == 1
 
 
-def test_one_worker_uses_serial_ticket_delivery(git_repo: Path) -> None:
+def test_one_worker_admits_one_development_lane(git_repo: Path) -> None:
     state, states, git, fixture = _run(git_repo, (2, 3), workers=1)
     started: list[int] = []
     agents = _TicketAgents(git_repo, (2, 3), started.append)
     engine = _engine(git, states, fixture, agents, development_only=True)
 
     assert state["policy_snapshot"]["ticket_development_workers"] == 1
-    assert engine.develop_frontier(str(state["run_id"]), state) is False
-    assert started == []
-    engine.deliver(str(state["run_id"]))
+    assert engine.develop_frontier(str(state["run_id"]), state) is True
 
     saved = states.load_current_run(str(state["run_id"]))
     assert saved is not None
@@ -1470,7 +1294,7 @@ def test_dependency_gate_and_reloaded_ticket_projections(git_repo: Path) -> None
     run_id = str(state["run_id"])
     reloaded_states = StateStore(git_repo / ".agent-run")
     for number in (2, 4):
-        local = TicketDevelopmentState(reloaded_states, run_id, number).load_current_run(run_id)
+        local = TicketState(reloaded_states, run_id, number).load_current_run(run_id)
         assert local is not None
         assert local["active_ticket_job"]["ticket_number"] == number
         assert local["active_agent_invocation"] == local["ticket_agent_invocations"][str(number)]

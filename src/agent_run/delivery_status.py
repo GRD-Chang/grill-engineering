@@ -494,7 +494,7 @@ def print_rich_status_progress(
     control = audit.get("executor_control")
     unknown_wait = (
         wait_view is not None and isinstance(control, dict)
-        and control.get("activity") == "unknown" and state.get("status") != "supervision_timeout"
+        and control.get("activity") == "unknown" and not isinstance(state.get("supervision_wait"), dict)
     )
     needs_diagnostic = activity == "unknown" or unknown_wait
     agent_running = (automatic_work is not None or (wait_view is None and activity == "running")) and not isinstance(action, dict)

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run.git import GitRepository
 from agent_run.semantic_attempt import canonical_fingerprint
@@ -99,13 +100,13 @@ def repairable_required_check_failure() -> dict[str, object]:
 
 
 def test_public_run_completes_one_independent_ticket_ci_repair(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
         delivery={
-            "required_checks": ["pending", "pending", "fail", "pass", "pass"],
+            "required_checks": ["pending"],
             "required_check_evidence": {
                 "pr_number": 1,
                 "checks": [repairable_required_check_failure()],
@@ -145,11 +146,30 @@ def test_public_run_completes_one_independent_ticket_ci_repair(
     agents = git_repo / "fallback-final-ci-fix.json"
     agents.write_text(json.dumps(agent_data), encoding="utf-8")
 
-    result = run_cli(
+    required_checks = FixtureGitHubPublisher._next_required_checks_result
+
+    def checks_after_pending_interval(
+        publisher: FixtureGitHubPublisher, pr_number: int,
+    ) -> str:
+        live = json.loads(fixture.read_text(encoding="utf-8"))
+        delivery = publisher.data["delivery"]
+        if (
+            live.get("supervision_clock", 0) > 0
+            and delivery["required_checks"] == ["pending"]
+        ):
+            delivery["required_checks"] = ["fail", "pass", "pass"]
+            delivery["check_position"] = 0
+        return required_checks(publisher, pr_number)
+
+    monkeypatch.setattr(
+        FixtureGitHubPublisher, "_next_required_checks_result", checks_after_pending_interval
+    )
+    result = invoke_cli_inprocess(
         git_repo,
         fixture,
         "run",
         "1",
+        "--json",
         "--agent-fixture",
         str(agents),
     )
@@ -225,7 +245,7 @@ def test_public_run_completes_one_independent_ticket_ci_repair(
     assert len(ticket_prs) == 1
     assert ticket_prs[0]["state"] == "MERGED"
     assert ticket_prs[0]["head_sha"] == job["publication_sha"]
-    assert fixture_data["delivery"]["check_position"] >= 5
+    assert fixture_data["delivery"]["check_position"] >= 3
     assert fixture_data["supervision_clock"] > 0
 
 
@@ -553,9 +573,14 @@ def test_ticket_required_checks_read_timeout_resumes_without_publication_retry(
 
     assert paused.returncode == 2
     paused_state = load_only_run_state(git_repo)
-    assert paused_state["status"] == "supervision_timeout"
+    assert paused_state["status"] == "blocked"
     job = paused_state["active_ticket_job"]
-    assert job["phase"] == "publishing"
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_supervision_timeout"
+    assert job["execution_resume_phase"] == "publishing"
+    assert job["supervision_wait"]["latest_observation"]["code"] == (
+        "github_checks_observation_pending"
+    )
     assert "publication_operation_retry" not in job
     assert "last_publication_error" not in job
     assert job["review_budget"]["development_attempts"] == 1
@@ -1445,8 +1470,11 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
         str(failed_agents),
     )
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "blocked"
     failed_job = load_only_run_state(git_repo)["active_ticket_job"]
+    assert failed_job["phase"] == "blocked"
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "reviewing"
     failed_attempt = failed_job["pending_semantic_attempt"]
     assert failed_attempt["role"] == "reviewer"
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
@@ -1549,8 +1577,11 @@ def test_last_reviewer_ordinal_process_failure_resumes_without_new_budget(
     )
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "blocked"
     failed_job = load_only_run_state(git_repo)["active_ticket_job"]
+    assert failed_job["phase"] == "blocked"
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "reviewing"
     pending = failed_job["pending_semantic_attempt"]
     assert pending["role"] == "reviewer"
     assert pending["ordinal"] == 3
@@ -3994,7 +4025,10 @@ def test_run_cli_fails_closed_when_run_ref_expected_absent_cas_loses_race(
     failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "blocked"
+    failed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "developing"
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert delivery.get("pull_requests", []) == []
     assert len(delivery["published_branches"]) == 1
@@ -4401,7 +4435,7 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
-        delivery={"required_checks": ["pending", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(
@@ -4454,6 +4488,9 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-3"
     assert checkout.is_dir()
     git_link = (checkout / ".git").read_text(encoding="utf-8")
+
+    waiting_fixture["delivery"]["required_checks"] = ["pass"]
+    fixture.write_text(json.dumps(waiting_fixture), encoding="utf-8")
 
     completed = run_internal_stage(
         git_repo,
@@ -4669,10 +4706,12 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     )
 
     assert failed.returncode == 2, failed.stderr
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "blocked"
     failed_state = load_only_run_state(git_repo)
     failed_job = failed_state["ticket_jobs"]["3"]
-    assert failed_job["phase"] == "accepted"
+    assert failed_job["phase"] == "blocked"
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "accepted"
     assert failed_job["modification_attempts"] == 1
     assert failed_job["validation_attempts"] == 1
     assert failed_job["publication_attempts"] == 1
@@ -4688,7 +4727,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         str(agent_fixture),
     )
     assert bypass.returncode == 2
-    assert stdout_json(bypass)["status"] == "execution_failed"
+    assert stdout_json(bypass)["status"] == "blocked"
 
     agent_fixture.write_text(
         json.dumps(
@@ -5010,7 +5049,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
-        delivery={"required_checks": ["pending", "pass"]},
+        delivery={"required_checks": ["pending"]},
     )
     first_agents = git_repo / "agents-first.json"
     first_agents.write_text(
@@ -5095,6 +5134,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     assert state["active_ticket_job"]["modification_attempts"] == 1
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 1
+    mutable_fixture["delivery"]["required_checks"] = ["pass"]
     mutable_fixture["delivery"]["crash_after_abandon_change_pr_once"] = True
     fixture.write_text(json.dumps(mutable_fixture), encoding="utf-8")
 

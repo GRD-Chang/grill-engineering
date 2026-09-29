@@ -29,6 +29,14 @@ def append_explicit_resume_audit(
     ticket_number: int | None = None,
 ) -> dict[str, Any]:
     """Record one public ``resume`` without creating a Resume budget."""
+    if ticket_number is None and state.get("status") in {"blocked", "progress_exhausted"}:
+        gates = operator_gate_subjects(state)
+        if len(gates) == 1:
+            location, subject = gates[0]
+            if location.startswith("ticket:") and subject.get("blocked_reason") in {
+                "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
+            }:
+                ticket_number = int(subject["ticket_number"])
 
     audit = state.setdefault(
         "resume_audit",
@@ -52,6 +60,8 @@ def append_explicit_resume_audit(
         raise ValueError("resume_audit.compacted must remain zero")
 
     invocation = state.get("active_agent_invocation")
+    if ticket_number is not None:
+        invocation = state.get("ticket_agent_invocations", {}).get(str(ticket_number))
     active = (
         invocation
         if isinstance(invocation, dict)
@@ -117,6 +127,12 @@ def append_explicit_resume_audit(
             "ticket_branch_generation",
             subject.get("repair_generation", subject.get("acceptance_generation", 1)),
         )
+    elif ticket_number is not None:
+        jobs = state.get("ticket_jobs")
+        ticket_job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
+        if isinstance(ticket_job, dict):
+            event["work_subject"] = f"ticket:{ticket_number}"
+            event["generation"] = ticket_job.get("ticket_branch_generation")
     elif event["kind"] in {"integration_resync", "execution_failure"}:
         acceptance = state.get("run_acceptance")
         repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
@@ -131,12 +147,6 @@ def append_explicit_resume_audit(
         ):
             event["work_subject"] = f"run-repair:{state['run_id']}"
             event["generation"] = repair.get("repair_generation")
-    elif ticket_number is not None:
-        jobs = state.get("ticket_jobs")
-        ticket_job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
-        if isinstance(ticket_job, dict):
-            event["work_subject"] = f"ticket:{ticket_number}"
-            event["generation"] = ticket_job.get("ticket_branch_generation")
     event["resume_id"] = resume_identity(str(state["run_id"]), event)
     event["event_digest"] = resume_event_digest(event)
     response_audit: dict[str, Any] | None = None
@@ -260,6 +270,8 @@ def _resume_kind(
             return "budget_checkpoint"
         if reason == "integration_resync_exhausted":
             return "integration_resync"
+        if reason == "ticket_supervision_timeout":
+            return "supervision_timeout"
         if reason == "ticket_execution_failed":
             return "execution_failure"
         if reason == "ticket_paused":

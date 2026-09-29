@@ -15,6 +15,8 @@ def clear_stale_delivery_evidence(job: dict[str, Any]) -> None:
     """Discard transient candidate evidence while retaining identity and budgets."""
     clear_required_checks_observation(job)
     for key in (
+        "external_wait",
+        "supervision_wait",
         "candidate_sha",
         "publication",
         "publication_sha",

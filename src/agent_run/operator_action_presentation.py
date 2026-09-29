@@ -63,6 +63,8 @@ def operator_action_view(
     phase = (
         subject.get("human_blocker_phase")
         if is_human_blocker
+        else subject["execution_resume_phase"]
+        if reason in {"ticket_execution_failed", "ticket_supervision_timeout"} and "execution_resume_phase" in subject
         else (
             evidence["phase"]
             if evidence is not None and len(subjects) == 1
@@ -171,6 +173,10 @@ def _operator_action_kind(
 ) -> str:
     if is_human_blocker:
         return "human_blocker"
+    if reason == "ticket_supervision_timeout":
+        return "supervision_timeout"
+    if reason == "ticket_execution_failed":
+        return "execution_failure"
     if reason in {
         "modification_budget_exhausted", "review_budget_exhausted",
         "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
@@ -333,7 +339,12 @@ def _operator_next_action(
         "supervision_timeout",
         "operator_stopped",
     } and isinstance(repository, str) and isinstance(parent_number, int):
-        return f"agent-run resume {parent_number} --repo {repository}"
+        command = f"agent-run resume {parent_number} --repo {repository}"
+        if reason in {"ticket_execution_failed", "ticket_supervision_timeout"}:
+            subjects = operator_gate_subjects(state)
+            if len(subjects) == 1 and type(number := subjects[0][1].get("ticket_number")) is int:
+                command += f" --ticket {number}"
+        return command
     if (
         action_kind == "final_approval"
         and isinstance(repository, str)

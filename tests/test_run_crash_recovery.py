@@ -454,7 +454,14 @@ def test_public_cli_recovers_after_external_response_loss(
         str(recovery_agents),
     )
     assert held.returncode == 2
-    assert stdout_json(held)["status"] == "execution_failed"
+    assert stdout_json(held)["status"] == (
+        "execution_failed" if action == "close" else "blocked"
+    )
+    if action != "close":
+        assert interrupted_state["ticket_jobs"]["2"]["phase"] == "blocked"
+        assert interrupted_state["ticket_jobs"]["2"]["blocked_reason"] == (
+            "ticket_execution_failed"
+        )
     assert load_only_run_state(git_repo) == interrupted_state
     assert fixture.read_text(encoding="utf-8") == fixture_before
 
@@ -637,13 +644,17 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
 
     assert interrupted.returncode == 2
     interrupted_output = stdout_json(interrupted)
-    assert interrupted_output["status"] == "execution_failed"
+    assert interrupted_output["status"] == "blocked"
     interrupted_state = load_only_run_state(git_repo)
-    assert interrupted_state["status"] == "execution_failed"
-    assert interrupted_state["terminal_kind"] == "execution_failed"
+    assert interrupted_state["status"] == "blocked"
+    assert interrupted_state["terminal_kind"] is None
+    failed_job = interrupted_state["ticket_jobs"]["2"]
+    assert failed_job["phase"] == "blocked"
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "developing"
     assert interrupted_state["diagnostics"] == [
         {
-            "code": "command_failed",
+            "code": "agent_invocation_failed",
             "message": "simulated Development Worker timeout",
         }
     ]
@@ -702,7 +713,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
     )
 
     assert publisher_interrupted.returncode == 2
-    assert stdout_json(publisher_interrupted)["status"] == "execution_failed"
+    assert stdout_json(publisher_interrupted)["status"] == "blocked"
     assert (checkout / "uncommitted.txt").read_text(
         encoding="utf-8"
     ) == "survives worker error\n"

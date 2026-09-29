@@ -74,7 +74,7 @@ def test_worker_limit_controls_new_ticket_admission_during_repair(git_repo: Path
     assert state_from_graph(state, graph)["active_ticket_job"]["ticket_number"] == 3
 
 
-@pytest.mark.parametrize("protocol", [None, False, 0, 1.0, "1"])
+@pytest.mark.parametrize("protocol", [None, False, 0, 1.0, "1", 2])
 def test_multi_ticket_protocol_rejects_old_or_malformed_run(
     git_repo: Path, protocol: object
 ) -> None:

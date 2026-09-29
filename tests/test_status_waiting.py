@@ -180,7 +180,7 @@ def test_multi_ticket_status_details_are_localized_and_read_only(
 ) -> None:
     repo, state = waiting_run
     state["language"] = language
-    state["multi_ticket_protocol"] = 2
+    state["multi_ticket_protocol"] = 3
     StateStore(managed_state(repo)).save_run(state["run_id"], state)
     before = _workspace_snapshot(repo)
     output = StringIO()
