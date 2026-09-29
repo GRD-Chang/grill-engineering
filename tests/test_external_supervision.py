@@ -537,3 +537,24 @@ def test_nonblocking_retry_persists_schedule_and_expires_without_sleep() -> None
     assert not supervisor.retry_due(persisted)
     assert persisted['status'] == 'supervision_timeout'
     assert sleeps == []
+
+
+def test_nested_delivery_uses_driver_clock_without_leaking_between_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_run import external_supervision
+    from agent_run.external_supervision import supervision_scope
+
+    monkeypatch.setattr(external_supervision, "monotonic", lambda: 900.0)
+    now = [100.25]
+    driver = ExternalSupervisor(now=lambda: now[0], sleeper=lambda delay: now.__setitem__(0, now[0] + delay), poll_interval_seconds=7)
+    state = {"status": "waiting_external"}
+    with supervision_scope(driver):
+        window = ensure_supervision_window(state)
+        assert window["started_at"] == 100.25
+        nested = ExternalSupervisor()
+        assert nested.before_retry(state)
+        assert now[0] == 107.25
+        with pytest.raises(RuntimeError), supervision_scope(ExternalSupervisor(now=lambda: 200.0)):
+            assert ensure_supervision_window({"status": "waiting_external"})["started_at"] == 200.0
+            raise RuntimeError("other delivery failed")
+        assert ensure_supervision_window(state)["deadline"] == 700.25
+    assert ensure_supervision_window({"status": "waiting_external"})["started_at"] == 900.0

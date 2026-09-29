@@ -27,6 +27,7 @@ from agent_run.credential_availability import (
     resume_initial_credential_wait,
     wait_for_initial_credential as wait_for_initial_credential_state,
 )
+from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git_errors import GitError, GitIntegrityError
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import repair_budget_context
@@ -134,7 +135,10 @@ def develop(
         request["_invocation_mode"] = "new-thread"
     elif job.get("development_failure_resume") is True:
         request["_invocation_mode"] = "resume"
-    result = stage.agents.develop(request)
+    try:
+        result = stage.agents.develop(request)
+    finally:
+        stage.release_agent_work()
     require_development_thread(
         job, result.thread_id, requested_thread=request.get("thread_id")
     )
@@ -182,6 +186,7 @@ def wait_for_initial_credential(
         resume_status=str(state.get("status", "active")),
         http_status=http_status,
     )
+    ensure_supervision_window(state)
     stage.save(state)
 
 

@@ -423,6 +423,12 @@ class TicketDeliveryLoop:
     def _engine(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> ChangeDeliveryEngine:
+        from agent_run.ticket_state import TicketState
+
+        if not isinstance(self.states, TicketState):
+            scoped = TicketState(self.states, str(state["run_id"]), int(job["ticket_number"]))
+            scoped.load_current_run(str(state["run_id"]))
+            self.states = scoped  # type: ignore[assignment]
         return ChangeDeliveryEngine(
             git=self.git,
             github=self.github,

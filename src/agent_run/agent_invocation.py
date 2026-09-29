@@ -429,6 +429,10 @@ def record_operator_stop(
 
 
 def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
+    # Called only after the Executor's exit/stop has been established. No
+    # running token survives into the explicit recovery window.
+    if "ticket_work_queue" in state:
+        state["ticket_work_queue"] = []
     invocations = state.get("ticket_agent_invocations")
     if not isinstance(invocations, dict):
         return

@@ -195,6 +195,7 @@ class TicketState:
                     latest[key] = deepcopy(state.get(key))
             _merge_ticket_cleanup(latest, state, job)
             self.states._save_run_and_notify_unlocked(run_id, latest)
+            state["ticket_work_queue"] = deepcopy(latest["ticket_work_queue"])
             # The lane also validates its in-memory projection between saves.
             # Keep its canonical Invocation synchronized with the active one,
             # just as StateStore does for a direct Controller save.
@@ -235,6 +236,11 @@ class TicketState:
             )
             ensure_supervision_window(state)
             self.save_run(self.run_id, state)
+            from agent_run.ticket_work import TicketWorkAdmission, generation
+
+            TicketWorkAdmission(self.states, self.run_id).cancel_waiter(
+                self.ticket_number, generation(state, self.ticket_number),
+            )
             return
 
         def commit() -> None:

@@ -309,7 +309,7 @@ class Controller:
                         for key in (
                             "status", "terminal_kind", "operator_stop", "diagnostics",
                             "ticket_jobs", "ticket_pause_requests",
-                            "ticket_integration_queue", "ticket_integration_holder",
+                            "ticket_integration_queue", "ticket_integration_holder", "ticket_work_queue",
                             "active_ticket_job",
                         )
                     ):
@@ -481,6 +481,12 @@ class Controller:
                     "operator_stopped resume does not accept Agent or Human Blocker options"
                 )
             restore_operator_stop(existing)
+        if explicit_resume and ticket_number is None and resume_pause["status"] == "execution_failed":
+            # The public lifecycle has fenced out the previous Executor before
+            # applying this Run-wide recovery. A crash can occur after lease
+            # persistence but before an Invocation exists, so Invocation-only
+            # interruption recovery is insufficient here.
+            existing["ticket_work_queue"] = []
         if human_response is not None:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
@@ -1503,7 +1509,7 @@ class Controller:
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
-            "multi_ticket_protocol": 3,
+            "multi_ticket_protocol": 4,
             "ticket_agent_invocations": {},
             "ticket_pause_requests": {},
             "semantic_attempt_protocol": 1,
@@ -1523,6 +1529,7 @@ class Controller:
             "active_ticket_job": None,
             "ticket_jobs": {},
             "ticket_integration_queue": [],
+            "ticket_work_queue": [],
             "ticket_integration_holder": None,
             "retired_ticket_generations": {},
             "pending_ticket_retirements": {},

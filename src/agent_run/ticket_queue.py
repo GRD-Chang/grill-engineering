@@ -92,15 +92,9 @@ def next_ticket(state: dict[str, Any], frontier: list[int]) -> int | None:
             "blocked", "completed", "publication_pending",
         }
     ]
-    policy = state.get("policy_snapshot")
-    configured_limit = policy.get("ticket_development_workers") if isinstance(policy, dict) else None
-    worker_limit = configured_limit if type(configured_limit) is int and configured_limit > 0 else 3
-    active_workers = {
-        number for number in frontier
-        if jobs.get(str(number), {}).get("phase") in DEVELOPMENT_WORKER_PHASES
-    }
-    if len(active_workers) >= worker_limit:
-        frontier = [number for number in frontier if number in active_workers]
+    for item in state.get("ticket_work_queue", []):
+        if item["lease_id"] is None and item["ticket_number"] in frontier:
+            return int(item["ticket_number"])
     if holder is None and queue:
         first = queue[0]["ticket_number"]
         if type(first) is int and first in frontier:
@@ -112,17 +106,14 @@ def next_ticket(state: dict[str, Any], frontier: list[int]) -> int | None:
         type(active_number) is int
         and active_number in frontier
         and active_number != holder
-        and active_phase not in {"repairing", "ready_for_integration", "waiting_checks", "blocked"}
+        and active_phase not in {"ready_for_integration", "waiting_checks", "blocked"}
     ):
         return active_number
     for number in frontier:
         if number == holder:
             continue
         phase = jobs.get(str(number), {}).get("phase")
-        if phase not in {"ready_for_integration", "repairing"}:
-            return number
-    for number in frontier:
-        if number != holder and jobs.get(str(number), {}).get("phase") == "repairing":
+        if phase != "ready_for_integration":
             return number
     if type(holder) is int and holder in frontier:
         return holder

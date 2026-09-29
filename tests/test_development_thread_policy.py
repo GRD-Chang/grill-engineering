@@ -64,6 +64,7 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
         _reject_stale=lambda *args: None, _invocation_boundary=lambda job: {"base_sha": "base"},
         _invocation_events=lambda *args, **kwargs: lambda *args, **kwargs: None,
         _agent_is_current=lambda *args: True, save=lambda state: saved.append(deepcopy(job)),
+        release_agent_work=lambda: None,
     )
     develop(stage, state, job, tmp_path)
     first_attempt = deepcopy(job["pending_semantic_attempt"])

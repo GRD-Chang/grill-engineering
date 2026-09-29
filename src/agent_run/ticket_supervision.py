@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def development_wait_due(
-    engine: TicketDeliveryEngine, run_id: str, number: int,
+    engine: TicketDeliveryEngine, run_id: str, number: int, *, already_ready: bool = False,
 ) -> bool | None:
     """Observe admitted development waits without external I/O or Agent work.
 
@@ -33,13 +33,18 @@ def development_wait_due(
         "developing", "repairing", "committing_candidate", "candidate", "reviewing",
     } or not isinstance(job.get("external_wait"), dict):
         return None
-    due = _retry_due(scoped, state)
+    due = _retry_due(scoped, state, already_ready=already_ready)
     return None if state.get("status") == "blocked" else due
 
 
-def _retry_due(scoped: TicketState, state: dict[str, Any]) -> bool:
+def _retry_due(scoped: TicketState, state: dict[str, Any], *, already_ready: bool = False) -> bool:
     previous = deepcopy(state.get("supervision_window"))
-    due = ExternalSupervisor().retry_due(state)
+    supervisor = ExternalSupervisor()
+    if already_ready and isinstance(previous, dict) and supervisor.now() < previous["deadline"]:
+        # A ready retry waiting for Agent capacity keeps its FIFO position;
+        # it does not spend another retry, but its absolute deadline still runs.
+        return True
+    due = supervisor.retry_due(state)
     if state.get("status") == "supervision_timeout":
         pause_ticket_supervision(scoped, state)
         return False
@@ -48,32 +53,34 @@ def _retry_due(scoped: TicketState, state: dict[str, Any]) -> bool:
     return due
 
 
-def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset[int]) -> None:
+def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset[int]) -> bool:
     state = engine.states.load_current_run(run_id)
     if state is None or state.get("status") in RUN_STOP_STATUSES:
-        return
+        return False
     number = state["ticket_integration_holder"]
     if number is None and state["ticket_integration_queue"]:
         number = state["ticket_integration_queue"][0]["ticket_number"]
     if type(number) is not int or number in lanes:
-        return
+        return False
     scoped = TicketState(engine.states, run_id, number)
     projected = scoped.load_current_run(run_id)
     if projected is None:
-        return
+        return False
     if is_supervised_wait(projected) and not _retry_due(scoped, projected):
-        return
+        return False
     from agent_run.delivery import TicketDeliveryEngine
 
     try:
-        TicketDeliveryEngine(
+        result = TicketDeliveryEngine(
             git=engine.git, states=scoped,  # type: ignore[arg-type]
             github=engine.github, agents=engine.agents,
         ).deliver(run_id)
+        return bool(result["active_ticket_job"].get("phase") == "completed")
     except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError, SimulatedProcessCrash):
         raise
     except Exception as error:
         scoped.block_execution_failure(error)
+        return False
 
 
 def pause_ticket_supervision(scoped: TicketState, state: dict[str, Any]) -> None:

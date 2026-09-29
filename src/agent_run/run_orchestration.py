@@ -9,6 +9,8 @@ from agent_run.operator_gate import (
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.ticket_queue import next_ticket
 from agent_run.ticket_state import RUN_STOP_STATUSES
+from agent_run.state import ConcurrentRunStateError
+from agent_run.task_control import TaskControlBusyError
 
 
 class RunController(Protocol):
@@ -16,7 +18,7 @@ class RunController(Protocol):
 
 
 class TicketEngine(Protocol):
-    def supervise(self, run_id: str, lanes: frozenset[int]) -> None: ...
+    def supervise(self, run_id: str, lanes: frozenset[int]) -> bool: ...
 
     def deliver(self, run_id: str) -> dict[str, Any]: ...
 
@@ -44,6 +46,22 @@ class DeliveryRunEngine:
         self, run_id: str, state: dict[str, Any]
     ) -> dict[str, Any]:
         idle_tickets: set[int] = set()
+        refresh_pending = False
+
+        def supervise(lanes: frozenset[int]) -> None:
+            nonlocal refresh_pending
+            refresh_pending |= self.tickets.supervise(run_id, lanes) is True
+            if refresh_pending:
+                try:
+                    self.controller.resume(run_id)
+                except TaskControlBusyError as error:
+                    if not isinstance(error.__cause__, ConcurrentRunStateError):
+                        raise
+                    # Other lanes may finish during the remote graph read.
+                    # Keep the completion signal for the next bounded pass.
+                else:
+                    refresh_pending = False
+
         while state.get("active_ticket_job") is not None:
             if state.get("status") in RUN_STOP_STATUSES:
                 return state
@@ -51,7 +69,7 @@ class DeliveryRunEngine:
             try:
                 developed = callable(parallel) and parallel(
                     run_id, state,
-                    supervise=lambda lanes: self.tickets.supervise(run_id, lanes),
+                    supervise=supervise,
                 )
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)

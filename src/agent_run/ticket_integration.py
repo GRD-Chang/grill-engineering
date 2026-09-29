@@ -381,7 +381,10 @@ def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: di
         request["_invocation_mode"] = "resume"
     stage.save(state)
     if "development_summary" not in conflict:
-        result = stage.agents.develop(request)
+        try:
+            result = stage.agents.develop(request)
+        finally:
+            stage.release_agent_work()
         require_development_thread(job, result.thread_id, requested_thread=request.get("thread_id"))
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
         if not stage.adapter.development_thread_is_allowed(state, result.thread_id):

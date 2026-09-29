@@ -147,6 +147,17 @@ class ChangeDeliveryEngine:
         self.development_only = development_only
         self._current_job: dict[str, Any] | None = None
         self._agent_work_allowed = True
+        self._work_token: str | None = None
+        self._work_admission = None
+        if contract.label.startswith("ticket-"):
+            from agent_run.ticket_state import TicketState
+            from agent_run.ticket_work import TicketWorkAdmission
+
+            store = state_store.states
+            self._work_admission = TicketWorkAdmission(
+                store.states if isinstance(store, TicketState) else store,
+                state_store.run_id,
+            )
 
     def _pause_ticket_if_requested(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -275,6 +286,8 @@ class ChangeDeliveryEngine:
                 return self._step_result(state, job, waiting=terminal)
             raise ValueError(f"unknown Ticket phase: {job['phase']}")
         except AgentWorkRequired as work:
+            if self._work_admission is not None and allow_agent and self._agent_work_allowed:
+                return DeliveryStep(DeliveryStepKind.WAITING, str(job["phase"]), "work_capacity")
             return DeliveryStep(DeliveryStepKind.NEEDS_AGENT, str(job["phase"]), work.role)
         except _TerminalChangeJob:
             return self._step_result(state, job, waiting=True)
@@ -286,17 +299,37 @@ class ChangeDeliveryEngine:
             )
             ensure_supervision_window(state)
             self.save(state)
+            if self._work_admission is not None:
+                self._work_admission.cancel_waiter(int(job["ticket_number"]), int(job["ticket_branch_generation"]))
             return self._step_result(state, job, waiting=True)
         except InitialCredentialUnavailable as error:
             self._refund_unstarted_credential_invocation(state, job)
             self._wait_for_initial_credential(state, job, http_status=error.http_status)
+            if self._work_admission is not None:
+                self._work_admission.cancel_waiter(int(job["ticket_number"]), int(job["ticket_branch_generation"]))
             return self._step_result(state, job, waiting=True)
         finally:
+            self.release_agent_work()
             self._agent_work_allowed = True
 
+    def release_agent_work(self) -> None:
+        if self._work_token is not None:
+            assert self._work_admission is not None
+            self._work_admission.release(self._work_token)
+            self._work_token = None
+
     def require_agent_work(self, role: str) -> None:
-        if not self._agent_work_allowed:
+        if not self._agent_work_allowed and self._work_admission is None:
             raise AgentWorkRequired(role)
+        if self._work_admission is not None:
+            assert self._current_job is not None
+            self._work_token = self._work_admission.acquire(
+                int(self._current_job["ticket_number"]),
+                int(self._current_job["ticket_branch_generation"]), role,
+                allow_start=self._agent_work_allowed,
+            )
+            if self._work_token is None:
+                raise AgentWorkRequired(role)
         self._agent_work_allowed = False
 
     @staticmethod

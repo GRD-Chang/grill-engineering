@@ -56,7 +56,7 @@ def _two_jobs(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     return first, second
 
 
-def test_worker_limit_controls_new_ticket_admission_during_repair(git_repo: Path) -> None:
+def test_work_fifo_controls_selection_instead_of_repair_priority(git_repo: Path) -> None:
     state = _state(git_repo)
     first = state["ticket_jobs"]["2"]
     first["phase"] = "repairing"
@@ -70,11 +70,15 @@ def test_worker_limit_controls_new_ticket_admission_during_repair(git_repo: Path
     assert state_from_graph(state, graph)["active_ticket_job"]["ticket_number"] == 2
 
     state["policy_snapshot"]["ticket_development_workers"] = 2
+    from agent_run.ticket_work import enqueue
+
+    enqueue(state, 3, "development")
+    enqueue(state, 2, "development")
     assert next_ticket(state, state["frontier"]) == 3
     assert state_from_graph(state, graph)["active_ticket_job"]["ticket_number"] == 3
 
 
-@pytest.mark.parametrize("protocol", [None, False, 0, 1.0, "1", 2])
+@pytest.mark.parametrize("protocol", [None, False, 0, 1.0, "1", 2, 3])
 def test_multi_ticket_protocol_rejects_old_or_malformed_run(
     git_repo: Path, protocol: object
 ) -> None:

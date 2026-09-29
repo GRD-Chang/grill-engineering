@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from threading import Lock
-from time import monotonic
 from typing import Any, Callable
-
-from agent_run.runner_credentials import runner_credential_scope
 
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
@@ -66,88 +62,16 @@ class TicketDeliveryEngine:
         after_lane: Callable[[frozenset[int]], None] | None = None,
         supervise: Callable[[frozenset[int]], None] | None = None,
     ) -> bool:
-        """Run one bounded batch of independent demand Dev/Review lanes."""
-        policy = state.get("policy_snapshot")
-        limit = policy.get("ticket_development_workers", 3) if isinstance(policy, dict) else 3
-        if type(limit) is not int or limit < 1:
-            raise ValueError("Ticket development capacity must be positive")
-        jobs = state.get("ticket_jobs", {})
-        if not isinstance(jobs, dict):
-            return False
-        candidates = [
-            number for number in state.get("frontier", [])
-            if type(number) is int
-            and (
-                not isinstance(jobs.get(str(number)), dict)
-                or jobs[str(number)].get("phase") is None
-                or jobs[str(number)].get("phase") in {
-                    "developing", "repairing", "committing_candidate",
-                    "candidate", "reviewing",
-                }
-            )
-            and state.get("ticket_integration_holder") != number
-        ][:limit]
-        if not candidates:
-            return False
+        """Advance ready work with dynamic refill and independent supervision."""
+        from agent_run.ticket_scheduling import develop_frontier
 
-        def advance(number: int) -> None:
-            scoped = TicketState(self.states, run_id, number)
-            try:
-                with runner_credential_scope():
-                    TicketDeliveryEngine(
-                        git=self.git,
-                        states=scoped,  # type: ignore[arg-type]
-                        github=self.github,
-                        agents=self.agents,
-                        development_only=True,
-                    ).deliver(run_id)
-            except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError, SimulatedProcessCrash):
-                raise
-            except Exception as error:
-                scoped.block_execution_failure(error)
+        return develop_frontier(self, run_id, state, after_lane=after_lane, supervise=supervise)
 
-        # The extra thread is program supervision, not another admitted Dev/Review
-        # lane. No new development batch is admitted until these lanes finish.
-        with ThreadPoolExecutor(max_workers=len(candidates) + 1, thread_name_prefix="ticket") as pool:
-            futures = {pool.submit(advance, number): number for number in candidates}
-            waiting: set[int] = set()
-            observer: Future[None] | None = None
-            next_observation = 0.0
-            while futures:
-                # These Tickets already own admission in this batch. Retrying
-                # their external wait does not admit successors or refill lanes.
-                from agent_run.ticket_supervision import development_wait_due
-
-                for number in tuple(waiting):
-                    due = development_wait_due(self, run_id, number)
-                    if due is not False:
-                        waiting.remove(number)
-                    if due is True:
-                        futures[pool.submit(advance, number)] = number
-                lanes = frozenset(futures.values())
-                if observer is not None and observer.done():
-                    observer.result()
-                    observer = None
-                    next_observation = monotonic() + SUPERVISION_POLL_SECONDS
-                if supervise is not None and observer is None and monotonic() >= next_observation:
-                    observer = pool.submit(_supervise_with_credentials, supervise, lanes)
-                done, _ = wait(futures, timeout=SUPERVISION_POLL_SECONDS, return_when=FIRST_COMPLETED)
-                for future in done:
-                    future.result()
-                    waiting.add(futures.pop(future))
-                    if after_lane is not None:
-                        after_lane(frozenset(futures.values()))
-            if observer is not None:
-                observer.result()
-            if supervise is not None:
-                supervise(frozenset())
-        return True
-
-    def supervise(self, run_id: str, lanes: frozenset[int]) -> None:
+    def supervise(self, run_id: str, lanes: frozenset[int]) -> bool:
         """Advance the integration owner independently of blocked Agent calls."""
         from agent_run.ticket_supervision import supervise_ticket
 
-        supervise_ticket(self, run_id, lanes)
+        return supervise_ticket(self, run_id, lanes)
 
     def deliver(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
@@ -243,11 +167,16 @@ class TicketDeliveryEngine:
                 "requeue_required",
                 "blocked",
                 "ready_for_human",
-            } or (
+            } or job.get("phase") == "ready_for_integration" or (
                 job.get("blocked_reason") == "agent_requires_human"
                 and job.get("human_blocker_phase")
                 in {"developing", "repairing"}
             )
+            latest = self.states.load_current_run(run_id)
+            if latest is not None and any(
+                item["ticket_number"] == ticket_number for item in latest["ticket_work_queue"]
+            ):
+                preserve_checkout = True
             return result
         except KeyboardInterrupt:
             preserve_checkout = (
@@ -514,10 +443,3 @@ def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be an object")
     return value
-
-
-def _supervise_with_credentials(
-    supervise: Callable[[frozenset[int]], None], lanes: frozenset[int],
-) -> None:
-    with runner_credential_scope():
-        supervise(lanes)

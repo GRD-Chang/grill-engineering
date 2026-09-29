@@ -10,7 +10,7 @@ status: accepted
 
 一个 Delivery Run 的有效策略固定 `ticket_development_workers`，默认 3，正整数，1 为单个开发 lane，仍独立进行 CI 监督。该额度只计算独立 Ticket 的需求开发和原有 Review lane；队列等待、CI 观测、集成及 Agent 内部子进程不占 lane。依赖只由已完成合入和收尾记录解除。Ticket 的开发及 Review 在各自固定工作区并行；集成、发布、CI 与合并继续沿用共享交付 Engine 和单一 Run Branch 集成席位。
 
-`ticket_jobs` 与 `ticket_agent_invocations` 按 Ticket 保存规范事实。开发、集成、CI 和收尾共用 `TicketState` 局部投影，每次保存均在 StateStore 的 Task Control 围栏和文件锁下重读最新 Run，只提交本票拥有的字段。Job、Invocation、需求变化或全局停止拒绝迟到提交；其他票的暂停、队列和结果保留。`active_ticket_job` 与 `active_agent_invocation` 是当前调度投影。Controller 刷新与外部读取不持共享状态锁。当前协议为 `multi_ticket_protocol=3`，旧协议在写入前明确拒绝，不迁移；监督与归属细节见 ADR 0019。
+`ticket_jobs` 与 `ticket_agent_invocations` 按 Ticket 保存规范事实。开发、集成、CI 和收尾共用 `TicketState` 局部投影，每次保存均在 StateStore 的 Task Control 围栏和文件锁下重读最新 Run，只提交本票拥有的字段。Job、Invocation、需求变化或全局停止拒绝迟到提交；其他票的暂停、队列和结果保留。`active_ticket_job` 与 `active_agent_invocation` 是当前调度投影。Controller 刷新与外部读取不持共享状态锁。当前协议为 `multi_ticket_protocol=4`，旧协议在写入前明确拒绝，不迁移；监督与归属细节见 ADR 0019。
 
 Controller 读取 GitHub 图时不持有状态锁。刷新开始时记录 Run 快照，提交时在 StateStore 事务内确认快照未被其他写入改变；发生冲突则基于最新状态重新刷新，显式操作要求调用方重试，不能把旧快照覆盖到新的局部暂停或控制状态。刷新返回前再次核对持久的 Ticket 调度和 Run 控制状态；全局停止保持停止，局部人工门禁允许重新选择仍可执行的 Ticket。
 

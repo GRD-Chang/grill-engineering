@@ -164,7 +164,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Semantic Agent Attempt protocol"
         )
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 3:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 4:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Multi Ticket protocol"
         )
@@ -194,6 +194,9 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
     _require_ticket_integration_queue(state)
+    from agent_run.ticket_work import require_queue
+
+    require_queue(state)
     _require_ticket_agent_invocations(state)
     _require_run_gate_exclusivity(state)
     if (

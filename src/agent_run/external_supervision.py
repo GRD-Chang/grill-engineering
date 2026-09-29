@@ -2,6 +2,9 @@ from __future__ import annotations
 
 """Bounded supervision of eventually-consistent GitHub lifecycle state."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -59,19 +62,36 @@ def waiting_boundary(state: dict[str, Any]) -> WaitingBoundary | None:
     return None
 
 
+_current_supervisor: ContextVar[ExternalSupervisor | None] = ContextVar("external_supervisor", default=None)
+
+
+@contextmanager
+def supervision_scope(supervisor: ExternalSupervisor) -> Iterator[None]:
+    """Share the Driver's clock with nested delivery and its bounded workers."""
+    token = _current_supervisor.set(supervisor)
+    try:
+        yield
+    finally:
+        _current_supervisor.reset(token)
+
+
 class ExternalSupervisor:
     """Own a single foreground waiting window without creating a daemon."""
 
     def __init__(
         self,
         *,
-        now: Callable[[], float] = monotonic,
-        sleeper: Callable[[float], None] = sleep,
-        poll_interval_seconds: int = POLL_INTERVAL_SECONDS,
+        now: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        poll_interval_seconds: int | None = None,
     ) -> None:
-        self.now = now
-        self.sleeper = sleeper
-        self.poll_interval_seconds = poll_interval_seconds
+        inherited = _current_supervisor.get()
+        self.now: Callable[[], float] = now or (inherited.now if inherited else monotonic)
+        self.sleeper: Callable[[float], None] = sleeper or (inherited.sleeper if inherited else sleep)
+        self.poll_interval_seconds: int = (
+            poll_interval_seconds if poll_interval_seconds is not None
+            else inherited.poll_interval_seconds if inherited else POLL_INTERVAL_SECONDS
+        )
 
     def before_retry(
         self,
@@ -137,6 +157,9 @@ class ExternalSupervisor:
             return False
         previous = window.get("retry_count")
         retries = (previous if isinstance(previous, int) else 0) + 1
+        availability = state.get("credential_availability")
+        if isinstance(availability, dict) and boundary.kind == "github_convergence":
+            availability["retry_count"] = retries
         delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), deadline - now)
         window.update({
             "retry_count": retries,
@@ -298,7 +321,7 @@ def ensure_supervision_window(
     boundary = waiting_boundary(state)
     if boundary is None:
         return None
-    return _supervision_window(state, boundary, now=(now or monotonic)())
+    return _supervision_window(state, boundary, now=(now or ExternalSupervisor().now)())
 
 
 def supervision_window_matches(

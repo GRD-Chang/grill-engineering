@@ -100,7 +100,10 @@ def publication(
             request["_invocation_mode"] = "new-thread"
         elif job.get("publication_failure_resume") is True:
             request["_invocation_mode"] = "resume"
-        raw = stage.agents.publication(request)
+        try:
+            raw = stage.agents.publication(request)
+        finally:
+            stage.release_agent_work()
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
         job.pop("publication_failure_resume", None)
         if isinstance(raw, HumanBlockerResult):

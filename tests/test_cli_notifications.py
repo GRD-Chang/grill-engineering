@@ -42,12 +42,13 @@ def test_cli_delivery_sends_cards_and_queries_never_send(
     binary.mkdir()
     messages = tmp_path / "messages.jsonl"
     tool = binary / "lark-cli"
-    tool.write_text(f"#!{sys.executable}\n" + '''import json, sys, socket, os
+    tool.write_text(f"#!{sys.executable}\n" + '''import json, sys, socket, os, time
 from pathlib import Path
 args = sys.argv[1:]
 if "whoami" in args:
     print(json.dumps({"profile":"test", "appId":"cli_test", "identity":"bot", "available":True}))
 else:
+    time.sleep(float(os.environ.get("NOTIFICATION_TEST_DELAY", "0")))
     with Path(''' + repr(str(messages)) + ''').open("a") as stream:
         stream.write(json.dumps(json.loads(args[args.index("--content")+1]), ensure_ascii=False)+"\\n")
     if os.environ.get("NOTIFICATION_TEST_PORT"):
@@ -108,8 +109,8 @@ original_close = notifications.Notifications.close
 original_send = notifications.send
 original_observe = notifications.Notifications.observe
 real_delivery_titles = set()
-# Synchronize only the isolated fast transport. This makes selected business
-# events inspectable without assuming production exit drains every message.
+# Capture lifecycle assertions without waiting for transport under the
+# StateStore/Task Control transaction that invokes this observer.
 def observe(self, *args, **kwargs):
     state = args[0]
     for event in notifications.events(state):
@@ -119,9 +120,6 @@ def observe(self, *args, **kwargs):
             active = state.get('active_agent_invocation') or {}
             assert active.get('reported_thread_id') and active.get('status') == 'running', active
     original_observe(self, *args, **kwargs)
-    if not os.environ.get('NOTIFICATION_TEST_PORT') and self.enabled and self.thread is not None:
-        with self.condition:
-            assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
 notifications.Notifications.observe = observe
 # Detailed-stage combinations are asserted against persisted lifecycle facts.
 # Keep the start, completed-ticket effort and approval/completion cards on the
@@ -151,9 +149,10 @@ def close(self):
                     assert ready.recv(1) == b'1', 'close readiness not acknowledged'
             else:
                 with self.condition:
-                    settled = lambda: bool(self.document.get('records')) or any(
-                        item['outcome'] in {'failed', 'unknown'} for item in self.document.get('pending', []))
-                    assert self.condition.wait_for(settled, timeout=15), 'representative send did not settle'
+                    # Executor has detached the observer and exited delivery.
+                    # Drain only this test's transport outside all business locks;
+                    # production close still has its original bounded behavior.
+                    assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
                     assert self.document.get('records'), self.document
     finally:
         release_sender.set()
@@ -171,6 +170,9 @@ raise SystemExit(main(sys.argv[1:]))
             )
 
         if drain:
+            if mode == "concise" and scope == "ticket":
+                # Exercise slow real transport without extending state-lock timeouts.
+                environment["NOTIFICATION_TEST_DELAY"] = "0.4"
             if mode == "detailed":
                 environment["NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT"] = "1"
             return execute()

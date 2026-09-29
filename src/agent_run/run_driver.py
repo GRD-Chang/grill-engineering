@@ -15,6 +15,7 @@ from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.external_supervision import (
     ExternalSupervisor,
+    supervision_scope,
     clear_supervision_window,
     is_github_refresh_wait,
     is_supervised_wait,
@@ -669,7 +670,8 @@ class RunDriver:
                     return state
                 progress_marker_before_dispatch = _progress_marker(state)
                 try:
-                    outcome = self.operations.dispatch(step, run_id)
+                    with supervision_scope(self.supervisor):
+                        outcome = self.operations.dispatch(step, run_id)
                 except GitHubReadError as error:
                     if is_proven_github_state_contradiction(error.code):
                         raise
@@ -794,7 +796,7 @@ class RunDriver:
     def _pause_ticket_supervision(self, run_id: str, state: dict[str, Any]) -> bool:
         job = state.get("active_ticket_job")
         if (
-            not isinstance(job, dict) or state.get("multi_ticket_protocol") != 3
+            not isinstance(job, dict) or state.get("multi_ticket_protocol") != 4
             or state.get("github_refresh_pending")
             or job.get("phase") in {"blocked", "completed"}
         ):

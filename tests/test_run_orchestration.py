@@ -1692,11 +1692,12 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
 
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["status"] == "progress_exhausted"
+    assert state["status"] == "ready_for_human"
     assert state["terminal_kind"] == "waiting_human"
-    assert state["active_ticket_job"] is None
+    assert state["active_ticket_job"]["ticket_number"] == 2
     assert state["ticket_jobs"]["2"]["phase"] == "blocked"
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
+    independent_head = state["ticket_jobs"]["3"]["integrated_sha"]
     assert "4" not in state["ticket_jobs"]
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
     assert status_view.returncode == 0
@@ -1756,7 +1757,7 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
             )
 
     # The first run and the later resume cover real CLI execution. This
-    # duplicate call only checks that an exhausted Run stays unchanged.
+    # duplicate call only checks that a Run waiting for a human stays unchanged.
     repeated = invoke_cli_inprocess(
         git_repo,
         fixture,
@@ -1769,8 +1770,8 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
 
     assert repeated.returncode == 2
     repeated_state = load_only_run_state(git_repo)
-    assert repeated_state["status"] == "progress_exhausted"
-    assert repeated_state["active_ticket_job"] is None
+    assert repeated_state["status"] == "ready_for_human"
+    assert repeated_state["active_ticket_job"]["ticket_number"] == 2
     assert repeated_state["ticket_jobs"]["3"]["phase"] == "completed"
 
     agent_fixture.write_text(
@@ -1821,6 +1822,10 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
     assert state["ticket_jobs"]["2"]["phase"] == "completed"
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
     assert state["ticket_jobs"]["4"]["phase"] == "completed"
+    assert state["ticket_jobs"]["3"]["integrated_sha"] == independent_head
+    publication_state = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert publication_state["closed_issues"] == [3, 2, 4]
+    assert len(publication_state["pull_requests"]) == 4
     history_json = stdout_json(
         invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
@@ -2253,9 +2258,12 @@ def test_run_recovers_after_process_failure_between_tickets(
 
     assert interrupted.returncode == 2
     failed_state = load_only_run_state(git_repo)
-    assert failed_state["status"] == "execution_failed"
-    assert failed_state["terminal_kind"] == "execution_failed"
+    assert failed_state["status"] == "progress_exhausted"
+    assert failed_state["terminal_kind"] == "waiting_human"
     assert failed_state["ticket_jobs"]["2"]["phase"] == "completed"
+    assert failed_state["ticket_jobs"]["3"]["phase"] == "blocked"
+    assert failed_state["ticket_jobs"]["3"]["blocked_reason"] == "ticket_execution_failed"
+    assert failed_state["ticket_jobs"]["3"]["execution_failure"] == "agent fixture exhausted developments"
     mutable = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable["delivery"]["closed_issues"] == [2]
     assert len(mutable["delivery"]["pull_requests"]) == 1

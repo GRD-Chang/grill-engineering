@@ -248,9 +248,9 @@ def test_branch_failure_refresh_preserves_running_lane(
         assert first["invocation"] is None
         assert any(expected in line for line in _multi_ticket_lines(progress))
         if executor_activity == "not_running":
-            assert multi["development_workers_active"] == 0
+            assert multi["work_slots_active"] == 0
         if executor_activity == "unknown":
-            assert multi["development_workers_active"] is None
+            assert multi["work_slots_active"] is None
     assert json.dumps(saved, sort_keys=True) == before_query
 
 
@@ -1140,17 +1140,32 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> N
     review_entered = Event()
     release_review = Event()
     reviews = {2: 0}
+    repairs: list[int] = []
+
+    def development_gate(number: int) -> None:
+        current = states.load_current_run(str(state["run_id"]))
+        assert current is not None
+        owned = [item for item in current["ticket_work_queue"] if item["ticket_number"] == number]
+        assert len(owned) == 1 and owned[0]["lease_id"] is not None
+        if current["ticket_jobs"][str(number)].get("pending_attempt_kind") == "ci_repair":
+            repairs.append(number)
+            assert current["ticket_integration_holder"] != number
 
     def review_gate(number: int) -> None:
         if number != 2:
             return
         reviews[2] += 1
+        current = states.load_current_run(str(state["run_id"]))
+        assert current is not None
+        owned = [item for item in current["ticket_work_queue"] if item["ticket_number"] == number]
+        assert len(owned) == 1 and owned[0]["lease_id"] is not None
+        assert owned[0]["role"] == "reviewer"
         if reviews[2] == 2:
             review_entered.set()
             assert release_review.wait(timeout=10)
 
     agents = _TicketAgents(
-        git_repo, (2,), lambda _number: None, before_review=review_gate,
+        git_repo, (2,), development_gate, before_review=review_gate,
     )
     path = git_repo / "ticket-2-agents.json"
     agent_data = json.loads(path.read_text(encoding="utf-8"))
@@ -1205,6 +1220,8 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> N
     assert job["blocked_reason"] == "ci_inner_budget_exhausted"
     assert job["ci_recovery"]["checkpoint_reason"] == "ci_inner_budget_exhausted"
     assert "2" not in saved["ticket_pause_requests"]
+    assert repairs == [2, 2]
+    assert saved["ticket_work_queue"] == []
     assert bind_resume_intent(saved, ticket_number=2)["authorization"] == "renew_ci_recovery"
     observed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"])
@@ -1213,7 +1230,7 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> N
     assert observed["ticket_jobs"]["2"]["ci_recovery"]["repairs_used"] == 1
 
 
-def test_one_worker_admits_one_development_lane(git_repo: Path) -> None:
+def test_one_worker_refills_in_fifo_order(git_repo: Path) -> None:
     state, states, git, fixture = _run(git_repo, (2, 3), workers=1)
     started: list[int] = []
     agents = _TicketAgents(git_repo, (2, 3), started.append)
@@ -1224,9 +1241,9 @@ def test_one_worker_admits_one_development_lane(git_repo: Path) -> None:
 
     saved = states.load_current_run(str(state["run_id"]))
     assert saved is not None
-    assert started == [2]
-    assert saved["ticket_jobs"]["2"]["phase"] == "ready_for_integration"
-    assert "3" not in saved["ticket_agent_invocations"]
+    assert started == [2, 3]
+    assert all(saved["ticket_jobs"][str(n)]["phase"] == "ready_for_integration" for n in (2, 3))
+    assert saved["ticket_work_queue"] == []
 
 
 def test_default_capacity_starts_three_without_starting_fourth(
@@ -1273,9 +1290,9 @@ def test_default_capacity_starts_three_without_starting_fourth(
     assert saved is not None
     assert all(
         saved["ticket_jobs"][str(number)]["phase"] == "ready_for_integration"
-        for number in (2, 3, 4)
+        for number in (2, 3, 4, 5)
     )
-    assert "5" not in saved["ticket_agent_invocations"]
+    assert saved["ticket_work_queue"] == []
 
 
 def test_dependency_gate_and_reloaded_ticket_projections(git_repo: Path) -> None:

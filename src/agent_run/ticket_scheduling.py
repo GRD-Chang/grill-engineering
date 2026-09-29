@@ -1,0 +1,164 @@
+"""Bounded development dispatch; program supervision has its own thread."""
+
+from __future__ import annotations
+
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import copy_context
+from time import monotonic
+from typing import Any, Callable, TYPE_CHECKING
+
+from agent_run.external_supervision import ExternalSupervisor
+from agent_run.revisions import TicketGraphDriftError
+from agent_run.runner_credentials import runner_credential_scope
+from agent_run.state import SimulatedProcessCrash
+from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.task_control import TaskControlBusyError
+from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
+from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
+from agent_run.ticket_supervision import development_wait_due
+from agent_run.ticket_work import TicketWorkAdmission, capacity
+
+if TYPE_CHECKING:
+    from agent_run.delivery import TicketDeliveryEngine
+
+
+def develop_frontier(
+    engine: TicketDeliveryEngine, run_id: str, state: dict[str, Any], *,
+    after_lane: Callable[[frozenset[int]], None] | None,
+    supervise: Callable[[frozenset[int]], None] | None,
+) -> bool:
+    from agent_run.delivery import SUPERVISION_POLL_SECONDS, TicketDeliveryEngine
+
+    limit = capacity(state)
+    admission = TicketWorkAdmission(engine.states, run_id)
+
+    def candidates(current: dict[str, Any], active: frozenset[int]) -> tuple[list[int], bool]:
+        ready: list[int] = []
+        waiting = False
+        if current["status"] in RUN_STOP_STATUSES:
+            return ready, waiting
+        for number in current["frontier"]:
+            if number in active:
+                continue
+            job = current["ticket_jobs"].get(str(number), {})
+            if current["ticket_integration_holder"] == number or job.get("phase") not in {
+                None, *DEVELOPMENT_WORKER_PHASES,
+            }:
+                continue
+            if isinstance(job.get("external_wait"), dict):
+                queued = any(item["ticket_number"] == number for item in current["ticket_work_queue"])
+                due = development_wait_due(engine, run_id, number, already_ready=queued)
+                if due is not True:
+                    waiting |= due is False
+                    continue
+            ready.append(number)
+        return ready, waiting
+
+    if not any(
+        state["ticket_integration_holder"] != number
+        and state["ticket_jobs"].get(str(number), {}).get("phase") in {None, *DEVELOPMENT_WORKER_PHASES}
+        for number in state["frontier"]
+    ):
+        return False
+
+    def advance(number: int) -> None:
+        scoped = TicketState(engine.states, run_id, number)
+        try:
+            with runner_credential_scope():
+                TicketDeliveryEngine(
+                    git=engine.git, states=scoped,  # type: ignore[arg-type]
+                    github=engine.github, agents=engine.agents, development_only=True,
+                ).deliver(run_id)
+        except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError, SimulatedProcessCrash):
+            raise
+        except Exception as error:
+            scoped.block_execution_failure(error)
+
+    def observe(lanes: frozenset[int]) -> None:
+        assert supervise is not None
+        with runner_credential_scope():
+            supervise(lanes)
+
+    # Agent capacity comes only from durable leases. Keep bounded room for
+    # returned Agents' program closeout (e.g. a slow currentness read), plus
+    # one reserved supervision thread. Program futures are not Agent permits.
+    pipeline_limit = 2 * limit
+    with ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool:
+        futures: dict[Future[None], int] = {}
+        observer: Future[None] | None = None
+        next_observation = 0.0
+        notify_completion = False
+        while True:
+            current = engine.states.load_current_run(run_id)
+            if current is None:
+                raise ValueError("Delivery Run disappeared during dispatch")
+            active = frozenset(futures.values())
+            ready, pending_wait = candidates(current, active)
+            admission.seed([number for number in ready if number not in active])
+            current = engine.states.load_current_run(run_id)
+            assert current is not None
+            if notify_completion and after_lane is not None and (
+                (not futures and not ready) or any(item["lease_id"] is not None for item in current["ticket_work_queue"])
+            ):
+                after_lane(frozenset(futures.values()))
+                notify_completion = False
+            waiting = [item["ticket_number"] for item in current["ticket_work_queue"] if item["lease_id"] is None]
+            occupied = sum(
+                item["lease_id"] is not None or item["ticket_number"] in active
+                for item in current["ticket_work_queue"]
+            )
+            for number in ready:
+                if len(futures) >= pipeline_limit:
+                    break
+                if number not in active and str(number) in current["ticket_pause_requests"]:
+                    futures[pool.submit(copy_context().run, advance, number)] = number
+            # Queue order, not role or a new thread's startup order, owns priority.
+            for number in waiting:
+                if occupied >= limit or len(futures) >= pipeline_limit:
+                    break
+                if number not in ready or number in active:
+                    break
+                futures[pool.submit(copy_context().run, advance, number)] = number
+                occupied += 1
+            if observer is not None and observer.done():
+                observer.result()
+                observer = None
+                next_observation = monotonic() + SUPERVISION_POLL_SECONDS
+            if not futures and not ready and not pending_wait:
+                break
+            if supervise is not None and observer is None and monotonic() >= next_observation:
+                observer = pool.submit(copy_context().run, observe, frozenset(futures.values()))
+            watched = set(futures)
+            if observer is not None:
+                watched.add(observer)
+            if watched:
+                done, _ = wait(watched, timeout=min(0.05, SUPERVISION_POLL_SECONDS), return_when=FIRST_COMPLETED)
+            else:
+                done = set()
+            for future in done:
+                if future is observer:
+                    continue
+                future.result()
+                number = futures.pop(future)
+                latest = engine.states.load_current_run(run_id)
+                queued = latest is not None and any(
+                    item["ticket_number"] == number for item in latest["ticket_work_queue"]
+                )
+                notify_completion |= not queued
+            if not futures and pending_wait and not ready and (observer is None or observer.done()):
+                supervisor = ExternalSupervisor()
+                now = supervisor.now()
+                deadlines = [
+                    window[key] - now
+                    for job in current["ticket_jobs"].values()
+                    if isinstance(external_wait := job.get("external_wait"), dict)
+                    if isinstance(window := external_wait.get("supervision_window"), dict)
+                    for key in ("next_retry_at", "deadline")
+                    if isinstance(window.get(key), (int, float)) and window[key] > now
+                ]
+                supervisor.sleeper(min([SUPERVISION_POLL_SECONDS, *deadlines]))
+        if observer is not None:
+            observer.result()
+        if supervise is not None:
+            supervise(frozenset())
+    return True

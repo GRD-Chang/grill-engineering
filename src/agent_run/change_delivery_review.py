@@ -97,7 +97,10 @@ def review(
             request["_invocation_mode"] = "new-thread"
         elif job.get("review_failure_resume") is True:
             request["_invocation_mode"] = "resume"
-        review = stage.agents.review(request)
+        try:
+            review = stage.agents.review(request)
+        finally:
+            stage.release_agent_work()
     finally:
         stage.git.remove_worktree(validation)
     clear_initial_credential_wait(state, work_subject=stage.contract.label)

@@ -83,6 +83,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
                     stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0)
     stage = SimpleNamespace(
         require_agent_work=lambda _role: None,
+        release_agent_work=lambda: None,
         adapter=SimpleNamespace(
             invocation_identity=lambda state, job: (subject, 1),
             development_request=lambda state, job, checkout: {"thread_id": job.get("development_thread_id")},

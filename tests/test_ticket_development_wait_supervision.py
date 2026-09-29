@@ -110,3 +110,83 @@ def test_development_wait_is_supervised_before_other_agent_returns(
         release_read.set()
         thread.join(10)
     assert not thread.is_alive() and not errors, errors
+
+
+@pytest.mark.parametrize("wait_kind", ["branch", "credential"])
+def test_preparation_wait_leaves_fifo_and_expires_while_work_slot_is_full(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, wait_kind: str,
+) -> None:
+    import agent_run.delivery as delivery
+    import agent_run.external_supervision as supervision
+    import agent_run.ticket_supervision as ticket_supervision
+
+    monkeypatch.setattr(delivery, "SUPERVISION_POLL_SECONDS", 0.02)
+    clock = [100.0]
+    monkeypatch.setattr(supervision, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ticket_supervision, "ExternalSupervisor",
+                        lambda: supervision.ExternalSupervisor(now=lambda: clock[0]))
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = state["run_id"]
+    entered, release, expired = Event(), Event(), Event()
+    retries: list[int] = []
+    original = FixtureGitHubPublisher.ensure_ticket_branch
+
+    def prepare(publisher: FixtureGitHubPublisher, **kwargs: Any) -> None:
+        if kwargs["ticket_number"] != 2 or wait_kind != "branch":
+            original(publisher, **kwargs)
+            return
+        current = states.load_current_run(run_id)
+        wait = current["ticket_jobs"]["2"].get("external_wait", {})
+        retry = wait.get("supervision_window", {}).get("retry_count", 0)
+        assert not retries or retry > retries[-1], "preparation bypassed durable backoff"
+        retries.append(retry)
+        raise GitHubReadError("github_read_failed", "branch preparation unavailable")
+
+    def develop(number: int) -> None:
+        if number == 2 and wait_kind == "credential":
+            from agent_run.credential_lifecycle import InitialCredentialUnavailable
+
+            current = states.load_current_run(run_id)
+            wait = current["ticket_jobs"]["2"].get("external_wait", {})
+            retry = wait.get("supervision_window", {}).get("retry_count", 0)
+            assert not retries or retry > retries[-1], "credential retry bypassed backoff"
+            retries.append(retry)
+            raise InitialCredentialUnavailable("issuer unavailable")
+        assert number == 3
+        entered.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "ensure_ticket_branch", prepare)
+    states.run_saved_observer = lambda value: expired.set() if value["ticket_jobs"].get("2", {}).get("blocked_reason") == "ticket_supervision_timeout" else None
+    agents = TicketAgents(git_repo, (2, 3), develop)
+    engine = ticket_engine(git, states, fixture, agents)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            engine.develop_frontier(run_id, state, supervise=lambda lanes: engine.supervise(run_id, lanes))
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(10), errors
+        current = states.load_current_run(run_id)
+        wait = current["ticket_jobs"]["2"]["external_wait"]
+        clock[0] = wait["supervision_window"]["deadline"] + 1
+        assert expired.wait(10), errors
+        assert not release.is_set()
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive() and not errors, errors
+    final = states.load_current_run(run_id)
+    assert final["ticket_jobs"]["2"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert final["ticket_work_queue"] == []
+    if wait_kind == "credential":
+        job = final["ticket_jobs"]["2"]
+        assert job["review_budget"]["development_attempts"] == 0
+        assert "2" not in final["ticket_agent_invocations"] or final["ticket_agent_invocations"]["2"] is None
+        assert not any(item.get("work_subject") == "ticket:2" for item in final["agent_invocation_history"])
+        assert job["supervision_wait"]["deadline"] == wait["supervision_window"]["deadline"]

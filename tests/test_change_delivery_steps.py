@@ -34,7 +34,12 @@ def test_ticket_steps_yield_agent_work_then_finish_current_ci_without_agent(
 
     class Agents(PassAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            current = states.load_current_run(run_id)
+            assert current is not None
+            owned = [item for item in current["ticket_work_queue"] if item["ticket_number"] == 3]
+            assert len(owned) == 1 and owned[0]["lease_id"] is not None
             if request.get("repair_source") == "merge_conflict":
+                assert owned[0]["role"] == "integration_conflict"
                 self.development_requests.append(request)
                 (checkout / "delivered.txt").write_text("first attempt\nexternal\n")
                 return DevelopmentResult(thread_id="development-thread-1", summary="Resolved both contributions")

@@ -22,6 +22,7 @@ from support.cli import (
     stdout_json,
 )
 from support.cli_payloads import passing_acceptance, publication, repair_acceptance, ticket
+from support.cli_crash import run_cli_at_development_boundary
 
 
 def _assert_credential_wait_is_not_public(
@@ -1213,15 +1214,14 @@ def test_status_and_history_show_started_development_attempt(
     agents = _run_agents(git_repo / "agents.json")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_cli_at_development_boundary(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
         str(agents),
-        "--crash-after-save",
-        "8",
+        boundary="running",
     )
 
     assert interrupted.returncode == 2

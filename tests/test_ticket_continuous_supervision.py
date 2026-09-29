@@ -82,7 +82,7 @@ def test_ci_green_closes_and_cleans_ticket_before_occupied_lanes_return(
         current = states.load_current_run(run_id)
         assert current is not None
         progress = multi_ticket_progress(current, executor_activity='running')
-        assert progress is not None and progress['development_workers_active'] == workers
+        assert progress is not None and progress['work_slots_active'] == workers
         assert current['ticket_jobs']['2']['external_wait']['supervision_window']['deadline'] == deadline
         green.set()
         clock[0] += 61

@@ -279,6 +279,10 @@ class StateStore:
         from agent_run.ticket_state import capture_ticket_wait
 
         capture_ticket_wait(state)
+        if "ticket_work_queue" in state:
+            from agent_run.ticket_work import reconcile
+
+            reconcile(state)
         durable_state = _sanitize_durable_errors(state)
         if "run_id" in durable_state:
             _append_timeline_event(durable_state, previous)

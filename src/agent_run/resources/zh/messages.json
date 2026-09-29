@@ -265,7 +265,7 @@
   "cli.parent_rounds_help": "Parent-only Development/Review 配对轮数（推导 D=N/R=N）",
   "cli.repair_rounds_help": "Parent 集成窗口问题修复上限（默认 3；首次审核另计）",
   "cli.ticket_rounds_help": "Ticket Review 语义轮数（推导 Development=N+1）",
-  "cli.ticket_development_workers_help": "每个 Run 并行 Ticket 开发与审核上限（默认 3；设为 1 时串行）",
+  "cli.ticket_development_workers_help": "每个 Run 同时执行 Agent 工作的 Ticket 上限（默认 3；包含开发、审核、CI 修复、冲突与发布文案；等待 CI 不占名额）",
   "cli.integration_resync_limit_help": "首次集成后，每个交付对象最多自动重新同步次数（默认 3）",
   "cli.ci_recovery_rounds_help": "每个交付对象的 CI 恢复轮数（默认 3）",
   "cli.ci_repairs_per_round_help": "每轮 CI 恢复的开发修复次数（默认 3）",

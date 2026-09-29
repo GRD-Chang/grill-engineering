@@ -819,11 +819,11 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
         return []
     zh = display_language() == "zh"
     holder = multi.get("integration_holder")
-    limit = multi.get("development_worker_limit")
+    limit = multi.get("work_concurrency_limit")
     lines = [
-        f"开发 Worker 上限：{limit}；集成席位：{f'Ticket #{holder}' if holder is not None else '空闲'}"
+        f"Ticket Agent 工作上限：{limit}；集成席位：{f'Ticket #{holder}' if holder is not None else '空闲'}"
         if zh else
-        f"Development Worker limit: {limit}; integration holder: {f'Ticket #{holder}' if holder is not None else 'free'}"
+        f"Ticket Agent work limit: {limit}; integration holder: {f'Ticket #{holder}' if holder is not None else 'free'}"
     ]
     executor_activity = multi.get("executor_activity")
     activity_key = {
@@ -842,7 +842,12 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
         parts = [f"Ticket #{item.get('ticket_number')}: {phase_label}"]
         position = item.get("queue_position")
         if type(position) is int:
-            parts.append(f"队列第 {position} 位" if zh else f"queue #{position}")
+            parts.append(f"集成队列第 {position} 位" if zh else f"integration queue #{position}")
+        work_position = item.get("work_queue_position")
+        if type(work_position) is int:
+            parts.append(f"等待工作名额，第 {work_position} 位" if zh else f"waiting for work slot #{work_position}")
+        if item.get("has_work_slot") and executor_activity == "running":
+            parts.append("正在工作" if zh else "working")
         if item.get("holds_integration"):
             parts.append("持有集成席位" if zh else "holds integration")
         usage = item.get("usage")

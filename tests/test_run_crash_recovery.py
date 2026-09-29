@@ -8,7 +8,7 @@ import pytest
 
 from support.workspace import managed_state
 
-from agent_run.state import StateStore
+from agent_run.state import FaultInjectingStateStore, SimulatedProcessCrash, StateStore
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
@@ -93,6 +93,7 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     job = state["ticket_jobs"]["2"]
     assert state["status"] == "run_approval_pending"
     assert job["phase"] == "completed"
+    assert state["ticket_work_queue"] == []
     assert job["validation_attempts"] >= 1
     record = job["acceptance_record"]
     assert record["reviewed_candidate_sha"] == job["candidate_sha"]
@@ -204,7 +205,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
 
 
 def test_public_resume_recovers_completed_invocation_with_pending_attempt(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket()}
@@ -214,6 +215,21 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
     )
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
+    def crash_after_completed_invocation(store: FaultInjectingStateStore) -> None:
+        current = store.load_run(run_id)
+        invocation = (current or {}).get("active_agent_invocation") or {}
+        if (
+            not store.injected and invocation.get("status") == "completed"
+            and invocation.get("semantic_attempt", {}).get("status") == "pending"
+        ):
+            store.injected = True
+            raise SimulatedProcessCrash("completed Invocation before attempt settlement")
+
+    # Target the durable semantic boundary, independent of queue save counts.
+    monkeypatch.setattr(
+        FaultInjectingStateStore, "_after_run_saved", crash_after_completed_invocation,
+    )
+
     interrupted = run_internal_stage(
         git_repo,
         fixture,
@@ -222,7 +238,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
         "--agent-fixture",
         str(first_agents),
         "--crash-after-save",
-        "10",
+        "1",
     )
 
     assert interrupted.returncode == 2

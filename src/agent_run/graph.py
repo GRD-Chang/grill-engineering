@@ -109,7 +109,7 @@ def state_from_graph(
             selected = continuing if continuing in frontier else frontier[0]
         active = ticket_jobs.get(str(selected), {"ticket_number": selected})
         active["selection_reason"] = (
-            "integration queue, development worker limit, then eligible ticket order"
+            "Ticket work queue, integration queue, then eligible ticket order"
         )
         previous_graph = previous.get("ticket_graph")
         if str(selected) in ticket_jobs and isinstance(previous_graph, dict):

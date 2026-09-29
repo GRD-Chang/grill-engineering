@@ -67,7 +67,7 @@ def multi_ticket_progress(
 ) -> dict[str, Any] | None:
     """Project the persisted Ticket queue and local Job facts for status only."""
 
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 3:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 4:
         return None
     if state.get("delivery_type") == "parent_only":
         return None
@@ -86,6 +86,9 @@ def multi_ticket_progress(
         if isinstance(item, dict) and type(item.get("ticket_number")) is int
     }
     holder = state.get("ticket_integration_holder")
+    work_queue = state.get("ticket_work_queue", [])
+    work_waiters = [item["ticket_number"] for item in work_queue if item["lease_id"] is None]
+    working = {item["ticket_number"] for item in work_queue if item["lease_id"] is not None}
     details = []
     for key in sorted(ticket_map, key=lambda value: int(value)):
         ticket = ticket_map[key]
@@ -170,6 +173,8 @@ def multi_ticket_progress(
             "ticket_number": number,
             "phase": phase,
             "queue_position": queued.get(number),
+            "work_queue_position": work_waiters.index(number) + 1 if number in work_waiters else None,
+            "has_work_slot": number in working,
             "holds_integration": number == holder,
             "required_checks": job_data.get("required_checks_evidence"),
             "supervision": _ticket_supervision_snapshot(state, job_data),
@@ -193,13 +198,8 @@ def multi_ticket_progress(
     snapshot = state.get("policy_snapshot")
     return {
         "executor_activity": executor_activity,
-        "development_worker_limit": snapshot.get("ticket_development_workers") if isinstance(snapshot, dict) else None,
-        "development_workers_active": sum(
-            isinstance(invocation, dict)
-            and invocation.get("status") in {"running", "resuming"}
-            and invocation.get("role") in {"development", "fresh_acceptance"}
-            for invocation in invocation_map.values()
-        ) if executor_activity == "running" else 0 if executor_activity == "not_running" else None,
+        "work_concurrency_limit": snapshot.get("ticket_development_workers") if isinstance(snapshot, dict) else None,
+        "work_slots_active": len(working) if executor_activity == "running" else 0 if executor_activity == "not_running" else None,
         "integration_queue": [dict(item) for item in queue_items if isinstance(item, dict)],
         "integration_holder": holder,
         "tickets": details,

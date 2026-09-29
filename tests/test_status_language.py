@@ -109,7 +109,7 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
     from agent_run.messages import presentation_language
 
     state = {
-        "multi_ticket_protocol": 3,
+        "multi_ticket_protocol": 4,
         "policy_snapshot": {
             "ticket_development_workers": 2,
             "ticket_review_rounds": 3,
@@ -140,7 +140,7 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
     assert ticket_progress(state) == {"completed": 0, "total": 3}
     progress = multi_ticket_progress(state)
     assert progress is not None
-    assert progress["development_worker_limit"] == 2
+    assert progress["work_concurrency_limit"] == 2
     assert progress["integration_holder"] == 2
     assert progress["integration_queue"] == state["ticket_integration_queue"]
     assert progress["tickets"][0]["holds_integration"] is True
@@ -163,7 +163,7 @@ def test_multi_ticket_status_does_not_offer_unsupported_resume() -> None:
     from agent_run.delivery_facts import multi_ticket_progress
 
     state = {
-        "multi_ticket_protocol": 3,
+        "multi_ticket_protocol": 4,
         "repository": "example/project", "parent": {"number": 1},
         "ticket_graph": {"tickets": {"2": {"blocked_by": []}}},
         "ticket_jobs": {"2": {

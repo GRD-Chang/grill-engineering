@@ -57,6 +57,7 @@ from support.cli_fixtures import run_agents
 from support.cli_supervision import _parent_only_agents
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import ticket
+from support.cli_crash import DevelopmentBoundary, run_cli_at_development_boundary
 
 
 def _assert_public_action_receipt(
@@ -1526,15 +1527,14 @@ def test_receipt_only_control_closes_once_after_exact_host_exit_proof(
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / f"host-exit-{control_case}")
-    interrupted = run_cli(
+    interrupted = run_cli_at_development_boundary(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
         str(agents),
-        "--crash-after-save",
-        "11",
+        boundary="running",
         extra_env=environment,
     )
     assert interrupted.returncode == 2
@@ -2211,16 +2211,16 @@ def test_run_can_replace_a_terminal_receipt_with_a_successor_action(
 
 @pytest.mark.parametrize(
     (
-        "crash_after_save",
+        "crash_boundary",
         "expected_development_invocations",
         "initial_invocation_status",
     ),
-    [(3, 0, None), (11, 1, "running"), (13, 1, "completed")],
+    [("before_invocation", 0, None), ("running", 1, "running"), ("completed", 1, "completed")],
 )
 def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     git_repo: Path,
     tmp_path: Path,
-    crash_after_save: int,
+    crash_boundary: DevelopmentBoundary,
     expected_development_invocations: int,
     initial_invocation_status: str | None,
 ) -> None:
@@ -2228,15 +2228,14 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "receipt-crash")
 
-    interrupted = run_cli(
+    interrupted = run_cli_at_development_boundary(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
         str(agents),
-        "--crash-after-save",
-        str(crash_after_save),
+        boundary=crash_boundary,
         extra_env=environment,
     )
     assert interrupted.returncode == 2
@@ -2335,7 +2334,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert recovered_control["action"]["status"] == (
         "completed" if expected_development_invocations == 1 else "failed"
     )
-    if crash_after_save == 3:
+    if crash_boundary == "before_invocation":
         resumed = run_cli(
             git_repo,
             fixture,
@@ -2353,27 +2352,26 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
 
 
 @pytest.mark.parametrize(
-    ("crash_after_save", "expected_invocation_status"),
-    [(3, None), (11, "running"), (13, "completed")],
+    ("crash_boundary", "expected_invocation_status"),
+    [("before_invocation", None), ("running", "running"), ("completed", "completed")],
 )
 def test_session_closeout_retries_only_the_control_commit(
     git_repo: Path,
     tmp_path: Path,
-    crash_after_save: int,
+    crash_boundary: DevelopmentBoundary,
     expected_invocation_status: str | None,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "session-closeout")
-    interrupted = run_cli(
+    interrupted = run_cli_at_development_boundary(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
         str(agents),
-        "--crash-after-save",
-        str(crash_after_save),
+        boundary=crash_boundary,
         extra_env=environment,
     )
     assert interrupted.returncode == 2
@@ -2666,15 +2664,14 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "public-reconciliation")
-    first = run_cli(
+    first = run_cli_at_development_boundary(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
         str(agents),
-        "--crash-after-save",
-        "9",
+        boundary="running",
         extra_env=environment,
     )
     assert first.returncode == 2, f"{first.stdout}\n{first.stderr}"
@@ -2689,6 +2686,8 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
     fixture_before = fixture.read_bytes()
     agents_before = agents.read_bytes()
     invocation_history_before = json.loads(state_before)["agent_invocation_history"]
+    assert len(invocation_history_before) == 1
+    assert invocation_history_before[0]["status"] == "running"
     if control_case == "missing":
         control_path.unlink()
     else:

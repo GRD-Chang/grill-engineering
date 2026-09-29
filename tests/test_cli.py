@@ -5061,7 +5061,7 @@ def test_frontier_uses_native_dependencies_labels_state_and_parent_order(
     assert state["frontier"] == [10, 5, 2]
     assert state["active_ticket_job"] == {
         "ticket_number": 10,
-        "selection_reason": "integration queue, development worker limit, then eligible ticket order",
+        "selection_reason": "Ticket work queue, integration queue, then eligible ticket order",
     }
     tickets = state["ticket_graph"]["tickets"]
     assert tickets["9"]["eligibility"]["reason"] == "blocked_by_open_issues"
