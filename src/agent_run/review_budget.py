@@ -102,6 +102,31 @@ def policy_for_subject(label: str) -> ReviewBudgetPolicy:
     return RUN_POLICY
 
 
+def review_budget_owner(subject: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the sole live owner of a Run's shared review window.
+
+    Ownership moves to Run Repair while that Job exists. The Run keeps its
+    own acceptance identity and attempts, but no mutable budget mirror.
+    """
+
+    repair = subject.get("repair_job")
+    return repair if isinstance(repair, dict) else subject
+
+
+def remove_repair_job(run: dict[str, Any]) -> None:
+    """Return the live window to Run Acceptance before removing its Repair."""
+
+    repair = run.get("repair_job")
+    if not isinstance(repair, dict):
+        return
+    for key in ("review_budget", "review_budget_history"):
+        if key in run or key not in repair:
+            raise ValueError("Run review budget must have exactly one owner")
+    run.pop("repair_job")
+    for key in ("review_budget", "review_budget_history"):
+        run[key] = repair.pop(key)
+
+
 def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudget:
     """Validate the canonical, durable budget projection.
 
@@ -109,6 +134,7 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     to infer a new budget from legacy counters.
     """
 
+    job = review_budget_owner(job)
     if "review_budget" not in job:
         raise ValueError("missing canonical review_budget")
     raw = job["review_budget"]
@@ -277,6 +303,8 @@ def _validate_budget_history(
 def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudget:
     """Open a new numbered window while retaining historical state elsewhere."""
 
+    subject = job
+    job = review_budget_owner(subject)
     current = ensure_budget(job, policy)
     history = job["review_budget_history"]
     if not isinstance(history, list):
@@ -291,14 +319,18 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     history.append(snapshot)
     next_window = int(current["window"]) + 1
     job["review_budget"] = new_budget(window=next_window)
-    clear_required_checks_observation(job)
-    job["modification_attempts"] = 0
-    job["validation_attempts"] = 0
-    job.pop("last_review_candidate_sha", None)
-    job.pop("publication_authority", None)
-    job.pop("fallback_publication_receipt", None)
-    job.pop("deterministic_integration_record", None)
-    job.pop("final_ci_fix_failure_head", None)
+    # Acceptance keeps its own role progress even while Repair owns the
+    # window. Reset both live roles, while archiving the budget only once.
+    for progress in ([job] if subject is job else [job, subject]):
+        clear_required_checks_observation(progress)
+        progress["modification_attempts"] = 0
+        progress["validation_attempts"] = 0
+        for key in (
+            "last_review_candidate_sha", "publication_authority",
+            "fallback_publication_receipt", "deterministic_integration_record",
+            "final_ci_fix_failure_head",
+        ):
+            progress.pop(key, None)
     return cast(ReviewBudget, job["review_budget"])
 
 
@@ -310,7 +342,7 @@ def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
     review entry is therefore the only safe source for Reviewer 2+ context.
     """
 
-    budget = job.get("review_budget")
+    budget = review_budget_owner(job).get("review_budget")
     if not isinstance(budget, dict):
         return None
     artifacts = budget.get("review_artifacts")

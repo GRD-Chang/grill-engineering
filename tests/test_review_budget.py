@@ -28,6 +28,8 @@ from agent_run.review_budget import (
     repair_budget_context,
     reset_budget,
     reviewer_budget_context,
+    remove_repair_job,
+    review_budget_owner,
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
 
@@ -382,87 +384,73 @@ def test_ticket_budget_resume_opens_new_window_and_preserves_repair_evidence() -
     ] == 3
 
 
-def test_run_repair_review_counts_share_the_run_window() -> None:
+def test_run_repair_owns_one_persisted_run_window() -> None:
+    import json
+
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
-    policy_snapshot = DeliveryPolicy().snapshot()
-    run: dict[str, object] = {
-        "policy_snapshot": policy_snapshot,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 0,
-            "reviewer_invocations": 3,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
+    job = _job_with_budget(
+        policy_snapshot=DeliveryPolicy().snapshot(), phase="reviewing",
+    )
+    job["review_budget"]["reviewer_invocations"] = 3
+    run = {
+        "policy_snapshot": DeliveryPolicy().snapshot(),
+        "repair_job": job,
         "repair_cycle": {"generation": 1},
     }
-    job: dict[str, object] = {
-        "policy_snapshot": policy_snapshot,
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 0,
-            "reviewer_invocations": 3,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-    }
+    run = json.loads(json.dumps(run))
+    job = run["repair_job"]
     mark_review(job, RUN_POLICY)
     sync_repair_cycle_counters(run, job)
-    assert run["review_budget"]["reviewer_invocations"] == 4
+    assert ensure_budget(run, RUN_POLICY)["reviewer_invocations"] == 4
+    assert not can_start_review(run, RUN_POLICY)
+    assert "review_budget" not in run
+    assert "review_budget_history" not in run
+    budget = job["review_budget"]
+    history = job["review_budget_history"]
+    remove_repair_job(run)
+    assert run["review_budget"] is budget
+    assert run["review_budget_history"] is history
+    assert "repair_job" not in run
+    assert not can_start_review(run, RUN_POLICY)
 
 
-def test_run_repair_sync_uses_frozen_limits_for_both_budget_projections() -> None:
+def test_run_repair_budget_uses_frozen_limits_and_retains_one_history() -> None:
+    from agent_run.delivery_policy import run_repair_budget_policy
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
     policy = DeliveryPolicy(run_repair_rounds=2)
-    run: dict[str, object] = {
+    job = _job_with_budget(policy_snapshot=policy.snapshot(), phase="blocked")
+    job["review_budget"].update({
+        "development_attempts": 2,
+        "reviewer_invocations": 3,
+        "review_artifacts": [
+            {"review_identity": {"attempt_id": f"r{ordinal}"}}
+            for ordinal in range(1, 4)
+        ],
+        "checkpoint_reason": "review_budget_exhausted",
+    })
+    run = {
         "policy_snapshot": policy.snapshot(),
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 1,
-            "reviewer_invocations": 2,
-            "final_ci_fix_used": False,
-            "review_artifacts": [
-                {"review_identity": {"attempt_id": "r1"}},
-                {"review_identity": {"attempt_id": "r2"}},
-            ],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
+        "repair_job": job,
         "repair_cycle": {"generation": 1},
+        "validation_attempts": 1,
     }
-    job: dict[str, object] = {
-        "policy_snapshot": policy.snapshot(),
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 2,
-            "reviewer_invocations": 3,
-            "final_ci_fix_used": False,
-            "review_artifacts": [
-                {"review_identity": {"attempt_id": "r2"}},
-                {"review_identity": {"attempt_id": "r3"}},
-            ],
-            "checkpoint_reason": "review_budget_exhausted",
-        },
-        "review_budget_history": [],
-    }
-
     sync_repair_cycle_counters(run, job)
-
-    assert run["review_budget"] == job["review_budget"]
-    assert run["review_budget"]["development_attempts"] == 2
-    assert run["review_budget"]["reviewer_invocations"] == 3
-    assert len(run["review_budget"]["review_artifacts"]) == 3
-    assert run["review_budget"]["checkpoint_reason"] == "review_budget_exhausted"
+    budget_policy = run_repair_budget_policy(policy)
+    assert not can_start_development(run, budget_policy)
+    assert not can_start_review(run, budget_policy)
+    reset_budget(run, budget_policy)
+    assert review_budget_owner(run) is job
+    assert run["validation_attempts"] == 0
+    assert job["review_budget"]["window"] == 2
+    assert len(job["review_budget_history"]) == 1
+    archived = job["review_budget_history"][0]["review_budget"]
+    assert archived["development_attempts"] == 2
+    assert archived["reviewer_invocations"] == 3
+    assert len(archived["review_artifacts"]) == 3
+    assert archived["checkpoint_reason"] == "review_budget_exhausted"
+    assert "review_budget_history" not in run
 
 
 def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -> None:

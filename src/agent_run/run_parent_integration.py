@@ -12,7 +12,6 @@ from agent_run.change_delivery_threads import (
     record_development_thread,
     require_development_thread,
 )
-from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.git import GitError
 from agent_run.integration_resync_budget import (
     ResyncBudgetExhausted,
@@ -23,7 +22,7 @@ from agent_run.parent_integration import (
     finish_parent_snapshot_conflict,
     prepare_parent_snapshot,
 )
-from agent_run.review_budget import reset_budget
+from agent_run.review_budget import reset_budget, review_budget_owner
 from agent_run.run_currentness import invalidate_run_acceptance, ticket_completion_records
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
@@ -269,12 +268,6 @@ def observe_run_repair_snapshot(
                 if key in repair
             }
             reset_budget(run, owner._run_budget_policy(state, run))
-            reset_budget(
-                repair,
-                run_repair_budget_policy_for_job(
-                    repair, state_snapshot=run.get("policy_snapshot")
-                ),
-            )
             repair.update(repair_ordinals)
             run["reviewed_integration_window"] = current_window
             owner._sync_repair_cycle_counters(run, repair)
@@ -325,7 +318,7 @@ def _resolve_conflict(
             generation=int(run["acceptance_generation"]),
             currentness_boundary=boundary,
             ordinal=ordinal,
-            budget_window=int(run["review_budget"]["window"]),
+            budget_window=int(review_budget_owner(run)["review_budget"]["window"]),
         )
         request = {
             "acceptance_scope": "run",

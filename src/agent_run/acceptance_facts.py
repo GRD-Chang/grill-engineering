@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import Any
+
+from agent_run.review_budget import review_budget_owner
 from agent_run.delivery_facts import current_work_subject
 
 def current_findings(state: dict[str, Any]) -> list[str]:
@@ -89,7 +91,7 @@ def current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
             return artifact
         return None
 
-    budget = subject.get("review_budget")
+    budget = review_budget_owner(subject).get("review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     if isinstance(artifacts, list):
         for review in reversed(artifacts):
@@ -298,7 +300,7 @@ def has_prior_acceptance_failure(subject: dict[str, Any]) -> bool:
             and artifact_has_failures(artifact)
         ):
             return True
-    budget = subject.get("review_budget")
+    budget = review_budget_owner(subject).get("review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     if not isinstance(artifacts, list):
         return False

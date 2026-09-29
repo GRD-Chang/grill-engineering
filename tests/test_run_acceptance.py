@@ -302,9 +302,10 @@ def test_run_repair_review_budget_stops_at_r_n_plus_one_without_development_n_pl
     assert run["blocked_reason"] == "review_budget_exhausted"
     assert len(agents.development_requests) == 1
     assert len(agents.review_requests) == 2
-    assert run["review_budget"]["development_attempts"] == 1
-    assert run["review_budget"]["reviewer_invocations"] == 2
-    assert job["review_budget"] == run["review_budget"]
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 2
+    assert "review_budget" not in run
+    assert "review_budget_history" not in run
     assert job["phase"] == "blocked"
 
 
@@ -893,8 +894,6 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
         "reviewer_thread_ids": [],
         "development_thread_id": None,
         "development_thread_history": [],
-        "review_budget": deepcopy(exhausted_budget),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "blocked",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -905,6 +904,8 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
             "candidate_sha": candidate,
             "development_thread_id": thread_id,
             "development_thread_history": thread_history,
+            "modification_attempts": 0,
+            "validation_attempts": 0,
             "review_budget": exhausted_budget,
             "review_budget_history": [],
         },
@@ -1766,6 +1767,8 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
         "repair_mode": "squash",
         "acceptance_artifact": _repair_artifact(),
     }
+    job["review_budget"] = run.pop("review_budget")
+    job["review_budget_history"] = run.pop("review_budget_history")
     run["repair_job"] = job
 
     RunRepairPublisher(engine, RunRepairPromotion(engine)).invalidate_stale(

@@ -76,8 +76,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         job = common
         job.update(repair_generation=1, repair_mode="squash", policy_snapshot=dict(state["policy_snapshot"]))
         state["run_acceptance"] = dict(phase="repairing", repair_job=job,
-            policy_snapshot=dict(state["policy_snapshot"]), review_budget=new_budget(),
-            review_budget_history=[], ci_recovery=new_ci_recovery_budget())
+            policy_snapshot=dict(state["policy_snapshot"]), ci_recovery=new_ci_recovery_budget())
         subject = f"run-repair:{state['run_id']}"
         key = "run_repair_integration_conflict"
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,

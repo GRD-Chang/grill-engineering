@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_run.operator_gate import operator_gate_subjects
-from agent_run.review_budget import budget_checkpoint_subjects
+from agent_run.review_budget import budget_checkpoint_subjects, review_budget_owner
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.task_control import TaskControlError
 
@@ -155,12 +155,13 @@ def bind_resume_intent(
         "subjects": [
             {
                 "location": location,
+                "review_budget": review_budget_owner(subject).get("review_budget"),
                 **{
                     key: subject.get(key)
                     for key in (
                         "ticket_number", "generation", "acceptance_generation",
                         "candidate_sha", "phase", "blocked_reason", "human_blockers",
-                        "pending_semantic_attempt", "review_budget", "integration_resync",
+                        "pending_semantic_attempt", "integration_resync",
                         "ci_recovery", "publication_operation_retry",
                     )
                 },

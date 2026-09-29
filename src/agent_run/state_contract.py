@@ -17,6 +17,7 @@ from agent_run.delivery_policy import (
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,
+    review_budget_owner,
 )
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
@@ -222,6 +223,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_active_run_repair_mode(state)
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
+    from agent_run.review_attempt import require_pending_run_review
+
+    run_review = state.get("run_acceptance")
+    if isinstance(run_review, dict):
+        require_pending_run_review(run_review)
     _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
     _require_human_response_audit(state)
     if not operator_gate_identity_is_consistent(state):
@@ -797,17 +803,12 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                 run_snapshot = value.get("policy_snapshot") or state.get(
                     "policy_snapshot"
                 )
-                run_budget = value.get("review_budget")
-                repair_budget = repair.get("review_budget")
-                if (
-                    isinstance(run_budget, dict)
-                    and isinstance(repair_budget, dict)
-                    and type(run_budget.get("window")) is int
-                    and type(repair_budget.get("window")) is int
-                    and run_budget["window"] != repair_budget["window"]
+                if any(
+                    field in value
+                    for field in ("review_budget", "review_budget_history")
                 ):
                     raise IncompatibleRunStateError(
-                        "legacy state has mismatched Run Acceptance and Run Repair Budget Windows"
+                        "Run Acceptance and Run Repair must have one Review Budget owner"
                     )
                 if repair.get("publication_authority") == "fallback" or (
                     "fallback_publication_receipt" in repair
@@ -1891,7 +1892,7 @@ def _require_owner_attempt(
                 f"run state has an invalid Publication Budget Window at {location}"
             )
         return
-    budget = owner.get("review_budget")
+    budget = review_budget_owner(owner).get("review_budget")
     current_window = budget.get("window") if isinstance(budget, dict) else None
     if (
         type(current_window) is not int
@@ -1935,7 +1936,7 @@ def _require_pending_invocation_attempt(
         )
     budget_window = pending.get("budget_window")
     if budget_window is not None:
-        budget = owner.get("review_budget")
+        budget = review_budget_owner(owner).get("review_budget")
         if not isinstance(budget, dict) or budget.get("window") != budget_window:
             raise IncompatibleRunStateError(
                 "run state has a pending Semantic Agent Attempt in the wrong Budget Window"

@@ -8,6 +8,8 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from agent_run.review_budget import review_budget_owner
+
 
 def semantic_attempt_subjects(
     state: dict[str, Any],
@@ -134,7 +136,7 @@ def allocate_semantic_attempt(
         **identity,
         "status": "pending",
     }
-    budget = subject.get("review_budget")
+    budget = review_budget_owner(subject).get("review_budget")
     if budget_window is not None and isinstance(budget, dict):
         # Capture only the bounded counters that were visible when this
         # Attempt was allocated. History must not later substitute the

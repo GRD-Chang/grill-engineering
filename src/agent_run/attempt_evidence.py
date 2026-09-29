@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
+
+from agent_run.review_budget import review_budget_owner
 from agent_run.delivery_facts import role_family as _role_family
 
 def _budget_facts_for_attempt(
@@ -29,7 +31,7 @@ def _budget_facts_for_attempt(
             continue
         if policy_owner is None:
             policy_owner = (owner_subject, owner)
-        history = owner.get("review_budget_history")
+        history = review_budget_owner(owner).get("review_budget_history")
         if not isinstance(history, list):
             continue
         for snapshot in history:
@@ -157,7 +159,7 @@ def _subject_variants(state: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]
     variants: list[tuple[str, dict[str, Any]]] = []
     for subject, owner in values:
         variants.append((subject, owner))
-        history = owner.get("review_budget_history")
+        history = review_budget_owner(owner).get("review_budget_history")
         if isinstance(history, list):
             variants.extend(
                 (subject, snapshot)
@@ -184,7 +186,7 @@ def review_artifact_for_attempt(
     candidates: list[dict[str, Any]] = []
     seen_candidates: set[str] = set()
     for owner in owners:
-        budget = owner.get("review_budget")
+        budget = review_budget_owner(owner).get("review_budget")
         if not isinstance(budget, dict):
             continue
         if budget.get("window") != attempt.get("budget_window"):

@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.review_budget import remove_repair_job
+
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
@@ -117,7 +119,7 @@ class RunPublicationShared:
         if merge_conflict_evidence is not None:
             request["merge_conflict_evidence"] = merge_conflict_evidence
         run.update({"phase": "repairing", "repair_request": request})
-        run.pop("repair_job", None)
+        remove_repair_job(run)
         publication = state.get("run_publication")
         if isinstance(publication, dict) and publication.get("phase") not in {
             "merged",

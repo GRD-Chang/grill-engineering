@@ -267,8 +267,6 @@ def _prepared_resume(
         state["run_acceptance"] = {
             "phase": "repairing",
             "policy_snapshot": dict(state["policy_snapshot"]),
-            "review_budget": _canonical_budget(),
-            "review_budget_history": [],
             "repair_job": {
                 "phase": "accepted",
                 "policy_snapshot": dict(state["policy_snapshot"]),

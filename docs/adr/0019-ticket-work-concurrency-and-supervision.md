@@ -22,4 +22,6 @@ Linux 继续由 systemd 托管 Executor；关闭发起终端不影响执行，Ex
 
 ## 交付状态
 
-上述需求均已逐项确认，尚未实施；当前实现不因 ADR 接受而被视为已具备持续多线监督、运行中定向恢复、统一额度或单票立即停止。
+Development–Review 已接入共同阶段循环与审核记账：Ticket、Parent-only 的 Dev-first，以及集成后完整 Parent 的 Review-first；Run Acceptance/Run Repair 的 Review Budget 采用唯一 owner。集成交付保持既有流程。
+
+持续多线监督、运行中定向恢复、统一工作额度与单票立即停止仍是后继工作；当前实现不因本 ADR 接受或 Development–Review 共用化而被视为已具备这些能力。

@@ -6,6 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_run.review_budget import remove_repair_job
+
 from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.integration_resync_budget import complete_integration_window
@@ -607,7 +609,7 @@ class RunRepairPromotion:
             work_subject=f"run-repair:{state['run_id']}",
             generation=int(job["repair_generation"]),
         )
-        run.pop("repair_job", None)
+        remove_repair_job(run)
         publication_state = state.get("run_publication")
         if isinstance(publication_state, dict) and publication_state.get("phase") not in {
             "merged",

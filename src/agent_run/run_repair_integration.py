@@ -277,7 +277,7 @@ def _open_repair_review_window(state: dict[str, Any], job: dict[str, Any]) -> No
     if not isinstance(run, dict):
         raise ValueError("Run Acceptance is missing during Repair integration")
     sync_repair_cycle_counters(run, job)
-    # The two review projections share one logical Run budget. Preserve the
+    # Run Repair owns the shared Run budget. Preserve the
     # active Repair Cycle ordinals while opening a fresh allowance for the new
     # externally integrated candidate; CI recovery remains a separate budget.
     ordinals = {
@@ -289,7 +289,6 @@ def _open_repair_review_window(state: dict[str, Any], job: dict[str, Any]) -> No
         job, state_snapshot=state.get("policy_snapshot")
     )
     reset_budget(run, policy)
-    reset_budget(job, policy)
     job.update(ordinals)
     job["reviewed_integration_window"] = current_window
     sync_repair_cycle_counters(run, job)

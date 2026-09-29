@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from agent_run.review_budget import review_budget_owner
+
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
 from agent_run.cli_presentation import _run_repair_status
@@ -308,7 +310,7 @@ def test_run_ci_reviewer_exhausts_inner_without_advancing_outer(git_repo: Path) 
     assert run["blocked_reason"] == "ci_inner_budget_exhausted"
     assert run["ci_recovery"]["rounds_used"] == 1
     assert run["ci_recovery"]["repairs_used"] == 3
-    assert run["review_budget"]["development_attempts"] == 0
+    assert review_budget_owner(run)["review_budget"]["development_attempts"] == 0
     assert len(agents.review_requests) == 3
     assert run["repair_cycle"]["status"] == "budget_exhausted"
     assert run["repair_cycle"]["ended_reason"] == "ci_inner_budget_exhausted"

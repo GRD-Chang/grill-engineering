@@ -61,6 +61,7 @@ from agent_run.run_currentness import (
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.review_budget import (
+    remove_repair_job,
     budget_checkpoint_subjects,
     reset_budget,
 )
@@ -2345,7 +2346,7 @@ def _resume_review_budget_window(
     run_state["repair_request"] = _budget_repair_request(subject)
     run_state["phase"] = "repairing"
     run_state.pop("blocked_reason", None)
-    run_state.pop("repair_job", None)
+    remove_repair_job(run_state)
     state.update(
         {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
     )

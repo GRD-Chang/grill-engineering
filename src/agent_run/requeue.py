@@ -12,6 +12,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.review_budget import remove_repair_job
+
 
 class RequeueError(ValueError):
     """Raised when an operator asks to requeue an ineligible Run."""
@@ -57,7 +59,7 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         state.pop("parent_job", None)
         next_status = "parent_delivery_pending"
     else:
-        container.pop("repair_job", None)
+        remove_repair_job(container)
         container["phase"] = "pending"
         next_status = "run_acceptance_pending"
 

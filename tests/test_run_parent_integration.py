@@ -7,6 +7,8 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
+from agent_run.review_budget import review_budget_owner
+
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.controller import Controller
@@ -237,7 +239,7 @@ def test_run_resync_resume_renews_only_exhausted_allowance(git_repo: Path) -> No
     accepted["status"] = "ready_for_human"
     accepted["terminal_kind"] = "waiting_human"
     states.save_run(str(state["run_id"]), accepted)
-    review_before = dict(run["review_budget"])
+    review_before = dict(review_budget_owner(run)["review_budget"])
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"]), explicit_resume=True,
@@ -267,8 +269,8 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
         "phase": "merging",
         "repair_mode": "squash",
         "policy_snapshot": deepcopy(run["policy_snapshot"]),
-        "review_budget": deepcopy(run["review_budget"]),
-        "review_budget_history": deepcopy(run["review_budget_history"]),
+        "review_budget": run.pop("review_budget"),
+        "review_budget_history": run.pop("review_budget_history"),
         "ci_recovery": deepcopy(run["ci_recovery"]),
     }
     repair_before = deepcopy(run["repair_job"])
@@ -331,14 +333,14 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
         "publication_sha": failed_head,
         "required_checks_origin": failed_observation,
         "policy_snapshot": deepcopy(run["policy_snapshot"]),
-        "review_budget": deepcopy(run["review_budget"]),
-        "review_budget_history": deepcopy(run["review_budget_history"]),
+        "review_budget": run.pop("review_budget"),
+        "review_budget_history": run.pop("review_budget_history"),
         "ci_recovery": deepcopy(run["ci_recovery"]),
     }
     accepted["run_publication"] = {"phase": "stale"}
     accepted.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
     states.save_run(str(state["run_id"]), accepted)
-    review_before = dict(run["review_budget"])
+    review_before = dict(review_budget_owner(run)["review_budget"])
     resync_before = dict(run["integration_resync"])
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
@@ -353,7 +355,7 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     assert resumed_run["repair_job"]["phase"] == "repairing"
     assert resumed_run["repair_job"]["next_attempt_kind"] == "ci_repair"
     assert "blocked_reason" not in resumed_run["repair_job"]
-    assert resumed_run["review_budget"] == review_before
+    assert review_budget_owner(resumed_run)["review_budget"] == review_before
     assert resumed_run["integration_resync"] == resync_before
     assert resumed_run["phase"] == "repairing"
     assert "repair_request" not in resumed_run

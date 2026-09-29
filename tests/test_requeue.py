@@ -284,8 +284,6 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
         "status": "requeue_required",
         "run_acceptance": {
             "phase": "repairing",
-            "review_budget": _canonical_budget(),
-            "review_budget_history": [],
             "ci_recovery": new_ci_recovery_budget(),
             "repair_job": repair,
         },

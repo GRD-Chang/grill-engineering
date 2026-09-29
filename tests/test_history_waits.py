@@ -310,7 +310,7 @@ def test_active_repair_checks_do_not_inherit_a_stale_publication_owner(tmp_path:
         "run_publication": stale_publication,
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 1,
-            "review_budget": {"window": 3}, "repair_job": repair,
+            "repair_job": repair,
         },
     }
     store = StateStore(tmp_path)

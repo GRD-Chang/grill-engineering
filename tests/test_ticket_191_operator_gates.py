@@ -110,6 +110,8 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
             "development_thread_history": [],
         }
         if subject_location == "run_repair":
+            del acceptance["review_budget"]
+            del acceptance["review_budget_history"]
             acceptance.update(
                 {
                     "phase": "ready_for_human",
@@ -220,6 +222,8 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
                 "development_thread_history": [],
             },
         }
+        del state["run_acceptance"]["review_budget"]
+        del state["run_acceptance"]["review_budget_history"]
     else:
         state["run_publication"] = {
             "phase": "ready_for_human",

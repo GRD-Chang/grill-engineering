@@ -130,8 +130,6 @@ def test_canonical_run_repair_modes_pass_state_validation(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -154,8 +152,6 @@ def test_run_repair_snapshot_is_required_for_materialized_projections(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": run_snapshot,
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": repair_snapshot,
@@ -213,13 +209,14 @@ def test_old_run_review_history_without_policy_snapshot_is_incompatible(
         _require_repair_state(state)
 
 
-def test_run_repair_budget_window_must_match_run_acceptance(
-    valid_run_state: dict[str, Any],
+@pytest.mark.parametrize("repair_window", [1, 2])
+def test_run_repair_rejects_duplicate_budget_owners(
+    valid_run_state: dict[str, Any], repair_window: int,
 ) -> None:
     state = valid_run_state
     run_budget = _canonical_run_budget()
     repair_budget = _canonical_run_budget()
-    repair_budget["window"] = 2
+    repair_budget["window"] = repair_window
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -234,7 +231,7 @@ def test_run_repair_budget_window_must_match_run_acceptance(
         },
     }
 
-    with pytest.raises(IncompatibleRunStateError, match="Budget Windows"):
+    with pytest.raises(IncompatibleRunStateError, match="one Review Budget owner"):
         _require_repair_state(state)
 
 
@@ -245,8 +242,6 @@ def test_run_repair_cannot_use_ticket_fallback_authority(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -268,8 +263,6 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "candidate",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -289,8 +282,6 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "waiting_checks",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -313,8 +304,6 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -354,8 +343,6 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "waiting_checks",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -459,8 +446,6 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": phase,
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -493,8 +478,6 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "candidate",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -515,8 +498,6 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_job": {
             "phase": "completed",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),

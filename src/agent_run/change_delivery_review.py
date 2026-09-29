@@ -12,8 +12,9 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
 )
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.development_review import after_review, ReviewDecision
+from agent_run.review_attempt import begin_review, review_ordinal, remember_review, consume_review_result
 from agent_run.ci_recovery_budget import (
-    checkpoint_after_reviewer_failure,
     ci_limits_for_job,
     ci_reviewer_budget_context,
 )
@@ -23,7 +24,6 @@ from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import reviewer_budget_context
 from agent_run.semantic_attempt import (
-    allocate_semantic_attempt,
     close_semantic_attempt,
     pending_semantic_attempt,
 )
@@ -40,29 +40,20 @@ def review(
     # Any result retained for a prior base/candidate must not survive into
     # an interrupted fresh attempt.
     job.pop("pending_review_result", None)
-    pending_attempt = pending_semantic_attempt(job, role="reviewer")
-    attempt = (
-        int(pending_attempt["ordinal"])
-        if pending_attempt is not None
-        else int(job.get("validation_attempts", 0)) + 1
-    )
-    if pending_attempt is None:
-        job["validation_attempts"] = attempt
-    stage._sync_attempts(state, job)
+    attempt = review_ordinal(job)
     job["phase"] = "reviewing"
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     budget = job.get("review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Reviewer is missing its Review Budget Window")
-    semantic_attempt = allocate_semantic_attempt(
+    semantic_attempt = begin_review(
         job,
-        role="reviewer",
         work_subject=work_subject,
         generation=generation,
-        currentness_boundary=stage._invocation_boundary(job),
-        ordinal=attempt,
+        boundary=stage._invocation_boundary(job),
         budget_window=int(budget["window"]),
     )
+    stage._sync_attempts(state, job)
     stage.save(state)
     validation = checkout.parent / f"validation-{stage.contract.label}-{attempt}"
     try:
@@ -119,15 +110,12 @@ def review(
     job.pop("review_resume_thread_id", None)
     job.pop("review_human_blocker_resume", None)
     try:
-        artifact = AcceptanceArtifact.parse(review.artifact)
+        artifact = consume_review_result(job, stage.review_budget_policy(), review.artifact)
     except ValueError:
         # A malformed Artifact has no resumable result, but its Reviewer
         # identity must remain durable before a fresh output attempt.
         stage.save(state)
         raise
-    if semantic_attempt.get("budget_consumed") is not True:
-        stage.mark_review_invocation(job)
-        semantic_attempt["budget_consumed"] = True
     job["pending_review_result"] = {
         "reviewer_thread_id": review.thread_id,
         "artifact": artifact.raw,
@@ -212,30 +200,10 @@ def complete_review(
             key: deepcopy(review_record[key])
             for key in ("reviewer_thread_id", "candidate_sha", "review_identity")
         }
-        matching_index = next(
-            (
-                index
-                for index in range(len(budget["review_artifacts"]) - 1, -1, -1)
-                if budget["review_artifacts"][index].get("candidate_sha")
-                == candidate_sha
-                and (
-                    pending.get("human_blocker_resume") is True
-                    or budget["review_artifacts"][index].get("reviewer_thread_id")
-                    == reviewer_thread_id
-                )
-            ),
-            None,
+        remember_review(
+            budget, review_record, limit=stage.review_budget_policy().review_limit,
+            human_blocker_resume=pending.get("human_blocker_resume") is True,
         )
-        if matching_index is None:
-            budget["review_artifacts"].append(review_record)
-        else:
-            # Human Blocker resume completes the same semantic Reviewer attempt
-            # against the same Candidate.  Its new Artifact supersedes the
-            # blocked result; the raw blocker remains in human_blocker_history.
-            budget["review_artifacts"][matching_index] = review_record
-        # Keep the recent full artifacts used as Reviewer context. The durable
-        # invocation count and semantic attempt history retain older audit facts.
-        del budget["review_artifacts"][: -stage.review_budget_policy().review_limit]
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw
@@ -285,40 +253,20 @@ def complete_review(
                 )
             ),
         )
-    if artifact.is_accepted:
+    decision = after_review(job, stage.review_budget_policy(), artifact)
+    if decision == ReviewDecision.ACCEPT:
         job["phase"] = "accepted"
-    elif job.get("attempt_kind") == "ci_repair":
-        outer_limit, inner_limit = ci_limits_for_job(job)
-        if checkpoint_after_reviewer_failure(
-            job,
-            outer_limit=outer_limit,
-            inner_limit=inner_limit,
-            is_ticket=stage.contract.label.startswith("ticket-"),
-        ):
-            job["phase"] = "escalating"
-            job["escalation_code"] = "ci_inner_budget_exhausted"
-        else:
-            job["phase"] = "repairing"
-            job["next_attempt_kind"] = "ci_repair"
-    elif (
-        not stage.review_budget_policy().fallback
-        and stage.review_budget_exhausted_for_review(job)
-    ):
+    elif decision == ReviewDecision.REVIEW_EXHAUSTED:
         stage._checkpoint_budget(
-            state,
-            job,
-            "review_budget_exhausted",
+            state, job, decision.value,
             "Review budget is exhausted and the current Candidate still needs modification",
         )
-    elif stage.modification_budget_exhausted(job):
-        job["phase"] = "escalating"
-        job["escalation_code"] = (
-            "reviewer_requires_human"
-            if artifact.requires_human
-            else "modification_budget_exhausted"
-        )
+    elif decision in {ReviewDecision.CI_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
+        job.update({"phase": "escalating", "escalation_code": decision.value})
     else:
         job["phase"] = "repairing"
+        if job.get("attempt_kind") == "ci_repair":
+            job["next_attempt_kind"] = "ci_repair"
     stage.save(state)
 
 

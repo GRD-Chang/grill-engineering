@@ -192,8 +192,6 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     run = {
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": dict(ordinary_budget),
-        "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_generation": 2,
         "modification_attempts": 3,
@@ -413,8 +411,6 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_cycle": {
             "generation": 2,
@@ -668,8 +664,6 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "candidate_acceptance_history": [],
         "repair_job": job,
     }

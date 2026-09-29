@@ -24,7 +24,7 @@ from agent_run.run_repair_cycle import (
     sync_repair_cycle_counters,
     uses_merge_resolution,
 )
-from agent_run.review_budget import ensure_budget, new_budget
+from agent_run.review_budget import ensure_budget
 from agent_run.run_repair_currentness import RunRepairObservationPending
 from agent_run.run_repair_delivery import (
     RunRepairAdapter,
@@ -368,7 +368,6 @@ class RunRepairLifecycle:
         run_budget_history = run_state.get("review_budget_history")
         if not isinstance(run_budget_history, list):
             raise ValueError("run review_budget_history must be an array")
-        prior_review_artifacts = deepcopy(run_budget["review_artifacts"][-1:])
         repair_source = str(repair_request.get("repair_source", "acceptance"))
         if repair_source not in {
             "acceptance",
@@ -424,13 +423,8 @@ class RunRepairLifecycle:
             "policy_snapshot": deepcopy(
                 run_state.get("policy_snapshot") or state.get("policy_snapshot")
             ),
-            "review_budget": new_budget(
-                window=run_budget["window"],
-                development_attempts=run_budget["development_attempts"],
-                reviewer_invocations=run_budget["reviewer_invocations"],
-                review_artifacts=prior_review_artifacts,
-            ),
-            "review_budget_history": deepcopy(run_budget_history),
+            "review_budget": run_budget,
+            "review_budget_history": run_budget_history,
             "ci_recovery": run["ci_recovery"],
             "repair_checkout": str(self.owner._repair_checkout(state)),
         }
@@ -474,6 +468,8 @@ class RunRepairLifecycle:
                 raise ValueError("merge-conflict repair evidence must be non-empty")
             job["merge_conflict_evidence"] = evidence
         job["repair_trigger_pending"] = True
+        run.pop("review_budget")
+        run.pop("review_budget_history")
         run["repair_job"] = job
         self._sync_repair_cycle_counters(run, job)
         self.owner._save(state)

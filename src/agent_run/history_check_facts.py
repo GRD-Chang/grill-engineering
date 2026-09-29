@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any
 
+from agent_run.review_budget import review_budget_owner
+
 
 CHECKS_HISTORY_FIELDS = (
     "history_work_subject",
@@ -125,7 +127,7 @@ def _subject_scope(
     else:
         work_subject = f"parent-only:{run_id}"
         generation = subject.get("parent_generation")
-    budget = budget_owner.get("review_budget")
+    budget = review_budget_owner(budget_owner).get("review_budget")
     return {
         "history_work_subject": work_subject,
         "history_generation": generation,

@@ -46,8 +46,10 @@ def test_three_real_appends_open_new_repair_review_windows(
     waiting = accept()
     job = waiting["run_acceptance"]["repair_job"]
     assert job["phase"] == "waiting_checks"
-    assert waiting["run_acceptance"]["review_budget"]["development_attempts"] == 1
-    assert waiting["run_acceptance"]["review_budget"]["reviewer_invocations"] == 2
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 2
+    assert "review_budget" not in waiting["run_acceptance"]
+    assert "review_budget_history" not in waiting["run_acceptance"]
     branch = str(job["repair_branch"])
     pr_number = job["pr_number"]
     ci_budget = deepcopy(job["ci_recovery"])
@@ -91,7 +93,8 @@ def test_three_real_appends_open_new_repair_review_windows(
         assert job["pr_number"] == pr_number
         assert git.is_ancestor(human_sha, str(job["publication_sha"]))
         assert job["ci_recovery"] == ci_budget
-        assert waiting["run_acceptance"]["review_budget"]["window"] == job["review_budget"]["window"]
+        assert "review_budget" not in waiting["run_acceptance"]
+        assert "review_budget_history" not in waiting["run_acceptance"]
         assert job["review_budget"]["window"] == index + 1
         windows.append(job["review_budget"]["window"])
 

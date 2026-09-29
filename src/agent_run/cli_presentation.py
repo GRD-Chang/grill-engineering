@@ -6,6 +6,8 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.review_budget import review_budget_owner
+
 from agent_run.attempt_projection import (
     current_semantic_attempt,
     semantic_attempt_history,
@@ -716,7 +718,7 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
         policy = run_repair_budget_policy_for_job(
             subject, state_snapshot=state.get("policy_snapshot")
         )
-    budget = subject.get("review_budget")
+    budget = review_budget_owner(subject).get("review_budget")
     if not isinstance(budget, dict):
         return None
     return {

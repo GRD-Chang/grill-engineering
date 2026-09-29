@@ -63,8 +63,6 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_cycle": {"status": "active"},
         "candidate_acceptance_history": [],
         "repair_job": {
@@ -264,7 +262,6 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     original_pr = job["pr_number"]
     original_candidate = job["candidate_sha"]
     original_review = deepcopy(job["review_budget"])
-    original_run_review = deepcopy(run["review_budget"])
     original_run_resync = deepcopy(run["integration_resync"])
     states.save_run(run_id, paused)
     collaborator = git_repo.parent / "repair-collaborator"
@@ -356,11 +353,9 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     assert blocked["status"] == "ready_for_human"
     assert blocked["run_acceptance"]["repair_job"]["blocked_reason"] == reason
     blocked_review = deepcopy(blocked["run_acceptance"]["repair_job"]["review_budget"])
-    blocked_run_review = deepcopy(blocked["run_acceptance"]["review_budget"])
     blocked_run_resync = deepcopy(blocked["run_acceptance"]["integration_resync"])
     if reason == "integration_failed":
         assert blocked_review == original_review
-        assert blocked_run_review == original_run_review
         assert blocked_run_resync == original_run_resync
     assert states.load_current_run(run_id) == blocked
 
@@ -378,7 +373,8 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     assert resumed_job["pr_number"] == original_pr
     assert resumed_job["candidate_sha"] == original_candidate
     assert resumed_job["review_budget"] == blocked_review
-    assert resumed_run["review_budget"] == blocked_run_review
+    assert "review_budget" not in resumed_run
+    assert "review_budget_history" not in resumed_run
     assert resumed_run["integration_resync"] == blocked_run_resync
     if reason == "integration_resync_exhausted":
         assert resumed_job["integration_resync"]["generation"] == 2
@@ -836,7 +832,8 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert run["repair_cycle"]["status"] == "active"
     assert run["repair_cycle"]["code_modification_attempts"] == 1
     assert run["repair_cycle"]["generation"] == generation
-    assert job["review_budget"]["window"] == run["review_budget"]["window"] == 2
+    assert job["review_budget"]["window"] == 2
+    assert "review_budget" not in run
     assert job["review_budget"]["reviewer_invocations"] == 0
     assert job["review_budget_history"][-1]["modification_attempts"] == 1
     assert repair_checkout.exists()
@@ -1026,10 +1023,11 @@ def test_exhausted_run_repair_budget_gets_new_review_after_external_resync(
     assert len(agents.development_requests) == 3
     assert run["integration_resync"]["window"] == 2
     assert run["integration_resync"]["used"] == 1
-    assert run["review_budget"]["window"] == job["review_budget"]["window"] == 2
-    assert run["review_budget"]["reviewer_invocations"] == 0
+    assert job["review_budget"]["window"] == 2
+    assert "review_budget" not in run
+    assert "review_budget_history" not in run
     assert job["review_budget"]["reviewer_invocations"] == 0
-    assert run["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 4
+    assert job["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 4
     assert job["review_budget_history"][-1]["review_budget"]["development_attempts"] == 3
     assert job["candidate_sha"]
     assert run["repair_cycle"]["status"] == "active"

@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Protocol
 
+from agent_run.review_budget import remove_repair_job
+
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -193,6 +195,7 @@ def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
         "acceptance_record",
         "acceptance_artifact",
         "reviewed_head_sha",
+        "pending_review_result",
         "reviewer_resume_thread_id",
         "reviewer_new_thread",
         "human_response_history",
@@ -270,7 +273,7 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
             work_subject=f"run-repair:{state['run_id']}",
             generation=int(repair_job.get("repair_generation", 1)),
         )
-    run.pop("repair_job", None)
+    remove_repair_job(run)
     run.pop("repair_request", None)
     state["active_agent_invocation"] = None
     state.pop("requeue_required", None)

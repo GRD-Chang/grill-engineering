@@ -15,12 +15,13 @@ from typing import Any, Callable
 
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
+from agent_run.development_review import advance_development_review
+from agent_run.change_development_review import ChangeDevelopmentReview
 from agent_run.ci_recovery_budget import (
     can_start_ci_repair,
     ci_limits_for_job,
     ci_review_required,
     mark_ci_repair,
-    mark_ci_review_invocation,
     refund_ci_repair_without_candidate,
 )
 from agent_run.artifacts import AcceptanceArtifact
@@ -47,7 +48,6 @@ from agent_run.review_budget import (
     can_start_review,
     ensure_budget,
     mark_development,
-    mark_review,
     policy_for_subject,
 )
 
@@ -236,99 +236,10 @@ class ChangeDeliveryEngine:
                     self.publisher.escalate(state, job, str(job["escalation_code"]))
                     job["phase"] = "blocked"
                     return self.save(state)
-                if phase in {"developing", "repairing"}:
-                    self._develop(state, job, checkout)
-                    if self._pause_ticket_if_requested(state, job):
-                        return state
-                    if job["phase"] in {"blocked", "escalating"}:
-                        continue
-                if job["phase"] == "committing_candidate":
-                    self._reject_stale(
-                        state,
-                        job,
-                        checkout,
-                        "Candidate was not created after requirements changed",
-                    )
-                    if not self._commit_candidate(state, job, checkout):
-                        return state
-                    if self._pause_ticket_if_requested(state, job):
-                        return state
-                if job["phase"] == "candidate":
-                    if (
-                        self.contract.label.startswith("ticket-")
-                        and job.get("attempt_kind") == "ci_repair"
-                    ):
-                        if not acquire_ticket_slot(state, job):
-                            self.save(state)
-                            return state
-                        self.save(state)
-                        if not prepare_ticket_integration(self, state, job, checkout):
-                            continue
-                        self._bind_ticket_ci_integration(state, job)
-                    if (
-                        self.contract.label == "parent-only"
-                        # A no-change first integration reuses demand acceptance
-                        # and does not open the separate integration review budget.
-                        # Its record still makes every later CI Candidate cross
-                        # the live snapshot boundary before Reviewer starts.
-                        and isinstance(job.get("parent_integration"), dict)
-                        and not prepare_parent_integration(self, state, job, checkout)
-                    ):
-                        continue
-                    if (
-                        self.contract.label.startswith("run-repair-")
-                        and not isinstance(job.get("integrated_sha"), str)
-                        and needs_repair_integration(self, job)
-                        and not prepare_repair_integration(self, state, job, checkout)
-                    ):
-                        continue
-                    if (
-                        job.get("attempt_kind") == "ci_repair"
-                        and job.get("repair_source") == "required_checks"
-                        and not ci_review_required(
-                            job, is_ticket=self.contract.label.startswith("ticket-")
-                        )
-                    ):
-                        if not self._prepare_ticket_ci_first_round_authorization(
-                            state, job
-                        ):
-                            raise ValueError("Ticket CI repair has no valid first-round publication authority")
-                        continue
-                    if pending_semantic_attempt(
-                        job, role="reviewer"
-                    ) is None and self.review_budget_exhausted_for_review(job):
-                        if self._prepare_ticket_fallback(state, job):
-                            continue
-                        checkpoint_code = (
-                            "modification_budget_exhausted"
-                            if self.review_budget_policy().fallback
-                            else "review_budget_exhausted"
-                        )
-                        self._checkpoint_budget(
-                            state,
-                            job,
-                            checkpoint_code,
-                            "Review budget is exhausted and the current Candidate still needs modification",
-                        )
-                        continue
-                    self._review(state, job, checkout)
-                    if self._pause_ticket_if_requested(state, job):
-                        return state
-                    if job["phase"] == "escalating":
-                        # Budget exhaustion is a durable terminal boundary;
-                        # process it before the Run Repair adapter asks the
-                        # outer Run Acceptance loop to re-enter.
-                        continue
-                if job["phase"] == "reviewing":
-                    if isinstance(job.get("pending_review_result"), dict):
-                        self._complete_review(state, job, checkout)
-                    else:
-                        # The reviewer may have been interrupted before returning
-                        # a result. Keep that attempt in the timeline, then request
-                        # a fresh independent reviewer on resume.
-                        job["phase"] = "candidate"
-                        self.save(state)
-                    continue
+                if not advance_development_review(
+                    ChangeDevelopmentReview(self, state, job, checkout)
+                ):
+                    return state
                 if job["phase"] == "accepted":
                     if self.development_only:
                         return state
@@ -705,11 +616,6 @@ class ChangeDeliveryEngine:
         return mark_development(
             job, self.review_budget_policy(), attempt_kind=attempt_kind
         )
-
-    def mark_review_invocation(self, job: dict[str, Any]) -> int:
-        if job.get("attempt_kind") == "ci_repair":
-            return mark_ci_review_invocation(job)
-        return mark_review(job, self.review_budget_policy())
 
     def _checkpoint_ci_budget(
         self, state: dict[str, Any], job: dict[str, Any], code: str

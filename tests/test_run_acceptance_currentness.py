@@ -141,8 +141,6 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     run = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -258,8 +256,6 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -671,8 +667,6 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
     run = state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": ["run-reviewer"],
@@ -1107,3 +1101,129 @@ def test_run_acceptance_binds_the_previewed_merge_tree(git_repo: Path) -> None:
         default_head_sha=git.resolve("main"),
         run_head_sha=git.resolve(str(state["run_branch"])),
     )
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_returned_run_review_survives_currentness_read_failure(
+    git_repo: Path, drift: bool,
+) -> None:
+    """A real save/load retains the result; a changed review boundary rejects it."""
+    state, states, git = _completed_run(git_repo)
+    agents = ScriptedRunAgents()
+    agents._reviews = [_passing_artifact()]
+
+    class FailingReadEngine(RunAcceptanceEngine):
+        def _refresh_run_currentness(self, current: dict[str, Any]) -> bool:
+            if agents.review_requests:
+                raise GitHubReadError("github_api_unavailable", "readback unavailable")
+            return super()._refresh_run_currentness(current)
+
+    with pytest.raises(GitHubReadError, match="readback unavailable"):
+        FailingReadEngine(git=git, states=states, agents=agents).accept(state["run_id"])
+    saved = states.load_current_run(state["run_id"])
+    run = saved["run_acceptance"]
+    assert run["phase"] == "reviewing"
+    assert run["pending_review_result"]["record"]["artifact"] == _passing_artifact()
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    attempt_id = run["pending_semantic_attempt"]["attempt_id"]
+    if drift:
+        saved["parent"]["revision"] = "changed-parent-revision"
+        states.save_run(state["run_id"], saved)
+    resumed = RunAcceptanceEngine(git=git, states=states, agents=agents).accept(state["run_id"])
+    run = resumed["run_acceptance"]
+    assert len(agents.review_requests) == 1
+    assert "pending_review_result" not in run
+    assert "pending_semantic_attempt" not in run
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["validation_attempts"] == 1
+    assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt_id
+    if drift:
+        assert run["phase"] == "pending"
+        assert "acceptance_record" not in run
+    else:
+        assert resumed["status"] == "run_publication_pending"
+        assert run["acceptance_record"]["reviewed_head_sha"] == git.resolve(state["run_branch"])
+    assert not list((states.root / "worktrees" / state["run_id"]).glob("validation-run-*"))
+
+
+@pytest.mark.parametrize("next_integration", ["unchanged", "git_failure", "conflict"])
+def test_returned_review_finishes_before_new_integration_work(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, next_integration: str,
+) -> None:
+    from agent_run.agents import HumanBlockerResult
+    from agent_run.git import GitError
+
+    state, states, git = _completed_run(git_repo)
+    run_id = state["run_id"]
+    publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
+
+    def commit_file(branch: str, name: str, content: str) -> str:
+        subprocess.run(["git", "checkout", branch], cwd=git_repo, check=True, capture_output=True)
+        (git_repo / name).write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", name], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "advance fixture"], cwd=git_repo, check=True, capture_output=True)
+        return git.resolve("HEAD")
+
+    run_head = commit_file(state["run_branch"], "README.md", "Run version\n")
+    publisher.sync_run_branch(run_branch=state["run_branch"], integrated_sha=run_head)
+    # The integrated target differs from the Run's original frozen base. A
+    # reloaded Engine must recover it from the still-current integration record.
+    target = commit_file("main", "default-added.txt", "default addition\n")
+    publisher.data["default_head_sha"] = target
+    publisher._save()
+
+    class Agents(ScriptedRunAgents):
+        def develop(self, request: dict[str, Any]) -> HumanBlockerResult:
+            self.development_requests.append(request)
+            assert request["repair_source"] == "merge_conflict"
+            return HumanBlockerResult("conflict-developer", ("Choose the README version",))
+
+    agents = Agents()
+    agents._reviews = [_passing_artifact()]
+
+    class ReadFailure(RunAcceptanceEngine):
+        def _refresh_run_currentness(self, current: dict[str, Any]) -> bool:
+            if agents.review_requests:
+                raise GitHubReadError("github_api_unavailable", "readback unavailable")
+            return super()._refresh_run_currentness(current)
+
+    with pytest.raises(GitHubReadError):
+        ReadFailure(git=git, states=states, agents=agents, github=publisher).accept(run_id)
+    saved = states.load_current_run(run_id)
+    attempt = saved["run_acceptance"]["pending_semantic_attempt"]["attempt_id"]
+    assert saved["run_acceptance"]["pending_review_result"]["record"]["reviewed_default_base_sha"] == target
+    if next_integration != "unchanged":
+        publisher.data["default_head_sha"] = commit_file("main", "README.md", "Default version\n")
+        publisher._save()
+    if next_integration != "conflict":
+        def fail_prepare(**_kwargs: object) -> None:
+            raise GitError("integration checkout unavailable")
+        monkeypatch.setattr(git, "prepare_run_repair_checkout", fail_prepare)
+
+    engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    result = engine.accept(run_id)
+    run = result["run_acceptance"]
+    assert "pending_review_result" not in run
+    assert "pending_semantic_attempt" not in run
+    assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert len(agents.review_requests) == 1
+    if next_integration == "unchanged":
+        assert result["status"] == "run_publication_pending"
+        assert run["acceptance_record"]["reviewed_default_base_sha"] == target
+    else:
+        assert run["phase"] == "pending"
+        assert run["semantic_attempt_history"][-1]["outcome"] == "currentness_invalidated"
+        result = engine.accept(run_id)
+        run = result["run_acceptance"]
+        assert result["status"] == "ready_for_human"
+        assert run["blocked_reason"] == (
+            "run_integration_failed" if next_integration == "git_failure"
+            else "integration_conflict_requires_human"
+        )
+        assert run["review_budget"]["reviewer_invocations"] == 1
+        assert len(agents.review_requests) == 1
+        if next_integration == "conflict":
+            assert run["pending_semantic_attempt"]["role"] == "development"
+            assert len(agents.development_requests) == 1
+    assert states.load_current_run(run_id) == result
