@@ -1084,6 +1084,43 @@ class TaskControlStore:
                 )
             yield
 
+    @contextmanager
+    def ticket_resume_transaction(
+        self, task: TaskKey, *, action_id: str, generation: int, run_id: str,
+    ) -> Iterator[None]:
+        """Admit local work only while the same Executor accepts new work."""
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            record = self._require_unlocked(task)
+            if (record["executor"].get("ticket_resume_closed") is True
+                    or record["action"].get("status") != "completed"):
+                raise ActionBusyError("Executor 正在收口；请在退出后恢复 Ticket")
+            yield
+
+    def close_ticket_resume_admission(
+        self, task: TaskKey, *, action_id: str, generation: int,
+        run_id: str, can_exit: Callable[[], bool],
+    ) -> bool:
+        """Atomically stop admission, or let the owner consume newly added work."""
+        deadline = monotonic() + _EXECUTOR_FENCE_RETRY_WINDOW_SECONDS
+        while True:
+            try:
+                with self._executor_current_transaction(
+                    task, action_id=action_id, generation=generation, run_id=run_id,
+                ):
+                    if not can_exit():
+                        return False
+                    record = self._require_unlocked(task)
+                    record["executor"]["ticket_resume_closed"] = True
+                    self._write_unlocked(task, record)
+                    return True
+            except TaskControlBusyError:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise
+                sleep(min(_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS, remaining))
+
     def mark_process_started(
         self,
         task: TaskKey,

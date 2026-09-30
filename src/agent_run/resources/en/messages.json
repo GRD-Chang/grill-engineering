@@ -236,6 +236,8 @@
   "cli.stop_ticket_help": "Pause only the selected Ticket and let others continue",
   "cli.ticket_pause_requested": "Ticket #{ticket_number}: pause requested",
   "cli.ticket_paused": "Ticket #{ticket_number}: paused",
+  "cli.ticket_resume_queued": "Ticket #{ticket_number}: Resume accepted, waiting for a work slot",
+  "cli.ticket_resume_accepted": "Ticket #{ticket_number}: Resume intent accepted",
   "cli.abandon_help": "Abandon delivery and perform bounded recovery and cleanup",
   "cli.discard_help": "Irreversibly discard this Run's dirty Managed Development Checkout",
   "cli.status_help": "Show current status and the next allowed action",

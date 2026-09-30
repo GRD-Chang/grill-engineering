@@ -197,6 +197,9 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     from agent_run.ticket_work import require_queue
 
     require_queue(state)
+    from agent_run.resume_intent import require_ticket_resume_receipts
+
+    require_ticket_resume_receipts(state)
     _require_ticket_agent_invocations(state)
     _require_run_gate_exclusivity(state)
     if (

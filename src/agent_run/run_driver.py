@@ -37,7 +37,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
-from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError
 
 
@@ -658,6 +658,21 @@ class RunDriver:
         *,
         control_operation: ControlRunOperation | None = None,
     ) -> dict[str, Any]:
+        while True:
+            try:
+                return self._advance(state, control_operation=control_operation)
+            except ConcurrentRunStateError:
+                latest = self.states.load_current_run(str(state["run_id"]))
+                if latest is None:
+                    raise
+                state = latest
+
+    def _advance(
+        self,
+        state: dict[str, Any],
+        *,
+        control_operation: ControlRunOperation | None = None,
+    ) -> dict[str, Any]:
         run_id = state.get("run_id")
         if not isinstance(run_id, str):
             raise ValueError("Delivery Run is missing its Run ID")
@@ -783,7 +798,7 @@ class RunDriver:
             # it into a normal Run execution failure: the Host must retain the
             # unresolved ownership record for the next command to reconcile.
             raise
-        except TaskControlBusyError:
+        except (TaskControlBusyError, ConcurrentRunStateError):
             # Short Task Control contention is not an execution failure.  The
             # state store retries its own commit boundary; any remaining
             # contention must reach the caller without changing Run status.

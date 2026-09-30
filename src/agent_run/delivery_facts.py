@@ -173,6 +173,7 @@ def multi_ticket_progress(
             "ticket_number": number,
             "phase": phase,
             "queue_position": queued.get(number),
+            "resume_accepted": isinstance(job_data.get("last_ticket_resume"), dict) and number in work_waiters,
             "work_queue_position": work_waiters.index(number) + 1 if number in work_waiters else None,
             "has_work_slot": number in working,
             "holds_integration": number == holder,

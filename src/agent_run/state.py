@@ -254,6 +254,18 @@ class StateStore:
         expected = expected_by_run.get(run_id)
         if expected is not None and previous != expected:
             raise ConcurrentRunStateError("Run changed during Controller refresh")
+        if (expected is None and isinstance(previous, dict)
+                and state.get("resume_audit", {}).get("total", 0)
+                <= previous.get("resume_audit", {}).get("total", 0)):
+            # Foreground external supervision may hold an older whole-Run
+            # projection while a targeted Resume commits. Do not erase its
+            # accepted work, audit or queue; the driver reloads and continues.
+            for number, job in previous.get("ticket_jobs", {}).items():
+                proposed = state.get("ticket_jobs", {}).get(number, {})
+                if (isinstance(job, dict) and job.get("last_ticket_resume")
+                        and job.get("ticket_branch_generation") == proposed.get("ticket_branch_generation")
+                        and job["last_ticket_resume"] != proposed.get("last_ticket_resume")):
+                    raise ConcurrentRunStateError("Ticket Resume superseded the Run projection")
         if isinstance(previous, dict) and isinstance(previous.get("ticket_pause_requests"), dict):
             requests = state.get("ticket_pause_requests")
             jobs = state.get("ticket_jobs")
@@ -966,7 +978,9 @@ def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
             "action_application_receipt", "target_executor", "worker",
             "process_start_token",
         ),
-    } or path[-2:] == ("candidate_commit_intent", "token") or (
+    } or path[-4:] == (
+        "last_ticket_resume", "payload", "resume_intent", "authorization"
+    ) or path[-2:] == ("candidate_commit_intent", "token") or (
         bool(path)
         and path[-1]
         in {

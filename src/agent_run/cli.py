@@ -727,6 +727,40 @@ def _main_with_parser_resources(
                     if (resume_feedback is not None and final_receipt_pending
                             and not has_unfinished_final_receipt(current, git.root)):
                         resume_feedback.progressed(current, "terminal_completion")
+                if parsed.ticket is not None and executor_binding is None:
+                    from agent_run.ticket_resume import active_ticket_resume
+
+                    accepted = active_ticket_resume(
+                        controller, TaskControlStore(states.root),
+                        _task_for_parent(parsed, github, git), executor_host,
+                        current, parsed.ticket,
+                        lambda state, previous: (
+                            _resume_payload_for_existing_action(parsed, previous, state)
+                            if previous is not None
+                            else _resume_action_payload(parsed, state)
+                        ),
+                    )
+                    if accepted is not None:
+                        accepted_state, repeated = accepted
+                        queue = accepted_state["ticket_work_queue"]
+                        waiting = [item["ticket_number"] for item in queue if item["lease_id"] is None]
+                        result = {
+                            "run_id": parsed.run_id, "ticket_number": parsed.ticket,
+                            "resume_accepted": True, "attached": repeated,
+                            "work_queue_position": (
+                                waiting.index(parsed.ticket) + 1 if parsed.ticket in waiting else None
+                            ),
+                            "resume_intent": accepted_state["ticket_jobs"][str(parsed.ticket)]["last_ticket_resume"]["payload"]["resume_intent"],
+                        }
+                        if parsed.as_json:
+                            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                        else:
+                            print(text(
+                                "cli.ticket_resume_queued" if parsed.ticket in waiting
+                                else "cli.ticket_resume_accepted",
+                                language=selected_language(accepted_state), ticket_number=parsed.ticket,
+                            ))
+                        return 0
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
@@ -1589,8 +1623,13 @@ def _resume_action_payload(
             "ordinary resume does not accept Delivery Policy overrides; "
             "policy can change only when opening a new Budget Window"
         )
+    policy_owner = current
+    if parsed.ticket is not None:
+        job = current.get("ticket_jobs", {}).get(str(parsed.ticket))
+        if isinstance(job, Mapping) and isinstance(job.get("policy_snapshot"), Mapping):
+            policy_owner = job
     policy = resolve_delivery_policy(
-        user_defaults=parse_policy_snapshot(policy_snapshot_for_state(current)),
+        user_defaults=parse_policy_snapshot(policy_snapshot_for_state(policy_owner)),
         command_overrides=explicit_policy,
     )
     return {
@@ -3355,7 +3394,7 @@ def _resolve_resume_selection(
             records,
             parent_number=parent_number,
             active_only=True,
-            recoverable_only=True,
+            recoverable_only=parsed.ticket is None,
             purpose="resume",
             current_root=git.root,
         )

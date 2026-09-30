@@ -577,146 +577,13 @@ class Controller:
             validate_resume_state(validation_state)
         if hold_operator_gate:
             return existing, True
-        resuming_run_acceptance = False
-        ticket_execution_resumed = False
-        budget_resumed = (
-            _resume_review_budget_window(
-                state,
-                effective_budget_policy,
-                ticket_number=ticket_number,
-            )
-            if resume_budget_checkpoint
-            else False
+        apply_resume_to_state(
+            state, explicit_resume=explicit_resume,
+            resume_human_blocker=resume_human_blocker, new_thread=new_thread,
+            human_response=human_response, resume_budget_checkpoint=resume_budget_checkpoint,
+            budget_policy=effective_budget_policy, ticket_number=ticket_number,
+            source_status=str(resume_pause["status"]),
         )
-        if explicit_resume and not budget_resumed:
-            budget_resumed = _resume_ci_recovery_window(state, ticket_number=ticket_number)
-        if explicit_resume and not budget_resumed:
-            budget_resumed = _resume_ticket_publication_retry(
-                state, ticket_number=ticket_number
-            )
-        if explicit_resume and not budget_resumed:
-            ticket_execution_resumed = _resume_ticket_execution_failure(
-                state, ticket_number=ticket_number
-            )
-            budget_resumed = ticket_execution_resumed
-        if explicit_resume and not budget_resumed:
-            budget_resumed = _resume_ticket_pause(
-                state, ticket_number=ticket_number
-            )
-        if explicit_resume and not budget_resumed and ticket_number is None:
-            budget_resumed = _resume_run_repair_integration(state)
-        if explicit_resume and not budget_resumed:
-            active_ticket = state.get("active_ticket_job")
-            if (
-                ticket_number is not None
-                and isinstance(active_ticket, dict)
-                and active_ticket.get("ticket_number") != ticket_number
-            ):
-                active_ticket = None
-            if not isinstance(active_ticket, dict):
-                ticket_jobs = state.get("ticket_jobs")
-                matches = [
-                    value for value in ticket_jobs.values()
-                    if isinstance(value, dict)
-                    and value.get("phase") == "blocked"
-                    and value.get("blocked_reason") == "integration_resync_exhausted"
-                ] if isinstance(ticket_jobs, dict) else []
-                if ticket_number is not None:
-                    matches = [
-                        value for value in matches
-                        if value.get("ticket_number") == ticket_number
-                    ]
-                active_ticket = matches[0] if len(matches) == 1 else None
-            if (
-                isinstance(active_ticket, dict)
-                and active_ticket.get("phase") == "blocked"
-                and active_ticket.get("blocked_reason") == "integration_resync_exhausted"
-            ):
-                renew_resync_budget(
-                    active_ticket,
-                    policy_snapshot=active_ticket["policy_snapshot"],
-                )
-                active_ticket["phase"] = (
-                    "candidate"
-                    if active_ticket.get("attempt_kind") == "ci_repair"
-                    else "accepted"
-                )
-                active_ticket.pop("blocked_reason", None)
-                if active_ticket["phase"] == "accepted":
-                    acquire_ticket_slot(state, active_ticket)
-                state["active_ticket_job"] = active_ticket
-                state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
-                sync_active_ticket_job(state)
-                budget_resumed = True
-            if not budget_resumed:
-                for key, resume_phase, resume_status in (
-                    ("parent_job", "accepted", "parent_delivery_pending"),
-                    ("run_acceptance", "pending", "run_acceptance_pending"),
-                ):
-                    subject = state.get(key)
-                    if not isinstance(subject, dict) or subject.get("blocked_reason") != "integration_resync_exhausted":
-                        continue
-                    if subject.get("phase") not in {"blocked", "ready_for_human"}:
-                        continue
-                    renew_resync_budget(
-                        subject,
-                        policy_snapshot=subject.get("policy_snapshot") or state["policy_snapshot"],
-                    )
-                    subject["phase"] = (
-                        "repairing"
-                        if key == "run_acceptance"
-                        and isinstance(subject.get("repair_job"), dict)
-                        else resume_phase
-                    )
-                    subject.pop("blocked_reason", None)
-                    state.update({
-                        "status": resume_status,
-                        "terminal_kind": None,
-                        "diagnostics": [],
-                    })
-                    budget_resumed = True
-                    break
-        if budget_resumed and human_response is not None:
-            raise ValueError("Checkpoint resume does not accept a Human Blocker response")
-        resumed_subject = False
-        if budget_resumed:
-            resumed_subject = True
-        elif resume_human_blocker:
-            resuming_run_acceptance = _run_acceptance_human_blocker(state)
-            resumed_subject = _resume_agent_human_blocker(
-                state, ticket_number=ticket_number
-            )
-            if human_response is not None and not resumed_subject:
-                raise ValueError("--message requires a current Human Blocker")
-        elif human_response is not None:
-            raise ValueError("--message requires Human Blocker resume")
-        # A targeted resume may replace the previously selected Ticket. Bind
-        # completed-result recovery to that final owner and its pending Attempt.
-        invocation = state.get("active_agent_invocation")
-        resume_completed_invocation = (
-            (resume_pause["status"] == "execution_failed" or ticket_execution_resumed)
-            and isinstance(invocation, dict)
-            and invocation.get("status") == "completed"
-            and invocation_attempt_is_pending(state, invocation)
-        )
-        invocation_already_resuming = (
-            isinstance(state.get("active_agent_invocation"), dict)
-            and state["active_agent_invocation"].get("status") == "resuming"
-        )
-        if new_thread and (not budget_resumed or ticket_execution_resumed):
-            if resuming_run_acceptance:
-                _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
-            else:
-                _clear_current_invocation_thread(state)
-        elif not invocation_already_resuming:
-            _restore_current_invocation_thread(
-                state, allow_completed=resume_completed_invocation
-            )
-        if explicit_resume and ticket_number is None:
-            _restore_parallel_ticket_invocations(state)
-        _mark_failed_invocation_resuming(state)
-        if resumed_subject:
-            _reactivate_resumed_ticket(state)
         self._ensure_delivery_branch(state, base_sha)
         self.states.save_run(run_id, state)
         self._initialize_direct_profile(state)
@@ -2330,7 +2197,8 @@ def _resume_review_budget_window(
             ),
         )
         subject["policy_snapshot"] = policy.snapshot()
-        state["policy_snapshot"] = policy.snapshot()
+        if ticket_number is None:
+            state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject.pop("escalation_code", None)
         _resume_change_subject_after_budget(subject)
@@ -3119,3 +2987,156 @@ def _operator_gate_diagnostic(
             fallback_phase=fallback_phase,
         )
     return diagnostic
+
+
+def apply_resume_to_state(
+    state: dict[str, Any], *, explicit_resume: bool,
+    resume_human_blocker: bool, new_thread: bool,
+    human_response: str | None, resume_budget_checkpoint: bool,
+    budget_policy: DeliveryPolicy, ticket_number: int | None,
+    source_status: str,
+) -> None:
+    """Apply the shared pause, budget and Invocation continuation rules."""
+    if ticket_number is not None:
+        state["active_ticket_job"] = state["ticket_jobs"][str(ticket_number)]
+        state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(ticket_number))
+    resuming_run_acceptance = False
+    ticket_execution_resumed = False
+    budget_resumed = (
+        _resume_review_budget_window(
+            state,
+            budget_policy,
+            ticket_number=ticket_number,
+        )
+        if resume_budget_checkpoint
+        else False
+    )
+    if explicit_resume and not budget_resumed:
+        budget_resumed = _resume_ci_recovery_window(state, ticket_number=ticket_number)
+    if explicit_resume and not budget_resumed:
+        budget_resumed = _resume_ticket_publication_retry(
+            state, ticket_number=ticket_number
+        )
+    if explicit_resume and not budget_resumed:
+        ticket_execution_resumed = _resume_ticket_execution_failure(
+            state, ticket_number=ticket_number
+        )
+        budget_resumed = ticket_execution_resumed
+    if explicit_resume and not budget_resumed:
+        budget_resumed = _resume_ticket_pause(
+            state, ticket_number=ticket_number
+        )
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        budget_resumed = _resume_run_repair_integration(state)
+    if explicit_resume and not budget_resumed:
+        active_ticket = state.get("active_ticket_job")
+        if (
+            ticket_number is not None
+            and isinstance(active_ticket, dict)
+            and active_ticket.get("ticket_number") != ticket_number
+        ):
+            active_ticket = None
+        if not isinstance(active_ticket, dict):
+            ticket_jobs = state.get("ticket_jobs")
+            matches = [
+                value for value in ticket_jobs.values()
+                if isinstance(value, dict)
+                and value.get("phase") == "blocked"
+                and value.get("blocked_reason") == "integration_resync_exhausted"
+            ] if isinstance(ticket_jobs, dict) else []
+            if ticket_number is not None:
+                matches = [
+                    value for value in matches
+                    if value.get("ticket_number") == ticket_number
+                ]
+            active_ticket = matches[0] if len(matches) == 1 else None
+        if (
+            isinstance(active_ticket, dict)
+            and active_ticket.get("phase") == "blocked"
+            and active_ticket.get("blocked_reason") == "integration_resync_exhausted"
+        ):
+            renew_resync_budget(
+                active_ticket,
+                policy_snapshot=active_ticket["policy_snapshot"],
+            )
+            active_ticket["phase"] = (
+                "candidate"
+                if active_ticket.get("attempt_kind") == "ci_repair"
+                else "accepted"
+            )
+            active_ticket.pop("blocked_reason", None)
+            if active_ticket["phase"] == "accepted":
+                acquire_ticket_slot(state, active_ticket)
+            state["active_ticket_job"] = active_ticket
+            state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            sync_active_ticket_job(state)
+            budget_resumed = True
+        if not budget_resumed:
+            for key, resume_phase, resume_status in (
+                ("parent_job", "accepted", "parent_delivery_pending"),
+                ("run_acceptance", "pending", "run_acceptance_pending"),
+            ):
+                subject = state.get(key)
+                if not isinstance(subject, dict) or subject.get("blocked_reason") != "integration_resync_exhausted":
+                    continue
+                if subject.get("phase") not in {"blocked", "ready_for_human"}:
+                    continue
+                renew_resync_budget(
+                    subject,
+                    policy_snapshot=subject.get("policy_snapshot") or state["policy_snapshot"],
+                )
+                subject["phase"] = (
+                    "repairing"
+                    if key == "run_acceptance"
+                    and isinstance(subject.get("repair_job"), dict)
+                    else resume_phase
+                )
+                subject.pop("blocked_reason", None)
+                state.update({
+                    "status": resume_status,
+                    "terminal_kind": None,
+                    "diagnostics": [],
+                })
+                budget_resumed = True
+                break
+    if budget_resumed and human_response is not None:
+        raise ValueError("Checkpoint resume does not accept a Human Blocker response")
+    resumed_subject = False
+    if budget_resumed:
+        resumed_subject = True
+    elif resume_human_blocker:
+        resuming_run_acceptance = _run_acceptance_human_blocker(state)
+        resumed_subject = _resume_agent_human_blocker(
+            state, ticket_number=ticket_number
+        )
+        if human_response is not None and not resumed_subject:
+            raise ValueError("--message requires a current Human Blocker")
+    elif human_response is not None:
+        raise ValueError("--message requires Human Blocker resume")
+    # A targeted resume may replace the previously selected Ticket. Bind
+    # completed-result recovery to that final owner and its pending Attempt.
+    invocation = state.get("active_agent_invocation")
+    resume_completed_invocation = (
+        (source_status == "execution_failed" or ticket_execution_resumed)
+        and isinstance(invocation, dict)
+        and invocation.get("status") == "completed"
+        and invocation_attempt_is_pending(state, invocation)
+    )
+    invocation_already_resuming = (
+        isinstance(state.get("active_agent_invocation"), dict)
+        and state["active_agent_invocation"].get("status") == "resuming"
+    )
+    if new_thread and (not budget_resumed or ticket_execution_resumed):
+        if resuming_run_acceptance:
+            _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
+        else:
+            _clear_current_invocation_thread(state)
+    elif not invocation_already_resuming:
+        _restore_current_invocation_thread(
+            state, allow_completed=resume_completed_invocation
+        )
+    if explicit_resume and ticket_number is None:
+        _restore_parallel_ticket_invocations(state)
+    _mark_failed_invocation_resuming(state)
+    if resumed_subject:
+        _reactivate_resumed_ticket(state)

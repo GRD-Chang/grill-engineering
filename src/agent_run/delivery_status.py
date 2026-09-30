@@ -844,6 +844,8 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
         if type(position) is int:
             parts.append(f"集成队列第 {position} 位" if zh else f"integration queue #{position}")
         work_position = item.get("work_queue_position")
+        if item.get("resume_accepted"):
+            parts.append("恢复已接受" if zh else "Resume accepted")
         if type(work_position) is int:
             parts.append(f"等待工作名额，第 {work_position} 位" if zh else f"waiting for work slot #{work_position}")
         if item.get("has_work_slot") and executor_activity == "running":

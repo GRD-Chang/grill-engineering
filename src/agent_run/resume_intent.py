@@ -164,6 +164,8 @@ def bind_resume_intent(
                     for key in (
                         "ticket_number", "generation", "acceptance_generation",
                         "candidate_sha", "phase", "blocked_reason", "human_blockers",
+                        "ticket_branch_generation", "pause_resume_phase",
+                        "execution_resume_phase", "last_ticket_resume",
                         "pending_semantic_attempt", "integration_resync",
                         "ci_recovery", "publication_operation_retry",
                     )
@@ -202,3 +204,37 @@ def action_resume_intent(action: Mapping[str, Any]) -> dict[str, Any] | None:
     payload = action.get("payload")
     intent = payload.get("resume_intent") if isinstance(payload, Mapping) else None
     return dict(intent) if isinstance(intent, Mapping) else None
+
+
+def require_ticket_resume_receipts(state: Mapping[str, Any]) -> None:
+    """Validate optional bounded receipts without introducing a second queue."""
+    from agent_run.state_errors import IncompatibleRunStateError
+
+    for number, job in state["ticket_jobs"].items():
+        receipt = job.get("last_ticket_resume")
+        if receipt is None:
+            continue
+        payload = receipt.get("payload") if isinstance(receipt, dict) else None
+        intent = payload.get("resume_intent") if isinstance(payload, dict) else None
+        if not (
+            isinstance(receipt, dict) and isinstance(payload, dict) and isinstance(intent, dict)
+            and receipt.get("job_generation") == job.get("ticket_branch_generation")
+            and type(receipt.get("executor_generation")) is int
+            and receipt["executor_generation"] > 0
+            and isinstance(receipt.get("executor_action_id"), str)
+            and bool(receipt["executor_action_id"])
+            and isinstance(receipt.get("accepted_at"), str)
+            and payload.get("run_id") == state["run_id"]
+            and payload.get("ticket_number") == int(number)
+            and intent.get("ticket_number") == int(number)
+            and isinstance(intent.get("target_digest"), str)
+            and intent["target_digest"].startswith("sha256:")
+            and len(intent["target_digest"]) == 71
+            and isinstance(intent.get("pause_reason"), str)
+            and isinstance(intent.get("authorization"), str)
+            and type(payload.get("new_thread")) is bool
+            and type(payload.get("resume_budget_checkpoint")) is bool
+            and (payload.get("message") is None or isinstance(payload["message"], str))
+            and isinstance(payload.get("policy"), dict)
+        ):
+            raise IncompatibleRunStateError("invalid targeted Ticket Resume receipt")

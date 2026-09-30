@@ -1283,9 +1283,23 @@ class RunLifecycle:
             generation=generation,
             run_id=run_id,
         )
-        if self.execute_with_binding is not None:
-            return self.execute_with_binding(run_id, action_id, generation)
-        return self.execute(run_id)
+        while True:
+            result = (
+                self.execute_with_binding(run_id, action_id, generation)
+                if self.execute_with_binding is not None else self.execute(run_id)
+            )
+
+            def can_exit() -> bool:
+                store = state_store or self.states
+                with store.locked():
+                    latest = store.load_current_run(run_id)
+                    return latest is None or latest.get("resume_audit", {}).get("total") == result.get("resume_audit", {}).get("total")
+
+            if self.control.close_ticket_resume_admission(
+                self.task, action_id=action_id, generation=generation,
+                run_id=run_id, can_exit=can_exit,
+            ):
+                return result
 
     def _run_executor(
         self,
