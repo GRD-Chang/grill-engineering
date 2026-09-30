@@ -64,7 +64,31 @@ import threading
 
 role = os.environ.get("TICKET_190_ROLE")
 
-if role == "first":
+if role == "replacement":
+    original_locked = TaskControlStore._locked
+    transactions = threading.Lock()
+    started = Path(os.environ["TICKET_190_AGENT_STARTED"])
+    parked = Path(os.environ["TICKET_190_EXECUTOR_PARKED"])
+    release = Path(os.environ["TICKET_190_AGENT_RELEASE"])
+
+    @contextmanager
+    def parked_transaction(self, task):
+        # Drain every prior transaction before acknowledging the barrier.
+        # Wait outside the real file lock; preserve all ownership validation.
+        with transactions:
+            if started.exists() and not release.exists():
+                parked.touch()
+                deadline = time.monotonic() + 10
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Executor replacement barrier timed out")
+                    time.sleep(0.001)
+            with original_locked(self, task):
+                yield
+
+    TaskControlStore._locked = parked_transaction
+
+elif role == "first":
     original_transaction = TaskControlStore._executor_current_transaction
 
     @contextmanager
@@ -161,6 +185,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     agents = _parent_only_agents(git_repo / "agents.json")
     started = tmp_path / "agent-started"
     release = tmp_path / "agent-release"
+    parked = tmp_path / "executor-parked"
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["invocation_gate"] = {
         "role": "development",
@@ -169,8 +194,18 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         "timeout_seconds": 30,
     }
     agents.write_text(json.dumps(data), encoding="utf-8")
+    sitecustomize = tmp_path / "sitecustomize"
+    sitecustomize.mkdir()
+    _write_competition_sitecustomize(sitecustomize / "sitecustomize.py")
     environment = _isolated_environment(tmp_path / "generation")
-    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    source_path = str(Path(__file__).resolve().parents[1] / "src")
+    environment.update({
+        "PYTHONPATH": f"{sitecustomize}{os.pathsep}{source_path}",
+        "TICKET_190_ROLE": "replacement",
+        "TICKET_190_AGENT_STARTED": str(started),
+        "TICKET_190_EXECUTOR_PARKED": str(parked),
+        "TICKET_190_AGENT_RELEASE": str(release),
+    })
     workspace = managed_workspace(git_repo, extra_env=environment)
     command = [
         sys.executable,
@@ -193,6 +228,9 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     )
     try:
         _wait_for_marker(process, started)
+        # The Agent barrier alone leaves the continuous scheduler running.
+        # Replace ownership only after all old Task Control work is parked.
+        _wait_for_marker(process, parked)
         state_path = next((workspace.state_root / "runs").glob("*.json"))
         control = TaskControlStore(workspace.state_root)
         task = TaskKey(workspace.repository_root, "example/project", 1)

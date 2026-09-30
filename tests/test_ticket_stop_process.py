@@ -103,8 +103,16 @@ pathlib.Path(output).write_text(json.dumps({"result_kind": "development", "summa
         for number in (2, 3):
             _until(lambda n=number: (git_repo / f"{n}.pid").exists())
             pids[number] = int((git_repo / f"{number}.pid").read_text())
-        before = states.load_current_run(run_id)
-        assert before is not None
+        # The child writes its PID independently of the stdout reader that
+        # persists thread.started. Snapshot the Attempt/budget only after that
+        # durable event, so Stop/Resume assertions use the actual Thread.
+        def target_thread_saved() -> dict[str, Any] | None:
+            saved = states.load_current_run(run_id)
+            assert saved is not None
+            invocation = saved["ticket_agent_invocations"].get("2", {})
+            return saved if invocation.get("reported_thread_id") == "developer-2" else None
+
+        before = _until(target_thread_saved)
         invocation = before["ticket_agent_invocations"]["2"]
         assert invocation["reported_thread_id"] == "developer-2"
         attempt_id = invocation["semantic_attempt"]["attempt_id"]
