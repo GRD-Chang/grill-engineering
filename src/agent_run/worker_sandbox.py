@@ -471,6 +471,9 @@ def run_worker_process(
     abort_reason: Callable[[], str] | None = None,
     on_process_started: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    from agent_run.worker_control import check_worker_control
+
+    check_worker_control()
     gate_write: int | None = None
     if on_process_started is None:
         process = subprocess.Popen(
@@ -513,6 +516,7 @@ def run_worker_process(
     try:
         if on_process_started is not None:
             on_process_started(process.pid)
+        check_worker_control()
         if gate_write is not None:
             if (
                 deadline_at_monotonic is not None
@@ -630,6 +634,7 @@ def run_worker_process(
             else time.monotonic() + timeout
         )
         while process.poll() is None:
+            check_worker_control()
             if abort_event is not None and abort_event.is_set():
                 wait_error = WorkerSandboxError(
                     abort_reason() if abort_reason is not None else "Worker credential renewal expired"
@@ -692,6 +697,11 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        # The original Popen remains our child even if its group disappeared.
+        # Reap it before the caller can release its Ticket work lease.
+        if process.poll() is None:
+            process.kill()
+        process.wait()
         return
     deadline = time.monotonic() + 0.2
     while time.monotonic() < deadline:

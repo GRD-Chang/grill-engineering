@@ -1886,13 +1886,15 @@ def _resume_ticket_pause(
     if phase not in {
         "developing", "repairing", "candidate", "reviewing", "accepted",
         "ready_for_integration", "waiting_checks", "publication_pending",
+        "committing_candidate", "publishing",
     }:
         raise ValueError("Ticket pause has no recoverable phase")
     job["phase"] = phase
     job.pop("blocked_reason", None)
     state["ticket_pause_requests"].pop(str(job["ticket_number"]), None)
     state["active_ticket_job"] = job
-    if phase in {"accepted", "waiting_checks"}:
+    state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(job["ticket_number"]))
+    if phase in {"accepted", "waiting_checks", "publishing"}:
         job["integration_resume_phase"] = phase
         phase = "ready_for_integration"
         job["phase"] = phase
@@ -3023,9 +3025,10 @@ def apply_resume_to_state(
         )
         budget_resumed = ticket_execution_resumed
     if explicit_resume and not budget_resumed:
-        budget_resumed = _resume_ticket_pause(
+        ticket_execution_resumed = _resume_ticket_pause(
             state, ticket_number=ticket_number
         )
+        budget_resumed = ticket_execution_resumed
     if explicit_resume and not budget_resumed and ticket_number is None:
         budget_resumed = _resume_run_repair_integration(state)
     if explicit_resume and not budget_resumed:

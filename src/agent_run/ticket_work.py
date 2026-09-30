@@ -99,6 +99,10 @@ class TicketWorkAdmission:
             ):
                 raise TaskControlBusyError("Ticket work lost its current Job authorization")
             reconcile(state)
+            if str(number) in state["ticket_pause_requests"]:
+                if state["ticket_work_queue"] != previous:
+                    self.states._save_run_and_notify_unlocked(self.run_id, state)
+                return
             item = enqueue(state, number, role)
             if item["lease_id"] is not None:
                 raise TaskControlBusyError("Ticket already has current Agent work")
@@ -116,6 +120,18 @@ class TicketWorkAdmission:
 
         self.states._commit_run(commit)
         return token
+
+    def check_control(self, token: str) -> None:
+        """Only the invocation holding this exact lease can stop its own child."""
+        from agent_run.ticket_pause import TicketStopRequested
+        from agent_run.ticket_state import RUN_STOP_STATUSES
+
+        state = self._load()
+        item = next((item for item in state["ticket_work_queue"] if item["lease_id"] == token), None)
+        if item is None or state["status"] in RUN_STOP_STATUSES:
+            raise TaskControlBusyError("Ticket Agent lost its execution lease")
+        if str(item["ticket_number"]) in state["ticket_pause_requests"]:
+            raise TicketStopRequested("Ticket stop requested")
 
     def release(self, token: str) -> None:
         def commit() -> None:

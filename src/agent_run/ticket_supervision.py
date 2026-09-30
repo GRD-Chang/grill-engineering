@@ -34,6 +34,13 @@ def development_wait_due(
 
 
 def _retry_due(scoped: TicketState, state: dict[str, Any], *, already_ready: bool = False) -> bool:
+    from agent_run.ticket_pause import can_pause_ticket, pause_ticket
+
+    job = state["active_ticket_job"]
+    if str(job["ticket_number"]) in state["ticket_pause_requests"] and can_pause_ticket(job):
+        pause_ticket(state, job)
+        scoped.save_run(str(state["run_id"]), state)
+        return False
     previous = deepcopy(state.get("supervision_window"))
     supervisor = ExternalSupervisor()
     if already_ready and isinstance(previous, dict) and supervisor.now() < previous["deadline"]:

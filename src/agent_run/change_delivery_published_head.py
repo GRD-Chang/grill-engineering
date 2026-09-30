@@ -267,6 +267,11 @@ def publish_and_merge(
                 "ticket_pr_closed_unmerged",
                 "Current Change Job PR was closed without merging",
             )
+        if (
+            ticket and stage._ticket_stop_requested(state, job)
+            and job.get("phase") in {"merging", "waiting_merge"}
+        ):
+            return stage._wait_for_merge_reconciliation(state, job, "Ticket stop is waiting for the sent merge result")
         if job.get("phase") == "merging" and isinstance(job.get("integrated_sha"), str):
             state["status"] = "waiting_merge"
             stage.save(state)
@@ -339,6 +344,10 @@ def publish_and_merge(
     if exhausted:
         return True
     if not observed_published and job.get("ticket_write_intent") != publish_intent:
+        # Remote reads may outlive Stop. Check before admitting a new write;
+        # an existing intent still needs its original reconciliation path.
+        if stage._pause_ticket_if_requested(state, job):
+            return True
         job["ticket_write_intent"] = publish_intent
         stage.save(state)
     if not observed_published:
@@ -368,9 +377,14 @@ def publish_and_merge(
             "head_sha": publish_result.head_sha,
             "disposition": publish_result.disposition,
         }
-    job.pop("ticket_write_intent", None)
+    # This readback settles the push only. A later PR write may still have
+    # an unknown response and must retain its intent until ensure_pr settles it.
+    if job.get("ticket_write_intent") == publish_intent:
+        job.pop("ticket_write_intent", None)
     job["published_sha"] = str(job["publication_sha"])
     stage.save(state)
+    if stage._pause_ticket_if_requested(state, job):
+        return True
     stage._reject_stale(
         state,
         job,
@@ -385,6 +399,8 @@ def publish_and_merge(
         "head_sha": str(job["publication_sha"]),
     }
     if job.get("ticket_write_intent") != pr_intent:
+        if stage._pause_ticket_if_requested(state, job):
+            return True
         job["ticket_write_intent"] = pr_intent
         stage.save(state)
     exhausted, pr_number = _publication_operation(
@@ -401,6 +417,8 @@ def publish_and_merge(
     job["pr_number"] = pr_number
     sync_fallback_receipt_observation(job, pr_number)
     stage.save(state)
+    if stage._pause_ticket_if_requested(state, job):
+        return True
     stage._reject_stale(
         state,
         job,
@@ -577,6 +595,8 @@ def publish_and_merge(
                 "required_checks_evidence": deepcopy(required_checks_evidence),
             }
         )
+    if stage._pause_ticket_if_requested(state, job):
+        return True
     merge_intent = job.get("merge_intent")
     integration_record = {
         "source": "fallback" if fallback else "ci_repair" if ci_repair else "accepted",
@@ -672,6 +692,8 @@ def publish_and_merge(
         checks,
         next_action=f"{stage.publisher.merge_description(job)} into the Run Branch",
     )
+    if stage._pause_ticket_if_requested(state, job):
+        return True
     attempts = merge_intent.get("attempts", 0)
     if type(attempts) is not int or attempts < 0:
         raise ValueError("merge intent attempts must be a non-negative integer")

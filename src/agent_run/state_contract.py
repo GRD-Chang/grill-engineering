@@ -2038,6 +2038,12 @@ def _change_owner_phase_is_current(
     if not isinstance(job, dict):
         return False
     if (
+        job.get("phase") == "blocked"
+        and job.get("blocked_reason") == "ticket_paused"
+        and invocation.get("status") in {"failed", "completed", "resuming"}
+    ):
+        job = {**job, "phase": job.get("pause_resume_phase")}
+    if (
         job.get("phase") == "ready_for_integration"
         and job.get("integration_resume_phase") == "accepted"
         and invocation.get("status") in {"failed", "completed", "resuming"}

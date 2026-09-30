@@ -521,14 +521,19 @@ def _main_with_parser_resources(
                 "status": paused["status"],
                 "ticket_number": parsed.ticket,
                 "pause_requested": str(parsed.ticket) in paused["ticket_pause_requests"],
-                "ticket_phase": paused["ticket_jobs"][str(parsed.ticket)]["phase"],
+                "ticket_phase": paused["ticket_jobs"].get(str(parsed.ticket), {}).get("phase", "pending"),
             }
             if parsed.as_json:
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             else:
-                print(text(
+                job = paused["ticket_jobs"].get(str(parsed.ticket), {})
+                message_key = (
                     "cli.ticket_pause_requested" if result["pause_requested"]
-                    else "cli.ticket_paused",
+                    else "cli.ticket_paused" if job.get("blocked_reason") == "ticket_paused"
+                    else "cli.ticket_stop_unchanged"
+                )
+                print(text(
+                    message_key,
                     language=selected_language(paused), ticket_number=parsed.ticket,
                 ))
             return 0

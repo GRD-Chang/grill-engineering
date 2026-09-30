@@ -184,6 +184,11 @@ def multi_ticket_progress(
                 int(item) for item in state.get("ticket_pause_requests", {})
                 if isinstance(item, str) and item.isdecimal()
             },
+            "stop_wait_reason": (
+                "agent_exit" if number in working else
+                "remote_reconciliation" if job_data.get("ticket_write_intent") is not None
+                or phase in {"merging", "merged", "waiting_merge"} else "local_boundary"
+            ) if str(number) in state.get("ticket_pause_requests", {}) else None,
             "blocked_by": unresolved,
             "usage": usage,
             "recovery_action": action,

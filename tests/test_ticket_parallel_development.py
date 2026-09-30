@@ -527,8 +527,7 @@ def test_ticket_stop_pauses_only_queued_ticket_and_resumes(git_repo: Path) -> No
     assert saved is not None
     assert saved["ticket_jobs"]["2"]["blocked_reason"] == "ticket_paused"
     assert saved["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
-    with pytest.raises(ValueError, match="no active delivery work"):
-        request_ticket_pause(states, str(state["run_id"]), 2)
+    assert request_ticket_pause(states, str(state["run_id"]), 2) == saved
     assert bind_resume_intent(saved, ticket_number=2)["authorization"] == "continue_ticket"
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     resumed, _ = controller.resume(
@@ -607,6 +606,17 @@ def test_ticket_pause_receipts_use_frozen_run_language(
     paused = states.load_current_run(str(state["run_id"]))
     assert paused is not None
     assert paused["ticket_jobs"][str(queued_number)]["blocked_reason"] == "ticket_paused"
+    # A later, independently established gate is not reported as a new Stop.
+    paused["ticket_jobs"][str(queued_number)]["blocked_reason"] = "modification_budget_exhausted"
+    states.save_run(str(state["run_id"]), paused)
+    unchanged = invoke_cli_inprocess(
+        git_repo, fixture, "stop", "1", "--ticket", str(queued_number),
+    )
+    assert unchanged.returncode == 0, unchanged.stdout + unchanged.stderr
+    assert unchanged.stdout.strip() == (
+        f"Ticket #{queued_number}：已无可停止的自动工作，保留当前结果" if run_language == "zh"
+        else f"Ticket #{queued_number}: no automatic work to stop; current result preserved"
+    )
 
 
 def test_pause_request_waits_for_active_development_boundary(git_repo: Path) -> None:

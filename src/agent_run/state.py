@@ -272,7 +272,7 @@ class StateStore:
             if isinstance(requests, dict):
                 for number, requested_at in previous["ticket_pause_requests"].items():
                     job = jobs.get(number) if isinstance(jobs, dict) else None
-                    if isinstance(job, dict) and job.get("phase") == "blocked":
+                    if isinstance(job, dict) and job.get("phase") in {"blocked", "completed", "publication_pending"}:
                         requests.pop(number, None)
                     else:
                         requests.setdefault(number, requested_at)

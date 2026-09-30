@@ -117,6 +117,12 @@ class TicketDeliveryEngine:
 
     def _deliver_loaded(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         job = self._job(state)
+        from agent_run.ticket_pause import can_pause_ticket, pause_ticket
+
+        if str(job["ticket_number"]) in state["ticket_pause_requests"] and can_pause_ticket(job):
+            pause_ticket(state, job)
+            self._save(state)
+            return state
         # Restore the in-memory mirror before shared stages save a recovered
         # Job; merge recovery intentionally performs no branch-intent write.
         sync_active_ticket_job(state)

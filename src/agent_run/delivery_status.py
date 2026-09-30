@@ -848,7 +848,15 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
             parts.append("恢复已接受" if zh else "Resume accepted")
         if type(work_position) is int:
             parts.append(f"等待工作名额，第 {work_position} 位" if zh else f"waiting for work slot #{work_position}")
-        if item.get("has_work_slot") and executor_activity == "running":
+        stop_reason = item.get("stop_wait_reason")
+        if stop_reason:
+            descriptions = {
+                "agent_exit": ("正在停止，等待 Agent 退出", "stopping; waiting for Agent exit"),
+                "remote_reconciliation": ("正在停止，等待远端结果对账", "stopping; reconciling remote result"),
+                "local_boundary": ("正在停止，等待本地步骤收口", "stopping; finishing local step"),
+            }
+            parts.append(descriptions[str(stop_reason)][0 if zh else 1])
+        if item.get("has_work_slot") and executor_activity == "running" and not stop_reason:
             parts.append("正在工作" if zh else "working")
         if item.get("holds_integration"):
             parts.append("持有集成席位" if zh else "holds integration")

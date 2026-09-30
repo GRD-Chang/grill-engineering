@@ -12,6 +12,7 @@ from agent_run.error_safety import bounded_error
 from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_eligibility import DISQUALIFYING_LABELS
 from agent_run.ticket_queue import enqueue, reconcile
+from agent_run.ticket_pause import TicketStopRequested, pause_ticket
 
 
 RUN_STOP_STATUSES = frozenset({
@@ -137,16 +138,19 @@ class TicketState:
                 # The shared Invocation recorder reports execution failure.
                 # Commit its Ticket owner as paused in the same transaction,
                 # never expose that local event as a Run authorization loss.
-                job["execution_resume_phase"] = job["phase"]
-                job["phase"] = "blocked"
-                job["blocked_reason"] = "ticket_execution_failed"
-                job["execution_failure"] = bounded_error(str(
-                    invocation.get("error") or diagnostics[0]["message"]
-                ))
-                if "prior_human_blockers" in job:
-                    job.pop("human_blockers", None)
-                state["status"] = "blocked"
-                state["terminal_kind"] = None
+                if number in latest["ticket_pause_requests"]:
+                    pause_ticket(state, job)
+                else:
+                    job["execution_resume_phase"] = job["phase"]
+                    job["phase"] = "blocked"
+                    job["blocked_reason"] = "ticket_execution_failed"
+                    job["execution_failure"] = bounded_error(str(
+                        invocation.get("error") or diagnostics[0]["message"]
+                    ))
+                    if "prior_human_blockers" in job:
+                        job.pop("human_blockers", None)
+                    state["status"] = "blocked"
+                    state["terminal_kind"] = None
             holder = state["ticket_integration_holder"]
             if holder != self._last_holder and (holder == self.ticket_number or self._last_holder == self.ticket_number):
                 if latest["ticket_integration_holder"] != self._last_holder:
@@ -178,7 +182,7 @@ class TicketState:
                 enqueue(latest, latest["ticket_jobs"][number])
             else:
                 reconcile(latest, latest["ticket_jobs"][number])
-            if job.get("blocked_reason") == "ticket_paused":
+            if job.get("phase") in {"blocked", "completed", "publication_pending"}:
                 latest["ticket_pause_requests"].pop(number, None)
             selected = latest.get("active_ticket_job")
             if isinstance(selected, dict) and selected.get("ticket_number") == self.ticket_number:
@@ -265,12 +269,16 @@ class TicketState:
                 raise TaskControlBusyError("Ticket demand changed while its lane ran")
             if job.get("phase") == "blocked":
                 return
-            job["execution_resume_phase"] = job.get("phase") or "developing"
-            job["phase"] = "blocked"
-            job["blocked_reason"] = "ticket_execution_failed"
-            job["execution_failure"] = bounded_error(str(error))
-            if "prior_human_blockers" in job:
-                job.pop("human_blockers", None)
+            stopping = isinstance(error, TicketStopRequested) or number in latest["ticket_pause_requests"]
+            if stopping:
+                pause_ticket(latest, job)
+            else:
+                job["execution_resume_phase"] = job.get("phase") or "developing"
+                job["phase"] = "blocked"
+                job["blocked_reason"] = "ticket_execution_failed"
+                job["execution_failure"] = bounded_error(str(error))
+                if "prior_human_blockers" in job:
+                    job.pop("human_blockers", None)
             invocation = latest["ticket_agent_invocations"].get(number)
             if isinstance(invocation, dict) and invocation.get("status") in {
                 "running", "resuming",
@@ -279,7 +287,8 @@ class TicketState:
                 invocation.update({
                     "status": "failed",
                     "interruption_observed_at": datetime.now(UTC).isoformat(),
-                    "error": "ticket_execution_failed",
+                    "error": "ticket_paused" if stopping else "ticket_execution_failed",
+                    "execution_interrupted": True,
                 })
                 latest["ticket_agent_invocations"][number] = invocation
                 _sync_invocation_history(latest, invocation)
@@ -291,8 +300,8 @@ class TicketState:
                     latest["active_agent_invocation"] = invocation
                 latest["status"] = "blocked"
                 latest["diagnostics"] = [{
-                    "code": "ticket_execution_failed",
-                    "message": job["execution_failure"],
+                    "code": job["blocked_reason"],
+                    "message": job.get("execution_failure", "Ticket paused; explicit resume is required"),
                     "ticket_number": self.ticket_number,
                 }]
             self.states._save_run_and_notify_unlocked(self.run_id, latest)

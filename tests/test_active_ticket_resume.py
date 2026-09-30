@@ -14,6 +14,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
+from agent_run.ticket_pause import TicketStopRequested, request_ticket_pause
 from support.cli import issue, run_cli, stdout_json
 from support.control import _bind_running_executor
 from support.seeding import seed_run, write_fixture
@@ -21,8 +22,9 @@ from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
 
 
+@pytest.mark.parametrize("pause_reason", ["ticket_execution_failed", "ticket_paused"])
 def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, pause_reason: str,
 ) -> None:
     """Only Agent responses are controlled; CLI, Git, scheduler and disk are real."""
     import agent_run.delivery as delivery
@@ -56,6 +58,9 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
         assert current is not None
         review_attempts.append(deepcopy(current["ticket_jobs"]["2"]["pending_semantic_attempt"]))
         if len(review_attempts) == 1:
+            if pause_reason == "ticket_paused":
+                request_ticket_pause(states, run_id, 2)
+                raise TicketStopRequested()
             raise RuntimeError("controlled Reviewer process failure")
         starts.append(number)
         started[number].set()
@@ -63,7 +68,7 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
 
     agents = TicketAgents(git_repo, numbers, develop, before_review=review)
     paused = ticket_engine(git, states, fixture, agents, development_only=True).deliver_ticket(run_id, 2)
-    assert paused["active_ticket_job"]["blocked_reason"] == "ticket_execution_failed"
+    assert paused["active_ticket_job"]["blocked_reason"] == pause_reason
     engine = DeliveryRunEngine(
         controller=Controller(FixtureGitHubReader(fixture), git, states),
         tickets=ticket_engine(git, states, fixture, agents),
@@ -95,7 +100,7 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
         assert receipt["attached"] is False
         assert receipt["work_queue_position"] == 2
         assert receipt["resume_intent"]["authorization"] == "continue_ticket"
-        assert receipt["resume_intent"]["pause_reason"] == "ticket_execution_failed"
+        assert receipt["resume_intent"]["pause_reason"] == pause_reason
         admitted = states.load_current_run(run_id)
         assert admitted is not None
         queue = deepcopy(admitted["ticket_work_queue"])

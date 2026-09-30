@@ -156,3 +156,39 @@ def test_invalid_persisted_queue_is_rejected(git_repo: Path, corruption: str) ->
     path.write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(IncompatibleRunStateError):
         StateStore(states.root).load_current_run(state["run_id"])
+
+
+@pytest.mark.parametrize("role", ["development", "reviewer", "publication", "integration_conflict"])
+def test_stop_before_process_launch_uses_exact_lease_and_keeps_slot_until_release(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, role: str,
+) -> None:
+    from agent_run.ticket_pause import TicketStopRequested, request_ticket_pause
+    from agent_run.worker_control import worker_control
+    from agent_run.worker_sandbox import run_worker_process
+
+    state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = state["run_id"]
+    admission = TicketWorkAdmission(states, run_id)
+    lease = admission.acquire(2, generation(state, 2), role)
+    assert lease is not None
+    request_ticket_pause(states, run_id, 2)
+    original_queue = _queue(states, run_id)
+    request_ticket_pause(states, run_id, 2)
+    assert _queue(states, run_id) == original_queue
+
+    def unexpected_process(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("Stop accepted before launch must prevent the Worker from starting")
+
+    monkeypatch.setattr("agent_run.worker_sandbox.subprocess.Popen", unexpected_process)
+    binding = worker_control.set(lambda: admission.check_control(lease))
+    try:
+        with pytest.raises(TicketStopRequested):
+            run_worker_process(["unused"], cwd=git_repo, prompt="", environment={}, timeout=1)
+    finally:
+        worker_control.reset(binding)
+    assert _queue(states, run_id)[0]["lease_id"] == lease
+    assert admission.acquire(3, generation(state, 3), "development") is None
+    admission.release(lease)
+    with pytest.raises(TaskControlBusyError):
+        admission.check_control(lease)
+    assert admission.acquire(3, generation(state, 3), "development") is not None

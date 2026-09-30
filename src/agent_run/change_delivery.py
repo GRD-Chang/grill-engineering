@@ -9,6 +9,7 @@ and StateStore persistence are kept in their own seam.  In particular,
 neither layer gets a shortcut from development to a Run Branch write.
 """
 
+from contextvars import Token
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
@@ -51,6 +52,8 @@ from agent_run.review_budget import (
     mark_development,
     policy_for_subject,
 )
+
+from agent_run.worker_control import worker_control
 
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 
@@ -148,6 +151,7 @@ class ChangeDeliveryEngine:
         self._current_job: dict[str, Any] | None = None
         self._agent_work_allowed = True
         self._work_token: str | None = None
+        self._control_token: Token[Callable[[], None] | None] | None = None
         self._work_admission = None
         if contract.label.startswith("ticket-"):
             from agent_run.ticket_state import TicketState
@@ -162,30 +166,23 @@ class ChangeDeliveryEngine:
     def _pause_ticket_if_requested(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
-        if not self.contract.label.startswith("ticket-") or job.get("phase") in {
-            "completed", "merged", "blocked", "escalating", "committing_candidate",
-            "publishing", "waiting_merge", "merging",
-        }:
+        from agent_run.ticket_pause import can_pause_ticket, pause_ticket
+
+        if not self.contract.label.startswith("ticket-") or not can_pause_ticket(job):
+            return False
+        if not self._ticket_stop_requested(state, job):
+            return False
+        pause_ticket(state, job)
+        self.save(state)
+        return True
+
+    def _ticket_stop_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        if not self.contract.label.startswith("ticket-"):
             return False
         latest = self.state_store.states.load_current_run(str(state["run_id"]))
         if latest is None:
             raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-        requests = latest.get("ticket_pause_requests")
-        number = str(job["ticket_number"])
-        if not isinstance(requests, dict) or number not in requests:
-            return False
-        state["ticket_pause_requests"] = dict(requests)
-        state["ticket_pause_requests"].pop(number, None)
-        job["pause_resume_phase"] = job["phase"]
-        job["phase"] = "blocked"
-        job["blocked_reason"] = "ticket_paused"
-        state.update({"status": "blocked", "terminal_kind": None, "diagnostics": [{
-            "code": "ticket_paused",
-            "message": "Ticket paused at a delivery boundary",
-            "ticket_number": job["ticket_number"],
-        }]})
-        self.save(state)
-        return True
+        return str(job["ticket_number"]) in latest["ticket_pause_requests"]
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         if self.contract.label.startswith("ticket-") and self._current_job is not None:
@@ -313,6 +310,9 @@ class ChangeDeliveryEngine:
             self._agent_work_allowed = True
 
     def release_agent_work(self) -> None:
+        if self._control_token is not None:
+            worker_control.reset(self._control_token)
+            self._control_token = None
         if self._work_token is not None:
             assert self._work_admission is not None
             self._work_admission.release(self._work_token)
@@ -330,6 +330,8 @@ class ChangeDeliveryEngine:
             )
             if self._work_token is None:
                 raise AgentWorkRequired(role)
+            admission, token = self._work_admission, self._work_token
+            self._control_token = worker_control.set(lambda: admission.check_control(token))
         self._agent_work_allowed = False
 
     @staticmethod

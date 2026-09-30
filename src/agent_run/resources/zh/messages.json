@@ -236,6 +236,7 @@
   "cli.stop_ticket_help": "只暂停指定 Ticket，保留其他 Ticket 的推进",
   "cli.ticket_pause_requested": "Ticket #{ticket_number}：已请求暂停",
   "cli.ticket_paused": "Ticket #{ticket_number}：已暂停",
+  "cli.ticket_stop_unchanged": "Ticket #{ticket_number}：已无可停止的自动工作，保留当前结果",
   "cli.ticket_resume_queued": "Ticket #{ticket_number}：恢复已接受，等待工作名额",
   "cli.ticket_resume_accepted": "Ticket #{ticket_number}：恢复意图已接受",
   "cli.abandon_help": "放弃交付运行并执行受限恢复与清理",

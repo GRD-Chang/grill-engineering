@@ -319,6 +319,8 @@ class CodexCliBackend:
     ) -> tuple[str, str]:
         """Run one Invocation with at most two same-Thread output repairs."""
 
+        from agent_run.worker_control import check_worker_control
+
         event = request.get("_invocation_event")
         event_deadline_seconds = getattr(event, "deadline_seconds", None)
         deadline_seconds = _invocation_timeout_seconds(
@@ -358,6 +360,7 @@ class CodexCliBackend:
             current_thread = value
 
         while attempt <= 3:
+            check_worker_control()
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before Invocation"
@@ -458,6 +461,7 @@ class CodexCliBackend:
                     notify("recovery_waiting", **facts)
                     if capacity:
                         for _ in range(30):
+                            check_worker_control()
                             if not recovery_allowed():
                                 raise CodexProcessError(
                                     "Execution recovery authorization changed",

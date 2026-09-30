@@ -237,7 +237,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
 | `stop` | 任意已知、未终止且有活动 Executor 的 Run | 原子撤销旧 Executor 写入权，定向终止其 Worker 进程组，并把 Run 置为可显式恢复的 `operator_stopped` | 不把 Stop 记为失败，不删除 checkout、Thread、Attempt 或 Artifact；确认无活动 Executor 及重复 Stop 都严格只读 |
 | `resume --ticket` | 指定 Ticket 位于合法局部暂停；可与其他 Ticket 的执行并存 | 复核需求、暂停授权和原 Executor；恢复意图及 FIFO 位置落盘后返回，名额可用时原 Executor 自动继续 | 返回成功只表示已接受；不新启 Executor，不插队，不重置有效预算；重复请求保持队位，最终批准和全局门禁仍有效 |
-| `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录局部暂停请求，在该 Ticket 下一个安全边界阻塞；已排队且未持席的 Ticket 可立即暂停，其他 Ticket 继续 | 不强杀仍在执行的 Agent，不停止整个 Run；用 `resume --ticket` 显式继续 |
+| `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录停止意图，立即中断准确归属该票的 Agent，取消未启动的工作排队；确认进程退出后释放名额，其他 Ticket 与 CI 监督继续 | 保留工作区、Attempt、适用 Thread 与独立预算门禁；在途写入先对账，状态展示等待收口原因；用 `resume --ticket` 显式继续 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
 Task Control 缺失或损坏时，下一次生命周期命令先按准确 Run receipt、Host ownership、Runner binding
