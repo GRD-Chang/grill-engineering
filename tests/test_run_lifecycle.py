@@ -3085,7 +3085,16 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
             extra_env=environment,
         )
         assert rejected.returncode == 2
-        assert stdout_json(rejected)["diagnostics"][0]["code"] == "action_busy"
+        diagnostic = stdout_json(rejected)["diagnostics"][0]
+        # Admission can race the live Executor's short ownership transaction.
+        # Both busy paths must reject without applying or persisting the Resume.
+        if diagnostic["code"] == "task_control":
+            assert diagnostic["message"] == (
+                "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
+            )
+        else:
+            assert diagnostic["code"] == "action_busy", rejected.stdout + rejected.stderr
+        assert diagnostic["application_status"] == "not_applied"
         assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
     finally:
         release.touch()

@@ -116,7 +116,6 @@ from agent_run.resume_intent import (
     bind_resume_intent,
     validate_resume_intent,
 )
-from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.run_selection import (
     load_exact_run, load_selected_state, read_state_directory, selector_records,
     selector_error, validate_repository_name, selected_local_run_id,
@@ -1615,13 +1614,8 @@ def _resume_action_payload(
     parsed: argparse.Namespace,
     current: Mapping[str, Any],
 ) -> dict[str, Any]:
-    budget_checkpoint_resume = (
-        sum(
-            1 for kind, subject in budget_checkpoint_subjects(dict(current))
-            if parsed.ticket is None
-            or (kind == "ticket" and subject.get("ticket_number") == parsed.ticket)
-        ) == 1
-    )
+    intent = bind_resume_intent(current, ticket_number=parsed.ticket)
+    budget_checkpoint_resume = intent["authorization"] == "new_budget_window"
     explicit_policy = _policy_overrides(parsed)
     if explicit_policy and not budget_checkpoint_resume:
         raise DeliveryPolicyError(
@@ -1644,7 +1638,7 @@ def _resume_action_payload(
         "message": parsed.message,
         "ticket_number": parsed.ticket,
         "resume_budget_checkpoint": budget_checkpoint_resume,
-        "resume_intent": bind_resume_intent(current, ticket_number=parsed.ticket),
+        "resume_intent": intent,
         "policy": policy.snapshot(),
     }
 

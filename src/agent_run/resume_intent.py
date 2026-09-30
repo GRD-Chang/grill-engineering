@@ -36,6 +36,10 @@ def bind_resume_intent(
     state = current = resume_pause_state(state)
     checkpoints = budget_checkpoint_subjects(current)
     gates = operator_gate_subjects(current)
+    if ticket_number is None and is_ticket_execution_recovery(current, current.get("status")):
+        # Run recovery cannot renew or reopen a sibling Ticket's local gate.
+        checkpoints = []
+        gates = []
     if ticket_number is not None:
         if type(ticket_number) is not int or ticket_number < 1:
             raise ResumeIntentError("resume Ticket 编号必须为正整数")
@@ -187,6 +191,14 @@ def bind_resume_intent(
     if ticket_number is not None:
         intent["ticket_number"] = ticket_number
     return intent
+
+
+def is_ticket_execution_recovery(state: Mapping[str, Any], status: object) -> bool:
+    """Resume the Ticket Executor without consuming independent local gates."""
+    return status in {"execution_failed", "operator_stopped"} and any(
+        state.get("ticket_jobs", {}).get(str(number), {}).get("phase") != "completed"
+        for number in state.get("ticket_graph", {}).get("tickets", {})
+    )
 
 
 def validate_resume_intent(

@@ -365,6 +365,14 @@ def record_session_interruption(
         work_subject, subject, _container = current_change_job(state)
     except RequeueError:
         subject = None
+    if subject is not None and subject.get("phase") in {"completed", "abandoned"}:
+        # The selected Ticket may have finished while a sibling was working.
+        # Never bind a new failure gate to that immutable completion.
+        subject = None
+        for number, job in state.get("ticket_jobs", {}).items():
+            if job.get("phase") not in {"completed", "abandoned"}:
+                work_subject, subject = f"ticket:{number}", job
+                break
     if subject is not None:
         phase = subject.get("phase")
         diagnostic["operator_gate"] = {
@@ -373,7 +381,7 @@ def record_session_interruption(
             "phase": (
                 phase
                 if isinstance(phase, str) and phase
-                else str(state.get("status") or "execution_failed")
+                else "active"
             ),
             "reason": "session_interrupted",
         }
@@ -429,10 +437,10 @@ def record_operator_stop(
 
 
 def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
-    # Called only after the Executor's exit/stop has been established. No
-    # running token survives into the explicit recovery window.
-    if "ticket_work_queue" in state:
-        state["ticket_work_queue"] = []
+    # Called only after the Executor's exit/stop has been established.
+    from agent_run.ticket_work import release_exited_executor_leases
+
+    release_exited_executor_leases(state)
     invocations = state.get("ticket_agent_invocations")
     if not isinstance(invocations, dict):
         return

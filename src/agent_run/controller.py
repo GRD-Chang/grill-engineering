@@ -71,7 +71,7 @@ from agent_run.requeue_supervision import (
 )
 from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
-from agent_run.resume_intent import resume_pause_state
+from agent_run.resume_intent import is_ticket_execution_recovery, resume_pause_state
 from agent_run.publication_operation_retry import require_publication_operation_retry
 from agent_run.scope_changes import reconcile_structure
 from agent_run.semantic_attempt import (
@@ -481,12 +481,16 @@ class Controller:
                     "operator_stopped resume does not accept Agent or Human Blocker options"
                 )
             restore_operator_stop(existing)
-        if explicit_resume and ticket_number is None and resume_pause["status"] == "execution_failed":
+        if explicit_resume and ticket_number is None and is_ticket_execution_recovery(
+            existing, resume_pause["status"],
+        ):
             # The public lifecycle has fenced out the previous Executor before
             # applying this Run-wide recovery. A crash can occur after lease
             # persistence but before an Invocation exists, so Invocation-only
             # interruption recovery is insufficient here.
-            existing["ticket_work_queue"] = []
+            from agent_run.ticket_work import release_exited_executor_leases
+
+            release_exited_executor_leases(existing)
         if human_response is not None:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
@@ -2491,17 +2495,29 @@ def _restore_current_invocation_thread(
             mirror["publication_failure_resume"] = True
 
 
+def _ticket_invocation_is_gated(state: dict[str, Any], invocation: dict[str, Any]) -> bool:
+    subject = invocation.get("work_subject", "")
+    if not isinstance(subject, str) or not subject.startswith("ticket:"):
+        return False
+    job = state.get("ticket_jobs", {}).get(subject.removeprefix("ticket:"), {})
+    return job.get("phase") in {"blocked", "publication_pending", "completed"}
+
+
 def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
     """Make an explicit resume distinguishable from a still-unacknowledged failure."""
 
     invocation = state.get("active_agent_invocation")
-    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+    if (
+        isinstance(invocation, dict) and invocation.get("status") == "failed"
+        and not _ticket_invocation_is_gated(state, invocation)
+    ):
         invocation["status"] = "resuming"
     invocations = state.get("ticket_agent_invocations")
     if isinstance(invocations, dict):
         for ticket_invocation in invocations.values():
             if (
                 isinstance(ticket_invocation, dict)
+                and not _ticket_invocation_is_gated(state, ticket_invocation)
                 and ticket_invocation.get("status") == "failed"
                 and ticket_invocation.get("error") in {
                     "operator_stopped", "session_interrupted"
@@ -2518,6 +2534,7 @@ def _restore_parallel_ticket_invocations(state: dict[str, Any]) -> None:
     for invocation in invocations.values():
         if (
             isinstance(invocation, dict)
+            and not _ticket_invocation_is_gated(state, invocation)
             and invocation.get("status") == "failed"
             and invocation.get("error") in {
                 "operator_stopped", "session_interrupted"
@@ -2999,6 +3016,24 @@ def apply_resume_to_state(
     source_status: str,
 ) -> None:
     """Apply the shared pause, budget and Invocation continuation rules."""
+    if (
+        explicit_resume and ticket_number is None
+        and is_ticket_execution_recovery(state, source_status)
+    ):
+        # Executor recovery does not authorize consuming independent local gates.
+        active = state.get("active_ticket_job")
+        if not isinstance(active, dict) or active.get("phase") not in {
+            "blocked", "publication_pending", "completed",
+        }:
+            if new_thread:
+                _clear_current_invocation_thread(state)
+            else:
+                _restore_current_invocation_thread(state, allow_completed=True)
+        if human_response is not None:
+            raise ValueError("Executor recovery does not accept a Human Blocker response")
+        _restore_parallel_ticket_invocations(state)
+        _mark_failed_invocation_resuming(state)
+        return
     if ticket_number is not None:
         state["active_ticket_job"] = state["ticket_jobs"][str(ticket_number)]
         state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(ticket_number))

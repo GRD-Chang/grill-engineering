@@ -48,7 +48,7 @@ def reconcile(state: dict[str, Any]) -> None:
         number = item["ticket_number"]
         job = state["ticket_jobs"].get(str(number), {})
         return (
-            state.get("status") not in RUN_STOP_STATUSES
+            state.get("status") not in (RUN_STOP_STATUSES - {"execution_failed", "operator_stopped"})
             and number in state["frontier"]
             and str(number) not in state["ticket_pause_requests"]
             and item["generation"] == generation(state, number)
@@ -59,6 +59,12 @@ def reconcile(state: dict[str, Any]) -> None:
         )
 
     state["ticket_work_queue"] = [item for item in state["ticket_work_queue"] if keep(item)]
+
+
+def release_exited_executor_leases(state: dict[str, Any]) -> None:
+    """After proven Executor exit, retain authorized work and its FIFO position."""
+    for item in state.get("ticket_work_queue", []):
+        item["lease_id"] = None
 
 
 class TicketWorkAdmission:

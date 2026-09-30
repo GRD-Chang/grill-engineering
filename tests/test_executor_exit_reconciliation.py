@@ -40,7 +40,7 @@ def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
 
 
 @pytest.mark.parametrize("case", [
-    "exited", "orphan", "recorded_exit_orphan", "unknown", "save_interrupted",
+    "exited", "orphan", "recorded_exit_orphan", "multiple_orphans", "unknown", "save_interrupted",
 ])
 def test_resume_reconciles_externally_exited_executor(
     git_repo: Path, case: str, monkeypatch: pytest.MonkeyPatch,
@@ -70,15 +70,17 @@ def test_resume_reconciles_externally_exited_executor(
     control.complete_action(task, action_id=claim.action_id,
         generation=reservation.generation, result_status=current["status"])
 
-    worker = None
+    workers: list[subprocess.Popen[bytes]] = []
     try:
-        if case in {"orphan", "recorded_exit_orphan"}:
-            worker = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                start_new_session=True)
-            token = _process_start_token(worker.pid)
-            assert token is not None
-            control.mark_worker_started(task, action_id=claim.action_id,
-                generation=reservation.generation, pid=worker.pid, process_start_token=token)
+        if case in {"orphan", "recorded_exit_orphan", "multiple_orphans"}:
+            for _ in range(2 if case == "multiple_orphans" else 1):
+                worker = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                    start_new_session=True)
+                workers.append(worker)
+                token = _process_start_token(worker.pid)
+                assert token is not None
+                control.mark_worker_started(task, action_id=claim.action_id,
+                    generation=reservation.generation, pid=worker.pid, process_start_token=token)
             if case == "recorded_exit_orphan":
                 control.finish_executor(task, action_id=claim.action_id,
                     generation=reservation.generation)
@@ -112,22 +114,23 @@ def test_resume_reconciles_externally_exited_executor(
             assert "退出证据不足" in result.stdout
             assert states.load_run(run_id) == before
             assert control.path_for(task).read_bytes() == control_before
-        elif worker is not None:
+        elif workers:
             assert result.returncode == 2, result.stdout + result.stderr
             assert "stop" in result.stdout
-            assert worker.poll() is None
+            assert all(worker.poll() is None for worker in workers)
             assert states.load_run(run_id) == before
             assert control.path_for(task).read_bytes() == control_before
             stopped = _run_cli(git_repo, fixture, "stop", run_id)
             assert stopped.returncode == 0, stopped.stdout + stopped.stderr
-            worker.wait(timeout=3)
+            for worker in workers:
+                worker.wait(timeout=3)
             assert states.load_run(run_id)["status"] == "operator_stopped"
         else:
             assert result.returncode == 0, result.stdout + result.stderr
             assert states.load_run(run_id)["status"] == "parent_approval_pending"
             assert control.load(task)["action"]["kind"] == "resume"
     finally:
-        if worker is not None:
+        for worker in workers:
             if worker.poll() is None:
                 worker.kill()
             worker.wait(timeout=3)

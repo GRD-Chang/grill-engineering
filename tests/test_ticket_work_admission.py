@@ -99,7 +99,10 @@ def test_pause_cancels_waiter_without_releasing_running_work(git_repo: Path) -> 
     assert admission.acquire(4, generation(state, 4), "publication") is not None
 
 
-def test_run_stop_cancels_waiters_but_keeps_running_lease(git_repo: Path) -> None:
+@pytest.mark.parametrize("status", ["operator_stopped", "abandoned"])
+def test_run_gate_blocks_admission_and_preserves_only_resumable_waiters(
+    git_repo: Path, status: str,
+) -> None:
     state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
     run_id = state["run_id"]
     admission = TicketWorkAdmission(states, run_id)
@@ -108,13 +111,14 @@ def test_run_stop_cancels_waiters_but_keeps_running_lease(git_repo: Path) -> Non
     assert token is not None
     stopped = states.load_current_run(run_id)
     assert stopped is not None
-    stopped["status"] = "operator_stopped"
+    stopped["status"] = status
     states.save_run(run_id, stopped)
-    assert [item["lease_id"] for item in _queue(states, run_id)] == [token]
+    remaining = [None] if status == "operator_stopped" else []
+    assert [item["lease_id"] for item in _queue(states, run_id)] == [token, *remaining]
     with pytest.raises(TaskControlBusyError):
         admission.acquire(3, generation(state, 3), "reviewer")
     admission.release(token)
-    assert _queue(states, run_id) == []
+    assert [item["lease_id"] for item in _queue(states, run_id)] == remaining
 
 
 @pytest.mark.parametrize("invalid", [0, -1, True, 1.5])

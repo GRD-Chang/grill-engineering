@@ -382,13 +382,9 @@ class RunLifecycle:
             assert isinstance(record, Mapping)
             record = self._close_receipt_predecessor(current, record)
             action, executor = record.get("action"), record.get("executor")
-        invocation = (
-            current.get("active_agent_invocation") if current is not None else None
-        )
         observing_active_invocation = (
-            request.kind == "run"
-            and isinstance(invocation, Mapping)
-            and invocation.get("status") in {"running", "resuming"}
+            request.kind == "run" and current is not None
+            and _has_unfinished_agent_work(current)
         )
         if (
             current is not None
@@ -2117,11 +2113,7 @@ def _restartable_after_executor_exit(state: Mapping[str, Any]) -> bool:
     status = state.get("status")
     if status in {"completed", "abandoned", "execution_failed", "ready_for_human"}:
         return False
-    invocation = state.get("active_agent_invocation")
-    if isinstance(invocation, Mapping) and invocation.get("status") in {
-        "running",
-        "resuming",
-    }:
+    if _has_unfinished_agent_work(state):
         return False
     return status in {
         "active",
@@ -2153,8 +2145,14 @@ def _safe_executor_recovery(state: Mapping[str, Any]) -> bool:
         "supervision_timeout",
     }:
         return False
-    invocation = state.get("active_agent_invocation")
-    return not (
-        isinstance(invocation, Mapping)
-        and invocation.get("status") in {"running", "resuming"}
+    return not _has_unfinished_agent_work(state)
+
+
+def _has_unfinished_agent_work(state: Mapping[str, Any]) -> bool:
+    invocations = state.get("ticket_agent_invocations", {})
+    return any(
+        isinstance(invocation, Mapping) and invocation.get("status") in {"running", "resuming"}
+        for invocation in [state.get("active_agent_invocation"), *invocations.values()]
+    ) or any(
+        item.get("lease_id") is not None for item in state.get("ticket_work_queue", [])
     )

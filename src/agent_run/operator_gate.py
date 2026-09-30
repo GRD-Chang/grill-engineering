@@ -204,10 +204,10 @@ def _local_gate_matches_top_status(
         location.startswith("ticket:")
         and status == "execution_failed"
         and (evidence := operator_gate_evidence(state)) is not None
-        and evidence["reason"] == "runner_credential_failed"
+        and evidence["reason"] in {"runner_credential_failed", "session_interrupted"}
         and evidence["action_kind"] == "execution_failure"
     ):
-        # A shared identity failure stops the Run without consuming Ticket gates.
+        # A Run failure stops execution without consuming independent Ticket gates.
         return True
     if status == "operator_stopped":
         return True
