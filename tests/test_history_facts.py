@@ -21,7 +21,10 @@ def test_invocation_identity_backfill_does_not_mutate_persisted_attempt(render: 
                 "work_subject": "ticket:3", "generation": 1, "ordinal": 1,
             },
             "started_at": "2026-09-21T00:00:00+00:00",
+            "reported_thread_id": "actual-thread",
             "ended_at": "2026-09-21T00:01:00+00:00",
+            "execution_segments": [{"started_at": "2026-09-21T00:00:00+00:00",
+                                    "ended_at": "2026-09-21T00:01:00+00:00"}],
         }],
     }
     state = {"run_id": "run", "ticket_jobs": {"3": {"semantic_attempt_history": [attempt]}}}

@@ -13,15 +13,43 @@ def _time(value: object) -> datetime | None:
         return None
 
 
+def invocation_started(invocation: dict[str, Any]) -> bool:
+    """A reported Thread proves execution; preparing an Invocation does not."""
+    thread_id = invocation.get("reported_thread_id")
+    return (
+        isinstance(thread_id, str) and bool(thread_id.strip())
+        and parse_optional_timestamp(invocation.get("started_at")) is not None
+    )
+
+
 def invocation_links_complete(
     state: dict[str, Any], records: list[dict[str, Any]],
 ) -> bool:
-    """Reject totals when Resume proves a retained Attempt lost a segment."""
+    """Require all known same-Attempt predecessor and Resume endpoints."""
     starts = {
         record.get("attempt_id"): {invocation.get("started_at")
                                    for invocation in record.get("invocations", [])}
         for record in records
     }
+    for record in records:
+        identity = record.get("attempt_id")
+        if not isinstance(identity, str) or not identity:
+            return False
+        for invocation in record.get("invocations", []):
+            predecessor = invocation.get("predecessor_invocation_started_at")
+            if predecessor is not None and predecessor not in starts[identity]:
+                return False
+    active = [state.get("active_agent_invocation")]
+    tickets = state.get("ticket_agent_invocations")
+    if isinstance(tickets, dict):
+        active.extend(tickets.values())
+    for invocation in active:
+        if not isinstance(invocation, dict):
+            continue
+        attempt = invocation.get("semantic_attempt")
+        identity = attempt.get("attempt_id") if isinstance(attempt, dict) else None
+        if identity in starts and invocation.get("started_at") not in starts[identity]:
+            return False
     for resume in (state.get("resume_audit") or {}).get("history", []):
         identity = resume.get("semantic_attempt_id")
         if identity not in starts:
@@ -32,12 +60,48 @@ def invocation_links_complete(
     return True
 
 
+def aggregate_invocation_timing(
+    invocations: list[dict[str, Any]], *, complete: bool = True,
+) -> dict[str, Any]:
+    """Sum proven segments while keeping missing evidence explicit."""
+    timings = [_invocation_timing(invocation) for invocation in invocations]
+    known = [timing["recorded_execution_seconds"] for timing in timings
+             if timing["recorded_execution_seconds"] is not None]
+    complete = bool(invocations) and complete and all(timing["execution_timing_complete"] for timing in timings)
+    recorded = sum(known) if known else None
+    return {
+        "execution_seconds": recorded if complete else None,
+        "execution_timing_complete": complete,
+        "recorded_execution_seconds": recorded,
+    }
+
+
+def record_execution_timing(
+    state: dict[str, Any], record: dict[str, Any],
+) -> dict[str, Any]:
+    """Project closed evidence and optional live time without filling gaps."""
+    invocations = record.get("invocations") or []
+    linked = invocation_links_complete(state, [record])
+    facts = aggregate_invocation_timing(invocations, complete=linked)
+    # A trusted live last segment remains useful in status/history. It never
+    # proves a completed total, nor repairs any earlier missing segment.
+    if (
+        not facts["execution_timing_complete"] and invocations and linked
+        and record.get("activity") in {"running", "capacity_wait", "recovery_wait"}
+    ):
+        previous = [invocation_execution_seconds(invocation) for invocation in invocations[:-1]]
+        live = invocation_execution_seconds(invocations[-1], allow_open=True)
+        if all(value is not None for value in previous) and live is not None:
+            facts["execution_seconds"] = sum(value for value in previous if value is not None) + live
+    return facts
+
+
 def execution_totals(
     state: dict[str, Any], records: list[dict[str, Any]], at: object,
     *, work_subject: str | None = None,
 ) -> dict[str, Any]:
     end, start = _time(at), _time(state.get("created_at"))
-    facts: dict[str, Any] = {}
+    facts: dict[str, Any] = {"execution_timing_complete": False}
     if end and start and end >= start:
         facts["elapsed_seconds"] = int((end - start).total_seconds())
     rounds = [record for record in records if not record.get("event_record")]
@@ -47,108 +111,91 @@ def execution_totals(
         raw = [invocation for invocation in raw
                if (invocation.get("work_subject") or (invocation.get("semantic_attempt") or {}).get("work_subject")) == work_subject]
     known = [invocation for record in rounds for invocation in record.get("invocations", [])]
-    # An invocation with no semantic association is still executed work. Its
-    # omission from history projection makes an aggregate incomplete.
-    if any(invocation not in known for invocation in raw):
-        return facts
-    if not invocation_links_complete(state, rounds):
-        return facts
-    complete = rounds and all(
-        _time(record.get("ended_at")) is not None
-        and type(record.get("execution_seconds")) is int
+    missing = [invocation for invocation in raw if invocation not in known]
+    # Unassociated work prevents a complete total, but its closed segment is
+    # still valid partial evidence. Parallel subjects are summed independently.
+    included = [
+        invocation for invocation in [*known, *missing]
+        if end is None or (ended := _time(invocation.get("ended_at"))) is None or ended <= end
+    ]
+    recorded = aggregate_invocation_timing(included)["recorded_execution_seconds"]
+    if recorded is not None:
+        facts["recorded_execution_seconds"] = recorded
+    complete = bool(rounds) and not missing and all(
+        record_execution_timing(state, record)["execution_timing_complete"]
         for record in rounds
     )
-    if not state.get("timeline_at_capacity") and complete:
-        if end and any((ended := _time(record.get("ended_at"))) is not None and ended > end for record in rounds):
-            return facts
-        facts["total_seconds"] = sum(record["execution_seconds"] for record in rounds)
+    if complete and end and any(
+        (ended := _time(invocation.get("ended_at"))) is not None and ended > end
+        for invocation in known
+    ):
+        complete = False
+    # Lifecycle snapshots may be bounded independently of durable Attempt and
+    # Invocation facts; timeline truncation alone does not lose execution time.
+    facts["execution_timing_complete"] = complete
+    if complete:
+        facts["total_seconds"] = recorded
     return facts
 
 
 def invocation_execution_seconds(
     invocation: dict[str, Any], *, allow_open: bool = False
 ) -> int | None:
-    """Return trusted active execution time, excluding persisted recovery waits."""
-
-    started = parse_optional_timestamp(invocation.get("started_at"))
-    ended = parse_optional_timestamp(invocation.get("ended_at"))
-    if started is None:
-        return None
-    if ended is None:
-        if not allow_open:
-            return None
-        ended = datetime.now(UTC)
-    if ended < started:
-        return None
-
-    waits = _recovery_wait_intervals(invocation, started=started, ended=ended)
-    if waits is None:
-        return None
-    wait_seconds = 0.0
-    previous_end = started
-    for wait_start, wait_end in sorted(waits):
-        if wait_start < started or wait_end > ended or wait_start < previous_end:
-            return None
-        wait_seconds += (wait_end - wait_start).total_seconds()
-        previous_end = wait_end
-    return max(0, int((ended - started).total_seconds() - wait_seconds))
+    """Return execution time only from observed Worker boundaries."""
+    seconds = _invocation_timing(invocation, allow_open=allow_open)["execution_seconds"]
+    return seconds if isinstance(seconds, int) else None
 
 
-
-def _recovery_wait_intervals(
-    invocation: dict[str, Any], *, started: datetime, ended: datetime
-) -> list[tuple[datetime, datetime]] | None:
-    raw_intervals = invocation.get("recovery_wait_intervals")
-    if isinstance(raw_intervals, list) and not raw_intervals:
-        # An explicitly persisted empty list belongs to this Invocation. In
-        # particular, a successor may retain the semantic Attempt's cumulative
-        # recovery count while having no waits of its own.
-        if not invocation.get("recovery_waiting") and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        # A legacy/current waiting record can have an empty list because its
-        # interval was not persisted. Fall through to the conservative legacy
-        # reconstruction below rather than claiming all elapsed time ran.
-        raw_intervals = None
-    if raw_intervals is None:
-        # Older records only have enough evidence for one capacity wait. More
-        # than one unversioned wait cannot be reconstructed safely.
-        count = invocation.get("capacity_recovery_count")
-        if count in (None, 0) and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        if count not in (None, 0, 1):
-            return None
-        raw_intervals = [
-            {
-                "started_at": invocation.get("last_failure_at"),
-                "ended_at": invocation.get("last_recovery_started_at"),
-            }
-        ]
-    if not isinstance(raw_intervals, list):
-        return None
-
-    intervals: list[tuple[datetime, datetime]] = []
-    for raw in raw_intervals:
-        if not isinstance(raw, dict):
-            return None
-        wait_start = parse_optional_timestamp(raw.get("started_at"))
-        wait_end = parse_optional_timestamp(raw.get("ended_at"))
-        if wait_start is None:
-            return None
-        if wait_end is None:
-            if not invocation.get("recovery_waiting"):
-                return None
-            wait_end = ended
-        if wait_end < wait_start:
-            return None
-        intervals.append((wait_start, wait_end))
-    return intervals
-
+def _invocation_timing(invocation: dict[str, Any], *, allow_open: bool = False) -> dict[str, Any]:
+    facts: dict[str, Any] = {
+        "execution_seconds": None, "execution_timing_complete": False,
+        "recorded_execution_seconds": None,
+    }
+    if not invocation_started(invocation):
+        if invocation.get("execution_not_started") is True and invocation.get("status") == "failed":
+            return {"execution_seconds": 0, "execution_timing_complete": True,
+                    "recorded_execution_seconds": 0}
+        return facts
+    segments = invocation.get("execution_segments")
+    if not isinstance(segments, list) or not segments:
+        # Invocation timestamps include Controller checks and setup. Legacy
+        # records cannot prove Worker duration, even when both timestamps exist.
+        return facts
+    closed_seconds = live_seconds = 0.0
+    known = False
+    complete = live_complete = True
+    previous_end = parse_optional_timestamp(invocation.get("started_at"))
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            complete = live_complete = False
+            continue
+        started = parse_optional_timestamp(segment.get("started_at"))
+        ended = parse_optional_timestamp(segment.get("ended_at"))
+        if started is None or (previous_end is not None and started < previous_end):
+            complete = live_complete = False
+            continue
+        if ended is None:
+            complete = False
+            if (segment.get("ended_at") is None and allow_open and index == len(segments) - 1
+                    and invocation.get("status") == "running"):
+                current = datetime.now(UTC)
+                if current >= started:
+                    live_seconds += (current - started).total_seconds()
+                    continue
+            live_complete = False
+            continue
+        if ended < started:
+            complete = live_complete = False
+            continue
+        closed_seconds += (ended - started).total_seconds()
+        previous_end = ended
+        known = True
+    facts["execution_timing_complete"] = complete
+    if known:
+        facts["recorded_execution_seconds"] = int(closed_seconds)
+    if complete or (allow_open and live_complete):
+        facts["execution_seconds"] = int(closed_seconds + live_seconds)
+    return facts
 
 
 def invocation_activity(

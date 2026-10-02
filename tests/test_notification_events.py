@@ -201,6 +201,7 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
                    'outcome': {'development': 'candidate', 'review': 'acceptance_artifact', 'publication': 'publication_artifact'}[role]}
         state['semantic_agent_attempts'].append(attempt)
         state['agent_invocation_history'].append({'semantic_attempt': attempt.copy(), 'status': 'completed', 'reported_thread_id': 'thread-1',
+            'execution_segments': [{'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'}],
             'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'})
     state.update(status='run_approval_pending', run_publication={'pr_number': 9})
     detailed = events(state)
@@ -240,14 +241,18 @@ def test_round_resume_timing_and_missing_data_are_not_fabricated() -> None:
     state = state_with_round()
     invocation = state['agent_invocation_history'][0]
     state['agent_invocation_history'].append({**invocation, 'resume_id': 'r2',
+        'execution_segments': [{'started_at': '2026-01-01T01:00:00+00:00', 'ended_at': '2026-01-01T01:07:55+00:00'}],
         'started_at': '2026-01-01T01:00:00+00:00', 'ended_at': '2026-01-01T01:07:55+00:00'})
     ended = events(state)[-1]
     assert ended['duration_seconds'] == 484
     assert '8 分 4 秒' in str(card(ended))
     state['agent_invocation_history'][0].pop('ended_at')
+    state['agent_invocation_history'][0]['execution_segments'][0].pop('ended_at')
     ended = events(state)[-1]
     assert ended['duration_seconds'] is None
-    assert '耗时' not in str(card(ended))
+    assert '耗时记录不完整' in str(card(ended))
+    assert '已记录执行时长' in str(card(ended))
+    assert ended['recorded_execution_seconds'] == 475
 
 
 def test_latest_recovery_keeps_mode_and_omits_resolved_todo() -> None:
@@ -272,6 +277,7 @@ def test_boundary_times_use_business_event_and_omit_incomplete_totals() -> None:
     assert result['total_seconds'] == 9
     assert result['elapsed_seconds'] == 600
     state['agent_invocation_history'][0].pop('ended_at')
+    state['agent_invocation_history'][0]['execution_segments'][0].pop('ended_at')
     result = events(state)[-1]
     assert 'total_seconds' not in result
     assert result['elapsed_seconds'] == 600
@@ -432,24 +438,32 @@ def test_card_localizes_labels_and_preserves_external_text(language: str) -> Non
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
-def test_concise_ticket_start_requires_invocation_and_survives_rework(language: str) -> None:
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_concise_start_requires_invocation_and_survives_rework(language: str, parent_only: bool) -> None:
     state = state_with_round()
-    state.update(language=language, notifications={"mode": "concise"})
+    state.update(language=language, notifications={"mode": "concise"},
+                 delivery_type="parent_only" if parent_only else "ticket_run")
+    kind = "parent_started" if parent_only else "ticket_started"
     attempt = state["semantic_agent_attempts"][0]
-    attempt.update(work_subject="ticket:2", started_at="2026-01-01T00:00:00+00:00")
+    attempt.update(work_subject="parent-only:r" if parent_only else "ticket:2", started_at="2026-01-01T00:00:00+00:00")
     state["ticket_graph"] = {"tickets": {"2": {"title": "Actual ticket"}}}
     invocation = state["agent_invocation_history"].pop()
     invocation["semantic_attempt"] = attempt.copy()
-    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    assert not any(event["kind"] == kind for event in events(state))
     state["agent_invocation_history"].append({key: value for key, value in invocation.items() if key != "reported_thread_id"})
-    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    assert not any(event["kind"] == kind for event in events(state))
     state["agent_invocation_history"][-1]["reported_thread_id"] = "actual-thread"
-    started = next(event for event in events(state) if event["kind"] == "ticket_started")
-    assert started["task_title"] == "Actual ticket"
+    started = next(event for event in events(state) if event["kind"] == kind)
+    assert started["task_title"] == (state["parent"]["title"] if parent_only else "Actual ticket")
     assert started["language"] == language
-    later = {**invocation, "semantic_attempt": {**attempt, "attempt_id": "rework", "ordinal": 2}}
-    state["agent_invocation_history"].append(later)
-    assert [event["id"] for event in events(state) if event["kind"] == "ticket_started"] == [started["id"]]
+    # Same-round continuation, replacement Thread and internal rework all
+    # retain the first milestone, even when the old history is compacted.
+    for identity, ordinal in (("a1", 1), ("rework", 2)):
+        later = {**invocation, "reported_thread_id": "replacement-thread",
+                 "started_at": "2026-01-01T01:00:00+00:00",
+                 "semantic_attempt": {**attempt, "attempt_id": identity, "ordinal": ordinal}}
+        state["agent_invocation_history"] = [later]
+        assert [event["id"] for event in events(state) if event["kind"] == kind] == [started["id"]]
 
 
 def _formal_review_state(parent_only: bool = False) -> dict[str, Any]:
@@ -483,6 +497,43 @@ def test_formal_pass_and_approval_are_independent(parent_only: bool, language: s
     assert after[-1]["kind"] == "boundary"
     state["notifications"]["mode"] = "detailed"
     assert not any(event["kind"] == "stage_end" for event in events(state))
+
+
+@pytest.mark.parametrize("parent_only", [False, True])
+@pytest.mark.parametrize("history", ["complete", "partial", "missing_invocations", "missing_all", "unrelated"])
+def test_formal_pass_always_explains_timing_integrity(parent_only: bool, history: str) -> None:
+    state = _formal_review_state(parent_only)
+    if history == "partial":
+        state["agent_invocation_history"].append({
+            **state["agent_invocation_history"][0],
+            "execution_segments": [{"started_at": "2026-01-01T01:00:00+00:00", "ended_at": None}],
+            "started_at": "2026-01-01T01:00:00+00:00", "ended_at": None,
+        })
+    elif history in {"missing_invocations", "missing_all"}:
+        state["agent_invocation_history"] = []
+        if history == "missing_all":
+            state["semantic_agent_attempts"] = []
+    elif history == "unrelated":
+        unrelated = state_with_round()
+        for key in ("agent_invocation_history", "semantic_agent_attempts"):
+            state[key] = unrelated[key]
+    passed = next(event for event in events(state) if event["kind"] == "acceptance_passed")
+    content = card(passed)["body"]["elements"][0]["content"]
+    if history == "complete":
+        assert passed["execution_timing_complete"] is True
+        assert passed["duration_seconds"] == 9
+        assert "**本轮执行耗时**：9 秒" in content
+        assert "耗时记录不完整" not in content
+    else:
+        assert passed["execution_timing_complete"] is False
+        assert passed.get("duration_seconds") is None
+        assert "耗时记录不完整" in content
+        if history == "partial":
+            assert passed["recorded_execution_seconds"] == 9
+            assert "**已记录执行时长**：9 秒" in content
+        else:
+            assert passed.get("recorded_execution_seconds") is None
+            assert "已记录执行时长" not in content
 
 
 @pytest.mark.parametrize("invalid", ["stale", "missing_lane", "no_checks", "failed_without_findings", "unpromoted", "local_only", "missing_findings", "parent_revision", "graph_revision"])
@@ -611,6 +662,7 @@ def test_completion_omits_total_when_resume_proves_missing_execution(role: str) 
         assert "execution_seconds" not in completed["effort"][role]
     # Restoring the actual missing segment makes the full total provable.
     earlier = {**state["agent_invocation_history"][0],
+               "execution_segments": [{"started_at": "2025-12-31T23:00:00+00:00", "ended_at": "2025-12-31T23:00:05+00:00"}],
                "started_at": "2025-12-31T23:00:00+00:00",
                "ended_at": "2025-12-31T23:00:05+00:00"}
     state["agent_invocation_history"].insert(0, earlier)

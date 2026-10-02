@@ -124,13 +124,20 @@ elif role == "first":
 
 elif role == "second":
     original_locked = TaskControlStore._locked
-    hold_state = {"used": False}
+    hold_state = {"used": False, "initial_contention": False}
 
     def held_lock(self, task):
         manager = original_locked(self, task)
 
         @contextmanager
         def hold_once():
+            if not hold_state["initial_contention"]:
+                hold_state["initial_contention"] = True
+                # Force the startup race once using the real nonblocking lock.
+                # A second open must contend even within the same process.
+                with original_locked(self, task):
+                    with manager:
+                        raise AssertionError("Task Control lock admitted a competing holder")
             with manager:
                 marker = os.environ.get("TICKET_190_HOLDER")
                 release = os.environ.get("TICKET_190_HOLDER_RELEASE")
@@ -165,8 +172,19 @@ elif role == "second":
                 raise RuntimeError("same-parent Executor did not become active")
             time.sleep(0.001)
         try:
-            with store._locked(task):
-                pass
+            # The live Executor can still commit scheduler/heartbeat state
+            # while its Agent is parked. Establish the fixture's holder before
+            # releasing that Agent; short startup contention is not the state
+            # commit retry that this test is meant to exercise.
+            while True:
+                try:
+                    with store._locked(task):
+                        pass
+                    break
+                except TaskControlBusyError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.001)
         except BaseException as error:
             error_path = os.environ.get("TICKET_190_HOLDER_ERROR")
             if error_path:

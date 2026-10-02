@@ -394,6 +394,10 @@ def _record_lines(
         lines.append(_copy('presentation.history.time_range', v1=interval))
     if record.get("execution_seconds") is not None:
         lines.append(_copy('presentation.history.round_execution_time', v1=_duration(record['execution_seconds'])))
+    if record.get("execution_timing_complete") is False:
+        lines.append(_copy('presentation.history.timing_incomplete'))
+        if type(record.get("recorded_execution_seconds")) is int:
+            lines.append(_copy('presentation.history.recorded_execution_time', v1=_duration(record['recorded_execution_seconds'])))
     if record.get("span_seconds") is not None and record.get("span_seconds") != record.get("execution_seconds"):
         lines.append(_copy('presentation.history.round_elapsed_time', v1=_duration(record['span_seconds'])))
     if details and _role_family(str(record.get("role") or "")) != "publication":

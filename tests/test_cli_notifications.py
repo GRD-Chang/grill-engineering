@@ -116,7 +116,7 @@ def observe(self, *args, **kwargs):
     for event in notifications.events(state):
         if event['kind'] in {'run_start', 'ticket_completed', 'boundary'}:
             real_delivery_titles.add(event['title'])
-        if not kwargs.get('recovering') and event['kind'] == 'ticket_started' and event['id'] not in self.document.get('seen', []):
+        if not kwargs.get('recovering') and event['kind'] in {'ticket_started', 'parent_started'} and event['id'] not in self.document.get('seen', []):
             active = state.get('active_agent_invocation') or {}
             assert active.get('reported_thread_id') and active.get('status') == 'running', active
     original_observe(self, *args, **kwargs)
@@ -217,12 +217,12 @@ raise SystemExit(main(sys.argv[1:]))
     def localized(zh: str, en: str) -> str:
         return zh if language == "zh" else en
 
-    assert delivered[0]["header"]["title"]["content"] == localized("任务已开始", "Task started")
-    assert localized("开始时间", "Started at") in str(delivered[0])
+    assert delivered[0]["header"]["title"]["content"] == localized("任务已创建", "Task created")
+    assert localized("创建时间", "Created at") in str(delivered[0])
     assert localized("打开 Issue", "Open Issue") in str(delivered[0])
     cards = [card(event) for event in events(current)]
     titles = [item["header"]["title"]["content"] for item in cards]
-    assert localized("任务已开始", "Task started") in titles
+    assert localized("任务已创建", "Task created") in titles
     if mode == "detailed":
         assert sum(event["kind"] == "ticket_started" for event in events(current)) == 1
         development_starts = [event for event in events(current)
@@ -237,6 +237,7 @@ raise SystemExit(main(sys.argv[1:]))
         kinds = [event["kind"] for event in projected]
         assert kinds.count("acceptance_passed") == 1
         assert kinds.count("ticket_started") == (1 if scope == "ticket" else 0)
+        assert kinds.count("parent_started") == (1 if scope == "parent" else 0)
         assert kinds.count("acceptance_started") == (1 if scope == "ticket" else 0)
         assert kinds.count("acceptance_repair") == (1 if scope == "ticket" else 0)
         assert "stage_start" not in kinds and "stage_end" not in kinds
@@ -252,7 +253,7 @@ raise SystemExit(main(sys.argv[1:]))
         if scope == "ticket":
             assert current["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
         else:
-            assert len(delivered_titles) == 3  # Start, formal pass, approval; repairs stay quiet.
+            assert len(delivered_titles) == 4  # Created, actual development, formal pass, approval.
     assert not any("最终 PR" in value and "已创建" in value for value in titles), titles
     assert any(localized("请批准合并 PR", "Please approve merging PR") in value for value in titles)
     approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith(localized("请批准合并 PR", "Please approve merging PR")))
@@ -311,8 +312,9 @@ raise SystemExit(main(sys.argv[1:]))
                 assert facts["rounds"] == expected_rounds
                 role_invocations = [item for item in invocations
                                     if item["role"] == ("fresh_acceptance" if role == "review" else role)]
-                seconds = sum(int((datetime.fromisoformat(item["ended_at"])
-                                   - datetime.fromisoformat(item["started_at"])).total_seconds())
+                seconds = sum(int(sum((datetime.fromisoformat(segment["ended_at"])
+                                       - datetime.fromisoformat(segment["started_at"])).total_seconds()
+                                      for segment in item["execution_segments"]))
                               for item in role_invocations)
                 assert facts["execution_seconds"] == seconds
                 assert label in rendered
@@ -327,8 +329,9 @@ raise SystemExit(main(sys.argv[1:]))
                 assert configuration["reasoning_effort"] in rendered
             assert any(item["role"] == "publication" for item in invocations)
             assert completion["total_seconds"] == sum(
-                int((datetime.fromisoformat(item["ended_at"])
-                     - datetime.fromisoformat(item["started_at"])).total_seconds())
+                int(sum((datetime.fromisoformat(segment["ended_at"])
+                         - datetime.fromisoformat(segment["started_at"])).total_seconds()
+                        for segment in item["execution_segments"]))
                 for item in invocations)
         arguments = ("--plain", "--details") if command == "history" else ("--plain",)
         human = invoke_cli_inprocess(git_repo, fixture, command, output["run_id"], *arguments)

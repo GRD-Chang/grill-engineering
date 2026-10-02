@@ -4,6 +4,8 @@ import json
 import math
 import subprocess
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,118 +72,119 @@ class FixtureAgentBackend:
                 invocation_mode=request.get("_invocation_mode"),
             )
         self._wait_for_invocation_gate("developments", request)
-        no_thread = step.get("no_thread", False)
-        if not isinstance(no_thread, bool):
-            raise ValueError("scripted Development no_thread must be a boolean")
-        if no_thread:
-            error = "scripted Development did not report a Thread ID"
+        with _fixture_execution_events(notify) as notify:
+            no_thread = step.get("no_thread", False)
+            if not isinstance(no_thread, bool):
+                raise ValueError("scripted Development no_thread must be a boolean")
+            if no_thread:
+                error = "scripted Development did not report a Thread ID"
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=error)
+                raise ValueError(error)
+            try:
+                thread_id = _string(step, "thread_id")
+            except ValueError as error:
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=str(error))
+                raise
             if notify is not None:
-                notify("failed", attempt_count=1, error=error)
-            raise ValueError(error)
-        try:
-            thread_id = _string(step, "thread_id")
-        except ValueError as error:
-            if notify is not None:
-                notify("failed", attempt_count=1, error=str(error))
-            raise
-        if notify is not None:
-            notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
-        checkout = Path(_string(request, "checkout")).resolve()
-        actual_head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=checkout,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        if request.get("head_sha") != actual_head:
-            raise ValueError(
-                "scripted Development Brief head does not match checkout"
-            )
-        expected_files = step.get("expected_files", {})
-        if not isinstance(expected_files, dict):
-            raise ValueError("expected_files must be an object")
-        for relative, expected_content in expected_files.items():
-            if not isinstance(relative, str) or not isinstance(
-                expected_content, str
-            ):
-                raise ValueError("expected file assertions must be strings")
-            target = (checkout / relative).resolve()
-            if checkout not in target.parents:
-                raise ValueError("expected file assertion escapes checkout")
-            if (
-                not target.is_file()
-                or target.read_text(encoding="utf-8") != expected_content
-            ):
+                notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
+            checkout = Path(_string(request, "checkout")).resolve()
+            actual_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            if request.get("head_sha") != actual_head:
                 raise ValueError(
-                    f"scripted expected file did not survive: {relative}"
+                    "scripted Development Brief head does not match checkout"
                 )
-        absent_files = step.get("absent_files", [])
-        if not isinstance(absent_files, list) or not all(
-            isinstance(item, str) for item in absent_files
-        ):
-            raise ValueError("absent_files must contain paths")
-        for relative in absent_files:
-            target = (checkout / relative).resolve()
-            if checkout not in target.parents:
-                raise ValueError("absent file assertion escapes checkout")
-            if target.exists():
-                raise ValueError(
-                    f"scripted expected file is still present: {relative}"
+            expected_files = step.get("expected_files", {})
+            if not isinstance(expected_files, dict):
+                raise ValueError("expected_files must be an object")
+            for relative, expected_content in expected_files.items():
+                if not isinstance(relative, str) or not isinstance(
+                    expected_content, str
+                ):
+                    raise ValueError("expected file assertions must be strings")
+                target = (checkout / relative).resolve()
+                if checkout not in target.parents:
+                    raise ValueError("expected file assertion escapes checkout")
+                if (
+                    not target.is_file()
+                    or target.read_text(encoding="utf-8") != expected_content
+                ):
+                    raise ValueError(
+                        f"scripted expected file did not survive: {relative}"
+                    )
+            absent_files = step.get("absent_files", [])
+            if not isinstance(absent_files, list) or not all(
+                isinstance(item, str) for item in absent_files
+            ):
+                raise ValueError("absent_files must contain paths")
+            for relative in absent_files:
+                target = (checkout / relative).resolve()
+                if checkout not in target.parents:
+                    raise ValueError("absent file assertion escapes checkout")
+                if target.exists():
+                    raise ValueError(
+                        f"scripted expected file is still present: {relative}"
+                    )
+            writes = step.get("write_files", {})
+            if not isinstance(writes, dict):
+                raise ValueError("write_files must be an object")
+            for relative, content in writes.items():
+                if not isinstance(relative, str) or not isinstance(content, str):
+                    raise ValueError("scripted file writes must be strings")
+                target = (checkout / relative).resolve()
+                if checkout not in target.parents:
+                    raise ValueError("scripted file write escapes checkout")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            deletions = step.get("delete_files", [])
+            if not isinstance(deletions, list) or not all(
+                isinstance(item, str) for item in deletions
+            ):
+                raise ValueError("delete_files must contain paths")
+            for relative in deletions:
+                target = (checkout / relative).resolve()
+                if checkout not in target.parents:
+                    raise ValueError("scripted file deletion escapes checkout")
+                if target.exists():
+                    if not target.is_file():
+                        raise ValueError("scripted file deletion requires a file")
+                    target.unlink()
+            configured_error = step.get("error_after_writes")
+            if isinstance(configured_error, str):
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=configured_error)
+                raise ValueError(configured_error)
+            if step.get("keyboard_interrupt_after_writes") is True:
+                raise KeyboardInterrupt
+            sandbox_error = step.get("sandbox_error_after_writes")
+            if isinstance(sandbox_error, str):
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=sandbox_error)
+                raise WorkerSandboxError(sandbox_error)
+            blockers = _human_blockers(step)
+            if blockers is not None:
+                if notify is not None:
+                    notify("completed", reported_thread_id=thread_id, attempt_count=1)
+                return HumanBlockerResult(
+                    thread_id=thread_id,
+                    human_blockers=blockers,
                 )
-        writes = step.get("write_files", {})
-        if not isinstance(writes, dict):
-            raise ValueError("write_files must be an object")
-        for relative, content in writes.items():
-            if not isinstance(relative, str) or not isinstance(content, str):
-                raise ValueError("scripted file writes must be strings")
-            target = (checkout / relative).resolve()
-            if checkout not in target.parents:
-                raise ValueError("scripted file write escapes checkout")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        deletions = step.get("delete_files", [])
-        if not isinstance(deletions, list) or not all(
-            isinstance(item, str) for item in deletions
-        ):
-            raise ValueError("delete_files must contain paths")
-        for relative in deletions:
-            target = (checkout / relative).resolve()
-            if checkout not in target.parents:
-                raise ValueError("scripted file deletion escapes checkout")
-            if target.exists():
-                if not target.is_file():
-                    raise ValueError("scripted file deletion requires a file")
-                target.unlink()
-        configured_error = step.get("error_after_writes")
-        if isinstance(configured_error, str):
-            if notify is not None:
-                notify("failed", attempt_count=1, error=configured_error)
-            raise ValueError(configured_error)
-        if step.get("keyboard_interrupt_after_writes") is True:
-            raise KeyboardInterrupt
-        sandbox_error = step.get("sandbox_error_after_writes")
-        if isinstance(sandbox_error, str):
-            if notify is not None:
-                notify("failed", attempt_count=1, error=sandbox_error)
-            raise WorkerSandboxError(sandbox_error)
-        blockers = _human_blockers(step)
-        if blockers is not None:
+            try:
+                summary = _string(step, "summary")
+            except ValueError as error:
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=str(error))
+                raise
             if notify is not None:
                 notify("completed", reported_thread_id=thread_id, attempt_count=1)
-            return HumanBlockerResult(
-                thread_id=thread_id,
-                human_blockers=blockers,
-            )
-        try:
-            summary = _string(step, "summary")
-        except ValueError as error:
-            if notify is not None:
-                notify("failed", attempt_count=1, error=str(error))
-            raise
-        if notify is not None:
-            notify("completed", reported_thread_id=thread_id, attempt_count=1)
-        return DevelopmentResult(thread_id=thread_id, summary=summary)
+            return DevelopmentResult(thread_id=thread_id, summary=summary)
 
     def publication(
         self, request: dict[str, Any]
@@ -214,33 +217,35 @@ class FixtureAgentBackend:
                 invocation_mode=request.get("_invocation_mode"),
             )
             self._wait_for_invocation_gate("publications", request)
-            if no_thread:
-                error = "scripted Publication did not report a Thread ID"
-                event("failed", attempt_count=1, error=error)
+        with _fixture_execution_events(event if callable(event) else None) as notify:
+            if callable(event):
+                if no_thread:
+                    error = "scripted Publication did not report a Thread ID"
+                    notify("failed", attempt_count=1, error=error)
+                    raise ValueError(error)
+                notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
+            if isinstance(configured_error, str):
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=configured_error)
+                raise ValueError(configured_error)
+            if configured_error is not None:
+                raise ValueError("scripted Publication error must be a string")
+            blockers = _human_blockers(step)
+            if blockers is not None:
+                if notify is not None:
+                    notify("completed", reported_thread_id=thread_id, attempt_count=1)
+                return HumanBlockerResult(
+                    thread_id=str(thread_id),
+                    human_blockers=blockers,
+                )
+            if "invalid" in step:
+                error = "scripted invalid Publication Artifact"
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=error)
                 raise ValueError(error)
-            event("thread_started", reported_thread_id=thread_id, attempt_count=1)
-        if isinstance(configured_error, str):
-            if callable(event):
-                event("failed", attempt_count=1, error=configured_error)
-            raise ValueError(configured_error)
-        if configured_error is not None:
-            raise ValueError("scripted Publication error must be a string")
-        blockers = _human_blockers(step)
-        if blockers is not None:
-            if callable(event):
-                event("completed", reported_thread_id=thread_id, attempt_count=1)
-            return HumanBlockerResult(
-                thread_id=str(thread_id),
-                human_blockers=blockers,
-            )
-        if "invalid" in step:
-            error = "scripted invalid Publication Artifact"
-            if callable(event):
-                event("failed", attempt_count=1, error=error)
-            raise ValueError(error)
-        if callable(event):
-            event("completed", reported_thread_id=thread_id, attempt_count=1)
-        return _publication_wire(step)
+            if notify is not None:
+                notify("completed", reported_thread_id=thread_id, attempt_count=1)
+            return _publication_wire(step)
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         name = (
@@ -288,38 +293,39 @@ class FixtureAgentBackend:
                 invocation_mode=request.get("_invocation_mode"),
             )
         self._wait_for_invocation_gate(name, request)
-        no_thread = step.get("no_thread", False)
-        if not isinstance(no_thread, bool):
-            raise ValueError("scripted Fresh Acceptance no_thread must be a boolean")
-        if no_thread:
-            error = "scripted Fresh Acceptance did not report a Thread ID"
+        with _fixture_execution_events(notify) as notify:
+            no_thread = step.get("no_thread", False)
+            if not isinstance(no_thread, bool):
+                raise ValueError("scripted Fresh Acceptance no_thread must be a boolean")
+            if no_thread:
+                error = "scripted Fresh Acceptance did not report a Thread ID"
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=error)
+                raise ValueError(error)
+            try:
+                thread_id = _string(step, "thread_id")
+            except ValueError as error:
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=str(error))
+                raise
             if notify is not None:
-                notify("failed", attempt_count=1, error=error)
-            raise ValueError(error)
-        try:
-            thread_id = _string(step, "thread_id")
-        except ValueError as error:
+                notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
+            configured_error = step.pop("error", None)
+            if isinstance(configured_error, str):
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=configured_error)
+                raise ValueError(configured_error)
+            if configured_error is not None:
+                raise ValueError("scripted Fresh Acceptance error must be a string")
+            try:
+                AcceptanceArtifact.parse(artifact)
+            except ValueError as error:
+                if notify is not None:
+                    notify("failed", attempt_count=1, error=str(error))
+                raise
             if notify is not None:
-                notify("failed", attempt_count=1, error=str(error))
-            raise
-        if notify is not None:
-            notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
-        configured_error = step.pop("error", None)
-        if isinstance(configured_error, str):
-            if notify is not None:
-                notify("failed", attempt_count=1, error=configured_error)
-            raise ValueError(configured_error)
-        if configured_error is not None:
-            raise ValueError("scripted Fresh Acceptance error must be a string")
-        try:
-            AcceptanceArtifact.parse(artifact)
-        except ValueError as error:
-            if notify is not None:
-                notify("failed", attempt_count=1, error=str(error))
-            raise
-        if notify is not None:
-            notify("completed", reported_thread_id=thread_id, attempt_count=1)
-        return ReviewResult(thread_id=thread_id, artifact=artifact)
+                notify("completed", reported_thread_id=thread_id, attempt_count=1)
+            return ReviewResult(thread_id=thread_id, artifact=artifact)
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         self._maybe_fail_initial_credential("run_publications")
@@ -382,58 +388,59 @@ class FixtureAgentBackend:
                 raise ValueError(message)
             if attempt > 1:
                 self._wait_for_invocation_gate(name, request, attempt=attempt)
-            try:
-                step = self._next(name)
-                has_expected_thread = "expected_thread_id" in step
-                expected_thread = step.pop("expected_thread_id", None)
-                if expected_thread is not None and not isinstance(expected_thread, str):
-                    raise ValueError("expected_thread_id must be a string or null")
-                if has_expected_thread and expected_thread != current_thread:
-                    raise ValueError("agent fixture expected a different Thread ID")
-                configured_thread = step.pop("thread_id", None)
-                if configured_thread is not None and (
-                    not isinstance(configured_thread, str)
-                    or not configured_thread.strip()
-                ):
-                    raise ValueError("thread_id must be a non-empty string")
-                no_thread = step.pop("no_thread", False)
-                if not isinstance(no_thread, bool):
-                    raise ValueError("no_thread must be a boolean")
-                if no_thread:
-                    raise ValueError("scripted Run Invocation did not report a Thread ID")
-                configured_error = step.pop("error", None)
-                if isinstance(configured_error, str):
-                    raise ValueError(configured_error)
-                if configured_error is not None:
-                    raise ValueError("error must be a string")
-            except ValueError as error:
-                start_invocation()
-                notify("failed", attempt_count=attempt, error=str(error))
-                raise
-            reported_thread = configured_thread or current_thread or default_thread
-            if current_thread is not None and reported_thread != current_thread:
-                message = "agent fixture resume reported a different Thread ID"
+            with _fixture_execution_events(notify) as execution_event:
+                try:
+                    step = self._next(name)
+                    has_expected_thread = "expected_thread_id" in step
+                    expected_thread = step.pop("expected_thread_id", None)
+                    if expected_thread is not None and not isinstance(expected_thread, str):
+                        raise ValueError("expected_thread_id must be a string or null")
+                    if has_expected_thread and expected_thread != current_thread:
+                        raise ValueError("agent fixture expected a different Thread ID")
+                    configured_thread = step.pop("thread_id", None)
+                    if configured_thread is not None and (
+                        not isinstance(configured_thread, str)
+                        or not configured_thread.strip()
+                    ):
+                        raise ValueError("thread_id must be a non-empty string")
+                    no_thread = step.pop("no_thread", False)
+                    if not isinstance(no_thread, bool):
+                        raise ValueError("no_thread must be a boolean")
+                    if no_thread:
+                        raise ValueError("scripted Run Invocation did not report a Thread ID")
+                    configured_error = step.pop("error", None)
+                    if isinstance(configured_error, str):
+                        raise ValueError(configured_error)
+                    if configured_error is not None:
+                        raise ValueError("error must be a string")
+                except ValueError as error:
+                    start_invocation()
+                    execution_event("failed", attempt_count=attempt, error=str(error))
+                    raise
+                reported_thread = configured_thread or current_thread or default_thread
+                if current_thread is not None and reported_thread != current_thread:
+                    message = "agent fixture resume reported a different Thread ID"
+                    report_thread(reported_thread, attempt)
+                    execution_event("failed", attempt_count=attempt, error=message)
+                    raise ValueError(message)
+                try:
+                    result = decode(step)
+                    validate(result)
+                except ValueError as error:
+                    report_thread(reported_thread, attempt)
+                    if attempt < 3:
+                        current_thread = reported_thread
+                        continue
+                    execution_event("failed", attempt_count=attempt, error=str(error))
+                    raise
                 report_thread(reported_thread, attempt)
-                notify("failed", attempt_count=attempt, error=message)
-                raise ValueError(message)
-            try:
-                result = decode(step)
-                validate(result)
-            except ValueError as error:
-                report_thread(reported_thread, attempt)
-                if attempt < 3:
-                    current_thread = reported_thread
-                    continue
-                notify("failed", attempt_count=attempt, error=str(error))
-                raise
-            report_thread(reported_thread, attempt)
-            current_thread = reported_thread
-            notify(
-                "completed",
-                reported_thread_id=current_thread,
-                attempt_count=attempt,
-            )
-            return result, current_thread
+                current_thread = reported_thread
+                execution_event(
+                    "completed",
+                    reported_thread_id=current_thread,
+                    attempt_count=attempt,
+                )
+                return result, current_thread
         raise AssertionError("unreachable")
 
     def _maybe_fail_initial_credential(
@@ -553,6 +560,35 @@ class FixtureAgentBackend:
         if not isinstance(value, dict):
             raise ValueError(f"agent fixture {name} item must be an object")
         return dict(value)
+
+
+@contextmanager
+def _fixture_execution_events(
+    notify: Callable[..., None] | None,
+) -> Iterator[Callable[..., None]]:
+    """Record a synchronous fixture Worker, including exceptional unwinding."""
+
+    observer = notify if notify is not None else lambda _kind, **_facts: None
+    observer("execution_started")
+    finished = False
+
+    def finish() -> None:
+        nonlocal finished
+        if not finished:
+            finished = True
+            observer("execution_finished")
+
+    def report(kind: str, **facts: Any) -> None:
+        # Only this simulated backend knows its work ends at these emissions.
+        # Real Workers record their own process boundaries independently.
+        if kind in {"completed", "failed"}:
+            finish()
+        observer(kind, **facts)
+
+    try:
+        yield report
+    finally:
+        finish()
 
 
 def _is_initial_credential_failure(value: object) -> bool:

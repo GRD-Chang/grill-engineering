@@ -267,11 +267,12 @@ def test_resume_request_and_unproven_success_never_send_success(
         sender.observe(current)
     sender.close()
     assert len(calls) == 1
-    assert calls[0]["header"]["title"]["content"] == "任务已开始"
+    assert calls[0]["header"]["title"]["content"] == "任务已创建"
 
 
-def test_first_ticket_start_is_not_replayed_after_history_rolls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_first_start_is_not_replayed_after_history_rolls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_only: bool,
 ) -> None:
     from support.notification import state_with_round
 
@@ -281,15 +282,17 @@ def test_first_ticket_start_is_not_replayed_after_history_rolls(
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
     current = state_with_round()
+    current["delivery_type"] = "parent_only" if parent_only else "ticket_run"
     current["notifications"] = {**state()["notifications"], "mode": "concise"}
     current["ticket_graph"] = {"tickets": {"3": {"title": "Feature"}}}
     attempt = current["semantic_agent_attempts"][0]
-    attempt["work_subject"] = "ticket:3"
+    attempt["work_subject"] = "parent-only:r" if parent_only else "ticket:3"
     invocation = current["agent_invocation_history"][0]
     invocation["semantic_attempt"] = attempt.copy()
     sender = Notifications(tmp_path, current)
     sender.close()
     first = len(calls)
+    assert first == 2  # Created and actual development.
     current.update(semantic_agent_attempts=[], agent_invocation_history=[])
     sender = Notifications(tmp_path, current)
     sender.close()

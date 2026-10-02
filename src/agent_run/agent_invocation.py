@@ -74,12 +74,14 @@ def invocation_event_recorder(
         "recovery_wait_intervals": [],
     }
     previous = state.get("active_agent_invocation")
+    predecessor_started_at = None
     if (
         isinstance(previous, dict)
         and isinstance(previous.get("semantic_attempt"), dict)
         and previous["semantic_attempt"].get("attempt_id")
         == semantic_attempt.get("attempt_id")
     ):
+        predecessor_started_at = previous.get("started_at")
         for key in (
             "ordinary_recovery_used",
             "capacity_recovery_count",
@@ -154,6 +156,8 @@ def invocation_event_recorder(
                 "attempt_count": 0,
                 "started_at": now,
                 "ended_at": None,
+                "execution_segments": [],
+                "predecessor_invocation_started_at": predecessor_started_at,
                 "error": None,
                 "return_code": None,
                 "signal": None,
@@ -188,7 +192,18 @@ def invocation_event_recorder(
             for key in recovery_state:
                 if key in facts:
                     recovery_state[key] = facts[key]
-            if kind == "output_step":
+            if kind == "execution_started":
+                invocation.setdefault("execution_segments", []).append(
+                    {"started_at": now, "ended_at": None}
+                )
+            elif kind == "execution_finished":
+                segments = invocation.setdefault("execution_segments", [])
+                if segments and segments[-1].get("ended_at") is None:
+                    segments[-1]["ended_at"] = now
+                else:
+                    # An unobserved start cannot be replaced by preparation time.
+                    segments.append({"started_at": None, "ended_at": now})
+            elif kind == "output_step":
                 invocation["execution_interrupted"] = True
             elif kind == "recovery_waiting":
                 invocation["status"] = "resuming"
@@ -414,7 +429,7 @@ def record_operator_stop(
         failed.update(
             {
                 "status": "failed",
-                "ended_at": datetime.now(UTC).isoformat(),
+                "interruption_observed_at": datetime.now(UTC).isoformat(),
                 "error": "operator_stopped",
             }
         )

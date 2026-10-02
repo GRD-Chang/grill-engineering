@@ -12,5 +12,6 @@ def state_with_round(role: str = "development", outcome: str = "candidate") -> d
             "status": "run_review_pending", "semantic_agent_attempts": [attempt],
             "agent_invocation_history": [{"semantic_attempt": attempt.copy(), "status": "completed", "reported_thread_id": "thread-1",
                                           "started_at": "2026-01-01T00:00:00+00:00",
+                                          "execution_segments": [{"started_at": "2026-01-01T00:00:00+00:00",
+                                                                  "ended_at": "2026-01-01T00:00:09+00:00"}],
                                           "ended_at": "2026-01-01T00:00:09+00:00"}]}
-

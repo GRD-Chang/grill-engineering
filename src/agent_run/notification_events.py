@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from agent_run.notification_event_facts import event_copy, event_envelope, event_subject
 
-from agent_run.execution_timing import execution_totals
+from agent_run.execution_timing import execution_totals, invocation_started
 from agent_run.ticket_effort import ticket_effort
 from typing import Any
 
@@ -37,8 +37,7 @@ def _round_events(
     title = facts.get("task_title") or (f"#{facts['task_number']}" if ticket else event_copy(state, "parent"))
     start_title = {"development": event_copy(state, "development_start", title=title), "review": event_copy(state, "review_ticket_start", title=title) if ticket else event_copy(state, "review_start"),
                    "publication": event_copy(state, "publication_ticket_start") if ticket else event_copy(state, "publication_start")}[role]
-    if any(invocation.get("reported_thread_id") for invocation in record.get("invocations", [])
-           if isinstance(invocation, dict)):
+    if any(invocation_started(invocation) for invocation in record.get("invocations", [])):
         result.append(event_envelope(state, "stage_start", record["attempt_id"],
                             start_title, started_at=record.get("started_at"), live=record.get("activity") == "running", **facts))
     artifact = record.get("acceptance_artifact") or {}
@@ -102,7 +101,9 @@ def _round_events(
     result.append(event_envelope(state, "stage_end", [record["attempt_id"], outcome, stopped, check_results],
                         title, color, checks=check_results, status_code=status_code,
                         summary=summary, next_step=next_step, findings_count=len(findings),
-                        duration_seconds=record.get("execution_seconds") if record.get("ended_at") else None, **facts))
+                        duration_seconds=record.get("execution_seconds") if record.get("execution_timing_complete") else None,
+                        execution_timing_complete=record.get("execution_timing_complete"),
+                        recorded_execution_seconds=record.get("recorded_execution_seconds"), **facts))
     return result
 
 
@@ -138,7 +139,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     # Detailed mode retains later rounds, but a milestone replaces its own
     # process-level start instead of describing the same fact twice.
     milestone_starts = {event.get("attempt_id") for event in key_events
-                        if event["kind"] in {"ticket_started", "acceptance_started"}}
+                        if event["kind"] in {"ticket_started", "parent_started", "acceptance_started"}}
     result = [event for event in result if not (
         event["kind"] == "stage_start" and event.get("attempt_id") in milestone_starts)]
     replaced_results: set[object] = set()
@@ -159,11 +160,15 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
                          and not str(record.get("work_subject")).startswith("ticket:")), None)
         if matching:
             replaced_results.add(matching.get("attempt_id"))
-            for event in key_events:
-                if event["kind"] == "acceptance_passed":
+        for event in key_events:
+            if event["kind"] == "acceptance_passed":
+                event["execution_timing_complete"] = False
+                if matching:
                     event.update(attempt_id=matching.get("attempt_id"), round=matching.get("ordinal"),
                                  phase=event_copy(state, "role_review"),
-                                 duration_seconds=matching.get("execution_seconds") if matching.get("ended_at") else None)
+                                 duration_seconds=matching.get("execution_seconds") if matching.get("execution_timing_complete") else None,
+                                 execution_timing_complete=matching.get("execution_timing_complete") is True,
+                                 recorded_execution_seconds=matching.get("recorded_execution_seconds"))
     result = [event for event in result if not (
         event["kind"] == "stage_end" and event.get("attempt_id") in replaced_results)]
     result.extend(key_events)
@@ -191,7 +196,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     from agent_run.notification_resume import apply_resume_result
     result = apply_resume_result(state, result)
     if (state.get("notifications") or {}).get("mode", "detailed") == "concise":
-        result = [event for event in result if event["kind"] in {"run_start", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "resume", "boundary"}]
+        result = [event for event in result if event["kind"] in {"run_start", "parent_started", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "resume", "boundary"}]
     return list({event["id"]: event for event in result}.values())
 
 
@@ -209,7 +214,7 @@ def recovery_events(state: dict[str, Any], pending: list[dict[str, Any]]) -> lis
                  for event in projected if event["kind"] == "stage_end"}
     eligible = [event for event in projected if event["id"] in pending_ids and (
         (event["kind"] == "run_start" and state.get("status") == "starting") or
-        (event["kind"] in {"stage_start", "ticket_started", "acceptance_started", "acceptance_repair", "resume"}
+        (event["kind"] in {"stage_start", "parent_started", "ticket_started", "acceptance_started", "acceptance_repair", "resume"}
          and event.get("live") and event.get("attempt_id") not in completed)
         or event["kind"] == "acceptance_passed"
         or (event["kind"] == "acceptance_repair"

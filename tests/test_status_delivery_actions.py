@@ -112,8 +112,10 @@ def test_history_single_result_and_exact_round_time(capsys, details: bool) -> No
     attempt = {"attempt_id": "a", "role": "development", "work_subject": "parent:1", "ordinal": 1,
                "status": "completed", "outcome": "candidate"}
     invocation = {"semantic_attempt": attempt, "work_subject": "parent:1", "role": "development",
+                  "reported_thread_id": "actual-thread",
                   "status": "completed", "started_at": "2026-09-15T01:00:00+00:00",
                   "ended_at": "2026-09-15T01:07:55+00:00", "model": "test-model", "reasoning_effort": "high"}
+    invocation["execution_segments"] = [{"started_at": invocation["started_at"], "ended_at": invocation["ended_at"]}]
     state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
              "agent_invocation_history": [invocation]}
     _print_history(state, as_json=False, plain=True, details=details)
@@ -153,3 +155,40 @@ def test_status_omits_terminal_elapsed_without_end(capsys, rich: bool) -> None:
     else:
         print_status_progress(state, audit, view, display_term=human_status_term, print_operator_action=lambda action: None)
     assert "任务历时" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("plain", [False, True])
+def test_history_and_status_explain_partial_execution(capsys, monkeypatch, plain: bool) -> None:
+    from agent_run.cli_presentation import _print_history
+    from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
+    from agent_run.presentation_helpers import human_status_term
+
+    attempt = {"attempt_id": "a", "role": "development", "work_subject": "parent:1", "ordinal": 1,
+               "status": "completed", "outcome": "candidate"}
+    invocation = {"semantic_attempt": attempt, "work_subject": "parent:1", "role": "development",
+                  "reported_thread_id": "actual-thread",
+                  "status": "completed", "started_at": "2026-09-15T01:00:00+00:00",
+                  "model": "model-a", "reasoning_effort": "high"}
+    resumed = {**invocation, "started_at": "2026-09-15T02:00:00+00:00",
+               "ended_at": "2026-09-15T02:07:55+00:00", "model": "model-b"}
+    resumed["execution_segments"] = [{"started_at": resumed["started_at"], "ended_at": resumed["ended_at"]}]
+    state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
+             "agent_invocation_history": [invocation, resumed]}
+    original = deepcopy(state)
+    monkeypatch.setenv("COLUMNS", "180")
+    _print_history(state, as_json=False, plain=plain, details=False)
+    history = capsys.readouterr().out
+    assert "耗时记录不完整" in history
+    assert "已记录执行时长：7 分 55 秒" in history
+    assert "model-a" in history and "model-b" in history and "high" in history
+    assert "本轮执行耗时" not in history
+    audit = {"status": "completed"}
+    view = status_progress_view(state, audit)
+    if plain:
+        print_status_progress(state, audit, view, display_term=human_status_term, print_operator_action=lambda action: None)
+    else:
+        print_rich_status_progress(state, audit, view)
+    status = capsys.readouterr().out
+    assert "耗时记录不完整" in status
+    assert "已记录执行时长：7 分 55 秒" in status
+    assert state == original

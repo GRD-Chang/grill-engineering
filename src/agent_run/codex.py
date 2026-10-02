@@ -349,6 +349,7 @@ class CodexCliBackend:
         currentness = request.get("_currentness_check")
         printed_steps: set[int] = set()
         role_prompt = prompt
+        invocation_attempted = False
 
         def remember_thread(value: str) -> None:
             nonlocal current_thread
@@ -365,7 +366,8 @@ class CodexCliBackend:
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before Invocation"
                 )
-                notify("failed", attempt_count=attempt - 1, error=str(stale))
+                notify("failed", attempt_count=attempt - 1, error=str(stale),
+                       execution_not_started=not invocation_attempted)
                 raise stale
             notify("output_step", output_attempt=attempt, validation_error=validation_error)
             remaining = deadline_at - time.monotonic()
@@ -379,6 +381,7 @@ class CodexCliBackend:
                     error=str(deadline_error),
                     return_code=None,
                     signal=None,
+                    execution_not_started=not invocation_attempted,
                 )
                 raise deadline_error
             attempt_prompt = role_prompt
@@ -415,6 +418,7 @@ class CodexCliBackend:
                     timeout=remaining,
                     deadline_at_monotonic=deadline_at,
                     on_thread=remember_thread,
+                    on_execution=notify,
                     validate_final_output=lambda value: validate(
                         _json_object(value, output_name)
                     ),
@@ -426,6 +430,7 @@ class CodexCliBackend:
                     not isinstance(error, _CodexInvocationDeadlineError)
                     or error.process_started
                 )
+                invocation_attempted = invocation_attempted or process_started
                 if isinstance(error, _CodexInvocationDeadlineError):
                     error = CodexProcessError(
                         f"{output_name} exceeded its Invocation Deadline",
@@ -479,6 +484,7 @@ class CodexCliBackend:
                     continue
                 failure_facts: dict[str, object] = {
                     "attempt_count": attempt if process_started else attempt - 1,
+                    "execution_not_started": not invocation_attempted,
                     "error": _bounded_error(str(error)),
                     "return_code": getattr(error, "return_code", None),
                     "signal": getattr(error, "signal_number", None),
@@ -488,6 +494,7 @@ class CodexCliBackend:
                     failure_facts["machine_error"] = getattr(error, "machine_error", None)
                 notify("failed", **failure_facts)
                 raise error
+            invocation_attempted = True
             if current_thread is not None and reported_thread != current_thread:
                 mismatch = CodexProcessError(
                     "Codex resume reported a different Thread ID", recoverable=False
@@ -560,6 +567,7 @@ class CodexCliBackend:
         timeout: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
         deadline_at_monotonic: float | None = None,
         on_thread: Callable[[str], None] | None = None,
+        on_execution: Callable[..., None] | None = None,
         validate_final_output: Callable[[str], object] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
@@ -730,12 +738,26 @@ class CodexCliBackend:
                         if self.on_worker_started is not None:
                             self.on_worker_started(pid)
 
+                    def worker_released() -> None:
+                        if on_execution is not None:
+                            on_execution("execution_started")
+
                     if "on_process_started" in inspect.signature(
                         run_worker_process
                     ).parameters:
                         worker_options["on_process_started"] = worker_started
+                    if "on_process_released" in inspect.signature(
+                        run_worker_process
+                    ).parameters:
+                        worker_options["on_process_released"] = worker_released
                     try:
-                        result = run_worker_process(arguments, **worker_options)
+                        try:
+                            result = run_worker_process(arguments, **worker_options)
+                        finally:
+                            # The Worker runner returns/raises only after its
+                            # process is reaped. Exclude auth/result checks below.
+                            if on_execution is not None:
+                                on_execution("execution_finished")
                         if not app_access and self.worker_identity is not None:
                             # Validate the credential consumed by this invocation, not a
                             # replacement that appeared at the reference while it ran.

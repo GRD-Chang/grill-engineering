@@ -149,3 +149,45 @@ else:
         final = load_only_run_state(git_repo)
         assert final["status"] == "completed"
         assert final.get("agent_invocation_history", []) == before_invocations
+
+
+def test_public_targeted_resume_reports_checks_that_remain_pending(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real checks read proves progress even without a new Agent or merge."""
+    from support.cli_payloads import ticket
+
+    cards_path = git_repo.parent / "pending-resume-cards.jsonl"
+
+    def send(_config, rendered, *_args):
+        # The fixture Executor forks; observe its requests through the shared
+        # test file rather than the parent's in-memory list.
+        with cards_path.open("a") as stream:
+            stream.write(json.dumps(rendered, ensure_ascii=False) + "\n")
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", send)
+    UserDefaultsStore().configure(notifications={"enabled": True, "profile": "test",
+        "open_id": "ou_test", "app_id": "cli_test"})
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()},
+                            delivery={"required_checks": ["pending"]},
+                            supervision_clock_multiplier=120)
+    agents = run_agents(git_repo / "agents.json")
+    initial = invoke_cli_inprocess(git_repo, fixture, "run", "1", "--json", "--agent-fixture", str(agents))
+    assert initial.returncode == 2, initial.stdout + initial.stderr
+    state = load_only_run_state(git_repo)
+    target = state["ticket_jobs"]["3"]
+    assert target["blocked_reason"] == "ticket_supervision_timeout"
+    old_observation = target["publication_observed_at"]
+    invocations = state["agent_invocation_history"]
+    cards_path.write_text("")
+    resumed = invoke_cli_inprocess(git_repo, fixture, "resume", state["run_id"], "--ticket", "3", "--json")
+    assert resumed.returncode == 2, resumed.stdout + resumed.stderr
+    final = load_only_run_state(git_repo)
+    assert final["agent_invocation_history"] == invocations
+    assert final["ticket_jobs"]["3"]["publication_observed_at"] > old_observation
+    cards = [json.loads(line) for line in cards_path.read_text().splitlines()]
+    progressed = [item for item in cards if item["header"]["title"]["content"] == text("notification.event.resume_started", language="zh")]
+    assert len(progressed) == 1, cards
+    assert progressed[0]["header"]["subtitle"]["content"].endswith("#3")
+    assert "检查" in str(progressed[0])

@@ -175,7 +175,7 @@ class Notifications:
                     pending.append({"event": item, "outcome": "pending", "attempts": 0})
                     if resume_identity is not None and resume_identity not in resume_results:
                         resume_results.append(resume_identity)
-                    if item["kind"] in {"ticket_started", "acceptance_started", "acceptance_repair"}:
+                    if item["kind"] in {"ticket_started", "parent_started", "acceptance_started", "acceptance_repair"}:
                         self.document["milestones"].append(identity)
                     added = True
                 self.document["seen"] = list(dict.fromkeys(

@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_run.acceptance_facts import current_artifact
 from agent_run.delivery_facts import role_family
+from agent_run.execution_timing import invocation_started
 from agent_run.run_currentness import ticket_completion_records
 
 
@@ -15,20 +16,22 @@ def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dic
     result: list[dict[str, Any]] = []
     parent_only = state.get("delivery_type") == "parent_only"
     started = [record for record in records if record.get("started_at") and not record.get("event_record")
-               and any(invocation.get("reported_thread_id") for invocation in record.get("invocations", [])
-                       if isinstance(invocation, dict))]
+               and any(invocation_started(invocation) for invocation in record.get("invocations", []))]
+    subjects: set[str] = set()
+    for record in started:
+        subject = str(record.get("work_subject") or "")
+        eligible = subject == f"parent-only:{state.get('run_id')}" if parent_only else subject.startswith("ticket:")
+        if not eligible or role_family(str(record.get("role"))) != "development" or subject in subjects:
+            continue
+        subjects.add(subject)
+        facts = event_subject(state, subject)
+        kind = "parent_started" if parent_only else "ticket_started"
+        first = next(invocation for invocation in record["invocations"] if invocation_started(invocation))
+        result.append(event_envelope(state, kind, subject,
+                            event_copy(state, kind, title=facts.get("task_title") or subject),
+                            attempt_id=record.get("attempt_id"), live=record.get("activity") == "running",
+                            started_at=first["started_at"], **facts))
     if not parent_only:
-        tickets: set[str] = set()
-        for record in started:
-            subject = str(record.get("work_subject") or "")
-            if not subject.startswith("ticket:") or role_family(str(record.get("role"))) != "development" or subject in tickets:
-                continue
-            tickets.add(subject)
-            facts = event_subject(state, subject)
-            result.append(event_envelope(state, "ticket_started", subject,
-                                event_copy(state, "ticket_started", title=facts.get("task_title") or subject),
-                                attempt_id=record.get("attempt_id"), live=record.get("activity") == "running",
-                                started_at=record["started_at"], **facts))
         reviews = [record for record in started if record.get("work_subject") == f"run-acceptance:{state.get('run_id')}"
                    and role_family(str(record.get("role"))) == "review"]
         run = state.get("run_acceptance") or {}
@@ -41,7 +44,7 @@ def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dic
             active = state.get("active_agent_invocation") or {}
             repairing = (active.get("work_subject") == f"run-repair:{state.get('run_id')}"
                          and active.get("role") == "development" and active.get("status") == "running"
-                         and bool(active.get("reported_thread_id")))
+                         and invocation_started(active))
             result.append(event_envelope(state, "acceptance_repair", state.get("run_id"),
                                 event_copy(state, "acceptance_repair_active" if repairing else "acceptance_repair_planned"),
                                 "orange", live=repairing))

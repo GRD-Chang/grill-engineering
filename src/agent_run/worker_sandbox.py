@@ -470,12 +470,13 @@ def run_worker_process(
     abort_event: threading.Event | None = None,
     abort_reason: Callable[[], str] | None = None,
     on_process_started: Callable[[int], None] | None = None,
+    on_process_released: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.worker_control import check_worker_control
 
     check_worker_control()
     gate_write: int | None = None
-    if on_process_started is None:
+    if on_process_started is None and on_process_released is None:
         process = subprocess.Popen(
             arguments,
             cwd=cwd,
@@ -524,6 +525,10 @@ def run_worker_process(
             ):
                 raise WorkerDeadlineExceeded("Codex worker timed out")
             os.write(gate_write, b"1")
+            # Registration, persistence and control checks ran while the
+            # bootstrap was blocked. Timing may start only after releasing it.
+            if on_process_released is not None:
+                on_process_released()
             if (
                 deadline_at_monotonic is not None
                 and time.monotonic() >= deadline_at_monotonic

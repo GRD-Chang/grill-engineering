@@ -1048,6 +1048,7 @@ def test_deadline_exhausted_before_output_repair_does_not_count_unstarted_proces
             "error": "Test output exceeded its Invocation Deadline",
             "return_code": None,
             "signal": None,
+            "execution_not_started": False,
         },
     )
 
@@ -1148,6 +1149,7 @@ def test_deadline_exhausted_during_worker_setup_does_not_start_output_attempt(
             "error": "Development result exceeded its Invocation Deadline",
             "return_code": None,
             "signal": None,
+            "execution_not_started": True,
         },
     )
 

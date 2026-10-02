@@ -10,6 +10,8 @@ import pytest
 
 from agent_run.controller import Controller
 from agent_run.git import GitRepository
+from agent_run.messages import text
+from agent_run.notifications import Notifications
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
@@ -69,6 +71,19 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
     agents = TicketAgents(git_repo, numbers, develop, before_review=review)
     paused = ticket_engine(git, states, fixture, agents, development_only=True).deliver_ticket(run_id, 2)
     assert paused["active_ticket_job"]["blocked_reason"] == pause_reason
+    # The existing Executor owns the sender; the public targeted Resume only
+    # persists admission and must not announce success while still queued.
+    paused["notifications"] = {"enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test"}
+    states.save_run(run_id, paused)
+    cards: list[dict[str, Any]] = []
+
+    def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any) -> dict[str, Any]:
+        cards.append(card)
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", send)
+    sender = Notifications(states.root, paused)
+    states.run_saved_observer = sender.observe
     engine = DeliveryRunEngine(
         controller=Controller(FixtureGitHubReader(fixture), git, states),
         tickets=ticket_engine(git, states, fixture, agents),
@@ -115,6 +130,7 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
             assert admitted["ticket_jobs"]["2"].get(key) == target.get(key), key
         assert {number: admitted["ticket_jobs"][number] for number in siblings} == siblings
         assert not started[2].is_set() and not started[5].is_set()
+        assert sender.document["resume_results"] == []
 
         repeated = run_cli(git_repo, fixture, "resume", "1", "--ticket", "2")
         assert repeated.returncode == 0, repeated.stdout + repeated.stderr
@@ -149,12 +165,21 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
         assert current["ticket_jobs"]["2"]["candidate_sha"] == target["candidate_sha"]
         assert current["ticket_jobs"]["2"]["review_budget"] == target["review_budget"]
         require_current_run_state(current)
+        assert sender.document["resume_results"] == [], "Preparing the resumed Worker is not a Thread start"
+        release[2].set()
+        with sender.condition:
+            assert sender.condition.wait_for(lambda: bool(sender.document["resume_results"])
+                                             and not sender.document["pending"], timeout=10), errors
+        titles = [card["header"]["title"]["content"] for card in cards]
+        assert titles.count(text("notification.event.resume_started", language=paused["language"])) == 1
+        assert not release[4].is_set(), "The result must arrive while a sibling is still executing"
     finally:
         for event in release.values():
             event.set()
         thread.join(15)
         worker.terminate()
         worker.wait(timeout=5)
+        sender.close()
     assert not thread.is_alive() and not errors, errors
     final = states.load_current_run(run_id)
     assert final is not None

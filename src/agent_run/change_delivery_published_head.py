@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
 
 from agent_run.change_delivery_branches import ensure_linked_branch_display
@@ -207,6 +208,9 @@ def publish_and_merge(
             ensure_supervision_window(state)
             stage.save(state)
             return True
+        # Retain proof of an actual Controller observation. Queue admission
+        # and restoring a waiting phase alone cannot prove Resume progressed.
+        job["publication_observed_at"] = datetime.now(UTC).isoformat()
         if existing_live.get("state") == "MERGED":
             if (
                 existing_live.get("head_branch") != stage.contract.branch

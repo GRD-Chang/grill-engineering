@@ -56,33 +56,51 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
         from datetime import datetime
         try:
             started = datetime.fromisoformat(event["started_at"]).astimezone()
-            lines.append(copy("field", label=copy("started_at"), value=f"{started:%Y-%m-%d %H:%M:%S %Z}"))
+            lines.append(copy("field", label=copy("created_at" if event.get("kind") == "run_start" else "started_at"), value=f"{started:%Y-%m-%d %H:%M:%S %Z}"))
         except ValueError:
             pass
     for field in ("duration_seconds", "total_seconds", "elapsed_seconds"):
         value = event.get(field)
         if type(value) is int and value >= 0:
             lines.append(copy("field", label=f"**{copy(field)}**", value=duration(value)))
+    if event.get("execution_timing_complete") is False:
+        lines.append(copy("timing_incomplete"))
+        recorded = event.get("recorded_execution_seconds")
+        if type(recorded) is int:
+            lines.append(copy("field", label=f"**{copy('recorded_execution_seconds')}**", value=duration(recorded)))
     effort = event.get("effort") or {}
     for role in ("development", "review"):
         facts = effort.get(role) or {}
         parts = []
         if "rounds" in facts:
-            parts.append(copy("effort.rounds", count=facts["rounds"]))
+            parts.append(copy("effort.recorded_rounds" if facts.get("rounds_complete") is False else "effort.rounds", count=facts["rounds"]))
         if "execution_seconds" in facts:
             parts.append(copy("effort.execution", duration=duration(facts["execution_seconds"])))
+        elif facts.get("execution_timing_complete") is False:
+            parts.append(copy("timing_incomplete"))
+            if type(facts.get("recorded_execution_seconds")) is int:
+                parts.append(copy("field", label=copy("recorded_execution_seconds"), value=duration(facts["recorded_execution_seconds"])))
         configurations = facts.get("configurations") or []
-        if len(configurations) == 1:
+        collapsed = len(configurations) == 1 and facts.get("configurations_complete", True)
+        if collapsed:
             config = configurations[0]
             parts.append(_markdown(f"{config['model']} / {config['reasoning_effort']}"))
         if parts:
             lines.append(copy("field", label=f"**{copy('effort.' + role)}**", value=" · ".join(parts)))
-        if len(configurations) > 1:
+        if configurations and not collapsed:
             for config in configurations:
-                participation = [copy("effort.participation", count=config["rounds"])]
+                participation = []
+                if "rounds" in config:
+                    participation.append(copy("effort.recorded_rounds" if config.get("rounds_complete") is False else "effort.participation", count=config["rounds"]))
                 if "execution_seconds" in config:
                     participation.append(duration(config["execution_seconds"]))
-                lines.append(copy("field", label=_markdown(f"{config['model']} / {config['reasoning_effort']}"),
+                elif config.get("execution_timing_complete") is False:
+                    participation.append(copy("timing_incomplete"))
+                    if type(config.get("recorded_execution_seconds")) is int:
+                        participation.append(copy("field", label=copy("recorded_execution_seconds"), value=duration(config["recorded_execution_seconds"])))
+                model = config.get("model") or copy("not_recorded")
+                reasoning = config.get("reasoning_effort") or copy("not_recorded")
+                lines.append(copy("field", label=_markdown(f"{model} / {reasoning}"),
                                   value=" · ".join(participation)))
             if facts.get("shared_rounds"):
                 lines.append(copy("effort.shared_rounds"))

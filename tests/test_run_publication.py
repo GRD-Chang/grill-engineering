@@ -25,6 +25,7 @@ from agent_run.state_contract import (
 )
 
 from support.inprocess_cli import invoke_cli_inprocess
+from support.lifecycle import _file_snapshot
 from support.workspace import prepare_workspace
 from support.cli import run_internal_stage, run_cli, stdout_json
 
@@ -433,6 +434,7 @@ def test_final_publication_human_resume_clears_current_blocker(
     with pytest.raises(IncompatibleRunStateError, match="Human Blocker phase"):
         require_current_run_state(malformed)
     assert publisher.data["delivery"]["pull_requests"] == []
+    before_queries = _file_snapshot(workspace.repository_root.parent)
     for command in ("status", "history"):
         view = invoke_cli_inprocess(
             repo,
@@ -451,9 +453,11 @@ def test_final_publication_human_resume_clears_current_blocker(
         )
         assert (
             "触发阻塞的 Agent: 发布 Agent；模型 publication-model；"
-            "推理强度 high；本轮时长: 0 秒"
+            "推理强度 high；耗时记录不完整"
             in view.stdout
         )
+        assert "本轮时长: 0 秒" not in view.stdout
+        assert "None 秒" not in view.stdout
         assert (
             "下一步: agent-run resume 1 --repo example/project"
             in view.stdout
@@ -473,6 +477,7 @@ def test_final_publication_human_resume_clears_current_blocker(
         and event.get("human_blockers")
         for event in history["timeline"]
     )
+    assert _file_snapshot(workspace.repository_root.parent) == before_queries
 
     resumed, _ = Controller(
         FixtureGitHubReader(repo / "github.json"), git, states

@@ -175,7 +175,7 @@ def test_resolved_gate_is_removed_while_other_transport_is_inflight(
         release.set()
         sender.close()
     assert len(calls) == 1
-    assert calls[0]["header"]["title"]["content"] == "任务已开始"
+    assert calls[0]["header"]["title"]["content"] == "任务已创建"
     assert read_notifications(tmp_path, "r")["pending"] == []
 
 

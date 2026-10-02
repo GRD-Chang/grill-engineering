@@ -2558,6 +2558,7 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "status": "pending",
     }
     first = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "completed",
@@ -2566,6 +2567,7 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "semantic_attempt": deepcopy(attempt),
     }
     resumed = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "running",
@@ -2573,6 +2575,8 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "ended_at": None,
         "semantic_attempt": deepcopy(attempt),
     }
+    first["execution_segments"] = [{"started_at": first["started_at"], "ended_at": first.get("ended_at")}]
+    resumed["execution_segments"] = [{"started_at": resumed["started_at"], "ended_at": resumed.get("ended_at")}]
     job = {
         "ticket_number": 3,
         "semantic_attempt_history": [attempt],
@@ -2711,6 +2715,7 @@ def test_history_running_attempt_reports_current_elapsed_time() -> None:
         "status": "pending",
     }
     invocation = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "running",
@@ -2718,6 +2723,7 @@ def test_history_running_attempt_reports_current_elapsed_time() -> None:
         "ended_at": None,
         "semantic_attempt": deepcopy(attempt),
     }
+    invocation["execution_segments"] = [{"started_at": invocation["started_at"], "ended_at": invocation.get("ended_at")}]
     job = {
         "ticket_number": 3,
         "pending_semantic_attempt": attempt,
@@ -5917,13 +5923,13 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("waits", "expected"),
+    ("segments", "expected"),
     [
         (
             [
                 {
-                    "started_at": "2026-09-10T00:00:10+00:00",
-                    "ended_at": "2026-09-10T00:00:40+00:00",
+                    "started_at": "2026-09-10T00:00:30+00:00",
+                    "ended_at": "2026-09-10T00:01:40+00:00",
                 }
             ],
             70,
@@ -5931,12 +5937,12 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
         (
             [
                 {
-                    "started_at": "2026-09-10T00:00:10+00:00",
+                    "started_at": "2026-09-10T00:00:00+00:00",
                     "ended_at": "2026-09-10T00:00:20+00:00",
                 },
                 {
-                    "started_at": "2026-09-10T00:00:30+00:00",
-                    "ended_at": "2026-09-10T00:00:40+00:00",
+                    "started_at": "2026-09-10T00:00:40+00:00",
+                    "ended_at": "2026-09-10T00:01:40+00:00",
                 },
             ],
             80,
@@ -5947,8 +5953,8 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
         ),
     ],
 )
-def test_history_execution_seconds_excludes_only_trusted_recovery_waits(
-    waits: list[dict[str, str]], expected: int | None
+def test_history_execution_seconds_sums_only_trusted_worker_segments(
+    segments: list[dict[str, str]], expected: int | None
 ) -> None:
     attempt = {
         "attempt_id": "attempt-duration",
@@ -5961,12 +5967,13 @@ def test_history_execution_seconds_excludes_only_trusted_recovery_waits(
         "outcome": "candidate",
     }
     invocation = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "completed",
         "started_at": "2026-09-10T00:00:00+00:00",
         "ended_at": "2026-09-10T00:01:40+00:00",
-        "recovery_wait_intervals": waits,
+        "execution_segments": segments,
         "semantic_attempt": deepcopy(attempt),
     }
     job = {
@@ -6324,11 +6331,13 @@ def test_successor_invocation_starts_with_own_recovery_wait_intervals() -> None:
 
     successor.update(
         {
+            "reported_thread_id": "actual-thread",
             "started_at": "2026-09-10T00:00:40+00:00",
             "ended_at": "2026-09-10T00:00:50+00:00",
             "status": "completed",
         }
     )
+    successor["execution_segments"] = [{"started_at": successor["started_at"], "ended_at": successor.get("ended_at")}]
     assert invocation_execution_seconds(successor) == 10
 
 

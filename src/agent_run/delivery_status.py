@@ -30,6 +30,7 @@ from agent_run.operator_action_presentation import (
     human_action_type,
     operator_action_items,
     human_preserved_results,
+    human_trigger_invocation,
 )
 from agent_run.presentation_helpers import (
     human_ci_fix_usage,
@@ -217,6 +218,10 @@ def print_status_progress(
     timing = status_timing(state)
     if "total_seconds" in timing:
         print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
+    elif timing.get("execution_timing_complete") is False:
+        print(display_text('presentation.status.timing_incomplete'))
+        if type(timing.get("recorded_execution_seconds")) is int:
+            print(display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds'])))
     print(display_text('presentation.status.nprogress'))
     print(f"  {_ticket_progress_text(state, view)}")
     for line in _multi_ticket_lines(view):
@@ -422,6 +427,11 @@ def print_rich_status_progress(
     timing = status_timing(state)
     if "total_seconds" in timing:
         add_identity(display_text('presentation.status.total_agent_execution_time'), _duration(timing["total_seconds"]))
+    elif timing.get("execution_timing_complete") is False:
+        detail = display_text('presentation.status.timing_incomplete')
+        if type(timing.get("recorded_execution_seconds")) is int:
+            detail += " · " + display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds']))
+        add_identity(display_text('presentation.status.total_agent_execution_time'), detail)
     progress_text = _ticket_progress_text(state, view)
     rounds = view.get("round_progress")
     if isinstance(rounds, dict) and state.get("status") != "completed":
@@ -540,9 +550,7 @@ def print_rich_status_progress(
                 action_lines.append(
                     _rich_labeled(
                         display_text('presentation.status.agent_that_triggered_the_blocker'),
-                        (
-                            display_text('presentation.status.v0_model_v2_reasoning_effort_v4_round_duration_v6_seconds', v0=_rich_role_label(triggering.get('role')), v2=triggering.get('model'), v4=triggering.get('reasoning_effort'), v6=triggering.get('duration_seconds'))
-                        ),
+                        human_trigger_invocation(triggering),
                     )
                 )
             if action.get("scope") == "global":

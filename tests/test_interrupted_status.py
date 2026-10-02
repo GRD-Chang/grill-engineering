@@ -46,6 +46,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     invocation.update(
         status='running', started_at='2026-09-07T01:39:19+00:00', ended_at=None,
         deadline_at='2026-09-07T03:39:19+00:00',
+        execution_segments=[{'started_at': '2026-09-07T01:39:19+00:00', 'ended_at': None}],
     )
     state['status'] = 'run_publication'
     state['run_publication']['phase'] = 'publishing'
@@ -55,6 +56,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     state['agent_invocation_history'][-1] = dict(invocation)
     if case == 'ended':
         invocation['ended_at'] = '2026-09-07T01:47:25+00:00'
+        invocation['execution_segments'][0]['ended_at'] = invocation['ended_at']
         state['agent_invocation_history'][-1] = dict(invocation)
     control_path = next((managed_state(git_repo, extra_env=environment) / 'task-control').glob('*.json'))
     if case == 'unknown':

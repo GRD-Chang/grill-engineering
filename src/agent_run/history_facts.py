@@ -12,7 +12,7 @@ from typing import Any
 from agent_run.delivery_facts import delivery_object_label, role_family as _role_family
 from agent_run.execution_timing import (
     invocation_activity,
-    invocation_execution_seconds,
+    record_execution_timing,
     parse_timestamp as _parse_timestamp,
     parse_optional_timestamp as _parse_optional_timestamp,
 )
@@ -501,7 +501,7 @@ def _finalize_history_record(state: dict[str, Any], record: dict[str, Any]) -> N
         record["ended_at"] = None
     record["activity"] = _record_activity(state, record, invocations)
     record["span_seconds"] = _record_span_seconds(record)
-    record["execution_seconds"] = _record_execution_seconds(record)
+    record.update(record_execution_timing(state, record))
     record["resumption_count"] = sum(
         1 for invocation in invocations if invocation.get("resume_id") is not None
     )
@@ -590,38 +590,6 @@ def _record_span_seconds(record: dict[str, Any]) -> int | None:
             return None
         ended = datetime.now(UTC)
     return max(0, int((ended - started).total_seconds()))
-
-def _record_execution_seconds(record: dict[str, Any]) -> int | None:
-    invocations = record.get("invocations")
-    if not isinstance(invocations, list) or not invocations:
-        return None
-    last_invocation_index = len(invocations) - 1
-    open_invocation_indices = [
-        index
-        for index, invocation in enumerate(invocations)
-        if isinstance(invocation, dict)
-        and _parse_optional_timestamp(invocation.get("started_at")) is not None
-        and _parse_optional_timestamp(invocation.get("ended_at")) is None
-    ]
-    if any(index != last_invocation_index for index in open_invocation_indices):
-        # An older invocation without a persisted end is not made complete by
-        # observing a later invocation running.  Its execution interval is
-        # unknowable, so the aggregate must remain unknown.
-        return None
-    total = 0
-    for index, invocation in enumerate(invocations):
-        if not isinstance(invocation, dict):
-            return None
-        allow_open = (
-            index == last_invocation_index
-            and record.get("activity")
-            in {"running", "capacity_wait", "recovery_wait"}
-        )
-        duration = invocation_execution_seconds(invocation, allow_open=allow_open)
-        if duration is None:
-            return None
-        total += duration
-    return total
 
 def _record_configurations(invocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     configurations: list[dict[str, Any]] = []
