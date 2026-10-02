@@ -17,7 +17,7 @@
 | repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，保存 StateStore；Candidate 和 currentness 由被测 Engine 执行 |
 | CLI 所需 accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号 |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
-| 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision` | 保留真实 Git 冲突、子进程、信号及归属清理 |
+| 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision`、`parent_approval_update`、`run_approval_update` | 保留真实 Git 冲突、子进程、信号及归属清理 |
 
 ## 合法前置与负向输入
 

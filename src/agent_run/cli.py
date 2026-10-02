@@ -2672,9 +2672,8 @@ def _run_lifecycle(
         )
     if (
         current is not None
-        and current.get("delivery_type") == "parent_only"
         and (
-            (action_kind == "approve" and current.get("status") == "parent_approval_pending")
+            (action_kind == "approve" and current.get("status") in {"parent_approval_pending", "run_approval_pending"})
             or (action_kind == "resume" and has_final_approval(current))
         )
     ):

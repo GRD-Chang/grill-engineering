@@ -1723,19 +1723,22 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                 "Task Control Record receipt-only marker is invalid"
             )
         if receipt_only:
-            failed_control = (
+            failed_operation = (
                 action.get("status") == "failed"
-                and action.get("kind") in {"stop", "abandon"}
+                and (
+                    action.get("kind") in {"stop", "abandon", "approve"}
+                    or action.get("final_approval_operation") is True
+                )
                 and isinstance(action.get("failure"), str)
             )
             if (
                 "payload" in action
                 or (
                     action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}
-                    and not failed_control
+                    and not failed_operation
                 )
                 or action.get("application_observed") is not True
-                or (action.get("failure") is not None and not failed_control)
+                or (action.get("failure") is not None and not failed_operation)
             ):
                 raise TaskControlError(
                     "Task Control Record receipt-only Action is invalid"

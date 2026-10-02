@@ -83,15 +83,40 @@ def is_final_approval_action(
 
 def approval_update_pending(state: Mapping[str, Any]) -> bool:
     """Recognize the durable handoff from old approval to stoppable update."""
-    job = state.get("parent_job")
+    parent_only = state.get("delivery_type") == "parent_only"
+    job = state.get("parent_job" if parent_only else "run_publication")
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_request") if isinstance(acceptance, Mapping) else None
     return (
-        state.get("delivery_type") == "parent_only"
-        and state.get("status") == "parent_delivery_pending"
+        state.get("status") == (
+            "parent_delivery_pending" if parent_only else "run_acceptance_pending"
+        )
         and isinstance(job, Mapping)
-        and job.get("phase") == "accepted"
-        and isinstance(job.get("approval_update"), Mapping)
+        and job.get("phase") in ({"accepted", "repairing"} if parent_only else {"stale"})
+        and (
+            isinstance(job.get("approval_update"), Mapping)
+            or (
+                isinstance(repair, Mapping)
+                and repair.get("repair_source") == "required_checks"
+            )
+        )
         and not has_final_approval(state)
     )
+
+
+def record_approval_update(
+    subject: dict[str, Any], *, previous_head: str, previous_base: str,
+    source: str, target: str,
+) -> None:
+    """Record the same handoff fact for either Parent, never a new merge grant."""
+    grant = subject.pop("approval_grant")
+    subject["approval_update"] = {
+        "granted_at": grant["granted_at"],
+        "previous_head_sha": previous_head,
+        "previous_base_sha": previous_base,
+        "source_sha": source,
+        "target_sha": target,
+    }
 
 
 def final_approval_cleanup_pending(state: Mapping[str, Any]) -> bool:

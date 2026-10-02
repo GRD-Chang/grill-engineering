@@ -37,6 +37,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.run_publication_approval import prepare_run_approval
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError
 
@@ -451,13 +452,23 @@ class DirectRunOperations:
         *,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> RunOutcome:
+        current = self.states.load_current_run(run_id)
+        if current is not None and current.get("status") == "run_approval_pending":
+            prepare_run_approval(current)
+            if prepare_state is not None:
+                prepare_state(current)
+            self.states.save_run(run_id, current)
         refreshed, _ = self._refresh(run_id)
+        selected = self.classify(refreshed)
         if refreshed.get("status") not in {
             "run_approval_pending",
             "parent_approval_pending",
             "parent_closeout_pending",
         }:
-            return self.classify(refreshed)
+            if prepare_state is not None and selected.kind is not RunOutcomeKind.EXTERNAL_WAIT:
+                prepare_state(refreshed)
+                self.states.save_run(run_id, refreshed)
+            return selected
         if refreshed.get("delivery_type") == "parent_only":
             parent = ParentDeliveryEngine(
                 git=self.git,

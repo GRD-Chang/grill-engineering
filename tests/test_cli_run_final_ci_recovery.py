@@ -212,32 +212,19 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
         git_repo, fixture, "resume", "1", "--agent-fixture", str(recovery_agents)
     )
 
-    assert recovered.returncode == 2, recovered.stderr
-    invalidated = load_only_run_state(git_repo)
-    assert stdout_json(recovered)["status"] == "run_acceptance_pending"
-    assert "approval_grant" not in invalidated["run_publication"]
-    assert invalidated["agent_invocation_history"] == waiting_state["agent_invocation_history"]
-    queued = invalidated["run_acceptance"]
-    assert queued["repair_request"]["repair_source"] == "required_checks"
-    assert queued["repair_request"]["ci_evidence"] == queued["ci_failed_evidence"]
-    assert queued["ci_failed_evidence"]["pr_number"] == grant["pr_number"]
-    assert queued["ci_failed_evidence"]["checks"][0]["job"]["head_sha"] == grant["head_sha"]
-    assert queued["ci_recovery"]["failure_head"] == grant["head_sha"]
-    assert queued["ci_recovery"]["rounds_used"] == 1
-    assert queued["ci_recovery"]["repairs_used"] == 0
-    assert queued["review_budget"] == awaiting["run_acceptance"]["review_budget"]
-    assert "repair_job" not in queued
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert stdout_json(recovered)["status"] == "run_approval_pending"
+    assert stdout_json(recovered)["action"]["status"] == "updating"
+    completed = load_only_run_state(git_repo)
+    assert "approval_grant" not in completed["run_publication"]
+    failed = completed["run_acceptance"]["ci_failed_evidence"]
+    assert failed["pr_number"] == grant["pr_number"]
+    assert failed["checks"][0]["job"]["head_sha"] == grant["head_sha"]
     assert not any(
         pull.get("scope") == "final_run" and pull.get("state") == "MERGED"
         for pull in json.loads(fixture.read_text())["delivery"]["pull_requests"]
     )
 
-    repaired = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
-    )
-    assert repaired.returncode == 0, repaired.stderr
-    completed = load_only_run_state(git_repo)
-    assert stdout_json(repaired)["status"] == "run_approval_pending"
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
     _assert_final_ci_repair_then_approve(

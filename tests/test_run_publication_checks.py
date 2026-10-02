@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from support.run_artifacts import _passing_artifact
-from support.run_scenarios import _sync_completed_ticket_integrated_sha, _accepted_run
+from support.run_scenarios import _accepted_run
 
 import subprocess
 from copy import deepcopy
@@ -10,7 +9,6 @@ from typing import Any
 
 import pytest
 
-from agent_run.agents import ReviewResult
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
@@ -288,9 +286,13 @@ def test_final_run_approve_revalidates_full_identity_before_merge(
     result = engine.approve(str(state["run_id"]))
 
     assert published["status"] == "run_approval_pending"
-    assert result["status"] == "run_acceptance_pending"
-    assert result["run_publication"]["phase"] == "stale"
-    assert "approval_grant" not in result["run_publication"]
+    if drift_kind == "base_sha":
+        assert result["status"] == "waiting_external"
+        assert result["diagnostics"][0]["code"] == "github_pr_head_observation_pending"
+    else:
+        assert result["status"] == "run_acceptance_pending"
+        assert result["run_publication"]["phase"] == "stale"
+        assert "approval_grant" not in result["run_publication"]
     assert "merge_intent" not in result["run_publication"]
     assert publisher.merge_calls == 0
     assert publisher.data["delivery"]["pull_requests"][0]["state"] == "OPEN"
@@ -368,9 +370,13 @@ def test_live_identity_drift_after_failure_evidence_cannot_start_repair(
         assert published["status"] == "run_approval_pending"
         result = engine.approve(str(state["run_id"]))
 
-    assert result["status"] == "run_acceptance_pending"
-    assert result["run_publication"]["phase"] == "stale"
-    assert "required_checks_evidence" not in result["run_publication"]
+    if drift_kind == "head":
+        assert result["status"] == "waiting_external"
+        assert result["diagnostics"][0]["code"] == "github_pr_head_observation_pending"
+    else:
+        assert result["status"] == "run_acceptance_pending"
+        assert result["run_publication"]["phase"] == "stale"
+        assert "required_checks_evidence" not in result["run_publication"]
     assert "repair_request" not in result["run_acceptance"]
     assert "repair_job" not in result["run_acceptance"]
     assert (
@@ -599,134 +605,34 @@ def test_final_mergeability_hint_with_clean_local_merge_starts_fresh_acceptance(
     assert "repair_request" not in refreshed["run_acceptance"]
     assert "repair_job" not in refreshed["run_acceptance"]
 
-def test_final_merge_preview_git_failure_does_not_start_integration_repair(
-    git_repo: Path,
-) -> None:
+def test_final_integration_git_failure_does_not_start_repair(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     publisher.data["delivery"]["mergeable"] = False
-    published = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(), github=publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    engine.publish(str(state["run_id"]))
+    pending = engine.approve(str(state["run_id"]))
+    assert pending["status"] == "run_acceptance_pending"
 
-    class FailingPreviewGit(GitRepository):
-        def prepare_expected_merge_checkout(
-            self,
-            *,
-            default_head_sha: str,
-            run_head_sha: str,
-            checkout: Path,
-        ) -> None:
-            del default_head_sha, run_head_sha, checkout
+    class FailingIntegrationGit(GitRepository):
+        def prepare_run_repair_checkout(self, *, branch: str, checkout: Path) -> None:
             raise GitError("worktree creation failed")
 
-    with pytest.raises(GitError, match="worktree creation failed"):
-        RunPublicationEngine(
-            git=FailingPreviewGit(git_repo),
-            states=states,
-            agents=RunPublicationAgents(),
-            github=publisher,
-            default_branch="main",
-            default_head_sha=git.resolve("main"),
-        ).approve(str(state["run_id"]))
-
-    preserved = states.load_run(str(state["run_id"]))
-    assert preserved is not None
-    assert preserved["status"] == published["status"]
-    assert "repair_request" not in preserved["run_acceptance"]
-    assert "repair_job" not in preserved["run_acceptance"]
-
-def test_final_real_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
-    accepted, states, git, publisher = _accepted_run(git_repo)
-    run_worktree = git_repo.parent / "conflicting-run"
-    subprocess.run(
-        ["git", "worktree", "add", str(run_worktree), str(accepted["run_branch"])],
-        cwd=git_repo,
-        check=True,
-        capture_output=True,
-    )
-    try:
-        (run_worktree / "shared.txt").write_text("run side\n", encoding="utf-8")
-        subprocess.run(["git", "add", "shared.txt"], cwd=run_worktree, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", "add run-side content"],
-            cwd=run_worktree,
-            check=True,
-            capture_output=True,
-        )
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(run_worktree)],
-            cwd=git_repo,
-            check=True,
-            capture_output=True,
-        )
-    _sync_completed_ticket_integrated_sha(
-        accepted, git, git.resolve(str(accepted["run_branch"]))
-    )
-    publisher.sync_run_branch(
-        run_branch=str(accepted["run_branch"]),
-        integrated_sha=git.resolve(str(accepted["run_branch"])),
-    )
-    states.save_run(str(accepted["run_id"]), accepted)
-
-    class ConflictRunReviewer:
-        def review(self, request: dict[str, Any]) -> ReviewResult:
-            del request
-            return ReviewResult("conflict-run-reviewer", _passing_artifact())
-
-    reviewer = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=ConflictRunReviewer(),
-        github=publisher,
+    result = RunAcceptanceEngine(
+        git=FailingIntegrationGit(git_repo), states=states,
+        agents=RunPublicationAgents(), github=publisher,
         default_head_sha=git.resolve("main"),
-    )
-    refreshed = reviewer.accept(str(accepted["run_id"]))
-    if refreshed["run_acceptance"]["phase"] != "accepted":
-        refreshed = reviewer.accept(str(accepted["run_id"]))
-    assert refreshed["run_acceptance"]["phase"] == "accepted"
-    accepted = refreshed
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-    engine.publish(str(accepted["run_id"]))
-    conflict_path = "shared.txt"
-    target = git_repo / conflict_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("default side\n", encoding="utf-8")
-    subprocess.run(["git", "add", conflict_path], cwd=git_repo, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "add conflicting default content"],
-        cwd=git_repo,
-        check=True,
-        capture_output=True,
-    )
-    publisher.data["default_head_sha"] = git.resolve("main")
-    publisher._save()
+    ).accept(str(state["run_id"]))
+    assert result["status"] == "ready_for_human"
+    assert result["diagnostics"][0]["code"] == "run_integration_failed"
+    assert "worktree creation failed" in result["diagnostics"][0]["message"]
+    assert "repair_job" not in result["run_acceptance"]
+    assert result["run_acceptance"]["review_budget"] == state["run_acceptance"]["review_budget"]
 
-    conflicted = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).approve(str(accepted["run_id"]))
-
-    assert conflicted["status"] == "run_acceptance_pending"
-    request = conflicted["run_acceptance"]["repair_request"]
-    assert request["repair_source"] == "merge_conflict"
-    assert conflict_path in request["merge_conflict_evidence"]
+# Real conflicts now use the ordinary integration conflict path, including
+# Stop/Resume and its independent budget, in test_run_approval_update.py.
 
 def test_approve_recovers_a_merge_that_succeeded_before_state_save(
     git_repo: Path,

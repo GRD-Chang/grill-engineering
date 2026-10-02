@@ -246,16 +246,23 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
     )
     repaired = control.load(task)
     assert repaired is not None
-    assert (
-        len(
-            [
-                entry
-                for entry in repaired["action_history"]
-                if entry["action"]["action_id"] == receipt["action_id"]
-            ]
-        )
-        == 1
+    predecessors = [
+        entry for entry in repaired["action_history"]
+        if entry["action"]["action_id"] == receipt["action_id"]
+    ]
+    assert len(predecessors) == 1
+    predecessor = predecessors[0]
+    assert predecessor["action"]["status"] == (
+        "failed" if command == "requeue" else "completed"
     )
+    for field in ("action_id", "kind", "payload_digest", "run_id", "executor_generation"):
+        assert predecessor["action"][field] == receipt[field]
+    assert predecessor["executor"]["status"] == "exited"
+    assert predecessor["executor"]["runner_binding"] == "0" * 16
+    if command == "requeue":
+        assert predecessor["action"]["kind"] == "approve"
+        assert predecessor["action"]["result_status"] == "requeue_required"
+        assert predecessor["action"]["failure"]
     # A repeat after successor application only returns its receipt when the
     # resulting state no longer grants this same command a new intent.
     if command != "revise":

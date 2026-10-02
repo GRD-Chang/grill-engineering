@@ -116,6 +116,8 @@ class RunPublicationFlow(RunPublicationShared):
                     "semantic_attempt_history",
                     "publication_operation_retry",
                     "last_publication_error",
+                    "approval_update",
+                    "published_head_sha",
                 )
                 if key in publication
             }
@@ -725,7 +727,9 @@ class RunPublicationFlow(RunPublicationShared):
                 }],
             })
             return self._save(state)
-        if source not in {published, run_head}:
+        integration = run.get("run_integration")
+        reviewed_source = integration.get("source_sha") if isinstance(integration, dict) else None
+        if source not in {published, run_head, reviewed_source}:
             return self._invalidate_for_fresh_acceptance(state)
         return None
 

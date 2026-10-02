@@ -12,7 +12,11 @@ status: accepted
 
 Publisher 保留已发布源分支的祖先关系，以准确远端 head 为 lease 追加提交并更新原 PR。新的组合、CI head 或批准依据失效时回到相应审核或暂停边界；最终批准仍绑定当前交付对象。新增持久状态使用新的 Delivery Policy 协议号，旧 Run 在外部写入前明确拒绝，不做自动迁移。
 
-Parent-only 的公开批准发现上述追加时，按 [ADR 0012](0012-noncancellable-final-approval.md) 结束旧批准段，自动进入可停止更新。Run Driver 的 `RunOutcome.next_step` 在每次事实刷新后重新选择交付、验收或发布；不继续刷新前已失效的操作。Change Delivery 在丢失原批准时先返回生命周期收口，接着由同一 Executor 复用普通循环。Parent-only 不因这次衔接获得 Ticket fallback 权限，需求、集成、CI 与 resync 预算保持独立。
+两种 Parent 的公开批准发现上述追加时，按 [ADR 0012](0012-noncancellable-final-approval.md) 结束旧批准段，自动进入可停止更新。Run Driver 的 `RunOutcome.next_step` 在每次事实刷新后重新选择交付、验收或发布；不继续刷新前已失效的操作。Change Delivery 与 Final Run Publication 在丢失原批准时先返回生命周期收口，接着由同一 Executor 复用普通循环。完整 Parent 保留 review-first：已完成 Ticket 不重做，新组合先做完整 Run Acceptance；Run Repair Candidate 仅在准确 tree/base/需求等匹配时提升，仍有效的候选不重复审核。两种 Parent 都不因这次衔接获得 Ticket fallback 或首轮 CI 窄授权，需求、集成、CI 与 resync 预算保持独立。
+
+Final Run 批准意图先绑定已验收版本，刷新后由 Publication 核对当前完整 PR 身份及准确 source/target。PR 与 ref 的非原子回读不一致时有界等待；只有追加关系已证实时记录更新、撤销旧 grant 并转交普通 Run Integration，不再通过批准专用 merge preview 排入另一条冲突修复路线。已完成的历史 Invocation 不承担新版本 currentness；待收口的 Reviewer 结果恢复时仍保留 reviewing 与原 Semantic Attempt，先核对并收口已返回结果。正式发布保留最近已发布 head，并允许已被当前验收覆盖的 source 追加；不因自身更新反复失效、重复审查。已有 merge intent 时，若目标分支已包含批准 Run 而 PR 仍回读为 OPEN，保留原 grant 与 intent 并有界等待；即使目标随后再次追加，也只核对原合并并补收尾。合并前最后回读才出现 MERGED 时同样保留对账事实。
+
+最终 PR 批准复查发现可修复 CI 失败时同样结束旧批准段，继续可停止的既有 Run Repair；额度耗尽则按共同人工待办暂停。最终 PR 与内部 Repair PR 共享 Run CI 额度。
 
 Parent-only 的 PR 快照与分支头读取并非原子操作。PR 仓库、分支或状态失配仍按原门禁处理；仅 head/base SHA 尚未一致时，复用有界 GitHub 收敛监督重读完整发布门禁，不能继续使用旧 PR 快照。读取一致后再检查祖先关系及更新授权；读间重试不消耗 resync，持续不一致按既有监督超时暂停，允许显式 resume 后重新核对。
 

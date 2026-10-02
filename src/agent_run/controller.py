@@ -564,6 +564,7 @@ class Controller:
         if (
             isinstance(invocation, dict)
             and invocation.get("role") in {"reviewer", "final_publication"}
+            and invocation_attempt_is_pending(state, invocation)
             and not self._run_invocation_boundary_is_current(state, invocation)
         ):
             _invalidate_stale_run_invocation(state, invocation)
@@ -1316,6 +1317,9 @@ class Controller:
         if state.get("status") in {
             "unsupported_scope_change",
             "deterministic_contradiction",
+            "requeue_required",
+            "blocked",
+            "ready_for_human",
         }:
             return
         acceptance = state.get("run_acceptance")
@@ -1325,10 +1329,13 @@ class Controller:
         if (
             isinstance(publication, dict)
             and publication.get("phase") not in {"merged", "abandoned", "stale"}
-            and isinstance(publication.get("merge_intent"), dict)
+            and (
+                isinstance(publication.get("merge_intent"), dict)
+                or isinstance(publication.get("approval_grant"), dict)
+            )
         ):
-            # A merge may have succeeded before GitHub's response or readback
-            # converged. The approval path owns exact merge-intent recovery.
+            # Approval owns exact PR/ref reconciliation and the handoff to
+            # stoppable updating, including any unknown merge result.
             return
         record = acceptance.get("acceptance_record")
         if not isinstance(record, dict):
@@ -2455,7 +2462,7 @@ def _restore_current_invocation_thread(
         if isinstance(thread_id, str) and thread_id.strip():
             run["reviewer_resume_thread_id"] = thread_id
         run.pop("reviewer_new_thread", None)
-        run["phase"] = "pending"
+        run["phase"] = "reviewing" if "pending_review_result" in run else "pending"
         state.update(
             {
                 "status": "run_acceptance_pending",

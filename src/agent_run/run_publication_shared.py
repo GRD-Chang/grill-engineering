@@ -42,6 +42,7 @@ from agent_run.required_checks_observation import (
     failure_evidence_matches_observation,
     read_required_checks_observation,
 )
+from agent_run.run_publication_update import reconcile_publication_update, wait_for_merge_readback
 
 
 class RunPublicationShared:
@@ -99,7 +100,8 @@ class RunPublicationShared:
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
-        invalidate_run_acceptance(state)
+        if state["run_acceptance"].get("phase") != "pending":
+            invalidate_run_acceptance(state)
         state.update(
             {
                 "status": "run_acceptance_pending",
@@ -116,7 +118,6 @@ class RunPublicationShared:
         repair_source: str,
         human_feedback: str | None = None,
         ci_evidence: dict[str, Any] | None = None,
-        merge_conflict_evidence: str | None = None,
     ) -> dict[str, Any]:
         run = self._mapping(state, "run_acceptance")
         request: dict[str, Any] = {"repair_source": repair_source}
@@ -125,8 +126,6 @@ class RunPublicationShared:
             run["modification_attempts"] = 0
         if ci_evidence is not None:
             request["ci_evidence"] = ci_evidence
-        if merge_conflict_evidence is not None:
-            request["merge_conflict_evidence"] = merge_conflict_evidence
         run.update({"phase": "repairing", "repair_request": request})
         remove_repair_job(run)
         publication = state.get("run_publication")
@@ -198,6 +197,7 @@ class RunPublicationShared:
                 reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
                 run.update({"phase": "ready_for_human", "blocked_reason": reason})
                 publication["phase"] = "stale"
+                publication.pop("approval_grant", None)
                 state.update({
                     "status": "ready_for_human",
                     "terminal_kind": "waiting_human",
@@ -306,7 +306,15 @@ class RunPublicationShared:
 
         try:
             live = self.github.live_pull_request(pr_number)
+            if live.get("state") == "MERGED" and isinstance(publication.get("merge_intent"), dict):
+                wait_for_merge_readback(self, state, "Final Run merged during authority revalidation")
+                return False
+            if live.get("state") == "OPEN" and not reconcile_publication_update(self, state, live):
+                return False
         except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and error.code == "foreign_run_pr":
+                self._invalidate_for_fresh_acceptance(state)
+                return False
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(
                 error.code
             ):
@@ -365,6 +373,13 @@ class RunPublicationShared:
                 "change_pr_identity_mismatch",
                 "change_pr_head_drift",
             }:
+                # A head change during the snapshot read may be an admissible
+                # append. Reconcile PR/ref authority before retiring the grant
+                # so its durable update handoff survives the checks race.
+                if error.code == "change_pr_head_drift" and not self._revalidate_final_run_pr_before_merge(
+                    state, publication, pr_number, expected_head_sha,
+                ):
+                    return None
                 self._invalidate_for_fresh_acceptance(state)
                 return None
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(

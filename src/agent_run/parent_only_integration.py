@@ -16,6 +16,7 @@ from agent_run.change_delivery_threads import (
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.git import GitError
+from agent_run.final_approval_operation import record_approval_update
 from agent_run.github import GitHubReadError
 from agent_run.integration_resync_budget import ResyncBudgetExhausted
 from agent_run.parent_integration import (
@@ -108,13 +109,10 @@ def reconcile_parent_integration(
         return False
     grant = job.get("approval_grant")
     if isinstance(grant, dict):
-        job["approval_update"] = {
-            "granted_at": grant["granted_at"],
-            "previous_head_sha": job["publication_sha"],
-            "previous_base_sha": record["target_sha"],
-            "source_sha": source,
-            "target_sha": target,
-        }
+        record_approval_update(
+            job, previous_head=job["publication_sha"], previous_base=record["target_sha"],
+            source=source, target=target,
+        )
     job["phase"] = "accepted"
     for key in (
         "publication", "publication_sha", "publication_parent_sha",

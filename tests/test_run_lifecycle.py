@@ -1224,8 +1224,13 @@ def test_untrusted_control_receipt_retries_stay_fail_closed(
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
 @pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
 @pytest.mark.parametrize(
-    ("predecessor_kind", "predecessor_status"),
-    [("run", "supervision_timeout"), ("resume", "execution_failed")],
+    ("predecessor_kind", "predecessor_status", "final_approval"),
+    [
+        ("run", "supervision_timeout", False),
+        ("resume", "execution_failed", False),
+        ("approve", "execution_failed", True),
+        ("resume", "execution_failed", True),
+    ],
 )
 def test_resume_reconciles_a_receipt_before_admitting_its_successor(
     tmp_path: Path,
@@ -1233,11 +1238,16 @@ def test_resume_reconciles_a_receipt_before_admitting_its_successor(
     host_status: str,
     predecessor_kind: str,
     predecessor_status: str,
+    final_approval: bool,
 ) -> None:
     task = _task(tmp_path)
     control = TaskControlStore(tmp_path / "state")
     states = _InMemoryRunState()
     states.value["status"] = predecessor_status
+    if final_approval:
+        states.value["run_publication"] = {
+            "approval_grant": {"granted_at": "approved"},
+        }
     if predecessor_status == "supervision_timeout":
         states.value.update(
             {
@@ -1294,6 +1304,8 @@ def test_resume_reconciles_a_receipt_before_admitting_its_successor(
     def execute(_run_id: str) -> dict[str, object]:
         nonlocal business_calls
         business_calls += 1
+        if final_approval:
+            states.value["status"] = "completed"
         return dict(states.value)
 
     lifecycle = RunLifecycle(
@@ -1334,7 +1346,17 @@ def test_resume_reconciles_a_receipt_before_admitting_its_successor(
             if entry["action"]["action_id"] == original_action["action_id"]
         ]
         assert len(predecessors) == 1
-        assert predecessors[0]["receipt_only_reconciliation"] is True
+        predecessor = predecessors[0]
+        assert predecessor["receipt_only_reconciliation"] is True
+        assert predecessor["status"] == ("failed" if final_approval else "completed")
+        assert predecessor["result_status"] == predecessor_status
+        for field in ("action_id", "kind", "payload_digest", "executor_generation"):
+            assert predecessor[field] == original_action[field]
+        if final_approval:
+            assert predecessor["final_approval_operation"] is True
+            assert predecessor["failure"]
+        else:
+            assert predecessor["failure"] is None
         return
 
     for attempt in range(2):
