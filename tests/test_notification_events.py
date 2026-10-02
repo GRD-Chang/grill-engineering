@@ -7,7 +7,7 @@ from support.notification import state_with_round
 import pytest
 
 from agent_run.notification_cards import card
-from agent_run.notification_events import events, recovery_event
+from agent_run.notification_events import events, recovery_events
 
 
 def test_semantic_round_identity_survives_resumption_and_wording_changes() -> None:
@@ -56,7 +56,7 @@ def test_boundary_colors_and_recovery_use_current_state(status: str, color: str)
     state.update(status=status, human_blockers=[])
     event = events(state)[-1]
     assert event["current"] and event["color"] == color
-    summary = recovery_event(state, missed)
+    summary = recovery_events(state, missed)[-1]
     assert "旧凭据" not in summary["summary"]
     assert summary["color"] == color
 
@@ -256,9 +256,9 @@ def test_latest_recovery_keeps_mode_and_omits_resolved_todo() -> None:
     state.update(status='ready_for_human', human_blockers=['旧待办'])
     pending = [events(state)[-1]]
     state.update(status='run_review_pending', human_blockers=[])
-    assert recovery_event(state, pending) is None
+    assert recovery_events(state, pending) == []
     state['status'] = 'completed'
-    recovered = recovery_event(state, pending)
+    recovered = recovery_events(state, pending)[-1]
     assert recovered and recovered['title'] == '任务已完成'
     assert '恢复' not in str(card(recovered))
     assert '旧待办' not in str(card(recovered))
@@ -294,7 +294,7 @@ def test_ticket_total_omits_incomplete_unassociated_execution() -> None:
 @pytest.mark.parametrize("status", ["blocked", "unsupported_scope_change", "deterministic_contradiction", "requeue_required", "publication_pending", "abandonment_pending"])
 def test_concise_preserves_other_human_boundaries(status: str) -> None:
     state = state_with_round()
-    state.update(status=status, blocked_reason="需要核对外部分支", notifications={"mode": "concise"})
+    state.update(status=status, terminal_kind="waiting_human", blocked_reason="需要核对外部分支", notifications={"mode": "concise"})
     boundary = events(state)[-1]
     assert boundary["kind"] == "boundary"
     assert boundary["current"] is True
@@ -338,12 +338,13 @@ def test_ticket_todo_uses_current_object_even_with_older_pr(mode: str, status: s
     state = state_with_round()
     state.update(status=status, notifications={"mode": mode},
                  ticket_graph={"tickets": {"3": {"title": "子任务原始标题 2026-09-15"}}},
-                 active_ticket_job={"ticket_number": 3, "phase": "blocked", "human_blockers": ["当前子任务问题"]},
-                 ticket_jobs={"2": {"phase": "blocked", "human_blockers": ["旧任务问题"]}},
+                 active_ticket_job={"ticket_number": 3, "phase": "blocked", "blocked_reason": "agent_requires_human", "human_blockers": ["当前子任务问题"]},
+                 ticket_jobs={"2": {"phase": "blocked", "blocked_reason": "agent_requires_human", "human_blockers": ["旧任务问题"]}},
                  run_publication={"pr_number": 9, "phase": "completed"})
-    pending = next(event for event in events(state) if event.get("current"))
-    recovered = recovery_event(state, [pending])
-    assert recovered is not None
+    pending = next(event for event in events(state) if event.get("work_subject") == "ticket:3")
+    recovered_events = recovery_events(state, [pending])
+    assert any(event.get("work_subject") == "ticket:2" for event in recovered_events)
+    recovered = next(event for event in recovered_events if event.get("work_subject") == "ticket:3")
     for notification in (pending, recovered):
         assert notification["task_number"] == 3
         assert notification["task_title"] == "子任务原始标题 2026-09-15"
@@ -351,7 +352,7 @@ def test_ticket_todo_uses_current_object_even_with_older_pr(mode: str, status: s
         assert "当前子任务问题" in notification["summary"]
         assert "旧任务问题" not in notification["summary"]
     state["active_ticket_job"]["ticket_number"] = 4
-    changed = next(event for event in events(state) if event.get("current"))
+    changed = next(event for event in events(state) if event.get("work_subject") == "ticket:4")
     assert changed["id"] != pending["id"]
     assert changed["task_number"] == 4
     assert changed["task_title"] == ""
@@ -362,7 +363,7 @@ def test_overall_todo_does_not_borrow_completed_ticket_identity(mode: str) -> No
     state = state_with_round()
     state.update(status="ready_for_human", notifications={"mode": mode},
                  active_ticket_job={"ticket_number": 3, "phase": "completed"},
-                 run_acceptance={"phase": "blocked", "human_blockers": ["整体验收问题"]},
+                 run_acceptance={"phase": "blocked", "blocked_reason": "reviewer_requires_human", "human_blockers": ["整体验收问题"]},
                  run_publication={"pr_number": 9, "phase": "completed"})
     notification = next(event for event in events(state) if event.get("current"))
     assert notification["task_number"] == state["parent"]["number"]

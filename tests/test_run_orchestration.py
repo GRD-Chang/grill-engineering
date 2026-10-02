@@ -12,7 +12,7 @@ from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.cli_presentation import _operator_action_view
+from agent_run.operator_action_presentation import operator_action_views
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_facts import multi_ticket_progress
@@ -160,7 +160,7 @@ def test_active_only_human_gate_projects_the_current_ticket() -> None:
     }
 
     assert operator_gate_subjects(state) == [("ticket:3", active)]
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
     assert action is not None
     assert action["type"] == "Human Blocker"
     assert action["object"] == "Ticket #3"
@@ -168,7 +168,7 @@ def test_active_only_human_gate_projects_the_current_ticket() -> None:
     assert action["reasons"] == ["Maintainer input is required."]
 
 
-def test_abandonment_pending_overrides_a_local_human_blocker_action() -> None:
+def test_abandonment_pending_preserves_the_run_recovery_action() -> None:
     active = {
         "ticket_number": 3,
         "phase": "blocked",
@@ -184,12 +184,12 @@ def test_abandonment_pending_overrides_a_local_human_blocker_action() -> None:
         "repository": "example/project",
     }
 
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
 
     assert action is not None
     assert action["type"] == "Abandonment Recovery"
-    assert action["object"] == "Ticket #3"
-    assert action["phase"] == "blocked"
+    assert action["object"] == "Delivery Run（Parent Issue #1）"
+    assert action["phase"] == "abandonment_pending"
     assert action["reasons"] == ["Run abandonment recovery is incomplete."]
     assert action["next_action"] == "agent-run abandon run-1"
 
@@ -207,7 +207,7 @@ def test_run_repair_supersedes_a_retained_publication_approval_phase() -> None:
     assert operator_gate_subjects(state) == []
     assert not has_run_operator_gate(state)
     assert not DirectRunOperations._cannot_advance(state)
-    assert _operator_action_view(state) is None
+    assert operator_action_views(state) == []
 
 
 def test_ordinary_run_cannot_advance_an_operator_stopped_boundary() -> None:
@@ -568,7 +568,7 @@ def test_diagnostic_gate_evidence_projects_execution_failure_subject() -> None:
     }
 
     assert operator_gate_subject_count(state) == 1
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
     assert action is not None
     assert action["type"] == "Execution Failure"
     assert action["object"] == "Ticket #3"
@@ -976,7 +976,7 @@ def test_diagnostic_gate_evidence_projects_each_change_job_subject(
     else:
         state["run_acceptance"] = {"phase": "repairing", "repair_job": job}
 
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
 
     assert action is not None
     assert action["type"] == "Deterministic Contradiction"
@@ -1070,7 +1070,7 @@ def test_deterministic_contradiction_keeps_the_triggering_work_subject() -> None
         ],
     }
 
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
 
     assert action is not None
     assert action["type"] == "Deterministic Contradiction"
@@ -1104,7 +1104,7 @@ def test_historical_mechanical_revision_does_not_hide_current_execution_gate() -
     }
 
     assert has_run_operator_gate(state)
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
     assert action is not None
     assert action["type"] == "Execution Failure"
     assert action["object"] == "Ticket #3"
@@ -1125,7 +1125,7 @@ def test_mechanical_revision_becomes_global_gate_at_requeue_boundary() -> None:
 
     assert has_run_operator_gate(state)
     assert operator_gate_subject_count(state) == 1
-    action = _operator_action_view(state)
+    action = operator_action_views(state)[0]
     assert action is not None
     assert action["type"] == "Requeue Required"
     assert action["object"] == "Ticket #2"
@@ -1738,7 +1738,7 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
         assert json_view["operator_action"]["object"] == "Ticket #2"
         assert json_view["operator_action"]["phase"] == "candidate"
         assert json_view["operator_action"]["next_action"] == (
-            "agent-run resume 1 --repo example/project"
+            "agent-run resume 1 --repo example/project --ticket 2"
         )
         assert json_view["next_action"] == json_view["operator_action"][
             "next_action"
@@ -1873,7 +1873,10 @@ def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None
         "2": "blocked", "3": "blocked"
     }
     view = stdout_json(invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json"))
-    assert view["operator_action"]["next_action"].endswith("--ticket <ticket-number>")
+    assert {action["next_action"] for action in view["operator_actions"]} == {
+        "agent-run resume 1 --repo example/project --ticket 2",
+        "agent-run resume 1 --repo example/project --ticket 3",
+    }
     assert {
         item["ticket_number"]: item["recovery_action"]
         for item in view["progress"]["multi_ticket"]["tickets"]

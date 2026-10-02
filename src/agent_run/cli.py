@@ -498,6 +498,7 @@ def _main_with_parser_resources(
                 resume_feedback = ResumeFeedback(
                     states.root, selected_resume,
                     lambda: states.load_current_run(parsed.run_id),
+                    ticket_number=parsed.ticket,
                 )
                 resources.callback(resume_feedback.close)
             selected_parent = selected_resume.get("parent")

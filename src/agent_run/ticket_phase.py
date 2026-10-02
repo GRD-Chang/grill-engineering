@@ -26,6 +26,7 @@ BLOCKED_MESSAGES = {
         "Merged Ticket PR was integrated, but no longer matches "
         "the current revision"
     ),
+    "agent_requires_human": "Ticket requires explicit human intervention",
     "reviewer_requires_human": "Ticket requires explicit human intervention",
     "modification_budget_exhausted": (
         "Ticket requires explicit human intervention"
@@ -33,6 +34,8 @@ BLOCKED_MESSAGES = {
     "review_budget_exhausted": (
         "Ticket Review budget requires an explicit new window"
     ),
+    "ci_inner_budget_exhausted": "Ticket CI repair allowance requires explicit resume",
+    "ci_outer_budget_exhausted": "Ticket CI recovery allowance requires explicit resume",
     "ticket_close_external_conflict": (
         "Ticket close evidence conflicts with the Publisher intent"
     ),

@@ -8,14 +8,10 @@ from typing import Any
 from uuid import uuid4
 
 from agent_run.notifications import Notifications
+from agent_run.operator_action_facts import operator_action_facts
 
 _BASELINE_FIELDS = ("status", "diagnostics", "active_agent_invocation", "human_blockers",
-                    "parent_job", "ticket_jobs", "run_acceptance")
-
-_FAILURES = {"execution_failed", "supervision_timeout", "deterministic_contradiction"}
-_HUMAN = {"ready_for_human", "blocked", "requeue_required", "unsupported_scope_change",
-          "run_approval_pending", "parent_approval_pending", "publication_pending",
-          "progress_exhausted", "abandonment_pending"}
+                    "parent_job", "ticket_jobs", "run_acceptance", "run_publication")
 
 
 class ResumeFeedback:
@@ -27,7 +23,7 @@ class ResumeFeedback:
     """
 
     def __init__(self, root: Path, state: dict[str, Any],
-                 load: Callable[[], dict[str, Any] | None]) -> None:
+                 load: Callable[[], dict[str, Any] | None], *, ticket_number: int | None = None) -> None:
         self.root = root
         self.state = state
         self.baseline = deepcopy({key: state.get(key) for key in _BASELINE_FIELDS})
@@ -37,6 +33,7 @@ class ResumeFeedback:
         self.sender: Notifications | None = None
         self.executor_owned = False
         self.suppressed = False
+        self.work_subject = f"ticket:{ticket_number}" if ticket_number is not None else None
 
     def attach(self, sender: Notifications, action_id: str | None) -> None:
         self.sender = sender
@@ -48,7 +45,7 @@ class ResumeFeedback:
         if not reason and self.result is not None and self.result.get("outcome") == outcome:
             reason = str(self.result.get("reason") or "")
         self.result = {"id": self.identity, "outcome": outcome,
-                       "evidence": evidence, "reason": reason}
+                       "evidence": evidence, "reason": reason, "work_subject": self.work_subject}
 
     def failure(self, reason: str, *, evidence: str = "preflight") -> None:
         self._result("failed", evidence, reason)
@@ -58,16 +55,25 @@ class ResumeFeedback:
 
     def observe(self, state: dict[str, Any], *, outcome_observed: bool = False) -> None:
         self.state = state
-        status = state.get("status")
         fresh = outcome_observed or any(state.get(key) != self.baseline.get(key) for key in _BASELINE_FIELDS)
-        if fresh and status in _FAILURES:
-            self._result("failed", "execution")
-        elif fresh and status in _HUMAN:
-            self._result("human_action", "controller_boundary")
+        gates = operator_action_facts(state)
+        gate = next((item for item in gates if item["work_subject"] == self.work_subject), None) if self.work_subject else (
+            next((item for item in gates if item["scope"] == "global"), None)
+        )
+        if gate is None and self.work_subject is None and len(gates) == 1 and state.get("status") not in {
+            "active", "ticket_delivery_pending", "waiting_checks", "waiting_external",
+        }:
+            gate = gates[0]
+        if fresh and gate is not None and gate["action_kind"] != "operator_stopped":
+            failed = gate["action_kind"] in {"execution_failure", "supervision_timeout", "deterministic_contradiction"}
+            self._result("failed" if failed else "human_action", "execution" if failed else "controller_boundary")
+            assert self.result is not None
+            self.result["work_subject"] = gate["work_subject"]
         invocation = state.get("active_agent_invocation")
         previous = self.baseline.get("active_agent_invocation") or {}
         if (self.result is None and isinstance(invocation, dict)
                 and invocation.get("reported_thread_id")
+                and (self.work_subject is None or invocation.get("work_subject") == self.work_subject)
                 and invocation.get("status") == "running"
                 and invocation.get("started_at") != previous.get("started_at")):
             self._result("started", "worker_started")

@@ -5,11 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending, has_final_approval
-from agent_run.delivery_facts import current_work_subject, ticket_phase_execution_activity
+from agent_run.delivery_facts import ticket_phase_execution_activity
 from agent_run.execution_timing import invocation_activity
 from agent_run.messages import text
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
-from agent_run.state_contract import human_blocker_subject_count
 
 
 @dataclass(frozen=True)
@@ -42,17 +41,19 @@ def render_next_action(
     parent = state.get("parent")
     number = parent.get("number", "?") if isinstance(parent, dict) else "?"
     key = f"guidance.action.{action.kind}"
-    if human and action.kind in {"stale_checkout", "scope_change", "contradiction", "publication_retry"}:
+    if human and action.kind in {"stale_checkout", "scope_change", "contradiction", "publication_retry", "external_contradiction"}:
         key += ".human"
     return text(
         key, language=language,
-        run=action_command(state, "run", number, human=human),
+        run=action_command(state, "run", number, human=human or action.kind == "external_contradiction"),
         abandon=action_command(state, "abandon", None, human=human),
         discard=action_command(state, "abandon", state.get("run_id"), human=human) + " --discard-worktree",
     )
 
 
 def next_action_fact(state: dict[str, Any]) -> NextAction:
+    from agent_run.operator_action_facts import operator_action_facts
+
     status = str(state.get("status"))
     run_id = state.get("run_id")
     parent = state.get("parent")
@@ -79,20 +80,9 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
         "waiting_external", "parent_closeout_pending", "execution_failed", "supervision_timeout",
     }:
         return NextAction("command", "resume", run_id)
-    if status in {"run_approval_pending", "parent_approval_pending"} and isinstance(
-        run_id, str
-    ):
-        return NextAction("command", "approve", run_id)
-    if status == "unsupported_scope_change":
-        return NextAction("scope_change")
-    if status == "deterministic_contradiction":
-        return NextAction("contradiction")
-    if status == "abandonment_pending" and isinstance(run_id, str):
-        return NextAction("command", "abandon", run_id)
-    if status == "operator_stopped" and isinstance(run_id, str):
-        return NextAction("command", "resume", run_id)
-    if status == "requeue_required" and isinstance(run_id, str):
-        return NextAction("command", "requeue", run_id)
+    actions = operator_action_facts(state)
+    if actions:
+        return actions[0]["action"] if len(actions) == 1 else NextAction("human_items")
     if invocation_is_explicitly_resumable(state) and isinstance(run_id, str):
         return NextAction("command", "resume", run_id)
     if (
@@ -102,18 +92,6 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
         return NextAction("command", "run", parent_number)
     if status == "waiting_external":
         return NextAction("command", "run", parent_number)
-    if status == "supervision_timeout" and isinstance(run_id, str):
-        return NextAction("command", "resume", run_id)
-    current = current_work_subject(state)
-    pauses = [
-        job for job in state.get("ticket_jobs", {}).values()
-        if isinstance(job, dict) and job.get("blocked_reason") in {
-            "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
-        }
-    ]
-    pause = current[1] if current and current[1] in pauses else pauses[0] if len(pauses) == 1 else None
-    if status in {"blocked", "progress_exhausted"} and pause is not None and isinstance(run_id, str):
-        return NextAction("command", "resume", run_id, int(pause["ticket_number"]))
     execution_audit = {"executor_control": state.get("_executor_control")}
     if (
         isinstance(run_id, str)
@@ -123,25 +101,6 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
         ) == "interrupted"
     ):
         return NextAction("command", "resume", run_id)
-    if (
-        status in {"blocked", "ready_for_human"}
-        and isinstance(run_id, str)
-        and current is not None
-        and current[1].get("blocked_reason") in {
-            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
-        }
-    ):
-        return NextAction("command", "resume", run_id)
-    if (
-        status in {"ready_for_human", "progress_exhausted"}
-        and human_blocker_subject_count(state) == 1
-        and isinstance(run_id, str)
-    ):
-        return NextAction("command", "resume", run_id)
-    if status in {"ready_for_human", "progress_exhausted", "blocked"}:
-        return NextAction("human_items")
-    if status == "publication_pending":
-        return NextAction("publication_retry")
     if status in {
         "active",
         "starting",

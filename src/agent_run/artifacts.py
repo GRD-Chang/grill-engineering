@@ -267,6 +267,22 @@ def clear_current_human_blocker(subject: dict[str, Any]) -> None:
         subject.pop("blocked_reason", None)
 
 
+def record_human_blocker(
+    state: dict[str, Any], subject: dict[str, Any], *, resume_phase: str,
+    blocked_phase: str, blockers: tuple[str, ...], code: str,
+) -> None:
+    """Record the raw response and its existing resumable human boundary."""
+    append_human_blocker_history(subject, phase=resume_phase, blockers=blockers)
+    subject.update({
+        "human_blockers": list(blockers), "human_blocker_phase": resume_phase,
+        "phase": blocked_phase, "blocked_reason": code,
+    })
+    state.update({
+        "status": "ready_for_human", "terminal_kind": "waiting_human",
+        "diagnostics": [{"code": code, "message": blocker} for blocker in blockers],
+    })
+
+
 def _mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict) or not all(
         isinstance(key, str) for key in value

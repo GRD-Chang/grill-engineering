@@ -8,12 +8,14 @@ from typing import Any
 
 from agent_run.artifacts import (
     AcceptanceArtifact,
-    append_human_blocker_history,
-    clear_current_human_blocker,
+    record_human_blocker,
 )
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.development_review import after_review, ReviewDecision
-from agent_run.review_attempt import begin_review, review_ordinal, remember_review, consume_review_result
+from agent_run.review_attempt import (
+    begin_review, consume_review_result, finish_review_result, remember_review,
+    review_ordinal,
+)
 from agent_run.ci_recovery_budget import (
     ci_limits_for_job,
     ci_reviewer_budget_context,
@@ -23,10 +25,7 @@ from agent_run.change_delivery_threads import record_reviewer as _record_reviewe
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import reviewer_budget_context
-from agent_run.semantic_attempt import (
-    close_semantic_attempt,
-    pending_semantic_attempt,
-)
+from agent_run.semantic_attempt import pending_semantic_attempt
 from agent_run.ticket_integration import delivery_base_sha
 
 
@@ -142,6 +141,8 @@ def complete_review(
     if not isinstance(reviewer_thread_id, str) or not reviewer_thread_id.strip():
         raise ValueError("pending review result is missing its Reviewer Thread")
     artifact = AcceptanceArtifact.parse(pending.get("artifact"))
+    if pending_semantic_attempt(job, role="reviewer") is None:
+        raise ValueError("Reviewer closeout is missing its Semantic Attempt")
     stage._reject_stale(
         state,
         job,
@@ -217,31 +218,11 @@ def complete_review(
         job.pop("ci_repair_publication_receipt", None)
     if not artifact.is_accepted:
         job["repair_source"] = "acceptance"
-    job.pop("pending_review_result", None)
     # A first rejection has no PR to expose.  For a repair after a PR
     # already exists, update that PR's one status comment immediately so
     # it cannot keep advertising an obsolete passing Candidate.
     existing_pr = job.get("pr_number")
-    if artifact.requires_human:
-        stage._wait_for_human(
-            state,
-            job,
-            phase="candidate",
-            blockers=artifact.blocker_evidence,
-            code="reviewer_requires_human",
-        )
-        return
-    semantic_attempt = pending_semantic_attempt(job, role="reviewer")
-    if semantic_attempt is None:
-        raise ValueError("Reviewer closeout is missing its Semantic Attempt")
-    close_semantic_attempt(
-        job,
-        semantic_attempt,
-        outcome="acceptance_artifact",
-        result={"history_facts": review_facts},
-    )
-    clear_current_human_blocker(job)
-    if isinstance(existing_pr, int):
+    if not artifact.requires_human and isinstance(existing_pr, int):
         stage._record_agent_run_status(
             existing_pr,
             job,
@@ -249,13 +230,16 @@ def complete_review(
             next_action=(
                 "repair Fresh Validation findings"
                 if artifact.has_failures
-                else (
-                    "await human decision"
-                    if artifact.requires_human
-                    else "generate publication narrative"
-                )
+                else "generate publication narrative"
             ),
         )
+    finish_review_result(
+        state, job, artifact, resume_phase="candidate", blocked_phase="blocked",
+        history_facts=review_facts,
+    )
+    if artifact.requires_human:
+        stage.save(state)
+        return
     decision = after_review(job, stage.review_budget_policy(), artifact)
     if decision == ReviewDecision.ACCEPT:
         job["phase"] = "accepted"
@@ -282,26 +266,8 @@ def wait_for_human(
     blockers: tuple[str, ...],
     code: str = "agent_requires_human",
 ) -> None:
-    append_human_blocker_history(job, phase=phase, blockers=blockers)
-    job.update(
-        {
-            "human_blockers": list(blockers),
-            "human_blocker_phase": phase,
-            "phase": "blocked",
-            "blocked_reason": code,
-        }
-    )
-    state.update(
-        {
-            "status": "ready_for_human",
-            "terminal_kind": "waiting_human",
-            "diagnostics": [
-                {
-                    "code": code,
-                    "message": blocker,
-                }
-                for blocker in blockers
-            ],
-        }
+    record_human_blocker(
+        state, job, resume_phase=phase, blocked_phase="blocked", blockers=blockers,
+        code=code,
     )
     stage.save(state)

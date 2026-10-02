@@ -28,6 +28,7 @@ from agent_run.final_approval_operation import (
 )
 from agent_run.operator_action_presentation import (
     human_action_type,
+    operator_action_items,
     human_preserved_results,
 )
 from agent_run.presentation_helpers import (
@@ -266,9 +267,10 @@ def print_status_progress(
         _print_scope_change(audit.get("scope_change"))
         print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(wait_view.guidance)}")
-        action = audit.get("operator_action")
-        if isinstance(action, dict):
-            print_operator_action(action)
+        actions = operator_action_items(audit)
+        if actions:
+            for action in actions:
+                print_operator_action(action)
         elif wait_view.show_command:
             print(f"  {_terminal_safe(view['next_action'])}")
         _print_findings(view["findings"])
@@ -310,7 +312,7 @@ def print_status_progress(
         for detail in agent["recovery_details"]:
             print(f"  {_terminal_safe(detail)}")
 
-    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
         print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(execution_guidance(state, activity))}")
         _print_findings(view["findings"])
@@ -344,10 +346,8 @@ def print_status_progress(
 
     _print_scope_change(audit.get("scope_change"))
     print()
-    if operator_action.get("type") == "Final Approval":
-        print(display_text('presentation.status.next_step_v1_36', v1=_terminal_safe(view['next_action'])))
-    else:
-        print_operator_action(operator_action)
+    for action in operator_action_items(audit):
+        print_operator_action(action)
     _print_findings(view["findings"])
 
 
@@ -509,7 +509,7 @@ def print_rich_status_progress(
             unknown_execution_guidance(state, include_command=False)
             if unknown_wait else wait_view.guidance
         ))
-    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
         action_lines.append(
             _rich_value(
                 execution_guidance(
@@ -517,37 +517,41 @@ def print_rich_status_progress(
                 )
             )
         )
-    elif isinstance(action, dict) and action.get("type") == "Final Approval":
-        action_lines.append(Text(display_text('presentation.status.inspect_the_pr_acceptance_and_pre_merge_checks_then_run_the_appro')))
     elif isinstance(action, dict):
-        action_lines.append(
-            _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
-        )
-        for reason in action.get("reasons", []):
-            message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
-            action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
-        action_lines.append(
-            _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
-        )
-        action_lines.append(
-            _rich_labeled(
-                display_text('presentation.status.blocked_phase'),
-                _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
+        for action in operator_action_items(audit):
+            action_lines.append(_rich_value(display_text("presentation.status.object_v1", v1=human_delivery_object(action.get("object")))))
+            action_lines.append(
+                _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
             )
-        )
-        triggering = action.get("trigger_invocation")
-        if isinstance(triggering, dict):
+            for reason in action.get("reasons", []):
+                message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
+                action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
+            action_lines.append(
+                _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
+            )
             action_lines.append(
                 _rich_labeled(
-                    display_text('presentation.status.agent_that_triggered_the_blocker'),
-                    (
-                        display_text('presentation.status.v0_model_v2_reasoning_effort_v4_round_duration_v6_seconds', v0=_rich_role_label(triggering.get('role')), v2=triggering.get('model'), v4=triggering.get('reasoning_effort'), v6=triggering.get('duration_seconds'))
-                    ),
+                    display_text('presentation.status.blocked_phase'),
+                    _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
                 )
             )
-        action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
-        if action.get("type") == "Review Budget Checkpoint":
-            action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
+            triggering = action.get("trigger_invocation")
+            if isinstance(triggering, dict):
+                action_lines.append(
+                    _rich_labeled(
+                        display_text('presentation.status.agent_that_triggered_the_blocker'),
+                        (
+                            display_text('presentation.status.v0_model_v2_reasoning_effort_v4_round_duration_v6_seconds', v0=_rich_role_label(triggering.get('role')), v2=triggering.get('model'), v4=triggering.get('reasoning_effort'), v6=triggering.get('duration_seconds'))
+                        ),
+                    )
+                )
+            if action.get("scope") == "global":
+                action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
+            else:
+                action_lines.append(Text(display_text('presentation.status.local_operator_gate')))
+            if action.get("type") == "Review Budget Checkpoint":
+                action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
+            action_lines.append(_rich_labeled(display_text('presentation.status.command'), action.get("next_action")))
     else:
         action_lines.append(
             _rich_value(automatic_work or _operator_instruction(state, audit.get("agent_invocation")))

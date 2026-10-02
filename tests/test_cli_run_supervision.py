@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,7 @@ from support.cli_supervision import (
     _run_until_pending_window,
 )
 from agent_run.executor_host import _process_start_token
+from agent_run.notification_events import events
 
 
 def _write_executor_record(repo: Path, pid: int, start_token: str) -> None:
@@ -565,18 +567,30 @@ def test_public_run_supervises_non_repairable_final_check_failure(
         for invocation in state["agent_invocation_history"]
     )
     assert state["run_publication"]["phase"] == "waiting_external"
-    status = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
-    )
-    assert status["supervision"]["kind"] == "github_convergence"
-    assert status["supervision"]["retry_count"] >= 2
-    status_view = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"])).stdout
-    assert "类型: 自动等待已超时" in status_view
-    assert "对象: 整体交付" in status_view
-    assert "阶段: 等待 GitHub 操作结果" in status_view
-    assert status["supervision"]["timeout_resume_action"] == (
-        f"agent-run resume {state['run_id']}"
-    )
+    run_id = str(state["run_id"])
+    for command in ("status", "history"):
+        output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
+        assert output["supervision"]["kind"] == "github_convergence"
+        assert output["supervision"]["retry_count"] >= 2
+        action, = output["operator_actions"]
+        assert output["operator_action"] == action
+        assert action["work_subject"] == f"run-publication:{run_id}"
+        assert action["generation"] == state["run_acceptance"]["acceptance_generation"] == 1
+        assert action["phase"] == "waiting_external"
+        assert action["action_kind"] == "supervision_timeout"
+        assert action["scope"] == "global"
+        assert action["run_paused"] is True
+        assert action["evidence"]["diagnostics"] == state["diagnostics"]
+        assert action["action"] == {"kind": "command", "command": "resume", "selector": run_id, "ticket_number": None}
+        assert f"PR #{state['run_publication']['pr_number']}" in action["preserved"]
+        assert output["supervision"]["timeout_resume_action"] == f"agent-run resume {run_id}"
+    view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
+    assert "类型: 自动等待已超时" in view
+    assert "对象: 整体交付" in view
+    assert "阶段: 等待 GitHub 操作结果" in view
+    boundary, = [event for event in events(state) if event["kind"] == "boundary"]
+    for field in ("work_subject", "generation", "action_kind", "scope", "reason", "evidence", "action"):
+        assert boundary[field] == action[field]
 
 def test_run_resumes_repair_promotion_after_merged_pr_readback_lags(
     git_repo: Path,

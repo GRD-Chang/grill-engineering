@@ -9,11 +9,7 @@ from agent_run.run_development_review import RunDevelopmentReview
 from agent_run.agent_invocation import (
     invocation_event_recorder,
 )
-from agent_run.artifacts import (
-    AcceptanceArtifact,
-    append_human_blocker_history,
-    clear_current_human_blocker,
-)
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import latest_reviewer_thread
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_policy import (
@@ -54,7 +50,10 @@ from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
-from agent_run.review_attempt import begin_review, review_ordinal, remember_review, consume_review_result
+from agent_run.review_attempt import (
+    begin_review, consume_review_result, finish_review_result, remember_review,
+    review_ordinal,
+)
 from agent_run.review_budget import (
     review_budget_owner,
     ReviewBudgetPolicy,
@@ -270,7 +269,10 @@ class RunAcceptanceEngine:
                 "ticket_graph_revision": request["ticket_graph"]["revision"],
                 "ticket_completion_records": request["ticket_completion_records"],
             })
-            run["pending_review_result"] = {"record": record}
+            run["pending_review_result"] = {
+                "record": record,
+                "human_blocker_resume": bool(run.get("prior_human_blockers")),
+            }
             # Persist the returned result together with its thread and budget.
             # A failed currentness read must not cause a second paid review.
             self._record_reviewer(state, run, review.thread_id)
@@ -329,46 +331,23 @@ class RunAcceptanceEngine:
                 "expected_merge_tree": expected_merge_tree,
             },
             "artifact": artifact.raw,
-        }, limit=budget_policy.review_limit)
+        }, limit=budget_policy.review_limit,
+            human_blocker_resume=pending.get("human_blocker_resume") is True)
         run.update({"reviewed_head_sha": run_head,
                     "acceptance_artifact": artifact.raw, "acceptance_record": record})
-        run.pop("pending_review_result", None)
+        if not artifact.requires_human:
+            self._record_final_pr_status(state, artifact.raw, run_head)
+        finish_review_result(
+            state, run, artifact, resume_phase="pending", blocked_phase="ready_for_human",
+        )
         decision = after_review(run, budget_policy, artifact)
         if artifact.is_accepted:
-            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
-            clear_current_human_blocker(run)
             run["phase"] = "accepted"
-        elif artifact.requires_human:
-            append_human_blocker_history(
-                run, phase="pending", blockers=artifact.blocker_evidence
-            )
-            run.update(
-                {
-                    "phase": "ready_for_human",
-                    "blocked_reason": "reviewer_requires_human",
-                    "human_blockers": list(artifact.blocker_evidence),
-                    "human_blocker_phase": "pending",
-                }
-            )
-            state.update(
-                {
-                    "status": "ready_for_human",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [
-                        {"code": "reviewer_requires_human", "message": blocker}
-                        for blocker in artifact.blocker_evidence
-                    ],
-                }
-            )
-        else:
-            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
-            clear_current_human_blocker(run)
+        elif not artifact.requires_human:
             if decision in {ReviewDecision.REVIEW_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
                 RunDevelopmentReview(self, state, run).checkpoint(decision.value)
             else:
                 run["phase"] = "repairing"
-        if not artifact.requires_human:
-            self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
         return True
 

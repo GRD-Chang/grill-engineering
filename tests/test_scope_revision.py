@@ -14,7 +14,7 @@ from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.graph import state_from_graph
-from agent_run.revisions import ticket_graph_revision
+from agent_run.revisions import effective_revision, ticket_graph_revision
 from agent_run.run_currentness import refresh_run_currentness
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
@@ -32,6 +32,36 @@ def _ticket(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
+
+
+@pytest.mark.parametrize("blocked_reason", [
+    "agent_requires_human", "reviewer_requires_human", "modification_budget_exhausted",
+    "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+    "ticket_execution_failed", "ticket_paused",
+])
+def test_graph_refresh_preserves_known_ticket_pauses_for_currentness_check(blocked_reason: str) -> None:
+    from dataclasses import replace
+
+    from agent_run.models import DeliveryGraph, Issue, ParentIssue
+
+    ticket = Issue(3, "Ticket", "Original requirements", "OPEN", frozenset({"ready-for-agent"}), ())
+    graph = DeliveryGraph(ParentIssue(1, "Parent", "Parent requirements", (3,), True), {3: ticket})
+    state = state_from_graph({"ticket_integration_holder": None, "ticket_integration_queue": []}, graph)
+    job = {"ticket_number": 3, "phase": "blocked", "blocked_reason": blocked_reason,
+           "effective_revision": effective_revision(
+               ticket_revision=state["ticket_graph"]["tickets"]["3"]["content_revision"],
+               parent_revision=state["parent"]["revision"], graph_revision=state["ticket_graph"]["revision"],
+           )}
+    state.update(ticket_jobs={"3": job}, active_ticket_job=job)
+    changed = replace(graph, issues={3: replace(ticket, body="Changed requirements")})
+
+    projected = state_from_graph(state, changed)
+
+    # Graph refresh must reach Controller currentness validation, which owns
+    # Requeue. A recognized old pause must not abort that refresh as unknown.
+    assert projected["active_ticket_job"]["source_revision_changed"] is True
+    assert projected["active_ticket_job"]["blocked_reason"] == blocked_reason
+    assert projected["diagnostics"][0]["code"] == blocked_reason
 
 
 @pytest.mark.parametrize(

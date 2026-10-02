@@ -692,6 +692,7 @@ _Avoid_: 仅成功时通知、隐藏人工待办
 
 **Operator Action View（操作者动作视图）**:
 Delivery Progress View 在 Run 需要维护者介入时采用的统一区块，固定说明准确类型、所在 Ticket/Parent Issue 或 Run 对象与阶段、原因、已保留成果、影响范围，以及唯一允许的下一步；Human Blocker 额外显示触发阻塞的 Agent 角色、模型、推理强度与本轮时长。Human Blocker、Review Budget Checkpoint、Execution Failure、Supervision Timeout Pause、Requeue Required 与最终批准继续保留各自真实语义，不因共享版式而被统称为 Human Blocker。
+全部 Ticket、Parent-only、Run Acceptance/Repair、Run Publication 和独立 Run 边界逐对象派生同一份只读事实，保留 Work Subject、适用 Generation、原因/原始证据、局部或全局范围及结构化动作。Status、History、操作指引和飞书共同消费；JSON 的 `operator_actions` 包含全部当前待办，单项 `operator_action` 仅为首项视图。非当前 Ticket 暂停不遮蔽其待办，也不阻止独立工作；全局与局部待办可以并存，各自恢复。正常等待与暂时失效的旧批准不成为人工待办。
 _Avoid_: 把所有暂停叫作 Human Blocker、只显示内部状态码、缺少恢复动作、把局部门禁说成整项 Run 暂停
 
 **Run-wide Operator Gate（运行级人工门禁）**:

@@ -9,26 +9,29 @@ from agent_run.notification_event_facts import event_copy, event_envelope, event
 
 from agent_run.execution_timing import execution_totals
 from agent_run.ticket_effort import ticket_effort
-from agent_run.final_approval_operation import final_approval_cleanup_pending
 from typing import Any
 
 from agent_run.attempt_projection import semantic_attempt_history
 from agent_run.history_facts import history_records
 from agent_run.delivery_facts import role_family
 from agent_run.delivery_facts import ticket_progress
-from agent_run.delivery_facts import current_work_subject
 from agent_run.messages import selected_language
 from agent_run.notification_milestones import milestones
-from agent_run.notification_presentation import status_term, pause_reason, next_action
+from agent_run.notification_presentation import status_term
+from agent_run.notification_boundaries import boundary_events
+from agent_run.operator_action_facts import operator_action_facts
 
 
-def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[str, Any]]:
+def _round_events(
+    state: dict[str, Any], record: dict[str, Any], actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     role = role_family(str(record.get("role")))
     if role is None or not record.get("attempt_id"):
         return []
     attempt = record.get("attempt") or {}
     facts = {"phase": event_copy(state, "role_" + role), "round": record.get("ordinal"),
-             "role": record.get("role"), "attempt_id": record["attempt_id"], **event_subject(state, record.get("work_subject"))}
+             "role": record.get("role"), "attempt_id": record["attempt_id"],
+             "work_subject": record.get("work_subject"), **event_subject(state, record.get("work_subject"))}
     result = []
     ticket = "task_number" in facts
     title = facts.get("task_title") or (f"#{facts['task_number']}" if ticket else event_copy(state, "parent"))
@@ -44,7 +47,10 @@ def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[st
     blocked_review = role == "review" and "blocked" in checks
     # A blocked review has a result even though its semantic round remains
     # pending for human recovery. Process exit alone still proves no result.
-    stopped = record["status_code"] == "execution_failed" and state.get("status") == "execution_failed"
+    subject_actions = [action for action in actions if action["work_subject"] == record.get("work_subject")]
+    stopped = record["status_code"] == "execution_failed" and any(
+        action["action_kind"] == "execution_failure" for action in subject_actions
+    )
     if not stopped and not blocked_review and (attempt.get("status") == "pending" or not attempt.get("outcome")):
         return result
     outcome = attempt.get("outcome")
@@ -58,7 +64,7 @@ def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[st
     if status_code == "execution_failed":
         color, next_step = "red", event_copy(state, "execution_next")
     elif status_code in {"review_failed", "review_blocked"}:
-        human = blocked_review or state.get("status") in {"ready_for_human", "progress_exhausted"}
+        human = blocked_review or bool(subject_actions)
         color = "yellow" if human else "orange"
         next_step = event_copy(state, "human_next") if human else event_copy(state, "repair_next")
     summary = record.get("development_summary")
@@ -117,9 +123,10 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     if (state.get("parent") or {}).get("number"):
         result.append(event_envelope(state, "run_start", state.get("run_id"), event_copy(state, "run_start"), started_at=state.get("created_at")))
     records = history_records(state, audit)
+    actions = operator_action_facts(state)
     for record in records:
         if not record.get("event_record"):
-            result.extend(_round_events(state, record))
+            result.extend(_round_events(state, record, actions))
         for point in record.get("turning_points", []):
             kind = point.get("kind")
             if kind == "pr_creation" and point.get("pr_number"):
@@ -178,73 +185,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
                             "green", summary=event_copy(state, "pr_summary"),
                             url=f"https://github.com/{state.get('repository')}/pull/{pr_number}"))
     status = str(state.get("status") or "")
-    boundary = {
-        "ready_for_human": (event_copy(state, "human_title"), "yellow"),
-        "blocked": (event_copy(state, "human_title"), "yellow"),
-        "unsupported_scope_change": (event_copy(state, "human_title"), "yellow"),
-        "deterministic_contradiction": (event_copy(state, "human_title"), "yellow"),
-        "requeue_required": (event_copy(state, "requeue"), "yellow"),
-        "publication_pending": (event_copy(state, "publication_pending"), "yellow"),
-        "abandonment_pending": (event_copy(state, "abandonment_pending"), "yellow"),
-        "run_approval_pending": (event_copy(state, "approval"), "yellow"),
-        "parent_approval_pending": (event_copy(state, "approval"), "yellow"),
-        "execution_failed": (event_copy(state, "execution_failed"), "red"),
-        "progress_exhausted": (event_copy(state, "budget"), "yellow"),
-        "supervision_timeout": (event_copy(state, "timeout"), "red"),
-        "operator_stopped": (event_copy(state, "stopped"), "yellow"),
-        "abandoned": (event_copy(state, "abandoned"), "yellow"),
-        "completed": (event_copy(state, "completed"), "green"),
-    }.get(status)
-    if boundary:
-        title, color = boundary
-        current = current_work_subject(state)
-        # Approval and lifecycle results describe the whole delivery. Other
-        # boundaries use the same current work object as Status, not history.
-        task_facts = event_subject(state, current[0]) if current and status not in {
-            "run_approval_pending", "parent_approval_pending", "completed",
-            "abandoned", "abandonment_pending", "operator_stopped",
-        } else {}
-        if not task_facts and pr_number and ("approval_pending" in status or status == "completed"):
-            task_facts["url"] = f"https://github.com/{state.get('repository')}/pull/{pr_number}"
-        blockers = list(state.get("human_blockers") or [])
-        for owner in [current[1]] if current else []:
-            if isinstance(owner, dict) and owner.get("phase") in {"ready_for_human", "blocked"}:
-                blockers.extend(owner.get("human_blockers") or [])
-                if owner.get("blocked_reason"):
-                    blockers.append(pause_reason(owner["blocked_reason"], selected_language(state)))
-        if status in {"execution_failed", "supervision_timeout"}:
-            blockers.extend(item.get("message", "") for item in state.get("diagnostics", [])
-                            if isinstance(item, dict))
-        if state.get("blocked_reason"):
-            blockers.append(pause_reason(state["blocked_reason"], selected_language(state)))
-        summary = event_copy(state, "separator").join(str(value) for value in blockers) or str(status_term(status, selected_language(state)))
-        if "approval_pending" in status:
-            title = event_copy(state, "approve_number", number=pr_number) if pr_number else event_copy(state, "approval_wait")
-            latest_review = event_copy(state, "review_pass") if any(
-                event["kind"] == "acceptance_passed" for event in key_events
-            ) else event_copy(state, "review_no_pass")
-            checks_result = (publication.get("required_checks_evidence") or {}).get("result")
-            checks_text = status_term(checks_result or "unknown", selected_language(state))
-            summary += event_copy(state, "approval_summary", review=latest_review, checks=checks_text)
-            for check in (publication.get("required_checks_evidence") or {}).get("checks", []):
-                if isinstance(check, dict) and check.get("name"):
-                    summary += event_copy(state, "check_result", name=check["name"], result=status_term(check.get("bucket") or check.get("state") or "unknown", selected_language(state)))
-        if status == "completed":
-            summary = event_copy(state, "separator").join(part for part in (event_copy(state, "merged", number=pr_number) if publication.get("phase") in {"merged", "completed"} and pr_number else "", event_copy(state, "closed") if publication.get("parent_closed") is True or (state.get("delivery_type") == "parent_only" and publication.get("phase") == "completed") else "") if part)
-        cleanup_pending = status == "completed" and final_approval_cleanup_pending(state)
-        if cleanup_pending:
-            title, color = event_copy(state, "cleanup"), "yellow"
-            summary += event_copy(state, "cleanup_summary")
-        timeline = list(state.get("timeline", [])) + list(state.get("timeline_continuation", []))
-        at = next((point.get("at") for point in reversed(timeline) if point.get("status") == status), None)
-        boundary_identity: object = "completed_cleanup" if cleanup_pending else status
-        if task_facts.get("task_number") is not None:
-            boundary_identity = [status, task_facts["task_number"]]
-        result.append(event_envelope(state, "boundary", boundary_identity, title, color, summary=summary,
-                            current=True, status_code=status, **execution_totals(state, records, at),
-                            trigger_role=next((event_copy(state, "role_" + str(role_family(str(r.get("role"))))) for r in reversed(records) if not r.get("event_record")), None) if status in {"ready_for_human", "execution_failed", "progress_exhausted"} else None,
-                            **task_facts,
-                            next_step="" if status == "abandoned" or (status == "completed" and not cleanup_pending) else str(next_action(state) or "")))
+    result.extend(boundary_events(state, records, key_events, actions))
     if "approval_pending" in status or status == "completed" or publication.get("approval_grant"):
         result = [event for event in result if event["kind"] != "pr_created"]
     from agent_run.notification_resume import apply_resume_result
@@ -254,12 +195,12 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     return list({event["id"]: event for event in result}.values())
 
 
-def recovery_event(state: dict[str, Any], pending: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Select the latest still-valid business fact without reviving old todo items."""
+def recovery_events(state: dict[str, Any], pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep all current boundaries, or the latest still-valid progress fact."""
     projected = events(state)
-    current = next((event for event in reversed(projected) if event.get("current")), None)
+    current = [event.copy() for event in projected if event.get("current")]
     if current:
-        return current.copy()
+        return current
     pending_ids = {event["id"] for event in pending}
     # Finished rounds are historical facts; they must not become a current
     # result just because their message was delayed. Only a live round start
@@ -273,4 +214,4 @@ def recovery_event(state: dict[str, Any], pending: list[dict[str, Any]]) -> dict
         or event["kind"] == "acceptance_passed"
         or (event["kind"] == "acceptance_repair"
             and (state.get("run_acceptance") or {}).get("phase") == "repairing"))]
-    return eligible[-1].copy() if eligible else None
+    return [eligible[-1].copy()] if eligible else []

@@ -35,6 +35,12 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
     lines = []
     if event.get("task_title"):
         lines.append(_markdown(event["task_title"], 160))
+    if event.get("object"):
+        lines.append(copy("field", label=copy("object"), value=_markdown(event["object"])))
+    if event.get("generation") is not None:
+        lines.append(copy("field", label=copy("generation"), value=_markdown(event["generation"])))
+    if event.get("scope") in {"local", "global"}:
+        lines.append(copy("scope." + event["scope"]))
     if event.get("kind") in {"stage_start", "stage_end"} or event.get("trigger_role"):
         role = _markdown(event.get("trigger_role") or event.get("phase", ""))
         ordinal = event.get("round")

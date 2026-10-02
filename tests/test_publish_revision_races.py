@@ -485,8 +485,10 @@ def test_abandon_recovers_lost_change_pr_close_response(
         )
         action = json_view["operator_action"]
         assert action["type"] == "Abandonment Recovery"
-        assert action["object"] == "Ticket #2"
-        assert action["phase"] == "waiting_checks"
+        assert action["object"] == "Delivery Run（Parent Issue #1）"
+        assert action["work_subject"] == f"run:{run_id}"
+        assert action["scope"] == "global"
+        assert action["phase"] == "abandonment_pending"
         assert action["reasons"] == [
             "Run abandonment recovery is incomplete."
         ]
@@ -494,8 +496,8 @@ def test_abandon_recovers_lost_change_pr_close_response(
         assert json_view["next_action"] == action["next_action"]
         text_view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "类型: 正在完成放弃操作" in text_view.stdout
-        assert "对象: 子任务 #2" in text_view.stdout
-        assert "阶段: 等待合并前检查" in text_view.stdout
+        assert "对象: 整体交付（需求 #1）" in text_view.stdout
+        assert "阶段: 正在完成放弃操作" in text_view.stdout
         assert "原因: 放弃操作尚未完成" in text_view.stdout
         assert "已保留成果:" in text_view.stdout
         assert "整项任务已暂停，其他子任务也不会继续。" in text_view.stdout

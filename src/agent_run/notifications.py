@@ -17,7 +17,7 @@ from typing import Any
 from agent_run.error_safety import bounded_error
 from agent_run.executor_host import _process_binding_status, _process_start_token
 from agent_run.notification_cards import card
-from agent_run.notification_events import events, recovery_event
+from agent_run.notification_events import events, recovery_events
 from agent_run.notification_transport import send
 
 MAX_PENDING = 32
@@ -145,8 +145,20 @@ class Notifications:
                 resume_results = self.document["resume_results"]
                 active = set(self.document["active"])
                 current = {item["id"] for item in projected if item.get("current")}
+                # Reserve one slot per current gate in the fixed Run graph.
+                # Progress/unknown backlog keeps its independent fixed bound;
+                # a large Ticket set cannot evict an unsent human boundary.
+                pending_limit = MAX_PENDING + len(current)
                 pending = self.document["pending"]
                 had_pending = bool(pending)
+                # A resolved gate must never wait behind another slow message
+                # and later be delivered as a current action. In-flight/unknown
+                # requests keep their actual delivery evidence.
+                pending[:] = [item for item in pending if (
+                    item["outcome"] in {"sending", "unknown"}
+                    or not item["event"].get("current")
+                    or item["event"].get("slot_id", item["event"]["id"].rsplit(":", 1)[0]) in current
+                )]
                 added = False
                 for item in projected:
                     identity = item["id"]
@@ -157,7 +169,7 @@ class Notifications:
                             continue
                         counts = self.document["occurrences"]
                         counts[identity] = counts.get(identity, 0) + 1
-                        item = {**item, "id": f"{identity}:{counts[identity]}"}
+                        item = {**item, "slot_id": identity, "id": f"{identity}:{counts[identity]}"}
                     elif identity in seen or (resume_identity is not None and resume_identity in resume_results):
                         continue
                     pending.append({"event": item, "outcome": "pending", "attempts": 0})
@@ -183,15 +195,25 @@ class Notifications:
                     or any(item["outcome"] == "failed" for item in retryable)
                 )
                 if retryable and (stale or len(pending) > MAX_PENDING):
-                    summary = recovery_event(state, [item["event"] for item in retryable])
+                    summaries = recovery_events(state, [item["event"] for item in retryable])
                     digest = hashlib.sha256(json.dumps([item["event"]["id"] for item in retryable]).encode()).hexdigest()
-                    if summary is not None:
-                        summary["id"] = f"{self.run_id}:recovery:{digest}"
                     pending[:] = [item for item in pending if item not in retryable]
-                    if summary is not None:
-                        pending.append({"event": summary, "outcome": "pending", "attempts": 0})
+                    for summary in summaries:
+                        if summary.get("current"):
+                            # Keep each unsent occurrence, its transport identity
+                            # and attempt count. Already-delivered sibling gates
+                            # are not reintroduced by recovery of another one.
+                            original = next((item for item in retryable if
+                                             item["event"].get("slot_id") == summary["id"]), None)
+                            if original is not None:
+                                original["event"] = {**summary, "id": original["event"]["id"],
+                                                     "slot_id": summary["id"]}
+                                pending.append(original)
+                        else:
+                            summary["id"] = f"{self.run_id}:recovery:{digest}"
+                            pending.append({"event": summary, "outcome": "pending", "attempts": 0})
                 # Unknown outcomes remain queryable, bounded, and never resubmitted.
-                while len(pending) > MAX_PENDING:
+                while len(pending) > pending_limit:
                     retired = next((item for item in pending if item["outcome"] == "unknown"), None)
                     if retired is None:
                         break

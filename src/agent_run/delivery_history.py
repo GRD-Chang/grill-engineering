@@ -14,7 +14,7 @@ from agent_run.delivery_status import (
 )
 from agent_run.final_approval_operation import approval_failure_text
 from agent_run.messages import display_language, text
-from agent_run.operator_action_presentation import human_action_type, human_preserved_results
+from agent_run.operator_action_presentation import human_action_type, human_preserved_results, operator_action_items
 from agent_run.presentation_helpers import (
     human_delivery_object,
     human_pause_reason,
@@ -137,19 +137,20 @@ def print_history_progress(
         "unknown",
         "capacity_wait",
         "recovery_wait",
-    }:
+    } and not operator_action_items(audit):
         print(_copy('presentation.history.next_step', v1=execution_guidance(state, progress['execution_activity'])))
         return
-    operator_action = audit.get("operator_action")
-    if isinstance(operator_action, dict):
-        print()
-        bounded_action = dict(operator_action)
-        reasons = operator_action.get("reasons")
-        if isinstance(reasons, list):
-            bounded_action["reasons"] = [
-                _truncate_history_detail(str(reason)) for reason in reasons
-            ]
-        print_operator_action(bounded_action)
+    actions = operator_action_items(audit)
+    if actions:
+        for operator_action in actions:
+            print()
+            bounded_action = dict(operator_action)
+            reasons = operator_action.get("reasons")
+            if isinstance(reasons, list):
+                bounded_action["reasons"] = [
+                    _truncate_history_detail(str(reason)) for reason in reasons
+                ]
+            print_operator_action(bounded_action)
     else:
         print(
             _copy('presentation.history.next_step_17', v1=human_next_action(audit.get('next_action'), run_id=state.get('run_id')), v3=_operator_instruction(state, None))
@@ -216,10 +217,11 @@ def print_rich_history_progress(
     if cleanup_lines:
         body.extend([Text(""), Text(_copy('presentation.history.delivery_cleanup_22'), style="bold")])
         body.extend(Text(line) for line in cleanup_lines)
-    action = audit.get("operator_action")
-    if isinstance(action, dict):
+    for action in operator_action_items(audit):
         body.extend([Text(""), Text(_copy('presentation.history.action_required'), style="bold yellow")])
         body.append(Text(_copy('presentation.history.type', v1=_safe_text(human_action_type(action.get('type'))))))
+        body.append(Text(_copy("presentation.status.object_v1", v1=human_delivery_object(action.get("object")))))
+        body.append(Text(_copy("presentation.history.command", v1=action.get("next_action"))))
         reasons = action.get("reasons")
         if isinstance(reasons, list):
             for reason in reasons:
@@ -235,7 +237,10 @@ def print_rich_history_progress(
         phase = action.get("phase")
         if phase is not None:
             body.append(Text(_copy('presentation.history.phase', v1=_safe_text(human_status_term(phase)))))
-        body.append(Text(_copy('presentation.history.the_entire_task_is_paused_other_subtasks_will_not_continue')))
+        if action.get("scope") == "global":
+            body.append(Text(_copy('presentation.history.the_entire_task_is_paused_other_subtasks_will_not_continue')))
+        else:
+            body.append(Text(_copy('presentation.status.local_operator_gate')))
     body.extend(
         [
             Text(""),

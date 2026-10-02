@@ -1683,6 +1683,9 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
             "remaining_review_attempts": 3,
     }
     run = accepted["run_acceptance"]
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert len(run["review_budget"]["review_artifacts"]) == 1
+    assert run["review_budget"]["review_artifacts"][0]["artifact"] == _passing_artifact()
     assert run["reviewer_thread_ids"] == (
         ["blocked-run-reviewer", "new-run-reviewer"]
         if new_thread

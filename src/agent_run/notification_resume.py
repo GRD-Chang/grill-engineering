@@ -5,7 +5,7 @@ from typing import Any
 
 from agent_run.messages import selected_language, text
 from agent_run.notification_presentation import next_action
-from agent_run.notification_event_facts import event_envelope
+from agent_run.notification_event_facts import event_envelope, event_subject
 
 
 def apply_resume_result(
@@ -35,14 +35,16 @@ def apply_resume_result(
     if outcome != "started":
         # Retain the boundary identity and occurrence even when the transient
         # result disappears on a later observation or process restart.
-        boundary = next((event for event in reversed(projected)
-                         if event.get("current") and event.get("kind") == "boundary"
-                         and event.get("status_code") not in {"completed", "abandoned", "operator_stopped"}), None)
+        boundaries = [event for event in projected
+                      if event.get("current") and event.get("kind") == "boundary"
+                      and event.get("status_code") not in {"completed", "abandoned", "operator_stopped"}
+                      and (not result.get("work_subject") or event.get("work_subject") == result["work_subject"])]
+        boundary = boundaries[0] if len(boundaries) == 1 else None
         if boundary is not None:
             superseded = [event["id"] for event in projected if
                           event.get("kind") == "stage_end" and event.get("status_code") in {
                               "execution_failed", "review_blocked",
-                          }]
+                          } and (not result.get("work_subject") or event.get("work_subject") == result["work_subject"])]
             projected = [event for event in projected if event["id"] not in superseded]
             return [{**event,
                      "title": event["title"] if "approval_pending" in str(event.get("status_code")) else title,
@@ -57,4 +59,5 @@ def apply_resume_result(
         summary=summary, next_step=next_action(state) if outcome != "started" else "",
         resume_id=result["id"], resume_outcome=outcome,
         live=outcome == "started",
+        work_subject=result.get("work_subject"), **event_subject(state, result.get("work_subject")),
     )]

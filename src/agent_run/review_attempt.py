@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.artifacts import AcceptanceArtifact
+from agent_run.artifacts import (
+    AcceptanceArtifact, clear_current_human_blocker, record_human_blocker,
+)
 from agent_run.ci_recovery_budget import mark_ci_review_invocation
 from agent_run.review_budget import ReviewBudget, ReviewBudgetPolicy, mark_review
 from agent_run.semantic_attempt import (
-    allocate_semantic_attempt, canonical_fingerprint, pending_semantic_attempt,
+    allocate_semantic_attempt, canonical_fingerprint, close_semantic_attempt,
+    pending_semantic_attempt,
 )
 from agent_run.state_errors import IncompatibleRunStateError
 
@@ -72,6 +75,34 @@ def remember_review(
     else:
         records[matching] = record
     del records[:-limit]
+
+
+def finish_review_result(
+    state: dict[str, Any], job: dict[str, Any], artifact: AcceptanceArtifact, *,
+    resume_phase: str, blocked_phase: str,
+    history_facts: dict[str, Any] | None = None,
+) -> None:
+    """Settle an applicable result after fallible readback has finished.
+
+    A human response continues the same Attempt and paid Reviewer round; only
+    a conclusive Artifact closes that identity. Candidate/Run acceptance and
+    the decision about the next work remain with the caller.
+    """
+    attempt = pending_semantic_attempt(job, role="reviewer")
+    if attempt is None:
+        raise ValueError("Reviewer closeout is missing its Semantic Attempt")
+    if artifact.requires_human:
+        record_human_blocker(
+            state, job, resume_phase=resume_phase, blocked_phase=blocked_phase,
+            blockers=artifact.blocker_evidence, code="reviewer_requires_human",
+        )
+    else:
+        close_semantic_attempt(
+            job, attempt, outcome="acceptance_artifact",
+            result={"history_facts": history_facts} if history_facts is not None else None,
+        )
+        clear_current_human_blocker(job)
+    job.pop("pending_review_result", None)
 
 
 def require_pending_run_review(run: dict[str, Any]) -> None:

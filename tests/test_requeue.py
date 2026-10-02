@@ -428,14 +428,12 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
     git = GitRepository(managed_repo(git_repo))
     states = StateStore(managed_state(git_repo))
     controller = Controller(FixtureGitHubReader(fixture), git, states)
-    state, _ = controller.start(1)
-    seed_idle_control(
-        TaskControlStore(managed_state(git_repo)),
-        TaskKey(managed_repo(git_repo), "example/project", 1),
-        str(state["run_id"]),
-    )
+    seeded = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))
+    state = states.load_current_run(seeded["run_id"])
+    assert state is not None
     active = state["active_ticket_job"]
     assert isinstance(active, dict)
+    active["policy_snapshot"] = deepcopy(state["policy_snapshot"])
     active.update(
         {
             "ticket_branch_generation": 1,
@@ -477,6 +475,28 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
     assert persisted["diagnostics"][0]["code"] == "github_invalid_response"
     assert persisted.get("github_refresh_pending") is None
     assert "agent-run run" not in _next_action(persisted)
+    from agent_run.notification_cards import card
+    from agent_run.notification_events import events
+
+    for command in ("status", "history"):
+        result = invoke_cli_inprocess(
+            git_repo, fixture, command, str(state["run_id"]), "--json",
+        )
+        query = stdout_json(result)
+        assert result.returncode == 0, result.stdout + result.stderr
+        action, = query["operator_actions"]
+        assert action["action"]["kind"] == "contradiction"
+        assert action["reasons"] == ["requeue graph JSON is incomplete"]
+        for guidance in (query["next_action"], action["next_action"]):
+            assert "agent-run abandon" in guidance
+            assert "agent-run run" not in guidance
+            assert "agent-run resume" not in guidance
+    boundary, = [event for event in events(persisted) if event.get("current")]
+    assert boundary["action"]["kind"] == "contradiction"
+    rendered = json.dumps(card(boundary), ensure_ascii=False)
+    assert "requeue graph JSON is incomplete" in rendered
+    assert "agent-run abandon" in rendered
+    assert "agent-run run" not in rendered and "agent-run resume" not in rendered
     assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get(
         "mutations", []
     ) == []

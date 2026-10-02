@@ -17,7 +17,7 @@ from support.workspace import managed_state
 from support.inprocess_cli import invoke_cli_inprocess
 
 from agent_run.notification_cards import card
-from agent_run.notification_events import events, recovery_event
+from agent_run.notification_events import events, recovery_events
 from agent_run.notifications import read_notifications
 from agent_run.presentation_helpers import human_status_term
 from agent_run.user_defaults import UserDefaultsStore
@@ -388,7 +388,7 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
         snapshot = deepcopy(state)
         snapshot["notifications"]["mode"] = mode
         pending = next(event for event in events(snapshot) if event.get("current"))
-        recovered = recovery_event(snapshot, [pending])
+        recovered = recovery_events(snapshot, [pending])[-1]
         assert recovered is not None
         for notification in (pending, recovered):
             assert notification["task_number"] == expected_number

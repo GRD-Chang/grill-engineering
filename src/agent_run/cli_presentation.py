@@ -37,7 +37,7 @@ from agent_run.delivery_progress import (
 )
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.operator_action_presentation import (
-    operator_action_view,
+    operator_action_views,
     human_next_action_for_state,
     print_operator_action as _print_operator_action,
 )
@@ -148,7 +148,8 @@ def _print_status(
         semantic_attempt = current_semantic_attempt(state, active_invocation)
         delivery_cleanup = _public_delivery_cleanup(state)
         latest_resume = latest_resume_audit(state)
-        operator_action = _operator_action_view(state)
+        operator_actions = operator_action_views(state, language=display_language())
+        operator_action = operator_actions[0] if operator_actions else None
         output = {
             "notifications": state.get("_notifications", {}),
             "run_id": state.get("run_id"),
@@ -172,6 +173,7 @@ def _print_status(
                 else _next_action(state)
             ),
             "operator_action": operator_action,
+            "operator_actions": operator_actions,
             "diagnostics": state.get("diagnostics", []),
             "scope_change": state.get("unsupported_scope_change"),
             "abandonment": state.get("run_abandonment"),
@@ -249,7 +251,8 @@ def _print_history(
         agent_resumes = public_resume_audit.get("history", [])
         if not isinstance(agent_resumes, list):
             raise ValueError("resume_audit.history must be an array")
-        operator_action = _operator_action_view(state)
+        operator_actions = operator_action_views(state, language=display_language())
+        operator_action = operator_actions[0] if operator_actions else None
         output = {
             "notifications": state.get("_notifications", {}),
             "run_id": state.get("run_id"),
@@ -261,6 +264,7 @@ def _print_history(
                 else _next_action(state)
             ),
             "operator_action": operator_action,
+            "operator_actions": operator_actions,
             "abandonment": state.get("run_abandonment"),
             "agent_invocations": [
                 public_invocation_view(invocation)
@@ -496,14 +500,6 @@ def _next_action(state: dict[str, Any]) -> str:
     return render_next_action(next_action_fact(state), state)
 
 
-def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
-    return operator_action_view(
-        state,
-        current_identity=current_delivery_identity(state),
-        fallback_next_action=_next_action(state),
-    )
-
-
 def human_delivery_status(value: object, *, language: str = "zh") -> object:
     """Render the same delivery terminology used by status and history."""
 
@@ -514,7 +510,13 @@ def _print_human_operator_action(
     state: Mapping[str, Any], action: dict[str, Any]
 ) -> None:
     human_action = dict(action)
-    human_action["next_action"] = human_next_action_for_state(state)
+    from agent_run.guidance_actions import NextAction
+
+    decision = action.get("action")
+    if isinstance(decision, dict):
+        human_action["next_action"] = render_next_action(
+            NextAction(**decision), dict(state), language=selected_language(dict(state)), human=True,
+        )
     _print_operator_action(human_action)
 
 

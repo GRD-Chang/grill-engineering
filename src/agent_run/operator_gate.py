@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
+from agent_run.external_supervision import supervision_window_matches
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 from agent_run.scope_changes import unsupported_scope_change_identity_is_consistent
 from agent_run.ticket_queue import next_ticket
@@ -58,6 +60,109 @@ def operator_gate_subjects(
     """Return current top-level work subjects that require operator action."""
 
     return list(_iter_operator_gate_subjects(state))
+
+
+@dataclass(frozen=True)
+class OperatorGateSource:
+    location: str
+    subject: dict[str, Any]
+    scope: str
+    top_level: bool = False
+
+
+def operator_gate_sources(
+    state: dict[str, Any],
+) -> list[OperatorGateSource]:
+    """Read every current gate without changing lifecycle admission semantics.
+
+    A Run stop/failure is independent of a retained Ticket pause.  Keep both
+    facts even when the stopped Invocation belongs to that same Ticket.
+    """
+    if state.get("status") in {"completed", "abandoned"}:
+        return []
+    local = list(_iter_local_operator_gate_subjects(state))
+    result = [
+        OperatorGateSource(location, subject, "local" if location.startswith("ticket:") else "global")
+        for location, subject in local
+        if subject.get("phase") != "ready_for_approval"
+        or state.get("status") == {
+            "parent": "parent_approval_pending",
+            "run_publication": "run_approval_pending",
+        }.get(location)
+    ]
+    if not _status_requires_operator_gate(state):
+        return result
+    status = state.get("status")
+    if status == "supervision_timeout":
+        location, subject = _supervision_gate_subject(state) or ("run", state)
+        result.insert(0, OperatorGateSource(location, subject, "global", top_level=True))
+        return result
+    if status in {"operator_stopped", "abandonment_pending", "unsupported_scope_change"}:
+        result.insert(0, OperatorGateSource("run", state, "global", top_level=True))
+        return result
+    current = _global_gate_subject(state)
+    if status == "requeue_required" and current is not None:
+        # A stale Generation cannot resume its old pause. Its Requeue boundary
+        # replaces that object's gate; independent Ticket gates remain visible.
+        location, subject = current
+        return [OperatorGateSource(location, subject, "global", top_level=True)] + [
+            source for source in result if source.location != location
+        ]
+    seen = {source.location for source in result}
+    if current is not None and current[0] in seen:
+        # A top-level execution diagnostic is additional evidence, never the
+        # reason for a different local gate on the same work object.
+        binding = operator_gate_evidence(state)
+        same_reason = binding is not None and binding["reason"] == current[1].get("blocked_reason")
+        if status in {"execution_failed", "deterministic_contradiction"} and not same_reason:
+            result.append(OperatorGateSource(current[0], current[1], "global", top_level=True))
+        return result
+    if current is not None:
+        location, subject = current
+        if subject.get("phase") == "ready_for_approval" and status in {
+            "run_approval_pending", "parent_approval_pending"
+        } and (location, subject) not in local:
+            return result
+        result.append(OperatorGateSource(location, subject, "global", top_level=True))
+    elif _unbound_status_gate_is_distinct(state, seen):
+        result.append(OperatorGateSource("run", state, "global", top_level=True))
+    return result
+
+
+def _supervision_gate_subject(
+    state: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Bind a timeout to the still-current PR or initial-credential window."""
+    wait = state.get("supervision_wait")
+    if not isinstance(wait, dict) or not supervision_window_matches(state, wait):
+        return None
+    active = state.get("active_ticket_job")
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    # Match the supervisor's PR selection order, retaining a separate Run
+    # boundary when it was supervising general GitHub state instead.
+    candidates = [
+        (f"ticket:{active.get('ticket_number')}", active,
+         f"ticket-{active.get('ticket_number')}") if isinstance(active, dict) else None,
+        ("run_repair", repair, f"run-repair-{repair.get('repair_attempt')}") if isinstance(repair, dict) else None,
+        ("run_publication", state.get("run_publication"), "run-publication"),
+        ("parent", state.get("parent_job"), "parent-only"),
+        ("run_acceptance", acceptance, "run-acceptance"),
+    ]
+    availability = state.get("credential_availability")
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        location, subject, credential_label = candidate
+        if not isinstance(subject, dict):
+            continue
+        if isinstance(availability, dict):
+            matches = availability.get("change_job") == credential_label
+        else:
+            matches = isinstance(subject.get("pr_number"), int)
+        if matches:
+            return location, subject
+    return None
 
 
 def _iter_operator_gate_subjects(
@@ -143,18 +248,27 @@ def operator_gate_subject_count(state: dict[str, Any]) -> int:
 def operator_gate_identity_is_consistent(state: dict[str, Any]) -> bool:
     """Whether the current gate matches its top-level status and subject."""
 
-    if state.get("status") == "requeue_required" and _requeue_gate_subject(
-        state
-    ) is None:
-        return False
     if (
         state.get("status") == "unsupported_scope_change"
         and not unsupported_scope_change_identity_is_consistent(state)
     ):
         return False
-    local = next(_iter_local_operator_gate_subjects(state), None)
-    if local is not None and not _local_gate_matches_top_status(state, local):
-        return False
+    if state.get("status") == "requeue_required":
+        requeue = _requeue_gate_subject(state)
+        if requeue is None:
+            return False
+        # Requeue is a global currentness boundary for one Generation. Other
+        # Tickets retain their own gates; none must become the Requeue subject
+        # merely because it is the first paused job in the iteration order.
+        for location, _subject in _iter_local_operator_gate_subjects(state):
+            if location != requeue[0] and not (
+                location.startswith("ticket:") and requeue[0].startswith("ticket:")
+            ):
+                return False
+    else:
+        local = next(_iter_local_operator_gate_subjects(state), None)
+        if local is not None and not _local_gate_matches_top_status(state, local):
+            return False
     if not _status_requires_operator_gate(state):
         return True
     binding, count = _operator_gate_evidence_summary(state)
@@ -230,9 +344,6 @@ def _local_gate_matches_top_status(
         return location == "parent" and phase == "ready_for_approval"
     if status == "run_approval_pending":
         return location == "run_publication" and phase == "ready_for_approval"
-    if status == "requeue_required":
-        resolved = _requeue_gate_subject(state)
-        return resolved is not None and resolved[0] == location
     if status == "unsupported_scope_change":
         # A newly observed graph contradiction invalidates an approval that was
         # current under the accepted graph.  The retained owner is still the

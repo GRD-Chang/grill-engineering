@@ -252,7 +252,7 @@ class RunPublicationFlow(RunPublicationShared):
         publication: dict[str, Any],
         error: GitHubReadError,
     ) -> dict[str, Any]:
-        publication["phase"] = "ready_for_human"
+        publication.update(phase="ready_for_human", blocked_reason="github_write_outcome_unknown")
         state.update(
             {
                 "status": "ready_for_human",
@@ -324,7 +324,7 @@ class RunPublicationFlow(RunPublicationShared):
         else:
             # A known foreign ref or failed CAS must not trigger another
             # Publication Agent invocation or a PR write.
-            publication["phase"] = "ready_for_human"
+            publication.update(phase="ready_for_human", blocked_reason="final_run_ref_authority_failed")
             state.update(
                 {
                     "status": "ready_for_human",
