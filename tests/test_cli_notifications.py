@@ -49,6 +49,8 @@ if "whoami" in args:
     print(json.dumps({"profile":"test", "appId":"cli_test", "identity":"bot", "available":True}))
 else:
     time.sleep(float(os.environ.get("NOTIFICATION_TEST_DELAY", "0")))
+    with Path(os.environ["NOTIFICATION_TEST_PROCESSES"]).open("a") as stream:
+        stream.write(json.dumps([os.getpid(), os.getppid()])+"\\n")
     with Path(''' + repr(str(messages)) + ''').open("a") as stream:
         stream.write(json.dumps(json.loads(args[args.index("--content")+1]), ensure_ascii=False)+"\\n")
     if os.environ.get("NOTIFICATION_TEST_PORT"):
@@ -126,48 +128,46 @@ notifications.Notifications.observe = observe
 # real executable transport; concise mode still delivers every card for its
 # sequence/deduplication assertions, and cancellation keeps its real sender.
 if os.environ.get('NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT'):
-    def representative_send(config, card, *args):
+    def representative_send(config, card, *args, **kwargs):
         if card['header']['title']['content'] in real_delivery_titles:
-            return original_send(config, card, *args)
+            return original_send(config, card, *args, **kwargs)
         return {'outcome': 'success', 'reason': None}
     notifications.send = representative_send
 release_sender = threading.Event()
 port = os.environ.get('NOTIFICATION_TEST_PORT')
 if port:
-    def send(*args):
+    notifications.CLOSE_TIMEOUT_SECONDS = 0.05
+    def send(*args, **kwargs):
         release_sender.wait()
-        return original_send(*args)
+        return original_send(*args, **kwargs)
     notifications.send = send
-
-def close(self):
-    try:
-        if self.thread is not None:
-            if port:
+    def close(self):
+        try:
+            if self.thread is not None:
                 release_sender.set()
                 with socket.create_connection(('127.0.0.1', int(port)), timeout=15) as ready:
                     ready.sendall(b'C')
                     assert ready.recv(1) == b'1', 'close readiness not acknowledged'
-            else:
-                with self.condition:
-                    # Executor has detached the observer and exited delivery.
-                    # Drain only this test's transport outside all business locks;
-                    # production close still has its original bounded behavior.
-                    assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
-                    assert self.document.get('records'), self.document
-    finally:
-        release_sender.set()
-        original_close(self)
-notifications.Notifications.close = close
+        finally:
+            release_sender.set()
+            original_close(self)
+    notifications.Notifications.close = close
 raise SystemExit(main(sys.argv[1:]))
 """
         source = str(Path(__file__).resolve().parents[1] / "src")
         environment = {**os.environ, "PYTHONPATH": source + os.pathsep + os.environ.get("PYTHONPATH", "")}
+        processes = tmp_path / f"{arguments[0]}-processes.jsonl"
+        environment["NOTIFICATION_TEST_PROCESSES"] = str(processes)
 
         def execute() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-c", script, *arguments, "--json", "--github-fixture", str(fixture)],
                 cwd=git_repo, env=environment, capture_output=True, text=True, check=False,
             )
+            assert processes.exists(), result.stdout + result.stderr
+            for line in processes.read_text().splitlines():
+                assert all(not Path(f"/proc/{pid}").exists() for pid in json.loads(line))
+            return result
 
         if drain:
             if mode == "concise" and scope == "ticket":
@@ -209,8 +209,7 @@ raise SystemExit(main(sys.argv[1:]))
     current = load_only_run_state(git_repo)
     assert current["notifications"]["profile"] == "test"
     # A representative real request proves Executor/transport integration.
-    # Complete card combinations use the actual persisted lifecycle facts;
-    # production close is allowed to leave later notifications unsent.
+    # Complete card combinations use the actual persisted lifecycle facts.
     delivered = [json.loads(line) for line in messages.read_text().splitlines()]
     assert delivered and all(item["schema"] == "2.0" for item in delivered)
     assert current["language"] == language
@@ -264,9 +263,12 @@ raise SystemExit(main(sys.argv[1:]))
     assert journal["seen"]
     if drain:
         assert any(record["outcome"] == "success" for record in journal["records"])
+        assert not journal["pending"]
     else:
-        assert any(item["outcome"] == "unknown" for item in journal["pending"])
-        assert any(item["outcome"] == "pending" for item in journal["pending"])
+        interrupted, = [item for item in journal["records"] if item["outcome"] == "unknown"]
+        assert interrupted["attempts"] == 1
+        assert interrupted["attempt_history"][-1]["cancelled"] is True
+        assert any(item["outcome"] == "pending" and item["attempts"] == 0 for item in journal["pending"])
     for result, expected in (
         ("none", localized("未配置合并前检查", "No pre-merge checks configured")), ("pass", localized(human_status_term("pass"), "Passed")),
         ("pending", localized(human_status_term("pending"), "Pending")), ("fail", localized(human_status_term("fail"), "Failed")),

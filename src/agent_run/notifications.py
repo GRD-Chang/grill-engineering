@@ -1,309 +1,262 @@
-"""Bounded, Run-owned notification delivery; queries never start a sender."""
+"""Run-owned asynchronous delivery with persistent, finite retry budgets."""
 from __future__ import annotations
 
-import fcntl
 import hashlib
-import json
 import os
 import sys
-import tempfile
 import threading
+import time
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from agent_run.error_safety import bounded_error
-from agent_run.executor_host import _process_binding_status, _process_start_token
+from agent_run.executor_host import _process_start_token
 from agent_run.notification_cards import card
 from agent_run.notification_events import events, recovery_events
+from agent_run import notification_outbox as outbox
+from agent_run.notification_outbox import notification_path as notification_path, read_notifications as read_notifications
 from agent_run.notification_transport import send
 
-MAX_PENDING = 32
-MAX_RECORDS = 256
-MAX_JOURNAL_BYTES = 1024 * 1024
-
-
-def notification_path(root: Path, run_id: str) -> Path:
-    # Do not allow external identifiers to select a filesystem path.
-    name = hashlib.sha256(run_id.encode()).hexdigest()[:32]
-    return root / "notifications" / f"{name}.json"
-
-
-def read_notifications(root: Path, run_id: str) -> dict[str, Any]:
-    path = notification_path(root, run_id)
-    try:
-        if not path.exists():
-            return {}
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_JOURNAL_BYTES + 1)
-        if len(raw) > MAX_JOURNAL_BYTES:
-            raise ValueError("通知记录超过容量")
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError("通知记录格式错误")
-        for field in ("seen", "pending", "records", "active", "milestones", "resume_results"):
-            if field in value and not isinstance(value[field], list):
-                raise ValueError(f"通知记录 {field} 格式错误")
-        if not isinstance(value.get("occurrences", {}), dict):
-            raise ValueError("通知 occurrence 记录格式错误")
-        for item in value.get("pending", []):
-            if not isinstance(item, dict) or not isinstance(item.get("event"), dict) or not isinstance(item["event"].get("id"), str):
-                raise ValueError("通知待发记录格式错误")
-        return value
-    except (OSError, ValueError) as error:
-        return {"unavailable_reason": bounded_error(str(error))}
+CLOSE_TIMEOUT_SECONDS = 60.0
 
 
 class Notifications:
-    """One finite sender per Executor, with a bounded durable outbox.
+    """One finite sender per Executor; all senders share outbox claims and budgets.
 
-    The business state remains authoritative. Seen identities cover the current
-    history window, so trimming the sent audit does not replay old history.
-    In-flight outcomes survive interruption as unknown and are not blindly retried.
+    ``load_state`` must be a lock-free read of the authoritative Run snapshot.
+    A host exit observer can use this same entrypoint without business writes.
     """
 
-    def __init__(self, root: Path, state: dict[str, Any]) -> None:
+    def __init__(self, root: Path, state: dict[str, Any], *,
+                 load_state: Callable[[], dict[str, Any] | None] | None = None) -> None:
         self.root = root
         self.run_id = str(state["run_id"])
-        self.config = state.get("notifications", {})
+        self.binding = (state.get("repository"), (state.get("parent") or {}).get("number"))
+        config = state.get("notifications", {})
+        self.config = dict(config) if isinstance(config, dict) else {}
         self.enabled = isinstance(self.config, dict) and self.config.get("enabled") is True
+        self.load_state = load_state
         self.condition = threading.Condition()
         self.cancel = threading.Event()
         self.thread: threading.Thread | None = None
         self.closing = False
-        self.version = 0
-        self.epoch = uuid.uuid4().hex
-        self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid())}
+        self.closed = False
+        self.failure_reason: str | None = None
+        self.recovery_requested = False
+        self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid()), "sender": uuid.uuid4().hex}
         self.document: dict[str, Any] = {}
+        self.state = state
         if not self.enabled:
             if isinstance(self.config, dict) and self.config.get("unavailable_reason"):
                 print(f"飞书通知不可用（开发继续）：{self.config['unavailable_reason']}", file=sys.stderr)
             return
         self.observe(state, recovering=True)
-        if not self.document.get("unavailable_reason"):
-            self.thread = threading.Thread(target=self._work, name="agent-run-notifications")
-            try:
-                self.thread.start()
-            except RuntimeError as error:
-                self.thread = None
-                self._unavailable(error)
+        self.thread = threading.Thread(target=self._work, name="agent-run-notifications")
+        try:
+            self.thread.start()
+        except RuntimeError as error:
+            self.thread = None
+            self._unavailable(error)
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        # Control and retiring Executors can briefly overlap. Serialize only
-        # local journal transactions, never hold this lock across CLI calls.
-        with self.condition:
-            path = notification_path(self.root, self.run_id).with_suffix(".lock")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                try:
-                    self.document = read_notifications(self.root, self.run_id)
-                    for key in ("seen", "pending", "records", "active", "milestones", "resume_results"):
-                        self.document.setdefault(key, [])
-                    self.document.setdefault("occurrences", {})
-                    self.recovered = False
-                    for item in self.document["pending"]:
-                        owner = item.get("owner", {})
-                        if item.get("outcome") == "sending" and (
-                            type(owner.get("pid")) is not int or _process_binding_status(
-                                owner["pid"], owner.get("token")
-                            ) == "absent"
-                        ):
-                            self.recovered = True
-                            item["outcome"] = "unknown"
-                            item["reason"] = "上次发送被中断，送达结果未知；不自动重复投递"
-                    yield
-                finally:
-                    fcntl.flock(lock, fcntl.LOCK_UN)
+        with self.condition, outbox.transaction(self.root, self.run_id) as document:
+            self.document = document
+            yield
+            self.condition.notify_all()
 
-    def _save(self) -> None:
-        path = notification_path(self.root, self.run_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(self.document, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded.encode()) > MAX_JOURNAL_BYTES:
-            raise ValueError("通知记录超过容量")
-        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".notification-")
-        try:
-            with os.fdopen(descriptor, "w") as stream:
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(name, path)
-        finally:
-            Path(name).unlink(missing_ok=True)
+    def _current(self, fallback: dict[str, Any]) -> dict[str, Any]:
+        state = self.load_state() if self.load_state else fallback
+        if (state is None or state.get("run_id") != self.run_id
+                or (state.get("repository"), (state.get("parent") or {}).get("number")) != self.binding
+                or state.get("notifications", {}) != self.config):
+            raise ValueError("无法核验通知所属 Run 或接收人绑定")
+        return state
 
     def observe(self, state: dict[str, Any], *, recovering: bool = False) -> None:
-        if not self.enabled or state.get("run_id") != self.run_id:
+        if not self.enabled or self.closed or state.get("run_id") != self.run_id:
             return
         try:
             with self._transaction():
-                projected = events(state)
-                seen = set(self.document["seen"]) | set(self.document["milestones"])
-                resume_results = self.document["resume_results"]
-                active = set(self.document["active"])
-                current = {item["id"] for item in projected if item.get("current")}
-                # Reserve one slot per current gate in the fixed Run graph.
-                # Progress/unknown backlog keeps its independent fixed bound;
-                # a large Ticket set cannot evict an unsent human boundary.
-                pending_limit = MAX_PENDING + len(current)
-                pending = self.document["pending"]
-                had_pending = bool(pending)
-                # A resolved gate must never wait behind another slow message
-                # and later be delivered as a current action. In-flight/unknown
-                # requests keep their actual delivery evidence.
-                pending[:] = [item for item in pending if (
-                    item["outcome"] in {"sending", "unknown"}
-                    or not item["event"].get("current")
-                    or item["event"].get("slot_id", item["event"]["id"].rsplit(":", 1)[0]) in current
-                )]
-                added = False
-                for item in projected:
-                    identity = item["id"]
-                    resume_identity = (f"{item['resume_id']}:{item.get('resume_outcome')}"
-                                       if item.get("resume_id") else None)
-                    if item.get("current"):
-                        if identity in active and (resume_identity is None or resume_identity in resume_results):
-                            continue
-                        counts = self.document["occurrences"]
-                        counts[identity] = counts.get(identity, 0) + 1
-                        item = {**item, "slot_id": identity, "id": f"{identity}:{counts[identity]}"}
-                    elif identity in seen or (resume_identity is not None and resume_identity in resume_results):
-                        continue
-                    pending.append({"event": item, "outcome": "pending", "attempts": 0})
-                    if resume_identity is not None and resume_identity not in resume_results:
-                        resume_results.append(resume_identity)
-                    if item["kind"] in {"ticket_started", "parent_started", "acceptance_started", "acceptance_repair"}:
-                        self.document["milestones"].append(identity)
-                    added = True
-                self.document["seen"] = list(dict.fromkeys(
-                    identity for item in projected
-                    for identity in [item["id"], *item.get("supersedes", [])]))
-                self.document["active"] = sorted(current)
-                self.document["resume_results"] = resume_results[-MAX_RECORDS:]
-                # First starts must survive history compaction. Their number is
-                # bounded by the fixed Ticket graph plus two overall nodes.
-                milestone_limit = len((state.get("ticket_graph") or {}).get("tickets") or {}) + 2
-                self.document["milestones"] = self.document["milestones"][-milestone_limit:]
-                # Only recurring boundary identities need counters.
-                self.document["occurrences"] = dict(list(self.document["occurrences"].items())[-MAX_RECORDS:])
-                retryable = [item for item in pending if item["outcome"] not in {"sending", "unknown"}]
-                stale = (added or recovering) and (
-                    (recovering and had_pending)
-                    or any(item["outcome"] == "failed" for item in retryable)
-                )
-                if retryable and (stale or len(pending) > MAX_PENDING):
-                    summaries = recovery_events(state, [item["event"] for item in retryable])
-                    digest = hashlib.sha256(json.dumps([item["event"]["id"] for item in retryable]).encode()).hexdigest()
-                    pending[:] = [item for item in pending if item not in retryable]
-                    for summary in summaries:
-                        if summary.get("current"):
-                            # Keep each unsent occurrence, its transport identity
-                            # and attempt count. Already-delivered sibling gates
-                            # are not reintroduced by recovery of another one.
-                            original = next((item for item in retryable if
-                                             item["event"].get("slot_id") == summary["id"]), None)
-                            if original is not None:
-                                original["event"] = {**summary, "id": original["event"]["id"],
-                                                     "slot_id": summary["id"]}
-                                pending.append(original)
-                        else:
-                            summary["id"] = f"{self.run_id}:recovery:{digest}"
-                            pending.append({"event": summary, "outcome": "pending", "attempts": 0})
-                # Unknown outcomes remain queryable, bounded, and never resubmitted.
-                while len(pending) > pending_limit:
-                    retired = next((item for item in pending if item["outcome"] == "unknown"), None)
-                    if retired is None:
-                        break
-                    pending.remove(retired)
-                    self._record(retired)
-                if added or recovering:
-                    self.version += 1
-                self._save()
-                self.condition.notify_all()
+                self._observe(self._current(state), recovering=recovering)
         except Exception as error:
             self._unavailable(error)
 
-    def _record(self, item: dict[str, Any]) -> None:
-        self.document["records"].append({
-            "id": item["event"]["id"], "outcome": item["outcome"],
-            "attempts": item["attempts"], "reason": item.get("reason"),
-        })
-        self.document["records"] = self.document["records"][-MAX_RECORDS:]
+    def _observe(self, state: dict[str, Any], *, recovering: bool = False) -> None:
+        self.state = state
+        projected = events(state)
+        now = time.time()
+        document = self.document
+        if self.failure_reason is None:
+            document.pop("unavailable_reason", None)
+        else:
+            # The worker acknowledges this only after the cancelled transport
+            # has returned. A successful read alone cannot clear its failure.
+            self.recovery_requested = True
+        outbox.settle(document, now)
+        seen = set(document["seen"]) | set(document["milestones"])
+        active = set(document["active"])
+        current = {item["id"] for item in projected if item.get("current")}
+        ids = {item["id"] for item in projected}
+        pending = document["pending"]
+        had_pending = bool(pending)
+        for item in list(pending):
+            event = item["event"]
+            if ((event.get("current") and event.get("slot_id") not in current)
+                    or (item.get("important") and not event.get("current") and event["id"] not in ids)):
+                outbox.cancel_item(document, item, "no_longer_current")
+        added = False
+        for event in projected:
+            identity = event["id"]
+            resume_identity = (f"{event['resume_id']}:{event.get('resume_outcome')}"
+                               if event.get("resume_id") else None)
+            if event.get("current"):
+                if identity in active and (resume_identity is None or resume_identity in document["resume_results"]):
+                    continue
+                for item in list(pending):
+                    if item["event"].get("slot_id") == identity:
+                        outbox.cancel_item(document, item, "superseded")
+                document["sequence"] += 1
+                event = {**event, "slot_id": identity, "id": f"{identity}:{document['sequence']}"}
+            elif identity in seen or (resume_identity and resume_identity in document["resume_results"]):
+                continue
+            outbox.enqueue(document, event, now)
+            if resume_identity and resume_identity not in document["resume_results"]:
+                document["resume_results"].append(resume_identity)
+            if event["kind"] in {"ticket_started", "parent_started", "acceptance_started", "acceptance_repair"}:
+                document["milestones"].append(identity)
+            added = True
+        document["seen"] = list(dict.fromkeys(
+            identity for event in projected for identity in [event["id"], *event.get("supersedes", [])]))
+        document["active"] = sorted(current)
+        document["resume_results"] = document["resume_results"][-outbox.MAX_RECORDS:]
+        milestone_limit = len((state.get("ticket_graph") or {}).get("tickets") or {}) + 2
+        document["milestones"] = document["milestones"][-milestone_limit:]
+        # Compress obsolete ordinary progress without manufacturing a new
+        # identity or resetting the retained event's attempts/deadline.
+        ordinary = [item for item in pending if not item["important"] and item["outcome"] != "sending"]
+        if ordinary and ((recovering and had_pending) or len(pending) > outbox.MAX_PENDING or (
+                added and any(item["outcome"] == "failed" for item in ordinary))):
+            keep = {event["id"] for event in recovery_events(state, [item["event"] for item in ordinary])}
+            for item in ordinary:
+                if item["event"]["id"] not in keep:
+                    outbox.cancel_item(document, item, "obsolete_progress")
+        limit = outbox.MAX_PENDING + len(current)
+        while len(pending) > limit:
+            item = next((entry for entry in pending if entry["outcome"] != "sending"
+                         and not entry["event"].get("current")), None)
+            if item is None:
+                break
+            outbox.cancel_item(document, item, "capacity")
 
-    def _unavailable(self, error: Exception) -> None:
+    def _unavailable(self, error: Exception, *, release_claim: bool = False) -> None:
         reason = bounded_error(str(error))
         print(f"飞书通知不可用（开发继续）：{reason}", file=sys.stderr)
-        try:
-            with self._transaction():
+        with self.condition:
+            self.failure_reason = reason
+            self.recovery_requested = False
+            self.cancel.set()
+            try:
+                with self._transaction():
+                    self.document["unavailable_reason"] = reason
+                    for item in self.document["pending"]:
+                        # Observation failure cannot release a live transport.
+                        if release_claim and item.get("outcome") == "sending" and item.get("owner") == self.owner:
+                            outbox.finish_attempt(item, {"outcome": "unknown", "reason": reason}, time.time())
+            except Exception:
                 self.document["unavailable_reason"] = reason
-                for item in self.document["pending"]:
-                    if item.get("outcome") == "sending" and item.get("owner") == self.owner:
-                        item.update(outcome="unknown", reason=reason)
-                self._save()
-        except Exception:
-            self.document["unavailable_reason"] = reason
+            self.condition.notify_all()
 
     def _work(self) -> None:
-        try:
-            self._deliver()
-        except Exception as error:
-            self._unavailable(error)
+        while True:
+            try:
+                self._deliver()
+            except Exception as error:
+                self._unavailable(error, release_claim=True)
+            with self.condition:
+                # Park until a business observation or normal close can prove
+                # recovery. No polling, new thread, or renewed event budget.
+                while self.failure_reason and not self.recovery_requested and not self.closing:
+                    self.condition.wait()
+                if self.closed or not self.failure_reason or not self.recovery_requested:
+                    return
+                self.failure_reason = None
+                self.recovery_requested = False
+                self.cancel.clear()
 
     def _deliver(self) -> None:
         while not self.cancel.is_set():
             with self._transaction():
-                version = f"{self.epoch}:{self.version}"
-                inflight = any(item["outcome"] == "sending" for item in self.document["pending"])
-                available = None if inflight else next((item for item in self.document["pending"]
-                                  if item["outcome"] not in {"unknown", "sending"}
-                                  and item.get("version") != version), None)
+                if self.cancel.is_set():
+                    return
+                self._observe(self._current(self.state))
+                outbox.settle(self.document, time.time())
+                pending = self.document["pending"]
+                inflight = any(item["outcome"] == "sending" for item in pending)
+                available = None if inflight else next((item for item in pending
+                    if not item.get("cancelled") and item["next_attempt_at"] <= time.time()), None)
                 if available is not None:
-                    available["version"] = version
-                    available["owner"] = self.owner
-                    available["outcome"] = "sending"
-                if available is not None or self.recovered:
-                    self._save()
+                    available.update(owner=self.owner, outcome="sending")
+                    available["attempts"] += 1
+                    available["attempt_history"].append({"number": available["attempts"],
+                        "started_at": time.time(), "outcome": "sending"})
+                elif self.closing and not pending:
+                    return
+                wait_seconds = (0.1 if inflight else min(
+                    (max(0.0, min(item["next_attempt_at"], item["deadline_at"]) - time.time())
+                     for item in pending), default=0.1))
             if available is None:
                 with self.condition:
-                    if self.closing and not inflight and version == f"{self.epoch}:{self.version}":
+                    if self.closing and not self.document["pending"]:
                         return
-                    # The other control Executor can finish an in-flight send.
-                    if version == f"{self.epoch}:{self.version}":
-                        self.condition.wait(timeout=0.1 if inflight else None)
+                    self.condition.wait(timeout=wait_seconds if self.document["pending"] else None)
                 continue
             identity = hashlib.sha256(available["event"]["id"].encode()).hexdigest()[:32]
-            attempts = 0
-            for _ in range(3):
-                result = send(self.config, card(available["event"]), identity, self.cancel)
-                attempts += 1
-                if result["outcome"] != "failed" or self.cancel.is_set():
-                    break
+            result = send(self.config, card(available["event"]), identity, self.cancel,
+                          timeout_seconds=max(0.0, available["deadline_at"] - time.time()))
             with self._transaction():
                 item = next((entry for entry in self.document["pending"]
-                             if entry["event"]["id"] == available["event"]["id"]), None)
+                             if entry["event"]["id"] == available["event"]["id"]
+                             and entry.get("owner") == self.owner), None)
                 if item is not None:
-                    item.update(result)
-                    item["attempts"] += attempts
+                    outbox.finish_attempt(item, dict(result), time.time())
+                    item["attempt_history"][-1]["cancelled"] = self.cancel.is_set()
                     if result["outcome"] != "success":
                         print(f"飞书通知未确认送达（开发继续）：{result['reason']}", file=sys.stderr)
-                    if item["outcome"] == "success":
-                        self.document["pending"].remove(item)
-                        self._record(item)
-                    self._save()
-                self.condition.notify_all()
+                    outbox.settle(self.document, time.time())
 
     def close(self) -> None:
-        if self.thread is None:
+        if not self.enabled or self.closed:
             return
         with self.condition:
             self.closing = True
+            if self.failure_reason:
+                self.observe(self.state)
             self.condition.notify_all()
-        # Give fast deliveries a small drain window; slow external work is cancelled.
-        self.thread.join(timeout=2)
-        self.cancel.set()
+        # Normal exit grants the outbox a complete, bounded delivery lifetime.
+        # The transport observes cancellation and reaps its process tree.
+        if self.thread is not None:
+            self.thread.join(timeout=CLOSE_TIMEOUT_SECONDS)
         with self.condition:
+            self.closed = True
+            self.cancel.set()
             self.condition.notify_all()
-        self.thread.join(timeout=2)
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        if self.failure_reason:
+            try:
+                with self._transaction():
+                    self.document["unavailable_reason"] = self.failure_reason
+                    for item in self.document["pending"]:
+                        if item["outcome"] != "sending":
+                            item["delivery_error"] = self.failure_reason
+                            if item["outcome"] == "pending":
+                                item.update(outcome="failed", reason=self.failure_reason)
+                    # A healthy overlapping sender can still use the original
+                    # remaining budget; this sender cannot retire its work.
+                    outbox.settle(self.document, time.time())
+            except Exception as error:
+                self._unavailable(error)

@@ -100,6 +100,8 @@ def send(
     card: Mapping[str, Any],
     idempotency_key: str,
     cancel_event: Event,
+    *,
+    timeout_seconds: float = SEND_TIMEOUT_SECONDS,
 ) -> SendResult:
     """Send once, including identity validation, within a ten-second deadline.
 
@@ -117,7 +119,7 @@ def send(
     assert isinstance(profile, str) and isinstance(open_id, str) and isinstance(app_id, str)
     if not open_id.startswith("ou_") or not idempotency_key or len(idempotency_key) > 50:
         return _result("failed", "通知接收人或幂等标识无效")
-    deadline = time.monotonic() + SEND_TIMEOUT_SECONDS
+    deadline = time.monotonic() + min(SEND_TIMEOUT_SECONDS, max(0.0, timeout_seconds))
     identity = _run(
         ["lark-cli", "--profile", profile, "whoami", "--as", "bot"],
         deadline, cancel_event,

@@ -89,7 +89,12 @@ class DeliveryExecutor:
             if action_id is not None:
                 feedback.identity = action_id
             feedback.observe(state)
-        notifications = Notifications(states.root, feedback.project(state) if feedback else state)
+        def notification_state() -> dict[str, Any] | None:
+            current = states.load_current_run(run_id)
+            return feedback.project(current) if feedback and current is not None else current
+
+        notifications = Notifications(states.root, feedback.project(state) if feedback else state,
+                                      load_state=notification_state)
         if feedback is not None:
             feedback.attach(notifications, action_id)
         states.run_saved_observer = feedback.observe if feedback else notifications.observe

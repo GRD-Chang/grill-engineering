@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.notifications import Notifications, read_notifications
+from agent_run.notifications import read_notifications
 from agent_run.messages import text
 from agent_run.user_defaults import UserDefaultsStore
 from support.cli_fixtures import run_agents
@@ -78,25 +78,6 @@ else:
         github_data = json.loads(fixture.read_text())
         github_data["parent"]["body"] += " Updated authoritative requirement."
         fixture.write_text(json.dumps(github_data))
-    original_observe, original_close = Notifications.observe, Notifications.close
-
-    def drain(sender: Notifications) -> None:
-        if sender.thread is not None:
-            with sender.condition:
-                assert sender.condition.wait_for(lambda: not sender.document["pending"], timeout=10)
-
-    def observe(sender: Notifications, *args, **kwargs) -> None:
-        original_observe(sender, *args, **kwargs)
-        drain(sender)
-
-    def close(sender: Notifications) -> None:
-        try:
-            drain(sender)
-        finally:
-            original_close(sender)
-
-    monkeypatch.setattr(Notifications, "observe", observe)
-    monkeypatch.setattr(Notifications, "close", close)
     if outcome == "running":
         ready_read, ready_write = os.pipe()
         release_read, release_write = os.pipe()
@@ -159,7 +140,7 @@ def test_public_targeted_resume_reports_checks_that_remain_pending(
 
     cards_path = git_repo.parent / "pending-resume-cards.jsonl"
 
-    def send(_config, rendered, *_args):
+    def send(_config, rendered, *_args, **_kwargs):
         # The fixture Executor forks; observe its requests through the shared
         # test file rather than the parent's in-memory list.
         with cards_path.open("a") as stream:

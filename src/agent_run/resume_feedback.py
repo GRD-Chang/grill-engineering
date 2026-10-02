@@ -116,7 +116,8 @@ class ResumeFeedback:
         # a successfully selected valid Run supplies a recipient and language.
         try:
             state = self.load() or self.state
-            sender = Notifications(self.root, self.project(state))
+            sender = Notifications(self.root, self.project(state),
+                                   load_state=lambda: self.project(current) if (current := self.load()) else None)
             sender.close()
         except Exception:
             # Notification failures must not replace the CLI's actual outcome.

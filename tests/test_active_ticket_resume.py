@@ -77,7 +77,7 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
     states.save_run(run_id, paused)
     cards: list[dict[str, Any]] = []
 
-    def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any, **_kwargs: Any) -> dict[str, Any]:
         cards.append(card)
         return {"outcome": "success", "reason": None}
 

@@ -183,7 +183,7 @@ def test_requeue_preserves_an_independent_reviewer_blocker(
             assert boundaries[action["work_subject"]][key] == action[key]
     sent: list[dict[str, Any]] = []
 
-    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any, **kwargs: Any) -> dict[str, Any]:
         sent.append(rendered)
         return {"outcome": "success", "reason": None}
 

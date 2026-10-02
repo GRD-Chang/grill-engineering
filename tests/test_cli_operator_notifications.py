@@ -58,7 +58,7 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
     sibling_started, blocker_sent = Event(), Event()
     original_observe, original_close = Notifications.observe, Notifications.close
 
-    def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any, **kwargs: Any) -> dict[str, Any]:
         record("cards", card)
         if original_evidence in json.dumps(card) and card["header"]["subtitle"]["content"].endswith("#3"):
             blocker_sent.set()
@@ -74,16 +74,15 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
         original_observe(sender, current, **kwargs)
 
     def drain(sender: Notifications) -> None:
+        # Freeze notification writes before comparing read-only query effects
+        # while the sibling is still executing; normal close is unmodified.
         if sender.thread is not None:
             with sender.condition:
                 assert sender.condition.wait_for(lambda: not sender.document["pending"], timeout=10)
 
     def close(sender: Notifications) -> None:
-        try:
-            drain(sender)
-        finally:
-            original_close(sender)
-            assert sender.thread is None or not sender.thread.is_alive()
+        original_close(sender)
+        assert sender.thread is None or not sender.thread.is_alive()
 
     monkeypatch.setattr("agent_run.notifications.send", send)
     monkeypatch.setattr(Notifications, "observe", observe)
@@ -153,7 +152,11 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
         assert "--ticket 3" in json.dumps(blocker_cards()[0])
         local_slot = next(event["id"] for event in events(current)
                           if event.get("current") and event.get("work_subject") == "ticket:3")
-        assert read_notifications(managed_state(git_repo), run_id)["occurrences"][local_slot] == 1
+        def local_occurrences() -> set[str]:
+            return {item["id"] for item in read_notifications(managed_state(git_repo), run_id)["records"]
+                    if item.get("slot_id") == local_slot}
+
+        assert len(local_occurrences()) == 1
         if execution_failure:
             assert current["ticket_jobs"]["3"]["execution_failure"] == original_evidence
             # Resolve the failing execution through the advertised target, and
@@ -203,7 +206,7 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
         assert load_only_run_state(git_repo)["status"] == "progress_exhausted"
         assert sorted(records("developments")) == [2, 3]
         # Explicit Resume reports its actual outcome separately from polling.
-        resume_occurrence = read_notifications(managed_state(git_repo), run_id)["occurrences"][local_slot]
+        resume_occurrences = local_occurrences()
         agents.backends[3].data["developments"] = [{
             **human_blocker_step("developer-3"), "expected_thread_id": "developer-3",
         }]
@@ -218,7 +221,7 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
         assert records("developments").count(3) == 2, resumed.stdout + resumed.stderr
         assert after["ticket_jobs"]["3"]["blocked_reason"] == "agent_requires_human"
         assert after["ticket_agent_invocations"]["3"]["semantic_attempt"] == ticket_three_attempt
-        assert read_notifications(managed_state(git_repo), run_id)["occurrences"][local_slot] > resume_occurrence
+        assert local_occurrences() > resume_occurrences
         assert len(blocker_cards()) >= 2, "A resolved then repeated blocker needs a new notification"
         assert not read_notifications(managed_state(git_repo), run_id)["pending"]
     finally:

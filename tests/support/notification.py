@@ -15,3 +15,18 @@ def state_with_round(role: str = "development", outcome: str = "candidate") -> d
                                           "execution_segments": [{"started_at": "2026-01-01T00:00:00+00:00",
                                                                   "ended_at": "2026-01-01T00:00:09+00:00"}],
                                           "ended_at": "2026-01-01T00:00:09+00:00"}]}
+
+
+def parallel_state(reason: str = "agent_requires_human", mode: str = "concise") -> dict[str, Any]:
+    running = {"ticket_number": 2, "phase": "developing", "generation": 1}
+    return {
+        "run_id": "r", "language": "zh", "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent"}, "status": "active",
+        "notifications": {"enabled": True, "mode": mode},
+        "ticket_graph": {"tickets": {"2": {"title": "Running"}, "3": {"title": "原始标题"}}},
+        "active_ticket_job": running,
+        "ticket_jobs": {"2": running, "3": {
+            "ticket_number": 3, "generation": 7, "phase": "blocked", "blocked_reason": reason,
+            "human_blockers": ["External account required."], "execution_resume_phase": "developing",
+        }},
+    }

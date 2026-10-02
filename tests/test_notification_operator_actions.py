@@ -15,19 +15,7 @@ from agent_run.notifications import Notifications, read_notifications
 from support.notification import state_with_round
 
 
-def parallel_state(reason: str = "agent_requires_human", mode: str = "concise") -> dict[str, Any]:
-    running = {"ticket_number": 2, "phase": "developing", "generation": 1}
-    return {
-        "run_id": "r", "language": "zh", "repository": "example/project",
-        "parent": {"number": 1, "title": "Parent"}, "status": "active",
-        "notifications": {"enabled": True, "mode": mode},
-        "ticket_graph": {"tickets": {"2": {"title": "Running"}, "3": {"title": "原始标题"}}},
-        "active_ticket_job": running,
-        "ticket_jobs": {"2": running, "3": {
-            "ticket_number": 3, "generation": 7, "phase": "blocked", "blocked_reason": reason,
-            "human_blockers": ["External account required."], "execution_resume_phase": "developing",
-        }},
-    }
+from support.notification import parallel_state
 
 
 @pytest.mark.parametrize("mode", ["concise", "detailed"])
@@ -122,8 +110,10 @@ def test_outbox_recovers_each_unsent_gate_and_only_realerts_after_resolution(
     calls: list[dict[str, Any]] = []
     offline = True
 
-    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
+        if offline:
+            _cancel.set()
         return {"outcome": "failed" if offline else "success", "reason": "offline" if offline else None}
 
     monkeypatch.setattr("agent_run.notifications.send", send)
@@ -158,7 +148,7 @@ def test_resolved_gate_is_removed_while_other_transport_is_inflight(
     entered, release = threading.Event(), threading.Event()
     calls: list[dict[str, Any]] = []
 
-    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         entered.set()
         assert release.wait(5)
@@ -188,7 +178,7 @@ def test_current_ticket_set_is_not_evicted_by_progress_backlog_limit(
         state["ticket_graph"]["tickets"][str(number)] = {"title": f"Ticket {number}"}
     calls: list[str] = []
 
-    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any) -> dict[str, Any]:
+    def send(_config: Any, rendered: dict[str, Any], _identity: str, _cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered["header"]["subtitle"]["content"])
         return {"outcome": "success", "reason": None}
 

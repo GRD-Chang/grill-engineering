@@ -779,7 +779,11 @@ def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> N
         return
     reason = notifications.get("unavailable_reason")
     pending = notifications.get("pending", [])
+    unconfirmed = len(pending) + sum(
+        not item.get("cancelled") and (item.get("exhausted") or item.get("outcome") in {"failed", "unknown"})
+        for item in notifications.get("records", [])
+    )
     if reason:
         print(text("presentation.notification.unavailable", language=selected_language(state), reason=reason))
-    if pending:
-        print(text("presentation.notification.pending", language=selected_language(state), count=len(pending)))
+    if unconfirmed:
+        print(text("presentation.notification.pending", language=selected_language(state), count=unconfirmed))
