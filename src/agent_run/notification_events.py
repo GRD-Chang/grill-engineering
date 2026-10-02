@@ -185,6 +185,14 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     publication = (state.get("parent_job") if state.get("delivery_type") == "parent_only"
                    else state.get("run_publication")) or {}
     pr_number = publication.get("pr_number")
+    update = publication.get("approval_update")
+    if isinstance(update, dict) and not publication.get("approval_grant"):
+        result.append(event_envelope(
+            state, "approval_update", update,
+            event_copy(state, "approval_update"), "orange",
+            summary=event_copy(state, "approval_update_summary"),
+            live=publication.get("phase") not in {"ready_for_approval", "completed", "blocked"},
+        ))
     if type(pr_number) is int:
         result.append(event_envelope(state, "pr_created", pr_number, event_copy(state, "pr_created", number=pr_number),
                             "green", summary=event_copy(state, "pr_summary"),
@@ -196,7 +204,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     from agent_run.notification_resume import apply_resume_result
     result = apply_resume_result(state, result)
     if (state.get("notifications") or {}).get("mode", "detailed") == "concise":
-        result = [event for event in result if event["kind"] in {"run_start", "parent_started", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "resume", "boundary"}]
+        result = [event for event in result if event["kind"] in {"run_start", "parent_started", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "approval_update", "resume", "boundary"}]
     return list({event["id"]: event for event in result}.values())
 
 
@@ -214,7 +222,7 @@ def recovery_events(state: dict[str, Any], pending: list[dict[str, Any]]) -> lis
                  for event in projected if event["kind"] == "stage_end"}
     eligible = [event for event in projected if event["id"] in pending_ids and (
         (event["kind"] == "run_start" and state.get("status") == "starting") or
-        (event["kind"] in {"stage_start", "parent_started", "ticket_started", "acceptance_started", "acceptance_repair", "resume"}
+        (event["kind"] in {"stage_start", "parent_started", "ticket_started", "acceptance_started", "acceptance_repair", "approval_update", "resume"}
          and event.get("live") and event.get("attempt_id") not in completed)
         or event["kind"] == "acceptance_passed"
         or (event["kind"] == "acceptance_repair"

@@ -22,6 +22,7 @@ from agent_run.executor_host import (
     HostObservation,
 )
 from agent_run.final_approval_operation import (
+    approval_update_pending,
     final_approval_busy_message,
     final_approval_failure,
     has_final_approval,
@@ -69,6 +70,7 @@ class ActionReceipt:
     payload_digest: str | None
     failure: str | None = None
     resume_intent: dict[str, Any] | None = None
+    result_status: str | None = None
 
 
 class _ExecutorDispatch:
@@ -395,6 +397,7 @@ class RunLifecycle:
             and (
                 action.get("kind") not in {"approve", "revise", "requeue"}
                 or observing_active_invocation
+                or action.get("result_status") == "updating"
             )
             and action_receipt_matches(current, action)
             and not reconciling_receipt_predecessor
@@ -410,6 +413,12 @@ class RunLifecycle:
                 )
             )
             and not _safe_executor_recovery(current)
+            and not (
+                request.kind == "resume"
+                and action.get("result_status") == "updating"
+                and approval_update_pending(current)
+                and not _has_unfinished_agent_work(current)
+            )
             and not (
                 session_interruption_is_persisted(current)
                 and executor.get("failure") == "session_interrupted"
@@ -850,7 +859,8 @@ class RunLifecycle:
             raise ActionReconciliationError("原 Action 缺少准确 Run receipt")
         if action.get("status") in {"completed", "failed"}:
             return dict(record)
-        if is_final_approval_action(action, current) and final_approval_failure(current):
+        updating = is_final_approval_action(action, current) and approval_update_pending(current)
+        if not updating and is_final_approval_action(action, current) and final_approval_failure(current):
             return self.control.finish_executor(
                 self.task, action_id=_string_field(action, "action_id"),
                 generation=_positive_integer(action.get("executor_generation")),
@@ -879,7 +889,7 @@ class RunLifecycle:
             action_id=_string_field(action, "action_id"),
             generation=_positive_integer(action.get("executor_generation")),
             application_receipt=receipt,
-            result_status=_string_field(current, "status"),
+            result_status="updating" if updating else _string_field(current, "status"),
         )
 
     def _reconcile_receipt_executor_exit(
@@ -1260,19 +1270,22 @@ class RunLifecycle:
                     self.execute_with_binding(run_id, action_id, generation)
                     if self.execute_with_binding is not None else self.execute(run_id)
                 )
+            updating = approval_update_pending(result)
             self.control.complete_action(
                 self.task, action_id=action_id, generation=generation,
-                result_status=str(result.get("status")),
-                failure=final_approval_failure(result),
+                result_status="updating" if updating else str(result.get("status")),
+                failure=None if updating else final_approval_failure(result),
             )
-            return result
-        result_status = prepared.get("status")
-        self.control.complete_action(
-            self.task,
-            action_id=action_id,
-            generation=generation,
-            result_status=(result_status if isinstance(result_status, str) else None),
-        )
+            if not updating:
+                return result
+        else:
+            result_status = prepared.get("status")
+            self.control.complete_action(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                result_status=(result_status if isinstance(result_status, str) else None),
+            )
         self.control.assert_executor_current(
             self.task,
             action_id=action_id,
@@ -1618,9 +1631,13 @@ class RunLifecycle:
                 "Delivery Run 缺少可对账的 Action Application Receipt"
             )
         action = record.get("action") if isinstance(record, Mapping) else None
+        updating = (
+            isinstance(action, Mapping) and is_final_approval_action(action, state)
+            and approval_update_pending(state)
+        )
         if (
             isinstance(action, Mapping) and is_final_approval_action(action, state)
-            and final_approval_failure(state)
+            and not updating and final_approval_failure(state)
         ):
             record = self.control.finish_executor(
                 self.task, action_id=action_id, generation=generation,
@@ -1635,7 +1652,8 @@ class RunLifecycle:
             generation=generation,
             application_receipt=application_receipt,
             result_status=(
-                state.get("status") if isinstance(state.get("status"), str) else None
+                "updating" if updating
+                else state.get("status") if isinstance(state.get("status"), str) else None
             ),
         )
         return (
@@ -1876,6 +1894,13 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=run_id if isinstance(run_id, str) else None,
             status="completed",
+            result_status=(
+                action.get("result_status")
+                if isinstance(action.get("result_status"), str)
+                else "updating" if (
+                    is_final_approval_action(action, state) and approval_update_pending(state)
+                ) else str(state.get("status"))
+            ),
             resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status="exited",
@@ -1931,6 +1956,10 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=_record_run_id(record),
             status=status if isinstance(status, str) else "unknown",
+            result_status=(
+                action.get("result_status")
+                if isinstance(action.get("result_status"), str) else None
+            ),
             resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status=(

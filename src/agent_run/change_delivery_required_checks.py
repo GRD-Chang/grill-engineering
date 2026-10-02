@@ -201,6 +201,11 @@ def _verify_live_publication_identity(
     if not isinstance(live, dict) or not _live_publication_identity_matches(
         stage, state, job, live
     ):
+        if stage.contract.label == "parent-only" and isinstance(live, dict):
+            from agent_run.parent_only_integration import reconcile_parent_integration
+
+            if not reconcile_parent_integration(stage, state, job, live=live):
+                return job.get("phase") != "accepted"
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -232,6 +237,19 @@ def observe_required_checks(
             expected_head_sha=str(job["publication_sha"]),
         )
     except (GitHubReadError, OSError, TimeoutError) as error:
+        if (
+            isinstance(error, GitHubReadError)
+            and error.code == "change_pr_head_drift"
+            and stage.contract.label == "parent-only"
+        ):
+            # A check snapshot can race an allowed source append. Re-read the
+            # complete identity and apply the same append-only integration gate
+            # used for drift observed before/after the check read.
+            outcome = _verify_live_publication_identity(
+                stage, state, job, pr_number, checks
+            )
+            if outcome is not None:
+                return outcome, checks
         if isinstance(error, GitHubReadError) and error.code in {
             "change_pr_head_drift",
             "change_pr_identity_mismatch",

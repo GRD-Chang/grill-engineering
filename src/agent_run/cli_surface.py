@@ -80,7 +80,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     return (
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1
-        or _ci_recovery_checkpoint_is_ready(state)
+        or _recovery_checkpoint_is_ready(state)
     )
 
 
@@ -114,12 +114,13 @@ def _review_budget_checkpoint_count(state: dict[str, object]) -> int:
     return len(budget_checkpoint_subjects(state))
 
 
-def _ci_recovery_checkpoint_is_ready(state: dict[str, object]) -> bool:
+def _recovery_checkpoint_is_ready(state: dict[str, object]) -> bool:
     gates = operator_gate_subjects(state)
     return (
         len(gates) == 1
         and gates[0][1].get("blocked_reason") in {
-            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+            "integration_resync_exhausted",
         }
         and not budget_checkpoint_subjects(state)
         and human_blocker_subject_count(state) == 0

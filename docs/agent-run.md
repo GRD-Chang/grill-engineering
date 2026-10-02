@@ -233,7 +233,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker、`operator_stopped`，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
-| `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
+| `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR；Parent-only 发现允许接纳的远端追加时先提示并自动更新、复验，再等待新批准 | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate；更新启动不表示交付完成 |
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
 | `stop` | 任意已知、未终止且有活动 Executor 的 Run | 原子撤销旧 Executor 写入权，定向终止其 Worker 进程组，并把 Run 置为可显式恢复的 `operator_stopped` | 不把 Stop 记为失败，不删除 checkout、Thread、Attempt 或 Artifact；确认无活动 Executor 及重复 Stop 都严格只读 |
 | `resume --ticket` | 指定 Ticket 位于合法局部暂停；可与其他 Ticket 的执行并存 | 复核需求、暂停授权和原 Executor；恢复意图及 FIFO 位置落盘后返回，名额可用时原 Executor 自动继续 | 返回成功只表示已接受；不新启 Executor，不插队，不重置有效预算；重复请求保持队位，最终批准和全局门禁仍有效 |
@@ -371,6 +371,9 @@ Repair → Candidate Run Acceptance → 严格 promotion 的路径；若 promoti
 Run tree、Parent、Graph 或 Completion 任一非 default 绑定失配，才回退到 fresh Run Acceptance。若只有
 default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；已集成 Job 在 revalidation 中又收到 Finding 时，
 Controller 保留 Repair Thread、Integration-repair Worktree 与计数，归档旧 Job/PR 并轮转新的 branch/PR。
+
+Parent-only 的 `approve` 先在终端说明自动更新规则：若默认分支或原任务分支新增可接纳的提交，将自动更新与复验，并重新请求批准。确认存在这类变化后，会向已启用的飞书提交更新通知，无需再次确认。旧批准段结束后，同一 Run 自动同步；真实冲突携原始证据交给修复，再完成 Reviewer 与适用检查，更新原 PR。此时可用 `stop` 和 `resume`，保留成果及有效预算历史。`action.status=updating` / `action_audit.result_status=updating` 仅表示更新已启动；新组合通过后仍需再次 `approve`，这次最终合并及必要收尾仍不可取消。通知不可用不阻止更新；需求变化仍须 requeue，身份、权限或非追加历史仍暂停处理。resync 额度耗尽时暂停并通知；显式 `resume` 只续期该额度，不重置需求、集成验收或 CI 的有效预算。
+
 `revise` 原样保存维护者反馈、重置一个新的 `N` 次实际变更预算，并进入同一 Candidate/promotion 语义。`abandon` 先把
 `abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
 带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期

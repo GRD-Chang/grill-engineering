@@ -2739,7 +2739,7 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
 
 
 @pytest.mark.parametrize("check_result", ["pass", "none"])
-def test_parent_only_approve_blocks_default_base_drift_before_merge(
+def test_parent_only_approve_updates_default_base_drift_before_merge(
     git_repo: Path, check_result: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -2757,7 +2757,7 @@ def test_parent_only_approve_blocks_default_base_drift_before_merge(
                 ],
                 "publications": [parent_publication()],
                 "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                    passing_acceptance("parent-reviewer-1", "candidate passed"),
                 ],
             }
         ),
@@ -2779,15 +2779,23 @@ def test_parent_only_approve_blocks_default_base_drift_before_merge(
     )
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    approval = run_cli(git_repo, fixture, "approve", run_id)
+    update_agents = git_repo / "updated-parent-agents.json"
+    update_agents.write_text(json.dumps({
+        "developments": [],
+        "reviews": [passing_acceptance("parent-reviewer-2", "updated combination passed")],
+        "publications": [parent_publication()],
+    }))
+    approval = run_cli(git_repo, fixture, "approve", run_id, "--agent-fixture", str(update_agents))
 
-    assert approval.returncode == 2
-    assert stdout_json(approval)["status"] == "blocked"
+    assert approval.returncode == 0, approval.stdout + approval.stderr
+    assert stdout_json(approval)["status"] == "parent_approval_pending"
     state = load_only_run_state(git_repo)
-    assert state["diagnostics"][0]["code"] == "published_head_mismatch"
-    assert state["parent_job"]["phase"] == "blocked"
+    assert state["diagnostics"] == []
+    assert "approval_grant" not in state["parent_job"]
+    assert state["parent_job"]["pr_number"] == before["parent_job"]["pr_number"]
+    assert state["parent_job"]["phase"] == "ready_for_approval"
     assert "integrated_sha" not in state["parent_job"]
-    assert state["parent_job"]["publication_sha"] == before["parent_job"][
+    assert state["parent_job"]["publication_sha"] != before["parent_job"][
         "publication_sha"
     ]
     pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
@@ -2797,8 +2805,12 @@ def test_parent_only_approve_blocks_default_base_drift_before_merge(
     assert "integrated_sha" not in pull
 
 
-def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={})
+def test_parent_only_approve_times_out_on_inconsistent_head_observation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={}, supervision_clock_multiplier=60,
+    )
     agents = git_repo / "parent-only-agents.json"
     agents.write_text(
         json.dumps(
@@ -2824,7 +2836,9 @@ def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> N
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert delivered.returncode == 0, delivered.stderr
+    before = load_only_run_state(git_repo)["parent_job"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
+    # Only the PR observation changes; remote history has not been rewritten.
     data["delivery"].update(
         {"required_checks": ["pass"], "live_head_override": "f" * 40}
     )
@@ -2832,15 +2846,25 @@ def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> N
 
     approval = run_cli(git_repo, fixture, "approve", run_id)
 
-    assert approval.returncode == 2
-    assert stdout_json(approval)["status"] == "blocked"
+    assert approval.returncode == 2, approval.stderr
+    assert stdout_json(approval)["status"] == "supervision_timeout"
     state = load_only_run_state(git_repo)
-    assert state["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert state["terminal_kind"] == "supervision_timeout"
+    assert state["supervision_wait"]["kind"] == "github_convergence"
+    assert state["supervision_wait"]["retry_count"] >= 1
+    assert state["diagnostics"][0]["code"] == "supervision_timeout"
+    assert state["diagnostics"][0]["last_error"]["code"] == (
+        "github_pr_head_observation_pending"
+    )
+    assert state["parent_job"]["candidate_sha"] == before["candidate_sha"]
+    assert state["parent_job"]["integration_resync"] == before["integration_resync"]
+    assert "approval_update" not in state["parent_job"]
     assert "integrated_sha" not in state["parent_job"]
-    pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
-        "pull_requests"
-    ][0]
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    pull = delivery["pull_requests"][0]
     assert pull["state"] == "OPEN"
+    assert "integrated_sha" not in pull
+    assert not delivery.get("closed_issues")
 
 
 @pytest.mark.parametrize(

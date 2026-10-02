@@ -73,6 +73,8 @@ def public_action_receipt(
         "applying": "in_progress",
         "failed": "failed",
     }.get(receipt.status, "in_progress")
+    if receipt.status == "completed" and receipt.result_status == "updating":
+        status = "updating"
     return {
         "repository": repository,
         "parent": parent_view,

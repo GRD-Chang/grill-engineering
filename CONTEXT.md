@@ -294,7 +294,7 @@ _Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以 Ctrl-C 
 _Avoid_: 终端控制文件、重复消费、通用消息队列、过期授权、命令各自直接驱动 Engine、隐式授权、重复命令创建第二个 Action
 
 **Action Admission Gate（动作准入门）**:
-一个 Local Delivery Workspace 中每个 Delivery Task 对维护者 Lifecycle Action 的单槽位准入规则：同一时刻最多一个已接受但尚未完成的 Action，后来的新 Action 立即拒绝且不修改 Run、不等待、不排队。`run`、普通 `resume`、`revise` 与 `requeue` 在各自意图已按 Action identity 准确应用且 Run Executor Session 完成启动握手时释放准入；`stop` 与 `abandon` 在各自目标状态持久形成时释放准入。`approve` 及恢复原最终批准操作的 `resume` 按 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md) 占用准入，直至完整操作成功或形成准确的无法继续边界，不能只凭批准已保存便释放；失败后仍须对账原执行和实际结果才能恢复。其他 RunDriver 自动工作不占用该门，只读查询与其他非 Delivery Run 生命周期管理也不经过该门。Action 中断或结果未知时，完全匹配的原命令可以附着并对账；恢复原最终批准操作的 `resume` 也可在准入前对账该原操作。只有先形成原 Action 的确定终态并释放单槽，才可顺序接受 successor，恢复执行还须确认旧执行者已结束，不能仅清除忙碌标记后接受下一项。
+一个 Local Delivery Workspace 中每个 Delivery Task 对维护者 Lifecycle Action 的单槽位准入规则：同一时刻最多一个已接受但尚未完成的 Action，后来的新 Action 立即拒绝且不修改 Run、不等待、不排队。`run`、普通 `resume`、`revise` 与 `requeue` 在各自意图已按 Action identity 准确应用且 Run Executor Session 完成启动握手时释放准入；`stop` 与 `abandon` 在各自目标状态持久形成时释放准入。`approve` 及恢复原最终批准操作的 `resume` 按 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md) 占用准入，直至完整操作成功或形成准确的无法继续边界，不能只凭批准已保存便释放；Parent-only 发现可接纳的远端追加时，旧批准失效，原 Action 以更新启动结果释放准入，同一 Executor 自动进入可停止更新；失败后仍须对账原执行和实际结果才能恢复。其他 RunDriver 自动工作不占用该门，只读查询与其他非 Delivery Run 生命周期管理也不经过该门。Action 中断或结果未知时，完全匹配的原命令可以附着并对账；恢复原最终批准操作的 `resume` 也可在准入前对账该原操作。只有先形成原 Action 的确定终态并释放单槽，才可顺序接受 successor，恢复执行还须确认旧执行者已结束，不能仅清除忙碌标记后接受下一项。
 _Avoid_: 整个 Run Executor Session 锁、全仓库串行、Action 队列、优先级升级、过期授权、阻止 status/history、遗留 busy 标记
 
 **Configuration Mutation（配置变更）**:
@@ -318,7 +318,7 @@ Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可�
 _Avoid_: 用户回执、Action history、第二份业务状态、重放业务意图、Publisher authority
 
 **Action Receipt（动作回执）**:
-公开生命周期命令在返回前对本次 Lifecycle Action 给出的有界、准确结果。`run`、普通 `resume`、`revise` 与 `requeue` 的成功回执说明命令特定意图已按 Action identity 幂等应用到 Delivery Run，且准确 Run Executor Session 已完成启动握手或已被确认存在；它不证明 Agent 工作、当前自动区间或整个 Delivery Run 已完成。`stop` 与 `abandon` 的成功回执只在各自准确目标状态已经持久形成后给出；`approve` 及恢复原最终批准操作的 `resume` 只在最终交付与必要收尾完成后给出成功回执，失败、结果未知或批准失效须如实说明已完成部分及当前允许的下一步。Action 接受后的中间进展属于可离开的 Action Completion Observation。启动或收口结果未知时不得伪装成功或直接创建第二个 Executor，须先依据 Host、Task Control 与 Run application receipt 对账。
+公开生命周期命令在返回前对本次 Lifecycle Action 给出的有界、准确结果。`run`、普通 `resume`、`revise` 与 `requeue` 的成功回执说明命令特定意图已按 Action identity 幂等应用到 Delivery Run，且准确 Run Executor Session 已完成启动握手或已被确认存在；它不证明 Agent 工作、当前自动区间或整个 Delivery Run 已完成。`stop` 与 `abandon` 的成功回执只在各自准确目标状态已经持久形成后给出；`approve` 及恢复原最终批准操作的 `resume` 只在最终交付与必要收尾完成后给出成功回执，失败、结果未知或批准失效须如实说明已完成部分及当前允许的下一步。Parent-only 自动更新的回执使用 `updating`，只证明原批准段结束并开始更新与复验；更新期间可 Stop/Resume，通过后仍需新批准。Action 接受后的中间进展属于可离开的 Action Completion Observation。启动或收口结果未知时不得伪装成功或直接创建第二个 Executor，须先依据 Host、Task Control 与 Run application receipt 对账。
 _Avoid_: 以启动握手冒充 Delivery Run 或 Agent 完成、仅凭进程启动请求、模糊 success、启动未知时盲目重试
 
 **Action Receipt View（动作回执视图）**:

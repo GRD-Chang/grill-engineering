@@ -107,13 +107,14 @@ def _publication_operation(
 
 
 def _reconcile_delivery_snapshot(
-    stage: PublishedHeadStage, state: dict[str, Any], job: dict[str, Any]
+    stage: PublishedHeadStage, state: dict[str, Any], job: dict[str, Any],
+    *, live: dict[str, Any] | None = None,
 ) -> bool:
     label = stage.contract.label
     if label.startswith("ticket-"):
         return reconcile_ticket_integration(stage, state, job)
     if label == "parent-only":
-        return reconcile_parent_integration(stage, state, job)
+        return reconcile_parent_integration(stage, state, job, live=live)
     if label.startswith("run-repair-"):
         if isinstance(job.get("integrated_sha"), str):
             return True
@@ -280,7 +281,7 @@ def publish_and_merge(
             state["status"] = "waiting_merge"
             stage.save(state)
             return True
-        if not _reconcile_delivery_snapshot(stage, state, job):
+        if not _reconcile_delivery_snapshot(stage, state, job, live=existing_live):
             return False
         observed_published = (
             existing_live.get("head_sha") == job["publication_sha"]
@@ -498,6 +499,8 @@ def publish_and_merge(
     )
     if exhausted:
         return True
+    if parent_only and not reconcile_parent_integration(stage, state, job, live=live):
+        return False
     fallback = job.get("publication_authority") == "fallback"
     ci_repair = job.get("publication_authority") == "ci_repair"
     acceptance = job.get("acceptance_record")

@@ -88,6 +88,7 @@ class ParentDeliveryEngine:
                     git=self.git, states=self.states, github=self.github
                 ).complete_parent(result)
             preserve_checkout = result.get("status") in {
+                "parent_delivery_pending",
                 "waiting_checks",
                 "requeue_required",
                 "blocked",
@@ -134,6 +135,7 @@ class ParentDeliveryEngine:
         if job.get("phase") == "ready_for_approval":
             authority = parent_approval_grant_authority(state, job)
             if not grant_matches(job.get("approval_grant"), authority):
+                job.pop("approval_update", None)
                 job["approval_grant"] = create_grant(authority)
             job["phase"] = "waiting_checks"
             state.update(
@@ -339,6 +341,7 @@ class ParentDeliveryEngine:
             "integrated_sha",
             "merge_intent",
             "approval_grant",
+            "approval_update",
             "pr_number",
             "pending_attempt",
             "blocked_reason",

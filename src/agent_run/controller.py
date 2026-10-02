@@ -1218,10 +1218,10 @@ class Controller:
                 "change_pr_head_changed_externally",
                 "change_pr_base_changed_externally",
             }
-            and subject.startswith("run-repair:")
+            and subject.startswith(("run-repair:", "parent-only:"))
             # A failed remote read cannot prove a rewrite. Delivery will
             # re-read the exact snapshot before reviewing or publishing.
-            and _run_repair_pr_is_append_only(
+            and _change_pr_is_append_only(
                 state, job, self.github, self.publisher.git
             ) is not False
         ):
@@ -2103,14 +2103,18 @@ def _resume_ci_recovery_window(
     return True
 
 
-def _run_repair_pr_is_append_only(
+def _change_pr_is_append_only(
     state: dict[str, Any], job: dict[str, Any],
     github: GitHubReader, git: GitRepository,
 ) -> bool | None:
     pr_number = job.get("pr_number")
     published = job.get("published_sha")
-    branch = job.get("repair_branch")
-    base_branch = state.get("run_branch")
+    parent_only = state.get("delivery_type") == "parent_only"
+    branch = job.get("parent_branch" if parent_only else "repair_branch")
+    base_branch = (
+        _state_mapping(state, "base").get("branch")
+        if parent_only else state.get("run_branch")
+    )
     if (
         type(pr_number) is not int or not isinstance(published, str)
         or not isinstance(branch, str) or not isinstance(base_branch, str)
@@ -2130,7 +2134,7 @@ def _run_repair_pr_is_append_only(
     ):
         return False
     try:
-        if not repair_run_branch_is_current(git, job, git.resolve(base_branch)):
+        if not parent_only and not repair_run_branch_is_current(git, job, git.resolve(base_branch)):
             return False
     except GitError:
         return False

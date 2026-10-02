@@ -16,6 +16,7 @@ from agent_run.change_delivery_threads import (
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.git import GitError
+from agent_run.github import GitHubReadError
 from agent_run.integration_resync_budget import ResyncBudgetExhausted
 from agent_run.parent_integration import (
     ParentHistoryRewritten,
@@ -32,7 +33,10 @@ from agent_run.semantic_attempt import (
 )
 
 
-def reconcile_parent_integration(stage: Any, state: dict[str, Any], job: dict[str, Any]) -> bool:
+def reconcile_parent_integration(
+    stage: Any, state: dict[str, Any], job: dict[str, Any],
+    *, live: dict[str, Any] | None = None,
+) -> bool:
     """Invalidate Parent publication if either remote ref gained outside work."""
 
     if not parent_integration_record_is_valid(stage.git, job):
@@ -43,10 +47,31 @@ def reconcile_parent_integration(stage: Any, state: dict[str, Any], job: dict[st
     source, target = stage.github.live_branch_heads(
         stage.contract.branch, stage.contract.base_branch
     )
+    if live is not None and (
+        live.get("state") != "OPEN"
+        or live.get("head_branch") != stage.contract.branch
+        or live.get("head_repository") != state.get("repository")
+        or live.get("base_repository") != state.get("repository")
+        or live.get("base_branch") != stage.contract.base_branch
+        or not isinstance(live.get("head_sha"), str) or not live["head_sha"]
+        or not isinstance(live.get("base_sha"), str) or not live["base_sha"]
+    ):
+        _pause(stage, state, job, "published_head_mismatch", "Parent PR identity does not match its remote refs")
+        return False
     published = job.get("published_sha")
     if source is None:
         _pause(stage, state, job, "remote_source_missing", "Parent source ref is missing")
         return False
+    if live is not None and (
+        live["head_sha"] != source or live["base_sha"] != target
+    ):
+        # These reads are not atomic. Let the existing bounded supervisor
+        # retry the whole publication gate, including PR identity/merge state;
+        # do not let callers continue with their earlier live PR snapshot.
+        raise GitHubReadError(
+            "github_pr_head_observation_pending",
+            "Parent PR and remote branch heads have not converged",
+        )
     if isinstance(published, str) and source != published:
         try:
             stage.git.fetch_remote_commit(stage.contract.branch, source)
@@ -69,6 +94,27 @@ def reconcile_parent_integration(stage: Any, state: dict[str, Any], job: dict[st
     )
     if (source == record["source_sha"] or own_source) and target == record["target_sha"]:
         return True
+    # Only append-only snapshots may end approval in favour of automatic
+    # updating. A rewritten target must retain the ordinary human gate.
+    try:
+        stage.git.fetch_remote_commit(stage.contract.base_branch, target)
+        if not stage.git.is_ancestor(str(record["target_sha"]), target):
+            raise ParentHistoryRewritten("target", str(record["target_sha"]), target)
+    except ParentHistoryRewritten as error:
+        _pause(stage, state, job, "integration_history_rewritten", str(error))
+        return False
+    except GitError as error:
+        _pause(stage, state, job, "integration_failed", str(error))
+        return False
+    grant = job.get("approval_grant")
+    if isinstance(grant, dict):
+        job["approval_update"] = {
+            "granted_at": grant["granted_at"],
+            "previous_head_sha": job["publication_sha"],
+            "previous_base_sha": record["target_sha"],
+            "source_sha": source,
+            "target_sha": target,
+        }
     job["phase"] = "accepted"
     for key in (
         "publication", "publication_sha", "publication_parent_sha",
@@ -78,6 +124,7 @@ def reconcile_parent_integration(stage: Any, state: dict[str, Any], job: dict[st
         job.pop(key, None)
     clear_required_checks_observation(job)
     state["status"] = "parent_delivery_pending"
+    state["terminal_kind"] = None
     state["diagnostics"] = []
     stage.save(state)
     return False

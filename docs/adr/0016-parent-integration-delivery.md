@@ -12,6 +12,10 @@ status: accepted
 
 Publisher 保留已发布源分支的祖先关系，以准确远端 head 为 lease 追加提交并更新原 PR。新的组合、CI head 或批准依据失效时回到相应审核或暂停边界；最终批准仍绑定当前交付对象。新增持久状态使用新的 Delivery Policy 协议号，旧 Run 在外部写入前明确拒绝，不做自动迁移。
 
+Parent-only 的公开批准发现上述追加时，按 [ADR 0012](0012-noncancellable-final-approval.md) 结束旧批准段，自动进入可停止更新。Run Driver 的 `RunOutcome.next_step` 在每次事实刷新后重新选择交付、验收或发布；不继续刷新前已失效的操作。Change Delivery 在丢失原批准时先返回生命周期收口，接着由同一 Executor 复用普通循环。Parent-only 不因这次衔接获得 Ticket fallback 权限，需求、集成、CI 与 resync 预算保持独立。
+
+Parent-only 的 PR 快照与分支头读取并非原子操作。PR 仓库、分支或状态失配仍按原门禁处理；仅 head/base SHA 尚未一致时，复用有界 GitHub 收敛监督重读完整发布门禁，不能继续使用旧 PR 快照。读取一致后再检查祖先关系及更新授权；读间重试不消耗 resync，持续不一致按既有监督超时暂停，允许显式 resume 后重新核对。
+
 可修复的 Required Checks 失败由每个交付对象独立的 CI 恢复额度处理：默认外层三轮、每轮最多三次开发修复。Ticket 首轮只允许一次修复；本轮使用准确旧发布授权、失败检查证据和新 Candidate 绑定的窄发布收据，不伪造 Reviewer 通过。Ticket 后续轮次与两种 Parent 的 CI 修复均需 Reviewer。CI 额度耗尽只暂停并续期对应层，不改需求开发、Parent 集成或 resync 额度。运行状态分别展示各窗口用量。
 
 多 Ticket Parent 的逻辑 CI 交付对象是 Run：最终 Run PR、内部 Repair PR 与后继提交共用 Run Acceptance 持久化的 `ci_recovery`。活动 Repair Job 持有相同预算快照，完成后由 Run 继续持有；更换内部 PR 或显式恢复不创建另一份额度。CI 修复的次数只记入 CI 内层，普通修复用量从独立 `review_budget` 展示。CI 内层或外层耗尽时，Repair Cycle 一同标记暂停；显式续期只恢复对应 CI 窗口及活动 Cycle，不重置外层累计轮数。

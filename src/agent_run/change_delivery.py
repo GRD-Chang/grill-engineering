@@ -212,10 +212,14 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
         """Complete the existing entry point using the same resumable steps."""
+        approved = isinstance(job.get("approval_grant"), dict)
         while self.advance(state, job, checkout, allow_agent=True).kind in {
             DeliveryStepKind.CONTINUE, DeliveryStepKind.NEEDS_AGENT,
         }:
-            pass
+            if approved and not isinstance(job.get("approval_grant"), dict):
+                # Yield to the lifecycle owner before work on a new result.
+                # It must end the old noncancellable Action first.
+                break
         return state
 
     def advance(

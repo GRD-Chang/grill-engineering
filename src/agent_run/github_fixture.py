@@ -1918,6 +1918,9 @@ class FixtureGitHubPublisher:
             check=True,
         )
         self.data["default_head_sha"] = created
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if isinstance(pull, dict) and pull.get("base_branch") == base_branch:
+                pull["base_sha"] = created
         self._save()
 
 

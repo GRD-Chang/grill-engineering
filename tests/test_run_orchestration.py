@@ -32,7 +32,7 @@ from agent_run.operator_gate import (
 )
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.resume_intent import bind_resume_intent
-from agent_run.run_driver import DirectRunOperations
+from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.state import StateStore
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.ticket_eligibility import TicketEligibilityError
@@ -206,7 +206,7 @@ def test_run_repair_supersedes_a_retained_publication_approval_phase() -> None:
 
     assert operator_gate_subjects(state) == []
     assert not has_run_operator_gate(state)
-    assert not DirectRunOperations._cannot_advance(state)
+    assert DirectRunOperations.classify(state).next_step is RunStep.ACCEPT
     assert operator_action_views(state) == []
 
 
@@ -214,7 +214,7 @@ def test_ordinary_run_cannot_advance_an_operator_stopped_boundary() -> None:
     state: dict[str, Any] = {"status": "operator_stopped"}
 
     assert has_run_operator_gate(state)
-    assert DirectRunOperations._cannot_advance(state)
+    assert DirectRunOperations.classify(state).next_step is None
 
 
 def test_pending_acceptance_cannot_claim_a_publication_approval_gate() -> None:

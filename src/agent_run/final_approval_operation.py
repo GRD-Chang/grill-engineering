@@ -75,7 +75,22 @@ def is_final_approval_action(
     action: Mapping[str, Any], state: Mapping[str, Any]
 ) -> bool:
     return action.get("kind") == "approve" or (
-        action.get("kind") == "resume" and has_final_approval(state)
+        action.get("kind") == "resume" and (
+            has_final_approval(state) or action.get("final_approval_operation") is True
+        )
+    )
+
+
+def approval_update_pending(state: Mapping[str, Any]) -> bool:
+    """Recognize the durable handoff from old approval to stoppable update."""
+    job = state.get("parent_job")
+    return (
+        state.get("delivery_type") == "parent_only"
+        and state.get("status") == "parent_delivery_pending"
+        and isinstance(job, Mapping)
+        and job.get("phase") == "accepted"
+        and isinstance(job.get("approval_update"), Mapping)
+        and not has_final_approval(state)
     )
 
 

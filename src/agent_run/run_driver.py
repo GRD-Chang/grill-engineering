@@ -59,6 +59,7 @@ class RunStep(str, Enum):
     ACCEPT = "accept-run"
     PUBLISH = "publish-run"
     REQUEUE = "requeue"
+    REFRESH = "refresh"
 
 
 @dataclass(frozen=True)
@@ -289,14 +290,13 @@ class DirectRunOperations:
 
     def deliver(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.DELIVER:
+            return selected
         if refreshed.get("status") == "completed" and has_final_approval(refreshed):
             return self.classify(DeliveryCleanupEngine(
                 git=self.git, states=self.states, github=self.publisher
             ).resume(run_id))
-        if self._cannot_advance(refreshed) and not (
-            refreshed.get("status") == "parent_approval_pending" and has_final_approval(refreshed)
-        ):
-            return self.classify(refreshed)
         refreshed = DeliveryCleanupEngine(
             git=self.git, states=self.states, github=self.publisher
         ).resume(run_id)
@@ -364,20 +364,9 @@ class DirectRunOperations:
                     state=refreshed,
                     next_step=None,
                 )
-        acceptance = refreshed.get("run_acceptance")
-        repair_wait = (
-            isinstance(acceptance, dict)
-            and acceptance.get("phase") == "repairing"
-            and isinstance(acceptance.get("repair_job"), dict)
-            and refreshed.get("status")
-            in {"waiting_checks", "waiting_external", "waiting_merge"}
-        )
-        if self._cannot_advance(refreshed) or (
-            refreshed.get("status")
-            not in {"run_acceptance_pending", "run_publication_pending"}
-            and not repair_wait
-        ):
-            return self.classify(refreshed)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.ACCEPT:
+            return selected
         return self._accept_current_run(run_id)
 
     def _accept_current_run(self, run_id: str) -> RunOutcome:
@@ -399,27 +388,14 @@ class DirectRunOperations:
 
     def publish(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed) and not (
-            refreshed.get("status") == "run_approval_pending" and has_final_approval(refreshed)
-        ):
-            return self.classify(refreshed)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.PUBLISH:
+            return selected
         publication = refreshed.get("run_publication")
         if (
             isinstance(publication, dict)
             and publication.get("phase") == "publication_pending"
         ):
-            return self.classify(refreshed)
-        eligible = refreshed.get("status") == "run_publication_pending" or (
-            isinstance(publication, dict)
-            and refreshed.get("status")
-            in {
-                "publication_pending",
-                "waiting_checks",
-                "waiting_external",
-                "run_approval_pending",
-            }
-        )
-        if not eligible:
             return self.classify(refreshed)
         repository = self.github_reader.repository()
         publication_engine = RunPublicationEngine(
@@ -476,7 +452,7 @@ class DirectRunOperations:
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed) and refreshed.get("status") not in {
+        if refreshed.get("status") not in {
             "run_approval_pending",
             "parent_approval_pending",
             "parent_closeout_pending",
@@ -595,6 +571,9 @@ class DirectRunOperations:
             return self.accept(run_id)
         if step is RunStep.PUBLISH:
             return self.publish(run_id)
+        if step is RunStep.REFRESH:
+            refreshed, _ = self._refresh(run_id)
+            return self.classify(refreshed)
         return self.requeue(run_id)
 
     @staticmethod
@@ -614,7 +593,7 @@ class DirectRunOperations:
             kind = RunOutcomeKind.TERMINAL_COMPLETION
         elif status == "abandoned":
             kind = RunOutcomeKind.TERMINAL_ABANDONMENT
-        elif _is_currentness_human_blocker(state) or status in {
+        elif has_run_operator_gate(state) or _is_currentness_human_blocker(state) or status in {
             "ready_for_human",
             "run_approval_pending",
             "parent_approval_pending",
@@ -626,15 +605,6 @@ class DirectRunOperations:
         else:
             kind = RunOutcomeKind.PROGRESS
         return RunOutcome(kind=kind, state=state, next_step=_next_step(state))
-
-    @staticmethod
-    def _cannot_advance(state: dict[str, Any]) -> bool:
-        return (
-            state.get("status") in {"completed", "abandoned"}
-            or has_run_operator_gate(state)
-            or is_github_refresh_wait(state)
-            or _is_currentness_human_blocker(state)
-        )
 
 
 class RunDriver:
@@ -860,6 +830,8 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
     status = str(state.get("status"))
+    if is_github_refresh_wait(state):
+        return RunStep.REFRESH
     if has_final_approval(state):
         if status == "run_approval_pending":
             return RunStep.PUBLISH
@@ -867,6 +839,8 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
             return RunStep.DELIVER
         if status == "completed" and final_approval_cleanup_pending(state):
             return RunStep.DELIVER
+    if status in {"completed", "abandoned"} or has_run_operator_gate(state) or _is_currentness_human_blocker(state):
+        return None
     if _has_pending_stale_dirty_checkout(state):
         return RunStep.ACCEPT
     if status in {

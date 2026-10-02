@@ -1371,7 +1371,10 @@ def _print_lifecycle_result(
             if receipt.failure:
                 print(message("failure_reason", reason=receipt.failure))
         elif receipt.status in {"completed", "executor_active"}:
-            print(message("delivery_completed_action" if final_approval else "applied"))
+            print(message(
+                "approval_updating" if receipt.result_status == "updating"
+                else "delivery_completed_action" if final_approval else "applied"
+            ))
         else:
             print(message("approval_running" if final_approval else "applying"))
         if receipt.executor_status in {"exited", "absent"}:
@@ -1434,6 +1437,7 @@ def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
         "kind": receipt.kind,
         "run_id": receipt.run_id,
         "status": receipt.status,
+        "result_status": receipt.result_status,
         "attached": receipt.attached,
         "executor_status": receipt.executor_status,
         "executor_generation": receipt.executor_generation,
@@ -2666,6 +2670,20 @@ def _run_lifecycle(
         return lifecycle.execute_claimed(
             action_id=executor_binding[0], generation=executor_binding[1]
         )
+    if (
+        current is not None
+        and current.get("delivery_type") == "parent_only"
+        and (
+            (action_kind == "approve" and current.get("status") == "parent_approval_pending")
+            or (action_kind == "resume" and has_final_approval(current))
+        )
+    ):
+        # Describe the automatic update before starting/attaching an Executor.
+        # stderr keeps JSON stdout intact and is flushed before any Git work;
+        # the eventual Action receipt reports whether updating actually began.
+        print(text(
+            "cli.approval_update_intent", language=str(current.get("language", "zh"))
+        ), file=sys.stderr, flush=True)
     return lifecycle.submit(
         LifecycleRequest(
             task=task,

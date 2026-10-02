@@ -466,6 +466,47 @@ def test_concise_start_requires_invocation_and_survives_rework(language: str, pa
         assert [event["id"] for event in events(state) if event["kind"] == kind] == [started["id"]]
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+def test_parent_start_and_approval_update_recover_only_while_current(
+    language: str, mode: str,
+) -> None:
+    state = state_with_round()
+    state.update(language=language, notifications={"mode": mode},
+                 delivery_type="parent_only", status="parent_delivery_pending",
+                 parent_job={"phase": "developing"}, _executor_control={"activity": "running"})
+    attempt = state["semantic_agent_attempts"][0]
+    attempt.update(work_subject="parent-only:r", status="pending", outcome=None)
+    invocation = state["agent_invocation_history"][0]
+    invocation.update(semantic_attempt=attempt.copy(), status="running", ended_at=None)
+    invocation["execution_segments"][0].pop("ended_at")
+    state["active_agent_invocation"] = invocation
+    projected = events(state)
+    assert projected[0]["title"] == ("任务已创建" if language == "zh" else "Task created")
+    started, = [event for event in projected if event["kind"] == "parent_started"]
+    assert recovery_events(state, [started]) == [started]
+
+    attempt.update(status="completed", outcome="candidate")
+    invocation.update(status="completed", ended_at="2026-01-01T00:00:09+00:00")
+    invocation["execution_segments"][0]["ended_at"] = invocation["ended_at"]
+    state.pop("active_agent_invocation")
+    job = state["parent_job"]
+    job.update(phase="accepted", approval_update={
+        "granted_at": "2026-01-01T01:00:00+00:00", "previous_head_sha": "a" * 40,
+        "previous_base_sha": "b" * 40, "source_sha": "a" * 40, "target_sha": "c" * 40,
+    })
+    update, = [event for event in events(state) if event["kind"] == "approval_update"]
+    assert ("需要重新批准" if language == "zh" else "Fresh approval is required") in update["summary"]
+    assert recovery_events(state, [started, update]) == [update]
+
+    job["phase"] = "ready_for_approval"
+    state["status"] = "parent_approval_pending"
+    recovered = recovery_events(state, [update])
+    assert recovered and all(event["kind"] == "boundary" for event in recovered)
+    job["approval_grant"] = {"granted_at": "2026-01-01T02:00:00+00:00"}
+    assert not any(event["kind"] == "approval_update" for event in events(state))
+
+
 def _formal_review_state(parent_only: bool = False) -> dict[str, Any]:
     state = state_with_round("reviewer", "acceptance_artifact")
     artifact = {"checks": {lane: {"status": "pass", "findings": []} for lane in ("e2e", "standards", "spec")}}
