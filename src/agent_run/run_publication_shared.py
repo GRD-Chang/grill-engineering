@@ -8,6 +8,10 @@ from agent_run.review_budget import remove_repair_job
 
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.ci_recovery_budget import (
+    ci_limits_for_job,
+    observe_repairable_ci_failure,
+)
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.external_supervision import (
     ensure_supervision_window,
@@ -29,8 +33,13 @@ from agent_run.publication_operation_retry import (
     record_publication_operation_failure,
 )
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.required_checks import (
+    is_explicitly_repairable_code_failure,
+    supervise_unrepairable_check_failure,
+)
 from agent_run.required_checks_observation import (
     clear_required_checks_observation,
+    failure_evidence_matches_observation,
     read_required_checks_observation,
 )
 
@@ -136,6 +145,87 @@ class RunPublicationShared:
             }
         )
         return state
+
+    def _route_required_checks(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist repair/wait/pause, or let the caller continue on passing checks.
+
+        Publication and approval retain their own authorization and write
+        boundaries. Both use this decision after an exact-head observation;
+        evidence reads and the pre-repair identity read must precede charging.
+        """
+        checks = observation["result"]
+        if checks == "fail":
+            self._save(state)
+            evidence = self._required_check_evidence(
+                state, publication, pr_number, run_head
+            )
+            if evidence is None:
+                return state
+            if not self._revalidate_final_run_pr_before_repair(
+                state, publication, pr_number, run_head
+            ):
+                return state
+            if not (
+                failure_evidence_matches_observation(
+                    observation, evidence, pr_number=pr_number, head_sha=run_head
+                )
+                and is_explicitly_repairable_code_failure(evidence)
+            ):
+                supervise_unrepairable_check_failure(
+                    state, publication, phase="waiting_external",
+                    waiting_for=f"Run PR #{pr_number} Required Check repairability",
+                )
+                return self._save(state)
+            run = self._mapping(state, "run_acceptance")
+            outer_limit, inner_limit = ci_limits_for_job(run)
+            decision = observe_repairable_ci_failure(
+                run, head_sha=run_head, outer_limit=outer_limit,
+                inner_limit=inner_limit, is_ticket=False,
+            )
+            run["ci_failed_evidence"] = evidence
+            if decision == "repair":
+                self._queue_repair(
+                    state, repair_source="required_checks", ci_evidence=evidence
+                )
+            else:
+                reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
+                run.update({"phase": "ready_for_human", "blocked_reason": reason})
+                publication["phase"] = "stale"
+                state.update({
+                    "status": "ready_for_human",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{
+                        "code": reason,
+                        "message": "Run CI recovery budget is exhausted; resume is required",
+                    }],
+                })
+        elif checks == "pending":
+            publication["phase"] = "waiting_checks"
+            state.update({
+                "status": "waiting_checks", "terminal_kind": "waiting_checks",
+                "diagnostics": [],
+            })
+            ensure_supervision_window(state)
+        elif checks == "unknown":
+            publication["required_checks_observation_status"] = "unknown"
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+        else:
+            return None
+        return self._save(state)
 
     def _required_check_evidence(
         self,

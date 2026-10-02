@@ -813,6 +813,7 @@ _Avoid_: 把 CI 修复计入普通需求开发次数、隐式额外 Reviewer
 
 **CI Recovery Budget（CI 恢复预算）**:
 每个交付对象的可修复 CI 失败独立使用外层轮次和内层修复额度，默认均为 3。相同失败 head 的回读幂等；实际修复后的新发布 head 再失败才进入下一轮。Ticket 首轮内层最多一次代码修复，以准确旧发布授权、失败 Observation 与新 Candidate 绑定的窄收据更新原 PR，不宣称 Reviewer 通过；从第二轮开始须经 Reviewer。Parent-only 与 Run CI 修复均经 Reviewer。预算耗尽安全暂停，显式 resume 只续期耗尽的外层或内层窗口，保留需求、集成、同步额度和有效成果。
+最终 Run PR 的发布检查与批准复查共用失败证据匹配、完整 PR 身份回读、可修复性分类、CI 预算、修复排队及暂停规则，见 [ADR 0016](docs/adr/0016-parent-integration-delivery.md)。pending/unknown、失败明细与 Observation 不匹配和不可修复失败进入有界等待；PR/head 身份漂移仍使验收失效。最终 PR 与内部 Repair PR 共用同一 Run CI 额度。修复使旧批准失效，新组合只有取得正式 Run Acceptance、必要检查与新批准后才可最终合并。
 _Avoid_: 同一失败 head 重复计轮、把 CI 修复记作需求修复、无证据跳过 Reviewer
 
 **Ticket Resume Command（Ticket 恢复命令）**:

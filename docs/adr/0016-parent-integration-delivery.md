@@ -16,6 +16,10 @@ Publisher 保留已发布源分支的祖先关系，以准确远端 head 为 lea
 
 多 Ticket Parent 的逻辑 CI 交付对象是 Run：最终 Run PR、内部 Repair PR 与后继提交共用 Run Acceptance 持久化的 `ci_recovery`。活动 Repair Job 持有相同预算快照，完成后由 Run 继续持有；更换内部 PR 或显式恢复不创建另一份额度。CI 修复的次数只记入 CI 内层，普通修复用量从独立 `review_budget` 展示。CI 内层或外层耗尽时，Repair Cycle 一同标记暂停；显式续期只恢复对应 CI 窗口及活动 Cycle，不重置外层累计轮数。
 
+最终 Run PR 的发布检查与批准复查由 `RunPublicationShared` 统一处理 Required Checks 的失败、等待与预算暂停：先保存准确 PR/head 的 Observation，再读取匹配的原始失败证据并回读完整 PR 身份，只有全部失败可修复时才观察 CI 轮次并排队 Run Repair。相同失败 head 重复观察不重复计轮；实际 Development 才扣内层修复次数。pending、unknown、证据未收敛或不可修复故障不进入代码修复，沿用有界外部监督；耗尽后的显式 resume 保留失败 head、原始证据与旧窗口历史，仅续期耗尽层。
+
+共享决策不接管各入口的授权和正式写入。批准仍校验准确批准对象，修复前及合并前分别保留必要回读，正式 Git/GitHub 写入仍由 Publisher 执行。CI 修复使原批准失效，后继结果须经既有 Candidate Acceptance 提升或 fresh Run Acceptance、最终 PR 检查和新批准；局部 Candidate 通过不独立构成正式 Run Acceptance。Ticket 首轮 CI 窄授权与 Parent-only 独立交付语义保持不变。
+
 ## 理由与边界
 
 Ticket 集成已有精确远端读取、机械合并和独立 resync 额度；Parent 共用这些底层事实，但各自保留 Review-first 与 Dev-first 的入口语义。Run Acceptance 原来的临时合并预览不能证明远端 Run Branch 已被接纳，Parent-only 原来的 base 漂移阻断也不能处理协作者追加。共用集成边界使审核对象与后续发布的 tree 一致，并让预算、暂停和恢复有单一事实来源。服务端最终 base 与 merge 之间的瞬时竞态仍由现有准确 head 检查承担，本决定不增加分布式锁或 merge queue。

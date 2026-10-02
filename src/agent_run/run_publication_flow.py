@@ -13,10 +13,6 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.change_delivery import ensure_linked_branch_display
-from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
-    observe_repairable_ci_failure,
-)
 from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.delivery_step import DeliveryStep, DeliveryStepKind
@@ -27,17 +23,11 @@ from agent_run.credential_availability import (
 )
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
-    ensure_supervision_window,
     is_github_convergence_error,
     wait_for_github_convergence,
 )
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
-from agent_run.required_checks import (
-    is_explicitly_repairable_code_failure,
-    supervise_unrepairable_check_failure,
-)
-from agent_run.required_checks_observation import failure_evidence_matches_observation
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.run_publication_shared import RunPublicationShared
@@ -696,71 +686,15 @@ class RunPublicationFlow(RunPublicationShared):
             return state
         checks = str(observation["result"])
         self._record_agent_run_status(pr_number, run, run_head, checks)
-        if checks == "fail":
-            self._save(state)
-            evidence = self._required_check_evidence(
-                state, publication, pr_number, run_head
-            )
-            if evidence is None:
-                return state
-            if not self._revalidate_final_run_pr_before_repair(
-                state, publication, pr_number, run_head
-            ):
-                return state
-            if failure_evidence_matches_observation(
-                observation,
-                evidence,
-                pr_number=pr_number,
-                head_sha=run_head,
-            ) and is_explicitly_repairable_code_failure(evidence):
-                outer_limit, inner_limit = ci_limits_for_job(run)
-                decision = observe_repairable_ci_failure(
-                    run, head_sha=run_head, outer_limit=outer_limit,
-                    inner_limit=inner_limit, is_ticket=False,
-                )
-                run["ci_failed_evidence"] = evidence
-                if decision == "repair":
-                    self._queue_repair(
-                        state,
-                        repair_source="required_checks",
-                        ci_evidence=evidence,
-                    )
-                else:
-                    reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
-                    run.update({"phase": "ready_for_human", "blocked_reason": reason})
-                    publication["phase"] = "stale"
-                    state.update({
-                        "status": "ready_for_human",
-                        "terminal_kind": "waiting_human",
-                        "diagnostics": [{"code": reason, "message": "Run CI recovery budget is exhausted; resume is required"}],
-                    })
-            else:
-                supervise_unrepairable_check_failure(
-                    state,
-                    publication,
-                    phase="waiting_external",
-                    waiting_for=f"Run PR #{pr_number} Required Check repairability",
-                )
-        elif checks == "pending":
-            publication["phase"] = "waiting_checks"
-            state["status"] = "waiting_checks"
-            state["terminal_kind"] = "waiting_checks"
-            state["diagnostics"] = []
-        elif checks == "unknown":
-            publication["required_checks_observation_status"] = "unknown"
-            publication["phase"] = "waiting_external"
-            wait_for_github_convergence(
-                state,
-                code="github_checks_observation_unknown",
-                message="GitHub Required Checks returned an unknown state",
-                waiting_for=f"Run PR #{pr_number} Required Checks observation",
-            )
-            ensure_supervision_window(state)
-        else:
-            publication["phase"] = "ready_for_approval"
-            state["status"] = "run_approval_pending"
-            state["terminal_kind"] = "waiting_human"
-            state["diagnostics"] = []
+        routed = self._route_required_checks(
+            state, publication, pr_number, run_head, observation
+        )
+        if routed is not None:
+            return routed
+        publication["phase"] = "ready_for_approval"
+        state["status"] = "run_approval_pending"
+        state["terminal_kind"] = "waiting_human"
+        state["diagnostics"] = []
         return self._save(state)
 
     def _published_source_change(

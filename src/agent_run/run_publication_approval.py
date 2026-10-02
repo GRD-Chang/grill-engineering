@@ -9,10 +9,6 @@ from agent_run.approval_grant import (
     grant_authority,
     grant_matches,
 )
-from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
-    observe_repairable_ci_failure,
-)
 from agent_run.delivery_cleanup import (
     DeliveryCleanupEngine,
     remove_run_worktrees,
@@ -26,11 +22,6 @@ from agent_run.external_supervision import (
 from agent_run.git import MergeConflictError
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
-from agent_run.required_checks import (
-    is_explicitly_repairable_code_failure,
-    supervise_unrepairable_check_failure,
-)
-from agent_run.required_checks_observation import failure_evidence_matches_observation
 from agent_run.run_publication_shared import RunPublicationShared
 
 
@@ -182,79 +173,11 @@ class RunPublicationApproval(RunPublicationShared):
             raise RuntimeError(
                 f"Final Run PR status comment write failed: {error}"
             ) from error
-        if checks == "fail":
-            self._save(state)
-            evidence = self._required_check_evidence(
-                state, publication, pr_number, run_head
-            )
-            if evidence is None:
-                return state
-            if not self._revalidate_final_run_pr_before_repair(
-                state, publication, pr_number, run_head
-            ):
-                return state
-            if not (
-                failure_evidence_matches_observation(
-                    observation,
-                    evidence,
-                    pr_number=pr_number,
-                    head_sha=run_head,
-                )
-                and is_explicitly_repairable_code_failure(evidence)
-            ):
-                supervise_unrepairable_check_failure(
-                    state,
-                    publication,
-                    phase="waiting_external",
-                    waiting_for=(
-                        f"Run PR #{pr_number} Required Check repairability"
-                    ),
-                )
-                return self._save(state)
-            outer_limit, inner_limit = ci_limits_for_job(run)
-            decision = observe_repairable_ci_failure(
-                run, head_sha=run_head, outer_limit=outer_limit,
-                inner_limit=inner_limit, is_ticket=False,
-            )
-            run["ci_failed_evidence"] = evidence
-            if decision != "repair":
-                reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
-                run.update({"phase": "ready_for_human", "blocked_reason": reason})
-                publication["phase"] = "stale"
-                state.update({
-                    "status": "ready_for_human",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [{
-                        "code": reason,
-                        "message": "Run CI recovery budget is exhausted; resume is required",
-                    }],
-                })
-                return self._save(state)
-            return self._save(
-                self._queue_repair(
-                    state,
-                    repair_source="required_checks",
-                    ci_evidence=evidence,
-                )
-            )
-        if checks == "pending":
-            publication["phase"] = "waiting_checks"
-            state["status"] = "waiting_checks"
-            state["terminal_kind"] = "waiting_checks"
-            state["diagnostics"] = []
-            ensure_supervision_window(state)
-            return self._save(state)
-        if checks == "unknown":
-            publication["required_checks_observation_status"] = "unknown"
-            publication["phase"] = "waiting_external"
-            wait_for_github_convergence(
-                state,
-                code="github_checks_observation_unknown",
-                message="GitHub Required Checks returned an unknown state",
-                waiting_for=f"Run PR #{pr_number} Required Checks observation",
-            )
-            ensure_supervision_window(state)
-            return self._save(state)
+        routed = self._route_required_checks(
+            state, publication, pr_number, run_head, observation
+        )
+        if routed is not None:
+            return routed
         if not grant_matches(publication.get("approval_grant"), authority):
             return self._invalidate_for_fresh_acceptance(state)
         if not self._revalidate_final_run_pr_before_merge(

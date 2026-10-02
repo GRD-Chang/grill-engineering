@@ -469,7 +469,8 @@ def _repair_agents_after_acceptance(path: Path, *, repair_generations: int) -> P
 # test_delivery: failed-check evidence and same-thread recovery;
 # test_run_acceptance_currentness: trigger fingerprint and same-cycle recovery;
 # test_run_publication_evidence_wait: Final evidence before/after approval.
-# Keep each distinct CLI timeout/recovery route and all its assertions here.
+# Final publication routes are in test_cli_run_final_ci_recovery.
+# Keep the other distinct CLI timeout/recovery routes and all assertions here.
 @pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_repair_trigger_live_pr_readback(
     git_repo: Path, error_type: str
@@ -684,147 +685,6 @@ def test_run_supervises_required_check_trigger_fingerprint_reads(
     assert recovered.returncode == 0, recovered.stderr
     completed = load_only_run_state(git_repo)
     assert stdout_json(recovered)["status"] == "run_approval_pending"
-    assert completed["run_acceptance"]["repair_generation"] == 1
-    assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
-
-@pytest.mark.parametrize("error_type", ["github"])
-def test_run_supervises_initial_final_check_evidence_reads(
-    git_repo: Path, error_type: str
-) -> None:
-    fixture, _ = prepare_accepted_run(
-        git_repo,
-        delivery={
-            "required_checks": ["fail"],
-            "required_check_evidence_failures": [
-                {
-                    "scope": "final_run",
-                    "type": error_type,
-                    "message": "final evidence unavailable",
-                }
-                for _ in range(3)
-            ],
-        },
-    )
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["supervision_clock_multiplier"] = 120
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = _repair_agents_after_acceptance(git_repo / "agents.json", repair_generations=1)
-
-    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert paused.returncode == 2
-    paused_state = load_only_run_state(git_repo)
-    run = paused_state["run_acceptance"]
-    assert paused_state["status"] == "supervision_timeout"
-    assert paused_state["supervision_wait"]["kind"] == "github_convergence"
-    assert run.get("repair_generation", 0) == 0
-    assert "repair_job" not in run
-    assert not any(
-        invocation.get("work_subject") == f"run-repair:{paused_state['run_id']}"
-        for invocation in paused_state["agent_invocation_history"]
-    )
-
-    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["delivery"].update(
-        {
-            "required_check_evidence_failures": [],
-            "required_checks": ["fail", "pass", "pass"],
-            "check_position": 0,
-        }
-    )
-    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    recovery_agents = _resume_repair_agents(
-        git_repo / "recovery-agents.json", expected_thread_id=None
-    )
-    recovered = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
-    )
-
-    assert recovered.returncode == 0, recovered.stderr
-    completed = load_only_run_state(git_repo)
-    assert stdout_json(recovered)["status"] == "run_approval_pending"
-    assert completed["run_acceptance"]["repair_generation"] == 1
-    assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
-
-@pytest.mark.parametrize("error_type", ["github"])
-def test_run_supervises_post_approval_final_check_evidence_reads(
-    git_repo: Path, error_type: str
-) -> None:
-    fixture, awaiting = prepare_published_run(git_repo)
-    run_id = str(awaiting["run_id"])
-    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["supervision_clock_multiplier"] = 120
-    fixture_data["delivery"].update(
-        {
-            "required_checks": ["fail"],
-            "check_position": 0,
-            "required_check_evidence_failures": [
-                {
-                    "scope": "final_run",
-                    "type": error_type,
-                    "message": "approved evidence unavailable",
-                }
-                for _ in range(4)
-            ],
-        }
-    )
-    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-
-    waiting = run_cli(git_repo, fixture, "approve", run_id)
-    assert waiting.returncode == 2
-    assert stdout_json(waiting)["status"] == "supervision_timeout"
-    waiting_state = load_only_run_state(git_repo)
-    grant = waiting_state["run_publication"]["approval_grant"]
-    assert waiting_state["run_acceptance"].get("repair_generation", 0) == 0
-    assert not any(
-        invocation.get("work_subject") == f"run-repair:{run_id}"
-        for invocation in waiting_state["agent_invocation_history"]
-    )
-
-    assert waiting_state["supervision_wait"]["kind"] == "github_convergence"
-    assert waiting_state["run_publication"]["approval_grant"] == grant
-
-    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["delivery"].update(
-        {
-            "required_check_evidence_failures": [],
-            "required_checks": ["fail", "pass", "pass"],
-            "check_position": 0,
-        }
-    )
-    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    recovery_agents = _resume_repair_agents(
-        git_repo / "recovery-agents.json", expected_thread_id=None
-    )
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    control_before = control_path.read_bytes()
-    fixture_before = fixture.read_bytes()
-    refused = run_cli(git_repo, fixture, "run", "1")
-    assert refused.returncode == 2, refused.stdout
-    assert stdout_json(refused)["status"] == "supervision_timeout"
-    assert load_only_run_state(git_repo) == waiting_state
-    assert control_path.read_bytes() == control_before
-    assert fixture.read_bytes() == fixture_before
-    recovered = run_cli(
-        git_repo, fixture, "resume", "1", "--agent-fixture", str(recovery_agents)
-    )
-
-    assert recovered.returncode == 2, recovered.stderr
-    invalidated = load_only_run_state(git_repo)
-    assert stdout_json(recovered)["status"] == "run_acceptance_pending"
-    assert "approval_grant" not in invalidated["run_publication"]
-    assert invalidated["agent_invocation_history"] == waiting_state["agent_invocation_history"]
-    assert not any(
-        pull.get("scope") == "final_run" and pull.get("state") == "MERGED"
-        for pull in json.loads(fixture.read_text())["delivery"]["pull_requests"]
-    )
-
-    repaired = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
-    )
-    assert repaired.returncode == 0, repaired.stderr
-    completed = load_only_run_state(git_repo)
-    assert stdout_json(repaired)["status"] == "run_approval_pending"
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
 
