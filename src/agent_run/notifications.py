@@ -24,7 +24,7 @@ CLOSE_TIMEOUT_SECONDS = 60.0
 
 
 class Notifications:
-    """One finite sender per Executor; all senders share outbox claims and budgets.
+    """Finite delivery for Executors and host exits, sharing claims and budgets.
 
     ``load_state`` must be a lock-free read of the authoritative Run snapshot.
     A host exit observer can use this same entrypoint without business writes.
@@ -86,8 +86,10 @@ class Notifications:
             self._unavailable(error)
 
     def _observe(self, state: dict[str, Any], *, recovering: bool = False) -> None:
+        from agent_run.executor_exit import exit_event
+
         self.state = state
-        projected = events(state)
+        projected = events(state) + exit_event(self.root, state, self.document)
         now = time.time()
         document = self.document
         if self.failure_reason is None:
@@ -215,8 +217,17 @@ class Notifications:
                     self.condition.wait(timeout=wait_seconds if self.document["pending"] else None)
                 continue
             identity = hashlib.sha256(available["event"]["id"].encode()).hexdigest()[:32]
+            options: dict[str, Any] = {}
+            if available["event"]["kind"] == "executor_exit":
+                from agent_run.executor_exit import exit_event
+
+                def is_current() -> bool:
+                    return bool(exit_event(self.root, self._current(self.state),
+                                           {"executor_exit": available["event"]["exit_evidence"]}))
+
+                options["is_current"] = is_current
             result = send(self.config, card(available["event"]), identity, self.cancel,
-                          timeout_seconds=max(0.0, available["deadline_at"] - time.time()))
+                          timeout_seconds=max(0.0, available["deadline_at"] - time.time()), **options)
             with self._transaction():
                 item = next((entry for entry in self.document["pending"]
                              if entry["event"]["id"] == available["event"]["id"]

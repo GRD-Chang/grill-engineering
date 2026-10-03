@@ -55,7 +55,7 @@ Card 2.0 需要支持该格式的飞书客户端；本功能不降级为 Card 1.
 
 `agent-run status <run-id> --json` 与 `agent-run history <run-id> --json` 的 `notifications` 包含未送达原因与发送记录；普通输出提示不可用或未确认送达数量。两个查询始终只读，不触发发送。
 
-Executor 管理发送线程；外部 CLI 在业务锁外执行。每个事件从进入 outbox 起共用六十秒总期限，最多尝试三次；每次身份预检与发送共用至多十秒，且不能超过事件剩余期限。第一次失败后等一秒，第二次失败后等两秒。发送前持久化次数与所有权，重启、重复观察和并发发送者共用原预算，不能重新计时或重复领取正在发送的事件。
+Executor 或宿主退出处理管理发送线程；外部 CLI 在业务锁外执行。每个事件从进入 outbox 起共用六十秒总期限，最多尝试三次；每次身份预检与发送共用至多十秒，且不能超过事件剩余期限。第一次失败后等一秒，第二次失败后等两秒。发送前持久化次数与所有权，重启、重复观察和并发发送者共用原预算，不能重新计时或重复领取正在发送的事件。
 
 明确失败可以在剩余额度内重试。人工待办、执行故障、更新失败及人工 Resume 失败等重要告警缺少回执时记为 `unknown`，也允许有限重试；当前终态结果沿用这项保护。重试使用同一事件身份派生的幂等键，仍接受少量重复，不能承诺绝对不重不漏。普通进展的 `unknown` 仅记录，不重放。恢复时普通进展只保留模式允许的最新有效状态，压缩不会产生新身份或新预算。已耗尽的同一事件不会因新进展或显式恢复重获额度。
 
@@ -70,3 +70,39 @@ Executor 管理发送线程；外部 CLI 在业务锁外执行。每个事件从
 去重保留当前有界 history 的身份；首次节点按固定子任务集合保存，人工恢复结果另保留至多256个身份。待办发生序号单调递增，不随近期结果裁剪重置。记录不是完整消息档案。缺少原预算的旧待发记录只保留为 `missing_budget` 耗尽，不分配新额度；新版 Runner 不逐条补发历史进展。查询始终只读，未启用通知不创建 outbox、不启动发送工作。
 
 自动测试使用隔离 CLI 替身，验证发送请求、生命周期与资源回收，不访问真实账号或发送真实聊天消息。
+
+## Executor 意外退出
+
+启用通知的正式 Linux Executor 在启动时注册 systemd `ExecStopPost`。systemd manager 位于
+Executor 生命周期之外；主进程被强杀或 OOM 终止后，由宿主启动一次有界退出处理，无需再执行
+`run`、`resume` 或查询。执行期间没有新增轮询进程；通知关闭时不注册钩子或保留通知环境。
+
+退出处理只接受宿主提供的主进程退出码、信号与结果，结合 Task Control 核验准确工作区、Run、
+Action、Executor Generation 与 Runner binding。正常返回、完成、Stop/Abandon、正常等待人工或批准
+不报崩溃；关闭 CLI 观察窗口不会触发退出。旧代次或已经恢复的新会话不补发旧故障。
+普通 Invocation 失败仍由存活 Executor 的既有业务事实通知。
+
+该处理把 `executor_exit` 原始退出事实写入同一个通知 outbox，并复用既有卡片、身份核验与 transport。
+每次领取和重试前重新核对当前执行身份，CLI 身份预检结束后、提交请求前再核对一次；同一退出事件共用原三次/六十秒预算，重复钩子不续期。
+`status/history --json` 的 `notifications.executor_exit` 与对应投递记录可查询退出证据和实际尝试结果，
+查询本身不写入。观察不改 Run、Invocation、业务预算或 Publisher 结果，也不自动恢复。
+
+宿主及存储可用、进程正常获调度时，服务残留进程停止阶段和退出钩子各有七十秒上限：
+最迟在前一阶段结束后开始自动观察和尝试投递，整个停止与通知处理至多一百四十秒。
+通知 sender 自身仍使用六十秒收尾及最多两秒 transport 回收；`TimeoutStopFailureMode=kill` 保证达到期限后直接回收钩子及其后代，不再追加温和停止窗口。
+这些是尝试与资源回收边界，不是外部送达承诺。整机离线、宿主观察能力同时死亡、存储不可用
+或网络完全不可用时不承诺即时外部告警；已写入的证据仍可查询。
+
+仅为启用通知的服务，systemd `LoadCredential` 在启动时从现有一次性载体取得至多 1 MiB 的私有环境副本，
+供退出时使用同一 HOME、PATH、代理和 CLI 凭据位置；环境值不进入 unit metadata、Run 或日志。
+源载体仍在握手或原三十秒期限内清除，宿主私有只读副本在服务结束时回收，不新增持久配置或临时文件。
+这些机制依赖支持 `LoadCredential` 的 systemd（247 及以后）；未启用通知的服务沿用原启动属性。
+
+启用通知时，Executor 在现有共享 Runner 租约内通过 `FDSTORE` 交给 systemd 同一打开文件的一个
+描述符，并用有界 `BARRIER` 确认宿主已处理交接；未确认不开始业务执行。宿主连续保留该租约直到
+服务及退出钩子全部结束，从而阻止强杀到钩子启动之间的安装、回滚或卸载穿插。钩子执行期间也取得
+现有共享租约；全部回收后管理动作恢复可用。不新增保活进程、Snapshot 固定或引用计数。
+
+宿主语义依据：[systemd service 退出钩子](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#ExecStopPost=)
+与 [systemd 私有凭据](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#LoadCredential=)、
+[文件描述符交接](https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html#FDSTORE=1)。

@@ -53,6 +53,8 @@
   "card.full_record": "完整记录",
   "card.open_pr": "打开 PR",
   "card.open_issue": "打开 Issue",
+  "notification.event.executor_exit": "执行会话意外退出",
+  "notification.event.executor_exit_summary": "宿主已确认执行会话异常退出，任务成果已保留。尚未自动恢复；发布写入结果需在恢复时核对。",
   "notification.event.unknown_repository": "未知仓库",
   "notification.event.delivery": "整体交付",
   "notification.event.parent": "整体需求",

@@ -1077,6 +1077,35 @@ def _worker_hidden_paths(
         os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
     ).expanduser()
     paths.extend((runtime_home / "bus", runtime_home / "systemd" / "private"))
+    # LoadCredential keeps a second copy after the startup carrier is consumed.
+    # Existing system-manager paths are hidden as well as user-manager paths.
+    for root in {Path("/run"), Path(f"/run/user/{os.geteuid()}"), runtime_home}:
+        paths.extend((root / "credentials", root / "systemd" / "temporary-credentials"))
+    runtime_roots = {runtime_home}
+    native_runtime = os.environ.get("AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY")
+    if native_runtime:
+        runtime_roots.add(Path(native_runtime))
+    native_credentials = os.environ.get("AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY")
+    if native_credentials:
+        runtime_roots.add(Path(native_credentials).parent.parent)
+    credential_directories = {
+        root / suffix for root in runtime_roots
+        for suffix in ("credentials", "systemd/temporary-credentials")
+    }
+    inherited_credentials = os.environ.get("CREDENTIALS_DIRECTORY")
+    if inherited_credentials:
+        credential_directories.add(Path(inherited_credentials))
+    # Prepare stable, empty mountpoints even when this Run disables notices.
+    # Otherwise a later user service can create a previously skipped directory
+    # visible through the Worker's root bind. Keep these fixed runtime dirs;
+    # removing/replacing them while Workers live would invalidate their masks.
+    for directory in credential_directories:
+        try:
+            resolved_directory = directory.expanduser().resolve()
+            resolved_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except (OSError, RuntimeError) as error:
+            raise WorkerSandboxError("无法准备 Worker 凭据隔离目录") from error
+        paths.append(resolved_directory)
     if checkout is not None:
         resolved_checkout = checkout.resolve()
         state_roots: set[Path] = set()

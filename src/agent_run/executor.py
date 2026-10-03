@@ -12,7 +12,7 @@ from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notifications import Notifications
 from agent_run.messages import error_detail, selected_language
-from agent_run.runner_lease import runner_usage_lease
+from agent_run.runner_lease import retain_lease_for_systemd_exit, runner_usage_lease
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError, TaskControlError, TaskKey
 from agent_run.ticket_eligibility import TicketEligibilityError
@@ -160,7 +160,12 @@ def main(arguments: list[str] | None = None) -> int:
         generation=parsed.generation,
         state_root=state_root,
     )
-    with runner_usage_lease(Path(parsed.runner_lock)):
+    with runner_usage_lease(Path(parsed.runner_lock)) as lease:
+        notify_socket = os.environ.get("AGENT_RUN_INTERNAL_EXIT_NOTIFY_SOCKET")
+        credentials_directory = os.environ.get("AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY")
+        systemd_runtime = os.environ.get("AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY")
+        if notify_socket:
+            retain_lease_for_systemd_exit(lease, notify_socket)
         environment, command = consume_environment_carrier(
             Path(parsed.carrier), spec
         )
@@ -175,6 +180,10 @@ def main(arguments: list[str] | None = None) -> int:
                 "AGENT_RUN_INTERNAL_STATE_ROOT": str(state_root),
             }
         )
+        if credentials_directory:
+            environment["AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY"] = credentials_directory
+        if systemd_runtime:
+            environment["AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY"] = systemd_runtime
         os.environ.clear()
         os.environ.update(environment)
         os.chdir(task.workspace)

@@ -96,7 +96,7 @@ def enqueue(document: dict[str, Any], event: dict[str, Any], now: float) -> None
         "event": event, "outcome": "pending", "attempts": 0, "attempt_history": [],
         "created_at": now, "deadline_at": now + DELIVERY_LIFETIME_SECONDS,
         "next_attempt_at": now, "exhausted": False,
-        "important": bool(event.get("current") or event.get("resume_outcome") in {"failed", "human_action"}),
+        "important": bool(event.get("important") or event.get("current") or event.get("resume_outcome") in {"failed", "human_action"}),
     })
 
 
@@ -104,6 +104,8 @@ def retire(document: dict[str, Any], item: dict[str, Any]) -> None:
     event = item["event"]
     record = {key: value for key, value in item.items() if key not in {"event", "owner", "next_attempt_at"}}
     record.update({key: event.get(key) for key in ("id", "kind", "work_subject", "generation", "slot_id")})
+    if event.get("exit_evidence"):
+        record["exit_evidence"] = event["exit_evidence"]
     document["records"].append(record)
     document["records"] = document["records"][-MAX_RECORDS:]
     document["pending"].remove(item)

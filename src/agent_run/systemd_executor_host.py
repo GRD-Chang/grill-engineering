@@ -31,6 +31,7 @@ from agent_run.executor_host import (
 )
 from agent_run.runner_lease import default_runner_lock_path
 from agent_run.task_control import TaskControlStore
+from agent_run.executor_exit import exit_properties
 
 
 class SystemdExecutionReadinessError(ExecutorHostError):
@@ -505,12 +506,13 @@ class SystemdUserExecutorHost:
                 generation=spec.generation,
                 run_id=spec.run_id,
             )
+            notification_properties = exit_properties(spec, control, self.executor_python, carrier)
             start_result = self.transport.start(
                 unit=self._unit(spec),
                 description=self._description(spec),
                 cwd=spec.cwd or spec.task.workspace,
-                command=self._executor_command(spec, carrier, runner_lock),
-                properties=self._PROPERTIES,
+                command=self._executor_command(spec, carrier, runner_lock, retain_exit_lease=bool(notification_properties)),
+                properties=(*self._PROPERTIES, *notification_properties),
             )
             if start_result.status == "rejected":
                 self._launch_pending_path(spec).unlink(missing_ok=True)
@@ -854,12 +856,13 @@ class SystemdUserExecutorHost:
         )
 
     def _executor_command(
-        self, spec: ExecutorSpec, carrier: Path, runner_lock: Path
+        self, spec: ExecutorSpec, carrier: Path, runner_lock: Path, *, retain_exit_lease: bool = False,
     ) -> tuple[str, ...]:
         command = [
             str(self._env_program),
             "-i",
             "PYTHONNOUSERSITE=1",
+            "AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY=${XDG_RUNTIME_DIR}",
             str(self.executor_python),
             "-I",
             "-m",
@@ -879,6 +882,14 @@ class SystemdUserExecutorHost:
         ]
         if spec.run_id is not None:
             command.extend(("--run-id", spec.run_id))
+        if retain_exit_lease:
+            # Preserve native metadata across env -i and the terminal snapshot.
+            # Neither control value reaches Agents; the credential location is
+            # used to mask the manager's copy even with a different runtime dir.
+            command[3:3] = [
+                "AGENT_RUN_INTERNAL_EXIT_NOTIFY_SOCKET=${NOTIFY_SOCKET}",
+                "AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY=${CREDENTIALS_DIRECTORY}",
+            ]
         command.extend(
             (
                 "--carrier",

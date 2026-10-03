@@ -53,6 +53,8 @@
   "card.full_record": "Full record",
   "card.open_pr": "Open PR",
   "card.open_issue": "Open Issue",
+  "notification.event.executor_exit": "Executor exited unexpectedly",
+  "notification.event.executor_exit_summary": "The host confirmed an unexpected Executor exit. Saved work is preserved. Recovery has not started; publication results require reconciliation.",
   "notification.event.unknown_repository": "Unknown repository",
   "notification.event.delivery": "Overall delivery",
   "notification.event.parent": "Overall requirement",

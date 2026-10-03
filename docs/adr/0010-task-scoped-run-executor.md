@@ -4,6 +4,14 @@ status: accepted
 
 # 每个 Delivery Task 由操作系统托管一个短生命周期 Executor
 
+后续有限修订：启用通知时，systemd 在 Executor 结束后运行有界 `ExecStopPost`，只记录准确退出与通知事实并复用现有 outbox。它不自动 Resume、不写业务状态、不推断 Publisher 结果；正常退出与已替换代次不报崩溃。为退出投递，systemd 从一次性载体取得私有、至多 1 MiB 的环境副本，随服务回收；原载体仍遵守三十秒清理边界。无常驻观察进程，通知关闭不增加钩子或环境副本。检测与投递上限及不可用边界见[通知合同](../notifications.md#executor-意外退出)。其余执行、授权和 Runner 租约合同不变。
+
+启用退出通知的 Executor 通过 systemd 原生 FDSTORE/BARRIER 连续交接现有共享租约，宿主最多保存一个描述符直到服务及退出处理结束；该关闭阶段仍拒绝 Runner 管理操作。租约不暴露给 Worker，无额外保活进程；宿主回收后立即释放，不固定历史 Snapshot。
+
+退出钩子的凭据副本仍属于 Runner 控制面。所有 Worker（含 Host/PAT 身份）必须在文件系统中屏蔽 systemd 的凭据及临时凭据目录；仅删除环境变量或设置当前用户只读权限不足以隔离同 UID 进程。屏蔽覆盖标准运行目录、继承的自定义目录及宿主实际传入的目录，包含其他服务和代次的副本。Executor 保留原生凭据路径只用于建立 Worker 屏蔽，不允许启动终端快照覆盖该路径，也不向 Worker 传递这一内部变量；退出钩子在 Worker 隔离之外读取副本。
+
+通知关闭时也保留宿主原生用户运行目录。启动 Worker 前，在该目录及继承的运行目录中预建 `credentials` 和 `systemd/temporary-credentials` 空目录，并准备继承的凭据目录；无法准备时拒绝启动，不跳过屏蔽。随后出现的服务凭据仍被同一挂载屏蔽覆盖。这些固定运行目录不含新快照，不随单个 Worker 删除或替换，由用户运行目录生命周期回收；已有目录的权限不变。不为此创建系统级 `/run` 目录、钩子、守护进程或通知请求。
+
 后续需求修订：[ADR 0019](0019-ticket-work-concurrency-and-supervision.md) 允许其他 Ticket 执行期间接受定向 Resume；已授权工作可等待并发名额，单 Ticket 故障或监督超时不结束仍有独立工作的 Executor。定向 Stop 只暂停目标 Ticket，不形成 Run 级停止；下文停止并结束 Executor 的规则仅适用于 Run 级 Stop。定向恢复、单票故障隔离与监督超时已实施，单票立即 Stop 仍待后续实现；这些修订仅取代相关局部操作的准入和退出限制，不建立通用 Lifecycle Action 队列，也不改变同一任务最多一个 Executor 的约束。
 
 后续修订：[ADR 0013](0013-runner-owned-delivery-workspace.md) 将 Local Delivery Workspace 改为 Runner 独立克隆，并将同一 Repository/Parent 的唯一性收敛到本机当前用户。下文以用户仓库根区分任务、要求维护者自行协调不同 clone 的规则由该 ADR 取代；Executor、Action 与任务级短锁合同继续适用。

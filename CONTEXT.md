@@ -274,6 +274,8 @@ _Avoid_: 业务状态权威、常驻 workspace daemon、裸 PID 身份、自动 
 
 **Linux Executor Host Availability（Linux 执行宿主可用性）**:
 Linux MVP 启动 Run Executor Session 的运行前置，表示当前用户的 systemd manager 可访问且能够创建用户级 transient service。它通常随正常登录会话提供，不要求安装、启用或常驻一个 agent-run service，也不要求开启 Logout Persistence。该能力不可用时，公开生命周期动作明确失败并说明环境缺口，不回退为绑定当前终端的第二套执行模式；`status` 与 `history` 等只读查询仍可使用。
+
+启用通知的 Session 由宿主在退出后执行一次有界观察，核对准确 Run、Action、Generation、Runner 与异常主进程退出事实，再复用通知 outbox 自动尝试告警。观察不拥有业务写入或恢复权限；正常退出、Stop、等待批准、离开观察窗口和已替换代次不误报。无每 Run 常驻轮询，通知关闭不注册观察。环境私有副本、时间边界与外部不可用限制见[通知合同](docs/notifications.md#executor-意外退出)。
 _Avoid_: linger 前置条件、常驻 agent-run daemon、手工 enable 固定 service、静默前台回退、阻止只读查询
 
 **Executor Launch Environment（Executor 启动环境）**:
