@@ -809,152 +809,162 @@ class Controller:
     def record_execution_failure(
         self, run_id: str, message: str, *, runner_credential_failure: bool = False,
     ) -> bool:
-        state = self.states.load_run(run_id)
-        if state is None:
-            return False
-        try:
-            require_current_run_state(state)
-        except IncompatibleRunStateError:
-            return False
-        if state.get("status") in {
-            "abandoned",
-            "abandonment_pending",
-            "completed",
-            "parent_closeout_pending",
-        }:
-            return False
-        # Requeue persists its replacement intent before it performs any
-        # Publisher mutation. A lost response while retiring the old PR
-        # must preserve the pending state for a fresh currentness decision,
-        # never turn it into an ordinary failed invocation.
-        if state.get("status") == "requeue_required" and isinstance(
-            state.get("requeue_transition"), dict
-        ):
-            return False
-        if (
-            has_run_operator_gate(state)
-            and state.get("status") != "execution_failed"
-            and not (runner_credential_failure and state.get("terminal_kind") != "permanent_blocked" and state.get("status") in {
-                "parent_approval_pending", "run_approval_pending", "blocked",
-                "ready_for_human", "publication_pending", "progress_exhausted",
-            })
-        ):
-            return False
+        # Resolve external identity before the short state-write transaction.
         hint_reader = getattr(self.github, "repository_hint", None)
         repository_hint = hint_reader() if callable(hint_reader) else None
-        if (
-            isinstance(repository_hint, str)
-            and repository_hint
-            and not same_repository(state.get("repository"), repository_hint)
-        ):
-            return False
         try:
             repository = self.github.repository()
         except (GitHubReadError, OSError, ValueError):
             repository = None
-        if (
-            repository is not None
-            and not same_repository(state.get("repository"), repository.name_with_owner)
-        ):
-            return False
-        active = state.get("active_agent_invocation")
-        invocation_owns_failure = (
-            isinstance(active, dict)
-            and (
-                active.get("status") in {"running", "failed"}
-                or (
-                    active.get("status") == "completed"
-                    and invocation_attempt_is_pending(state, active)
+
+        def record() -> bool:
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+            }:
+                return False
+            # Requeue persists its replacement intent before it performs any
+            # Publisher mutation. A lost response while retiring the old PR
+            # must preserve the pending state for a fresh currentness decision,
+            # never turn it into an ordinary failed invocation.
+            if state.get("status") == "requeue_required" and isinstance(
+                state.get("requeue_transition"), dict
+            ):
+                return False
+            if (
+                has_run_operator_gate(state)
+                and state.get("status") != "execution_failed"
+                and not (runner_credential_failure and state.get("terminal_kind") != "permanent_blocked" and state.get("status") in {
+                    "parent_approval_pending", "run_approval_pending", "blocked",
+                    "ready_for_human", "publication_pending", "progress_exhausted",
+                })
+            ):
+                return False
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and not same_repository(state.get("repository"), repository_hint)
+            ):
+                return False
+            if (
+                repository is not None
+                and not same_repository(state.get("repository"), repository.name_with_owner)
+            ):
+                return False
+            failure_message = message
+            active = state.get("active_agent_invocation")
+            invocation_owns_failure = (
+                isinstance(active, dict)
+                and (
+                    active.get("status") in {"running", "failed"}
+                    or (
+                        active.get("status") == "completed"
+                        and invocation_attempt_is_pending(state, active)
+                    )
                 )
             )
-        )
-        if isinstance(active, dict) and isinstance(active.get("role"), str):
-            fail_interrupted_invocation(
+            if isinstance(active, dict) and isinstance(active.get("role"), str):
+                fail_interrupted_invocation(
+                    state,
+                    role=str(active["role"]),
+                    save=lambda _state: None,
+                )
+            if runner_credential_failure:
+                code = "runner_credential_failed"
+            elif failure_message.startswith("controller_no_progress:"):
+                code = "controller_no_progress"
+                failure_message = failure_message.partition(":")[2].strip()
+            else:
+                code = (
+                    "worker_credential_renewal_failed"
+                    if "worker_credential_renewal_failed:" in failure_message
+                    else "command_failed"
+                )
+            diagnostic = _operator_gate_diagnostic(
                 state,
-                role=str(active["role"]),
-                save=lambda _state: None,
+                code=code,
+                message=failure_message,
+                action_kind="execution_failure",
+                reason=code,
+                fallback_phase=str(state.get("status") or "execution_failed"),
+                bind_to_current_change_job=runner_credential_failure or not invocation_owns_failure,
             )
-        if runner_credential_failure:
-            code = "runner_credential_failed"
-        elif message.startswith("controller_no_progress:"):
-            code = "controller_no_progress"
-            message = message.partition(":")[2].strip()
-        else:
-            code = (
-                "worker_credential_renewal_failed"
-                if "worker_credential_renewal_failed:" in message
-                else "command_failed"
+            state.update(
+                {
+                    "status": "execution_failed",
+                    "terminal_kind": "execution_failed",
+                    "diagnostics": [diagnostic],
+                    "updated_at": _now(),
+                }
             )
-        diagnostic = _operator_gate_diagnostic(
-            state,
-            code=code,
-            message=message,
-            action_kind="execution_failure",
-            reason=code,
-            fallback_phase=str(state.get("status") or "execution_failed"),
-            bind_to_current_change_job=runner_credential_failure or not invocation_owns_failure,
-        )
-        state.update(
-            {
-                "status": "execution_failed",
-                "terminal_kind": "execution_failed",
-                "diagnostics": [diagnostic],
-                "updated_at": _now(),
-            }
-        )
-        self.states.save_run(run_id, state)
-        return True
+            self.states._save_run_and_notify_unlocked(run_id, state)
+            return True
+
+        return self.states._commit_run(record)
 
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
     ) -> bool:
         """Persist a proven GitHub fact without treating it as retryable."""
 
-        state = self.states.load_run(run_id)
-        if state is None:
-            return False
-        try:
-            require_current_run_state(state)
-        except IncompatibleRunStateError:
-            return False
-        if state.get("status") in {
-            "abandoned",
-            "abandonment_pending",
-            "completed",
-            "parent_closeout_pending",
-            "deterministic_contradiction",
-        }:
-            return False
         hint_reader = getattr(self.github, "repository_hint", None)
         repository_hint = hint_reader() if callable(hint_reader) else None
-        if (
-            isinstance(repository_hint, str)
-            and repository_hint
-            and not same_repository(state.get("repository"), repository_hint)
-        ):
-            return False
-        state.pop("supervision_window", None)
-        state.pop("supervision_wait", None)
-        diagnostic = _operator_gate_diagnostic(
-            state,
-            code=code,
-            message=message,
-            action_kind="deterministic_contradiction",
-            reason=code,
-            fallback_phase=str(
-                state.get("status") or "deterministic_contradiction"
-            ),
-        )
-        state.update(
-            {
-                "status": "deterministic_contradiction",
-                "terminal_kind": "deterministic_contradiction",
-                "diagnostics": [diagnostic],
-                "updated_at": _now(),
-            }
-        )
-        self.states.save_run(run_id, state)
-        return True
+
+        def record() -> bool:
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+                "deterministic_contradiction",
+            }:
+                return False
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and not same_repository(state.get("repository"), repository_hint)
+            ):
+                return False
+            state.pop("supervision_window", None)
+            state.pop("supervision_wait", None)
+            diagnostic = _operator_gate_diagnostic(
+                state,
+                code=code,
+                message=message,
+                action_kind="deterministic_contradiction",
+                reason=code,
+                fallback_phase=str(
+                    state.get("status") or "deterministic_contradiction"
+                ),
+            )
+            state.update(
+                {
+                    "status": "deterministic_contradiction",
+                    "terminal_kind": "deterministic_contradiction",
+                    "diagnostics": [diagnostic],
+                    "updated_at": _now(),
+                }
+            )
+            self.states._save_run_and_notify_unlocked(run_id, state)
+            return True
+
+        return self.states._commit_run(record)
 
     def _load_bound_run(
         self, run_id: str, *, state: dict[str, Any] | None = None
