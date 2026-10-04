@@ -156,3 +156,34 @@ def test_global_resume_binds_ticket_authority_not_active_projection(
     for number, job in jobs.items():
         assert {key: resumed["ticket_jobs"][number][key] for key in job} == job
     assert resumed["status"] == "active"
+
+
+def test_global_resume_can_select_ticket_before_its_first_invocation(git_repo: Path) -> None:
+    from agent_run.resume_intent import ResumeIntentError, validate_resume_intent
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = state["run_id"]
+    TicketWorkAdmission(states, run_id).seed([3, 2])
+    paused = states.load_current_run(run_id)
+    assert paused is not None
+    assert "3" not in paused["ticket_jobs"]
+    record_session_interruption(paused, save=lambda current: states.save_run(run_id, current))
+    intent = bind_resume_intent(paused)
+    for remove in (False, True):
+        changed = deepcopy(paused)
+        if remove:
+            del changed["ticket_graph"]["tickets"]["3"]
+        else:
+            changed["ticket_graph"]["tickets"]["4"] = {
+                **changed["ticket_graph"]["tickets"]["3"], "number": 4,
+            }
+        with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
+            validate_resume_intent(changed, intent)
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+        validate_resume_state=lambda current: validate_resume_intent(current, intent),
+    )
+    assert resumed["status"] == "active"
+    assert resumed["active_ticket_job"]["ticket_number"] == 3
+    assert resumed["ticket_agent_invocations"] == {}
+    assert [item["ticket_number"] for item in resumed["ticket_work_queue"]] == [3, 2]

@@ -155,3 +155,75 @@ def test_resume_preserves_unchanged_markdown_requirements(git_repo: Path) -> Non
     assert saved is not None
     assert saved["parent"]["body"] == body
     assert saved["ticket_graph"]["tickets"]["2"]["body"] == body
+
+
+@pytest.mark.parametrize("wait_at", ["binding", "refresh"])
+@pytest.mark.parametrize("drift", [False, True])
+def test_ticket_executor_resume_keeps_authority_through_refresh_wait(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, wait_at: str, drift: bool,
+) -> None:
+    from support.ticket_parallel import ticket_run
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3))
+    run_id = state["run_id"]
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    assert controller.record_execution_failure(run_id, "Controller failed before Agent startup")
+    failed = states.load_current_run(run_id)
+    assert failed is not None and failed["active_agent_invocation"] is None
+    intent = bind_resume_intent(failed)
+    calls = 0
+    original_binding = controller._load_bound_run
+    original_refresh = controller._refresh
+
+    def load_bound(run_id: str, *, state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        if wait_at == "binding":
+            calls += 1
+            if calls <= 2:
+                raise GitHubReadError("github_read_failed", "temporary outage")
+        return original_binding(run_id, state=state)
+
+    def refresh(current: dict[str, Any], parent_number: int) -> dict[str, Any]:
+        nonlocal calls
+        if wait_at == "refresh":
+            calls += 1
+            if calls <= 2:
+                wait_for_github_refresh(
+                    current, code="github_read_failed", message="temporary outage",
+                    waiting_for="GitHub graph",
+                )
+                return current
+        return original_refresh(current, parent_number)
+
+    monkeypatch.setattr(controller, "_load_bound_run", load_bound)
+    monkeypatch.setattr(controller, "_refresh", refresh)
+
+    def resume() -> dict[str, Any]:
+        resumed, _ = controller.resume(
+            run_id, explicit_resume=True, record_explicit_resume_audit=False,
+            validate_resume_state=lambda current: validate_resume_intent(current, intent),
+        )
+        return resumed
+
+    first = resume()
+    assert first["status"] == "waiting_external"
+    second = resume()
+    assert second["status"] == "waiting_external"
+    assert second["supervision_window"]["started_at"] == first["supervision_window"]["started_at"]
+    assert second["supervision_window"]["deadline"] == first["supervision_window"]["deadline"]
+    if drift:
+        changed = states.load_current_run(run_id)
+        assert changed is not None
+        changed["ticket_jobs"]["2"]["ticket_branch_generation"] = 2
+        changed["active_ticket_job"] = deepcopy(changed["ticket_jobs"]["2"])
+        states.save_run(run_id, changed)
+        with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
+            resume()
+        assert calls == 2
+    else:
+        resumed = resume()
+        assert resumed["status"] == "active"
+        for number, job in failed["ticket_jobs"].items():
+            assert {key: resumed["ticket_jobs"][number][key] for key in job} == job
+        assert resumed.get("github_refresh_pending") is not True
+        assert calls == 3

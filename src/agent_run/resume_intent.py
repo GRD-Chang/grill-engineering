@@ -142,7 +142,11 @@ def bind_resume_intent(
         # Refresh may clear the synthetic execution-failure gate while retaining
         # the exact interrupted Invocation. Its Agent identity is the target.
         subjects = []
-    invocation = None if ticket_recovery else state.get("active_agent_invocation")
+    ticket_work_identity = (
+        ticket_number is None and authorization == "continue_existing_work"
+        and _has_pending_ticket_work(state)
+    )
+    invocation = None if ticket_work_identity else state.get("active_agent_invocation")
     if ticket_number is not None:
         invocations = state.get("ticket_agent_invocations")
         invocation = invocations.get(str(ticket_number)) if isinstance(invocations, Mapping) else None
@@ -165,17 +169,20 @@ def bind_resume_intent(
         "supervision_wait": state.get("supervision_wait")
         if reason == "supervision_timeout" else None,
     }
-    if ticket_recovery:
-        # Active Ticket/Invocation are FIFO presentation projections. Bind the
-        # durable per-Ticket work instead, including jobs not yet invoked.
+    if ticket_work_identity:
+        # Active Ticket/Invocation and temporary refresh waits are projections.
+        # Bind durable work throughout the same continuation, including jobs
+        # not yet invoked; the grant above still checks the actual pause.
         target["ticket_work"] = {
             number: {
                 "invocation": _invocation_identity(
                     state.get("ticket_agent_invocations", {}).get(number)
                 ),
-                "job": _subject_identity(job),
+                "job": _subject_identity(state.get("ticket_jobs", {}).get(
+                    str(number), {"ticket_number": int(number)},
+                )),
             }
-            for number, job in state.get("ticket_jobs", {}).items()
+            for number in state.get("ticket_graph", {}).get("tickets", {})
         }
     intent: dict[str, Any] = {
         "pause_reason": reason,
@@ -218,7 +225,11 @@ def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
 
 def is_ticket_execution_recovery(state: Mapping[str, Any], status: object) -> bool:
     """Resume the Ticket Executor without consuming independent local gates."""
-    return status in {"execution_failed", "operator_stopped"} and any(
+    return status in {"execution_failed", "operator_stopped"} and _has_pending_ticket_work(state)
+
+
+def _has_pending_ticket_work(state: Mapping[str, Any]) -> bool:
+    return any(
         state.get("ticket_jobs", {}).get(str(number), {}).get("phase") != "completed"
         for number in state.get("ticket_graph", {}).get("tickets", {})
     )
