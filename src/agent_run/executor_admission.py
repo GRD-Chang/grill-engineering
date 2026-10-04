@@ -5,7 +5,6 @@ from contextvars import ContextVar
 
 from agent_run.error_safety import bounded_error
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash
-from agent_run.revisions import TicketGraphDriftError
 
 _close_admission: ContextVar[Callable[[BaseException | None], None] | None] = ContextVar(
     "executor_failure_admission", default=None,
@@ -62,7 +61,7 @@ def report_executor_failure(error: BaseException) -> None:
 def close_admission_on_failure() -> Iterator[None]:
     try:
         yield
-    except (SimulatedProcessCrash, ConcurrentRunStateError, TicketGraphDriftError):
+    except (SimulatedProcessCrash, ConcurrentRunStateError):
         raise
     except BaseException as error:
         try:

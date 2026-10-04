@@ -62,11 +62,15 @@ class TicketDeliveryEngine:
         *,
         after_lane: Callable[[frozenset[int]], None] | None = None,
         supervise: Callable[[frozenset[int]], None] | None = None,
+        refresh_graph: Callable[[], None] | None = None,
     ) -> bool:
         """Advance ready work with dynamic refill and independent supervision."""
         from agent_run.ticket_scheduling import develop_frontier
 
-        return develop_frontier(self, run_id, state, after_lane=after_lane, supervise=supervise)
+        return develop_frontier(
+            self, run_id, state, after_lane=after_lane, supervise=supervise,
+            refresh_graph=refresh_graph,
+        )
 
     def supervise(self, run_id: str, lanes: frozenset[int]) -> bool:
         """Advance the integration owner independently of blocked Agent calls."""

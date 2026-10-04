@@ -26,6 +26,7 @@ class TicketEngine(Protocol):
         self, run_id: str, state: dict[str, Any],
         *, after_lane: Callable[[frozenset[int]], None] | None = None,
         supervise: Callable[[frozenset[int]], None] | None = None,
+        refresh_graph: Callable[[], None] | None = None,
     ) -> bool: ...
 
 
@@ -62,6 +63,9 @@ class DeliveryRunEngine:
                 else:
                     refresh_pending = False
 
+        def refresh_graph() -> None:
+            self.controller.resume(run_id)
+
         while state.get("active_ticket_job") is not None:
             if state.get("status") in RUN_STOP_STATUSES:
                 return state
@@ -69,7 +73,7 @@ class DeliveryRunEngine:
             try:
                 developed = callable(parallel) and parallel(
                     run_id, state,
-                    supervise=supervise,
+                    supervise=supervise, refresh_graph=refresh_graph,
                 )
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)

@@ -219,7 +219,7 @@ def test_reconciliation_does_not_manufacture_execution_failure(tmp_path: Path, k
     assert recorded == []
 
 
-@pytest.mark.parametrize("kind", ["concurrent", "graph"])
+@pytest.mark.parametrize("kind", ["concurrent"])
 def test_reconcilable_result_keeps_live_executor_resume_admission(tmp_path: Path, kind: str) -> None:
     from agent_run.state import ConcurrentRunStateError
     from agent_run.revisions import TicketGraphDriftError

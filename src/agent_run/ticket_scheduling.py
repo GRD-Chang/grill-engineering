@@ -11,6 +11,8 @@ from agent_run.executor_admission import close_admission_on_failure, close_execu
 from agent_run.external_supervision import ExternalSupervisor
 from agent_run.runner_credentials import runner_credential_scope
 from agent_run.state import ConcurrentRunStateError
+from agent_run.revisions import TicketGraphDriftError
+from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
 from agent_run.ticket_state import RUN_STOP_STATUSES
 from agent_run.ticket_supervision import development_wait_due
@@ -24,6 +26,7 @@ def develop_frontier(
     engine: TicketDeliveryEngine, run_id: str, state: dict[str, Any], *,
     after_lane: Callable[[frozenset[int]], None] | None,
     supervise: Callable[[frozenset[int]], None] | None,
+    refresh_graph: Callable[[], None] | None = None,
 ) -> bool:
     from agent_run.delivery import SUPERVISION_POLL_SECONDS, TicketDeliveryEngine
 
@@ -76,6 +79,21 @@ def develop_frontier(
                 # The next supervision pass rereads; Agent work keeps running.
                 return
 
+    def consume_result(future: Future[None]) -> bool:
+        if not isinstance(future.exception(), TicketGraphDriftError) or refresh_graph is None:
+            future.result()
+            return True
+        try:
+            refresh_graph()
+        except (ConcurrentRunStateError, TaskControlBusyError) as error:
+            if isinstance(error, TaskControlBusyError) and not isinstance(error.__cause__, ConcurrentRunStateError):
+                raise
+            # Keep this finished future until its graph refresh commits.
+            # Only the read/validate refresh is retried, never Agent work.
+            ExternalSupervisor().sleeper(min(0.05, SUPERVISION_POLL_SECONDS))
+            return False
+        return True
+
     # Agent capacity comes only from durable leases. Keep bounded room for
     # returned Agents' program closeout (e.g. a slow currentness read), plus
     # one reserved supervision thread. Program futures are not Agent permits.
@@ -123,8 +141,7 @@ def develop_frontier(
                     break
                 futures[pool.submit(copy_context().run, advance, number)] = number
                 occupied += 1
-            if observer is not None and observer.done():
-                observer.result()
+            if observer is not None and observer.done() and consume_result(observer):
                 observer = None
                 next_observation = monotonic() + SUPERVISION_POLL_SECONDS
             if not futures and not ready and not pending_wait:
@@ -141,7 +158,8 @@ def develop_frontier(
             for future in done:
                 if future is observer:
                     continue
-                future.result()
+                if not consume_result(future):
+                    continue
                 number = futures.pop(future)
                 latest = engine.states.load_current_run(run_id)
                 queued = latest is not None and any(
@@ -161,7 +179,8 @@ def develop_frontier(
                 ]
                 supervisor.sleeper(min([SUPERVISION_POLL_SECONDS, *deadlines]))
         if observer is not None:
-            observer.result()
+            while not consume_result(observer):
+                pass
         if supervise is not None:
             supervise(frozenset())
     return True
