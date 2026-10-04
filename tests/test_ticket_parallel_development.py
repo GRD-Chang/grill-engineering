@@ -1122,7 +1122,31 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
     assert current["status"] == "operator_stopped"
 
 
-def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> None:
+def test_pause_during_exhausted_ci_review_keeps_budget_gate(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_run.change_delivery as development
+    import agent_run.ticket_scheduling as scheduling
+
+    committing, dispatch_checked = Event(), Event()
+    commit_candidate = development.commit_candidate
+    wait = scheduling.wait
+
+    def held_commit(stage, current, job, checkout):
+        if job.get('pending_attempt_kind') == 'ci_repair':
+            # The observer still owns program closeout after releasing both
+            # its integration seat and Agent lease. Force dispatch to see it.
+            committing.set()
+            assert dispatch_checked.wait(10)
+        return commit_candidate(stage, current, job, checkout)
+
+    def observed_dispatch(*args, **kwargs):
+        if committing.is_set():
+            dispatch_checked.set()
+        return wait(*args, **kwargs)
+
+    monkeypatch.setattr(development, 'commit_candidate', held_commit)
+    monkeypatch.setattr(scheduling, 'wait', observed_dispatch)
     state, states, git, fixture = _run(
         git_repo, (2,), ci_repairs_per_round=1,
     )
@@ -1216,9 +1240,11 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(git_repo: Path) -> N
     thread.start()
     try:
         assert review_entered.wait(timeout=10), f"second CI Reviewer did not start: {errors!r}"
+        assert committing.is_set() and dispatch_checked.is_set()
         requested = request_ticket_pause(states, str(state["run_id"]), 2)
         assert "2" in requested["ticket_pause_requests"]
     finally:
+        dispatch_checked.set()
         release_review.set()
         thread.join(timeout=10)
     assert not thread.is_alive()

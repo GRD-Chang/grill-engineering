@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, TYPE_CHECKING
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Callable, Iterator, TYPE_CHECKING
 
 from agent_run.external_supervision import ExternalSupervisor, is_supervised_wait
 from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
 
 if TYPE_CHECKING:
     from agent_run.delivery import TicketDeliveryEngine
+
+
+_claim_ticket: ContextVar[Callable[[int], None] | None] = ContextVar("supervision_ticket_owner", default=None)
+
+
+@contextmanager
+def supervision_ownership(claim: Callable[[int], None]) -> Iterator[None]:
+    """Report the exact Ticket before supervision can change its work phase."""
+    token = _claim_ticket.set(claim)
+    try:
+        yield
+    finally:
+        _claim_ticket.reset(token)
 
 
 def development_wait_due(
@@ -65,6 +80,8 @@ def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset
         number = state["ticket_integration_queue"][0]["ticket_number"]
     if type(number) is not int or number in lanes:
         return False
+    if claim := _claim_ticket.get():
+        claim(number)
     scoped = TicketState(engine.states, run_id, number)
     projected = scoped.load_current_run(run_id)
     if projected is None:

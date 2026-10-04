@@ -20,6 +20,8 @@ class RunController(Protocol):
 class TicketEngine(Protocol):
     def supervise(self, run_id: str, lanes: frozenset[int]) -> bool: ...
 
+    def current_result(self, run_id: str) -> dict[str, Any]: ...
+
     def deliver(self, run_id: str) -> dict[str, Any]: ...
 
     def develop_frontier(
@@ -101,7 +103,12 @@ class DeliveryRunEngine:
             if isinstance(number, int) and number in idle_tickets and not ready_for_freed_seat:
                 return state
             try:
-                result = self.tickets.deliver(run_id)
+                # The dispatcher also owns integration-only and final Agent
+                # work. Consume its result without starting a foreground lane.
+                result = (
+                    self.tickets.current_result(run_id) if developed
+                    else self.tickets.deliver(run_id)
+                )
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state

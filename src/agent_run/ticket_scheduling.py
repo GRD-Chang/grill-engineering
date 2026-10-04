@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
+from threading import Lock
 from time import monotonic
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -15,7 +16,7 @@ from agent_run.revisions import TicketGraphDriftError
 from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
 from agent_run.ticket_state import RUN_STOP_STATUSES
-from agent_run.ticket_supervision import development_wait_due
+from agent_run.ticket_supervision import development_wait_due, supervision_ownership
 from agent_run.ticket_work import TicketWorkAdmission, capacity
 
 if TYPE_CHECKING:
@@ -55,7 +56,9 @@ def develop_frontier(
             ready.append(number)
         return ready, waiting
 
-    if not any(
+    if not (supervise is not None and (
+        state["ticket_integration_holder"] is not None or state["ticket_integration_queue"]
+    )) and not any(
         state["ticket_integration_holder"] != number
         and state["ticket_jobs"].get(str(number), {}).get("phase") in {None, *DEVELOPMENT_WORKER_PHASES}
         for number in state["frontier"]
@@ -69,9 +72,17 @@ def develop_frontier(
                 github=engine.github, agents=engine.agents, development_only=True,
             ).deliver_ticket(run_id, number)
 
+    observer_ticket: int | None = None
+    observer_lock = Lock()
+
+    def claim_observed_ticket(number: int) -> None:
+        nonlocal observer_ticket
+        with observer_lock:
+            observer_ticket = number
+
     def observe(lanes: frozenset[int]) -> None:
         assert supervise is not None
-        with runner_credential_scope():
+        with runner_credential_scope(), supervision_ownership(claim_observed_ticket):
             try:
                 supervise(lanes)
             except ConcurrentRunStateError:
@@ -106,6 +117,7 @@ def develop_frontier(
         observer: Future[None] | None = None
         next_observation = 0.0
         notify_completion = False
+        final_observation = False
         while True:
             current = engine.states.load_current_run(run_id)
             if current is None:
@@ -114,7 +126,9 @@ def develop_frontier(
                 close_executor_admission()
                 return True
             active = frozenset(futures.values())
-            ready, pending_wait = candidates(current, active)
+            with observer_lock:
+                owned = active | ({observer_ticket} if observer_ticket is not None else set())
+            ready, pending_wait = candidates(current, frozenset(owned))
             admission.seed([number for number in ready if number not in active])
             current = engine.states.load_current_run(run_id)
             assert current is not None
@@ -143,9 +157,22 @@ def develop_frontier(
                 occupied += 1
             if observer is not None and observer.done() and consume_result(observer):
                 observer = None
+                with observer_lock:
+                    observer_ticket = None
                 next_observation = monotonic() + SUPERVISION_POLL_SECONDS
+                # Supervision may have refreshed the frontier or accepted a
+                # concurrent Resume. Decide from a fresh snapshot next pass.
+                continue
+            # Supervision may still own a long Agent call or external I/O.
+            # Keep dispatch and global controls live until it has returned.
             if not futures and not ready and not pending_wait:
-                break
+                if observer is None:
+                    if supervise is None or final_observation:
+                        break
+                    observer = pool.submit(copy_context().run, observe, frozenset())
+                    final_observation = True
+            else:
+                final_observation = False
             if supervise is not None and observer is None and monotonic() >= next_observation:
                 observer = pool.submit(copy_context().run, observe, frozenset(futures.values()))
             watched = set(futures)
@@ -178,9 +205,4 @@ def develop_frontier(
                     if isinstance(window.get(key), (int, float)) and window[key] > now
                 ]
                 supervisor.sleeper(min([SUPERVISION_POLL_SECONDS, *deadlines]))
-        if observer is not None:
-            while not consume_result(observer):
-                pass
-        if supervise is not None:
-            supervise(frozenset())
     return True

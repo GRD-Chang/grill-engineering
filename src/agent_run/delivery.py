@@ -78,6 +78,19 @@ class TicketDeliveryEngine:
 
         return supervise_ticket(self, run_id, lanes)
 
+    def current_result(self, run_id: str) -> dict[str, Any]:
+        """Read the selected Ticket's persisted result, including its wait."""
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            projected = TicketState(self.states, run_id, int(active["ticket_number"])).load_current_run(run_id)
+            if projected is None:
+                raise ValueError(f"unknown Delivery Run: {run_id}")
+            return projected
+        return state
+
     def deliver(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
         if state is None:
