@@ -13,7 +13,7 @@ from agent_run.error_safety import bounded_error, redact_credentials
         ("0123456789abcdef", "0123456789abcdef"),
         ("中文ſecretKey", "中文ſecretKey"),
         ("01", "01"),
-        ("1e2", "100.0"),
+        ("1e2", "1e2"),
         ('false {"token":"credential"}', 'false {"token":"[REDACTED]"}'),
         ('123 {"password":"credential"}', '123 {"password":"[REDACTED]"}'),
         ("Infinity token=credential", "Infinity token=[REDACTED]"),
@@ -60,14 +60,14 @@ from agent_run.error_safety import bounded_error, redact_credentials
             'first {"token":"one"} then {"secret":"two"}',
             'first {"token":"[REDACTED]"} then {"secret":"[REDACTED]"}',
         ),
-        (" \t42\r\n", "42"),
-        (" 1e2 ", "100.0"),
-        (" true ", "true"),
-        (" false ", "false"),
+        (" \t42\r\n", " \t42\r\n"),
+        (" 1e2 ", " 1e2 "),
+        (" true ", " true "),
+        (" false ", " false "),
         (" null ", " null "),
-        (" NaN ", "NaN"),
-        (" Infinity ", "Infinity"),
-        (" -Infinity ", "-Infinity"),
+        (" NaN ", " NaN "),
+        (" Infinity ", " Infinity "),
+        (" -Infinity ", " -Infinity "),
     ],
 )
 def test_credential_redaction_preserves_text_and_json_semantics(
@@ -87,3 +87,21 @@ def test_error_bound_applies_after_redacting_embedded_credentials() -> None:
     assert result.startswith('prefix {"password":"[REDACTED]"} ')
     assert "credential" not in result
     assert len(result.encode("utf-8")) <= 8192
+
+
+@pytest.mark.parametrize("prefix", ["", "payload "])
+@pytest.mark.parametrize(("value", "expected"), [
+    ('{"x":"\\u0067hp_123456789abcdef", "x":"safe"}', '{"x":"safe"}'),
+    ('{"x":{"password":"private-value"}, "x":"safe"}', '{"x":"safe"}'),
+    ('{"nested":{"x":"\\u0067hp_123456789abcdef", "x":"safe"}}',
+     '{"nested":{"x":"safe"}}'),
+])
+def test_duplicate_json_keys_do_not_hide_escaped_credentials(
+    prefix: str, value: str, expected: str,
+) -> None:
+    assert redact_credentials(prefix + value) == prefix + expected
+
+
+def test_embedded_json_redaction_keeps_adjacent_harmless_fragments() -> None:
+    value = '{"x":"\\u0067hp_123456789abcdef", "x":"safe"} then { "x": 1, "x": 2 } - [ ]'
+    assert redact_credentials(value) == '{"x":"safe"} then { "x": 1, "x": 2 } - [ ]'

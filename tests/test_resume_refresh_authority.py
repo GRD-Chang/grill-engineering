@@ -125,3 +125,33 @@ def test_resume_preserves_authority_across_persisted_refresh_wait(
         assert final["status"] not in {"operator_stopped", "supervision_timeout"}
         assert pause_key not in states.load_run(run_id)
         assert final.get("github_refresh_pending") is not True
+
+
+def test_resume_preserves_unchanged_markdown_requirements(git_repo: Path) -> None:
+    body = '- [ ] 保持任务正文\r\n- [x] 已确认\r\n示例：{ "enabled": true }'
+    fixture = write_fixture(git_repo / "github.json", issues={
+        "2": {"number": 2, "title": "Ticket", "body": body, "state": "OPEN",
+              "labels": ["ready-for-agent"], "blocked_by": []},
+    }, parent={"number": 1, "title": "Parent", "body": body,
+               "sub_issues": [2], "sub_issue_order_reliable": True})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
+    state, _ = controller.start(1)
+    run_id = state["run_id"]
+    record_operator_stop(state, save=lambda current: states.save_run(run_id, current))
+    paused = states.load_current_run(run_id)
+    assert paused is not None
+    intent = bind_resume_intent(paused)
+
+    resumed, _ = controller.resume(
+        run_id, explicit_resume=True,
+        validate_resume_state=lambda current: validate_resume_intent(current, intent),
+    )
+
+    assert resumed["status"] == "active"
+    assert resumed["accepted_parent_spec_revision"] == state["accepted_parent_spec_revision"]
+    assert resumed["accepted_ticket_graph_revision"] == state["accepted_ticket_graph_revision"]
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    assert saved["parent"]["body"] == body
+    assert saved["ticket_graph"]["tickets"]["2"]["body"] == body

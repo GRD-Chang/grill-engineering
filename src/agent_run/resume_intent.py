@@ -36,7 +36,10 @@ def bind_resume_intent(
     state = current = resume_pause_state(state)
     checkpoints = budget_checkpoint_subjects(current)
     gates = operator_gate_subjects(current)
-    if ticket_number is None and is_ticket_execution_recovery(current, current.get("status")):
+    ticket_recovery = ticket_number is None and is_ticket_execution_recovery(
+        current, current.get("status")
+    )
+    if ticket_recovery:
         # Run recovery cannot renew or reopen a sibling Ticket's local gate.
         checkpoints = []
         gates = []
@@ -139,7 +142,7 @@ def bind_resume_intent(
         # Refresh may clear the synthetic execution-failure gate while retaining
         # the exact interrupted Invocation. Its Agent identity is the target.
         subjects = []
-    invocation = state.get("active_agent_invocation")
+    invocation = None if ticket_recovery else state.get("active_agent_invocation")
     if ticket_number is not None:
         invocations = state.get("ticket_agent_invocations")
         invocation = invocations.get(str(ticket_number)) if isinstance(invocations, Mapping) else None
@@ -151,30 +154,9 @@ def bind_resume_intent(
         invocation = {}
     target = {
         "run_id": state.get("run_id"),
-        "invocation": {
-            key: invocation.get(key)
-            for key in (
-                "binding_id", "role", "requested_thread_id", "reported_thread_id",
-                "started_at", "semantic_attempt", "currentness_boundary",
-                "thread_execution_binding", "output_attempt", "validation_error",
-            )
-        },
+        "invocation": _invocation_identity(invocation),
         "subjects": [
-            {
-                "location": location,
-                "review_budget": review_budget_owner(subject).get("review_budget"),
-                **{
-                    key: subject.get(key)
-                    for key in (
-                        "ticket_number", "generation", "acceptance_generation",
-                        "candidate_sha", "phase", "blocked_reason", "human_blockers",
-                        "ticket_branch_generation", "pause_resume_phase",
-                        "execution_resume_phase", "last_ticket_resume",
-                        "pending_semantic_attempt", "integration_resync",
-                        "ci_recovery", "publication_operation_retry",
-                    )
-                },
-            }
+            {"location": location, **_subject_identity(subject)}
             for location, subject in subjects
         ],
         "operator_stop": state.get("operator_stop"),
@@ -183,6 +165,18 @@ def bind_resume_intent(
         "supervision_wait": state.get("supervision_wait")
         if reason == "supervision_timeout" else None,
     }
+    if ticket_recovery:
+        # Active Ticket/Invocation are FIFO presentation projections. Bind the
+        # durable per-Ticket work instead, including jobs not yet invoked.
+        target["ticket_work"] = {
+            number: {
+                "invocation": _invocation_identity(
+                    state.get("ticket_agent_invocations", {}).get(number)
+                ),
+                "job": _subject_identity(job),
+            }
+            for number, job in state.get("ticket_jobs", {}).items()
+        }
     intent: dict[str, Any] = {
         "pause_reason": reason,
         "authorization": authorization,
@@ -191,6 +185,35 @@ def bind_resume_intent(
     if ticket_number is not None:
         intent["ticket_number"] = ticket_number
     return intent
+
+
+def _invocation_identity(invocation: object) -> dict[str, Any]:
+    value = invocation if isinstance(invocation, Mapping) else {}
+    return {
+        key: value.get(key)
+        for key in (
+            "binding_id", "role", "requested_thread_id", "reported_thread_id",
+            "started_at", "semantic_attempt", "currentness_boundary",
+            "thread_execution_binding", "output_attempt", "validation_error",
+        )
+    }
+
+
+def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "review_budget": review_budget_owner(subject).get("review_budget"),
+        **{
+            key: subject.get(key)
+            for key in (
+                "ticket_number", "generation", "acceptance_generation",
+                "candidate_sha", "phase", "blocked_reason", "human_blockers",
+                "ticket_branch_generation", "pause_resume_phase",
+                "execution_resume_phase", "last_ticket_resume",
+                "pending_semantic_attempt", "integration_resync",
+                "ci_recovery", "publication_operation_retry",
+            )
+        },
+    }
 
 
 def is_ticket_execution_recovery(state: Mapping[str, Any], status: object) -> bool:

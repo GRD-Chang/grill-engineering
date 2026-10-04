@@ -38,7 +38,7 @@ _MULTILINE_PRIVATE_KEY = re.compile(
     r"(?:[\"']?-----BEGIN .*?-----END [^-]*-----|[^\r\n]*(?:\r?\n[^\r\n]*)+)"
 )
 _MAX_ERROR_BYTES = 8 * 1024
-_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f]")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)")
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
 _NON_JSON_NUMBER = re.compile(r"[^0-9eE+.\- \t\r\n]")
 # Every labelled pattern contains one of these words; matching remains below.
@@ -58,7 +58,7 @@ def redact_credentials(value: str) -> str:
 
     json_value = _redact_json_credentials(value)
     if json_value is not None:
-        value = json.dumps(json_value, ensure_ascii=False, separators=(",", ":"))
+        value = json_value
     else:
         value = _redact_embedded_json_credentials(value)
     return _redact_text(value)
@@ -66,7 +66,7 @@ def redact_credentials(value: str) -> str:
 
 def _redact_text(value: str) -> str:
     # Credential forms and control characters all require non-alphanumeric text.
-    # Keep this after JSON normalization (for example, 1e2 becomes 100.0).
+    # Decoded JSON is inspected before this textual pass.
     if value.isalnum():
         return value
     # Every labelled credential pattern requires one of these separators.
@@ -100,7 +100,23 @@ def _redact_text(value: str) -> str:
     return redacted
 
 
-def _redact_json_credentials(value: str) -> object | None:
+class _CredentialJSONDecoder(json.JSONDecoder):
+    """Detect shadowed values that must not survive credential inspection."""
+
+    def __init__(self) -> None:
+        self.hidden_credentials = False
+        super().__init__(object_pairs_hook=self._object)
+
+    def _object(self, pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result and _redact_decoded_json({key: result[key]}) is not None:
+                self.hidden_credentials = True
+            result[key] = item
+        return result
+
+
+def _redact_json_credentials(value: str) -> str | None:
     # Avoid constructing JSONDecodeError for ordinary status/identity strings.
     # Python's JSON decoder also accepts NaN and Infinity by default.
     leading = value.lstrip(" \t\n\r")
@@ -113,22 +129,26 @@ def _redact_json_credentials(value: str) -> object | None:
         if leading.rstrip(" \t\n\r") != "-Infinity" and _NON_JSON_NUMBER.search(leading):
             return None
     try:
-        decoded: object = json.loads(value)
+        decoder = _CredentialJSONDecoder()
+        decoded: object = decoder.decode(value)
     except json.JSONDecodeError:
         return None
-    return _redact_json_value(decoded)
+    return _redact_json_fragment(
+        value, decoded, hidden_credentials=decoder.hidden_credentials,
+    )
 
 
 def _redact_embedded_json_credentials(value: str) -> str:
-    """Normalize every complete JSON object or array embedded in error text."""
+    """Inspect embedded JSON without reformatting credential-free fragments."""
 
-    decoder: json.JSONDecoder | None = None
+    decoder: _CredentialJSONDecoder | None = None
     fragments: list[str] = []
     cursor = 0
     while match := _JSON_CONTAINER_START.search(value, cursor):
         cursor = match.start()
         if decoder is None:
-            decoder = json.JSONDecoder()
+            decoder = _CredentialJSONDecoder()
+        decoder.hidden_credentials = False
         try:
             decoded, end = decoder.raw_decode(value, cursor)
         except json.JSONDecodeError:
@@ -136,12 +156,36 @@ def _redact_embedded_json_credentials(value: str) -> str:
             continue
         fragments.append(value[:cursor])
         fragments.append(
-            json.dumps(_redact_json_value(decoded), ensure_ascii=False, separators=(",", ":"))
+            _redact_json_fragment(
+                value[cursor:end], decoded, hidden_credentials=decoder.hidden_credentials,
+            )
         )
         value = value[end:]
         cursor = 0
     fragments.append(value)
     return "".join(fragments)
+
+
+def _redact_json_fragment(
+    original: str, decoded: object, *, hidden_credentials: bool = False,
+) -> str:
+    sanitized = _redact_decoded_json(decoded)
+    if sanitized is not None:
+        return sanitized
+    if hidden_credentials:
+        # A duplicate key discarded a secret-bearing value while decoding.
+        return json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    return original
+
+
+def _redact_decoded_json(decoded: object) -> str | None:
+    # Inspect decoded text too: escaped labels and bare tokens must not evade
+    # redaction. JSON reserialization is necessary only when content changes.
+    normalized = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    sanitized = _redact_text(json.dumps(
+        _redact_json_value(decoded), ensure_ascii=False, separators=(",", ":"),
+    ))
+    return sanitized if sanitized != normalized else None
 
 
 def _redact_json_value(value: object) -> object:

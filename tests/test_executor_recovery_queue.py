@@ -95,3 +95,64 @@ def test_run_recovery_does_not_renew_or_resume_sibling_budget_gate(
         ticket_number=None, source_status=status,
     )
     assert state == before
+
+
+@pytest.mark.parametrize("boundary", ["interruption", "operator_stop"])
+def test_global_resume_binds_ticket_authority_not_active_projection(
+    git_repo: Path, boundary: str,
+) -> None:
+    from agent_run.resume_intent import ResumeIntentError, validate_resume_intent
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = state["run_id"]
+    agents = TicketAgents(git_repo, (3, 2), lambda _number: None)
+    engine = ticket_engine(git, states, fixture, agents, development_only=True)
+    for number in (3, 2):
+        engine.deliver_ticket(run_id, number)
+    paused = states.load_current_run(run_id)
+    assert paused is not None
+    assert paused["active_agent_invocation"]["work_subject"] == "ticket:2"
+    assert paused["ticket_integration_queue"][0]["ticket_number"] == 3
+    record = record_session_interruption if boundary == "interruption" else record_operator_stop
+    record(paused, save=lambda value: states.save_run(run_id, value))
+    paused = states.load_current_run(run_id)
+    assert paused is not None
+    intent = bind_resume_intent(paused)
+    # Even the non-selected sibling remains part of the accepted authority.
+    for field in ("candidate_sha", "ticket_branch_generation", "review_budget"):
+        changed = deepcopy(paused)
+        job = changed["ticket_jobs"]["3"]
+        if field == "review_budget":
+            job[field]["window"] += 1
+        elif field == "ticket_branch_generation":
+            job[field] += 1
+        else:
+            job[field] = "f" * 40
+        with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
+            validate_resume_intent(changed, intent)
+    for field in ("binding_id", "semantic_attempt", "currentness_boundary"):
+        changed = deepcopy(paused)
+        invocation = changed["ticket_agent_invocations"]["3"]
+        if field == "binding_id":
+            invocation[field] = "replacement-binding"
+        elif field == "semantic_attempt":
+            invocation[field]["attempt_id"] = "replacement-attempt"
+        else:
+            invocation[field]["candidate_sha"] = "f" * 40
+        with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
+            validate_resume_intent(changed, intent)
+    for field in ("accepted_parent_spec_revision", "accepted_ticket_graph_revision"):
+        changed = {**paused, field: "changed"}
+        with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
+            validate_resume_intent(changed, intent)
+    identities = deepcopy(paused["ticket_agent_invocations"])
+    jobs = deepcopy(paused["ticket_jobs"])
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+        validate_resume_state=lambda current: validate_resume_intent(current, intent),
+    )
+    assert resumed["active_agent_invocation"]["work_subject"] == "ticket:3"
+    assert resumed["ticket_agent_invocations"] == identities
+    for number, job in jobs.items():
+        assert {key: resumed["ticket_jobs"][number][key] for key in job} == job
+    assert resumed["status"] == "active"

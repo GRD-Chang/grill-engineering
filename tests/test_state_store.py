@@ -39,6 +39,36 @@ def test_run_state_reads_pretty_json_and_saves_the_same_data_compactly(
     assert len(path.read_bytes()) < len(original.encode("utf-8"))
 
 
+@pytest.mark.parametrize("body", [
+    "- [ ] 保持原文\n- [x] 已完成\n示例：[ 1,  2 ]",
+    "- [ ] 保持原文\r\n- [x] 已完成\r\n",
+    '{ "enabled": true, "limits": [ 1, 2 ] }',
+    '{ "example": "first", "example": "last" }',
+    '示例：{ "enabled": true }，数值 1e2，- [ ] 验收',
+])
+def test_requirement_body_survives_persistence_verbatim(tmp_path: Path, body: str) -> None:
+    store = StateStore(tmp_path)
+    state = {"parent": {"body": body}, "ticket_graph": {"tickets": {"2": {"body": body}}}}
+    store.save_run("run-1", state)
+    assert store.load_run("run-1") == state
+
+
+@pytest.mark.parametrize("body", [
+    '正文 {"to\\u006ben": "private-credential"} - [ ] 验收',
+    '正文 {"x":"\\u0067hp_123456789abcdef", "x":"safe", "token":"private-credential"} - [ ] 验收',
+    '正文 {"message": "ghp_12345678\\u0039abcdef"} - [ ] 验收',
+    '正文 {"password": {"nested": "private-credential"}} - [ ] 验收',
+])
+def test_requirement_body_keeps_credential_redaction(tmp_path: Path, body: str) -> None:
+    store = StateStore(tmp_path)
+    store.save_run("run-1", {"parent": {"body": body}})
+    saved = store.load_run("run-1")["parent"]["body"]
+    assert "private-credential" not in saved
+    assert "ghp_" not in saved
+    assert "[REDACTED]" in saved
+    assert "- [ ] 验收" in saved
+
+
 def test_controller_refresh_rejects_a_concurrent_run_write(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     store.save_run("run-1", {"version": 1})
