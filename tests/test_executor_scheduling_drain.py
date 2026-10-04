@@ -289,4 +289,3 @@ def test_supervision_snapshot_race_keeps_dispatch_alive(git_repo: Path, monkeypa
         release.set()
         thread.join(5)
     assert not thread.is_alive() and not errors, errors
-
