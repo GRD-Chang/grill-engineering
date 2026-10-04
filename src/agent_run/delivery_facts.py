@@ -14,6 +14,20 @@ _CURRENT_PUBLICATION_GATE_PHASES = {
 }
 
 
+def scheduler_progress(control: object) -> dict[str, Any]:
+    """Distinguish live workers from admission closed for executor shutdown."""
+    if not isinstance(control, dict):
+        return {"activity": "unknown", "failure": None}
+    executor = control.get("executor")
+    activity = control.get("activity", "unknown")
+    draining = (activity == "running" and isinstance(executor, dict)
+                and executor.get("ticket_resume_closed") is True)
+    return {
+        "activity": "draining" if draining else activity,
+        "failure": executor.get("failure") if draining and isinstance(executor, dict) else None,
+    }
+
+
 def _ticket_execution_activity(invocation: object, executor_activity: str) -> str:
     if not isinstance(invocation, dict) or invocation.get("status") not in {
         "running", "resuming",

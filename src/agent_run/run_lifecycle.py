@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.executor_admission import executor_admission_scope
 from agent_run.models import same_repository
 from agent_run.agent_invocation import (
     record_session_interruption,
@@ -1293,10 +1294,18 @@ class RunLifecycle:
             run_id=run_id,
         )
         while True:
-            result = (
-                self.execute_with_binding(run_id, action_id, generation)
-                if self.execute_with_binding is not None else self.execute(run_id)
-            )
+            def close_failed_admission(error: BaseException | None) -> None:
+                self.control.close_ticket_resume_admission(
+                    self.task, action_id=action_id, generation=generation,
+                    run_id=run_id, can_exit=lambda: True,
+                    failure=str(error) if error is not None else None,
+                )
+
+            with executor_admission_scope(close_failed_admission):
+                result = (
+                    self.execute_with_binding(run_id, action_id, generation)
+                    if self.execute_with_binding is not None else self.execute(run_id)
+                )
 
             def can_exit() -> bool:
                 store = state_store or self.states
@@ -1946,6 +1955,14 @@ class RunLifecycle:
         generation = action.get("executor_generation")
         kind = action.get("kind")
         status = action.get("status")
+        failure = action.get("failure")
+        if (
+            not isinstance(failure, str) and isinstance(executor, Mapping)
+            and executor.get("action_id") == action.get("action_id")
+            and executor.get("generation") == generation
+            and executor.get("ticket_resume_closed") is True
+        ):
+            failure = executor.get("failure")
         return ActionReceipt(
             action_id=action_id
             or (
@@ -1973,11 +1990,7 @@ class RunLifecycle:
                 if isinstance(action.get("payload_digest"), str)
                 else None
             ),
-            failure=(
-                action.get("failure")
-                if isinstance(action.get("failure"), str)
-                else None
-            ),
+            failure=failure if isinstance(failure, str) else None,
         )
 
     def _state_store_for_record(self, record: Mapping[str, Any] | None) -> StateStore:

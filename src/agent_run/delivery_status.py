@@ -12,7 +12,7 @@ from agent_run.acceptance_facts import (
     acceptance_subject,
     has_prior_acceptance_failure,
 )
-from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family, ticket_phase_execution_activity
+from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family, ticket_phase_execution_activity, scheduler_progress
 from agent_run.execution_timing import invocation_execution_seconds, invocation_activity, parse_optional_timestamp
 
 from agent_run.messages import display_text, display_language
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from rich.text import Text
 
 from agent_run.status_actions import approval_lines, controller_work, delivery_result_lines, status_heading, status_timing
-from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation, scheduler_notice
 from agent_run.final_approval_operation import (
     approval_failure_text,
     final_approval_cleanup_pending,
@@ -130,6 +130,7 @@ def status_progress_view(
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
         "execution_activity": activity,
+        "scheduler": scheduler_progress(control),
         "findings": findings,
         "conclusion": _current_conclusion(
             state, current, findings, activity=activity
@@ -200,6 +201,8 @@ def print_status_progress(
     )
     status_label = status_heading(state, view, status_label)
     print(display_text('presentation.status.status_v1', v1=_terminal_safe(status_label)))
+    if notice := scheduler_notice(view.get("scheduler")):
+        print(notice)
     for result in delivery_result_lines(state):
         print(display_text('presentation.status.delivery_result_v1', v1=result))
     phase = _phase_term(view["phase"], view["current_object"], display_term)
@@ -412,6 +415,8 @@ def print_rich_status_progress(
         or display_text('presentation.status.no_specific_phase_yet'),
     )
     add_identity(display_text('presentation.status.current_object'), human_delivery_object(view.get("current_object")))
+    if notice := scheduler_notice(view.get("scheduler")):
+        add_identity(display_text('presentation.status.status'), notice)
 
     for result in delivery_result_lines(state):
         add_identity(display_text('presentation.status.delivery_result'), result)

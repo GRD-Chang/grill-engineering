@@ -136,6 +136,7 @@ from agent_run.state_contract import (
 )
 from agent_run.task_control import (
     ActionBusyError,
+    ActionReconciliationError,
     TaskControlError,
     TaskControlStore,
     TaskKey,
@@ -2376,7 +2377,7 @@ def _run_lifecycle(
                         pid=pid,
                         process_start_token=token,
                     )
-                except TaskControlError:
+                except ActionReconciliationError:
                     # A Stop/Abandon fence may already have revoked this
                     # Executor.  The old Worker must not overwrite that fence.
                     return
@@ -3635,6 +3636,7 @@ def _with_executor_control(
                     "generation",
                     "pid",
                     "handshake_at",
+                    "ticket_resume_closed",
                     "failure",
                 )
             }

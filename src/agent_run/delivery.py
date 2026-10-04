@@ -31,7 +31,6 @@ from agent_run.ticket_phase import (
 )
 from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
 from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
-from agent_run.task_control import TaskControlBusyError
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.state_contract import IncompatibleRunStateError
 
@@ -92,7 +91,7 @@ class TicketDeliveryEngine:
                 failed = self.states.load_current_run(run_id)
                 assert failed is not None
                 return failed
-            except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError,
+            except (TicketGraphDriftError, IncompatibleRunStateError,
                     SimulatedProcessCrash, GitHubIdentityError):
                 raise
             except Exception as error:

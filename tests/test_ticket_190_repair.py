@@ -6,7 +6,6 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -72,7 +71,7 @@ if role == "replacement":
     release = Path(os.environ["TICKET_190_AGENT_RELEASE"])
 
     @contextmanager
-    def parked_transaction(self, task):
+    def parked_transaction(self, task, *, wait=False, **kwargs):
         # Drain every prior transaction before acknowledging the barrier.
         # Wait outside the real file lock; preserve all ownership validation.
         with transactions:
@@ -83,51 +82,37 @@ if role == "replacement":
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Executor replacement barrier timed out")
                     time.sleep(0.001)
-            with original_locked(self, task):
+            with original_locked(self, task, wait=wait, **kwargs):
                 yield
 
     TaskControlStore._locked = parked_transaction
 
 elif role == "first":
-    original_transaction = TaskControlStore._executor_current_transaction
+    import fcntl
+    original_flock = fcntl.flock
 
-    @contextmanager
-    def observed_transaction(self, task, *, action_id, generation, run_id=None):
-        agent_release = os.environ.get("TICKET_190_AGENT_RELEASE")
-        holder = os.environ.get("TICKET_190_HOLDER")
-        attempted = os.environ.get("TICKET_190_ATTEMPTED")
-        busy = os.environ.get("TICKET_190_BUSY")
-        if (
-            agent_release
-            and holder
-            and attempted
-            and Path(agent_release).exists()
-            and Path(holder).exists()
-            and not Path(attempted).exists()
-        ):
-            Path(attempted).touch()
+    def observed_flock(fd, flags):
         try:
-            with original_transaction(
-                self,
-                task,
-                action_id=action_id,
-                generation=generation,
-                run_id=run_id,
-            ):
-                yield
-        except TaskControlBusyError:
-            if busy:
+            return original_flock(fd, flags)
+        except BlockingIOError:
+            agent_release = os.environ.get("TICKET_190_AGENT_RELEASE")
+            holder = os.environ.get("TICKET_190_HOLDER")
+            attempted = os.environ.get("TICKET_190_ATTEMPTED")
+            busy = os.environ.get("TICKET_190_BUSY")
+            if (agent_release and holder and attempted and busy
+                    and Path(agent_release).exists() and Path(holder).exists()):
+                Path(attempted).touch()
                 Path(busy).touch()
             raise
 
-    TaskControlStore._executor_current_transaction = observed_transaction
+    fcntl.flock = observed_flock
 
 elif role == "second":
     original_locked = TaskControlStore._locked
     hold_state = {"used": False, "initial_contention": False}
 
-    def held_lock(self, task):
-        manager = original_locked(self, task)
+    def held_lock(self, task, *, wait=False, **kwargs):
+        manager = original_locked(self, task, wait=wait, **kwargs)
 
         @contextmanager
         def hold_once():
@@ -460,7 +445,7 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
 
 
 def test_state_commit_retries_task_control_busy_without_failing_run(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = TaskKey(tmp_path / "checkout", "example/project", 156)
     control = TaskControlStore(tmp_path / "control")
@@ -495,27 +480,27 @@ def test_state_commit_retries_task_control_busy_without_failing_run(
     retry_attempts: list[int] = []
     release_errors: list[BaseException] = []
 
-    def transaction() -> object:
-        @contextmanager
-        def current_transaction() -> object:
-            try:
-                with control._executor_current_transaction(
-                    task,
-                    action_id=claim.action_id,
-                    generation=reservation.generation,
-                    run_id="run-1",
-                ):
-                    yield
-            except TaskControlBusyError:
-                retry_attempts.append(len(retry_attempts) + 1)
-                busy_observed.set()
-                if len(retry_attempts) >= 9:
-                    ninth_attempt.set()
-                raise
+    from agent_run import task_control as control_module
+    real_flock = control_module.fcntl.flock
 
-        return current_transaction()
+    def observe_acquisition(fd: int, flags: int) -> None:
+        try:
+            real_flock(fd, flags)
+        except BlockingIOError:
+            retry_attempts.append(len(retry_attempts) + 1)
+            busy_observed.set()
+            if len(retry_attempts) >= 9:
+                ninth_attempt.set()
+            raise
 
-    states._set_write_guard(lambda: None, transaction=transaction)
+    monkeypatch.setattr(control_module.fcntl, "flock", observe_acquisition)
+    states._set_write_guard(
+        lambda: None,
+        transaction=lambda: control._executor_current_transaction(
+            task, action_id=claim.action_id, generation=reservation.generation,
+            run_id="run-1",
+        ),
+    )
 
     def hold_task_control() -> None:
         with control._locked(task):

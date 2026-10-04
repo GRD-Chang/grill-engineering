@@ -9,6 +9,7 @@ from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
+from agent_run.task_control import TaskControlBusyError
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -161,3 +162,100 @@ def test_foreground_integration_failure_keeps_candidate_and_delivers_sibling(
     completed = DeliveryRunEngine(controller=controller, tickets=engine).deliver_from_state(run_id, resumed)
     assert all(completed['ticket_jobs'][str(n)]['phase'] == 'completed' for n in (2, 3, 4))
     require_current_run_state(states.load_current_run(run_id))
+
+
+def test_control_contention_pauses_only_its_ticket(git_repo: Path) -> None:
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=2)
+
+    def develop(number: int) -> None:
+        if number == 2:
+            raise TaskControlBusyError("control lock deadline expired")
+
+    agents = TicketAgents(git_repo, (2, 3), develop)
+    result = DeliveryRunEngine(
+        controller=Controller(FixtureGitHubReader(fixture), git, states),
+        tickets=ticket_engine(git, states, fixture, agents),
+    ).deliver_from_state(state["run_id"], state)
+
+    failed = result["ticket_jobs"]["2"]
+    assert failed["phase"] == "blocked"
+    assert failed["blocked_reason"] == "ticket_execution_failed"
+    assert failed["execution_failure"] == "control lock deadline expired"
+    assert failed["execution_resume_phase"] == "developing"
+    assert result["ticket_jobs"]["3"]["phase"] == "completed"
+    require_current_run_state(states.load_current_run(state["run_id"]))
+
+
+def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Path) -> None:
+    from threading import Event, Thread
+    from agent_run.resume_intent import bind_resume_intent
+    from agent_run.task_control import TaskControlStore, TaskKey
+    from agent_run.ticket_resume import admit_ticket_resume
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=2)
+    run_id = state['run_id']
+    sibling_started, release_sibling, paused, resumed = (Event() for _ in range(4))
+    failed_once = False
+    errors: list[BaseException] = []
+    control = TaskControlStore(states.root)
+    task = TaskKey(git_repo, 'example/project', 1)
+    claim = control.claim_action(task, kind='run', payload={})
+    generation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id).generation
+    identity = dict(action_id=claim.action_id, generation=generation)
+    control.bind_run(task, claim.action_id, run_id, generation=generation)
+    control.mark_handshake(task, **identity, pid=900, process_start_token='executor')
+    control.record_application(task, **identity, run_id=run_id, payload_digest=claim.action['payload_digest'])
+    control.complete_action(task, **identity, result_status='active')
+
+    def develop(number: int) -> None:
+        nonlocal failed_once
+        if number == 3:
+            sibling_started.set()
+            assert release_sibling.wait(10)
+        elif not failed_once:
+            failed_once = True
+            assert sibling_started.wait(10)
+            raise TaskControlBusyError('control lock deadline expired')
+        else:
+            resumed.set()
+
+    def saved(value: dict[str, Any]) -> None:
+        if value['ticket_jobs'].get('2', {}).get('blocked_reason') == 'ticket_execution_failed':
+            paused.set()
+
+    states.run_saved_observer = saved
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    engine = DeliveryRunEngine(controller=controller, tickets=ticket_engine(
+        git, states, fixture, TicketAgents(git_repo, (2, 3), develop),
+    ))
+
+    def run() -> None:
+        try:
+            engine.deliver_from_state(run_id, state)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=run)
+    thread.start()
+    try:
+        assert paused.wait(10), errors
+        current = states.load_current_run(run_id)
+        budget = deepcopy(current['ticket_jobs']['2']['review_budget'])
+        executor = control.load(task)['executor']
+        accepted, duplicate = admit_ticket_resume(controller, control, task, executor, {
+            'parent': 1, 'run_id': run_id, 'ticket_number': 2, 'new_thread': False,
+            'message': None, 'resume_budget_checkpoint': False,
+            'policy': current['policy_snapshot'],
+            'resume_intent': bind_resume_intent(current, ticket_number=2),
+        })
+        assert not duplicate
+        assert accepted['ticket_jobs']['2']['review_budget'] == budget
+        assert resumed.wait(10), errors
+        assert thread.is_alive() and not release_sibling.is_set()
+    finally:
+        release_sibling.set()
+        thread.join(10)
+    assert not thread.is_alive() and not errors, errors
+    final = states.load_current_run(run_id)
+    assert all(final['ticket_jobs'][str(number)]['phase'] == 'completed' for number in (2, 3))
+    assert final['ticket_jobs']['2']['review_budget']['development_attempts'] == 1

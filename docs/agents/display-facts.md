@@ -2,6 +2,8 @@
 
 Status、History、CLI 和 Notification 从既有 Run state 派生事实，不另存展示状态，不执行恢复、发送或 Publisher 操作。渠道自行选择字段、摘要和固定 Run 语言下的文案；原始结果及证据保持原文。
 
+Status/History 的 `scheduler` 从准确 Executor 的活性与既有 `ticket_resume_closed` 派生，区分进程仍活着和调度正在收尾。收尾时保留已知 Agent 活性，同时明确不接受新恢复；不能继续承诺后台检查或新任务派发。此投影不新增持久状态，查询不执行恢复或通知。
+
 | 规则 | 维护归属 | 消费者 |
 | --- | --- | --- |
 | 角色族、当前 Work Subject、Candidate/PR 诊断身份、Ticket 进度 | `delivery_facts.py` | Status、CLI、History、通知、State 查询 |

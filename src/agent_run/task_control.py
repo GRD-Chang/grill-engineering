@@ -30,8 +30,8 @@ _ACTIVE_ACTION_STATUSES = frozenset({"accepted", "applying"})
 _TERMINAL_ACTION_STATUSES = frozenset({"completed", "failed"})
 _ACTIVE_EXECUTOR_STATUSES = frozenset({"starting", "running"})
 _MAX_ACTION_HISTORY = 4
-_EXECUTOR_FENCE_RETRY_WINDOW_SECONDS = 1.0
-_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS = 0.01
+_CONTROL_WRITE_RETRY_WINDOW_SECONDS = 1.0
+_CONTROL_WRITE_RETRY_INTERVAL_SECONDS = 0.01
 
 class TaskControlError(ValueError):
     """The task control record is unavailable or violates its contract."""
@@ -141,7 +141,7 @@ def unresolved_control_target(action: object) -> dict[str, Any] | None:
 
 
 class TaskControlStore:
-    """One bounded JSON record and one non-blocking lock per :class:`TaskKey`."""
+    """One bounded record and short admission/ownership lock per TaskKey."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
@@ -536,7 +536,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Close a Stop/Abandon after its exact Run outcome is durable."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             if action.get("kind") not in {"stop", "abandon"}:
@@ -715,7 +715,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         if not run_id:
             raise TaskControlError("Lifecycle Action is missing its Delivery Run ID")
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             if (
@@ -764,7 +764,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Keep the exact final-approval role with the durable Action history."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             if (
@@ -791,7 +791,7 @@ class TaskControlStore:
         generation: int | None = None,
         state_dir: Path | None = None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor: dict[str, Any] | None = None
             if generation is not None:
@@ -955,7 +955,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Record a host observation before an explicit Executor recovery."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") in _ACTIVE_EXECUTOR_STATUSES:
@@ -983,7 +983,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Persist an exact Host exit proof while retaining the Action gate."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             executor = _require_executor(record, action_id, generation)
@@ -1033,23 +1033,10 @@ class TaskControlStore:
     ) -> None:
         """Revalidate the exact Executor fence before an external side effect."""
 
-        deadline = monotonic() + _EXECUTOR_FENCE_RETRY_WINDOW_SECONDS
-        while True:
-            try:
-                with self._executor_current_transaction(
-                    task,
-                    action_id=action_id,
-                    generation=generation,
-                    run_id=run_id,
-                ):
-                    return
-            except TaskControlBusyError:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise
-                # Only retry acquisition/validation, outside every shared lock.
-                # The caller has not dispatched its external operation yet.
-                sleep(min(_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS, remaining))
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            return
 
     @contextmanager
     def _executor_current_transaction(
@@ -1062,7 +1049,7 @@ class TaskControlStore:
     ) -> Iterator[None]:
         """Hold ownership through one short external/state commit boundary."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="executor/state commit"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
@@ -1100,26 +1087,20 @@ class TaskControlStore:
 
     def close_ticket_resume_admission(
         self, task: TaskKey, *, action_id: str, generation: int,
-        run_id: str, can_exit: Callable[[], bool],
+        run_id: str, can_exit: Callable[[], bool], failure: str | None = None,
     ) -> bool:
         """Atomically stop admission, or let the owner consume newly added work."""
-        deadline = monotonic() + _EXECUTOR_FENCE_RETRY_WINDOW_SECONDS
-        while True:
-            try:
-                with self._executor_current_transaction(
-                    task, action_id=action_id, generation=generation, run_id=run_id,
-                ):
-                    if not can_exit():
-                        return False
-                    record = self._require_unlocked(task)
-                    record["executor"]["ticket_resume_closed"] = True
-                    self._write_unlocked(task, record)
-                    return True
-            except TaskControlBusyError:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise
-                sleep(min(_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS, remaining))
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            if not can_exit():
+                return False
+            record = self._require_unlocked(task)
+            record["executor"]["ticket_resume_closed"] = True
+            if failure is not None:
+                record["executor"]["failure"] = _bounded_text(failure)
+            self._write_unlocked(task, record)
+            return True
 
     def mark_process_started(
         self,
@@ -1130,7 +1111,7 @@ class TaskControlStore:
         pid: int,
         process_start_token: str | None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") == "starting":
@@ -1149,7 +1130,7 @@ class TaskControlStore:
         pid: int,
         process_start_token: str | None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("pid") not in {None, pid}:
@@ -1185,7 +1166,7 @@ class TaskControlStore:
             raise TaskControlError("Worker PID must be positive")
         if not isinstance(process_start_token, str) or not process_start_token:
             raise TaskControlError("Worker process start token is required")
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="worker start"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
@@ -1223,7 +1204,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Clear the exact Worker binding without affecting Executor ownership."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="worker finish"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             workers = _executor_workers(executor)
@@ -1255,7 +1236,7 @@ class TaskControlStore:
         run_id: str | None = None,
         runner_binding: str | None = None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             action = record.get("action")
@@ -1311,7 +1292,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Release admission at the command-specific durable completion boundary."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             executor = record.get("executor")
@@ -1350,7 +1331,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Close an applied Action after the exact Executor is proven gone."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action_value = record.get("action")
             if (
@@ -1421,7 +1402,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Atomically fence a proven dead Executor around its Run failure save."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action_value = record.get("action")
             if (
@@ -1492,7 +1473,7 @@ class TaskControlStore:
     def fail_action(
         self, task: TaskKey, *, action_id: str, failure: str
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             action["status"] = "failed"
@@ -1536,18 +1517,36 @@ class TaskControlStore:
         return record
 
     @contextmanager
-    def _locked(self, task: TaskKey) -> Iterator[None]:
+    def _locked(
+        self, task: TaskKey, *, wait: bool = False, operation: str = "control transaction",
+    ) -> Iterator[None]:
+        """Retry only acquisition for authorized work, never the transaction body.
+
+        New Action admission remains nonblocking. Waiting holds no shared lock;
+        the caller rereads and validates its exact binding after acquisition.
+        """
+        deadline = monotonic() + _CONTROL_WRITE_RETRY_WINDOW_SECONDS if wait else None
         self.directory.mkdir(parents=True, exist_ok=True)
         lock_path = self.directory / f".{task.fingerprint}.lock"
         with lock_path.open("a+", encoding="utf-8") as lock_file:
-            try:
-                fcntl.flock(
-                    lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-            except BlockingIOError as error:
-                raise TaskControlBusyError(
-                    "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
-                ) from error
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    remaining = deadline - monotonic() if deadline is not None else 0
+                    if remaining <= 0:
+                        message = (
+                            "Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
+                            if wait else
+                            "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
+                        )
+                        raise TaskControlBusyError(f"{operation}: {message}") from error
+                    sleep(min(_CONTROL_WRITE_RETRY_INTERVAL_SECONDS, remaining))
+                    if deadline is not None and monotonic() >= deadline:
+                        raise TaskControlBusyError(
+                            f"{operation}: Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
+                        ) from error
             try:
                 yield
             finally:

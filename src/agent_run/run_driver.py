@@ -26,6 +26,7 @@ from agent_run.external_supervision import (
 from agent_run.final_approval_operation import (
     final_approval_cleanup_pending, has_final_approval,
 )
+from agent_run.executor_admission import failure_recorded
 from agent_run.executor_host import ExecutorHost
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -758,49 +759,32 @@ class RunDriver:
                         f"next_action={wait['next_action']}",
                         file=sys.stderr,
                     )
-        except GitHubReadError as error:
-            if is_proven_github_state_contradiction(error.code):
-                recorded = self.operations.controller.record_deterministic_contradiction(
-                    run_id, error.code, error.message
-                )
-            else:
-                recorded = self.operations.controller.record_execution_failure(
-                    run_id, str(error)
-                )
-            if not recorded:
-                raise
-            failed = self.states.load_current_run(run_id)
-            if failed is None:  # pragma: no cover - Controller just wrote it
-                raise
-            return failed
-
         except SimulatedProcessCrash:
-            # Fault injection models an abrupt Executor exit.  Do not convert
-            # it into a normal Run execution failure: the Host must retain the
-            # unresolved ownership record for the next command to reconcile.
             raise
         except (TaskControlBusyError, ConcurrentRunStateError):
-            # Short Task Control contention is not an execution failure.  The
-            # state store retries its own commit boundary; any remaining
-            # contention must reach the caller without changing Run status.
+            # Do not replay a Driver operation after bounded lock acquisition.
             raise
-        except RunnerCredentialError as error:
-            if not self.operations.controller.record_execution_failure(
-                run_id, str(error), runner_credential_failure=True,
-            ):
+        except (GitHubReadError, RunnerCredentialError, CodexProcessError, OSError, ValueError) as error:
+            if not self.record_failure(run_id, error):
                 raise
             failed = self.states.load_current_run(run_id)
-            if failed is None:  # pragma: no cover - Controller just wrote it
+            if failed is None:
                 raise
             return failed
 
-        except (CodexProcessError, OSError, ValueError) as error:
-            if not self.operations.controller.record_execution_failure(run_id, str(error)):
-                raise
-            failed = self.states.load_current_run(run_id)
-            if failed is None:  # pragma: no cover - Controller just wrote it
-                raise
-            return failed
+    def record_failure(self, run_id: str, error: BaseException) -> bool:
+        """Use the same business classification before and after worker drain."""
+        if failure_recorded(error):
+            return True
+        if isinstance(error, GitHubReadError) and is_proven_github_state_contradiction(error.code):
+            return bool(self.operations.controller.record_deterministic_contradiction(
+                run_id, error.code, error.message,
+            ))
+        if isinstance(error, RunnerCredentialError):
+            return bool(self.operations.controller.record_execution_failure(
+                run_id, str(error), runner_credential_failure=True,
+            ))
+        return bool(self.operations.controller.record_execution_failure(run_id, str(error)))
 
     def _pause_ticket_supervision(self, run_id: str, state: dict[str, Any]) -> bool:
         job = state.get("active_ticket_job")

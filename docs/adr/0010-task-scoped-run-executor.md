@@ -40,6 +40,8 @@ Executor Host 是平台无关 Interface，负责按准确 Local Delivery Workspa
 
 Task Control Record 使用任务级短锁，Run state 与共享索引也只在读取、验证、原子提交期间持锁。任何 Agent、Git、GitHub、Publisher、sleep 或外部监督都不得在共享状态锁内运行。Executor 是当前 Delivery Task 的唯一业务写者；每次 Agent、Git 或 Publisher 副作用前必须短事务重验 ownership、generation、currentness 与 Stop/Abandon 控制栅栏，既防止旧快照覆盖，也防止已经失去授权的 Executor继续产生外部副作用。Stop/Abandon 栅栏后只允许已在途的单个 Publisher operation 完成或进入对账，不能继续后续链式 mutation。
 
+内部已授权操作遇到任务控制锁短暂占用时，在统一的有限期限内等待锁；取得锁后重新读取并验证执行身份。等待只重试获取锁，不重放事务体、通知回调或外部写入。外部新 Action 的非阻塞准入保持不变。持续抢锁失败与 ownership 已失效分别处理：可保存的单票故障局部暂停；无法继续保证共享执行安全时，关闭准入、保存准确故障并通过既有通知入口反馈，再完成退出收尾。
+
 每个 Executor Session 使用启动它的 lifecycle 命令所在终端的用户环境快照，使项目 PATH、虚拟环境、代理、自定义 SDK 与本机工具保持一致。快照通过仅当前用户可读、大小有界、绑定准确 Action/generation 且只能消费一次的临时载体传递，不进入 Run state、history、unit metadata 或日志；握手、确定失败、冲突收口、Host 证明退出或不长于握手窗口的截止时间都会删除载体，迟到 generation 不能消费。Worker 从该环境派生项目能力，但 agent-run 自有 Publisher 凭证、控制 capability、Task Control、Runner 管理和 lifecycle mutation 入口必须被机制性遮蔽；这是 ADR 0001 trusted-yolo 合同的窄控制面例外，不是通用文件系统 sandbox。
 
 Executor 与其 Worker 必须绑定准确的任务、Run、执行代次和 Host ownership。Executor 意外退出后，不自动重放中断的 Agent Invocation：先把可证明已中断的 Invocation 形成 `execution_failed/session_interrupted`，等待显式 `resume`；纯外部监督可以从已持久的监督窗口继续；Publisher 写结果未知时先读取远端权威事实对账。无法证明旧执行者已经消失时 fail closed，不依据裸 PID 猜测或终止进程。Operator Stop 是例外的明确授权：意图和控制栅栏持久化后直接终止准确归属的 Codex Worker，不通知或等待 Agent 收尾，保留已落盘 checkout、Semantic Attempt 与可恢复 Thread，形成 `operator_stopped` 并结束 Executor；后续必须显式 `resume`。

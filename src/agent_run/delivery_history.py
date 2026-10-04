@@ -22,7 +22,7 @@ from agent_run.presentation_helpers import (
     human_next_action,
     terminal_safe,
 )
-from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation, scheduler_notice
 from agent_run.history_facts import (
     history_records as semantic_history_records,
     history_record_status_code,
@@ -34,7 +34,7 @@ from agent_run.attempt_evidence import (
     invocation_attempt_view,
 )
 from agent_run.acceptance_facts import acceptance_lanes, artifact_findings as _artifact_findings
-from agent_run.delivery_facts import role_family as _role_family, ticket_phase_execution_activity, multi_ticket_progress
+from agent_run.delivery_facts import role_family as _role_family, ticket_phase_execution_activity, multi_ticket_progress, scheduler_progress
 from agent_run.execution_timing import (
     invocation_activity, invocation_execution_seconds,
     run_elapsed_seconds,
@@ -67,6 +67,7 @@ def history_progress_view(
     return {
         "events": events,
         "execution_activity": execution_activity,
+        "scheduler": scheduler_progress(control),
         "multi_ticket": multi_ticket_progress(state, executor_activity=executor_activity),
         "summary": {
             "rounds": _round_summary(audit.get("semantic_agent_attempts")),
@@ -93,6 +94,8 @@ def print_history_progress(
         _copy('presentation.history.requirement', v1=_safe_text(parent_view.get('number', '?')), v3=_safe_text(parent_view.get('title') or _copy('presentation.history.untitled_requirement')))
     )
     print(_copy('presentation.history.timezone', v1=timezone_label))
+    if notice := scheduler_notice(progress.get("scheduler")):
+        print(notice)
     if progress["summary"]["elapsed_seconds"] is not None:
         print(_copy('presentation.history.elapsed', v1=_duration(progress['summary']['elapsed_seconds'])))
     executor_control = audit.get("executor_control")
@@ -188,6 +191,8 @@ def print_rich_history_progress(
         _rich_line(_copy('presentation.history.timezone_19'), timezone_label),
 
     ]
+    if notice := scheduler_notice(progress.get("scheduler")):
+        header.append(Text(notice))
     if progress["summary"]["elapsed_seconds"] is not None:
         header.append(_rich_line(_copy('presentation.history.elapsed_time'), _duration(progress["summary"]["elapsed_seconds"])))
     if progress.get("execution_activity") in {

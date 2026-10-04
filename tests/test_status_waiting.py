@@ -103,6 +103,45 @@ def status_text(run_id: str, *, plain: bool) -> str:
     return Text.from_ansi(output.getvalue()).plain
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_queries_distinguish_draining_scheduler_from_live_executor(
+    waiting_run: tuple[Path, dict[str, Any]], language: str,
+) -> None:
+    repo, state = waiting_run
+    state["language"] = language
+    StateStore(managed_state(repo)).save_run(state["run_id"], state)
+    control = TaskControlStore(managed_state(repo))
+    task = TaskKey(managed_repo(repo), state["repository"], state["parent"]["number"])
+    record = control.load(task)
+    assert record is not None
+    executor = record["executor"]
+    assert control.close_ticket_resume_admission(
+        task, action_id=executor["action_id"], generation=executor["generation"],
+        run_id=state["run_id"], can_exit=lambda: True, failure="scheduler failed",
+    )
+    before = _workspace_snapshot(repo)
+    for command in ("status", "history"):
+        output = StringIO()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"], "--json"]) == 0
+        audit = json.loads(output.getvalue())
+        assert audit["executor_control"]["activity"] == "running"
+        progress = audit["progress"] if command == "status" else audit
+        assert progress["scheduler"] == {
+            "activity": "draining", "failure": "scheduler failed",
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"], "--plain"]) == 0
+        assert ("调度已停止" if language == "zh" else "Scheduling stopped") in output.getvalue()
+        output = TerminalOutput()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"]]) == 0
+        assert ("调度已停止" if language == "zh" else "Scheduling stopped") in Text.from_ansi(output.getvalue()).plain
+    assert ("调度已停止" if language == "zh" else "Scheduling stopped") in status_text(state["run_id"], plain=False)
+    assert _workspace_snapshot(repo) == before
+
+
 @pytest.mark.parametrize("plain", [True, False])
 def test_running_agent_status_does_not_offer_a_duplicate_run_command(
     waiting_run: tuple[Path, dict[str, Any]], plain: bool,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_run.delivery_facts import current_work_subject
+from agent_run.delivery_facts import current_work_subject, scheduler_progress
 
 from agent_run.messages import display_text
 
@@ -22,6 +22,12 @@ class WaitingPresentation:
     guidance: str
     show_command: bool
     details: tuple[tuple[str, str], ...]
+
+
+def scheduler_notice(scheduler: object) -> str | None:
+    if isinstance(scheduler, dict) and scheduler.get("activity") == "draining":
+        return display_text('presentation.status.scheduler_draining')
+    return None
 
 
 def cleanup_instruction(state: dict[str, Any]) -> str | None:
@@ -63,7 +69,10 @@ def waiting_presentation(
     control = audit.get("executor_control")
     activity = control.get("activity") if isinstance(control, dict) else "unknown"
     timed_out = status == "supervision_timeout" or ticket_timeout
-    if timed_out:
+    if scheduler_progress(control)["activity"] == "draining":
+        description = display_text('presentation.status.scheduler_draining')
+        guidance = display_text('presentation.status.scheduler_resume_after_exit')
+    elif timed_out:
         description = display_text('presentation.status.automatic_waiting_timed_out_for_this_round')
         guidance = display_text('presentation.status.run_the_following_command_to_resume_waiting')
     elif activity == "running":

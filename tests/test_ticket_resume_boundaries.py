@@ -244,27 +244,25 @@ def test_resume_accepts_repaired_remote_qualification(paused_ticket) -> None:
 
 
 def test_exit_handshake_retries_concurrent_resume_transaction(paused_ticket, monkeypatch) -> None:
-    from contextlib import contextmanager
     from threading import Event, Thread
-    from agent_run.task_control import TaskControlBusyError, TaskControlStore
+    from agent_run import task_control as control_module
+    from agent_run.task_control import TaskControlStore
 
     _, control, task, executor, payload, _ = paused_ticket
     arguments = dict(action_id=executor['action_id'], generation=executor['generation'], run_id=payload['run_id'])
     contended = Event()
     finished = Event()
     results, errors = [], []
-    original = control._executor_current_transaction
+    original = control_module.fcntl.flock
 
-    @contextmanager
-    def observe_contention(*args, **kwargs):
+    def observe_contention(fd, flags):
         try:
-            with original(*args, **kwargs):
-                yield
-        except TaskControlBusyError:
+            return original(fd, flags)
+        except BlockingIOError:
             contended.set()
             raise
 
-    monkeypatch.setattr(control, '_executor_current_transaction', observe_contention)
+    monkeypatch.setattr(control_module.fcntl, 'flock', observe_contention)
 
     def close():
         try:
@@ -287,3 +285,25 @@ def test_exit_handshake_retries_concurrent_resume_transaction(paused_ticket, mon
             thread.join(5)
     assert not errors and results == [False]
     assert control.load(task)['executor'].get('ticket_resume_closed') is not True
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: bool) -> None:
+    controller, control, task, executor, payload, _ = paused_ticket
+    admitted, repeated = admit_ticket_resume(controller, control, task, executor, payload)
+    assert not repeated
+    if closed:
+        assert control.close_ticket_resume_admission(
+            task, action_id=executor['action_id'], generation=executor['generation'],
+            run_id=payload['run_id'], can_exit=lambda: True, failure='scheduler stopped',
+        )
+    state_before = (controller.states.runs_directory / f"{payload['run_id']}.json").read_bytes()
+    control_before = control.path_for(task).read_bytes()
+    if closed:
+        with pytest.raises(ActionBusyError, match='收口'):
+            admit_ticket_resume(controller, control, task, executor, payload)
+    else:
+        duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
+        assert repeated and duplicate == admitted
+    assert (controller.states.runs_directory / f"{payload['run_id']}.json").read_bytes() == state_before
+    assert control.path_for(task).read_bytes() == control_before

@@ -93,7 +93,7 @@ def test_delivery_progress_preserves_audit(
         "repository", "parent", "status", "phase", "current_object",
         "ticket_progress", "round_progress", "integration_resync", "ci_recovery",
         "run_repair", "elapsed_seconds",
-        "current_agent", "execution_activity", "findings", "conclusion", "next_action",
+        "current_agent", "execution_activity", "scheduler", "findings", "conclusion", "next_action",
     }
     assert progress["ticket_progress"] == {
         "completed": completed, "total": 2 if completed else 0,

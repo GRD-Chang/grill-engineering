@@ -58,10 +58,19 @@ def admit_ticket_resume(
         raise ResumeIntentError('Delivery Run 已不存在')
     _require_admission(initial, number)
     if _replay(initial, number, payload):
-        # Even read-only duplicate receipts must still belong to this session.
-        control.assert_executor_current(task, action_id=str(executor['action_id']),
-                                        generation=int(executor['generation']), run_id=run_id)
-        return initial, True
+        # A live process may already be draining; duplicate receipts must use
+        # the same admission fence as new work and recheck the latest Ticket.
+        with control.ticket_resume_transaction(
+            task, action_id=str(executor['action_id']),
+            generation=int(executor['generation']), run_id=run_id,
+        ), states.locked():
+            latest = states.load_current_run(run_id)
+            if latest is None:
+                raise ResumeIntentError('Delivery Run 已不存在')
+            _require_admission(latest, number)
+            if _replay(latest, number, payload):
+                return latest, True
+            initial = latest
     policy = parse_policy_snapshot(payload['policy']).snapshot()
     frozen = initial['ticket_jobs'][str(number)]['policy_snapshot']
     if any(policy[key] != frozen[key] for key in policy if key not in {

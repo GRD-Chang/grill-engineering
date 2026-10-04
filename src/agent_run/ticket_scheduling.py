@@ -7,8 +7,10 @@ from contextvars import copy_context
 from time import monotonic
 from typing import Any, Callable, TYPE_CHECKING
 
+from agent_run.executor_admission import close_admission_on_failure, close_executor_admission
 from agent_run.external_supervision import ExternalSupervisor
 from agent_run.runner_credentials import runner_credential_scope
+from agent_run.state import ConcurrentRunStateError
 from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
 from agent_run.ticket_state import RUN_STOP_STATUSES
 from agent_run.ticket_supervision import development_wait_due
@@ -67,13 +69,21 @@ def develop_frontier(
     def observe(lanes: frozenset[int]) -> None:
         assert supervise is not None
         with runner_credential_scope():
-            supervise(lanes)
+            try:
+                supervise(lanes)
+            except ConcurrentRunStateError:
+                # A live Resume or lane save invalidated a refresh snapshot.
+                # The next supervision pass rereads; Agent work keeps running.
+                return
 
     # Agent capacity comes only from durable leases. Keep bounded room for
     # returned Agents' program closeout (e.g. a slow currentness read), plus
     # one reserved supervision thread. Program futures are not Agent permits.
     pipeline_limit = 2 * limit
-    with ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool:
+    with (
+        ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
+        close_admission_on_failure(),
+    ):
         futures: dict[Future[None], int] = {}
         observer: Future[None] | None = None
         next_observation = 0.0
@@ -82,6 +92,9 @@ def develop_frontier(
             current = engine.states.load_current_run(run_id)
             if current is None:
                 raise ValueError("Delivery Run disappeared during dispatch")
+            if current["status"] in RUN_STOP_STATUSES:
+                close_executor_admission()
+                return True
             active = frozenset(futures.values())
             ready, pending_wait = candidates(current, active)
             admission.seed([number for number in ready if number not in active])

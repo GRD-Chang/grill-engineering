@@ -1048,6 +1048,8 @@
   "presentation.final_approval.status_comment_failed": "Final approval failed while writing the PR status comment: {reason}",
   "presentation.final_approval.action_failed": "Final approval action failed: {reason}",
   "presentation.status.executor_activity": "Executor: {activity}",
+  "presentation.status.scheduler_draining": "Scheduling stopped; the executor is finishing. Existing Agents may still be working; new Resume requests are not accepted.",
+  "presentation.status.scheduler_resume_after_exit": "Wait for the executor to exit, then Resume. Existing results and queued work are preserved.",
   "presentation.status.executor_activity_running": "running",
   "presentation.status.executor_activity_exited": "exited",
   "presentation.status.executor_activity_unknown": "unknown",

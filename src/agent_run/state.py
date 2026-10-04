@@ -7,7 +7,6 @@ import json
 import os
 import tempfile
 import threading
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -20,7 +19,6 @@ from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
-from agent_run.task_control import TaskControlBusyError
 
 
 MAX_TIMELINE_EVENTS = 256
@@ -28,10 +26,6 @@ MAX_TIMELINE_CONTINUATION_EVENTS = 256
 MAX_DIAGNOSTIC_ENTRIES = 32
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
 MAX_RUN_STATE_BYTES = 4 * 1024 * 1024
-# Bound transient Task Control contention without relying on scheduler yield
-# counts; the interval stays short while the total wait remains finite.
-_STATE_COMMIT_RETRY_WINDOW_SECONDS = 0.25
-_STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
 _T = TypeVar("_T")
 
 
@@ -138,27 +132,11 @@ class StateStore:
             yield
 
     def _commit_run(self, operation: Callable[[], _T]) -> _T:
-        retry_deadline = (
-            time.monotonic() + _STATE_COMMIT_RETRY_WINDOW_SECONDS
-        )
-        while True:
-            try:
-                # Acquire Task Control before Run state.  Every retry leaves
-                # both short-transaction contexts before trying again.
-                with self._write_boundary():
-                    with self.locked():
-                        return operation()
-            except TaskControlBusyError:
-                remaining = retry_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                # Release the StateStore lock before retrying the short
-                # Task Control transaction.  Use a bounded interval rather
-                # than a fixed number of scheduler yields so a legal,
-                # millisecond-scale transaction can finish.
-                time.sleep(
-                    min(_STATE_COMMIT_RETRY_INTERVAL_SECONDS, remaining)
-                )
+        # Task Control owns bounded acquisition, before the Run state lock.
+        # Do not retry the body: observers or future operations may have effects.
+        with self._write_boundary():
+            with self.locked():
+                return operation()
 
     def create_run_if_absent(
         self, run_id: str, state: dict[str, Any]

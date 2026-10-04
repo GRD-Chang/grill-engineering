@@ -1048,6 +1048,8 @@
   "presentation.final_approval.status_comment_failed": "最终批准在 PR 状态评论写入阶段失败：{reason}",
   "presentation.final_approval.action_failed": "最终批准动作失败：{reason}",
   "presentation.status.executor_activity": "执行器：{activity}",
+  "presentation.status.scheduler_draining": "调度已停止，执行器正在收尾；现有 Agent 可能仍在执行，暂不接受新恢复。",
+  "presentation.status.scheduler_resume_after_exit": "请等待执行器退出后再执行 Resume；已有成果和待执行任务会保留。",
   "presentation.status.executor_activity_running": "正在运行",
   "presentation.status.executor_activity_exited": "已退出",
   "presentation.status.executor_activity_unknown": "无法确认",
