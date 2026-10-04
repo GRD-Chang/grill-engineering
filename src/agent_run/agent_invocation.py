@@ -417,6 +417,7 @@ def record_operator_stop(
 
     if state.get("status") == "operator_stopped":
         return
+    state.pop("github_refresh_resume_status", None)
     state["operator_stop"] = {
         "resume_status": state.get("status"),
         "resume_terminal_kind": state.get("terminal_kind"),

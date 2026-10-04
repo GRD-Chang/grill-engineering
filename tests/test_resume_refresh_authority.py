@@ -227,3 +227,118 @@ def test_ticket_executor_resume_keeps_authority_through_refresh_wait(
             assert {key: resumed["ticket_jobs"][number][key] for key in job} == job
         assert resumed.get("github_refresh_pending") is not True
         assert calls == 3
+
+
+@pytest.mark.parametrize("gate", [
+    "ticket_paused", "modification_budget_exhausted", "ticket_execution_failed",
+])
+@pytest.mark.parametrize("validate", [False, True])
+def test_global_refresh_recovery_preserves_independent_ticket_gate(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, gate: str, validate: bool,
+) -> None:
+    from agent_run.agent_invocation import record_session_interruption
+    from agent_run.ticket_pause import TicketStopRequested, request_ticket_pause
+    from agent_run.ticket_work import TicketWorkAdmission
+    from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+
+    state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = state["run_id"]
+
+    def fail(_number: int) -> None:
+        if gate != "ticket_paused":
+            raise RuntimeError("controlled local failure")
+
+    def pause(number: int) -> None:
+        request_ticket_pause(states, run_id, number)
+        raise TicketStopRequested()
+
+    agents = TicketAgents(git_repo, (2,), fail, before_review=pause)
+    ticket_engine(git, states, fixture, agents, development_only=True).deliver_ticket(run_id, 2)
+    local = states.load_current_run(run_id)
+    assert local is not None
+    if gate == "modification_budget_exhausted":
+        local["ticket_jobs"]["2"]["blocked_reason"] = gate
+        local["ticket_jobs"]["2"]["review_budget"]["checkpoint_reason"] = gate
+        local["active_ticket_job"] = deepcopy(local["ticket_jobs"]["2"])
+        states.save_run(run_id, local)
+    TicketWorkAdmission(states, run_id).seed([3])
+    paused = states.load_current_run(run_id)
+    assert paused is not None
+    record_session_interruption(paused, save=lambda current: states.save_run(run_id, current))
+    intent = bind_resume_intent(paused)
+    sibling = deepcopy(paused["ticket_jobs"]["2"])
+    assert sibling["blocked_reason"] == gate
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    original_binding = controller._load_bound_run
+    calls = 0
+
+    def load_bound(run_id: str, *, state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise GitHubReadError("github_read_failed", "temporary outage")
+        return original_binding(run_id, state=state)
+
+    monkeypatch.setattr(controller, "_load_bound_run", load_bound)
+    deadline = None
+    for _ in range(2):
+        waiting, _ = controller.resume(
+            run_id, explicit_resume=True, record_explicit_resume_audit=False,
+            validate_resume_state=(
+                (lambda current: validate_resume_intent(current, intent)) if validate else None
+            ),
+        )
+        assert waiting["status"] == "waiting_external"
+        assert waiting["ticket_jobs"]["2"] == sibling
+        assert waiting["github_refresh_resume_status"] == "execution_failed"
+        current_deadline = waiting["supervision_window"]["deadline"]
+        assert deadline is None or deadline == current_deadline
+        deadline = current_deadline
+    resumed, _ = controller.resume(
+        run_id, explicit_resume=True, record_explicit_resume_audit=False,
+        validate_resume_state=(
+            (lambda current: validate_resume_intent(current, intent)) if validate else None
+        ),
+    )
+    assert resumed["status"] == "active"
+    assert resumed["ticket_jobs"]["2"] == sibling
+    assert [item["ticket_number"] for item in resumed["ticket_work_queue"]] == [3]
+    assert resumed.get("github_refresh_pending") is not True
+    assert "github_refresh_resume_status" not in resumed
+
+
+def test_refresh_failure_source_is_narrow_and_cleared_by_new_boundaries(git_repo: Path) -> None:
+    from agent_run.external_supervision import wait_for_github_convergence
+    from agent_run.resume_intent import resume_pause_state
+    from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
+    from support.ticket_parallel import ticket_run
+
+    state, states, git, fixture = ticket_run(git_repo, (2,))
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    assert controller.record_execution_failure(state["run_id"], "before Agent startup")
+    failed = states.load_current_run(state["run_id"])
+    assert failed is not None
+    wait_for_github_refresh(
+        failed, code="github_read_failed", message="temporary", waiting_for="GitHub graph",
+    )
+    states.save_run(state["run_id"], failed)
+    waiting = states.load_current_run(state["run_id"])
+    assert waiting is not None
+    assert resume_pause_state(waiting)["status"] == "execution_failed"
+    for value in (None, False, "operator_stopped", {"status": "execution_failed"}):
+        invalid = {**waiting, "github_refresh_resume_status": value}
+        with pytest.raises(IncompatibleRunStateError, match="refresh Resume source"):
+            require_current_run_state(invalid)
+    with pytest.raises(IncompatibleRunStateError, match="refresh Resume source"):
+        require_current_run_state({**waiting, "github_refresh_pending": False})
+
+    stopped = deepcopy(waiting)
+    record_operator_stop(stopped, save=lambda _state: None)
+    assert "github_refresh_resume_status" not in stopped
+    assert resume_pause_state(stopped)["status"] == "operator_stopped"
+    another_wait = deepcopy(waiting)
+    wait_for_github_convergence(
+        another_wait, code="github_read_failed", message="temporary", waiting_for="PR",
+    )
+    assert "github_refresh_resume_status" not in another_wait
+    assert resume_pause_state(another_wait)["status"] == "waiting_external"

@@ -361,7 +361,7 @@ class Controller:
             raise ValueError("supervision timeout resume does not accept Agent or Human Blocker options")
         retry_window = None
         if (
-            validate_resume_state is not None
+            (explicit_resume or validate_resume_state is not None)
             and existing.get("status") == "waiting_external"
             and is_github_refresh_wait(existing)
         ):
@@ -1063,6 +1063,7 @@ class Controller:
             previous_boundary = waiting_boundary(state)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            refreshed.pop("github_refresh_resume_status", None)
             _select_ticket_currentness_subject(
                 refreshed, previous=state, git=self.publisher.git
             )

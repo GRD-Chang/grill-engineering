@@ -302,6 +302,7 @@ def wait_for_github_convergence(
 ) -> None:
     """Persist a bounded read wait, retaining any active checks deadline."""
 
+    state.pop("github_refresh_resume_status", None)
     state.update(
         {
             "status": "waiting_external",
@@ -396,10 +397,19 @@ def wait_for_github_refresh(
 ) -> None:
     """Persist a failed Controller refresh without suppressing later retries."""
 
+    # Keep the actual global pause across observation-only GitHub failures.
+    # Local Ticket gates must not become the target of the same Run Resume.
+    resume_status = None
+    if state.get("status") == "execution_failed":
+        resume_status = "execution_failed"
+    elif state.get("status") == "waiting_external" and is_github_refresh_wait(state):
+        resume_status = state.get("github_refresh_resume_status")
     wait_for_github_convergence(
         state, code=code, message=message, waiting_for=waiting_for
     )
     state["github_refresh_pending"] = True
+    if resume_status == "execution_failed":
+        state["github_refresh_resume_status"] = resume_status
     ensure_supervision_window(state)
 
 

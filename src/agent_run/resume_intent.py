@@ -26,6 +26,8 @@ def resume_pause_state(state: Mapping[str, Any]) -> dict[str, Any]:
             current["status"] = "operator_stopped"
         elif isinstance(current.get("supervision_wait"), Mapping):
             current["status"] = "supervision_timeout"
+        elif current.get("github_refresh_resume_status") == "execution_failed":
+            current["status"] = "execution_failed"
     return current
 
 

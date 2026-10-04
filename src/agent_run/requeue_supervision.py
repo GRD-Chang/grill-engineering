@@ -57,6 +57,7 @@ def refresh_requeue_transition_facts(
             return refreshed
         state["parent"] = _mapping(refreshed, "parent")
         state["ticket_graph"] = _mapping(refreshed, "ticket_graph")
+        state.pop("github_refresh_resume_status", None)
         if state.pop("github_refresh_pending", None):
             requeue = _mapping(state, "requeue_required")
             reason = requeue.get("reason")

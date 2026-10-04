@@ -190,6 +190,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state is missing canonical {key}"
             )
+    if "github_refresh_resume_status" in state and (
+        state["github_refresh_resume_status"] != "execution_failed"
+        or state.get("github_refresh_pending") is not True
+    ):
+        raise IncompatibleRunStateError("invalid GitHub refresh Resume source status")
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
