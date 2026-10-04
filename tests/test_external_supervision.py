@@ -585,3 +585,37 @@ def test_nested_delivery_uses_driver_clock_without_leaking_between_runs(monkeypa
             raise RuntimeError("other delivery failed")
         assert ensure_supervision_window(state)["deadline"] == 700.25
     assert ensure_supervision_window({"status": "waiting_external"})["started_at"] == 900.0
+
+
+@pytest.mark.parametrize('handoff_at,persist_cost,expected_sleep', [
+    (0.0, 0.0, 5.0), (2.0, 1.0, 2.0), (5.0, 0.0, None),
+    (CHECKS_BUDGET_SECONDS, 0.0, None),
+])
+def test_foreground_consumes_observers_persisted_retry_without_charging_twice(
+    handoff_at: float, persist_cost: float, expected_sleep: float | None,
+) -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def advance(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    supervisor = ExternalSupervisor(now=lambda: now[0], sleeper=advance)
+    state: dict[str, Any] = {'status': 'waiting_checks'}
+    assert supervisor.retry_due(state)
+    window = state['supervision_window']
+    deadline = window['deadline']
+    assert window['retry_count'] == 1 and window['next_retry_at'] == 5.0
+    now[0] = handoff_at
+    continued = supervisor.before_retry(
+        state, persist_before_sleep=lambda: now.__setitem__(0, now[0] + persist_cost),
+    )
+    assert continued is (handoff_at < deadline)
+    assert sleeps == ([] if expected_sleep is None else [expected_sleep])
+    assert window['retry_count'] == 1 and window['deadline'] == deadline
+    if continued:
+        assert supervisor.retry_due(state)
+        assert window['retry_count'] == 2
+    else:
+        assert state['status'] == 'supervision_timeout'

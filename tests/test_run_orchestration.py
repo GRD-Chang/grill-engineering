@@ -1445,18 +1445,20 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
         state["ticket_jobs"][number]["phase"]
         for number in ("2", "3", "4", "5")
     ] == ["completed", "completed", "completed", "completed"]
-    assert (
-        state["ticket_jobs"]["3"]["base_sha"]
-        == state["ticket_jobs"]["2"]["integrated_sha"]
-    )
-    assert (
-        state["ticket_jobs"]["4"]["base_sha"]
-        == state["ticket_jobs"]["3"]["integrated_sha"]
-    )
-    assert (
-        state["ticket_jobs"]["5"]["base_sha"]
-        == state["ticket_jobs"]["4"]["integrated_sha"]
-    )
+    git = GitRepository(managed_repo(git_repo))
+    # Job creation freezes its base after its dependencies complete. Siblings
+    # may start before each other's program closeout, even with one Agent slot.
+    for parent, child in (("2", "3"), ("2", "4"), ("3", "5"), ("4", "5")):
+        assert git.is_ancestor(
+            state["ticket_jobs"][parent]["integrated_sha"],
+            state["ticket_jobs"][child]["base_sha"],
+        )
+    for number in (2, 3, 4, 5):
+        content = subprocess.run(
+            ["git", "show", f"{state['run_branch']}:ticket-{number}.txt"],
+            cwd=managed_repo(git_repo), text=True, capture_output=True, check=True,
+        ).stdout
+        assert content == "done\n"
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable_fixture["delivery"]["closed_issues"] == [2, 3, 4, 5]
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 4

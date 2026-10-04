@@ -112,6 +112,16 @@ class DeliveryRunEngine:
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state
+            if result.get("status") == "waiting_external" and developed:
+                active_result = result.get("active_ticket_job") or {}
+                wait = active_result.get("external_wait") or {}
+                window = wait.get("supervision_window") or {}
+                if window and window.get("next_retry_at") is None:
+                    # A lost response has not had its first readback yet.
+                    # Perform it through the same bounded observer; once it
+                    # plans a retry, the Driver owns the persisted backoff.
+                    state = result
+                    continue
             if result.get("status") in {"requeue_required", "waiting_external"}:
                 return result
             if (

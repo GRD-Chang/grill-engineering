@@ -116,9 +116,12 @@ class ExternalSupervisor:
         window = self.observe(state)
         if window is None:  # pragma: no cover - guarded by waiting_boundary above
             return True
+        next_retry_at = window.get("next_retry_at")
         prior_retries = window.get("retry_count")
-        retries = (prior_retries if isinstance(prior_retries, int) else 0) + 1
-        window["retry_count"] = retries
+        retries = prior_retries if isinstance(prior_retries, int) else 0
+        if not isinstance(next_retry_at, (int, float)):
+            retries += 1
+            window["retry_count"] = retries
         observation = _last_external_error(state)
         window["latest_observation"] = observation
         availability = state.get("credential_availability")
@@ -129,13 +132,22 @@ class ExternalSupervisor:
             raise ValueError("supervision window is missing its deadline")
         remaining = deadline - self.now()
         if remaining > 0:
-            delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), remaining)
+            # A Ticket observer may already have planned the next retry.
+            # Hand that same deadline to the Driver without charging twice.
+            planned_delay = (
+                max(0.0, next_retry_at - self.now())
+                if isinstance(next_retry_at, (int, float))
+                else _retry_delay_seconds(retries, self.poll_interval_seconds)
+            )
+            delay = min(planned_delay, remaining)
             # Persist the intended delay before sleeping, including crash recovery.
             window["last_retry_delay_seconds"] = delay
             if persist_before_sleep is not None:
                 persist_before_sleep()
             remaining = deadline - self.now()
-            if remaining > 0:
+            if isinstance(next_retry_at, (int, float)):
+                delay = max(0.0, next_retry_at - self.now())
+            if remaining > 0 and delay > 0:
                 self.sleeper(min(delay, remaining))
             if self.now() < deadline:
                 return True
