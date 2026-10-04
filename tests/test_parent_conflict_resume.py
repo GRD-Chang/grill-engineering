@@ -17,7 +17,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from support.delivery_agents import PassAgents
+from support.delivery_agents import ScriptedAgents
 from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import seed_idle_control, write_fixture
 from support.workspace import prepare_workspace
@@ -51,19 +51,22 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
     finally:
         command(repo, "worktree", "remove", "--force", str(collaborator))
 
-    class ConflictAgents(PassAgents):
+    class ConflictAgents(ScriptedAgents):
         resume_conflict = False
         successor_seen = False
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             if request.get("repair_source") != "merge_conflict":
                 return super().develop(request)
+            assert "acceptance_artifact" not in request
+            assert "ci_evidence" not in request
             event = request["_invocation_event"]
             event("started", requested_thread_id="development-thread-1", attempt_count=1)
             event("thread_started", reported_thread_id="development-thread-1")
             current = StateStore(states.root).load_current_run(run_id)
             assert current is not None
             assert current["active_agent_invocation"]["phase"] == "integration_conflict"
+            assert current["parent_job"]["repair_source"] == "acceptance"
             if not self.resume_conflict:
                 (checkout / "preserved.txt").write_text("partial conflict work\n")
                 event("failed", error="controlled Parent conflict interruption", return_code=1)
@@ -75,7 +78,7 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
             assert current["parent_job"]["review_budget"] == budget
             assert current["parent_job"]["acceptance_record"] == acceptance
             assert (checkout / "preserved.txt").read_text() == "partial conflict work\n"
-            (checkout / "delivered.txt").write_text("first attempt\nhuman contribution\n")
+            (checkout / "delivered.txt").write_text("first attempt\nrepair applied\nhuman contribution\n")
             event("completed", reported_thread_id="development-thread-1")
             assert StateStore(states.root).load_current_run(run_id) is not None
             return DevelopmentResult(thread_id="development-thread-1", summary="Resolved both contributions")
@@ -94,7 +97,7 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
                 assert job["ci_recovery"] == ci_budget
                 assert any(item["attempt_id"] == attempt["attempt_id"] and item["outcome"] == "integration_conflict_resolved"
                            for item in job["semantic_attempt_history"])
-                assert (checkout / "delivered.txt").read_text() == "first attempt\nhuman contribution\n"
+                assert (checkout / "delivered.txt").read_text() == "first attempt\nrepair applied\nhuman contribution\n"
                 self.successor_seen = True
                 raise RuntimeError("stopped at integration review boundary")
             publisher.data["delivery"]["published_branches"][current["parent_job"]["parent_branch"]] = source

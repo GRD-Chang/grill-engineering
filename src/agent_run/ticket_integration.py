@@ -352,12 +352,13 @@ def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: di
         stage.require_agent_work("integration_conflict")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=existing_attempt is None)
-    request = stage.adapter.development_request(state, job, checkout)
-    request.update({
+    conflict_input = {
         "repair_source": "merge_conflict",
         "merge_conflict_evidence": json.dumps(conflict, ensure_ascii=False, sort_keys=True, indent=2),
-        "_prompt_resources": state["prompt_resources"],
-    })
+    }
+    # Select this invocation's evidence before the adapter reads historical repair input.
+    request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
+    request.update({**conflict_input, "_prompt_resources": state["prompt_resources"]})
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     if existing_attempt is None:
         job["integration_conflict_agent_ordinal"] = max(

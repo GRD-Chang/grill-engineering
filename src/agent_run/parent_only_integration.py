@@ -239,12 +239,13 @@ def resolve_parent_conflict(
         stage.require_agent_work("integration_conflict")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=attempt is None)
-    request = stage.adapter.development_request(state, job, checkout)
-    request.update({
+    conflict_input = {
         "repair_source": "merge_conflict",
         "merge_conflict_evidence": json.dumps(conflict, ensure_ascii=False, sort_keys=True, indent=2),
-        "_prompt_resources": state["prompt_resources"],
-    })
+    }
+    # Select this invocation's evidence before the adapter reads historical repair input.
+    request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
+    request.update({**conflict_input, "_prompt_resources": state["prompt_resources"]})
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     if attempt is None:
         ordinal_key = f"{record_key}_conflict_ordinal"

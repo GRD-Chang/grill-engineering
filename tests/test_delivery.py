@@ -2557,6 +2557,8 @@ def test_ticket_ci_conflict_human_resume_returns_to_candidate(
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult | HumanBlockerResult:
             if request.get("repair_source") == "merge_conflict":
+                assert "acceptance_artifact" not in request
+                assert "ci_evidence" not in request
                 self.conflict_calls += 1
                 self.development_requests.append(request)
                 thread_id = str(request.get("thread_id") or "development-thread-1")
@@ -4985,8 +4987,9 @@ def test_ticket_ci_resync_renewal_returns_to_candidate(
         assert job["acceptance_record"]["reviewed_candidate_tree"] == published_tree
 
 
+@pytest.mark.parametrize("fallback", [False, True])
 def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, fallback: bool,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
@@ -5011,19 +5014,37 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
 
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
 
+    expected_content = "first attempt\n" + "repair applied\n" * (3 if fallback else 0) + "remote contribution\n"
+
     class ConflictAgents(PassAgents):
         appended: str | None = None
+        conflict_budget: dict[str, Any] | None = None
+        fallback_receipt: dict[str, Any] | None = None
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            if fallback:
+                return AlwaysRejectAgents.review(self, request)
+            return super().review(request)
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             if request.get("repair_source") == "merge_conflict":
                 event = request["_invocation_event"]
                 event("started", requested_thread_id="development-thread-1", attempt_count=1)
                 event("thread_started", reported_thread_id="development-thread-1")
-                assert StateStore(states.root).load_current_run(state["run_id"]) is not None
+                current = StateStore(states.root).load_current_run(state["run_id"])
+                assert current is not None
+                active = current["active_ticket_job"]
+                self.conflict_budget = deepcopy(active["review_budget"])
+                assert "acceptance_artifact" not in request
+                assert "ci_evidence" not in request
+                if fallback:
+                    assert active["repair_source"] == "acceptance"
+                    assert "acceptance_artifact" not in active
+                    self.fallback_receipt = deepcopy(active["fallback_publication_receipt"])
                 assert isinstance(request["merge_conflict_evidence"], str)
                 assert '"source_sha"' in request["merge_conflict_evidence"]
                 (checkout / "delivered.txt").write_text(
-                    "first attempt\nremote contribution\n", encoding="utf-8"
+                    expected_content, encoding="utf-8"
                 )
                 old = str(publisher.live_head)
                 self.appended = subprocess.run(
@@ -5047,17 +5068,25 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     ).deliver(state["run_id"])
 
-    assert completed["status"] == "ticket_completed"
+    assert completed["status"] == "ticket_completed", completed.get("diagnostics")
     job = completed["active_ticket_job"]
-    assert job["modification_attempts"] == 1
-    assert agents.review_count == 1
+    assert job["modification_attempts"] == (4 if fallback else 1)
+    assert agents.review_count == (3 if fallback else 1)
+    assert job["review_budget"] == agents.conflict_budget
+    if fallback:
+        assert "acceptance_record" not in job
+        assert "acceptance_artifact" not in job
+        assert job["repair_source"] == "acceptance"
+        assert agents.fallback_receipt is not None
+        for key in ("candidate_sha", "review_artifacts", "development_summary"):
+            assert job["fallback_publication_receipt"][key] == agents.fallback_receipt[key]
     assert job["ticket_integration"]["conflict_paths"] == ["delivered.txt"]
     assert job["ticket_integration"]["source_sha"] == agents.appended
     assert job["integration_resync"]["used"] == 1
     assert GitRepository(git_repo).is_ancestor(source, job["publication_sha"])
     integrated = subprocess.run(["git", "show", f"{job['integrated_sha']}:delivered.txt"],
                                 cwd=git_repo, text=True, capture_output=True, check=True)
-    assert integrated.stdout == "first attempt\nremote contribution\n"
+    assert integrated.stdout == expected_content
 
     loaded = StateStore(states.root).load_current_run(state["run_id"])
     assert loaded is not None

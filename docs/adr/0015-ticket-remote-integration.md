@@ -8,4 +8,6 @@ Ticket Development 与 Fresh Acceptance 绑定创建 Job 时的 base 和 Candida
 
 真实合并冲突保留 Git 现场，交由同一 Development Agent 解决并自测；这项纯冲突工作不消耗需求开发、Reviewer 或 CI 修复额度，也不新增 Fresh Acceptance。失败或业务歧义有界暂停。网络或执行错误不归类为 Git 冲突；非追加历史改写明确暂停且不覆盖远端成果。受管 checkout 的 Git 元数据保护继续生效。Parent Acceptance 可读取原审查事实与真实集成记录，审查完整累计结果。
 
+冲突调用在进入既有 Development Request Adapter 前明确选择本次 `merge_conflict` 输入，只读取准确冲突证据与通用任务上下文，不再要求或夹带上一轮 Acceptance、CI 或其他修复输入。这一选择只作用于本次请求，不改写 Job 的历史修复来源、有效发布收据或预算；Ticket fallback 删除旧验收 Artifact 后仍可进入冲突处理。Parent-only 与 Run Repair 共用相同的调用规则。
+
 状态协议随新增持久字段切换；旧 Run 在外部写入前按现有 MVP 规则拒绝，不推断缺失额度，也不隐式迁移。实现沿用共享 Engine、Publisher、StateStore 和有限的 Ticket Adapter；Git 集成动作可供后续 Parent 与 CI 路径调用，但本决策不改变它们的业务流程。
