@@ -467,7 +467,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     _with_canonical_ci_budgets(state)
     store.save_run(run_id, state)
 
-    resumed, reused = controller.resume(run_id)
+    resumed, reused = controller.resume(run_id, explicit_resume=True, message="凭据已恢复，继续原开发。")
 
     assert reused
     assert resumed["status"] == "active"
@@ -475,6 +475,8 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     assert resumed["diagnostics"] == []
     assert resumed["active_agent_invocation"]["status"] == "resuming"
     assert resumed["ticket_jobs"]["3"]["development_failure_resume"] is True
+
+    assert resumed["ticket_jobs"]["3"]["human_response_history"][-1]["response"] == "凭据已恢复，继续原开发。"
 
 
 @pytest.mark.parametrize(

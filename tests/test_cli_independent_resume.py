@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from support.cli import load_only_run_state, run_cli
 from support.seeding import write_fixture
 from support.workspace import managed_state
@@ -55,15 +57,16 @@ raise SystemExit(cli.main(sys.argv[1:]))
 '''
 
 
+@pytest.mark.parametrize("unknown_reason,new_thread", [(False, False), (True, False), (True, True)])
 def test_first_public_resume_reenters_real_cli_in_independent_executor(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, unknown_reason: bool, new_thread: bool,
 ) -> None:
     fixture = write_fixture(git_repo / 'github.json', issues={})
     agents = git_repo / 'agents.json'
     agents.write_text(json.dumps({'developments': [
         {'thread_id': 'resume-worker', 'write_files': {'progress.txt': 'first\n'},
          'error_after_writes': 'controlled initial failure'},
-        {'expected_thread_id': 'resume-worker', 'thread_id': 'resume-worker',
+        {'expected_thread_id': None if new_thread else 'resume-worker', 'thread_id': 'resumed-fresh' if new_thread else 'resume-worker',
          'write_files': {'resumed.txt': 'second worker started\n'},
          'error_after_writes': 'controlled resumed worker boundary'},
     ]}), encoding='utf-8')
@@ -75,6 +78,12 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     before = load_only_run_state(git_repo)
     assert before['status'] == 'execution_failed'
     run_id = before['run_id']
+    if unknown_reason:
+        before['status'] = 'blocked'
+        before['parent_job'].update(phase='blocked', blocked_reason='unclassified_runtime_failure',
+                                    execution_resume_phase='developing')
+        from agent_run.state import StateStore
+        StateStore(managed_state(git_repo)).save_run(run_id, before)
     history_before = before['agent_invocation_history']
     assert len(history_before) == 1
     control_file, = (managed_state(git_repo) / 'task-control').glob('*.json')
@@ -84,9 +93,12 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     environment.update(PYTHONPATH=str(Path(__file__).parents[1] / 'src'),
                        RESUME_SNAPSHOT=str(snapshot), RESUME_RUNTIME=str(tmp_path / 'runtime'))
     resumed = subprocess.run([sys.executable, '-c', _REENTER, 'resume', run_id,
-                              '--github-fixture', str(fixture), '--agent-fixture', str(agents), '--json'],
+                              '--github-fixture', str(fixture), '--agent-fixture', str(agents), '--json',
+                              *(['--new-thread'] if new_thread else []),
+                              *(['--message', '已修复环境，继续原工作。'] if unknown_reason else [])],
                              cwd=git_repo, env=environment, capture_output=True, text=True, timeout=40)
     assert resumed.returncode == 2, resumed.stdout + resumed.stderr
+    assert snapshot.exists(), resumed.stdout + resumed.stderr
     admitted = json.loads(snapshot.read_text())
     assert admitted['run_id'] is None
     assert admitted['action']['run_id'] is None
@@ -113,7 +125,11 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     assert history[-1]['semantic_attempt']['attempt_id'] == history_before[0]['semantic_attempt']['attempt_id']
     assert history[-1]['work_subject'] == history_before[0]['work_subject']
     assert history[-1]['generation'] == history_before[0]['generation']
-    assert history[-1]['requested_thread_id'] == 'resume-worker'
+    assert history[-1]['requested_thread_id'] == (None if new_thread else 'resume-worker')
+    if unknown_reason:
+        assert after['parent_job']['human_response_history'][-1]['response'] == '已修复环境，继续原工作。'
+        assert after['resume_audit']['history'][-1]['successor_invocation_started_at'] == history[-1]['started_at']
+        assert after['parent_job']['pause_history'][-1]['blocked_reason'] == 'unclassified_runtime_failure'
     checkout = managed_state(git_repo) / 'worktrees' / run_id / 'parent'
     assert (checkout / 'progress.txt').read_text() == 'first\n'
     assert (checkout / 'resumed.txt').read_text() == 'second worker started\n'

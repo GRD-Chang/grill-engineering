@@ -144,3 +144,29 @@ def test_execution_resume_cannot_be_reinterpreted_as_budget_authority(
     final = load_only_run_state(git_repo)
     assert final["parent_job"]["review_budget"] == initial["parent_job"]["review_budget"]
     assert final["agent_invocation_history"] == initial["agent_invocation_history"]
+
+
+def test_budget_resume_new_thread_starts_successor_with_original_repair_context(git_repo: Path) -> None:
+    fixture, agents, state = _checkpoint(git_repo)
+    before = state['parent_job']
+    invalid_thread = before['development_thread_id']
+    data = json.loads(agents.read_text())
+    data['developments'] = [{
+        'expected_thread_id': None, 'thread_id': 'budget-fresh-thread',
+        'write_files': {'resumed-budget.txt': 'new session continued repair\n'},
+        'error_after_writes': 'controlled budget successor boundary',
+    }]
+    agents.write_text(json.dumps(data))
+    resumed = run_cli(git_repo, fixture, 'resume', state['run_id'], '--new-thread',
+                      '--message', '旧会话失效，继续原修复。', '--agent-fixture', str(agents))
+    assert resumed.returncode == 2, resumed.stdout + resumed.stderr
+    after = load_only_run_state(git_repo)
+    successor = after['agent_invocation_history'][-1]
+    assert successor['requested_thread_id'] is None
+    assert successor['reported_thread_id'] == 'budget-fresh-thread'
+    assert after['parent_job']['repair_source'] == before['repair_source']
+    assert after['parent_job']['acceptance_artifact'] == before['acceptance_artifact']
+    assert invalid_thread in after['parent_job']['development_thread_history']
+    assert after['parent_job']['review_budget']['window'] == before['review_budget']['window'] + 1
+    assert after['parent_job']['review_budget_history'][-1]['review_budget'] == before['review_budget']
+    assert after['parent_job']['human_response_history'][-1]['response'] == '旧会话失效，继续原修复。'

@@ -783,45 +783,6 @@ def _main_with_parser_resources(
                         current, as_json=parsed.as_json
                     )
                     return 2
-                if (
-                    not resume_attachable
-                    and parsed.message is not None
-                    and (
-                        human_blocker_subject_count(current) != 1
-                        if parsed.ticket is None
-                        else not any(
-                            location == f"ticket:{parsed.ticket}"
-                            and subject.get("blocked_reason") in {
-                                "agent_requires_human", "reviewer_requires_human"
-                            }
-                            for location, subject in operator_gate_subjects(current)
-                        )
-                    )
-                ):
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
-                if current.get("status") == "supervision_timeout" and (
-                    parsed.new_thread or parsed.message is not None
-                ):
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
-                if has_non_invocation_execution_failure(current) and (
-                    parsed.new_thread or parsed.message is not None
-                ):
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
             command_dispatched = True
             state, resumed, lifecycle_receipt = _run_lifecycle(
                 parsed,

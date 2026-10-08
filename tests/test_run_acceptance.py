@@ -896,6 +896,8 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
         "development_thread_history": [],
         "repair_job": {
             "phase": "blocked",
+            "human_response_generation": 1,
+            "human_response_history": [{"generation": 1, "human_blockers": [], "response": "额度已续期，继续原修复。"}],
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "blocked_reason": "review_budget_exhausted",
             "repair_mode": "squash",
@@ -930,6 +932,9 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
     assert job["development_thread_history"] == thread_history
     assert job["repair_seed_candidate_sha"] == candidate
     assert job["repair_mode"] == "squash"
+
+    assert job["human_response_generation"] == 1
+    assert job["human_response_history"][-1]["response"] == "额度已续期，继续原修复。"
 
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "run-repair-seed"
     git.prepare_ticket_checkout(

@@ -13,6 +13,7 @@ from agent_run.change_delivery_threads import (
     require_development_thread,
 )
 from agent_run.git import GitError
+from agent_run.human_responses import current_human_response_history
 from agent_run.integration_resync_budget import (
     ResyncBudgetExhausted,
     observe_integration_snapshot,
@@ -336,6 +337,10 @@ def _resolve_conflict(
             "thread_id": run.get("development_thread_id"),
             "_prompt_resources": state["prompt_resources"],
         }
+        if history := current_human_response_history(
+            run, generation=int(run["acceptance_generation"])
+        ):
+            request["human_response_history"] = history
         request["_invocation_event"] = invocation_event_recorder(
             state,
             role="development",
@@ -380,6 +385,7 @@ def _resolve_conflict(
 
 
 def _pause(owner: RunAcceptanceEngine, state: dict[str, Any], run: dict[str, Any], code: str, message: str) -> None:
+    run["execution_resume_phase"] = run["phase"]
     run["phase"] = "ready_for_human"
     run["blocked_reason"] = code
     state.update({

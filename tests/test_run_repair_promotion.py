@@ -411,7 +411,7 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
         ).stdout.strip() == "target contribution"
 
 
-def test_nested_run_repair_history_rewrite_is_not_resumable(git_repo: Path) -> None:
+def test_nested_run_repair_history_rewrite_resumes_from_saved_work(git_repo: Path) -> None:
     state, states, git = _completed_run(git_repo)
     run_id = str(state["run_id"])
     fixture = git_repo / "github.json"
@@ -428,11 +428,19 @@ def test_nested_run_repair_history_rewrite_is_not_resumable(git_repo: Path) -> N
     paused.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
     states.save_run(run_id, paused)
 
-    with pytest.raises(ValueError, match="no canonical recovery boundary"):
-        Controller(FixtureGitHubReader(fixture), git, states).resume(
-            run_id, explicit_resume=True,
-        )
-    assert states.load_current_run(run_id) == paused
+    original = deepcopy(job)
+    delivery_before = deepcopy(publisher.data["delivery"])
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+    )
+    reloaded = states.load_current_run(run_id)
+    assert reloaded == resumed
+    resumed_job = resumed["run_acceptance"]["repair_job"]
+    assert resumed_job["phase"] == "accepted"
+    for key in ("repair_generation", "candidate_sha", "acceptance_record", "review_budget", "ci_recovery"):
+        assert resumed_job[key] == original[key]
+    assert resumed_job["pause_history"][-1]["blocked_reason"] == "integration_history_rewritten"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == delivery_before
 
 
 @pytest.mark.parametrize("rewritten_branch", ["source", "target"])

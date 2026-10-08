@@ -221,8 +221,6 @@ def test_mechanical_merge_recovery_bounds_real_merge_driver_and_preserves_scene(
     import ctypes
     import json
     import shlex
-    import signal
-    import time
     from agent_run import git as git_module, git_output
 
     git = GitRepository(git_repo)
@@ -291,16 +289,58 @@ def test_mechanical_merge_recovery_bounds_real_merge_driver_and_preserves_scene(
             scratch.unlink()
         try:
             if pid_path.exists():
-                driver_pid = int(pid_path.read_text())
-                deadline = time.monotonic() + 2
-                while True:
-                    waited, _ = os.waitpid(driver_pid, os.WNOHANG)
-                    if waited == driver_pid:
-                        break
-                    if time.monotonic() >= deadline:
-                        os.kill(driver_pid, signal.SIGKILL)
-                        os.waitpid(driver_pid, 0)
-                        pytest.fail("merge driver remained executing after the Git timeout")
-                    time.sleep(0.01)
+                _assert_merge_driver_exited(int(pid_path.read_text()))
         finally:
             assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def _assert_merge_driver_exited(driver_pid: int) -> None:
+    import signal
+    import time
+
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            waited, _ = os.waitpid(driver_pid, os.WNOHANG)
+        except ChildProcessError:
+            # Git's shell may reap the driver before it can be adopted by
+            # our subreaper. ECHILD alone does not prove that it has exited.
+            assert not Path(f"/proc/{driver_pid}").exists(), "merge driver is alive but not owned"
+            return
+        if waited == driver_pid:
+            return
+        if time.monotonic() >= deadline:
+            os.kill(driver_pid, signal.SIGKILL)
+            os.waitpid(driver_pid, 0)
+            pytest.fail("merge driver remained executing after the Git timeout")
+        time.sleep(0.01)
+
+
+def test_merge_driver_exit_check_accepts_parent_reaped_child() -> None:
+    import subprocess
+    import sys
+
+    # A real intermediate parent owns and reaps its child before exiting.
+    # This is the other valid outcome of killing Git's driver process group.
+    parent = subprocess.run(
+        [sys.executable, "-c", "import subprocess, sys; subprocess.run("
+         "[sys.executable, '-c', 'import os; print(os.getpid())'], check=True)"],
+        capture_output=True, text=True, check=True, timeout=5,
+    )
+    driver_pid = int(parent.stdout.strip())
+    _assert_merge_driver_exited(driver_pid)
+    assert not Path(f"/proc/{driver_pid}").exists()
+
+
+def test_merge_driver_exit_check_reaps_owned_child() -> None:
+    import subprocess
+    import sys
+
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as process:
+        _assert_merge_driver_exited(process.pid)
+        assert not Path(f"/proc/{process.pid}").exists()
+
+
+def test_merge_driver_exit_check_rejects_unowned_live_process() -> None:
+    with pytest.raises(AssertionError, match="driver.*alive"):
+        _assert_merge_driver_exited(os.getpid())

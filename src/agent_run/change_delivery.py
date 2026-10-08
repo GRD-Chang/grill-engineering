@@ -861,6 +861,8 @@ class ChangeDeliveryEngine:
     def _block(
         self, state: dict[str, Any], job: dict[str, Any], code: str, message: str
     ) -> bool:
+        if job.get("phase") != "blocked":
+            job["execution_resume_phase"] = job["phase"]
         job.update({"phase": "blocked", "blocked_reason": code})
         state["status"] = "blocked"
         state["diagnostics"] = [

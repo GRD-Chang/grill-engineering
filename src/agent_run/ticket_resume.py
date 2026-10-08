@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_run.controller import Controller, apply_resume_to_state, _bind_current_human_response
+from agent_run.controller import Controller, apply_resume_to_state, _bind_resume_message
 from agent_run.delivery_policy import parse_policy_snapshot
 from agent_run.final_approval_operation import has_final_approval
 from agent_run.resume_audit import append_explicit_resume_audit
@@ -82,12 +82,6 @@ def admit_ticket_resume(
     if any(item['ticket_number'] == number and item['lease_id'] is not None
            for item in initial['ticket_work_queue']):
         raise ResumeIntentError('指定 Ticket 的当前工作尚未释放名额')
-    if intent['pause_reason'] == 'ticket_supervision_timeout' and (
-        payload['new_thread'] or payload['message'] is not None
-    ):
-        raise ResumeIntentError('supervision timeout resume does not accept Agent or Human Blocker options')
-    if payload['message'] is not None and intent['authorization'] != 'human_response':
-        raise ResumeIntentError('--message requires a current Human Blocker')
     controller._load_bound_run(run_id, state=initial)
     controller._require_ticket_labels(initial, ticket_number=number)
     probe = deepcopy(initial)
@@ -127,7 +121,10 @@ def admit_ticket_resume(
         latest['active_ticket_job'] = latest['ticket_jobs'][str(number)]
         latest['active_agent_invocation'] = latest['ticket_agent_invocations'].get(str(number))
         if payload['message'] is not None:
-            _bind_current_human_response(latest, payload['message'], ticket_number=number)
+            _bind_resume_message(
+                latest, payload['message'], ticket_number=number,
+                human_blocker=intent['authorization'] == 'human_response',
+            )
         append_explicit_resume_audit(
             latest, new_thread=payload['new_thread'],
             human_response_supplied=payload['message'] is not None, ticket_number=number,

@@ -432,6 +432,7 @@ class RunRepairLifecycle:
             "prior_human_blockers",
             "human_response_history",
             "human_response_generation",
+            "development_new_thread",
         ):
             if key in repair_request:
                 job[key] = deepcopy(repair_request[key])

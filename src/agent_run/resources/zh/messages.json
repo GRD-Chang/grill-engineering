@@ -236,7 +236,7 @@
   "cli.new_thread_help": "为当前失败或人工阻塞的 Agent 阶段新开 Thread（监督超时不可用）",
   "cli.requeue_help": "仅从 requeue_required 创建新的 Change Job Generation",
   "cli.selector_help": "Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
-  "cli.response_help": "仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
+  "cli.response_help": "继续原工作的维护者消息（最多 8 KiB，不改变正式范围或批准）",
   "cli.approve_help": "显式批准并合并已通过门禁的最终 Run PR",
   "cli.revise_help": "以 Run 级人工反馈开启新的修复窗口",
   "cli.feedback_help": "未经改写的修订反馈",

@@ -14,6 +14,12 @@ Publication 的 Agent 语义生成与外部操作恢复分开计数。Publicatio
 
 Managed Development Checkout 是尚未形成 Candidate 时的交付成果边界。维护者中断前台调用只表示可恢复暂停，不授权删除工作区；这一决策有意替代现有运行手册、实现与测试中“操作者显式取消即终态清理”的旧边界。普通 `run`、`resume` 和自动 cleanup 发现 tracked modifications 或 untracked files 时必须 fail closed，保留路径、原因与恢复动作。普通 `abandon` 必须在任何外部 mutation 前扫描全部 Managed Development Checkout 并在发现 dirty checkout 时拒绝；只有额外显式的 `--discard-worktree` 才授权不可恢复删除。Validation Checkout 等一次性验证工作区不属于这一交付成果边界。
 
+## 统一暂停续接
+
+恢复入口不以 reason 白名单作为永久准入规则。当前架构内的 Ticket、Parent-only、Run Repair、Run Acceptance 和 Final Publication 保留原目标、对象、角色、成果、证据及待完成阶段；人工处理后由同一 `resume` 复核事实并启动适用后继。暂停前阶段或准确 pending Attempt 决定续接，已有完成成果继续消费，不新开初始开发。未知原因的原始证据留在暂停历史与 Resume 审计；材料不足时明确缺口，不猜测外部写入结果。
+
+`--message` 附加到当前工作 Generation，并进入对应角色的实际 Prompt；它不接受新需求、任务图或替代最终批准。普通 Resume 不续期额度，只有额度耗尽后的明确继续才追加对应窗口并保留旧窗口。定向 Ticket 恢复仍使用已有 FIFO、共享名额与锁，不解除其他 Ticket 的独立人工门禁。旧状态不自动迁移，也不删除成果。
+
 ## Considered Options
 
 - 只调整 Development 的 `pending_attempt` 门禁：能修复 Issue #140 的直接错误，但 Reviewer 的 validation 序号和 Publication 的混合计数仍会把 Resume 视为新 Attempt，因此拒绝。

@@ -199,12 +199,19 @@ ADR 0011 的边界内自动同 Thread 续接：普通异常最多一次，准确
 Prompt，只补充继续同一次语义工作仍然需要的动态证据；`--new-thread` 只替换
 Invocation/Thread，不替换 Semantic Attempt，并使用当前角色和任务模式的完整标准 Prompt 新开 Thread。
 模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算窗口或后继流程；Reviewer 与定向 Repair
-只接收从现有预算投影的简短审查次数。`--message` 只允许用于当前 Human Blocker；它 trim
-后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
-和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
+只接收从现有预算投影的简短审查次数。`--message` 可补充任意当前恢复工作的人工处理结果；它 trim
+后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development、
+Review 和 Publish 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
-`resume` 恢复当前 failed 或 Human Blocker Invocation，也可以从 `supervision_timeout` 为同一等待身份开启新窗口；后者不接受 `--new-thread` 或 `--message`，不会创建 Worker、PR 或 merge。Ticket 与 Parent-only Change Job 的
+`resume` 继续原对象的未完成工作，不以暂停 reason 白名单决定是否永久拒绝。程序复核原需求与任务图，
+再按暂停前阶段、准确 pending Attempt 或已有 Candidate/Acceptance 进入对应后继；已完成角色成果由确定操作消费，
+不机械重新调用 Agent。Ticket、Parent-only、Run Repair、Run Acceptance 与 Final Publication 共用该准入。
+Run 级 Executor 恢复的消息按现有工作 FIFO、集成队列与名额选中的工作绑定，并进入该对象的实际 Agent 请求；
+其他 Ticket 的局部暂停不接收这条消息。回复局部暂停的 Ticket 时使用 `--ticket` 指定对象。
+缺少阶段或必要成果时，诊断列出需要补足/核验的事实，保留现场与同一入口；未知外部结果仍须先对账。
+`supervision_timeout` 为同一等待身份开启新窗口；message 保存在该工作上下文中，后续需要 Agent 时传递，
+纯等待恢复不创建 Worker。`--new-thread` 仅适用于已有 Agent 工作身份。Ticket 与 Parent-only Change Job 的
 preflight 若发现 requirements 或 base/head 已 stale，绝不启动 Codex，而是进入
 `requeue_required`。此状态下只允许 `status`、`history`、`requeue` 与 `abandon`。Run Repair 的
 Parent、Graph、Ticket Completion 或 Run Branch 边界发生漂移时，不创建 replacement generation；
@@ -230,7 +237,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
 | `run` | 新 Run、正常可推进状态或不存在当前 Work Subject 的 Run-wide Operator Gate 的纯监督超时暂停 | 提交或附着普通 Lifecycle Action；准确的 Executor 握手后可返回，由独立 Run Executor Session 持续监督 checks 与 GitHub 读取/对账，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker、`operator_stopped`，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
+| `resume` | 原目标未变的受支持 Run 中，唯一暂停对象或准确中断/待完成工作；未知 reason 保留入口 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场；message 进入对应角色 Prompt，缺事实时明确暂停 | 普通继续保留领域 attempt 与额度；额度耗尽的显式继续仅续期对应窗口并留存历史，重复请求不重复续期；不替代最终批准 |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR；两种 Parent 发现允许接纳的远端追加时先提示并自动更新、复验，再等待新批准 | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate；更新启动不表示交付完成 |
@@ -286,7 +293,7 @@ agent-run resume <parent-issue> \
 ```
 
 `--message` 会 trim 校验为非空、限制为 8 KiB，并按顺序绑定当前 Job Generation；它会进入后续
-Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不触发 Requeue，也不能替代
+Development、Review 与 Publish 的对应工作上下文。它不修改 Issue、不触发 Requeue，也不能替代
 `revise --message` 的 Run 级反馈。若 Resume preflight 发现 stale，命令不会运行 Codex，而是返回
 `requeue_required`；此时只能先查看状态/历史，再由维护者显式 Requeue：
 
@@ -579,6 +586,6 @@ Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer�
 
 Ticket 原开发—审核与规定上限后的末轮跳过保持原合同；取得有效审查或 fallback 凭据后进行本地集成，集成不另调用 Review。Git 合并、整理后的检查或提交失败携具体操作、准确 source/target/candidate、HEAD/MERGE_HEAD 和原始输出回到 Development；处理后程序重新检查、提交及集成，随后普通 PR/CI 合入 Run Branch。Agent 自述不能作为 Git 成功证据。
 
-`--ticket-integration-development-limit` 默认 3，为独立累计额度，包含冲突工作。新失败和远端追加不清零，重复读状态及同一 Semantic Attempt 的中断续接不额外扣费。耗尽时 `integration_development_exhausted` 保留工作树，`resume <run-id> --ticket <number>` 只追加对应集成额度并保留历史，不重置需求、CI 或 resync 额度；重复恢复不重复授权。`--new-thread` 使用完整集成 Prompt，现有 Human Blocker 的 `--message` 继续进入同一工作来源。更广暂停恢复准入仍沿用既有合同。
+`--ticket-integration-development-limit` 默认 3，为独立累计额度，包含冲突工作。新失败和远端追加不清零，重复读状态及同一 Semantic Attempt 的中断续接不额外扣费。耗尽时 `integration_development_exhausted` 保留工作树，`resume <run-id> --ticket <number>` 只追加对应集成额度并保留历史，不重置需求、CI 或 resync 额度；重复恢复不重复授权。`--new-thread` 使用完整集成 Prompt，`--message` 继续进入同一工作来源。普通未知原因恢复不续期其他额度，也不解除其他 Ticket 的人工门禁。
 
 status/history 区分需求开发与集成开发累计用量、额度窗口及语义工作。Git 机械操作限时 30 秒，超时保留现场和输出；工作使用原共享 Ticket Agent 名额与 FIFO，集成交付继续单席，正常 CI 等待不占 Agent 名额。新状态不迁移旧 Run。详见 [ADR 0020](adr/0020-ticket-integration-development-loop.md)。

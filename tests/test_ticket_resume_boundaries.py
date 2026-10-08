@@ -117,7 +117,8 @@ def test_executor_exit_closes_admission_or_yields_to_new_resume(paused_ticket) -
             pytest.fail('closed Executor accepted new work')
 
 
-def test_shared_resume_renews_only_target_exhausted_demand_window() -> None:
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_shared_resume_renews_only_target_exhausted_demand_window(new_thread: bool) -> None:
     policy = DeliveryPolicy(ticket_review_rounds=1)
     job: dict[str, Any] = {
         'ticket_number': 2, 'phase': 'blocked', 'blocked_reason': 'modification_budget_exhausted',
@@ -140,10 +141,11 @@ def test_shared_resume_renews_only_target_exhausted_demand_window() -> None:
         'ticket_integration_holder': None, 'ticket_integration_queue': [],
     }
     apply_resume_to_state(
-        state, explicit_resume=True, resume_human_blocker=False, new_thread=False,
+        state, explicit_resume=True, resume_human_blocker=False, new_thread=new_thread,
         human_response=None, resume_budget_checkpoint=True, budget_policy=policy,
         ticket_number=2, source_status='blocked',
     )
+    assert job.get('development_new_thread', False) is new_thread
     assert job['review_budget']['window'] == 2
     assert job['review_budget_history'][0]['review_budget'] == old_budget
     assert job['ci_recovery'] == job['integration_resync'] == {'unchanged': True}
@@ -307,3 +309,43 @@ def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: boo
         assert repeated and duplicate == admitted
     assert (controller.states.runs_directory / f"{payload['run_id']}.json").read_bytes() == state_before
     assert control.path_for(task).read_bytes() == control_before
+
+
+def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(paused_ticket) -> None:
+    controller, control, task, executor, payload, fixture = paused_ticket
+    def fail_sibling(_number):
+        raise RuntimeError('independent sibling pause')
+    ticket_engine(controller.publisher.git, controller.states, fixture,
+                  TicketAgents(fixture.parent, (2, 3), fail_sibling),
+                  development_only=True).deliver_ticket(payload['run_id'], 3)
+    state = controller.states.load_current_run(payload['run_id'])
+    job = state['ticket_jobs']['2']
+    job['blocked_reason'] = 'unclassified_worker_failure'
+    state['active_ticket_job'] = job
+    sibling = state['ticket_jobs']['3']
+    sibling['blocked_reason'] = 'ticket_paused'
+    sibling['pause_resume_phase'] = sibling.pop('execution_resume_phase')
+    controller.states.save_run(payload['run_id'], state)
+    payload['resume_intent'] = bind_resume_intent(state, ticket_number=2)
+    before = deepcopy(state)
+    resumed, repeated = admit_ticket_resume(controller, control, task, executor, payload)
+    assert not repeated
+    assert resumed['ticket_jobs']['2']['phase'] == 'developing'
+    assert resumed['ticket_jobs']['3'] == before['ticket_jobs']['3']
+    assert resumed['ticket_jobs']['2']['pending_semantic_attempt'] == before['ticket_jobs']['2']['pending_semantic_attempt']
+    assert resumed['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
+    duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
+    assert repeated and duplicate == resumed
+    calls = []
+
+    def failed_again(number):
+        calls.append(number)
+        raise RuntimeError('controlled successor invocation')
+
+    agents = TicketAgents(fixture.parent, (2, 3), failed_again)
+    result = ticket_engine(controller.publisher.git, controller.states, fixture, agents,
+                           development_only=True).deliver_ticket(payload['run_id'], 2)
+    assert calls == [2]
+    assert result['ticket_jobs']['2']['pending_semantic_attempt']['attempt_id'] == before['ticket_jobs']['2']['pending_semantic_attempt']['attempt_id']
+    assert result['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
+    assert result['ticket_jobs']['3'] == before['ticket_jobs']['3']

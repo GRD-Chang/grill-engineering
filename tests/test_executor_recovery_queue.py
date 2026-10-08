@@ -65,8 +65,9 @@ def test_executor_recovery_preserves_fifo_and_local_pause(
 
 @pytest.mark.parametrize("status", ["execution_failed", "operator_stopped"])
 @pytest.mark.parametrize("gate_count", [1, 2])
+@pytest.mark.parametrize("new_thread", [False, True])
 def test_run_recovery_does_not_renew_or_resume_sibling_budget_gate(
-    status: str, gate_count: int,
+    status: str, gate_count: int, new_thread: bool,
 ) -> None:
     policy = DeliveryPolicy(ticket_review_rounds=1)
     job = {
@@ -90,7 +91,7 @@ def test_run_recovery_does_not_renew_or_resume_sibling_budget_gate(
     before = deepcopy(state)
     assert bind_resume_intent(state)["authorization"] == "continue_existing_work"
     apply_resume_to_state(
-        state, explicit_resume=True, resume_human_blocker=False, new_thread=False,
+        state, explicit_resume=True, resume_human_blocker=False, new_thread=new_thread,
         human_response=None, resume_budget_checkpoint=False, budget_policy=policy,
         ticket_number=None, source_status=status,
     )
@@ -158,7 +159,39 @@ def test_global_resume_binds_ticket_authority_not_active_projection(
     assert resumed["status"] == "active"
 
 
-def test_global_resume_can_select_ticket_before_its_first_invocation(git_repo: Path) -> None:
+@pytest.mark.parametrize("phase,flag", [
+    ("developing", "development_new_thread"),
+    ("reviewing", "review_new_thread"),
+    ("publishing", "publication_new_thread"),
+])
+def test_executor_recovery_selects_current_thread_without_invocation(
+    phase: str, flag: str,
+) -> None:
+    job = {"ticket_number": 2, "ticket_branch_generation": 1, "phase": phase,
+           "development_thread_id": "prior-developer", "review_resume_thread_id": "prior-reviewer",
+           "publication_thread_id": "prior-publisher", "candidate_sha": "preserved",
+           "review_budget": {"window": 1, "development_attempts": 1}}
+    sibling = {"ticket_number": 3, "phase": "blocked", "blocked_reason": "modification_budget_exhausted"}
+    state = {"run_id": "run", "status": "execution_failed",
+             "ticket_graph": {"tickets": {"2": {}, "3": {}}},
+             "ticket_jobs": {"2": job, "3": sibling}, "active_ticket_job": job,
+             "active_agent_invocation": None, "ticket_agent_invocations": {}}
+    before_job, before_sibling = deepcopy(job), deepcopy(sibling)
+    apply_resume_to_state(
+        state, explicit_resume=True, resume_human_blocker=False, new_thread=True,
+        human_response=None, resume_budget_checkpoint=False, budget_policy=DeliveryPolicy(),
+        ticket_number=None, source_status="execution_failed",
+    )
+    assert job[flag] is True
+    for key in ("phase", "candidate_sha", "review_budget", "ticket_branch_generation"):
+        assert job[key] == before_job[key]
+    assert sibling == before_sibling
+
+
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_global_resume_can_select_ticket_before_its_first_invocation(
+    git_repo: Path, new_thread: bool,
+) -> None:
     from agent_run.resume_intent import ResumeIntentError, validate_resume_intent
 
     state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
@@ -180,7 +213,7 @@ def test_global_resume_can_select_ticket_before_its_first_invocation(git_repo: P
         with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
             validate_resume_intent(changed, intent)
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
-        run_id, explicit_resume=True,
+        run_id, explicit_resume=True, new_thread=new_thread,
         validate_resume_state=lambda current: validate_resume_intent(current, intent),
     )
     assert resumed["status"] == "active"

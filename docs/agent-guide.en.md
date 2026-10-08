@@ -55,7 +55,7 @@ Run mutation commands from any directory with the actual Parent and `--repo OWNE
 | Situation | Action |
 | --- | --- |
 | Running or waiting for checks | Continue observing; no restart is needed |
-| Recoverable execution failure, manual stop, or supervision timeout | Resolve the known cause, then follow status instructions to `resume` |
+| Execution or command failure, unknown pause reason, manual stop, or supervision timeout | Verify and resolve the cause, then `resume` the original work; add context with `--message`, or use `--new-thread` for an unavailable Agent session |
 | Human Blocker needs an answer | Show the original question; pass the user's answer unchanged through `resume --message` |
 | `requeue_required` | Check the changed requirements, then `requeue` |
 | Final PR awaits approval | Show the PR, acceptance, and check results; execute `approve` only with explicit approval for that final delivery |

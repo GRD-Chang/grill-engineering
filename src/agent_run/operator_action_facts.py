@@ -179,8 +179,8 @@ def _next_action(
         if state.get("status") == "unsupported_scope_change":
             return NextAction("scope_change")
         if state.get("status") == "deterministic_contradiction":
-            return NextAction("contradiction")
+            return NextAction("command", "resume", run_id)
         if reason in {"candidate_or_acceptance_inconsistent", "foreign_run_pr"}:
             return NextAction("command", "abandon", run_id)
         return NextAction("external_contradiction")
-    return NextAction("human_items")
+    return NextAction("command", "resume", run_id, ticket_number)

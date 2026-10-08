@@ -632,20 +632,32 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
             assert str(latest_invocation["model"]) in text
             assert str(latest_invocation["reasoning_effort"]) in text
 
-    before_rejected_resume = load_only_run_state(git_repo)
-    for forbidden_arguments in (("--new-thread",), ("--message", "human response")):
-        rejected = run_cli(
+    before_resume = load_only_run_state(git_repo)
+    original_job = before_resume["ticket_jobs"]["3"]
+    for resume_arguments in (("--new-thread",), ("--message", "human response")):
+        resumed_with_options = run_cli(
             git_repo,
             fixture,
             "resume",
             run_id,
-            *forbidden_arguments,
+            *resume_arguments,
             "--agent-fixture",
             str(agents),
         )
 
-        assert rejected.returncode == 2
-        assert load_only_run_state(git_repo) == before_rejected_resume
+        assert resumed_with_options.returncode == 2
+        assert stdout_json(resumed_with_options)["status"] == "blocked"
+        continued = load_only_run_state(git_repo)
+        job = continued["ticket_jobs"]["3"]
+        assert job["blocked_reason"] == "ticket_supervision_timeout"
+        for key in ("ticket_branch_generation", "candidate_sha", "acceptance_record", "review_budget", "ci_recovery"):
+            assert job[key] == original_job[key]
+        assert continued["agent_invocation_history"] == before_resume["agent_invocation_history"]
+        if resume_arguments[0] == "--message":
+            assert job["human_response_history"][-1]["response"] == "human response"
+        delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+        assert len(delivery["pull_requests"]) == 1
+        assert delivery["closed_issues"] == []
 
     resumed = run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents))
 

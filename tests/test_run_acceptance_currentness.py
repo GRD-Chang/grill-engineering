@@ -1103,13 +1103,23 @@ def test_run_acceptance_binds_the_previewed_merge_tree(git_repo: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("drift", [False, True])
+@pytest.mark.parametrize("drift,new_thread", [(False, False), (False, True), (True, False)])
 def test_returned_run_review_survives_currentness_read_failure(
-    git_repo: Path, drift: bool,
+    git_repo: Path, drift: bool, new_thread: bool,
 ) -> None:
     """A real save/load retains the result; a changed review boundary rejects it."""
     state, states, git = _completed_run(git_repo)
-    agents = ScriptedRunAgents()
+
+    class ReturningReviewer(ScriptedRunAgents):
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            event = request["_invocation_event"]
+            event("started", requested_thread_id=None, attempt_count=0)
+            event("thread_started", reported_thread_id="run-reviewer-1", attempt_count=1)
+            result = super().review(request)
+            event("completed", reported_thread_id=result.thread_id, attempt_count=1)
+            return result
+
+    agents = ReturningReviewer()
     agents._reviews = [_passing_artifact()]
 
     class FailingReadEngine(RunAcceptanceEngine):
@@ -1129,6 +1139,18 @@ def test_returned_run_review_survives_currentness_read_failure(
     if drift:
         saved["parent"]["revision"] = "changed-parent-revision"
         states.save_run(state["run_id"], saved)
+    else:
+        saved.update(status="execution_failed", terminal_kind="execution_failed")
+        states.save_run(state["run_id"], saved)
+        resumed_state, _ = Controller(
+            FixtureGitHubReader(git_repo / "github.json"), git, states,
+        ).resume(state["run_id"], explicit_resume=True, new_thread=new_thread)
+        reloaded = states.load_current_run(state["run_id"])
+        assert reloaded == resumed_state
+        assert reloaded["run_acceptance"]["phase"] == "reviewing"
+        assert not reloaded["run_acceptance"].get("reviewer_new_thread", False)
+        assert reloaded["run_acceptance"]["pending_review_result"] == run["pending_review_result"]
+        assert reloaded["run_acceptance"]["pending_semantic_attempt"]["attempt_id"] == attempt_id
     resumed = RunAcceptanceEngine(git=git, states=states, agents=agents).accept(state["run_id"])
     run = resumed["run_acceptance"]
     assert len(agents.review_requests) == 1

@@ -480,11 +480,11 @@ def _job_is_executable(
 
 def _job_diagnostic(job: dict[str, Any]) -> dict[str, Any]:
     reason = job.get("blocked_reason") or job.get("escalation_code")
-    if not isinstance(reason, str) or reason not in BLOCKED_MESSAGES:
-        raise ValueError("unresolved Ticket Job has unknown blocker")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("unresolved Ticket Job is missing its pause reason")
     return {
         "code": reason,
-        "message": BLOCKED_MESSAGES[reason],
+        "message": BLOCKED_MESSAGES.get(reason, str(job.get("execution_failure") or reason)),
         "ticket_number": job["ticket_number"],
     }
 

@@ -1636,7 +1636,7 @@ def _require_active_invocation_identity(
     elif subject == f"run-publication:{run_id}":
         acceptance = state.get("run_acceptance")
         publication = state.get("run_publication")
-        if not isinstance(publication, dict) or publication.get("phase") != "publishing":
+        if not isinstance(publication, dict) or not _paused_role_phase(publication, "run_publication", "publishing"):
             raise IncompatibleRunStateError(
                 "run state has an active Final Publication without a valid owner"
             )
@@ -2042,9 +2042,21 @@ def _reviewer_generation(acceptance: object, invocation_status: str) -> int | No
     if type(validation_attempts) is not int or validation_attempts < 1:
         return None
     expected_phase = "pending" if invocation_status == "resuming" else "reviewing"
-    if acceptance.get("phase") != expected_phase:
+    if not _paused_role_phase(acceptance, "run_acceptance", expected_phase):
         return None
     return generation
+
+
+def _paused_role_phase(owner: dict[str, Any], location: str, expected: str) -> bool:
+    if owner.get("phase") == expected:
+        return True
+    if owner.get("phase") not in {"blocked", "ready_for_human"}:
+        return False
+    from agent_run.resume_work import continuation_phase
+    try:
+        return continuation_phase(location, owner) == expected
+    except ValueError:
+        return False
 
 
 def _final_publication_generation(acceptance: object) -> int | None:
@@ -2060,11 +2072,15 @@ def _change_owner_phase_is_current(
     if not isinstance(job, dict):
         return False
     if (
-        job.get("phase") == "blocked"
-        and job.get("blocked_reason") == "ticket_paused"
+        job.get("phase") in {"blocked", "ready_for_human"}
         and invocation.get("status") in {"failed", "completed", "resuming"}
     ):
-        job = {**job, "phase": job.get("pause_resume_phase")}
+        from agent_run.resume_work import continuation_phase
+        location = "ticket" if invocation.get("work_subject", "").startswith("ticket:") else "parent"
+        try:
+            job = {**job, "phase": continuation_phase(location, job)}
+        except ValueError:
+            return False
     if (
         job.get("phase") == "ready_for_integration"
         and job.get("integration_resume_phase") == "accepted"

@@ -911,6 +911,7 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
             {
                 "expected_thread_id": None,
                 "thread_id": "developer-2",
+                "write_files": {"resumed.txt": "continued original Ticket\n"},
                 "human_blockers": ["Maintainer input is required."],
             }
         ],
@@ -986,22 +987,6 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         assert rejected.returncode == 2
         assert load_only_run_state(git_repo) == failed
 
-    for invalid_option in (
-        ("--message", "not valid for an Execution Failure"),
-        ("--new-thread",),
-    ):
-        invalid_resume = run_cli(
-            git_repo,
-            fixture,
-            "resume",
-            "1",
-            "--repo",
-            "example/project",
-            *invalid_option,
-        )
-        assert invalid_resume.returncode == 2
-        assert load_only_run_state(git_repo) == failed
-
     resumed = run_cli(
         git_repo,
         fixture,
@@ -1009,6 +994,9 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         "1",
         "--repo",
         "example/project",
+        "--message",
+        "Controller issue resolved; continue the original Ticket.",
+        "--new-thread",
         "--agent-fixture",
         str(agents),
     )
@@ -1017,6 +1005,21 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     resumed_state = load_only_run_state(git_repo)
     assert stdout_json(resumed)["status"] == "ready_for_human"
     assert resumed_state["status"] == "ready_for_human"
+    assert resumed_state["run_id"] == failed["run_id"]
+    assert resumed_state["accepted_parent_spec_revision"] == failed["accepted_parent_spec_revision"]
+    assert resumed_state["accepted_ticket_graph_revision"] == failed["accepted_ticket_graph_revision"]
+    job = resumed_state["ticket_jobs"]["2"]
+    assert job["human_response_history"][-1]["response"] == (
+        "Controller issue resolved; continue the original Ticket."
+    )
+    assert job["human_response_history"][-1]["generation"] == job["ticket_branch_generation"]
+    assert job["human_blockers"] == ["Maintainer input is required."]
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-2"
+    assert (checkout / "resumed.txt").read_text(encoding="utf-8") == "continued original Ticket\n"
+    invocation = resumed_state["active_agent_invocation"]
+    assert (invocation["role"], invocation["work_subject"]) == ("development", "ticket:2")
+    assert invocation["requested_thread_id"] is None
+    assert invocation["reported_thread_id"] == "developer-2"
     assert resumed_state["resume_audit"]["history"][-1]["kind"] == (
         "execution_failure"
     )
@@ -1026,7 +1029,10 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
 
     final_audit = load_only_run_state(git_repo)["resume_audit"]["history"][-1]
     assert final_audit["kind"] == "execution_failure"
-    assert isinstance(final_audit["successor_invocation_started_at"], str)
+    assert final_audit["new_thread"] is True
+    assert final_audit["human_response_supplied"] is True
+    assert final_audit["successor_invocation_started_at"] == invocation["started_at"]
+    assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get("mutations", []) == []
 
 
 def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(

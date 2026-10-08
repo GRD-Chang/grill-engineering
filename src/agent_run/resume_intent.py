@@ -96,9 +96,17 @@ def bind_resume_intent(
         if location.startswith("ticket:")
         and subject.get("blocked_reason") in {"ticket_paused", "ci_investigation_paused"}
     ]
+    known = {location for group in (
+        human, resync, integration_development, ci_recovery, publication_retry,
+        ticket_failure, ticket_pause,
+    ) for location, _subject in group}
+    from agent_run.resume_work import paused_work
+    continuation = [item for item in paused_work(current, ticket_number)
+                    if item[0] not in known and not ticket_recovery
+                    and not any(item[1] is subject for _kind, subject in checkpoints)]
     if ticket_number is not None and not any(
         (checkpoints, human, resync, integration_development, ci_recovery, publication_retry,
-         ticket_failure, ticket_pause)
+         ticket_failure, ticket_pause, continuation)
     ):
         raise ResumeIntentError("指定 Ticket 没有受支持的局部恢复边界")
     if (
@@ -106,9 +114,10 @@ def bind_resume_intent(
         or len(integration_development) > 1 or len(ci_recovery) > 1 or len(publication_retry) > 1
         or len(ticket_failure) > 1
         or len(ticket_pause) > 1
+        or len(continuation) > 1
         or sum(bool(group) for group in (
             checkpoints, human, resync, integration_development, ci_recovery, publication_retry,
-            ticket_failure, ticket_pause,
+            ticket_failure, ticket_pause, continuation,
         )) > 1
     ):
         raise ResumeIntentError("resume 暂停对象不唯一；拒绝推断恢复授权")
@@ -136,6 +145,9 @@ def bind_resume_intent(
     elif ticket_pause:
         reason, authorization = str(ticket_pause[0][1]["blocked_reason"]), "continue_ticket"
         subjects = ticket_pause
+    elif continuation:
+        reason, authorization = str(continuation[0][1].get("blocked_reason")), "continue_existing_work"
+        subjects = continuation
     else:
         reason = str(state.get("status"))
         parent_job = state.get("parent_job")
@@ -225,7 +237,8 @@ def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
                 "ticket_number", "generation", "acceptance_generation",
                 "candidate_sha", "phase", "blocked_reason", "human_blockers",
                 "ticket_branch_generation", "pause_resume_phase",
-                "execution_resume_phase", "last_ticket_resume",
+                "execution_resume_phase", "human_blocker_phase", "repair_source",
+                "acceptance_record", "publication_sha", "artifact", "last_ticket_resume",
                 "pending_semantic_attempt", "integration_resync", "integration_development_budget",
                 "ci_recovery", "publication_operation_retry",
             )

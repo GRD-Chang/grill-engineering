@@ -60,7 +60,16 @@ def append_explicit_resume_audit(
     if compacted != 0:
         raise ValueError("resume_audit.compacted must remain zero")
 
+    from agent_run.resume_intent import is_ticket_execution_recovery
+    from agent_run.resume_work import resume_message_owner
+    executor_recovery = ticket_number is None and is_ticket_execution_recovery(state, state.get("status"))
+    executor_target = resume_message_owner(state) if executor_recovery else None
     invocation = state.get("active_agent_invocation")
+    if executor_recovery:
+        invocation = (
+            state.get("ticket_agent_invocations", {}).get(executor_target[0].split(":", 1)[1])
+            if executor_target is not None else None
+        )
     if ticket_number is not None:
         invocation = state.get("ticket_agent_invocations", {}).get(str(ticket_number))
     active = (
@@ -76,7 +85,7 @@ def append_explicit_resume_audit(
     bound = active.get("semantic_attempt") if active is not None else None
     attempt = bound if isinstance(bound, dict) else None
     human_owner: tuple[str, dict[str, Any]] | None = None
-    if human_response_supplied and (
+    if human_response_supplied and not executor_recovery and (
         ticket_number is not None or human_blocker_subject_count(state) == 1
     ):
         human_owner = next(
@@ -119,7 +128,10 @@ def append_explicit_resume_audit(
         "human_response_supplied": human_response_supplied,
         "successor_invocation_started_at": None,
     }
-    if human_owner is not None:
+    if executor_recovery:
+        if executor_target is not None:
+            event["work_subject"], _owner, event["generation"] = executor_target
+    elif human_owner is not None:
         location, subject = human_owner
         event["work_subject"] = location if location.startswith("ticket:") else (
             f"parent-only:{state['run_id']}" if location == "parent" else f"{location.replace('_', '-')}:{state['run_id']}"
@@ -148,6 +160,10 @@ def append_explicit_resume_audit(
         ):
             event["work_subject"] = f"run-repair:{state['run_id']}"
             event["generation"] = repair.get("repair_generation")
+    if event["work_subject"] is None and not executor_recovery:
+        target = resume_message_owner(state, ticket_number)
+        if target is not None:
+            event["work_subject"], _owner, event["generation"] = target
     event["resume_id"] = resume_identity(str(state["run_id"]), event)
     event["event_digest"] = resume_event_digest(event)
     response_audit: dict[str, Any] | None = None
@@ -179,7 +195,7 @@ def _latest_human_response(
         subject = jobs.get(work_subject.split(":", 1)[1]) if isinstance(jobs, dict) else None
     elif isinstance(work_subject, str) and work_subject.startswith("parent-only:"):
         subject = state.get("parent_job")
-    elif isinstance(work_subject, str) and work_subject.startswith("run-acceptance:"):
+    elif isinstance(work_subject, str) and work_subject.startswith(("run-acceptance:", "run-integration:")):
         subject = state.get("run_acceptance")
     elif isinstance(work_subject, str) and work_subject.startswith("run-repair:"):
         acceptance = state.get("run_acceptance")
@@ -260,6 +276,9 @@ def _resume_kind(
     state: dict[str, Any], invocation: dict[str, Any] | None,
     *, ticket_number: int | None = None,
 ) -> str:
+    from agent_run.resume_intent import is_ticket_execution_recovery
+    if ticket_number is None and is_ticket_execution_recovery(state, state.get("status")):
+        return "operator_stopped" if state.get("status") == "operator_stopped" else "execution_failure"
     if ticket_number is not None:
         jobs = state.get("ticket_jobs")
         job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
@@ -284,7 +303,9 @@ def _resume_kind(
             return "operator_stopped"
         if job.get("phase") == "publication_pending":
             return "publication_operation_retry"
-        raise ValueError("resume Ticket has no supported local recovery boundary")
+        if job.get("phase") in {"blocked", "ready_for_human"}:
+            return "execution_failure"
+        raise ValueError("resume Ticket has no current local recovery boundary")
     if state.get("status") == "operator_stopped":
         return "operator_stopped"
     if state.get("status") == "supervision_timeout":
@@ -327,7 +348,7 @@ def _resume_kind(
             return "execution_failure"
     if human_blocker_subject_count(state) == 1:
         return "human_blocker"
-    if has_non_invocation_execution_failure(state):
+    if state.get("status") == "deterministic_contradiction" or has_non_invocation_execution_failure(state):
         return "execution_failure"
     if (
         invocation is not None
@@ -335,6 +356,9 @@ def _resume_kind(
         and invocation_attempt_is_pending(state, invocation)
     ):
         return "agent_invocation"
+    from agent_run.resume_work import paused_work
+    if len(paused_work(state, ticket_number)) == 1:
+        return "execution_failure"
     raise ValueError("explicit Resume has no canonical recovery boundary")
 
 

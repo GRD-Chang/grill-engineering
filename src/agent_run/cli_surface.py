@@ -56,6 +56,11 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
 
     status = state.get("status")
+    from agent_run.resume_work import paused_work
+    if len(paused_work(state)) == 1:
+        return True
+    if status == "deterministic_contradiction":
+        return True  # Re-read authority; continuing never assumes an external result.
     if status == "operator_stopped":
         return isinstance(state.get("operator_stop"), dict)
     if status == "supervision_timeout":

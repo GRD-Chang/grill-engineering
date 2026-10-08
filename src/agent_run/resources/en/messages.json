@@ -236,7 +236,7 @@
   "cli.new_thread_help": "Start a new thread for the failed or human-blocked Agent stage (not supervision timeouts)",
   "cli.requeue_help": "Create a new Change Job Generation only from requeue_required",
   "cli.selector_help": "Parent Issue number; automation and diagnostics may use a full Run ID",
-  "cli.response_help": "Original human response for the current Human Blocker (up to 8 KiB)",
+  "cli.response_help": "Maintainer message for continuing the original work (up to 8 KiB; no scope change or approval)",
   "cli.approve_help": "Explicitly approve and merge the gated final Run PR",
   "cli.revise_help": "Open a new repair window using Run-level human feedback",
   "cli.feedback_help": "Original revision feedback",

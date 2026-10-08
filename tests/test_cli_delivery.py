@@ -4227,7 +4227,7 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
     )
     assert stdout_json(status)["status"] == "deterministic_contradiction"
     assert "agent-run run" not in stdout_json(status)["next_action"]
-    assert "agent-run resume" not in stdout_json(history)["next_action"]
+    assert "agent-run resume" in stdout_json(history)["next_action"]
 
 
 def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) -> None:

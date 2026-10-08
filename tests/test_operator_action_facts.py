@@ -328,7 +328,7 @@ def test_publication_failure_transition_keeps_its_owned_diagnostic(failure: str,
     assert fact["reason"] == failure
     assert fact["reasons"] == [message]
     assert fact["evidence"]["diagnostics"] == saved["diagnostics"]
-    assert fact["action"] == NextAction("human_items")
+    assert fact["action"] == NextAction("command", "resume", saved["run_id"])
     actions = operator_action_views(saved)
     ticket_action = next(item for item in actions if item["work_subject"] == "ticket:3")
     assert ticket_action["reasons"] == ["Ticket-only error"]
@@ -340,7 +340,8 @@ def test_publication_failure_transition_keeps_its_owned_diagnostic(failure: str,
         assert action["reason"] == failure
         assert action["reasons"] == [message]
         assert action["evidence"]["diagnostics"] == saved["diagnostics"]
-        assert action["action"]["kind"] == "human_items"
+        assert action["action"] == {"kind": "command", "command": "resume",
+                                    "selector": saved["run_id"], "ticket_number": None}
     boundary = next(event for event in events(saved) if event.get("work_subject") == "run-publication:r1")
     assert boundary["reason"] == failure
     assert boundary["evidence"]["diagnostics"] == saved["diagnostics"]
@@ -361,5 +362,6 @@ def test_query_action_guidance_uses_the_frozen_language(command: str, plain: boo
     query = cli_presentation._print_status if command == "status" else cli_presentation._print_history
     query(state, as_json=False, plain=plain)
     output = capsys.readouterr().out
-    assert text("guidance.action.human_items", language="en") in output
-    assert text("guidance.action.human_items", language="zh") not in output
+    assert "agent-run resume 1 --repo example/project" in output
+    assert text("card.next_step", language="en") in output
+    assert text("card.next_step", language="zh") not in output

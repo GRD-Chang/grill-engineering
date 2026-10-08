@@ -486,18 +486,19 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
         query = stdout_json(result)
         assert result.returncode == 0, result.stdout + result.stderr
         action, = query["operator_actions"]
-        assert action["action"]["kind"] == "contradiction"
+        assert action["action"]["kind"] == "command"
+        assert action["action"]["command"] == "resume"
         assert action["reasons"] == ["requeue graph JSON is incomplete"]
         for guidance in (query["next_action"], action["next_action"]):
-            assert "agent-run abandon" in guidance
+            assert "agent-run resume" in guidance
             assert "agent-run run" not in guidance
-            assert "agent-run resume" not in guidance
     boundary, = [event for event in events(persisted) if event.get("current")]
-    assert boundary["action"]["kind"] == "contradiction"
+    assert boundary["action"]["kind"] == "command"
+    assert boundary["action"]["command"] == "resume"
     rendered = json.dumps(card(boundary), ensure_ascii=False)
     assert "requeue graph JSON is incomplete" in rendered
-    assert "agent-run abandon" in rendered
-    assert "agent-run run" not in rendered and "agent-run resume" not in rendered
+    assert "agent-run resume" in rendered
+    assert "agent-run run" not in rendered
     assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get(
         "mutations", []
     ) == []

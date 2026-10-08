@@ -349,17 +349,11 @@ class Controller:
     ) -> tuple[dict[str, Any], bool]:
         if message is not None:
             if human_response is not None:
-                raise ValueError("pass only one Human Blocker response")
+                raise ValueError("pass only one resume message")
             human_response = message
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
-        if explicit_resume and (new_thread or human_response is not None) and any(
-            isinstance(job, dict) and job.get("blocked_reason") == "ticket_supervision_timeout"
-            and (ticket_number is None or job.get("ticket_number") == ticket_number)
-            for job in existing.get("ticket_jobs", {}).values()
-        ):
-            raise ValueError("supervision timeout resume does not accept Agent or Human Blocker options")
         retry_window = None
         if (
             (explicit_resume or validate_resume_state is not None)
@@ -405,11 +399,12 @@ class Controller:
                 raise
             response_replayed = False
             if human_response is not None:
-                response_binding = _bind_current_human_response(
-                    existing, human_response, ticket_number=ticket_number
+                response_binding = _bind_resume_message(
+                    existing, human_response, ticket_number=ticket_number,
+                    human_blocker=resume_human_blocker
                 )
-                if not resume_human_blocker or response_binding is None:
-                    raise ValueError("--message requires a current Human Blocker")
+                if response_binding is None:
+                    raise ValueError("--message requires a current work subject")
                 response_replayed = response_binding == "replayed"
             audit_replayed = response_replayed and _resume_audit_matches_replay(
                 existing, new_thread=new_thread
@@ -438,16 +433,18 @@ class Controller:
             "abandoned",
             "abandonment_pending",
             "completed",
-            "deterministic_contradiction",
         }:
+            return existing, True
+        if existing.get("status") == "deterministic_contradiction" and not explicit_resume:
             return existing, True
         response_replayed = False
         if human_response is not None:
-            response_binding = _bind_current_human_response(
-                existing, human_response, ticket_number=ticket_number
+            response_binding = _bind_resume_message(
+                existing, human_response, ticket_number=ticket_number,
+                human_blocker=resume_human_blocker
             )
-            if not resume_human_blocker or response_binding is None:
-                raise ValueError("--message requires a current Human Blocker")
+            if response_binding is None:
+                raise ValueError("--message requires a current work subject")
             response_replayed = response_binding == "replayed"
         hold_operator_gate = (
             not explicit_resume
@@ -477,10 +474,6 @@ class Controller:
                 ticket_number=ticket_number,
             )
         if resuming_operator_stop:
-            if new_thread or human_response is not None:
-                raise ValueError(
-                    "operator_stopped resume does not accept Agent or Human Blocker options"
-                )
             restore_operator_stop(existing)
         if explicit_resume and ticket_number is None and is_ticket_execution_recovery(
             existing, resume_pause["status"],
@@ -496,10 +489,6 @@ class Controller:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
         if resuming_supervision_timeout:
-            if new_thread or human_response is not None:
-                raise ValueError(
-                    "supervision timeout resume does not accept Agent or Human Blocker options"
-                )
             restore_supervision_wait(existing)
             if retry_window is not None:
                 existing["supervision_window"] = retry_window
@@ -1748,6 +1737,49 @@ def _resume_agent_human_blocker(
     return False
 
 
+def _bind_resume_message(
+    state: dict[str, Any], response: str, *, ticket_number: int | None = None,
+    human_blocker: bool = False,
+) -> Literal["appended", "replayed"] | None:
+    """Attach maintainer context to the retained work, without granting permission."""
+    if human_blocker:
+        return _bind_current_human_response(state, response, ticket_number=ticket_number)
+    invocation = state.get("active_agent_invocation")
+    if ticket_number is not None:
+        subject = state.get("ticket_jobs", {}).get(str(ticket_number))
+        if not isinstance(subject, dict):
+            return None
+        generation = _subject_generation(subject)
+    elif (isinstance(invocation, dict) and invocation.get("status") != "completed"
+          and not is_ticket_execution_recovery(state, state.get("status"))):
+        role = invocation.get("role")
+        if role == "reviewer":
+            subject = _run_acceptance_for_invocation(state, invocation)
+        elif role in {"publication", "final_publication"}:
+            subject, _mirror = _publication_job_for_invocation(state, invocation)
+        else:
+            subject = _change_job_for_invocation(state, invocation)
+        generation = int(invocation["generation"])
+    else:
+        from agent_run.resume_work import resume_message_owner
+        target = resume_message_owner(state, ticket_number)
+        if target is None:
+            return None
+        _work_subject, subject, generation = target
+    blockers: list[str] = []
+    if _is_replayed_human_response(state, subject, blockers, response, generation=generation):
+        return "replayed"
+    append_human_response(subject, blockers, response, generation=generation)
+    if type(subject.get("ticket_number")) is int:
+        state["ticket_jobs"][str(subject["ticket_number"])] = subject
+    active = state.get("active_ticket_job")
+    if (isinstance(active, dict) and subject.get("ticket_number") is not None
+            and active.get("ticket_number") == subject.get("ticket_number")):
+        state["active_ticket_job"] = subject
+        sync_active_ticket_job(state)
+    return "appended"
+
+
 def _bind_current_human_response(
     state: dict[str, Any], response: str, *, ticket_number: int | None = None
 ) -> Literal["appended", "replayed"] | None:
@@ -1819,10 +1851,7 @@ def _latest_unconsumed_response_audit(
             continue
         if event.get("successor_invocation_started_at") is not None:
             return None
-        if event.get("human_response_supplied") is True and event.get("kind") in {
-            "human_blocker",
-            "github_refresh_retry",
-        }:
+        if event.get("human_response_supplied") is True:
             return event
     return None
 
@@ -1833,7 +1862,6 @@ def _resume_audit_matches_replay(
     event = latest_resume_audit(state)
     return (
         event is not None
-        and event.get("kind") in {"human_blocker", "github_refresh_retry"}
         and event.get("human_response_supplied") is True
         and event.get("successor_invocation_started_at") is None
         and event.get("new_thread") is new_thread
@@ -2386,6 +2414,9 @@ def _carry_development_thread_context(
     if thread_id is not None:
         request["development_thread_id"] = thread_id
     request["development_thread_history"] = deepcopy(history)
+    for key in ("human_response_history", "human_response_generation"):
+        if key in job:
+            request[key] = deepcopy(job[key])
     return request
 
 
@@ -2396,6 +2427,10 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     role = invocation.get("role")
     if role == "reviewer":
         run = _run_acceptance_for_invocation(state, invocation)
+        # The returned result still owns this Attempt. Consume it before
+        # choosing a Thread for any further Reviewer work.
+        if isinstance(run.get("pending_review_result"), dict):
+            return
         run.pop("reviewer_resume_thread_id", None)
         run["reviewer_new_thread"] = True
         run["phase"] = "pending"
@@ -2439,6 +2474,41 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         mirror.pop("publication_thread_id", None)
         mirror["publication_new_thread"] = True
         mirror.pop("publication_failure_resume", None)
+
+
+def _clear_successor_thread(state: dict[str, Any], ticket_number: int | None) -> None:
+    """Apply a Thread choice to the next role when no Invocation owns it yet."""
+    from agent_run.resume_work import resume_message_owner
+    target = resume_message_owner(state, ticket_number)
+    if target is None:
+        raise ValueError("--new-thread requires current work facts")
+    work_subject, subject, _generation = target
+    phase = subject.get("phase")
+    if work_subject.startswith("run-acceptance:") and phase == "repairing":
+        request = subject.get("repair_request")
+        if isinstance(request, dict):
+            subject = request
+            phase = "repairing"
+    integration_work = any(isinstance(subject.get(key), dict) for key in (
+        "integration_conflict", "parent_integration_conflict", "run_repair_integration_conflict",
+    ))
+    if phase in {"developing", "repairing"} or integration_work:
+        previous = subject.pop("development_thread_id", None)
+        if isinstance(previous, str) and previous:
+            history = subject.setdefault("development_thread_history", [])
+            if previous not in history:
+                history.append(previous)
+        subject["development_new_thread"] = True
+    elif work_subject.startswith("run-acceptance:"):
+        subject.pop("reviewer_resume_thread_id", None)
+        subject["reviewer_new_thread"] = True
+    elif phase in {"candidate", "reviewing"}:
+        subject.pop("review_resume_thread_id", None)
+        subject["review_new_thread"] = True
+    else:
+        subject.pop("publication_thread_id", None)
+        subject.pop("thread_id", None)
+        subject["publication_new_thread"] = True
 
 
 def _restore_current_invocation_thread(
@@ -3045,11 +3115,14 @@ def apply_resume_to_state(
             "blocked", "publication_pending", "completed",
         }:
             if new_thread:
-                _clear_current_invocation_thread(state)
+                if isinstance(state.get("active_agent_invocation"), dict):
+                    _clear_current_invocation_thread(state)
+                elif isinstance(active, dict) and active.get("phase") is not None:
+                    _clear_successor_thread(state, active["ticket_number"])
+                # Before the first Invocation, newly selected work already
+                # starts a fresh Thread; there is no prior Thread to replace.
             else:
                 _restore_current_invocation_thread(state, allow_completed=True)
-        if human_response is not None:
-            raise ValueError("Executor recovery does not accept a Human Blocker response")
         _restore_parallel_ticket_invocations(state)
         _mark_failed_invocation_resuming(state)
         return
@@ -3182,8 +3255,6 @@ def apply_resume_to_state(
                 })
                 budget_resumed = True
                 break
-    if budget_resumed and human_response is not None:
-        raise ValueError("Checkpoint resume does not accept a Human Blocker response")
     resumed_subject = False
     if budget_resumed:
         resumed_subject = True
@@ -3194,13 +3265,14 @@ def apply_resume_to_state(
         )
         if human_response is not None and not resumed_subject:
             raise ValueError("--message requires a current Human Blocker")
-    elif human_response is not None:
-        raise ValueError("--message requires Human Blocker resume")
+    elif explicit_resume:
+        from agent_run.resume_work import resume_paused_work
+        resumed_subject = resume_paused_work(state, ticket_number=ticket_number)
     # A targeted resume may replace the previously selected Ticket. Bind
     # completed-result recovery to that final owner and its pending Attempt.
     invocation = state.get("active_agent_invocation")
     resume_completed_invocation = (
-        (source_status == "execution_failed" or ticket_execution_resumed)
+        (explicit_resume or ticket_execution_resumed)
         and isinstance(invocation, dict)
         and invocation.get("status") == "completed"
         and invocation_attempt_is_pending(state, invocation)
@@ -3209,9 +3281,16 @@ def apply_resume_to_state(
         isinstance(state.get("active_agent_invocation"), dict)
         and state["active_agent_invocation"].get("status") == "resuming"
     )
-    if new_thread and (not budget_resumed or ticket_execution_resumed):
+    if new_thread and budget_resumed and not ticket_execution_resumed:
+        if isinstance(invocation, dict) and invocation_attempt_is_pending(state, invocation):
+            _clear_current_invocation_thread(state)
+        else:
+            _clear_successor_thread(state, ticket_number)
+    elif new_thread:
         if resuming_run_acceptance:
             _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
+        elif not isinstance(invocation, dict):
+            _clear_successor_thread(state, ticket_number)
         else:
             _clear_current_invocation_thread(state)
     elif not invocation_already_resuming:

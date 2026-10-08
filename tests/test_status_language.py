@@ -281,7 +281,7 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
 
 
 @pytest.mark.parametrize(("status", "command"), [
-    ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "abandon"),
+    ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "resume"),
     ("publication_pending", "abandon"),
 ])
 def test_status_qualifies_manual_abandon_guidance_without_changing_json(
@@ -305,10 +305,9 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     assert "agent-run abandon 1 --repo" not in json.loads(audit_output.getvalue())["next_action"]
     if status == "deterministic_contradiction":
         guidance = json.loads(audit_output.getvalue())["next_action"]
-        assert "agent-run abandon" in guidance
-        for invalid_command in ("agent-run run", "agent-run resume"):
-            assert invalid_command not in guidance
-            assert invalid_command not in output.getvalue()
+        assert "agent-run resume" in guidance
+        assert "agent-run run" not in guidance
+        assert "agent-run run" not in output.getvalue()
     assert _file_snapshot(root) == before
 
 
