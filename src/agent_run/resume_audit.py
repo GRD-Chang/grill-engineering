@@ -229,6 +229,7 @@ def bind_resume_to_successor(
         "human_blocker",
         "operator_stopped",
         "integration_resync",
+        "integration_development",
     }:
         return None
     if event.get("successor_invocation_started_at") is not None:
@@ -268,6 +269,8 @@ def _resume_kind(
             return "human_blocker"
         if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}:
             return "budget_checkpoint"
+        if reason == "integration_development_exhausted":
+            return "integration_development"
         if reason == "integration_resync_exhausted":
             return "integration_resync"
         if reason == "ticket_supervision_timeout":
@@ -299,6 +302,9 @@ def _resume_kind(
             "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }:
             return "budget_checkpoint"
+    for job in state.get("ticket_jobs", {}).values():
+        if isinstance(job, dict) and job.get("blocked_reason") == "integration_development_exhausted":
+            return "integration_development"
     for key in ("active_ticket_job", "parent_job", "run_acceptance"):
         subject = state.get(key)
         if (

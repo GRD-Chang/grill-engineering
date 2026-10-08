@@ -18,7 +18,7 @@ from agent_run.review_budget import (
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 6
+DELIVERY_POLICY_PROTOCOL = 7
 _POLICY_KEYS = frozenset(
     {
         "ticket_development_workers",
@@ -26,6 +26,7 @@ _POLICY_KEYS = frozenset(
         "run_repair_rounds",
         "ticket_review_rounds",
         "integration_resync_limit",
+        "ticket_integration_development_limit",
         "ci_recovery_rounds",
         "ci_repairs_per_round",
         "development_thread_policy",
@@ -50,6 +51,7 @@ class DeliveryPolicy:
     ticket_review_rounds: int = 3
     ticket_development_workers: int = 3
     integration_resync_limit: int = 3
+    ticket_integration_development_limit: int = 3
     ci_recovery_rounds: int = 3
     ci_repairs_per_round: int = 3
     parent_only_paired_rounds: int = 10
@@ -77,7 +79,7 @@ class DeliveryPolicy:
             "integration_resync_limit",
             _nonnegative_integer(self.integration_resync_limit, "integration_resync_limit"),
         )
-        for field in ("ci_recovery_rounds", "ci_repairs_per_round"):
+        for field in ("ci_recovery_rounds", "ci_repairs_per_round", "ticket_integration_development_limit"):
             object.__setattr__(self, field, _positive_integer(getattr(self, field), field))
         object.__setattr__(
             self,
@@ -109,6 +111,7 @@ class DeliveryPolicy:
             "ticket_review_rounds": self.ticket_review_rounds,
             "ticket_development_workers": self.ticket_development_workers,
             "integration_resync_limit": self.integration_resync_limit,
+            "ticket_integration_development_limit": self.ticket_integration_development_limit,
             "ci_recovery_rounds": self.ci_recovery_rounds,
             "ci_repairs_per_round": self.ci_repairs_per_round,
             "development_thread_policy": self.development_thread_policy,
@@ -191,6 +194,7 @@ def normalize_policy_overrides(
         "ticket_review_round": "ticket_review_rounds",
         "ticket_development_workers": "ticket_development_workers",
         "integration_resync_limit": "integration_resync_limit",
+        "ticket_integration_development_limit": "ticket_integration_development_limit",
         "ci_recovery_rounds": "ci_recovery_rounds",
         "ci_repairs_per_round": "ci_repairs_per_round",
     }
@@ -253,6 +257,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
             "ticket_review_rounds": value.get("ticket_review_rounds"),
             "ticket_development_workers": value.get("ticket_development_workers"),
             "integration_resync_limit": value.get("integration_resync_limit"),
+            "ticket_integration_development_limit": value.get("ticket_integration_development_limit"),
             "ci_recovery_rounds": value.get("ci_recovery_rounds"),
             "ci_repairs_per_round": value.get("ci_repairs_per_round"),
             "development_thread_policy": value.get("development_thread_policy", "reuse"),
@@ -439,6 +444,9 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
         ),
         ticket_development_workers=_positive_integer(
             values.get("ticket_development_workers"), "ticket_development_workers"
+        ),
+        ticket_integration_development_limit=_positive_integer(
+            values.get("ticket_integration_development_limit"), "ticket_integration_development_limit"
         ),
         integration_resync_limit=_nonnegative_integer(
             values.get("integration_resync_limit"), "integration_resync_limit"

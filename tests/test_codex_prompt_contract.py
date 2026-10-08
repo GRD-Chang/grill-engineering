@@ -2048,3 +2048,30 @@ def test_worker_output_schema_is_separate_from_prompt_examples(
     else:
         assert "human_blocker" in prompt
         assert "human_blockers" in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("mode", ["new-thread", "resume"])
+def test_actual_worker_integration_prompt_retains_scene_and_work_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, mode: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+    request = {
+        "_prompt_resources": resolve_resources(language=language),
+        "_invocation_mode": mode, "thread_id": "integration-thread",
+        "acceptance_scope": "ticket", "repair_source": "integration",
+        "task_issue_url": "https://github.com/example/project/issues/400",
+        "parent_issue_url": "https://github.com/example/project/issues/399",
+        "integration_evidence": '{"source_sha":"SOURCE_REVISION","target_sha":"TARGET_REVISION","failure":{"command":["git","diff","--cached","--check"],"stdout_json":"CSV_RAW_OUTPUT"}}',
+        "prior_human_blockers": ["Confirm retained data"],
+        "human_response_history": [{"human_blockers": ["Confirm retained data"], "response": "KEEP_CSV_DATA"}],
+    }
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="integration")
+    assert all(value in prompt for value in ("SOURCE_REVISION", "TARGET_REVISION", "CSV_RAW_OUTPUT", "KEEP_CSV_DATA"))
+    if language == "zh":
+        assert "不重新开发整套需求" in prompt
+        assert "程序随后重新执行实际 Git 检查" in prompt
+    else:
+        assert "do not redevelop the full requirements" in prompt
+        assert "program will rerun actual Git checks" in prompt
+    assert "acceptance_artifact" not in prompt and "ci_evidence" not in prompt

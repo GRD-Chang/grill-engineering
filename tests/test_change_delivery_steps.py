@@ -38,7 +38,7 @@ def test_ticket_steps_yield_agent_work_then_finish_current_ci_without_agent(
             assert current is not None
             owned = [item for item in current["ticket_work_queue"] if item["ticket_number"] == 3]
             assert len(owned) == 1 and owned[0]["lease_id"] is not None
-            if request.get("repair_source") == "merge_conflict":
+            if request.get("repair_source") == "integration":
                 assert owned[0]["role"] == "integration_conflict"
                 self.development_requests.append(request)
                 (checkout / "delivered.txt").write_text("first attempt\nexternal\n")

@@ -89,6 +89,7 @@ from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
 from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.ticket_queue import acquire as acquire_ticket_slot, reconcile_all as reconcile_ticket_slots
 from agent_run.integration_resync_budget import renew_resync_budget
+from agent_run.integration_development_budget import renew_integration_development_budget
 from agent_run.ci_recovery_budget import ci_limits_for_job, reset_exhausted_ci_budget
 
 
@@ -3088,6 +3089,27 @@ def apply_resume_to_state(
         budget_resumed = ticket_execution_resumed
     if explicit_resume and not budget_resumed and ticket_number is None:
         budget_resumed = _resume_run_repair_integration(state)
+    if explicit_resume and not budget_resumed:
+        jobs = state.get("ticket_jobs", {})
+        integration_jobs = [
+            job for job in jobs.values()
+            if isinstance(job, dict) and job.get("phase") == "blocked"
+            and job.get("blocked_reason") == "integration_development_exhausted"
+            and (ticket_number is None or job.get("ticket_number") == ticket_number)
+        ] if isinstance(jobs, dict) else []
+        if len(integration_jobs) == 1:
+            job = integration_jobs[0]
+            renew_integration_development_budget(
+                job, policy_snapshot=budget_policy.snapshot(),
+            )
+            job["phase"] = "candidate" if job.get("attempt_kind") == "ci_repair" else "accepted"
+            job.pop("blocked_reason", None)
+            if job["phase"] == "accepted":
+                acquire_ticket_slot(state, job)
+            state["active_ticket_job"] = job
+            state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            sync_active_ticket_job(state)
+            budget_resumed = True
     if explicit_resume and not budget_resumed:
         active_ticket = state.get("active_ticket_job")
         if (

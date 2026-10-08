@@ -3947,6 +3947,12 @@ def _add_policy_options(
         help=cli_message('cli.ticket_development_workers_help'),
     )
     parser.add_argument(
+        "--ticket-integration-development-limit",
+        dest=f"{dest_prefix}ticket_integration_development_limit",
+        type=_positive_integer,
+        help=cli_message("cli.ticket_integration_development_limit_help"),
+    )
+    parser.add_argument(
         "--integration-resync-limit",
         dest=f"{dest_prefix}integration_resync_limit",
         type=_nonnegative_integer,
@@ -3987,6 +3993,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "ticket_review_rounds",
         "ticket_development_workers",
         "integration_resync_limit",
+        "ticket_integration_development_limit",
         "ci_recovery_rounds",
         "ci_repairs_per_round",
         "development_thread_policy",

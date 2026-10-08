@@ -23,6 +23,7 @@ from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
 from agent_run.integration_resync_budget import require_resync_budget
+from agent_run.integration_development_budget import require_integration_development_budget, semantic_attempt_budget
 from agent_run.operator_gate import (
     active_ticket_gate_mirror_is_consistent,
     operator_gate_identity_is_consistent,
@@ -684,6 +685,16 @@ def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
         if isinstance(job, dict):
             subjects.append((key, job))
     for location, job in subjects:
+        development_budget = job.get("integration_development_budget")
+        if development_budget is not None:
+            try:
+                require_integration_development_budget(
+                    development_budget, policy_snapshot=job.get("policy_snapshot") or state.get("policy_snapshot"),
+                )
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError(
+                    f"incompatible_run_state: {location}.integration_development_budget is invalid"
+                ) from error
         budget = job.get("integration_resync")
         if budget is None:
             continue
@@ -1914,7 +1925,7 @@ def _require_owner_attempt(
                 f"run state has an invalid Publication Budget Window at {location}"
             )
         return
-    budget = review_budget_owner(owner).get("review_budget")
+    budget = semantic_attempt_budget(owner, attempt)
     current_window = budget.get("window") if isinstance(budget, dict) else None
     if (
         type(current_window) is not int
@@ -1958,7 +1969,7 @@ def _require_pending_invocation_attempt(
         )
     budget_window = pending.get("budget_window")
     if budget_window is not None:
-        budget = review_budget_owner(owner).get("review_budget")
+        budget = semantic_attempt_budget(owner, pending)
         if not isinstance(budget, dict) or budget.get("window") != budget_window:
             raise IncompatibleRunStateError(
                 "run state has a pending Semantic Agent Attempt in the wrong Budget Window"
@@ -2120,12 +2131,12 @@ def _change_conflict_owner_is_current(
         or conflict.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("base_sha") != job.get("base_sha")
-        or conflict.get("stage") not in {"source", "target"}
+        or conflict.get("stage") not in ({"source", "target", "git_check"} if subject.startswith("ticket:") else {"source", "target"})
         or type(conflict.get("attempts")) is not int
         or conflict["attempts"] != 1
-        or conflict.get("merge_head_sha") != conflict.get(f"{conflict.get('stage')}_sha")
+        or (conflict.get("stage") != "git_check" and conflict.get("merge_head_sha") != conflict.get(f"{conflict.get('stage')}_sha"))
         or not isinstance(conflict.get("paths"), list)
-        or not conflict["paths"]
+        or (conflict.get("stage") != "git_check" and not conflict["paths"])
         or any(not isinstance(path, str) or not path for path in conflict["paths"])
     ):
         return False
@@ -2135,9 +2146,16 @@ def _change_conflict_owner_is_current(
                       "default_base_sha", "repair_base_run_head_sha")
     ):
         return False
+    if conflict.get("stage") == "git_check":
+        if not isinstance(conflict.get("failure"), dict) or not conflict["failure"].get("error"):
+            return False
+        merge_head = conflict.get("merge_head_sha")
+        if merge_head is not None and (not isinstance(merge_head, str) or not merge_head):
+            return False
     return all(
         isinstance(conflict.get(field), str) and bool(conflict[field])
-        for field in ("source_sha", "target_sha", "head_sha", "merge_head_sha")
+        for field in (("source_sha", "target_sha", "head_sha") if conflict.get("stage") == "git_check"
+                      else ("source_sha", "target_sha", "head_sha", "merge_head_sha"))
     )
 
 

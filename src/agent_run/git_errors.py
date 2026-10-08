@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class GitError(RuntimeError):
     """A managed Git operation could not preserve its required boundary."""
+
+    def __init__(self, message: str, *, evidence: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence or {}
 
 
 class GitIntegrityError(GitError):

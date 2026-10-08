@@ -120,6 +120,7 @@ def _recovery_checkpoint_is_ready(state: dict[str, object]) -> bool:
         len(gates) == 1
         and gates[0][1].get("blocked_reason") in {
             "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+            "integration_development_exhausted",
             "integration_resync_exhausted",
         }
         and not budget_checkpoint_subjects(state)

@@ -37,6 +37,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         job = state["ticket_jobs"]["3"]
         job.update(common)
         job["ticket_branch_generation"] = 1
+        job["policy_snapshot"] = dict(state["policy_snapshot"])
         ticket = state["ticket_graph"]["tickets"]["3"]
         job["effective_revision"] = effective_revision(
             ticket_revision=ticket["content_revision"], parent_revision=state["parent"]["revision"],
@@ -94,7 +95,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         _invocation_boundary=invocation_boundary,
         _agent_is_current=lambda state, job: True,
         _reject_stale=lambda *args: None,
-        git=SimpleNamespace(checkout_head=lambda checkout: base, commit_parents=lambda head: [base, base]),
+        git=SimpleNamespace(checkout_head=lambda checkout: base, commit_parents=lambda head: [base, base], commit_integration_work=lambda *args, **kwargs: base),
     )
     stage._invocation_events = partial(invocation_events, stage)
     stage.conflict_key = key

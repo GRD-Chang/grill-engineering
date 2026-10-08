@@ -202,3 +202,110 @@ def test_rewritten_remote_source_is_observed_without_overwriting_local_history(
     assert publisher.live_branch_heads("ticket", "main")[0] == rewritten
     assert not git.is_ancestor(former, rewritten)
     assert git.checkout_head(git_repo) == candidate
+
+
+def test_resolution_reports_real_csv_diff_check_and_retries_after_file_repair(
+    git_repo: Path, tmp_path: Path,
+) -> None:
+    collaborator, git, publisher, _base = _collaboration(git_repo, tmp_path)
+    _git(git_repo, "checkout", "-b", "ticket")
+    candidate = _commit(git_repo, "README.md", "agent\n")
+    _git(collaborator, "checkout", "ticket")
+    source = _commit(collaborator, "README.md", "human\n")
+    _git(collaborator, "push", "origin", "ticket")
+    _, target = publisher.live_branch_heads("ticket", "main")
+    git.fetch_remote_commit("ticket", source)
+    assert git.integrate_remote_heads(
+        git_repo, candidate_sha=candidate, source_sha=source, target_sha=target,
+    ).status == "conflict"
+    (git_repo / "README.md").write_text("agent and human\n")
+    csv = git_repo / "fleet.csv"
+    csv.write_bytes(b"\xef\xbb\xbfname,value\r\nship,1\r\n")
+    with pytest.raises(GitError, match="trailing whitespace") as error:
+        git.commit_integration_work(
+            git_repo, expected_head_sha=candidate, expected_merge_sha=source,
+            message="resolve csv integration",
+        )
+    evidence = error.value.evidence
+    assert evidence["command"] == ["git", "diff", "--cached", "--check"]
+    assert evidence["operation"] == "commit_integration_resolution"
+    assert evidence["returncode"] != 0
+    assert "fleet.csv:1: trailing whitespace" in evidence["stdout"]
+    assert evidence["stderr"] == ""
+    assert evidence["checkout"] == str(git_repo)
+    assert evidence["head_sha"] == candidate
+    assert evidence["merge_head_sha"] == source
+    assert _git(git_repo, "ls-files", "-u") == ""
+    assert csv.read_bytes().endswith(b"\r\n")
+    csv.write_bytes(csv.read_bytes().replace(b"\r\n", b"\n"))
+    resolved = git.commit_integration_work(
+        git_repo, expected_head_sha=candidate, expected_merge_sha=source,
+        message="resolve csv integration",
+    )
+    assert git.commit_parents(resolved) == [candidate, source]
+    assert csv.read_bytes() == b"\xef\xbb\xbfname,value\nship,1\n"
+    assert git.commit_integration_work(
+        git_repo, expected_head_sha=candidate, expected_merge_sha=source,
+        message="resolve csv integration",
+    ) == resolved
+
+
+def test_nonmerge_integration_work_checks_and_exact_recovery(git_repo: Path) -> None:
+    git = GitRepository(git_repo)
+    original = git.checkout_head(git_repo)
+    (git_repo / "data.csv").write_bytes(b"item,value \n")
+    with pytest.raises(GitError) as error:
+        git.commit_integration_work(
+            git_repo, expected_head_sha=original, expected_merge_sha=None,
+            message="repair integration",
+        )
+    assert error.value.evidence["command"] == ["git", "diff", "--cached", "--check"]
+    assert error.value.evidence["head_sha"] == original
+    assert error.value.evidence["merge_head_sha"] is None
+    (git_repo / "data.csv").write_text("item,value\n")
+    committed = git.commit_integration_work(
+        git_repo, expected_head_sha=original, expected_merge_sha=None,
+        message="repair integration",
+    )
+    assert git.commit_parents(committed) == [original]
+    assert git.commit_integration_work(
+        git_repo, expected_head_sha=original, expected_merge_sha=None,
+        message="repair integration",
+    ) == committed
+    with pytest.raises(GitError, match="HEAD changed"):
+        git.commit_integration_work(
+            git_repo, expected_head_sha=original, expected_merge_sha=None,
+            message="other integration action",
+        )
+    assert git.commit_integration_work(
+        git_repo, expected_head_sha=committed, expected_merge_sha=None,
+        message="clean retry",
+    ) == committed
+
+
+def test_non_conflict_merge_failure_reports_original_hook_output(
+    git_repo: Path, tmp_path: Path,
+) -> None:
+    collaborator, git, publisher, _base = _collaboration(git_repo, tmp_path)
+    _git(git_repo, "checkout", "-b", "ticket")
+    candidate = _commit(git_repo, "agent.txt", "agent\n")
+    _git(collaborator, "checkout", "ticket")
+    source = _commit(collaborator, "human.txt", "human\n")
+    _git(collaborator, "push", "origin", "ticket")
+    _, target = publisher.live_branch_heads("ticket", "main")
+    git.fetch_remote_commit("ticket", source)
+    hook = git_repo / ".git/hooks/pre-merge-commit"
+    hook.write_text("#!/bin/sh\nprintf 'original stdout\n'\nprintf 'hook failed\n' >&2\nexit 1\n")
+    hook.chmod(0o700)
+    with pytest.raises(GitError) as error:
+        git.integrate_remote_heads(
+            git_repo, candidate_sha=candidate, source_sha=source, target_sha=target,
+        )
+    assert error.value.evidence["command"] == ["git", "merge", "--no-ff", "--no-edit", source]
+    # Git routes hook stdout to stderr; preserve the actual Git pipe outputs.
+    assert error.value.evidence["stdout"] == ""
+    assert "original stdout\n" in error.value.evidence["stderr"]
+    assert "hook failed\n" in error.value.evidence["stderr"]
+    assert error.value.evidence["head_sha"] == candidate
+    assert error.value.evidence["merge_head_sha"] is None
+    assert _git(git_repo, "status", "--porcelain") == ""

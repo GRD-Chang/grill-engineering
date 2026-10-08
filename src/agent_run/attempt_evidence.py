@@ -55,6 +55,12 @@ def _budget_facts_for_attempt(
                 "reviewer_invocations": stored_snapshot.get("reviewer_invocations"),
             }
         )
+    if isinstance(stored_snapshot, dict) and "integration_development_used" in stored_snapshot:
+        return {
+            "window": window,
+            "integration_development_used": stored_snapshot.get("integration_development_used"),
+            "integration_development_limit": stored_snapshot.get("integration_development_limit"),
+        }
     if policy_owner is None:
         return facts
     owner_subject, owner = policy_owner

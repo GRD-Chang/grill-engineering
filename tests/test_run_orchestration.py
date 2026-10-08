@@ -1850,7 +1850,10 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
     assert long_response not in history_text
 
 
-def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None:
+@pytest.mark.parametrize("commit_gate", [False, True], ids=["normal", "ticket-3-review-first"])
+def test_resume_selects_one_of_two_local_ticket_blockers(
+    git_repo: Path, commit_gate: bool,
+) -> None:
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket(2), "3": _ticket(3)}
     )
@@ -1867,13 +1870,31 @@ def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None
         idle_control=True,
     )
     run_id = stdout_json(started)["run_id"]
-    first = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(initial_agents))
+    if commit_gate:
+        from support.ticket_commit_gate import run_with_second_ticket_review_first
+
+        first = run_with_second_ticket_review_first(git_repo, fixture, run_id, initial_agents)
+    else:
+        first = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(initial_agents))
     assert first.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["status"] == "ready_for_human"
     assert {number: job["phase"] for number, job in state["ticket_jobs"].items()} == {
         "2": "blocked", "3": "blocked"
     }
+    # Review results belong to invocation order, not Ticket numbers. Program
+    # commit closeout can let Ticket 3 reach Review first even with one lease.
+    reviewer_threads = {
+        number: job["review_budget"]["review_artifacts"][-1]["reviewer_thread_id"]
+        for number, job in state["ticket_jobs"].items()
+    }
+    assert set(reviewer_threads.values()) == {"reviewer-2", "reviewer-3"}
+    if commit_gate:
+        assert reviewer_threads == {"2": "reviewer-3", "3": "reviewer-2"}
+    selected_thread = reviewer_threads["2"]
+    selected_review_count = state["ticket_jobs"]["2"]["review_budget"]["reviewer_invocations"]
+    assert selected_review_count == 1
+    sibling_before = deepcopy(state["ticket_jobs"]["3"])
     view = stdout_json(invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json"))
     assert {action["next_action"] for action in view["operator_actions"]} == {
         "agent-run resume 1 --repo example/project --ticket 2",
@@ -1901,8 +1922,8 @@ def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None
     resumed_agents = git_repo / "resumed-agents.json"
     resumed_agents.write_text(json.dumps({
         "reviews": [{
-            **passing_acceptance("reviewer-2", "Ticket 2 passed."),
-            "expected_thread_id": "reviewer-2",
+            **passing_acceptance(selected_thread, "Ticket 2 passed."),
+            "expected_thread_id": selected_thread,
         }],
         "publications": [_publication(2)],
     }), encoding="utf-8")
@@ -1912,8 +1933,15 @@ def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None
     )
     assert resumed.returncode == 2, (resumed.stdout, resumed.stderr)
     state = load_only_run_state(git_repo)
-    assert state["ticket_jobs"]["2"]["phase"] == "completed"
+    assert state["ticket_jobs"]["2"]["phase"] == "completed", (
+        state["ticket_jobs"]["2"].get("blocked_reason"),
+        state.get("diagnostics"), resumed.stdout, resumed.stderr,
+    )
     assert state["ticket_jobs"]["3"]["phase"] == "blocked"
+    assert state["ticket_jobs"]["3"] == sibling_before
+    resumed_review = state["ticket_jobs"]["2"]["review_budget"]
+    assert resumed_review["reviewer_invocations"] == selected_review_count
+    assert resumed_review["review_artifacts"][-1]["reviewer_thread_id"] == selected_thread
     assert state["ticket_integration_holder"] is None
 
 

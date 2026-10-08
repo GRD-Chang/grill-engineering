@@ -17,6 +17,7 @@ RESUME_AUDIT_KINDS = frozenset(
         "operator_stopped",
         "supervision_timeout",
         "integration_resync",
+        "integration_development",
         "publication_operation_retry",
     }
 )

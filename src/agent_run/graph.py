@@ -429,6 +429,7 @@ def _exhaustion_kind(
         "acceptance_record_mismatch",
         "merged_result_mismatch",
         "no_code_changes",
+        "integration_development_exhausted",
         "integration_resync_exhausted",
         "integration_conflict_unresolved",
         "integration_conflict_requires_human",

@@ -136,16 +136,26 @@ def allocate_semantic_attempt(
         **identity,
         "status": "pending",
     }
-    budget = review_budget_owner(subject).get("review_budget")
+    integration_budget = subject.get("integration_development_budget")
+    integration_work = (
+        role == "development" and work_subject.startswith("ticket:")
+        and isinstance(subject.get("integration_conflict"), dict)
+        and isinstance(integration_budget, dict)
+    )
+    budget = integration_budget if integration_work else review_budget_owner(subject).get("review_budget")
     if budget_window is not None and isinstance(budget, dict):
         # Capture only the bounded counters that were visible when this
         # Attempt was allocated. History must not later substitute the
         # owner's newer cumulative budget for this historical fact.
-        attempt["budget_snapshot"] = {
-            "window": budget_window,
-            "development_attempts": budget.get("development_attempts"),
-            "reviewer_invocations": budget.get("reviewer_invocations"),
-        }
+        attempt["budget_snapshot"] = (
+            {"window": budget_window, "integration_development_used": int(budget["used"]) + 1,
+             "integration_development_limit": budget.get("limit")}
+            if integration_work else {
+                "window": budget_window,
+                "development_attempts": budget.get("development_attempts"),
+                "reviewer_invocations": budget.get("reviewer_invocations"),
+            }
+        )
     subject["pending_semantic_attempt"] = attempt
     history = subject.setdefault("semantic_attempt_history", [])
     if not isinstance(history, list):

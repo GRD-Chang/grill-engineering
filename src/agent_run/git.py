@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from agent_run.git_errors import (
     GitIntegrityError as GitIntegrityError,
     MergeConflictError as MergeConflictError,
 )
+from agent_run.git_integration_operation import IntegrationGitOperation
 from agent_run.git_integration_commit import IntegrationRepairCommitGit
 from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
@@ -29,6 +31,7 @@ from agent_run.git_retirement import (
 )
 
 
+GIT_COMMAND_TIMEOUT_SECONDS = 30.0
 _worktree_registry_lock = RLock()
 
 
@@ -45,6 +48,7 @@ class GitIntegrationResult:
     conflict_paths: tuple[str, ...] = ()
     conflict_stage: Literal["source", "target"] | None = None
     merge_head_sha: str | None = None
+    failure_evidence: dict[str, Any] | None = field(default=None, compare=False)
 
 
 class GitRepository:
@@ -854,7 +858,11 @@ class GitRepository:
         if fetched.returncode != 0 or not self._commit_exists(expected_sha):
             raise GitError(
                 fetched.stderr.strip()
-                or f"could not fetch observed head {expected_sha} of {branch!r}"
+                or f"could not fetch observed head {expected_sha} of {branch!r}",
+                evidence={"operation": "fetch_remote_commit", "checkout": str(self.root),
+                          "command": list(fetched.args), "returncode": fetched.returncode,
+                          "stdout_json": json.dumps(fetched.stdout, ensure_ascii=False),
+                          "stderr_json": json.dumps(fetched.stderr, ensure_ascii=False)},
             )
         return expected_sha
 
@@ -871,97 +879,105 @@ class GitRepository:
         A real merge conflict is returned with Git's MERGE_HEAD and index left
         intact for a bounded repair. Other merge failures are aborted and raised.
         """
-        current_head = self.checkout_head(checkout)
-        status = self._run_in(
-            checkout, "status", "--porcelain=v1", "--untracked-files=all"
-        )
-        if status.returncode != 0:
-            raise GitError(
-                status.stderr.strip() or "could not inspect integration checkout"
+        with IntegrationGitOperation(self, checkout, "integrate_remote_heads") as operation:
+            current_head = self.checkout_head(checkout)
+            status = operation.run("status", "--porcelain=v1", "--untracked-files=all"
             )
-        merge_head = self._resolve_in_optional(checkout, "MERGE_HEAD")
-        source_already_merged = (
-            source_sha is not None
-            and self._is_mechanical_merge_commit(candidate_sha, source_sha, current_head)
-        )
-        if merge_head is not None:
-            if merge_head == source_sha and current_head == candidate_sha:
-                conflict_stage: Literal["source", "target"] = "source"
-            elif merge_head == target_sha and (
-                current_head == candidate_sha or source_already_merged
-            ):
-                conflict_stage = "target"
-            else:
-                raise GitError("integration checkout has an unexpected merge")
-            unmerged = self._run_in(
-                checkout, "diff", "--name-only", "--diff-filter=U", "-z"
-            )
-            if unmerged.returncode != 0 or not unmerged.stdout:
-                raise GitError("integration merge has no identifiable conflict")
-            return GitIntegrationResult(
-                status="conflict",
-                head_sha=current_head,
-                conflict_paths=tuple(
-                    path for path in unmerged.stdout.split("\0") if path
-                ),
-                conflict_stage=conflict_stage,
-                merge_head_sha=merge_head,
-            )
-        if status.stdout.strip():
-            raise GitError("integration checkout contains uncommitted work")
-        if current_head != candidate_sha and not source_already_merged:
-            parents = self.commit_parents(current_head)
-            first_parent = parents[0] if parents else ""
-            previous_source_merge = (
-                source_sha is not None
-                and self._is_mechanical_merge_commit(
-                    candidate_sha, source_sha, first_parent
+            if status.returncode != 0:
+                raise GitError(
+                    status.stderr.strip() or "could not inspect integration checkout"
                 )
-            )
-            if (
-                (first_parent == candidate_sha or previous_source_merge)
-                and self._is_mechanical_merge_commit(
-                    first_parent, target_sha, current_head
-                )
-            ):
-                return GitIntegrationResult(status="clean", head_sha=current_head)
-            raise GitError("integration checkout no longer matches its Candidate")
-        for stage, incoming in (("source", source_sha), ("target", target_sha)):
-            if incoming is None or self.is_ancestor(incoming, self.checkout_head(checkout)):
-                continue
-            if not self._commit_exists(incoming):
-                raise GitError(f"observed {stage} commit {incoming} is unavailable")
-            merged = self._run_in(checkout, "merge", "--no-ff", "--no-edit", incoming)
-            if merged.returncode == 0:
-                continue
-            unmerged = self._run_in(
-                checkout, "diff", "--name-only", "--diff-filter=U", "-z"
-            )
             merge_head = self._resolve_in_optional(checkout, "MERGE_HEAD")
-            if unmerged.returncode == 0 and unmerged.stdout and merge_head == incoming:
-                conflict_stage = "source" if stage == "source" else "target"
+            source_already_merged = (
+                source_sha is not None
+                and self._is_mechanical_merge_commit(candidate_sha, source_sha, current_head)
+            )
+            if merge_head is not None:
+                if merge_head == source_sha and current_head == candidate_sha:
+                    conflict_stage: Literal["source", "target"] = "source"
+                elif merge_head == target_sha and (
+                    current_head == candidate_sha or source_already_merged
+                ):
+                    conflict_stage = "target"
+                else:
+                    raise GitError("integration checkout has an unexpected merge")
+                unmerged = operation.run(
+                    "diff", "--name-only", "--diff-filter=U", "-z",
+                )
+                if unmerged.returncode != 0 or not unmerged.stdout:
+                    raise GitError("integration merge has no identifiable conflict")
                 return GitIntegrationResult(
                     status="conflict",
-                    head_sha=self.checkout_head(checkout),
+                    head_sha=current_head,
                     conflict_paths=tuple(
                         path for path in unmerged.stdout.split("\0") if path
                     ),
                     conflict_stage=conflict_stage,
-                    merge_head_sha=incoming,
+                    merge_head_sha=merge_head,
                 )
-            self._run_in(checkout, "merge", "--abort")
-            raise GitError(
-                merged.stderr.strip() or f"could not integrate observed {stage} head"
-            )
+            if status.stdout.strip():
+                raise GitError("integration checkout contains uncommitted work")
+            if current_head != candidate_sha and not source_already_merged:
+                parents = self.commit_parents(current_head)
+                first_parent = parents[0] if parents else ""
+                previous_source_merge = (
+                    source_sha is not None
+                    and self._is_mechanical_merge_commit(
+                        candidate_sha, source_sha, first_parent
+                    )
+                )
+                if (
+                    (first_parent == candidate_sha or previous_source_merge)
+                    and self._is_mechanical_merge_commit(
+                        first_parent, target_sha, current_head
+                    )
+                ):
+                    return GitIntegrationResult(status="clean", head_sha=current_head)
+                raise GitError("integration checkout no longer matches its Candidate")
+            for stage, incoming in (("source", source_sha), ("target", target_sha)):
+                if incoming is None or self.is_ancestor(incoming, self.checkout_head(checkout)):
+                    continue
+                if not self._commit_exists(incoming):
+                    raise GitError(f"observed {stage} commit {incoming} is unavailable")
+                merged = operation.run("merge", "--no-ff", "--no-edit", incoming)
+                failed_evidence = operation.command_evidence()
+                if merged.returncode == 0:
+                    continue
+                unmerged = operation.run(
+                    "diff", "--name-only", "--diff-filter=U", "-z",
+                )
+                merge_head = self._resolve_in_optional(checkout, "MERGE_HEAD")
+                if unmerged.returncode == 0 and unmerged.stdout and merge_head == incoming:
+                    conflict_stage = "source" if stage == "source" else "target"
+                    return GitIntegrationResult(
+                        status="conflict",
+                        head_sha=self.checkout_head(checkout),
+                        conflict_paths=tuple(
+                            path for path in unmerged.stdout.split("\0") if path
+                        ),
+                        conflict_stage=conflict_stage,
+                        merge_head_sha=incoming,
+                        failure_evidence={
+                            "operation": "integrate_remote_heads", "checkout": str(checkout),
+                            **failed_evidence,
+                            "stdout_json": json.dumps(merged.stdout, ensure_ascii=False),
+                            "stderr_json": json.dumps(merged.stderr, ensure_ascii=False),
+                        },
+                    )
+                operation.run("merge", "--abort")
+                operation.restore_command(failed_evidence)
+                raise GitError(
+                    merged.stderr.strip() or f"could not integrate observed {stage} head"
+                )
 
-        result = self.checkout_head(checkout)
-        if not self.is_ancestor(candidate_sha, result) or not self.is_ancestor(
-            target_sha, result
-        ):
-            raise GitError("integrated commit does not preserve Candidate and target")
-        if source_sha is not None and not self.is_ancestor(source_sha, result):
-            raise GitError("integrated commit does not preserve remote source")
-        return GitIntegrationResult(status="clean", head_sha=result)
+            result = self.checkout_head(checkout)
+            if not self.is_ancestor(candidate_sha, result) or not self.is_ancestor(
+                target_sha, result
+            ):
+                raise GitError("integrated commit does not preserve Candidate and target")
+            if source_sha is not None and not self.is_ancestor(source_sha, result):
+                raise GitError("integrated commit does not preserve remote source")
+            return GitIntegrationResult(status="clean", head_sha=result)
 
     def _is_mechanical_merge_commit(
         self, first_parent: str, incoming: str, commit: str
@@ -983,38 +999,102 @@ class GitRepository:
         message: str,
     ) -> str:
         """Commit an Agent-resolved merge only against its recorded parents."""
-        if self.checkout_head(checkout) != expected_head_sha or (
-            self._resolve_in_optional(checkout, "MERGE_HEAD") != expected_merge_sha
-        ):
-            raise GitError("integration conflict parents changed before resolution")
-        staged = self._run_in(checkout, "add", "--all")
-        if staged.returncode != 0:
-            raise GitError(
-                staged.stderr.strip() or "could not stage integration resolution"
-            )
-        unmerged = self._run_in(checkout, "ls-files", "-u")
-        if unmerged.returncode != 0:
-            raise GitError(
-                unmerged.stderr.strip() or "could not inspect conflict resolution"
-            )
-        if unmerged.stdout.strip():
-            raise GitError("integration conflict still has unresolved paths")
-        checked = self._run_in(checkout, "diff", "--cached", "--check")
-        if checked.returncode != 0:
-            raise GitError(
-                checked.stdout.strip()
-                or checked.stderr.strip()
-                or "integration resolution has invalid whitespace or conflict markers"
-            )
-        committed = self._run_in(checkout, "commit", "-m", message)
-        if committed.returncode != 0:
-            raise GitError(
-                committed.stderr.strip() or "could not commit integration resolution"
-            )
-        result = self.checkout_head(checkout)
-        if self.commit_parents(result) != [expected_head_sha, expected_merge_sha]:
-            raise GitError("integration resolution did not preserve both parents")
-        return result
+        with IntegrationGitOperation(self, checkout, "commit_integration_resolution") as operation:
+            if self.checkout_head(checkout) != expected_head_sha or (
+                self._resolve_in_optional(checkout, "MERGE_HEAD") != expected_merge_sha
+            ):
+                raise GitError("integration conflict parents changed before resolution")
+            staged = operation.run("add", "--all")
+            if staged.returncode != 0:
+                raise GitError(
+                    staged.stderr.strip() or "could not stage integration resolution"
+                )
+            unmerged = operation.run("ls-files", "-u")
+            if unmerged.returncode != 0:
+                raise GitError(
+                    unmerged.stderr.strip() or "could not inspect conflict resolution"
+                )
+            if unmerged.stdout.strip():
+                raise GitError("integration conflict still has unresolved paths")
+            checked = operation.run("diff", "--cached", "--check")
+            if checked.returncode != 0:
+                raise GitError(
+                    checked.stdout.strip()
+                    or checked.stderr.strip()
+                    or "integration resolution has invalid whitespace or conflict markers"
+                )
+            committed = operation.run("commit", "-m", message)
+            if committed.returncode != 0:
+                raise GitError(
+                    committed.stderr.strip() or "could not commit integration resolution"
+                )
+            result = self.checkout_head(checkout)
+            if self.commit_parents(result) != [expected_head_sha, expected_merge_sha]:
+                raise GitError("integration resolution did not preserve both parents")
+            return result
+
+    def commit_integration_work(
+        self, checkout: Path, *, expected_head_sha: str,
+        expected_merge_sha: str | None, message: str,
+    ) -> str:
+        """Validate and commit work against the exact recorded integration scene."""
+        with IntegrationGitOperation(self, checkout, "commit_integration_work") as operation:
+            head = self.checkout_head(checkout)
+            merge_head = self._resolve_in_optional(checkout, "MERGE_HEAD")
+            parents = [expected_head_sha]
+            if expected_merge_sha is not None:
+                parents.append(expected_merge_sha)
+            if head != expected_head_sha:
+                status = operation.run("status", "--porcelain=v1", "--untracked-files=all")
+                current_message = operation.run("cat-file", "commit", head)
+                if (
+                    merge_head is None and status.returncode == 0 and not status.stdout
+                    and self.commit_parents(head) == parents
+                    and current_message.returncode == 0
+                    and commit_messages_match(
+                        current_message.stdout.partition("\n\n")[2], message,
+                    )
+                ):
+                    # A matching commit may have been made while paused. Check
+                    # its actual delta; the clean index cannot prove it passed
+                    # the pre-commit checks before the state save was interrupted.
+                    checked = operation.run("diff", "--check", expected_head_sha, head)
+                    if checked.returncode != 0:
+                        raise GitError(
+                            checked.stdout.strip() or checked.stderr.strip()
+                            or "recovered integration work failed Git checks"
+                        )
+                    return head
+                raise GitError("integration work HEAD changed before commit")
+            if merge_head != expected_merge_sha:
+                raise GitError("integration work MERGE_HEAD changed before commit")
+            if expected_merge_sha is not None:
+                return self.commit_integration_resolution(
+                    checkout, expected_head_sha=expected_head_sha,
+                    expected_merge_sha=expected_merge_sha, message=message,
+                )
+            staged = operation.run("add", "--all")
+            if staged.returncode != 0:
+                raise GitError(staged.stderr.strip() or "could not stage integration work")
+            unmerged = operation.run("ls-files", "-u")
+            if unmerged.returncode != 0 or unmerged.stdout:
+                raise GitError(unmerged.stderr.strip() or "integration work has unresolved paths")
+            checked = operation.run("diff", "--cached", "--check")
+            if checked.returncode != 0:
+                raise GitError(checked.stdout.strip() or checked.stderr.strip()
+                               or "integration work failed Git checks")
+            dirty = operation.run("diff", "--cached", "--quiet")
+            if dirty.returncode == 0:
+                return head
+            if dirty.returncode != 1:
+                raise GitError(dirty.stderr.strip() or "could not inspect staged integration work")
+            committed = operation.run("commit", "-m", message)
+            if committed.returncode != 0:
+                raise GitError(committed.stderr.strip() or "could not commit integration work")
+            result = self.checkout_head(checkout)
+            if self.commit_parents(result) != parents:
+                raise GitError("integration work did not preserve its recorded parent")
+            return result
 
     def managed_checkout_dirty_reason(self, checkout: Path) -> str | None:
         """Describe unsaved work in a registered Managed Development Checkout."""
@@ -1152,8 +1232,13 @@ class GitRepository:
         return self._run_in(self.root, *arguments)
 
     def _run_in(
-        self, directory: Path, *arguments: str, input: str | None = None
+        self, directory: Path, *arguments: str, input: str | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # Also bound metadata and merge-tree calls made by helper methods;
+        # repository merge drivers can run during otherwise mechanical checks.
+        if timeout is None:
+            timeout = GIT_COMMAND_TIMEOUT_SECONDS
         # Recheck each dispatch, including later commands inside one public call.
         self._check_write_guard()
         if arguments and arguments[0] == "worktree":
@@ -1167,10 +1252,12 @@ class GitRepository:
                 self._check_write_guard()
                 return run_git(
                     ["git", *arguments], cwd=directory, input=input,
+                    **({"timeout": timeout} if timeout is not None else {}),
                     **runner_options(self.runner_identity),
                 )
         return run_git(
             ["git", *arguments], cwd=directory, input=input,
+            **({"timeout": timeout} if timeout is not None else {}),
             **runner_options(self.runner_identity),
         )
 

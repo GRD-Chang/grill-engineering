@@ -96,7 +96,7 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
         elif damage == "generation":
             job[{"ticket": "ticket_branch_generation", "parent_only": "parent_generation", "run_repair": "repair_generation"}[kind]] = 2
         elif damage == "budget":
-            job["review_budget"]["window"] = 2
+            job["integration_development_budget" if kind == "ticket" else "review_budget"]["window"] = 2
         else:
             state["active_agent_invocation"]["role"] = "publication"
         stage.save(state)

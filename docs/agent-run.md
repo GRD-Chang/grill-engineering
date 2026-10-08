@@ -574,3 +574,11 @@ Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer�
 `unsupported_scope_change`，不更新 active。进程在两张 Ticket 之间退出或失败时，下一次
 `run` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
 动作不会重复。没有可执行 Ticket 时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。
+
+### Ticket 集成 Development 循环
+
+Ticket 原开发—审核与规定上限后的末轮跳过保持原合同；取得有效审查或 fallback 凭据后进行本地集成，集成不另调用 Review。Git 合并、整理后的检查或提交失败携具体操作、准确 source/target/candidate、HEAD/MERGE_HEAD 和原始输出回到 Development；处理后程序重新检查、提交及集成，随后普通 PR/CI 合入 Run Branch。Agent 自述不能作为 Git 成功证据。
+
+`--ticket-integration-development-limit` 默认 3，为独立累计额度，包含冲突工作。新失败和远端追加不清零，重复读状态及同一 Semantic Attempt 的中断续接不额外扣费。耗尽时 `integration_development_exhausted` 保留工作树，`resume <run-id> --ticket <number>` 只追加对应集成额度并保留历史，不重置需求、CI 或 resync 额度；重复恢复不重复授权。`--new-thread` 使用完整集成 Prompt，现有 Human Blocker 的 `--message` 继续进入同一工作来源。更广暂停恢复准入仍沿用既有合同。
+
+status/history 区分需求开发与集成开发累计用量、额度窗口及语义工作。Git 机械操作限时 30 秒，超时保留现场和输出；工作使用原共享 Ticket Agent 名额与 FIFO，集成交付继续单席，正常 CI 等待不占 Agent 名额。新状态不迁移旧 Run。详见 [ADR 0020](adr/0020-ticket-integration-development-loop.md)。

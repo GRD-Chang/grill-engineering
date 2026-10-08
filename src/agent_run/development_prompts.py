@@ -16,6 +16,7 @@ from agent_run.prompt_context import (
 
 
 _REPAIR_SOURCES = {
+    "integration": ("integration_evidence", "Integration Development", "development/repair-integration"),
     "acceptance": (
         "acceptance_artifact",
         "Acceptance Repair",
@@ -52,7 +53,7 @@ def _repair_evidence(request: dict[str, Any]) -> str:
         raise ValueError(f"unknown repair_source: {source}")
     field, error_role, instruction = _REPAIR_SOURCES[source]
     evidence = request.get(field)
-    if source in {"human_revision", "merge_conflict"}:
+    if source in {"human_revision", "merge_conflict", "integration"}:
         if not isinstance(evidence, str) or not evidence.strip():
             raise ValueError(f"{error_role} requires {field}")
         raw = evidence

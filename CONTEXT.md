@@ -655,7 +655,7 @@ Publisher 推送 Publication Commit 后，Controller 确定性验证目标 PR �
 _Avoid_: Fresh Acceptance、GitHub PR Exact-Head Review Loop、智能代码判断
 
 **Ticket Remote Integration（Ticket 远端集成）**:
-Ticket 的 Development、暂停续接和 Fresh Acceptance 固定在当前 Job 的原始 base 与 Candidate；普通远端源分支或 Run Branch 追加不作废这些语义轮次。原 Candidate 获得 Acceptance Record 或 Fallback Publication Receipt 后，Controller 读取 live 源与目标 SHA，先机械集成双方成果，再以集成后的准确 tree 发布或更新原 PR；初始源 ref 与原 base 相同，不作为独立开发成果。集成记录同时保存原 base/Candidate/tree、远端源/目标、集成 head/tree 和冲突路径，供 Parent 验收区分原 Ticket 审查对象与后续组合。远端新快照使已发布 head 的检查和合并权限失效，但不自动恢复已暂停的 Job，也不凭机械组合伪造新的 Ticket Acceptance。只有真实 Git 冲突交给 Development Agent 在受管 checkout 解决并自测，不消耗需求 Development、Review 或 CI 修复额度；冲突仍未解决或有业务歧义时有界暂停。远端非追加历史改写保留现场并暂停；网络和执行错误与真实冲突分开处理。首次集成免费，其后默认最多自动同步三个外部新快照，额度随有效 Run Policy 固定；自己的发布、回读和重复操作不计数。额度耗尽仅由显式 `resume` 续期该额度。实际合入前复核 live 版本与集成记录，服务端最后瞬时竞争仍以准确 head 约束为准。
+Ticket 的 Development、暂停续接和 Fresh Acceptance 固定在当前 Job 的原始 base 与 Candidate；普通远端源分支或 Run Branch 追加不作废这些语义轮次。原 Candidate 获得 Acceptance Record 或 Fallback Publication Receipt 后，Controller 读取 live 源与目标 SHA，先机械集成双方成果，再以集成后的准确 tree 发布或更新原 PR；初始源 ref 与原 base 相同，不作为独立开发成果。集成记录同时保存原 base/Candidate/tree、远端源/目标、集成 head/tree 和冲突路径，供 Parent 验收区分原 Ticket 审查对象与后续组合。远端新快照使已发布 head 的检查和合并权限失效，但不自动恢复已暂停的 Job，也不凭机械组合伪造新的 Ticket Acceptance。集成中的真实 Git 失败与冲突以具体操作、命令、准确版本、现场及原始输出交给 Development，不按错误白名单筛选，也不增加行尾专项策略。处理后直接返回程序的 Git 检查、提交与集成，不新增 Review。集成 Development 使用独立累计额度 `ticket_integration_development_limit`（默认 3），冲突处理同样扣费；新失败、新快照不重置额度，状态重读及同语义中断续接不重复扣费。额度耗尽保留现场并暂停，显式 `resume` 仅追加此额度、保留累计用量和历史；无法继续时明确暂停。远端非追加历史改写和身份、权限门禁继续保留。首次集成免费，其后默认最多自动同步三个外部新快照，额度随有效 Run Policy 固定；自己的发布、回读和重复操作不计数。额度耗尽仅由显式 `resume` 续期该额度。实际合入前复核 live 版本与集成记录，服务端最后瞬时竞争仍以准确 head 约束为准。
 _Avoid_: 把远端推进变成 Ticket Reviewer 重审、把机械集成当语义验收、自动解除人工暂停、以旧 PR head 的检查授权新 head
 
 **Git Integrity Check（Git 完整性检查）**:
@@ -873,6 +873,6 @@ _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue
 
 首次集成免费；完成后的真实外部源/目标新增提交才消耗一次自动 resync 机会并开启新窗口。自身发布、回读、Reviewer 退回及 CI 失败不开户；默认最多三次自动 resync。额度耗尽时保留工作区、PR、有效验收及未耗尽预算，显式 resume 只续期该耗尽额度。集成记录绑定准确源、目标、候选、结果 head/tree 与冲突路径；非追加历史明确暂停。已发布源分支只追加提交，保持原 PR；当前结果的 Reviewer、Required Checks 与最终人工批准才可授权合入。状态协议不兼容时在外部写入前拒绝旧 Run，不做隐式迁移。
 
-Ticket、Parent-only 和 Run Repair 的纯冲突调用保留 `development / integration_conflict`，Job 保留其合法业务阶段。活动调用必须同时匹配当前 Job 归属、Generation、pending Semantic Agent Attempt、预算窗口和准确候选的冲突上下文；失败及恢复不放宽这些约束。completed 事件落盘后与业务收尾后的历史都可读取，已收尾历史不再要求活动 pending Attempt 或冲突现场。公开 resume 续接同一 Attempt 和适用线程，保留候选、有效验收、工作区成果及预算历史，不把冲突处理计为新一轮开发。Run 最终集成仍使用独立的 `run_integration_conflict` 语义。
+Ticket 集成 Development 以及 Parent-only 和 Run Repair 的纯冲突调用保留 `development / integration_conflict`，Job 保留其合法业务阶段。活动调用必须同时匹配当前 Job 归属、Generation、pending Semantic Agent Attempt、预算窗口和准确候选的冲突上下文；失败及恢复不放宽这些约束。completed 事件落盘后与业务收尾后的历史都可读取，已收尾历史不再要求活动 pending Attempt 或冲突现场。公开 resume 续接同一 Attempt 和适用线程，保留候选、有效验收、工作区成果及预算历史，不把冲突处理计为新一轮开发。Run 最终集成仍使用独立的 `run_integration_conflict` 语义。
 
 CI 恢复额度独立于上述需求与集成预算。每个对象默认最多三轮，每轮默认最多三次有实际代码工作的修复；同一失败 head 的回读不计轮。Ticket 首轮最多一次修复，允许以绑定旧已发布授权和准确失败证据的窄收据更新 PR；从第二轮开始须经 Reviewer。Parent-only 与多 Ticket Parent 的 CI 修复每轮均须 Reviewer。内层或外层耗尽均安全暂停，显式 resume 只续期耗尽层并保留其他预算与有效成果。

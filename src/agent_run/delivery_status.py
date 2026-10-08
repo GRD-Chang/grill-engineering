@@ -126,6 +126,7 @@ def status_progress_view(
         ),
         "run_repair": _run_repair_progress(audit.get("run_repair")),
         "integration_resync": audit.get("integration_resync"),
+        "integration_development": audit.get("integration_development"),
         "ci_recovery": audit.get("ci_recovery"),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
@@ -234,6 +235,11 @@ def print_status_progress(
         print(display_text('presentation.status.nexecution_allowance'))
         for line in _round_details(rounds):
             print(f"  {_terminal_safe(line)}")
+    integration = view.get("integration_development")
+    if isinstance(integration, dict):
+        print(display_text("presentation.status.integration_development_usage",
+                           used=integration.get("used"), limit=integration.get("limit"),
+                           window=integration.get("window")))
     resync = view.get("integration_resync")
     if isinstance(resync, dict):
         print(display_text('presentation.status.integration_resync_usage',
@@ -441,6 +447,12 @@ def print_rich_status_progress(
     rounds = view.get("round_progress")
     if isinstance(rounds, dict) and state.get("status") != "completed":
         add_identity(display_text('presentation.status.execution_allowance'), "；".join(_round_details(rounds)))
+    integration = view.get("integration_development")
+    if isinstance(integration, dict):
+        add_identity(display_text("presentation.status.integration_development_label"),
+                     display_text("presentation.status.integration_development_usage",
+                                  used=integration.get("used"), limit=integration.get("limit"),
+                                  window=integration.get("window")))
     resync = view.get("integration_resync")
     if isinstance(resync, dict):
         add_identity(display_text('presentation.status.integration_resync_label'),
@@ -884,6 +896,7 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
                 ("验收", "review", "reviewer_invocations", "review_limit"),
                 ("CI 轮次", "CI rounds", "ci_rounds_used", "ci_rounds_limit"),
                 ("CI 修复", "CI repairs", "ci_repairs_used", "ci_repairs_limit"),
+                ("集成开发", "integration development", "integration_development_used", "integration_development_limit"),
                 ("同步", "resync", "integration_resync_used", "integration_resync_limit"),
             )
             parts.append(" / ".join(

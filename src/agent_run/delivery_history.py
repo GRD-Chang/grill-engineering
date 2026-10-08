@@ -539,6 +539,12 @@ def _budget_line(record: dict[str, Any]) -> str:
         return _copy('presentation.history.used_at_round_start_development_count_not_recorded_acceptance_cou')
     window = facts.get("window")
     window_text = window if isinstance(window, int) else _copy('presentation.history.not_recorded')
+    if "integration_development_used" in facts:
+        return _copy(
+            "presentation.history.integration_development_usage",
+            window=window_text, used=facts.get("integration_development_used"),
+            limit=facts.get("integration_development_limit"),
+        )
     development = _budget_fraction(
         facts.get("development_attempts"), facts.get("development_limit")
     )

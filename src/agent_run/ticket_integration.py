@@ -2,19 +2,10 @@ from __future__ import annotations
 
 """Ticket delivery integration after fixed-base Development and Review."""
 
-import json
 from pathlib import Path
 from typing import Any
 
-from agent_run.agents import HumanBlockerResult
-from agent_run.artifacts import clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
-from agent_run.change_delivery_threads import (
-    record_development_thread,
-    require_development_thread,
-    select_development_thread,
-)
-from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.git import GitError
 from agent_run.integration_resync_budget import (
     ResyncBudgetExhausted,
@@ -22,7 +13,6 @@ from agent_run.integration_resync_budget import (
     observe_integration_snapshot,
 )
 from agent_run.semantic_attempt import (
-    allocate_semantic_attempt,
     close_semantic_attempt,
     detach_active_invocation,
     pending_semantic_attempt,
@@ -173,8 +163,12 @@ def _observe(stage: ChangeDeliveryStage, job: dict[str, Any]) -> tuple[str, str]
     if source is None:
         raise GitError("Ticket source ref disappeared before integration")
     # Exact objects, not local tracking refs, are the only merge inputs.
-    stage.git.fetch_remote_commit(stage.contract.branch, source)
-    stage.git.fetch_remote_commit(stage.contract.base_branch, target)
+    try:
+        stage.git.fetch_remote_commit(stage.contract.branch, source)
+        stage.git.fetch_remote_commit(stage.contract.base_branch, target)
+    except GitError as error:
+        error.evidence.update(source_sha=source, target_sha=target)
+        raise
     old = job.get("ticket_integration")
     conflict = job.get("integration_conflict")
     old_source = (
@@ -205,6 +199,15 @@ def prepare_ticket_integration(
 ) -> bool:
     """Return True only when one exact live snapshot has been integrated."""
 
+    while True:
+        ready = _prepare_ticket_integration_once(stage, state, job, checkout)
+        if ready is not None:
+            return ready
+
+
+def _prepare_ticket_integration_once(
+    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+) -> bool | None:
     try:
         source, target = _observe(stage, job)
     except HistoryRewritten as error:
@@ -215,6 +218,23 @@ def prepare_ticket_integration(
         }
         _pause(stage, state, job, "integration_history_rewritten", str(error))
         return False
+    except GitError as error:
+        observed_source = error.evidence.get("source_sha")
+        observed_target = error.evidence.get("target_sha")
+        if not isinstance(observed_source, str) or not isinstance(observed_target, str):
+            # No reliable snapshot or executable scene can be handed to work.
+            raise
+        source, target = observed_source, observed_target
+        from agent_run.integration_development import failure_scene
+        existing = job.get("integration_conflict")
+        if not isinstance(existing, dict) or "resolution_sha" in existing:
+            job["integration_conflict"] = failure_scene(
+                stage, job, checkout, error, source=source, target=target, paths=[],
+            )
+            stage.save(state)
+        if not _resolve_conflict(stage, state, job, checkout):
+            return False
+        return None
     pending_conflict = job.get("integration_conflict")
     if isinstance(pending_conflict, dict):
         # Finish the recorded conflict scene first. A newer append is picked
@@ -266,63 +286,40 @@ def prepare_ticket_integration(
         if isinstance(prior, dict) and prior.get("candidate_sha") == job.get("candidate_sha")
         else []
     )
-    resolved_stages: set[str] = set()
-    if isinstance(pending_conflict, dict):
-        if (
-            pending_conflict.get("source_sha") != source
-            or pending_conflict.get("target_sha") != target
-            or pending_conflict.get("candidate_sha") != job.get("candidate_sha")
-        ):
-            _pause(
-                stage, state, job, "integration_snapshot_changed_during_conflict",
-                "Remote snapshot changed while Ticket conflict resolution was pending",
-            )
-            return False
-        conflict_paths = list(pending_conflict.get("prior_paths", []))
-        conflict_paths.extend(path for path in pending_conflict["paths"] if path not in conflict_paths)
-        resolved_stages = set(pending_conflict.get("prior_stages", []))
-        if not _resolve_conflict(stage, state, job, checkout):
-            return False
-        resolved_stages.add(str(pending_conflict["stage"]))
-        result = stage.git.integrate_remote_heads(
-            checkout, candidate_sha=stage.git.checkout_head(checkout),
-            source_sha=source, target_sha=target,
-        )
-    else:
+    if not isinstance(pending_conflict, dict):
         if stage.git.checkout_head(checkout) != start:
             stage.git.seed_managed_checkout(checkout, expected_head=start)
-        result = stage.git.integrate_remote_heads(
-            checkout, candidate_sha=start, source_sha=source, target_sha=target
-        )
-    while result.status == "conflict":
-        if result.conflict_stage in resolved_stages or len(resolved_stages) >= 2:
-            _pause(stage, state, job, "integration_conflict_unresolved", "Ticket integration still conflicts")
-            return False
+    while True:
+        scene = job.get("integration_conflict")
+        if isinstance(scene, dict):
+            conflict_paths.extend(path for path in scene["paths"] if path not in conflict_paths)
+            if not _resolve_conflict(stage, state, job, checkout):
+                return False
+            start = stage.git.checkout_head(checkout)
+        try:
+            result = stage.git.integrate_remote_heads(
+                checkout, candidate_sha=start, source_sha=source, target_sha=target,
+            )
+        except GitError as error:
+            from agent_run.integration_development import failure_scene
+            job["integration_conflict"] = failure_scene(
+                stage, job, checkout, error, source=source, target=target,
+                paths=conflict_paths,
+            )
+            stage.save(state)
+            continue
+        if result.status != "conflict":
+            break
         job["integration_conflict"] = {
-            "source_sha": source,
-            "target_sha": target,
+            "source_sha": source, "target_sha": target,
             "candidate_sha": str(job["candidate_sha"]),
-            "stage": result.conflict_stage,
-            "head_sha": result.head_sha,
+            "stage": result.conflict_stage, "head_sha": result.head_sha,
             "merge_head_sha": result.merge_head_sha,
-            "paths": list(result.conflict_paths),
-            "prior_paths": list(conflict_paths),
-            "prior_stages": sorted(resolved_stages),
+            "paths": list(result.conflict_paths), "prior_paths": list(conflict_paths),
             "attempts": 0,
+            "failure": result.failure_evidence,
         }
         stage.save(state)
-        if not _resolve_conflict(stage, state, job, checkout):
-            return False
-        for path in result.conflict_paths:
-            if path not in conflict_paths:
-                conflict_paths.append(path)
-        resolved_stages.add(str(result.conflict_stage))
-        result = stage.git.integrate_remote_heads(
-            checkout,
-            candidate_sha=stage.git.checkout_head(checkout),
-            source_sha=source,
-            target_sha=target,
-        )
     record = {
         "base_sha": str(job["base_sha"]),
         "candidate_sha": str(job["candidate_sha"]),
@@ -343,87 +340,5 @@ def prepare_ticket_integration(
 
 
 def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-    conflict = job["integration_conflict"]
-    existing_attempt = pending_semantic_attempt(job, role="development")
-    if conflict["attempts"] >= 1 and existing_attempt is None and "development_summary" not in conflict:
-        _pause(stage, state, job, "integration_conflict_unresolved", "Ticket conflict resolution already attempted")
-        return False
-    if "development_summary" not in conflict:
-        stage.require_agent_work("integration_conflict")
-    conflict["attempts"] = 1
-    select_development_thread(state, job, new_attempt=existing_attempt is None)
-    conflict_input = {
-        "repair_source": "merge_conflict",
-        "merge_conflict_evidence": json.dumps(conflict, ensure_ascii=False, sort_keys=True, indent=2),
-    }
-    # Select this invocation's evidence before the adapter reads historical repair input.
-    request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
-    request.update({**conflict_input, "_prompt_resources": state["prompt_resources"]})
-    work_subject, generation = stage.adapter.invocation_identity(state, job)
-    if existing_attempt is None:
-        job["integration_conflict_agent_ordinal"] = max(
-            int(job.get("modification_attempts", 0)),
-            int(job.get("integration_conflict_agent_ordinal", 0)),
-        ) + 1
-    attempt = allocate_semantic_attempt(
-        job, role="development", work_subject=work_subject, generation=generation,
-        currentness_boundary=stage._invocation_boundary(job),
-        ordinal=int(job["integration_conflict_agent_ordinal"]),
-        budget_window=int(job["review_budget"]["window"]),
-    )
-    request["_invocation_event"] = stage._invocation_events(
-        state, job, request, role="development", phase="integration_conflict",
-        semantic_attempt=attempt,
-    )
-    request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
-    if job.get("development_new_thread") is True:
-        request["_invocation_mode"] = "new-thread"
-    elif job.get("development_failure_resume") is True:
-        request["_invocation_mode"] = "resume"
-    stage.save(state)
-    if "development_summary" not in conflict:
-        try:
-            result = stage.agents.develop(request)
-        finally:
-            stage.release_agent_work()
-        require_development_thread(job, result.thread_id, requested_thread=request.get("thread_id"))
-        clear_initial_credential_wait(state, work_subject=stage.contract.label)
-        if not stage.adapter.development_thread_is_allowed(state, result.thread_id):
-            raise ValueError("Change Job Development Thread is not independent")
-        record_development_thread(job, result.thread_id, result.replaced_thread_id)
-        job.pop("development_new_thread", None)
-        job.pop("development_failure_resume", None)
-        if isinstance(result, HumanBlockerResult):
-            stage._wait_for_human(
-                state, job,
-                phase="candidate" if job.get("attempt_kind") == "ci_repair" else "accepted",
-                blockers=result.human_blockers,
-                code="agent_requires_human",
-            )
-            return False
-        if not isinstance(result.summary, str) or not result.summary.strip():
-            _pause(stage, state, job, "integration_conflict_unresolved", "Conflict Agent returned no result")
-            return False
-        conflict["development_summary"] = result.summary
-        clear_current_human_blocker(job)
-        stage.save(state)
-        stage._reject_stale(
-            state, job, checkout,
-            "Ticket conflict resolution was discarded after requirements changed",
-        )
-    resolved = stage.git.checkout_head(checkout)
-    if stage.git.commit_parents(resolved) != [conflict["head_sha"], conflict["merge_head_sha"]]:
-        try:
-            resolved = stage.git.commit_integration_resolution(
-                checkout,
-                expected_head_sha=str(conflict["head_sha"]),
-                expected_merge_sha=str(conflict["merge_head_sha"]),
-                message=f"chore(ticket-{job['ticket_number']}): resolve integration conflict",
-            )
-        except GitError as error:
-            _pause(stage, state, job, "integration_conflict_unresolved", str(error))
-            return False
-    close_semantic_attempt(job, attempt, outcome="integration_conflict_resolved", result={"development_summary": conflict["development_summary"]})
-    conflict["resolution_sha"] = resolved
-    stage.save(state)
-    return True
+    from agent_run.integration_development import resolve_integration_work
+    return resolve_integration_work(stage, state, job, checkout)

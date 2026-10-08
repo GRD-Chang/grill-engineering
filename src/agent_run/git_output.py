@@ -5,6 +5,7 @@ import selectors
 import shutil
 import signal
 import subprocess
+import time
 from functools import lru_cache
 from collections.abc import Mapping
 from typing import Any
@@ -47,6 +48,7 @@ def git_environment() -> dict[str, str]:
 def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None,
     runner_identity: Mapping[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drain both pipes; never return a truncated patch or other Git result."""
     if input is not None and len(input) > MAX_GIT_OUTPUT_BYTES:
@@ -65,6 +67,7 @@ def run_git(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         env=environment,
     )
+    deadline = time.monotonic() + timeout if timeout is not None else None
     stdout, stderr = bytearray(), bytearray()
     overflow = {"stdout": False, "stderr": False}
     streams = [process.stdout, process.stderr, process.stdin]
@@ -82,6 +85,16 @@ def run_git(
                     process.stdin.close()
             offset = 0
             while selector.get_map():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise GitError(
+                        f"Git command timed out after {timeout:g} seconds",
+                        evidence={
+                            "command": arguments, "returncode": None,
+                            "stdout": stdout.decode("utf-8", errors="replace"),
+                            "stderr": stderr.decode("utf-8", errors="replace"),
+                            "timeout_seconds": timeout,
+                        },
+                    )
                 for key, _ in selector.select(timeout=0.1):
                     if key.data == "stdin":
                         try:
@@ -106,7 +119,17 @@ def run_git(
                 if process.poll() is not None:
                     # Hooks must not leave descendants holding our output pipes open.
                     _kill_group(process.pid)
-            returncode = process.wait()
+            try:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as timeout_error:
+                raise GitError(
+                    f"Git command timed out after {timeout:g} seconds",
+                    evidence={"command": arguments, "returncode": None,
+                              "stdout": stdout.decode("utf-8", errors="replace"),
+                              "stderr": stderr.decode("utf-8", errors="replace"),
+                              "timeout_seconds": timeout},
+                ) from timeout_error
     finally:
         _kill_group(process.pid)
         process.wait()

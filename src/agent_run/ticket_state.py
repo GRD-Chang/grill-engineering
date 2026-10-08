@@ -210,8 +210,15 @@ class TicketState:
             else:
                 state["ticket_agent_invocations"].pop(number, None)
             self._last_holder = latest["ticket_integration_holder"]
-            self._last_job = deepcopy(latest["ticket_jobs"][number])
-            self._last_invocation = deepcopy(invocation) if isinstance(invocation, dict) else None
+            # Persistence normalizes diagnostic payloads (including Git control
+            # characters). Compare subsequent writes with the durable baseline,
+            # rather than the unsanitized in-memory payload we just saved.
+            from agent_run.state import _sanitize_durable_errors
+            baseline = _sanitize_durable_errors({
+                "job": latest["ticket_jobs"][number], "invocation": invocation,
+            })
+            self._last_job = baseline["job"]
+            self._last_invocation = baseline["invocation"] if isinstance(invocation, dict) else None
 
         self.states._commit_run(commit)
 

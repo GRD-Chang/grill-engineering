@@ -137,6 +137,7 @@ def multi_ticket_progress(
         review = job_data.get("review_budget")
         ci = job_data.get("ci_recovery")
         resync = job_data.get("integration_resync")
+        integration = job_data.get("integration_development_budget")
         job_policy = job_data.get("policy_snapshot")
         policy = job_policy if isinstance(job_policy, dict) else state.get("policy_snapshot")
         policy_data = policy if isinstance(policy, dict) else {}
@@ -153,6 +154,8 @@ def multi_ticket_progress(
                 policy_data.get("ci_repairs_per_round")
                 if isinstance(ci, dict) and ci.get("review_required") is True else 1
             ),
+            "integration_development_used": integration.get("used") if isinstance(integration, dict) else None,
+            "integration_development_limit": integration.get("limit") if isinstance(integration, dict) else policy_data.get("ticket_integration_development_limit"),
             "integration_resync_used": resync.get("used") if isinstance(resync, dict) else None,
             "integration_resync_limit": resync.get("limit") if isinstance(resync, dict) else policy_data.get("integration_resync_limit"),
         }
@@ -168,6 +171,7 @@ def multi_ticket_progress(
                 "agent_requires_human", "reviewer_requires_human",
                 "modification_budget_exhausted", "review_budget_exhausted",
                 "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+                "integration_development_exhausted",
                 "integration_resync_exhausted",
                 "ticket_execution_failed", "ticket_supervision_timeout",
                 "ticket_paused",

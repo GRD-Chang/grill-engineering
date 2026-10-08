@@ -63,6 +63,11 @@ def bind_resume_intent(
         for location, subject in gates
         if subject.get("blocked_reason") == "integration_resync_exhausted"
     ]
+    integration_development = [
+        (location, subject) for location, subject in gates
+        if location.startswith("ticket:")
+        and subject.get("blocked_reason") == "integration_development_exhausted"
+    ]
     ci_recovery = [
         (location, subject)
         for location, subject in gates
@@ -92,17 +97,17 @@ def bind_resume_intent(
         and subject.get("blocked_reason") == "ticket_paused"
     ]
     if ticket_number is not None and not any(
-        (checkpoints, human, resync, ci_recovery, publication_retry,
+        (checkpoints, human, resync, integration_development, ci_recovery, publication_retry,
          ticket_failure, ticket_pause)
     ):
         raise ResumeIntentError("指定 Ticket 没有受支持的局部恢复边界")
     if (
         len(checkpoints) > 1 or len(human) > 1 or len(resync) > 1
-        or len(ci_recovery) > 1 or len(publication_retry) > 1
+        or len(integration_development) > 1 or len(ci_recovery) > 1 or len(publication_retry) > 1
         or len(ticket_failure) > 1
         or len(ticket_pause) > 1
         or sum(bool(group) for group in (
-            checkpoints, human, resync, ci_recovery, publication_retry,
+            checkpoints, human, resync, integration_development, ci_recovery, publication_retry,
             ticket_failure, ticket_pause,
         )) > 1
     ):
@@ -116,6 +121,9 @@ def bind_resume_intent(
     elif resync:
         reason, authorization = "integration_resync", "renew_integration_resync"
         subjects = resync
+    elif integration_development:
+        reason, authorization = "integration_development", "renew_integration_development"
+        subjects = integration_development
     elif ci_recovery:
         reason, authorization = "ci_recovery", "renew_ci_recovery"
         subjects = ci_recovery
@@ -218,7 +226,7 @@ def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
                 "candidate_sha", "phase", "blocked_reason", "human_blockers",
                 "ticket_branch_generation", "pause_resume_phase",
                 "execution_resume_phase", "last_ticket_resume",
-                "pending_semantic_attempt", "integration_resync",
+                "pending_semantic_attempt", "integration_resync", "integration_development_budget",
                 "ci_recovery", "publication_operation_retry",
             )
         },

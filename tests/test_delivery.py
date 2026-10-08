@@ -2556,7 +2556,7 @@ def test_ticket_ci_conflict_human_resume_returns_to_candidate(
         conflict_calls = 0
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult | HumanBlockerResult:
-            if request.get("repair_source") == "merge_conflict":
+            if request.get("repair_source") == "integration":
                 assert "acceptance_artifact" not in request
                 assert "ci_evidence" not in request
                 self.conflict_calls += 1
@@ -5027,7 +5027,7 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
             return super().review(request)
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if request.get("repair_source") == "merge_conflict":
+            if request.get("repair_source") == "integration":
                 event = request["_invocation_event"]
                 event("started", requested_thread_id="development-thread-1", attempt_count=1)
                 event("thread_started", reported_thread_id="development-thread-1")
@@ -5041,8 +5041,8 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
                     assert active["repair_source"] == "acceptance"
                     assert "acceptance_artifact" not in active
                     self.fallback_receipt = deepcopy(active["fallback_publication_receipt"])
-                assert isinstance(request["merge_conflict_evidence"], str)
-                assert '"source_sha"' in request["merge_conflict_evidence"]
+                assert isinstance(request["integration_evidence"], str)
+                assert '"source_sha"' in request["integration_evidence"]
                 (checkout / "delivered.txt").write_text(
                     expected_content, encoding="utf-8"
                 )
@@ -5110,7 +5110,7 @@ def test_ticket_resolves_source_and_target_conflicts_in_one_integration(
         conflict_calls = 0
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if request.get("repair_source") == "merge_conflict":
+            if request.get("repair_source") == "integration":
                 self.conflict_calls += 1
                 assert self.conflict_calls <= 2
                 (checkout / "delivered.txt").write_text(
