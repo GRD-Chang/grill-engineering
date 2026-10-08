@@ -211,3 +211,27 @@ def test_budget_window_override_preserves_frozen_thread_policy() -> None:
     )
     assert renewed.development_thread_policy == "new-per-attempt"
     assert renewed.ticket_review_rounds == 5
+
+
+def test_ticket_ci_policy_defaults_overrides_and_frozen_snapshot() -> None:
+    policy = resolve_delivery_policy()
+    assert policy.ticket_ci_development_limit == 3
+    assert policy.ticket_ci_review is False
+    configured = resolve_delivery_policy(
+        user_defaults={"ticket_ci_development_limit": 7, "ticket_ci_review": True},
+        command_overrides={"ticket_ci_review": False},
+    )
+    assert configured.ticket_ci_review is False
+    assert parse_policy_snapshot(configured.snapshot()).ticket_ci_development_limit == 7
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.2, "3"])
+def test_ticket_ci_development_limit_rejects_nonpositive_or_noninteger(invalid: object) -> None:
+    with pytest.raises(DeliveryPolicyError):
+        resolve_delivery_policy(command_overrides={"ticket_ci_development_limit": invalid})
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "true"])
+def test_ticket_ci_review_requires_boolean(invalid: object) -> None:
+    with pytest.raises(DeliveryPolicyError):
+        resolve_delivery_policy(user_defaults={"ticket_ci_review": invalid})

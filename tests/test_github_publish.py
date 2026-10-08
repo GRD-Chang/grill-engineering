@@ -99,8 +99,12 @@ def test_real_publisher_applies_repository_owned_check_repairability(
         },
     )
 
+    monkeypatch.setattr(publisher, "_run", lambda *args, **kwargs: subprocess.CompletedProcess(
+        args, 0, stdout="RAW_ACTIONS_LOG", stderr="",
+    ))
     evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
+    assert evidence["checks"][0]["logs"] == "RAW_ACTIONS_LOG"
     assert evidence["checks"][0]["repairability"] == "code_failure"
     assert is_explicitly_repairable_code_failure(evidence) is True
 
@@ -164,6 +168,9 @@ def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable
         },
     )
 
+    monkeypatch.setattr(publisher, "_run", lambda *args, **kwargs: subprocess.CompletedProcess(
+        args, 0, stdout="RAW_ACTIONS_LOG", stderr="",
+    ))
     evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
     assert "repairability" not in evidence["checks"][0]
@@ -2685,3 +2692,46 @@ def _remote_head(repository: Path, branch: str) -> str:
         check=True,
     ).stdout
     return output.split()[0]
+
+
+@pytest.mark.parametrize("log_exit", [0, 1])
+def test_ci_evidence_collects_available_raw_logs_without_classification_gate(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, log_exit: int,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_checks", lambda *args: [{
+        "workflow": "new-workflow", "name": "runner", "bucket": "fail",
+        "link": "https://github.com/example/project/actions/runs/22/job/33",
+    }])
+    monkeypatch.setattr(publisher, "_json", lambda *args: {
+        "id": 33, "head_sha": "failed-head", "status": "completed", "conclusion": "failure",
+    })
+    calls = []
+
+    def read_logs(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, log_exit, stdout="raw log\n" * 10000, stderr="logs expired")
+
+    monkeypatch.setattr(publisher, "_run", read_logs)
+    check = publisher.required_check_evidence(12, expected_head_sha="failed-head")["checks"][0]
+    assert calls == [("api", "repos/example/project/actions/jobs/33/logs")]
+    assert "repairability" not in check
+    if log_exit == 0:
+        assert check["logs"] == ("raw log\n" * 10000)[:65536]
+        assert check["logs_truncated"] is True
+    else:
+        assert check["logs_unavailable"] == "logs expired"
+
+
+@pytest.mark.parametrize("head,status", [("other-head", "completed"), ("failed-head", "in_progress")])
+def test_ci_evidence_waits_for_the_exact_completed_job(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, head: str, status: str,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_checks", lambda *args: [{
+        "bucket": "fail", "link": "https://github.com/example/project/actions/runs/22/job/33",
+    }])
+    monkeypatch.setattr(publisher, "_json", lambda *args: {"id": 33, "head_sha": head, "status": status})
+    with pytest.raises(GitHubReadError) as failure:
+        publisher.required_check_evidence(12, expected_head_sha="failed-head")
+    assert failure.value.code == "github_check_evidence_observation_pending"

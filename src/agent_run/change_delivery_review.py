@@ -26,7 +26,6 @@ from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import reviewer_budget_context
 from agent_run.semantic_attempt import pending_semantic_attempt
-from agent_run.ticket_integration import delivery_base_sha
 
 
 def review(
@@ -50,7 +49,11 @@ def review(
         work_subject=work_subject,
         generation=generation,
         boundary=stage._invocation_boundary(job),
-        budget_window=int(budget["window"]),
+        budget_window=int(
+            job["ci_recovery"]["window"]
+            if job.get("attempt_kind") == "ci_repair" and stage.contract.label.startswith("ticket-")
+            else budget["window"]
+        ),
     )
     stage._sync_attempts(state, job)
     stage.save(state)
@@ -66,6 +69,11 @@ def review(
                 if isinstance(previous, dict):
                     request["previous_acceptance_artifact"] = previous.get("artifact")
                     request["previous_review_identity"] = previous.get("review_identity")
+        if stage.contract.label.startswith("ticket-") and job.get("attempt_kind") == "ci_repair":
+            request["ci_evidence"] = deepcopy(job.get("ci_evidence"))
+            request["ci_failure_context"] = deepcopy(job.get("required_checks_origin"))
+            request["attempt_kind"] = "ci_repair"
+            request["work_source"] = "ci"
         request["_prompt_resources"] = state["prompt_resources"]
         if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
             request.pop("review_budget_context", None)
@@ -156,11 +164,12 @@ def complete_review(
     # A new valid Acceptance Artifact supersedes any earlier Required-Checks
     # repair input when it is itself an Acceptance Repair.  A passing review
     # after CI repair still needs the exact CI failure as Publication context;
-    # a later failed Acceptance Repair must clear it before its next Worker.
-    if not artifact.is_accepted:
+    # Ticket CI findings retain that original failure for the next CI Worker.
+    ticket_ci = stage.contract.label.startswith("ticket-") and job.get("attempt_kind") == "ci_repair"
+    if not artifact.is_accepted and not ticket_ci:
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
-    elif previous_repair_source != "required_checks":
+    elif not ticket_ci and previous_repair_source != "required_checks":
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
     clear_required_checks_observation(job)
@@ -172,12 +181,7 @@ def complete_review(
     review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
         candidate_sha = str(job["candidate_sha"])
-        reviewed_base_sha = (
-            delivery_base_sha(job)
-            if stage.contract.label.startswith("ticket-")
-            and job.get("attempt_kind") == "ci_repair"
-            else str(job["base_sha"])
-        )
+        reviewed_base_sha = str(job["base_sha"])
         if isinstance(job.get("default_base_sha"), str):
             review_identity = {
                 "run_base_sha": str(job["base_sha"]),
@@ -253,7 +257,10 @@ def complete_review(
             state, job, decision.value,
             "Review budget is exhausted and the current Candidate still needs modification",
         )
-    elif decision in {ReviewDecision.CI_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
+    elif decision in {
+        ReviewDecision.CI_EXHAUSTED, ReviewDecision.TICKET_CI_EXHAUSTED,
+        ReviewDecision.DEVELOPMENT_EXHAUSTED,
+    }:
         job.update({"phase": "escalating", "escalation_code": decision.value})
     else:
         job["phase"] = "repairing"

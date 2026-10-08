@@ -1437,7 +1437,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
                     "log": "Preserve this exact CI evidence.",
                 },
             },
-            "下列检查失败对应当前提交",
+            "准确失败版本的 CI 问题",
             "Preserve this exact CI evidence.",
         ),
     ],

@@ -67,7 +67,8 @@ def ticket_run(
     git_repo: Path, numbers: tuple[int, ...],
     *, blocked_by: dict[int, list[int]] | None = None,
     workers: int = 3,
-    ci_repairs_per_round: int = 3,
+    ticket_ci_development_limit: int = 3,
+    ticket_ci_review: bool = False,
 ) -> tuple[dict[str, Any], StateStore, GitRepository, Path]:
     fixture = write_fixture(git_repo / "github.json", issues={
         str(number): {
@@ -89,7 +90,8 @@ def ticket_run(
         FixtureGitHubReader(fixture), git, states,
         delivery_policy=DeliveryPolicy(
             ticket_development_workers=workers,
-            ci_repairs_per_round=ci_repairs_per_round,
+            ticket_ci_development_limit=ticket_ci_development_limit,
+            ticket_ci_review=ticket_ci_review,
         ),
     )
     state, _ = controller.start(1)

@@ -184,11 +184,7 @@ def _require_deterministic_integration_record(
             f"incompatible_run_state: {location}.ticket_integration does not match delivery"
         )
     original_record = dict(record)
-    original_record["base_sha"] = (
-        ticket_integration["target_sha"]
-        if source == "accepted" and promoted_ci_integration
-        else ticket_integration["base_sha"]
-    )
+    original_record["base_sha"] = ticket_integration["base_sha"]
     if source == "accepted":
         require_completed_accepted_ticket_authorization(
             completed_job, authorization, original_record, location

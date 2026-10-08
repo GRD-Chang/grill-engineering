@@ -904,7 +904,7 @@
   "presentation.status.ci_recovery_label": "CI recovery",
   "presentation.status.ci_recovery_usage": "CI outer window {outer_window}: rounds {rounds_used}/{rounds_limit}; inner window {inner_window}: repairs {repairs_used}/{repairs_limit}",
   "presentation.status.ci_review_required": "This CI repair round requires Reviewer acceptance",
-  "presentation.status.ci_review_exempt": "This first Ticket CI repair round is exempt from Review",
+  "presentation.status.ci_review_exempt": "Ticket CI Review disabled; this candidate has no independent acceptance",
   "presentation.status.ci_failure_head": "Failed head: {head}",
   "presentation.status.ci_failed_checks": "Failed checks: {checks}",
   "cli.settings.field.development_thread_policy": "Development thread policy",
@@ -1095,5 +1095,13 @@
   "presentation.status.timing_incomplete": "Execution timing record incomplete",
   "presentation.status.recorded_execution_time": "Recorded execution time: {v1}",
   "card.effort.recorded_rounds": "{count} recorded rounds",
-  "card.not_recorded": "Not recorded"
+  "card.not_recorded": "Not recorded",
+  "cli.ticket_ci_development_limit_help": "Ticket cumulative CI Development allowance (default 3)",
+  "cli.ticket_ci_review_help": "Review every Ticket CI repair (default disabled)",
+  "cli.settings.field.ticket_ci_development_limit": "Ticket CI Development allowance",
+  "cli.settings.field.ticket_ci_review": "Ticket CI Review",
+  "presentation.status.ticket_ci_usage": "CI window {window}: cumulative development {used}/{limit}",
+  "guidance.pause.ci_investigation_paused": "CI investigation completed without code changes; explicit resume required",
+  "guidance.pause.ci_development_budget_exhausted": "Ticket cumulative CI development allowance exhausted; explicit resume required",
+  "presentation.history.ticket_ci_usage": "CI window {window}: cumulative development at round start {used}/{limit}"
 }

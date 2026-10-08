@@ -9,6 +9,7 @@ import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import (
     Controller,
     _change_job_for_invocation,
@@ -43,9 +44,12 @@ def _with_canonical_ci_budgets(state: dict[str, Any]) -> None:
     """Materialize the CI fields alongside hand-built invocation subjects."""
 
     for owner in (*state.get("ticket_jobs", {}).values(), state.get("active_ticket_job"),
-                  state.get("parent_job")):
+                  ):
         if isinstance(owner, dict):
-            owner.setdefault("ci_recovery", new_ci_recovery_budget())
+            owner.setdefault("ci_recovery", new_ticket_ci_recovery_budget())
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        parent.setdefault("ci_recovery", new_ci_recovery_budget())
     run = state.get("run_acceptance")
     if isinstance(run, dict):
         run.setdefault("ci_recovery", new_ci_recovery_budget())

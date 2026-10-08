@@ -187,3 +187,33 @@ def test_controller_reprepare_intent_fails_closed_after_boundary_tampering() -> 
 
     with pytest.raises(ValueError, match="intent is invalid"):
         require_controller_reprepare_intent(job)
+
+
+@pytest.mark.parametrize("role", ["development", "reviewer"])
+def test_ticket_ci_attempt_binds_ci_window_and_preserves_snapshot_on_resume(role: str) -> None:
+    from agent_run.integration_development_budget import semantic_attempt_budget
+    from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+    from agent_run.delivery_policy import DeliveryPolicy
+
+    ci = new_ticket_ci_recovery_budget(review_required=True)
+    ci.update(window=2, developments_used=1, failure_head="failed-head")
+    job: dict[str, Any] = {
+        "ci_recovery": ci, "review_budget": {"window": 1},
+        "policy_snapshot": DeliveryPolicy(ticket_ci_review=True).snapshot(),
+        "pending_attempt_kind": "ci_repair", "attempt_kind": "ci_repair",
+    }
+    first = allocate_semantic_attempt(
+        job, role=role, work_subject="ticket:403", generation=1,
+        currentness_boundary=_boundary(), ordinal=1, budget_window=2,
+    )
+    assert first["budget_snapshot"]["ci_developments_used"] == 1
+    assert semantic_attempt_budget(job, first) is ci
+    resumed = allocate_semantic_attempt(
+        job, role=role, work_subject="ticket:403", generation=1,
+        currentness_boundary=_boundary(), ordinal=2, budget_window=2,
+    )
+    assert resumed is first
+    assert resumed["budget_window"] == 2
+    assert ci["developments_used"] == 1
+    ci["developments_used"] = 2
+    assert first["budget_snapshot"]["ci_developments_used"] == 1

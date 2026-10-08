@@ -39,21 +39,20 @@ class ChangeDevelopmentReview:
 
     def review(self) -> bool:
         state, job, checkout = self.state, self.job, self.checkout
-        if not prepare_delivery_integration(
+        if not self.engine.contract.label.startswith("ticket-") and not prepare_delivery_integration(
             self.engine, state, job, checkout, before_review=True
         ):
             return job.get("phase") != "ready_for_integration"
         if (
             job.get("attempt_kind") == "ci_repair"
-            and job.get("repair_source") == "required_checks"
             and not ci_review_required(
                 job, is_ticket=self.engine.contract.label.startswith("ticket-")
             )
         ):
-            if not self.engine._prepare_ticket_ci_first_round_authorization(
+            if not self.engine._prepare_ticket_ci_publication_authorization(
                 state, job
             ):
-                raise ValueError("Ticket CI repair has no valid first-round publication authority")
+                raise ValueError("Ticket CI repair has no valid publication authority")
             return True
         policy = self.engine.review_budget_policy()
         if not review_is_due(job, policy):

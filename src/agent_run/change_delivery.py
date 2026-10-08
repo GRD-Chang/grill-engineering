@@ -409,7 +409,11 @@ class ChangeDeliveryEngine:
                     inner_limit=inner_limit,
                     is_ticket=self.contract.label.startswith("ticket-"),
                 ):
-                    self._checkpoint_ci_budget(state, job, "ci_inner_budget_exhausted")
+                    self._checkpoint_ci_budget(
+                        state, job,
+                        "ci_development_budget_exhausted" if self.contract.label.startswith("ticket-")
+                        else "ci_inner_budget_exhausted",
+                    )
                     return
             elif not can_start_development(
                 job, self.review_budget_policy(), attempt_kind=attempt_kind
@@ -444,31 +448,6 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> bool:
         return commit_candidate(self, state, job, checkout)
-
-    def _bind_ticket_ci_integration(
-        self, state: dict[str, Any], job: dict[str, Any], *,
-        invalidate_review: bool = False,
-    ) -> None:
-        """Make the exact integrated head the CI repair authorization boundary."""
-
-        record = _mapping(job, "ticket_integration")
-        if job.get("candidate_sha") == record["head_sha"] and not invalidate_review:
-            return
-        pending_review = pending_semantic_attempt(job, role="reviewer")
-        if pending_review is not None:
-            close_semantic_attempt(
-                job, pending_review, outcome="currentness_invalidated"
-            )
-            detach_active_invocation(state, pending_review)
-        job["candidate_sha"] = record["head_sha"]
-        job["phase"] = "candidate"
-        for key in (
-            "acceptance_record", "acceptance_artifact", "publication_authority",
-            "ci_repair_publication_receipt", "fallback_publication_receipt",
-            "pending_review_result",
-        ):
-            job.pop(key, None)
-        self.save(state)
 
     def _publication(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -660,14 +639,14 @@ class ChangeDeliveryEngine:
         job["ci_recovery"]["checkpoint_reason"] = code
         self.save(state)
 
-    def _prepare_ticket_ci_first_round_authorization(
+    def _prepare_ticket_ci_publication_authorization(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
         from agent_run.change_delivery_fallback import (
-            prepare_ticket_ci_first_round_authorization,
+            prepare_ticket_ci_publication_authorization,
         )
 
-        return prepare_ticket_ci_first_round_authorization(self, state, job)
+        return prepare_ticket_ci_publication_authorization(self, state, job)
 
     def _checkpoint_budget(
         self,

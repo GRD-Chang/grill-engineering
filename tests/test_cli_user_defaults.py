@@ -640,3 +640,19 @@ def test_profile_and_policy_cli_errors_are_bilingual_and_keep_original_audit(
     diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
     assert diagnostic["message"] == audit + "；请排除上述原因后重试；已有交付请先查询 status 确认状态。"
     assert store.path.read_bytes() == before
+
+
+def test_ticket_ci_settings_are_explicit_and_can_be_disabled() -> None:
+    code, builtin = settings("show")
+    assert code == 0
+    assert builtin["policy"]["ticket_ci_development_limit"] == 3
+    assert builtin["policy"]["ticket_ci_review"] is False
+    code, enabled = settings("configure", "--ticket-ci-development-limit", "5", "--ticket-ci-review")
+    assert code == 0
+    assert enabled["policy"]["ticket_ci_development_limit"] == 5
+    assert enabled["policy"]["ticket_ci_review"] is True
+    code, disabled = settings("configure", "--no-ticket-ci-review")
+    assert code == 0
+    assert disabled["policy"]["ticket_ci_review"] is False
+    assert disabled["policy"]["ticket_ci_development_limit"] == 5
+    assert UserDefaultsStore().load()["policy"]["ticket_ci_review"] is False

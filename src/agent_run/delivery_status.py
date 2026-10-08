@@ -46,8 +46,23 @@ from agent_run.presentation_helpers import (
 )
 
 
+def _ci_recovery_usage(recovery: dict[str, Any]) -> str:
+    if "window" in recovery:
+        return display_text('presentation.status.ticket_ci_usage',
+                            window=recovery.get('window'),
+                            used=recovery.get('developments_used'),
+                            limit=recovery.get('development_limit'))
+    return display_text('presentation.status.ci_recovery_usage',
+                        outer_window=recovery.get('outer_window'),
+                        rounds_used=recovery.get('rounds_used'),
+                        rounds_limit=recovery.get('rounds_limit'),
+                        inner_window=recovery.get('inner_window'),
+                        repairs_used=recovery.get('repairs_used'),
+                        repairs_limit=recovery.get('repairs_limit'))
+
+
 def _ci_recovery_details(recovery: dict[str, Any]) -> list[str]:
-    if not recovery.get("rounds_used"):
+    if not recovery.get("failure_head"):
         return []
     details = [display_text(
         'presentation.status.ci_review_required'
@@ -247,13 +262,7 @@ def print_status_progress(
                            window=resync.get('window')))
     ci_recovery = view.get("ci_recovery")
     if isinstance(ci_recovery, dict):
-        print(display_text('presentation.status.ci_recovery_usage',
-                           outer_window=ci_recovery.get('outer_window'),
-                           rounds_used=ci_recovery.get('rounds_used'),
-                           rounds_limit=ci_recovery.get('rounds_limit'),
-                           inner_window=ci_recovery.get('inner_window'),
-                           repairs_used=ci_recovery.get('repairs_used'),
-                           repairs_limit=ci_recovery.get('repairs_limit')))
+        print(_ci_recovery_usage(ci_recovery))
         for detail in _ci_recovery_details(ci_recovery):
             print(detail)
     if view["elapsed_seconds"] is not None:
@@ -462,13 +471,7 @@ def print_rich_status_progress(
     ci_recovery = view.get("ci_recovery")
     if isinstance(ci_recovery, dict):
         add_identity(display_text('presentation.status.ci_recovery_label'),
-                     display_text('presentation.status.ci_recovery_usage',
-                                  outer_window=ci_recovery.get('outer_window'),
-                                  rounds_used=ci_recovery.get('rounds_used'),
-                                  rounds_limit=ci_recovery.get('rounds_limit'),
-                                  inner_window=ci_recovery.get('inner_window'),
-                                  repairs_used=ci_recovery.get('repairs_used'),
-                                  repairs_limit=ci_recovery.get('repairs_limit')))
+                     _ci_recovery_usage(ci_recovery))
         for detail in _ci_recovery_details(ci_recovery):
             add_identity(display_text('presentation.status.ci_recovery_label'), detail)
     repair = view.get("run_repair")
@@ -894,8 +897,7 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
             labels = (
                 ("开发", "development", "development_attempts", "development_limit"),
                 ("验收", "review", "reviewer_invocations", "review_limit"),
-                ("CI 轮次", "CI rounds", "ci_rounds_used", "ci_rounds_limit"),
-                ("CI 修复", "CI repairs", "ci_repairs_used", "ci_repairs_limit"),
+                ("CI 开发", "CI development", "ci_developments_used", "ci_development_limit"),
                 ("集成开发", "integration development", "integration_development_used", "integration_development_limit"),
                 ("同步", "resync", "integration_resync_used", "integration_resync_limit"),
             )

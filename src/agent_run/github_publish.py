@@ -868,7 +868,23 @@ class GhGitHubPublisher:
                         "github_invalid_response",
                         "Actions job response does not match the requested job",
                     )
+                if job.get("head_sha") != expected_head_sha or job.get("status") != "completed":
+                    raise GitHubReadError(
+                        "github_check_evidence_observation_pending",
+                        "Actions job evidence is not completed at the expected failed head",
+                    )
                 check["job"] = dict(job)
+                # Logs supplement exact job facts; unavailable logs must not
+                # erase a real failure or pretend its investigation passed.
+                try:
+                    logs = self._run("api", f"repos/{self.repository}/actions/jobs/{job_id}/logs")
+                    if logs.returncode == 0:
+                        check["logs"] = logs.stdout[:65536]
+                        check["logs_truncated"] = len(logs.stdout) > 65536
+                    else:
+                        check["logs_unavailable"] = logs.stderr[:4096] or f"gh exited {logs.returncode}"
+                except (GitHubReadError, OSError, TimeoutError) as error:
+                    check["logs_unavailable"] = str(error)[:4096]
             failed.append(check)
         failed = annotate_configured_code_failures(
             failed,

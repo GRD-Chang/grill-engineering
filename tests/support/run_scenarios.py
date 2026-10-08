@@ -12,6 +12,7 @@ from agent_run.ci_recovery_budget import (
     new_ci_recovery_budget, observe_repairable_ci_failure,
 )
 from agent_run.delivery_policy import DeliveryPolicy
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader, FixtureGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -29,7 +30,7 @@ def save_run_with_ci_fixture(
     if isinstance(jobs, dict):
         for job in jobs.values():
             if isinstance(job, dict) and "phase" in job:
-                job.setdefault("ci_recovery", new_ci_recovery_budget())
+                job.setdefault("ci_recovery", new_ticket_ci_recovery_budget())
     for key in ("parent_job", "run_acceptance"):
         subject = state.get(key)
         if isinstance(subject, dict):
@@ -131,7 +132,7 @@ def _completed_run(
             ],
             "integrated_sha": integrated,
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     }
     integrated_sha = str(state["ticket_jobs"][ticket_key]["integrated_sha"])

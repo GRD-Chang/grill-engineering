@@ -35,6 +35,7 @@ def append_explicit_resume_audit(
             location, subject = gates[0]
             if location.startswith("ticket:") and subject.get("blocked_reason") in {
                 "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
+                "ci_investigation_paused",
             }:
                 ticket_number = int(subject["ticket_number"])
 
@@ -267,7 +268,7 @@ def _resume_kind(
         reason = job.get("blocked_reason")
         if reason in {"agent_requires_human", "reviewer_requires_human"}:
             return "human_blocker"
-        if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}:
+        if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}:
             return "budget_checkpoint"
         if reason == "integration_development_exhausted":
             return "integration_development"
@@ -277,6 +278,8 @@ def _resume_kind(
             return "supervision_timeout"
         if reason == "ticket_execution_failed":
             return "execution_failure"
+        if reason == "ci_investigation_paused":
+            return "ci_investigation"
         if reason == "ticket_paused":
             return "operator_stopped"
         if job.get("phase") == "publication_pending":
@@ -301,7 +304,7 @@ def _resume_kind(
         if isinstance(subject, dict) and subject.get("blocked_reason") == "integration_development_exhausted":
             return "integration_development"
         if isinstance(subject, dict) and subject.get("blocked_reason") in {
-            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }:
             return "budget_checkpoint"
     for job in state.get("ticket_jobs", {}).values():

@@ -456,10 +456,10 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
 每个 Ticket Review Budget Window 默认最多允许四次普通 Development Attempt 和三次 Reviewer
-Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。可修复的 Required Checks 失败使用独立 CI 恢复额度：默认最多三轮、每轮最多三次开发修复；Ticket 首轮仅一次修复并以绑定旧发布授权与失败证据的窄收据更新原 PR，从第二轮开始须经 Reviewer。Development Attempt 在首次
+Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。准确 Required Checks 失败回到同一开发循环，不要求先分类为代码可修。Ticket 使用独立累计 CI Development 额度 `ticket_ci_development_limit`（默认 3），新失败版本与 PR 更新不重置；`ticket_ci_review` 默认关闭，开启时所有轮次一致审核。免审以绑定准确旧发布授权、失败证据和新候选的收据更新原 PR，不生成 Acceptance。CI 工作完成后再集成，集成不增加 Review。Development Attempt 在首次
 分配时占用预算；进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 只继续同一
 Semantic Agent Attempt，不重复计数。普通需求预算耗尽且仍需修改时进入
-`modification_budget_exhausted`；CI 恢复内层或外层耗尽时只续期对应 CI 窗口。维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
+`modification_budget_exhausted`；Ticket CI 累计额度耗尽产生 `ci_development_budget_exhausted`，仅显式 resume 续期对应 CI 窗口。维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
 额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
 ## Source Runner 安装

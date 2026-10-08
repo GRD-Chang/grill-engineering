@@ -124,7 +124,7 @@ def _resolve_integration_work_once(
         job.pop("development_failure_resume", None)
         if isinstance(result, HumanBlockerResult):
             stage._wait_for_human(state, job,
-                phase="candidate" if job.get("attempt_kind") == "ci_repair" else "accepted",
+                phase="accepted",
                 blockers=result.human_blockers, code="agent_requires_human")
             return False
         if not result.summary.strip():

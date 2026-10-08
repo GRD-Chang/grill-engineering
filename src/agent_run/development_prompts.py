@@ -70,6 +70,16 @@ def development_prompt(
     request = bind_resources(request)
     repair = request.get("repair_source") is not None
     evidence = _repair_evidence(request)
+    if request.get("work_source") == "ci" and request.get("repair_source") != "required_checks":
+        ci_evidence = request.get("ci_evidence")
+        if not isinstance(ci_evidence, dict):
+            raise ValueError("CI Development requires original ci_evidence")
+        evidence = "\n\n".join((
+            resource(request, "development/repair-required-checks").format(
+                "ci_evidence", pretty(ci_evidence)
+            ),
+            evidence,
+        ))
     if force_continuation or uses_short_role_prompt(request):
         return "\n\n".join(
             block

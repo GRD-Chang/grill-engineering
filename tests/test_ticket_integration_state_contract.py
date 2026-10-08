@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import Controller
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -46,7 +46,7 @@ def _two_jobs(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": new_budget(),
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     second = deepcopy(first)

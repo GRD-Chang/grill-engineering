@@ -32,6 +32,7 @@ def parallel_state() -> dict:
     ("integration_resync_exhausted", "review_budget_checkpoint", "blocked", "progress_exhausted"),
     ("ticket_supervision_timeout", "supervision_timeout", "blocked", "supervision_timeout"),
     ("ticket_paused", "operator_stopped", "blocked", "operator_stopped"),
+    ("ci_investigation_paused", "ci_investigation", "blocked", "ready_for_human"),
     (None, "publication_retry_exhausted", "publication_pending", "publication_pending"),
 ])
 def test_nonselected_ticket_action_comes_from_its_own_evidence(

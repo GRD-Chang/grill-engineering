@@ -14,8 +14,10 @@ _REASON_KINDS = {
     "ticket_execution_failed": "execution_failure",
     "ticket_supervision_timeout": "supervision_timeout",
     "ticket_paused": "operator_stopped",
+    "ci_investigation_paused": "ci_investigation",
     "modification_budget_exhausted": "review_budget_checkpoint",
     "review_budget_exhausted": "review_budget_checkpoint",
+    "ci_development_budget_exhausted": "review_budget_checkpoint",
     "ci_inner_budget_exhausted": "review_budget_checkpoint",
     "ci_outer_budget_exhausted": "review_budget_checkpoint",
     "integration_development_exhausted": "review_budget_checkpoint",
@@ -105,7 +107,7 @@ def operator_action_facts(state: dict[str, Any]) -> list[dict[str, Any]]:
             reasons = reasons or (["Run abandonment recovery is incomplete."] if kind == "abandonment_recovery" and not reason else [str(reason or status_code)])
             if reason in {"ticket_execution_failed", "ticket_supervision_timeout"}:
                 phase = subject.get("execution_resume_phase", phase)
-            elif reason == "ticket_paused":
+            elif reason in {"ticket_paused", "ci_investigation_paused"}:
                 phase = subject.get("pause_resume_phase", phase)
             elif evidence:
                 phase = evidence["phase"]
@@ -163,7 +165,7 @@ def _next_action(
     run_id = state.get("run_id")
     ticket_number = int(location.removeprefix("ticket:")) if scope == "local" else None
     if kind in {"human_blocker", "review_budget_checkpoint", "execution_failure",
-                "supervision_timeout", "operator_stopped"}:
+                "supervision_timeout", "operator_stopped", "ci_investigation"}:
         return NextAction("command", "resume", run_id, ticket_number)
     if kind == "final_approval":
         return NextAction("command", "resume" if has_final_approval(state) else "approve", run_id)

@@ -8,7 +8,7 @@ from typing import Any
 
 INTEGRATION_HOLDER_PHASES = frozenset({
     "accepted", "publishing", "waiting_checks",
-    "waiting_merge", "merging", "merged", "candidate", "reviewing",
+    "waiting_merge", "merging", "merged",
 })
 DEVELOPMENT_WORKER_PHASES = frozenset({
     "developing", "repairing", "committing_candidate", "candidate", "reviewing",
@@ -36,9 +36,7 @@ def acquire(state: dict[str, Any], job: dict[str, Any]) -> bool:
     holder = state["ticket_integration_holder"]
     if holder == number:
         return True
-    resume_phase = job.get("integration_resume_phase") or (
-        "candidate" if job.get("attempt_kind") == "ci_repair" else "accepted"
-    )
+    resume_phase = job.get("integration_resume_phase") or "accepted"
     enqueue(state, job)
     queue = state["ticket_integration_queue"]
     if holder is not None or queue[0]["ticket_number"] != number:
@@ -75,10 +73,7 @@ def requires_integration_seat(job: dict[str, Any]) -> bool:
         and job.get("execution_resume_phase") in {"merging", "merged"}
     ):
         return True
-    return phase in INTEGRATION_HOLDER_PHASES and (
-        phase not in {"candidate", "reviewing"}
-        or job.get("attempt_kind") == "ci_repair"
-    )
+    return phase in INTEGRATION_HOLDER_PHASES
 
 
 def reconcile_all(state: dict[str, Any]) -> None:

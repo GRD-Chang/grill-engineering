@@ -106,11 +106,11 @@ Continue addressing problems that can be resolved within your responsibilities."
 {1}""",
     },
     'development/repair-required-checks': {
-        'zh': """下列检查失败对应当前提交，并已被确定为可修改代码解决的问题。修复根因，保持有效测试、断言与检查意图，不得删除有效测试、放宽断言或绕过检查。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。
+        'zh': """你负责调查并处理下列准确失败版本的 CI 问题。根据检查结果及可取得的原始日志调查根因，不预设只能修改代码解决。原需求只约束本次定向修复，不重新开发整套需求。核验修复效果和直接影响的回归，保持有效测试、断言与检查意图，不得删除有效测试、放宽断言或绕过检查来制造通过。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。证据不足或确需人提供权限、凭据或外部操作时，按开发结果格式说明具体缺口。
 
 {0}（完整原始证据）：
 {1}""",
-        'en': """The following failed checks correspond to the current commit and have been identified as problems that code changes can resolve. Fix the root cause while preserving valid tests, assertions and check intent; do not delete valid tests, weaken assertions or bypass checks. If you cannot reproduce locally, state what you verified and what still needs remote checks to establish. Do not claim remote checks passed.
+        'en': """You are responsible for investigating and addressing CI problems at the exact failed revision below. Investigate the root cause using check results and available original logs; do not presume code changes are the only solution. Original requirements constrain this directed repair; do not redevelop the full requirements. Verify the repair and directly affected regressions while preserving valid tests, assertions and check intent. Do not delete valid tests, weaken assertions or bypass checks to manufacture a pass. If you cannot reproduce locally, state what you verified and what still needs remote checks to establish. Do not claim remote checks passed. If evidence is insufficient or a human must provide permissions, credentials or an external action, describe the specific gap in the development result.
 
 {0} (complete original evidence):
 {1}""",

@@ -95,10 +95,12 @@ Runner App 复用相同的签发与续签实现，后续 Controller、Publisher 
 | `run_repair_rounds` / `--run-repair-rounds` | 3 | 正整数 N；Parent-only 的 Git 与集成 Findings 共用累计 N 次 Development，远端追加不重置，resume 仅续期耗尽额度；多 Ticket Parent 保留既有集成窗口 |
 | `ticket_integration_development_limit` / `--ticket-integration-development-limit` | 3 | 正整数；Ticket 集成 Development 累计额度，包含冲突处理。中断续接不重复扣费，显式 resume 追加对应额度并保留累计用量 |
 | `integration_resync_limit` / `--integration-resync-limit` | 3 | 非负整数；首次集成后，同一交付对象最多自动重新同步的次数。仅外部源/目标分支新快照计数 |
-| `ci_recovery_rounds` / `--ci-recovery-rounds` | 3 | 正整数 N；每个交付对象最多 N 轮可恢复 CI 失败 |
-| `ci_repairs_per_round` / `--ci-repairs-per-round` | 3 | 正整数 N；每轮最多 N 次开发修复；Ticket 首轮仅允许一次 |
+| `ticket_ci_development_limit` / `--ticket-ci-development-limit` | 3 | 正整数；同一 Ticket 的 CI Development 与 Review Findings 修改共用累计额度，独立于初始开发及集成 |
+| `ticket_ci_review` / `--ticket-ci-review` / `--no-ticket-ci-review` | false | 布尔值；所有 Ticket CI 修复轮次统一采用此审核策略，不影响初始 Ticket Review 或 Parent 验收 |
+| `ci_recovery_rounds` / `--ci-recovery-rounds` | 3 | 正整数 N；旧 Parent CI 路径每个交付对象最多 N 轮 CI 恢复 |
+| `ci_repairs_per_round` / `--ci-repairs-per-round` | 3 | 正整数 N；旧 Parent CI 路径每轮最多 N 次开发修复 |
 
-Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback。可修复 CI 失败使用独立的外层轮次与内层修复额度；Ticket 首轮一次修复无需重复 Reviewer，但发布收据严格绑定上一版验收和失败检查。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
+Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback。Ticket CI 默认关闭 Review，开启后所有轮次均审核；未经审核的修复不记录 Acceptance。失败版本、提交和 PR 更新不重置累计 CI 开发额度；重复观察不扣费，同语义工作中断续接不重复计数。额度耗尽后显式 resume 只续期 CI 额度，重复请求不重复续期，历史保留。旧 Parent CI 路径在对应切片收敛前仍使用独立外层轮次与内层修复额度。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
 
 ## 开发会话策略
 

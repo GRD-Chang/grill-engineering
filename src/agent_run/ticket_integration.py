@@ -129,21 +129,7 @@ def _invalidate_ticket_publication(
     if pending is not None:
         close_semantic_attempt(job, pending, outcome="currentness_invalidated")
         detach_active_invocation(state, pending)
-    ci_repair = job.get("attempt_kind") == "ci_repair"
-    job["phase"] = "candidate" if ci_repair else "accepted"
-    if ci_repair:
-        pending_review = pending_semantic_attempt(job, role="reviewer")
-        if pending_review is not None:
-            close_semantic_attempt(
-                job, pending_review, outcome="currentness_invalidated"
-            )
-            detach_active_invocation(state, pending_review)
-        for key in (
-            "acceptance_record", "acceptance_artifact", "publication_authority",
-            "ci_repair_publication_receipt", "fallback_publication_receipt",
-            "pending_review_result",
-        ):
-            job.pop(key, None)
+    job["phase"] = "accepted"
     for key in (
         "publication", "publication_sha", "publication_parent_sha", "publication_prior_published_sha",
         "pending_publication_result", "merge_intent", "deterministic_integration_record",
@@ -151,6 +137,9 @@ def _invalidate_ticket_publication(
     ):
         job.pop(key, None)
     clear_required_checks_observation(job)
+    ci_receipt = job.get("ci_repair_publication_receipt")
+    if isinstance(ci_receipt, dict):
+        ci_receipt.pop("publication_sha", None)
     state["status"] = "ticket_delivery_pending"
     state["diagnostics"] = []
     stage.save(state)

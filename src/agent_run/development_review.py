@@ -30,6 +30,7 @@ class ReviewDecision(str, Enum):
     REVIEW_EXHAUSTED = "review_budget_exhausted"
     DEVELOPMENT_EXHAUSTED = "modification_budget_exhausted"
     CI_EXHAUSTED = "ci_inner_budget_exhausted"
+    TICKET_CI_EXHAUSTED = "ci_development_budget_exhausted"
 
 
 def review_is_due(job: dict[str, Any], policy: ReviewBudgetPolicy) -> bool:
@@ -62,7 +63,7 @@ def after_review(
             job, outer_limit=outer_limit, inner_limit=inner_limit,
             is_ticket=policy.budget_scope == "ticket",
         ):
-            return ReviewDecision.CI_EXHAUSTED
+            return (ReviewDecision.TICKET_CI_EXHAUSTED if policy.budget_scope == "ticket" else ReviewDecision.CI_EXHAUSTED)
         return ReviewDecision.REPAIR
     if not policy.fallback and not can_start_review(job, policy):
         return ReviewDecision.REVIEW_EXHAUSTED

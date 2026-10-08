@@ -692,6 +692,16 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
             for check in raw_checks
             if isinstance(check, dict) and check.get("bucket") == "fail"
         ]
+    if location.startswith("ticket:"):
+        return {
+            "window": budget.get("window"),
+            "developments_used": budget.get("developments_used"),
+            "development_limit": inner_limit,
+            "review_required": budget.get("review_required"),
+            "checkpoint_reason": budget.get("checkpoint_reason"),
+            "failure_head": failure_head,
+            "failed_checks": failed_checks,
+        }
     return {
         "outer_window": budget.get("outer_window"),
         "rounds_used": budget.get("rounds_used"),

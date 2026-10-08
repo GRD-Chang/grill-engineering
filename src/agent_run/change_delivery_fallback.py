@@ -32,12 +32,11 @@ def ci_repair_publication_context(receipt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def prepare_ticket_ci_first_round_authorization(
+def prepare_ticket_ci_publication_authorization(
     stage: FallbackStage, state: dict[str, Any], job: dict[str, Any]
 ) -> bool:
-    """Authorize exactly one reviewed-head CI repair for a Ticket.
+    """Authorize an unreviewed CI repair for the configured Ticket policy.
 
-    The caller must route every later CI recovery round through Reviewer.
     This function does not create Acceptance and never alters Review budget.
     """
 
@@ -53,7 +52,6 @@ def prepare_ticket_ci_first_round_authorization(
         or not isinstance(candidate, str) or not candidate
         or not isinstance(base, str) or not base
         or not isinstance(failure_head, str) or not failure_head
-        or job.get("repair_source") != "required_checks"
         or job.get("attempt_kind") != "ci_repair"
         or not isinstance(job.get("required_checks_origin"), dict)
         or not isinstance(job.get("ci_evidence"), dict)
@@ -64,11 +62,11 @@ def prepare_ticket_ci_first_round_authorization(
         return False
     recovery_identity = {
         key: recovery.get(key)
-        for key in ("outer_window", "rounds_used", "inner_window", "repairs_used", "failure_head", "repair_pending", "review_required")
+        for key in ("window", "developments_used", "failure_head", "repair_pending", "review_required")
     }
     if (
-        recovery_identity["rounds_used"] != 1
-        or recovery_identity["repairs_used"] != 1
+        type(recovery_identity["developments_used"]) is not int
+        or recovery_identity["developments_used"] < 1
         or recovery_identity["repair_pending"] is not True
         or recovery_identity["review_required"] is not False
         or previous.get("publication_sha") != failure_head
@@ -201,7 +199,7 @@ def previous_publication_authorization(
     receipt = job.get("fallback_publication_receipt")
     if authority is None and isinstance(acceptance, dict):
         authority = "acceptance"
-    if authority not in {"acceptance", "fallback"}:
+    if authority not in {"acceptance", "fallback", "ci_repair"}:
         return None
     publication_sha = job.get("publication_sha")
     pr_number = job.get("pr_number")
@@ -226,6 +224,8 @@ def previous_publication_authorization(
         nested_acceptance: dict[str, Any] | None = deepcopy(acceptance)
         nested_receipt = None
     else:
+        if authority == "ci_repair":
+            receipt = job.get("ci_repair_publication_receipt")
         if not isinstance(receipt, dict):
             return None
         candidate_sha = receipt.get("candidate_sha")

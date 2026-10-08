@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from agent_run.change_delivery_fallback import (
-    prepare_ticket_ci_first_round_authorization,
+    prepare_ticket_ci_publication_authorization,
     previous_publication_authorization,
 )
 from agent_run.ci_recovery_budget import (
@@ -88,8 +88,7 @@ def _reviewed_failed_job() -> dict[str, Any]:
         "ci_evidence": deepcopy(failed),
         "required_checks_origin": deepcopy(failed),
         "ci_recovery": {
-            "outer_window": 1, "rounds_used": 1,
-            "inner_window": 1, "repairs_used": 1,
+            "window": 1, "developments_used": 1, "semantic_work_ids": [],
             "failure_head": "failed-head", "repair_pending": True,
             "review_required": False, "checkpoint_reason": None,
             "history": [],
@@ -125,7 +124,7 @@ def _stage() -> SimpleNamespace:
 
 def test_first_ticket_ci_repair_has_narrow_authority_without_review() -> None:
     job = _reviewed_failed_job()
-    assert prepare_ticket_ci_first_round_authorization(_stage(), {}, job)
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
     assert job["phase"] == "accepted"
     assert job["publication_authority"] == "ci_repair"
     assert "acceptance_record" not in job
@@ -152,7 +151,7 @@ def test_first_ticket_ci_repair_has_narrow_authority_without_review() -> None:
     for mutation in (
         lambda copy: copy["ci_repair_publication_receipt"].update(candidate_tree="other-tree"),
         lambda copy: copy["ci_repair_publication_receipt"].update(failure_head="other-head"),
-        lambda copy: copy["ci_repair_publication_receipt"]["failure_evidence"]["checks"][0].update(repairability="unknown"),
+        lambda copy: copy["ci_repair_publication_receipt"]["failure_evidence"]["checks"][0].update(name="wrong-check"),
         lambda copy: copy["ci_recovery"].update(review_required=True),
         lambda copy: copy["required_checks_evidence"].update(head_sha="old-head"),
     ):
@@ -166,21 +165,21 @@ def test_first_ticket_ci_repair_has_narrow_authority_without_review() -> None:
 
 def test_first_ticket_ci_repair_rejects_later_round_and_missing_prior_head() -> None:
     job = _reviewed_failed_job()
-    job["ci_recovery"]["rounds_used"] = 2
+    job["ci_recovery"]["developments_used"] = 2
     job["ci_recovery"]["review_required"] = True
-    assert not prepare_ticket_ci_first_round_authorization(_stage(), {}, job)
+    assert not prepare_ticket_ci_publication_authorization(_stage(), {}, job)
     assert job["phase"] == "candidate"
     assert "ci_repair_publication_receipt" not in job
 
     job = _reviewed_failed_job()
     job["ci_recovery"]["previous_publication_authorization"]["publication_sha"] = "other-head"
-    assert not prepare_ticket_ci_first_round_authorization(_stage(), {}, job)
+    assert not prepare_ticket_ci_publication_authorization(_stage(), {}, job)
     assert "ci_repair_publication_receipt" not in job
 
 
 def test_completed_ticket_ci_repair_record_keeps_its_own_source() -> None:
     job = _reviewed_failed_job()
-    assert prepare_ticket_ci_first_round_authorization(_stage(), {}, job)
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
     job["phase"] = "completed"
     job["publication_sha"] = "repaired-head"
     job["integrated_sha"] = "merge-head"
@@ -245,7 +244,7 @@ def test_later_ticket_ci_round_needs_its_real_reviewer_artifact() -> None:
         "artifact": artifact,
     }
     recovery = job["ci_recovery"]
-    recovery["rounds_used"] = 2
+    recovery["developments_used"] = 2
     recovery["review_required"] = True
     recovery["reviewer_invocations"] = 1
     recovery["review_artifacts"] = [{
@@ -268,217 +267,44 @@ def test_later_ticket_ci_round_needs_its_real_reviewer_artifact() -> None:
     require_active_ticket_publication_authorization(
         job, candidate_tree="reviewed-ci-tree"
     )
-    forged_first_round = deepcopy(job)
-    forged_first_round["ci_recovery"]["rounds_used"] = 1
-    with pytest.raises(IncompatibleRunStateError, match="reviewed outer renewal"):
-        require_active_ticket_publication_authorization(
-            forged_first_round, candidate_tree="reviewed-ci-tree"
-        )
-
-    assert observe_repairable_ci_failure(
-        job, head_sha="next-failed-head", outer_limit=2,
-        inner_limit=3, is_ticket=True,
-    ) == "outer_exhausted"
-    assert reset_exhausted_ci_budget(
-        job, outer_limit=2, inner_limit=3, is_ticket=True,
-    ) == "ci_outer_budget_exhausted"
-    assert mark_ci_repair(
-        job, outer_limit=2, inner_limit=3, is_ticket=True,
-    ) == 1
-    assert (recovery["outer_window"], recovery["rounds_used"], recovery["review_required"]) == (2, 1, True)
-    renewed_artifact = passing_acceptance("renewed-ci-reviewer", "Renewed repair passed")
-    renewed_artifact.pop("thread_id")
-    job["candidate_sha"] = "renewed-ci-candidate"
-    job["acceptance_artifact"] = renewed_artifact
-    job["acceptance_record"] = {
-        **job["acceptance_record"],
-        "reviewed_candidate_sha": "renewed-ci-candidate",
-        "reviewed_candidate_tree": "renewed-ci-tree",
-        "reviewer_thread_id": "renewed-ci-reviewer",
-        "artifact": renewed_artifact,
-    }
-    recovery["reviewer_invocations"] += 1
-    recovery["review_artifacts"].append({
-        "reviewer_thread_id": "renewed-ci-reviewer",
-        "candidate_sha": "renewed-ci-candidate",
-        "reviewed_base_sha": "base",
-        "review_identity": {
-            "reviewed_base_sha": "base",
-            "reviewed_candidate_sha": "renewed-ci-candidate",
-            "reviewed_candidate_tree": "renewed-ci-tree",
-        },
-        "artifact": renewed_artifact,
-    })
-    require_active_ticket_publication_authorization(
-        job, candidate_tree="renewed-ci-tree"
-    )
     for mutation in (
-        lambda copy: copy["ci_recovery"]["history"].clear(),
-        lambda copy: copy["ci_recovery"]["history"][-1].update(outer_window=9),
+        lambda copy: copy["ci_recovery"].update(review_required=False),
         lambda copy: copy["ci_recovery"]["review_artifacts"].clear(),
+        lambda copy: copy["ci_recovery"]["review_artifacts"][-1].update(candidate_sha="old-ci-candidate"),
     ):
         forged = deepcopy(job)
         mutation(forged)
         with pytest.raises(IncompatibleRunStateError):
-            require_active_ticket_publication_authorization(
-                forged, candidate_tree="renewed-ci-tree"
-            )
-    recovery["review_artifacts"][-1]["candidate_sha"] = "old-ci-candidate"
-    with pytest.raises(IncompatibleRunStateError, match="CI Review Artifact"):
-        require_active_ticket_publication_authorization(
-            job, candidate_tree="renewed-ci-tree"
-        )
+            require_active_ticket_publication_authorization(forged, candidate_tree="reviewed-ci-tree")
 
 
-def test_first_round_new_head_after_outer_renewal_requires_current_ci_review() -> None:
+@pytest.mark.parametrize("used", [1, 2, 3])
+def test_unreviewed_ticket_ci_policy_applies_to_every_development(used: int) -> None:
     job = _reviewed_failed_job()
-    recovery = job["ci_recovery"]
-    assert observe_repairable_ci_failure(
-        job, head_sha="new-failed-head", outer_limit=1,
-        inner_limit=3, is_ticket=True,
-    ) == "outer_exhausted"
-    assert recovery["review_required"] is True
-    assert reset_exhausted_ci_budget(
-        job, outer_limit=1, inner_limit=3, is_ticket=True,
-    ) == "ci_outer_budget_exhausted"
-    assert mark_ci_repair(
-        job, outer_limit=1, inner_limit=3, is_ticket=True,
-    ) == 1
-    artifact = passing_acceptance("renewed-ci-reviewer", "Renewed repair passed")
-    artifact.pop("thread_id")
-    job.update({
-        "phase": "accepted",
-        "publication_authority": "accepted",
-        "candidate_sha": "renewed-ci-candidate",
-        "acceptance_artifact": artifact,
-        "acceptance_record": {
-            "acceptance_scope": "change_job",
-            "reviewed_base_sha": "base",
-            "reviewed_candidate_sha": "renewed-ci-candidate",
-            "reviewed_candidate_tree": "renewed-ci-tree",
-            "effective_revision": "revision",
-            "reviewer_thread_id": "renewed-ci-reviewer",
-            "artifact": artifact,
-        },
-    })
-    recovery["reviewer_invocations"] = 1
-    recovery["review_artifacts"] = [{
-        "reviewer_thread_id": "renewed-ci-reviewer",
-        "candidate_sha": "renewed-ci-candidate",
-        "reviewed_base_sha": "base",
-        "review_identity": {
-            "reviewed_base_sha": "base",
-            "reviewed_candidate_sha": "renewed-ci-candidate",
-            "reviewed_candidate_tree": "renewed-ci-tree",
-        },
-        "artifact": artifact,
-    }]
-    require_active_ticket_publication_authorization(
-        job, candidate_tree="renewed-ci-tree"
-    )
-
-    for mutation in (
-        lambda copy: copy["ci_recovery"]["history"].clear(),
-        lambda copy: copy["ci_recovery"]["history"][-1].update(failure_head="old-head"),
-        lambda copy: copy["ci_recovery"]["history"][-2].update(failure_head="new-failed-head"),
-        lambda copy: copy["ci_recovery"].update(outer_window=1),
-        lambda copy: copy["ci_recovery"]["review_artifacts"][-1].update(candidate_sha="old-candidate"),
-    ):
-        forged = deepcopy(job)
-        mutation(forged)
-        with pytest.raises(IncompatibleRunStateError):
-            require_active_ticket_publication_authorization(
-                forged, candidate_tree="renewed-ci-tree"
-            )
+    job["ci_recovery"]["developments_used"] = used
+    job["ci_evidence"]["checks"][0]["repairability"] = "unknown"
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
+    require_active_ticket_publication_authorization(job, candidate_tree="repaired-tree")
+    assert "acceptance_record" not in job
 
 
-@pytest.mark.parametrize("second_window_repairs", [2, 3])
-def test_consecutive_ticket_ci_outer_renewals_keep_review_authority(
-    second_window_repairs: int,
-) -> None:
+def test_next_failure_preserves_compact_prior_unreviewed_authority() -> None:
     job = _reviewed_failed_job()
-    job["policy_snapshot"] = resolve_delivery_policy(
-        command_overrides={"ci_recovery_rounds": 1}
-    ).snapshot()
-    recovery = job["ci_recovery"]
-    limits = {"outer_limit": 1, "inner_limit": 3, "is_ticket": True}
-
-    assert observe_repairable_ci_failure(
-        job, head_sha="second-failed-head", **limits
-    ) == "outer_exhausted"
-    assert reset_exhausted_ci_budget(job, **limits) == "ci_outer_budget_exhausted"
-    for attempt in range(second_window_repairs):
-        assert mark_ci_repair(job, **limits) == attempt + 1
-        thread_id = f"second-window-reviewer-{attempt + 1}"
-        artifact = (
-            passing_acceptance(thread_id, "Repair passed")
-            if attempt + 1 == second_window_repairs
-            else repair_acceptance(thread_id)
-        )
-        artifact.pop("thread_id")
-        mark_ci_review_invocation(job)
-        recovery["review_artifacts"].append({
-            "reviewer_thread_id": thread_id,
-            "candidate_sha": f"second-window-candidate-{attempt + 1}",
-            "reviewed_base_sha": "base",
-            "review_identity": {
-                "reviewed_base_sha": "base",
-                "reviewed_candidate_sha": f"second-window-candidate-{attempt + 1}",
-                "reviewed_candidate_tree": f"second-window-tree-{attempt + 1}",
-            },
-            "artifact": artifact,
-        })
-    assert observe_repairable_ci_failure(
-        job, head_sha="third-failed-head", **limits
-    ) == "outer_exhausted"
-    assert reset_exhausted_ci_budget(job, **limits) == "ci_outer_budget_exhausted"
-    assert mark_ci_repair(job, **limits) == 1
-    assert (recovery["outer_window"], recovery["rounds_used"], recovery["review_required"]) == (3, 1, True)
-    assert recovery["history"][-2]["repairs_used"] == second_window_repairs
-    assert recovery["history"][-1]["repairs_used"] == second_window_repairs
-
-    thread_id = "third-window-reviewer"
-    artifact = passing_acceptance(thread_id, "Third-window repair passed")
-    artifact.pop("thread_id")
-    job.update({
-        "phase": "accepted",
-        "publication_authority": "accepted",
-        "candidate_sha": "third-window-candidate",
-        "acceptance_artifact": artifact,
-        "acceptance_record": {
-            "acceptance_scope": "change_job",
-            "reviewed_base_sha": "base",
-            "reviewed_candidate_sha": "third-window-candidate",
-            "reviewed_candidate_tree": "third-window-tree",
-            "effective_revision": "revision",
-            "reviewer_thread_id": thread_id,
-            "artifact": artifact,
-        },
-    })
-    mark_ci_review_invocation(job)
-    recovery["review_artifacts"].append({
-        "reviewer_thread_id": thread_id,
-        "candidate_sha": "third-window-candidate",
-        "reviewed_base_sha": "base",
-        "review_identity": {
-            "reviewed_base_sha": "base",
-            "reviewed_candidate_sha": "third-window-candidate",
-            "reviewed_candidate_tree": "third-window-tree",
-        },
-        "artifact": artifact,
-    })
-    require_active_ticket_publication_authorization(
-        job, candidate_tree="third-window-tree"
-    )
-
-    for mutation in (
-        lambda copy: copy["ci_recovery"]["history"][-1].update(outer_window=9),
-        lambda copy: copy["ci_recovery"]["history"][-2].update(repairs_used=1),
-        lambda copy: copy["ci_recovery"]["review_artifacts"][-1].update(candidate_sha="forged"),
-    ):
-        forged = deepcopy(job)
-        mutation(forged)
-        with pytest.raises(IncompatibleRunStateError):
-            require_active_ticket_publication_authorization(
-                forged, candidate_tree="third-window-tree"
-            )
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
+    failed = {
+        "pr_number": 7, "head_sha": "failed-head", "result": "fail",
+        "checks": deepcopy(job["ci_evidence"]["checks"]),
+    }
+    receipt = job["ci_repair_publication_receipt"]
+    receipt.update(publication_sha="failed-head", pr_number=7, required_checks_evidence=failed)
+    prior = previous_publication_authorization(job)
+    assert prior is not None and prior["authority"] == "ci_repair"
+    assert "previous_publication_authorization" not in prior["fallback_receipt"]
+    job["ci_recovery"].update(developments_used=2, previous_publication_authorization=prior)
+    prior["candidate_sha"] = "previous-candidate"
+    prior["candidate_tree"] = "previous-tree"
+    prior["fallback_receipt"].update(candidate_sha="previous-candidate", candidate_tree="previous-tree")
+    prior["fallback_receipt"]["git_integrity"].update(candidate_sha="previous-candidate", candidate_tree="previous-tree")
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
+    require_active_ticket_publication_authorization(job, candidate_tree="repaired-tree")
+    assert "acceptance_record" not in job

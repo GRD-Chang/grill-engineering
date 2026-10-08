@@ -904,7 +904,7 @@
   "presentation.status.ci_recovery_label": "CI 恢复",
   "presentation.status.ci_recovery_usage": "CI 外层窗口 {outer_window}：轮数 {rounds_used}/{rounds_limit}；内层窗口 {inner_window}：修复 {repairs_used}/{repairs_limit}",
   "presentation.status.ci_review_required": "本轮 CI 修复需要 Reviewer 审核",
-  "presentation.status.ci_review_exempt": "本轮 Ticket CI 修复免审",
+  "presentation.status.ci_review_exempt": "Ticket CI Review 已关闭；本候选未经独立验收",
   "presentation.status.ci_failure_head": "失败版本：{head}",
   "presentation.status.ci_failed_checks": "失败检查：{checks}",
   "cli.settings.field.development_thread_policy": "开发会话策略",
@@ -1095,5 +1095,13 @@
   "presentation.status.timing_incomplete": "耗时记录不完整",
   "presentation.status.recorded_execution_time": "已记录执行时长：{v1}",
   "card.effort.recorded_rounds": "已记录 {count} 轮",
-  "card.not_recorded": "未记录"
+  "card.not_recorded": "未记录",
+  "cli.ticket_ci_development_limit_help": "Ticket 累计 CI 开发额度（默认 3）",
+  "cli.ticket_ci_review_help": "审核所有 Ticket CI 修复轮次（默认关闭）",
+  "cli.settings.field.ticket_ci_development_limit": "Ticket CI 开发额度",
+  "cli.settings.field.ticket_ci_review": "Ticket CI 审核",
+  "presentation.status.ticket_ci_usage": "CI 窗口 {window}：累计开发 {used}/{limit}",
+  "guidance.pause.ci_investigation_paused": "CI 调查已完成但未产生代码修改，需要显式 resume 继续",
+  "guidance.pause.ci_development_budget_exhausted": "Ticket 累计 CI 开发额度已用尽，需要显式 resume",
+  "presentation.history.ticket_ci_usage": "CI 窗口 {window}：本轮启动时累计开发 {used}/{limit}"
 }

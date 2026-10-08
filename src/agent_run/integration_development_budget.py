@@ -118,7 +118,11 @@ def require_integration_development_budget(
 
 
 def semantic_attempt_budget(owner: dict[str, Any], attempt: dict[str, Any]) -> object:
-    """Select the independent allowance only for charged integration work."""
+    """Select the independent allowance for CI or charged integration work."""
+    ci_budget = owner.get("ci_recovery")
+    ci_snapshot = attempt.get("budget_snapshot")
+    if isinstance(ci_snapshot, dict) and "ci_developments_used" in ci_snapshot:
+        return ci_budget if isinstance(ci_budget, dict) and "developments_used" in ci_budget else None
     budget = owner.get("integration_development_budget")
     charged = isinstance(budget, dict) and attempt.get("attempt_id") in budget.get("attempt_ids", [])
     snapshot = attempt.get("budget_snapshot")

@@ -70,8 +70,6 @@ def _route_repairable_ci_failure(
     budget = job["ci_recovery"]
     if (
         stage.contract.label.startswith("ticket-")
-        and decision == "repair"
-        and budget["rounds_used"] == 1
         and not budget["review_required"]
     ):
         authorization = previous_publication_authorization(job)
@@ -87,7 +85,9 @@ def _route_repairable_ci_failure(
     else:
         job["phase"] = "escalating"
         job["escalation_code"] = (
-            "ci_inner_budget_exhausted"
+            "ci_development_budget_exhausted"
+            if stage.contract.label.startswith("ticket-")
+            else "ci_inner_budget_exhausted"
             if decision == "inner_exhausted"
             else "ci_outer_budget_exhausted"
         )
@@ -332,6 +332,18 @@ def observe_required_checks(
         ensure_supervision_window(state)
         stage.commit_required_checks_observation(state, job, pr_number)
         return True, checks
+    if checks == "fail" and stage.contract.label.startswith("ticket-") and any(
+        check.get("bucket") == "pending" for check in observation["checks"]
+    ):
+        job["phase"] = "waiting_checks"
+        wait_for_github_convergence(
+            state, code="github_checks_observation_pending",
+            message="GitHub Required Checks still contain pending checks",
+            waiting_for=f"Change PR #{pr_number} Required Checks completion",
+        )
+        ensure_supervision_window(state)
+        stage.commit_required_checks_observation(state, job, pr_number)
+        return True, checks
     if checks == "fail":
         job["phase"] = "waiting_checks"
         wait_for_github_convergence(
@@ -378,7 +390,10 @@ def observe_required_checks(
                 "head_sha": str(job["publication_sha"]),
                 "result": "fail",
             }
-            if not is_explicitly_repairable_code_failure(evidence):
+            if (
+                not stage.contract.label.startswith("ticket-")
+                and not is_explicitly_repairable_code_failure(evidence)
+            ):
                 job["ci_evidence"] = deepcopy(evidence)
                 supervise_unrepairable_check_failure(
                     state,
@@ -431,7 +446,10 @@ def observe_required_checks(
             evidence,
             pr_number=pr_number,
             head_sha=str(job["publication_sha"]),
-        ) or not is_explicitly_repairable_code_failure(evidence):
+        ) or (
+            not stage.contract.label.startswith("ticket-")
+            and not is_explicitly_repairable_code_failure(evidence)
+        ):
             job["ci_evidence"] = canonical_evidence
             supervise_unrepairable_check_failure(
                 state,

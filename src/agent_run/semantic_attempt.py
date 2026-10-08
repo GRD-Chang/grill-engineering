@@ -158,6 +158,22 @@ def allocate_semantic_attempt(
                 "reviewer_invocations": budget.get("reviewer_invocations"),
             }
         )
+    ci_budget = subject.get("ci_recovery")
+    ci_work = (
+        role in {"development", "reviewer"}
+        and work_subject.startswith("ticket:")
+        and (subject.get("pending_attempt_kind") == "ci_repair" if role == "development" else subject.get("attempt_kind") == "ci_repair")
+        and isinstance(ci_budget, dict) and "developments_used" in ci_budget
+    )
+    if ci_work and isinstance(ci_budget, dict):
+        from agent_run.ci_recovery_budget import ci_limits_for_job
+        _, ci_limit = ci_limits_for_job(subject)
+        attempt["budget_snapshot"] = {
+            "window": budget_window,
+            "ci_developments_used": ci_budget["developments_used"],
+            "ci_development_limit": ci_limit,
+            "ci_reviewer_invocations": ci_budget["reviewer_invocations"],
+        }
     subject["pending_semantic_attempt"] = attempt
     history = subject.setdefault("semantic_attempt_history", [])
     if not isinstance(history, list):

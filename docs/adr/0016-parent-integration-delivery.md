@@ -24,13 +24,15 @@ Final Run 批准意图先绑定已验收版本，刷新后由 Publication 核对
 
 Parent-only 的 PR 快照与分支头读取并非原子操作。PR 仓库、分支或状态失配仍按原门禁处理；仅 head/base SHA 尚未一致时，复用有界 GitHub 收敛监督重读完整发布门禁，不能继续使用旧 PR 快照。读取一致后再检查祖先关系及更新授权；读间重试不消耗 resync，持续不一致按既有监督超时暂停，允许显式 resume 后重新核对。
 
-可修复的 Required Checks 失败由每个交付对象独立的 CI 恢复额度处理：默认外层三轮、每轮最多三次开发修复。Ticket 首轮只允许一次修复；本轮使用准确旧发布授权、失败检查证据和新 Candidate 绑定的窄发布收据，不伪造 Reviewer 通过。Ticket 后续轮次与两种 Parent 的 CI 修复均需 Reviewer。CI 额度耗尽只暂停并续期对应层，不改需求开发、Parent 集成或 resync 额度。运行状态分别展示各窗口用量。
+Ticket CI 路径已由 [ADR 0021](0021-ticket-ci-development-loop.md) 取代：准确失败交给定向 Development，默认关闭、全轮可选 Review，并使用独立累计 CI 开发额度。以下旧分类及双层预算仅暂用于两种 Parent；Parent CI 切片负责收敛，不让 Ticket 配置改变完整 Parent 验收或人工批准。
+
+两种 Parent 的可修复 Required Checks 失败仍使用独立 CI 恢复额度：默认外层三轮、每轮最多三次开发修复，均需 Reviewer。额度耗尽只暂停并续期对应层，不改需求开发、Parent 集成或 resync 额度。
 
 多 Ticket Parent 的逻辑 CI 交付对象是 Run：最终 Run PR、内部 Repair PR 与后继提交共用 Run Acceptance 持久化的 `ci_recovery`。活动 Repair Job 持有相同预算快照，完成后由 Run 继续持有；更换内部 PR 或显式恢复不创建另一份额度。CI 修复的次数只记入 CI 内层，普通修复用量从独立 `review_budget` 展示。CI 内层或外层耗尽时，Repair Cycle 一同标记暂停；显式续期只恢复对应 CI 窗口及活动 Cycle，不重置外层累计轮数。
 
 最终 Run PR 的发布检查与批准复查由 `RunPublicationShared` 统一处理 Required Checks 的失败、等待与预算暂停：先保存准确 PR/head 的 Observation，再读取匹配的原始失败证据并回读完整 PR 身份，只有全部失败可修复时才观察 CI 轮次并排队 Run Repair。相同失败 head 重复观察不重复计轮；实际 Development 才扣内层修复次数。pending、unknown、证据未收敛或不可修复故障不进入代码修复，沿用有界外部监督；耗尽后的显式 resume 保留失败 head、原始证据与旧窗口历史，仅续期耗尽层。
 
-共享决策不接管各入口的授权和正式写入。批准仍校验准确批准对象，修复前及合并前分别保留必要回读，正式 Git/GitHub 写入仍由 Publisher 执行。CI 修复使原批准失效，后继结果须经既有 Candidate Acceptance 提升或 fresh Run Acceptance、最终 PR 检查和新批准；局部 Candidate 通过不独立构成正式 Run Acceptance。Ticket 首轮 CI 窄授权与 Parent-only 独立交付语义保持不变。
+共享决策不接管各入口的授权和正式写入。批准仍校验准确批准对象，修复前及合并前分别保留必要回读，正式 Git/GitHub 写入仍由 Publisher 执行。CI 修复使原批准失效，后继结果须经既有 Candidate Acceptance 提升或 fresh Run Acceptance、最终 PR 检查和新批准；局部 Candidate 通过不独立构成正式 Run Acceptance。Ticket CI 免审收据与 Parent-only 独立交付语义各自保持准确对象边界。
 
 ## 理由与边界
 

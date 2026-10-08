@@ -29,6 +29,9 @@ def begin_review(
     boundary: dict[str, Any], budget_window: int,
 ) -> dict[str, Any]:
     ordinal = review_ordinal(job)
+    ci_budget = job.get("ci_recovery")
+    if job.get("attempt_kind") == "ci_repair" and isinstance(ci_budget, dict) and "developments_used" in ci_budget:
+        budget_window = int(ci_budget["window"])
     job["validation_attempts"] = ordinal
     return allocate_semantic_attempt(
         job, role="reviewer", work_subject=work_subject, generation=generation,

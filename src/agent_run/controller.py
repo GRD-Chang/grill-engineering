@@ -1897,7 +1897,7 @@ def _resume_ticket_pause(
         job for job in jobs.values()
         if isinstance(job, dict)
         and job.get("phase") == "blocked"
-        and job.get("blocked_reason") == "ticket_paused"
+        and job.get("blocked_reason") in {"ticket_paused", "ci_investigation_paused"}
         and (ticket_number is None or job.get("ticket_number") == ticket_number)
     ]
     if not paused:
@@ -2041,7 +2041,7 @@ def _resume_ci_recovery_window(
     exhausted = [
         (kind, job) for kind, job in candidates
         if job.get("blocked_reason") in {
-            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }
         and (
             ticket_number is None
@@ -2095,7 +2095,7 @@ def _resume_ci_recovery_window(
             repair_job["next_attempt_kind"] = "ci_repair"
             cycle = job.get("repair_cycle")
             if isinstance(cycle, dict) and cycle.get("ended_reason") in {
-                "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+                "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
             }:
                 cycle["status"] = "active"
                 cycle.pop("ended_reason", None)
@@ -2780,10 +2780,7 @@ def _reactivate_resumed_ticket(state: dict[str, Any]) -> None:
     if number not in frontier:
         frontier.append(number)
         frontier.sort(key=lambda item: order.index(item))
-    if active.get("phase") == "accepted" or (
-        active.get("phase") == "candidate"
-        and active.get("attempt_kind") == "ci_repair"
-    ):
+    if active.get("phase") == "accepted":
         acquire_ticket_slot(state, active)
     state["terminal_kind"] = None
 
@@ -2808,8 +2805,7 @@ def _resume_change_job_owner(
         and isinstance(value.get("integration_conflict"), dict)
         and value.get("blocked_reason") == "agent_requires_human"
     ):
-        # Older paused CI conflicts recorded the pre-review phase as accepted.
-        resume_phase = "candidate"
+        resume_phase = "accepted"
     value.update(
         {
             "phase": resume_phase,
@@ -3111,7 +3107,7 @@ def apply_resume_to_state(
             renew_integration_development_budget(
                 job, policy_snapshot=budget_policy.snapshot(),
             )
-            job["phase"] = "candidate" if job.get("attempt_kind") == "ci_repair" else "accepted"
+            job["phase"] = "accepted"
             job.pop("blocked_reason", None)
             if job["phase"] == "accepted":
                 acquire_ticket_slot(state, job)
@@ -3150,11 +3146,7 @@ def apply_resume_to_state(
                 active_ticket,
                 policy_snapshot=active_ticket["policy_snapshot"],
             )
-            active_ticket["phase"] = (
-                "candidate"
-                if active_ticket.get("attempt_kind") == "ci_repair"
-                else "accepted"
-            )
+            active_ticket["phase"] = "accepted"
             active_ticket.pop("blocked_reason", None)
             if active_ticket["phase"] == "accepted":
                 acquire_ticket_slot(state, active_ticket)

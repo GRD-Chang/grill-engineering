@@ -4,6 +4,10 @@ status: accepted
 
 # Ticket Review 预算耗尽后按仓库 Required Checks 策略确定性集成
 
+## 后续取代：Ticket CI 定向工作与累计额度
+
+Ticket CI 的旧分类准入、首轮免审及外层/内层额度由 [ADR 0021](0021-ticket-ci-development-loop.md) 取代。普通 Ticket fallback 与最终 Parent 完整验收责任保持不变。以下有关旧 CI 特例的内容仅为历史。
+
 ## 后续取代：Issue #307 Parent 集成与独立 CI 恢复
 
 本 ADR 的 Ticket 确定性兜底条件仍适用。关于可修复 Required Checks 失败使用普通 Development/Review 额度及条件式 Final CI-fix、Run 默认 D10/R11 的段落，已由 [ADR 0016](0016-parent-integration-delivery.md) 取代：CI 恢复使用独立外层/内层额度，Ticket 首轮仅一次修复并用窄发布收据，之后轮次与 Parent 修复经 Reviewer；普通 Parent 集成窗口默认 D3/R4。以下保留原决策文本作为历史记录。

@@ -171,11 +171,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def review_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
-        review_base = (
-            delivery_base_sha(job)
-            if job.get("attempt_kind") == "ci_repair"
-            else str(job["base_sha"])
-        )
+        review_base = str(job["base_sha"])
         request = {
             "acceptance_scope": "ticket",
             "parent_issue_url": _parent(state)["url"],
@@ -226,11 +222,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         reviewer_thread_id: str,
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
-        reviewed_base = (
-            delivery_base_sha(job)
-            if job.get("attempt_kind") == "ci_repair"
-            else str(job["base_sha"])
-        )
+        reviewed_base = str(job["base_sha"])
         return {
             "acceptance_scope": "change_job",
             "reviewed_base_sha": reviewed_base,
@@ -246,11 +238,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
-        reviewed_base = (
-            delivery_base_sha(job)
-            if job.get("attempt_kind") == "ci_repair"
-            else job.get("base_sha")
-        )
+        reviewed_base = job.get("base_sha")
         return (
             acceptance.get("reviewed_base_sha") == reviewed_base
             and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")

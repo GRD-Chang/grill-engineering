@@ -106,6 +106,8 @@ _PAUSE_REASONS = {
     'modification_budget_exhausted',
     'published_head_mismatch',
     'review_budget_exhausted',
+    'ci_development_budget_exhausted',
+    'ci_investigation_paused',
     'ci_inner_budget_exhausted',
     'ci_outer_budget_exhausted',
     'reviewer_requires_human',

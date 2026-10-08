@@ -48,6 +48,11 @@ def _budget_facts_for_attempt(
         policy_owner = historical_policy_owner
 
     stored_snapshot = attempt.get("budget_snapshot")
+    if isinstance(stored_snapshot, dict) and "ci_developments_used" in stored_snapshot:
+        return {
+            key: stored_snapshot.get(key)
+            for key in ("window", "ci_developments_used", "ci_development_limit", "ci_reviewer_invocations")
+        }
     if isinstance(stored_snapshot, dict) and stored_snapshot.get("window") == window:
         facts.update(
             {
@@ -192,7 +197,12 @@ def review_artifact_for_attempt(
     candidates: list[dict[str, Any]] = []
     seen_candidates: set[str] = set()
     for owner in owners:
-        budget = review_budget_owner(owner).get("review_budget")
+        snapshot = attempt.get("budget_snapshot")
+        budget = (
+            owner.get("ci_recovery")
+            if isinstance(snapshot, dict) and "ci_developments_used" in snapshot
+            else review_budget_owner(owner).get("review_budget")
+        )
         if not isinstance(budget, dict):
             continue
         if budget.get("window") != attempt.get("budget_window"):

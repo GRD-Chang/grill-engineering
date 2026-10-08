@@ -11,3 +11,5 @@ Ticket Development 与 Fresh Acceptance 绑定创建 Job 时的 base 和 Candida
 集成请求在 Adapter 读取历史 repair input 前选择 `repair_source=integration`，只传当前集成现场，不夹带上一轮 Acceptance 或 CI 修复来源。有效原需求审查或 fallback 凭据不因此被伪造或重置。Parent-only 由 [ADR 0021](0021-parent-only-integration-loop.md) 接入共用集成 Development；Run Repair 保留原冲突合同。
 
 状态协议随新增持久字段切换；旧 Run 在外部写入前按现有 MVP 规则拒绝，不推断缺失额度，也不隐式迁移。实现沿用共享 Engine、Publisher、StateStore 和有限的 Ticket Adapter；Git 集成动作可供后续 Parent 与 CI 路径调用，但本决策不改变它们的业务流程。
+
+Ticket CI 修复先完成同一开发—审核循环，再进入这里的集成；集成不增加 Review。默认关闭及全轮可选审核、累计额度和定向证据合同见 [ADR 0021](0021-ticket-ci-development-loop.md)。

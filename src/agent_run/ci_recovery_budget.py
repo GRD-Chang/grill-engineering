@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-"""Durable, independent limits for repairable Required Checks failures.
+"""Durable independent quotas for Required Checks recovery.
 
 The caller owns phase changes and persistence. This module is the sole writer
 of the CI recovery counters; ordinary development and integration budgets are
 never modified here.
 """
 
+from collections.abc import Mapping
 from typing import Any, Literal, TypedDict, cast
 
 from agent_run.delivery_policy import parse_policy_snapshot
+from agent_run.ticket_ci_budget import (
+    EXHAUSTED, ensure_ticket_ci_budget, mark_ticket_ci_development,
+    new_ticket_ci_recovery_budget as new_ticket_ci_recovery_budget,
+    observe_ticket_ci_failure, renew_ticket_ci_budget,
+)
 
 
-CIRecoveryDecision = Literal["repair", "inner_exhausted", "outer_exhausted"]
+CIRecoveryDecision = Literal["repair", "inner_exhausted", "outer_exhausted", "exhausted"]
 _CHECKPOINTS = {None, "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}
 _FIELDS = frozenset(
     {
@@ -70,6 +76,8 @@ def ci_limits_for_job(
     """Read limits from this Job's frozen Delivery Policy."""
 
     policy = parse_policy_snapshot(job.get("policy_snapshot") or state_snapshot)
+    if "ticket_number" in job or isinstance(job.get("ci_recovery"), dict) and "developments_used" in job["ci_recovery"]:
+        return policy.ticket_ci_development_limit, policy.ticket_ci_development_limit
     return policy.ci_recovery_rounds, policy.ci_repairs_per_round
 
 
@@ -80,16 +88,18 @@ def _limits(outer_limit: int, inner_limit: int) -> None:
         raise ValueError("CI inner limit must be a positive integer")
 
 
-def _inner_limit(budget: CIRecoveryBudget, inner_limit: int, is_ticket: bool) -> int:
-    return 1 if is_ticket and not budget["review_required"] else inner_limit
+def _inner_limit(budget: Mapping[str, Any], inner_limit: int, is_ticket: bool) -> int:
+    return inner_limit
 
 
 def ensure_ci_recovery_budget(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
-) -> CIRecoveryBudget:
+) -> dict[str, Any]:
     """Reject missing or incompatible state rather than infer used attempts."""
 
     _limits(outer_limit, inner_limit)
+    if is_ticket:
+        return ensure_ticket_ci_budget(job, inner_limit)
     raw = job.get("ci_recovery")
     if not isinstance(raw, dict) or set(raw) != _FIELDS:
         raise ValueError("missing canonical ci_recovery")
@@ -138,11 +148,9 @@ def ensure_ci_recovery_budget(
         raise ValueError("ci_recovery.review_artifacts must contain objects")
     if len(artifacts) > budget["reviewer_invocations"]:
         raise ValueError("CI Review Artifacts exceed Reviewer invocations")
-    if is_ticket and budget["rounds_used"] >= 2 and not budget["review_required"]:
-        raise ValueError("Ticket CI review cannot be disabled after round one")
     if not is_ticket and budget["rounds_used"] > 0 and not budget["review_required"]:
         raise ValueError("Parent CI recovery requires Reviewer")
-    return budget
+    return cast(dict[str, Any], budget)
 
 
 def observe_repairable_ci_failure(
@@ -151,6 +159,8 @@ def observe_repairable_ci_failure(
 ) -> CIRecoveryDecision:
     """Open a round only for a new failed version following a charged repair."""
 
+    if is_ticket:
+        return cast(CIRecoveryDecision, observe_ticket_ci_failure(job, head_sha=head_sha, limit=inner_limit))
     if not isinstance(head_sha, str) or not head_sha:
         raise ValueError("CI failure must identify its published head")
     budget = ensure_ci_recovery_budget(
@@ -163,7 +173,7 @@ def observe_repairable_ci_failure(
     if budget["rounds_used"] == 0:
         budget["rounds_used"] = 1
         budget["failure_head"] = head_sha
-        budget["review_required"] = not is_ticket
+        budget["review_required"] = True
     elif head_sha != budget["failure_head"]:
         if not budget["repair_pending"]:
             raise ValueError("new CI failure has no preceding repair version")
@@ -173,8 +183,7 @@ def observe_repairable_ci_failure(
         )
         budget["failure_head"] = head_sha
         budget["repair_pending"] = False
-        # A new failed version needs Reviewer authority even if the outer
-        # window is exhausted before its next round starts.
+        # Parent always retains Reviewer authority.
         budget["review_required"] = True
         if budget["rounds_used"] >= outer_limit:
             budget["checkpoint_reason"] = "ci_outer_budget_exhausted"
@@ -191,6 +200,9 @@ def observe_repairable_ci_failure(
 def can_start_ci_repair(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
 ) -> bool:
+    if is_ticket:
+        ticket_budget = ensure_ticket_ci_budget(job, inner_limit)
+        return ticket_budget["failure_head"] is not None and ticket_budget["checkpoint_reason"] is None and ticket_budget["developments_used"] < inner_limit
     budget = ensure_ci_recovery_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     )
@@ -202,8 +214,11 @@ def can_start_ci_repair(
 
 
 def mark_ci_repair(
-    job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
+    job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool,
+    semantic_work_id: str | None = None,
 ) -> int:
+    if is_ticket:
+        return mark_ticket_ci_development(job, limit=inner_limit, semantic_work_id=semantic_work_id)
     if not can_start_ci_repair(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     ):
@@ -217,7 +232,15 @@ def mark_ci_repair(
 def refund_ci_repair_without_candidate(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
 ) -> None:
-    """Return a reserved repair slot when no code Candidate was produced."""
+    """Settle a no-Candidate investigation; only legacy Parent refunds work."""
+    if is_ticket:
+        ticket_budget = ensure_ticket_ci_budget(job, inner_limit)
+        if not ticket_budget["developments_used"]:
+            raise ValueError("no CI repair attempt to refund")
+        # A completed investigation consumed actual Agent work, even if it
+        # produced no code Candidate. Only observation/waiting is free.
+        ticket_budget["repair_pending"] = False
+        return
     budget = ensure_ci_recovery_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     )
@@ -238,17 +261,17 @@ def ci_review_required(job: dict[str, Any], *, is_ticket: bool) -> bool:
 def ci_reviewer_budget_context(
     job: dict[str, Any], *, inner_limit: int, is_ticket: bool
 ) -> dict[str, int]:
-    """Describe the charged CI repair being reviewed, without ordinary quota."""
+    """Describe the charged CI Development, without ordinary quota."""
 
     budget = job.get("ci_recovery")
     if not isinstance(budget, dict):
         raise ValueError("missing canonical ci_recovery")
-    repairs = budget.get("repairs_used")
+    repairs = budget.get("developments_used" if is_ticket else "repairs_used")
     if type(repairs) is not int or repairs < 1:
         raise ValueError("CI Reviewer requires a charged repair")
-    limit = 1 if is_ticket and not budget.get("review_required") else inner_limit
+    limit = inner_limit
     return {
-        "current_review_attempt": repairs,
+        "current_review_attempt": int(budget["reviewer_invocations"]) + 1 if is_ticket else repairs,
         "remaining_review_attempts": limit - repairs,
     }
 
@@ -269,17 +292,17 @@ def mark_ci_review_invocation(job: dict[str, Any]) -> int:
 def ci_repair_budget_context(
     job: dict[str, Any], *, inner_limit: int, is_ticket: bool
 ) -> dict[str, int]:
-    """Project the active CI round's remaining repair capacity."""
+    """Project remaining CI Development capacity."""
 
     budget = job.get("ci_recovery")
     if not isinstance(budget, dict):
         raise ValueError("missing canonical ci_recovery")
-    repairs = budget.get("repairs_used")
+    repairs = budget.get("developments_used" if is_ticket else "repairs_used")
     if type(repairs) is not int or repairs < 1:
         raise ValueError("CI repair context requires a charged repair")
-    limit = 1 if is_ticket and not budget.get("review_required") else inner_limit
+    limit = inner_limit
     return {
-        "completed_review_attempts": max(0, repairs - 1),
+        "completed_review_attempts": int(budget["reviewer_invocations"]) if is_ticket else max(0, repairs - 1),
         "remaining_review_attempts": limit - repairs,
     }
 
@@ -287,8 +310,14 @@ def ci_repair_budget_context(
 def checkpoint_after_reviewer_failure(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
 ) -> bool:
-    """Return True when another repair in this same CI round is unavailable."""
+    """Return True when another CI Development is unavailable."""
 
+    if is_ticket:
+        ticket_budget = ensure_ticket_ci_budget(job, inner_limit)
+        if ticket_budget["developments_used"] < inner_limit:
+            return False
+        ticket_budget["checkpoint_reason"] = EXHAUSTED
+        return True
     budget = ensure_ci_recovery_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     )
@@ -301,8 +330,10 @@ def checkpoint_after_reviewer_failure(
 def reset_exhausted_ci_budget(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
 ) -> str:
-    """Resume only the exhausted layer; retain the Ticket review upgrade."""
+    """Renew only the exhausted CI allowance, retaining history."""
 
+    if is_ticket:
+        return renew_ticket_ci_budget(job, limit=inner_limit)
     budget = ensure_ci_recovery_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     )
@@ -324,4 +355,4 @@ def reset_exhausted_ci_budget(
     budget["repairs_used"] = 0
     budget["repair_pending"] = False
     budget["checkpoint_reason"] = None
-    return reason
+    return str(reason)

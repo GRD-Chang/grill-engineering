@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.controller import Controller
-from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_loop import TicketDeliveryLoop
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -37,7 +37,7 @@ def test_ticket_escalation_preserves_github_labels(git_repo: Path, reason: str) 
         "policy_snapshot": state["policy_snapshot"],
         "review_budget": new_budget(),
         "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
+        "ci_recovery": new_ticket_ci_recovery_budget(),
     })
     checkout = git_repo / "unused-checkout"
     result = TicketDeliveryLoop(
@@ -62,7 +62,7 @@ def test_running_ticket_keeps_its_place_when_labels_change(git_repo: Path) -> No
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     state, _ = controller.start(1)
     state["active_ticket_job"].update({
-        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ci_recovery_budget(),
+        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(),
     })
     states.save_run(state["run_id"], state)
     data = json.loads(fixture.read_text())
@@ -88,7 +88,7 @@ def test_explicit_entry_rejects_labels_without_consuming_work(
     state, _ = controller.start(1)
     job = state["active_ticket_job"]
     job.update({
-        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ci_recovery_budget(),
+        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(),
     })
     if command == "requeue":
         job.update({
@@ -153,7 +153,7 @@ def test_resume_retry_reuses_only_successful_action_label_qualification(
     state, _ = controller.start(1)
     run_id = state["run_id"]
     state["active_ticket_job"].update({
-        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ci_recovery_budget(),
+        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(),
     })
     states.save_run(run_id, state)
     controller.record_execution_failure(run_id, "interrupted")

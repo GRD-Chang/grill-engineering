@@ -1148,7 +1148,7 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(
     monkeypatch.setattr(development, 'commit_candidate', held_commit)
     monkeypatch.setattr(scheduling, 'wait', observed_dispatch)
     state, states, git, fixture = _run(
-        git_repo, (2,), ci_repairs_per_round=1,
+        git_repo, (2,), ticket_ci_development_limit=1, ticket_ci_review=True,
     )
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data.setdefault("delivery", {}).update({
@@ -1253,17 +1253,17 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(
     assert saved is not None
     job = saved["ticket_jobs"]["2"]
     assert job["phase"] == "blocked"
-    assert job["blocked_reason"] == "ci_inner_budget_exhausted"
-    assert job["ci_recovery"]["checkpoint_reason"] == "ci_inner_budget_exhausted"
+    assert job["blocked_reason"] == "ci_development_budget_exhausted"
+    assert job["ci_recovery"]["checkpoint_reason"] == "ci_development_budget_exhausted"
     assert "2" not in saved["ticket_pause_requests"]
-    assert repairs == [2, 2]
+    assert repairs == [2]
     assert saved["ticket_work_queue"] == []
     assert bind_resume_intent(saved, ticket_number=2)["authorization"] == "renew_ci_recovery"
     observed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"])
     )
-    assert observed["ticket_jobs"]["2"]["blocked_reason"] == "ci_inner_budget_exhausted"
-    assert observed["ticket_jobs"]["2"]["ci_recovery"]["repairs_used"] == 1
+    assert observed["ticket_jobs"]["2"]["blocked_reason"] == "ci_development_budget_exhausted"
+    assert observed["ticket_jobs"]["2"]["ci_recovery"]["developments_used"] == 1
 
 
 def test_one_worker_refills_in_fifo_order(git_repo: Path) -> None:

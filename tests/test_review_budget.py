@@ -11,6 +11,7 @@ from agent_run.ci_recovery_budget import (
     new_ci_recovery_budget,
     observe_repairable_ci_failure,
 )
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_policy import (
     DeliveryPolicy,
     parent_only_budget_policy,
@@ -456,7 +457,7 @@ def test_run_repair_budget_uses_frozen_limits_and_retains_one_history() -> None:
 def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -> None:
     job = _job_with_budget(
         policy_snapshot=DeliveryPolicy().snapshot(),
-        ci_recovery=new_ci_recovery_budget(),
+        ci_recovery=new_ticket_ci_recovery_budget(),
     )
     budget = job["review_budget"]
     budget["development_attempts"] = TICKET_POLICY.development_limit
@@ -471,8 +472,8 @@ def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -
     assert mark_ci_repair(
         job, outer_limit=3, inner_limit=3, is_ticket=True,
     ) == 1
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert job["ci_recovery"]["repairs_used"] == 1
+    assert job["ci_recovery"]["window"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
     assert budget["development_attempts"] == TICKET_POLICY.development_limit
     assert budget["reviewer_invocations"] == TICKET_POLICY.review_limit
 

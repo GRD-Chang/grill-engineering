@@ -182,8 +182,7 @@ def test_public_run_completes_one_independent_ticket_ci_repair(
     assert job["review_budget"]["development_attempts"] == 4
     assert job["review_budget"]["reviewer_invocations"] == 3
     assert job["review_budget"]["final_ci_fix_used"] is False
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert job["ci_recovery"]["repairs_used"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
     assert job["ci_recovery"]["review_required"] is False
     assert job["modification_attempts"] == 5
     assert job["attempt_kind"] == "ci_repair"
@@ -213,8 +212,7 @@ def test_public_run_completes_one_independent_ticket_ci_repair(
     )
     receipt = job["deterministic_integration_record"]["ci_repair_publication_receipt"]
     assert receipt["kind"] == "ticket_ci_repair_publication_receipt"
-    assert receipt["ci_recovery_identity"]["rounds_used"] == 1
-    assert receipt["ci_recovery_identity"]["repairs_used"] == 1
+    assert receipt["ci_recovery_identity"]["developments_used"] == 1
     assert receipt["failure_head"] != job["publication_sha"]
     assert receipt["failure_evidence"]["head_sha"] == receipt["failure_head"]
     failure_check = receipt["failure_evidence"]["checks"][0]
@@ -839,8 +837,7 @@ def test_public_resume_reuses_pending_ticket_ci_repair_attempt(
     assert job["pending_attempt_kind"] == "ci_repair"
     assert job["review_budget"]["development_attempts"] == 4
     assert job["review_budget"]["final_ci_fix_used"] is False
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert job["ci_recovery"]["repairs_used"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
     assert "required_checks_evidence" not in job
     assert "required_checks_evidence" not in job["fallback_publication_receipt"]
     assert job["ci_evidence"]["result"] == "fail"
@@ -884,7 +881,7 @@ def test_public_resume_reuses_pending_ticket_ci_repair_attempt(
     completed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert completed_job["review_budget"]["development_attempts"] == 4
     assert completed_job["review_budget"]["final_ci_fix_used"] is False
-    assert completed_job["ci_recovery"]["repairs_used"] == 1
+    assert completed_job["ci_recovery"]["developments_used"] == 1
     assert completed_job["modification_attempts"] == 5
     assert completed_job["deterministic_integration_record"][
         "required_checks_evidence"
@@ -918,7 +915,7 @@ def test_public_run_does_not_implicitly_resume_ci_budget_checkpoint(
     policy_store = UserDefaultsStore(
         config_home / "agent-run" / "user-defaults.json"
     )
-    policy_store.configure(policy={"ticket_review_rounds": 3, "ci_recovery_rounds": 1})
+    policy_store.configure(policy={"ticket_review_rounds": 3, "ticket_ci_development_limit": 1})
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
@@ -983,17 +980,16 @@ def test_public_run_does_not_implicitly_resume_ci_budget_checkpoint(
     run_id = before["run_id"]
     job_before = before["ticket_jobs"]["3"]
     assert before["status"] == "blocked"
-    assert job_before["blocked_reason"] == "ci_outer_budget_exhausted"
+    assert job_before["blocked_reason"] == "ci_development_budget_exhausted"
     assert job_before.get("pending_semantic_attempt") is None
     assert job_before["review_budget"]["window"] == 1
     assert job_before["review_budget"]["development_attempts"] == 4
     assert job_before["review_budget"]["final_ci_fix_used"] is False
     assert job_before["modification_attempts"] == 5
     ci_before = job_before["ci_recovery"]
-    assert ci_before["outer_window"] == 1
-    assert ci_before["rounds_used"] == 1
-    assert ci_before["repairs_used"] == 1
-    assert ci_before["checkpoint_reason"] == "ci_outer_budget_exhausted"
+    assert ci_before["window"] == 1
+    assert ci_before["developments_used"] == 1
+    assert ci_before["checkpoint_reason"] == "ci_development_budget_exhausted"
     first_failure_head = job_before["ci_repair_publication_receipt"]["failure_head"]
     latest_failure_head = job_before["publication_sha"]
     assert latest_failure_head != first_failure_head
@@ -1105,7 +1101,7 @@ def test_public_run_does_not_implicitly_resume_ci_budget_checkpoint(
     assert completed_job["phase"] == "completed"
     assert json.dumps(completed_job["review_budget"], sort_keys=True) == budget_before
     assert completed["policy_snapshot"]["ticket_review_rounds"] == 3
-    assert completed["policy_snapshot"]["ci_recovery_rounds"] == 1
+    assert completed["policy_snapshot"]["ticket_ci_development_limit"] == 1
     assert completed_job["policy_snapshot"] == completed["policy_snapshot"]
     assert completed_job["review_budget_history"] == []
     assert completed_job["final_ci_fix_failure_head"] == latest_failure_head
@@ -1114,36 +1110,32 @@ def test_public_run_does_not_implicitly_resume_ci_budget_checkpoint(
     assert completed_job["required_checks_evidence"]["result"] == "pass"
     assert completed_job["required_checks_evidence"]["head_sha"] == completed_job["publication_sha"]
     recovery = completed_job["ci_recovery"]
-    assert recovery["outer_window"] == 2
-    assert recovery["rounds_used"] == 1
-    assert recovery["repairs_used"] == 1
-    assert recovery["review_required"] is True
-    assert recovery["reviewer_invocations"] == 1
-    assert recovery["review_artifacts"][-1]["candidate_sha"] == completed_job["candidate_sha"]
+    assert recovery["window"] == 2
+    assert recovery["developments_used"] == 1
+    assert recovery["review_required"] is False
+    assert recovery["reviewer_invocations"] == 0
+    assert recovery["review_artifacts"] == []
     assert recovery["history"][-2:] == [
         {
-            "kind": "round",
-            "round": 1,
-            "repairs_used": 1,
-            "failure_head": first_failure_head,
+            "kind": "failure",
+            "developments_used": 1,
+            "failure_head": latest_failure_head,
         },
         {
             "kind": "resume",
-            "reason": "ci_outer_budget_exhausted",
-            "outer_window": 1,
-            "inner_window": 1,
-            "rounds_used": 1,
-            "repairs_used": 1,
+            "reason": "ci_development_budget_exhausted",
+            "window": 1,
+            "developments_used": 1,
             "failure_head": latest_failure_head,
         },
     ]
     resume_event = completed["resume_audit"]["history"][-1]
     assert resume_event["kind"] == "budget_checkpoint"
-    assert resume_event["failure_code"] == "ci_outer_budget_exhausted"
+    assert resume_event["failure_code"] == "ci_development_budget_exhausted"
     assert resume_event["semantic_attempt_id"] is not None
     assert any(
         attempt["attempt_id"] == resume_event["semantic_attempt_id"]
-        and attempt["budget_window"] == 1
+        and attempt["budget_window"] == 2
         for attempt in completed_job["semantic_attempt_history"]
     )
 

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-"""Exact-version authority for the one Ticket CI repair without a Reviewer."""
+"""Exact-version authority for unreviewed Ticket CI repairs without a Reviewer."""
 
-from typing import Any, NoReturn
+from typing import Any, Callable, NoReturn
 
-from agent_run.required_checks import is_explicitly_repairable_code_failure
 from agent_run.required_checks_observation import (
     failure_evidence_matches_observation,
     require_required_checks_observation,
@@ -26,7 +25,7 @@ def require_ci_repair_publication_authorization(
     candidate_tree: str | None = None,
     require_publication_facts: bool = False,
 ) -> None:
-    """Reject a repair unless a previously authorized PR head failed code CI.
+    """Reject a repair unless a previously authorized PR head failed CI.
 
     The old Acceptance or fallback is evidence about the *old* head. This
     receipt authorizes only the new candidate and never represents a Reviewer
@@ -56,21 +55,19 @@ def require_ci_repair_publication_authorization(
         invalid("CI recovery state is missing")
     expected_recovery = {
         key: recovery.get(key)
-        for key in ("outer_window", "rounds_used", "inner_window", "repairs_used", "failure_head", "repair_pending", "review_required")
+        for key in ("window", "developments_used", "failure_head", "repair_pending", "review_required")
     }
     if (
         recovery_identity != expected_recovery
-        or type(expected_recovery["outer_window"]) is not int
-        or expected_recovery["outer_window"] < 1
-        or expected_recovery["rounds_used"] != 1
-        or type(expected_recovery["inner_window"]) is not int
-        or expected_recovery["inner_window"] < 1
-        or expected_recovery["repairs_used"] != 1
+        or type(expected_recovery["window"]) is not int
+        or expected_recovery["window"] < 1
+        or type(expected_recovery["developments_used"]) is not int
+        or expected_recovery["developments_used"] < 1
         or expected_recovery["repair_pending"] is not True
         or expected_recovery["review_required"] is not False
         or recovery.get("checkpoint_reason") is not None
     ):
-        invalid("is outside the first CI repair round")
+        invalid("is outside an unreviewed CI repair")
     failure_head = receipt.get("failure_head")
     previous = receipt.get("previous_publication_authorization")
     if (
@@ -82,16 +79,19 @@ def require_ci_repair_publication_authorization(
     ):
         invalid("failed head or previous authority is not bound")
     authority = previous.get("authority")
-    if authority not in {"acceptance", "fallback"}:
+    if authority not in {"acceptance", "fallback", "ci_repair"}:
         invalid("previous authority is invalid")
-    _require_previous_publication_authorization(
-        previous,
-        previous_authority=authority,
-        failure_head=failure_head,
-        base_sha=job["base_sha"],
-        effective_revision=job["effective_revision"],
-        location=location,
-    )
+    if authority == "ci_repair":
+        _require_previous_ci_authorization(previous, job, failure_head, invalid)
+    else:
+        _require_previous_publication_authorization(
+            previous,
+            previous_authority=authority,
+            failure_head=failure_head,
+            base_sha=job["base_sha"],
+            effective_revision=job["effective_revision"],
+            location=location,
+        )
     previous_budget = receipt.get("previous_review_budget")
     if previous_budget != job.get("review_budget"):
         invalid("previous Reviewer budget differs from the active Ticket")
@@ -117,7 +117,7 @@ def require_ci_repair_publication_authorization(
             },
             location,
         )
-    elif previous_budget != previous["fallback_receipt"].get("review_budget"):
+    elif authority == "fallback" and previous_budget != previous["fallback_receipt"].get("review_budget"):
         invalid("previous fallback budget is not bound")
     if previous.get("candidate_sha") == job["candidate_sha"] or previous.get("candidate_tree") == tree:
         invalid("has no new candidate code")
@@ -130,15 +130,14 @@ def require_ci_repair_publication_authorization(
     )
     evidence = receipt.get("failure_evidence")
     if (
-        not is_explicitly_repairable_code_failure(evidence)
-        or not failure_evidence_matches_observation(
+        not failure_evidence_matches_observation(
             observation, evidence,
             pr_number=previous["pr_number"], head_sha=failure_head,
         )
         or evidence != job.get("ci_evidence")
         or observation != job.get("required_checks_origin")
     ):
-        invalid("code failure evidence is invalid")
+        invalid("failure evidence is invalid")
     integrity = receipt.get("git_integrity")
     if not isinstance(integrity, dict) or any(
         integrity.get(key) != value for key, value in {
@@ -185,3 +184,36 @@ def require_ci_repair_publication_authorization(
     elif receipt.get("required_checks_evidence") is not None:
         if receipt["required_checks_evidence"] != job.get("required_checks_evidence"):
             invalid("new head Required Checks are not bound")
+
+
+def _require_previous_ci_authorization(
+    previous: dict[str, Any], job: dict[str, Any], failure_head: str, invalid: Callable[[str], NoReturn],
+) -> None:
+    """Validate compact prior CI provenance without recursively growing receipts."""
+    prior = previous.get("fallback_receipt")
+    if (
+        not isinstance(prior, dict)
+        or prior.get("kind") != "ticket_ci_repair_publication_receipt"
+        or previous.get("acceptance_record") is not None
+        or previous.get("publication_sha") != failure_head
+        or previous.get("base_sha") != job.get("base_sha")
+        or previous.get("effective_revision") != job.get("effective_revision")
+        or prior.get("policy_snapshot") != job.get("policy_snapshot")
+        or any(prior.get(key) != previous.get(key) for key in (
+            "base_sha", "candidate_sha", "candidate_tree", "effective_revision", "publication_sha", "pr_number"
+        ))
+    ):
+        invalid("previous CI publication boundary is invalid")
+    require_required_checks_observation(
+        prior.get("required_checks_evidence"),
+        location="previous_ci_publication.required_checks_evidence",
+        expected_pr_number=previous.get("pr_number"), expected_head_sha=failure_head,
+        allowed_results=frozenset({"fail"}),
+    )
+    integrity = prior.get("git_integrity")
+    if not isinstance(integrity, dict) or any(integrity.get(key) != value for key, value in {
+        "status": "pass", "base_sha": previous["base_sha"],
+        "candidate_sha": previous["candidate_sha"], "candidate_tree": previous["candidate_tree"],
+        "base_is_ancestor": "true", "failed_head_is_ancestor": "true",
+    }.items()):
+        invalid("previous CI publication integrity is invalid")

@@ -462,17 +462,22 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
                 isinstance(ci_budget, dict)
                 and isinstance(ci_evidence, dict)
                 and isinstance(required_checks_origin, dict)
-                and type(ci_budget.get("rounds_used")) is int
-                and ci_budget["rounds_used"] > 1
+                and (
+                    type(ci_budget.get("developments_used")) is int
+                    or (type(ci_budget.get("rounds_used")) is int and ci_budget["rounds_used"] > 1)
+                )
                 and isinstance(ci_budget.get("failure_head"), str)
                 and required_checks_origin.get("head_sha") == ci_budget.get("failure_head")
                 and ci_evidence.get("pr_number") == required_checks_origin.get("pr_number")
                 and isinstance(ci_evidence.get("checks"), list)
                 and bool(ci_evidence["checks"])
-                and all(
-                    isinstance(check, dict)
-                    and check.get("repairability") == "code_failure"
-                    for check in ci_evidence["checks"]
+                and (
+                    type(ci_budget.get("developments_used")) is int
+                    or all(
+                        isinstance(check, dict)
+                        and check.get("repairability") == "code_failure"
+                        for check in ci_evidence["checks"]
+                    )
                 )
             )
             if current_ci_failure:

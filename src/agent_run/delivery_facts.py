@@ -147,13 +147,8 @@ def multi_ticket_progress(
             "development_limit": review_rounds + 1 if type(review_rounds) is int else None,
             "reviewer_invocations": review.get("reviewer_invocations") if isinstance(review, dict) else None,
             "review_limit": review_rounds,
-            "ci_rounds_used": ci.get("rounds_used") if isinstance(ci, dict) else None,
-            "ci_rounds_limit": policy_data.get("ci_recovery_rounds"),
-            "ci_repairs_used": ci.get("repairs_used") if isinstance(ci, dict) else None,
-            "ci_repairs_limit": (
-                policy_data.get("ci_repairs_per_round")
-                if isinstance(ci, dict) and ci.get("review_required") is True else 1
-            ),
+            "ci_developments_used": ci.get("developments_used") if isinstance(ci, dict) else None,
+            "ci_development_limit": policy_data.get("ticket_ci_development_limit"),
             "integration_development_used": integration.get("used") if isinstance(integration, dict) else None,
             "integration_development_limit": integration.get("limit") if isinstance(integration, dict) else policy_data.get("ticket_integration_development_limit"),
             "integration_resync_used": resync.get("used") if isinstance(resync, dict) else None,
@@ -170,11 +165,11 @@ def multi_ticket_progress(
             elif reason in {
                 "agent_requires_human", "reviewer_requires_human",
                 "modification_budget_exhausted", "review_budget_exhausted",
-                "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+                "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
                 "integration_development_exhausted",
                 "integration_resync_exhausted",
                 "ticket_execution_failed", "ticket_supervision_timeout",
-                "ticket_paused",
+                "ticket_paused", "ci_investigation_paused",
             }:
                 action = "resume"
         parent = state.get("parent")

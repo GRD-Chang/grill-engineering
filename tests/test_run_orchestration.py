@@ -11,7 +11,7 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
-from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.operator_action_presentation import operator_action_views
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_policy import DeliveryPolicy
@@ -131,7 +131,7 @@ def test_independent_tickets_may_hold_separate_local_operator_gates(
                 "policy_snapshot": dict(state["policy_snapshot"]),
                 "review_budget": new_budget(),
                 "review_budget_history": [],
-                "ci_recovery": new_ci_recovery_budget(),
+                "ci_recovery": new_ticket_ci_recovery_budget(),
                 "blocked_reason": "agent_requires_human",
                 "human_blocker_phase": "candidate",
                 "human_blockers": [f"Ticket {ticket_number} needs maintainer input."],
@@ -321,7 +321,7 @@ def test_canonical_ticket_gate_can_wait_without_an_active_job(
             "policy_snapshot": dict(state["policy_snapshot"]),
             "review_budget": new_budget(),
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     state["active_ticket_job"] = (
@@ -481,7 +481,7 @@ def test_ticket_gate_and_another_active_ticket_are_compatible(git_repo: Path) ->
             "policy_snapshot": dict(state["policy_snapshot"]),
             "review_budget": new_budget(),
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     active = {
@@ -490,7 +490,7 @@ def test_ticket_gate_and_another_active_ticket_are_compatible(git_repo: Path) ->
         "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": new_budget(),
         "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
+        "ci_recovery": new_ticket_ci_recovery_budget(),
     }
     state["ticket_jobs"]["3"] = deepcopy(active)
     state["active_ticket_job"] = deepcopy(active)
@@ -1152,7 +1152,7 @@ def test_requeue_gate_generation_must_match_the_current_change_job(
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": new_budget(),
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     state.update(
@@ -1207,7 +1207,7 @@ def test_pending_semantic_attempt_owner_mismatch_is_rejected_without_invocation(
     job = state["ticket_jobs"]["2"]
     job["review_budget"] = new_budget()
     job["review_budget_history"] = []
-    job["ci_recovery"] = new_ci_recovery_budget()
+    job["ci_recovery"] = new_ticket_ci_recovery_budget()
     allocate_semantic_attempt(
         job,
         role="development",
@@ -1971,7 +1971,7 @@ def test_deterministic_ticket_conflict_allows_independent_frontier(
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     state.update(
@@ -2243,7 +2243,7 @@ def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
     assert delivered["ticket_jobs"]["2"]["phase"] == "completed"
     assert delivered["ticket_jobs"]["3"]["ticket_integration"]["target_sha"] == state["base"]["sha"]
     assert delivered["ticket_jobs"]["2"]["ticket_integration"]["target_sha"] == delivered["ticket_jobs"]["3"]["integrated_sha"]
-    assert delivered["ticket_jobs"]["2"]["ci_recovery"]["rounds_used"] == 1
+    assert delivered["ticket_jobs"]["2"]["ci_recovery"]["developments_used"] == 1
 
 
 def test_run_recovers_after_process_failure_between_tickets(

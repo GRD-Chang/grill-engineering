@@ -13,8 +13,13 @@ from agent_run.state_contract import IncompatibleRunStateError
 from support.conflict_invocations import prepared_conflict, run_conflict
 
 
-@pytest.mark.parametrize("kind", ["ticket", "parent_only", "run_repair"])
-@pytest.mark.parametrize("phase", ["accepted", "candidate"])
+# Ticket CI now finishes Development–Review before integration. Its live
+# integration/conflict boundary is accepted, never an unreviewed candidate;
+# candidate entry remains applicable to the unchanged Parent paths.
+@pytest.mark.parametrize(("kind", "phase"), [
+    ("ticket", "accepted"), ("parent_only", "accepted"),
+    ("parent_only", "candidate"), ("run_repair", "accepted"), ("run_repair", "candidate"),
+])
 def test_conflict_events_round_trip_before_and_after_business_closeout(git_repo: Path, kind: str, phase: str) -> None:
     state, store, job, stage = prepared_conflict(git_repo, kind, phase)
     budget = deepcopy(job["review_budget"])

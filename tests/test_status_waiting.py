@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -216,7 +217,19 @@ def test_waiting_status_shows_current_checks_without_restart_command(
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_multi_ticket_status_details_are_localized_and_read_only(
     waiting_run: tuple[Path, dict[str, Any]], language: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A read-only query still projects live elapsed time. Hold the query clock
+    # constant so equality verifies query determinism rather than wall-clock speed.
+    queried_at = datetime.now(UTC)
+
+    class QueryClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return queried_at.astimezone(tz) if tz is not None else queried_at.replace(tzinfo=None)
+
+    monkeypatch.setattr("agent_run.execution_timing.datetime", QueryClock)
+    monkeypatch.setattr("agent_run.history_facts.datetime", QueryClock)
     repo, state = waiting_run
     state["language"] = language
     state["multi_ticket_protocol"] = 4

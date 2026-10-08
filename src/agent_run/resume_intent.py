@@ -72,7 +72,7 @@ def bind_resume_intent(
         (location, subject)
         for location, subject in gates
         if subject.get("blocked_reason") in {
-            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }
     ]
     human = [
@@ -94,7 +94,7 @@ def bind_resume_intent(
     ticket_pause = [
         (location, subject) for location, subject in gates
         if location.startswith("ticket:")
-        and subject.get("blocked_reason") == "ticket_paused"
+        and subject.get("blocked_reason") in {"ticket_paused", "ci_investigation_paused"}
     ]
     if ticket_number is not None and not any(
         (checkpoints, human, resync, integration_development, ci_recovery, publication_retry,
@@ -134,7 +134,7 @@ def bind_resume_intent(
         reason, authorization = str(ticket_failure[0][1]["blocked_reason"]), "continue_ticket"
         subjects = ticket_failure
     elif ticket_pause:
-        reason, authorization = "ticket_paused", "continue_ticket"
+        reason, authorization = str(ticket_pause[0][1]["blocked_reason"]), "continue_ticket"
         subjects = ticket_pause
     else:
         reason = str(state.get("status"))

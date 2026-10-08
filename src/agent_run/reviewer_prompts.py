@@ -24,6 +24,7 @@ def review_prompt(request: dict[str, Any]) -> str:
         resource(request, "methods/acceptance"),
         task_brief(request, read_issues=True),
         _review_object(request),
+        _ci_repair_evidence(request),
         resource(request, "review/read-only-validation"),
         _integration_evidence(request),
         _previous_review(request),
@@ -40,6 +41,7 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
         resource(request, "review/resume"),
         task_brief(request, read_issues=False),
         _review_object(request),
+        _ci_repair_evidence(request),
         _integration_evidence(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
@@ -50,7 +52,9 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
 def _review_object(request: dict[str, Any]) -> str:
     identity = request.get("current_review_identity")
     facts = identity if isinstance(identity, dict) else {}
-    if request.get("acceptance_scope") != "run":
+    if request.get("work_source") == "ci":
+        description = resource(request, "review/ci-object")
+    elif request.get("acceptance_scope") != "run":
         description = resource(request, "review/commit-object")
     elif request.get("repair_scope") == "run_repair":
         description = (
@@ -67,6 +71,15 @@ def _review_object(request: dict[str, Any]) -> str:
     return "\n".join(
         [description, *_identity_lines(facts, request)]
     )
+
+
+def _ci_repair_evidence(request: dict[str, Any]) -> str:
+    if request.get("work_source") != "ci":
+        return ""
+    evidence = request.get("ci_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("CI Review requires original ci_evidence")
+    return resource(request, "review/ci-repair").format(pretty(evidence))
 
 
 def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[str]:
@@ -91,7 +104,7 @@ def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[s
 def _previous_review(request: dict[str, Any]) -> str:
     artifact = request.get("previous_acceptance_artifact")
     if not isinstance(artifact, dict):
-        return resource(request, "review/initial-baseline")
+        return resource(request, "review/ci-initial-baseline" if request.get("work_source") == "ci" else "review/initial-baseline")
     identity = request.get("previous_review_identity")
     facts = identity if isinstance(identity, dict) else {}
     return resource(request, "review/previous-result").format(

@@ -5,6 +5,7 @@ from typing import Any
 
 
 BLOCKED_MESSAGES = {
+    "ci_investigation_paused": "CI investigation produced no code changes; explicit resume is required",
     "ticket_supervision_timeout": "Ticket external supervision timed out; explicit resume is required",
     "ticket_execution_failed": "Ticket execution failed; explicit resume is required",
     "ticket_paused": "Ticket was paused by the operator; explicit resume is required",
@@ -34,6 +35,7 @@ BLOCKED_MESSAGES = {
     "review_budget_exhausted": (
         "Ticket Review budget requires an explicit new window"
     ),
+    "ci_development_budget_exhausted": "Ticket CI Development allowance requires explicit resume",
     "ci_inner_budget_exhausted": "Ticket CI repair allowance requires explicit resume",
     "ci_outer_budget_exhausted": "Ticket CI recovery allowance requires explicit resume",
     "ticket_close_external_conflict": (

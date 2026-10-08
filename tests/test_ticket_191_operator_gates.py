@@ -14,6 +14,7 @@ from support.workspace import managed_repo, managed_state, prepare_workspace
 
 import agent_run.cli as cli_module
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_retry import MAX_READ_ATTEMPTS
@@ -86,7 +87,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": budget,
         "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
+        "ci_recovery": new_ticket_ci_recovery_budget() if subject_location == "ticket" else new_ci_recovery_budget(),
     }
     if subject_location == "ticket":
         job = state["ticket_jobs"]["2"]
@@ -173,7 +174,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
+        "ci_recovery": new_ticket_ci_recovery_budget() if subject_location == "ticket" else new_ci_recovery_budget(),
     }
     subject["review_budget"]["checkpoint_reason"] = "review_budget_exhausted"
     if subject_location == "ticket":
@@ -680,7 +681,7 @@ def test_ordinary_run_preserves_requeue_required_boundary(
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
             "effective_revision": "stale-revision",
             "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }

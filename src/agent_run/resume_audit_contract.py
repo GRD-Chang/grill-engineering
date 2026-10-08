@@ -10,6 +10,7 @@ from agent_run.semantic_attempt import canonical_fingerprint
 RESUME_AUDIT_KINDS = frozenset(
     {
         "agent_invocation",
+        "ci_investigation",
         "budget_checkpoint",
         "execution_failure",
         "github_refresh_retry",

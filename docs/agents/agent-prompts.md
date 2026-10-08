@@ -216,7 +216,7 @@ summary 简要记录实际命令、结果、验证对象与必要环境，不把
 | Ticket / Parent-only 集成处理 | 按准确 source/target、候选与 HEAD/MERGE_HEAD、现场及失败操作和原始输出处理集成问题，保留双方应交付成果。原需求仅约束本次处理，不重新开发；只整理文件，程序复做 Git 检查、提交和集成。新线程、同轮续接和人工回复均保留 `repair_source=integration`；不注入旧 Acceptance/CI 来源。 | `integration_evidence` 完整现场；Parent-only 集成 Findings 同时携带原始完整 `acceptance_artifact` 和准确集成记录；`stdout_json` / `stderr_json` 可用 JSON 解码恢复原始命令输出 |
 | 合并冲突 | 解决当前工作树中的真实冲突及其对本次范围的直接影响；不借机扩展功能，也不自行执行 merge、rebase 或其他历史写入。 | `merge_conflict_evidence` 原文 |
 
-CI 修复使用独立额度；Worker 只接收准确失败证据和当前修复任务，不由它判断外层/内层计数或发布授权。
+CI 修复使用独立额度；Worker 只接收准确失败证据和当前修复任务，不由它判断累计额度或发布授权。
 Parent-only 集成修复负责当前完整需求与最终组合；Git 问题和 Review Findings 均保留本地、源分支及目标分支成果，不重新开发整套需求。集成 Review 展示准确 source/target/candidate/head/tree 和冲突路径；只有同 Parent、同需求版本的完整基线可作为增量核验依据，旧结论不授权当前新成果。
 
 ## 独立验收
@@ -378,7 +378,7 @@ Standards/Spec 的并行子 Agent 安排沿用 Skill；增加 E2E 责任不额�
 保留包括 `failure_evidence_source` 在内的已有适用字段，不传完整凭据、不生成新的证据包，
 也不把审查次数、预算或后续状态带入文案角色。
 
-Ticket 首轮 CI 修复免审另用 `ci_repair_publication_context`：只提供上次发布版本的
+Ticket CI Review 关闭时各轮均另用 `ci_repair_publication_context`：只提供上次发布版本的
 代码检查失败、当前修复候选和变更差异，明确本候选尚无独立 Reviewer 通过或新版本 CI 结果。
 旧版本的审核与检查不能被表述为本候选的验收或合并许可。
 
@@ -474,3 +474,9 @@ Ticket 首轮 CI 修复免审另用 `ci_repair_publication_context`：只提供�
     不带入初次开发的审查建议。格式修复不重新执行工作。
 11. 对实际渲染 Prompt 做分支覆盖和独立阅读核验，不以机械字数或关键词删减代替语义检查。
     文档行数下降不等于模型 Token 或缺陷率改善；效果需根据后续真实调用另外评价。
+
+## Ticket CI 定向工作
+
+Ticket 的 CI Development 与 CI Review 请求使用 `work_source=ci` 并携带准确 `ci_evidence`（失败 head、检查与可取得的原始日志）。Development 调查根因和直接影响，不预设失败只能修改代码解决，不重新开发整套需求，不削弱有效检查制造通过。Review 只核验该修复、证据及直接回归；初始 Ticket Review、完整 Parent 验收与人工批准不受配置影响。
+
+Review Findings 退回时 `repair_source=acceptance`，仍携带原始 CI 证据和 `work_source=ci`；新会话、同次执行续接及人工 message 保留同一来源。免审成果不生成 Acceptance，文案明确当前候选未独立验收。

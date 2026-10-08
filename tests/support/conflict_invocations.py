@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_run.change_delivery_publication_agent import invocation_boundary, invocation_events
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import Controller
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -29,7 +30,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     base = git.resolve("HEAD")
     common = dict(phase=phase, base_sha=base, candidate_sha=base,
                   review_budget=new_budget(development_attempts=1, reviewer_invocations=0),
-                  review_budget_history=[], ci_recovery=new_ci_recovery_budget(),
+                  review_budget_history=[], ci_recovery=(new_ticket_ci_recovery_budget() if kind == "ticket" else new_ci_recovery_budget()),
                   modification_attempts=1, development_thread_id="conflict-thread")
     if phase == "candidate":
         common["attempt_kind"] = "ci_repair"

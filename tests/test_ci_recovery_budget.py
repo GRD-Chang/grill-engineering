@@ -10,6 +10,7 @@ from agent_run.ci_recovery_budget import (
     ensure_ci_recovery_budget,
     mark_ci_repair,
     new_ci_recovery_budget,
+    new_ticket_ci_recovery_budget,
     observe_repairable_ci_failure,
     refund_ci_repair_without_candidate,
     reset_exhausted_ci_budget,
@@ -20,7 +21,7 @@ def _job() -> dict[str, Any]:
     return {"ci_recovery": new_ci_recovery_budget()}
 
 
-@pytest.mark.parametrize("is_ticket,expected_repairs", [(True, 7), (False, 9)])
+@pytest.mark.parametrize("is_ticket,expected_repairs", [(False, 9)])
 def test_default_ci_recovery_repair_matrix(
     is_ticket: bool, expected_repairs: int
 ) -> None:
@@ -82,52 +83,56 @@ def test_review_rejection_stays_in_round_and_inner_resume_preserves_outer() -> N
     )
 
 
-def test_ticket_review_upgrade_survives_outer_resume() -> None:
-    job = _job()
-    observe_repairable_ci_failure(
-        job, head_sha="first", outer_limit=2, inner_limit=3, is_ticket=True
-    )
-    mark_ci_repair(job, outer_limit=2, inner_limit=3, is_ticket=True)
-    observe_repairable_ci_failure(
-        job, head_sha="second", outer_limit=2, inner_limit=3, is_ticket=True
-    )
-    mark_ci_repair(job, outer_limit=2, inner_limit=3, is_ticket=True)
+@pytest.mark.parametrize("review_enabled", [False, True])
+def test_ticket_ci_uses_one_cumulative_budget_and_stable_review(review_enabled: bool) -> None:
+    job = {"ci_recovery": new_ticket_ci_recovery_budget(review_required=review_enabled)}
+    for number in range(1, 4):
+        assert observe_repairable_ci_failure(
+            job, head_sha=f"failure-{number}", outer_limit=3, inner_limit=3, is_ticket=True
+        ) == "repair"
+        assert ci_review_required(job, is_ticket=True) is review_enabled
+        # Re-observing facts never charges work.
+        assert observe_repairable_ci_failure(
+            job, head_sha=f"failure-{number}", outer_limit=3, inner_limit=3, is_ticket=True
+        ) == "repair"
+        assert mark_ci_repair(
+            job, outer_limit=3, inner_limit=3, is_ticket=True,
+            semantic_work_id=f"work-{number}",
+        ) == number
+        # Interrupted work resumes its semantic identity, even at the limit.
+        assert mark_ci_repair(
+            job, outer_limit=3, inner_limit=3, is_ticket=True,
+            semantic_work_id=f"work-{number}",
+        ) == number
     assert observe_repairable_ci_failure(
-        job, head_sha="third", outer_limit=2, inner_limit=3, is_ticket=True
-    ) == "outer_exhausted"
+        job, head_sha="failure-4", outer_limit=3, inner_limit=3, is_ticket=True
+    ) == "exhausted"
+    assert job["ci_recovery"]["developments_used"] == 3
     assert reset_exhausted_ci_budget(
-        job, outer_limit=2, inner_limit=3, is_ticket=True
-    ) == "ci_outer_budget_exhausted"
-    assert job["ci_recovery"]["outer_window"] == 2
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert ci_review_required(job, is_ticket=True)
-    assert mark_ci_repair(
-        job, outer_limit=2, inner_limit=3, is_ticket=True
-    ) == 1
+        job, outer_limit=3, inner_limit=3, is_ticket=True
+    ) == "ci_development_budget_exhausted"
+    assert job["ci_recovery"]["window"] == 2
+    assert reset_exhausted_ci_budget(
+        job, outer_limit=3, inner_limit=3, is_ticket=True
+    ) == ""
+    assert job["ci_recovery"]["window"] == 2
+    assert ci_review_required(job, is_ticket=True) is review_enabled
+    assert mark_ci_repair(job, outer_limit=3, inner_limit=3, is_ticket=True) == 1
 
 
-def test_first_ticket_ci_round_outer_exhaustion_upgrades_review_before_resume() -> None:
-    job = _job()
-    assert observe_repairable_ci_failure(
-        job, head_sha="first", outer_limit=1, inner_limit=3, is_ticket=True
-    ) == "repair"
-    mark_ci_repair(job, outer_limit=1, inner_limit=3, is_ticket=True)
-
-    assert observe_repairable_ci_failure(
-        job, head_sha="second", outer_limit=1, inner_limit=3, is_ticket=True
-    ) == "outer_exhausted"
-    budget = ensure_ci_recovery_budget(
-        job, outer_limit=1, inner_limit=3, is_ticket=True
-    )
-    assert budget["failure_head"] == "second"
-    assert budget["review_required"] is True
-    assert budget["checkpoint_reason"] == "ci_outer_budget_exhausted"
-
-    reset_exhausted_ci_budget(
-        job, outer_limit=1, inner_limit=3, is_ticket=True
-    )
-    assert ci_review_required(job, is_ticket=True)
-    assert mark_ci_repair(job, outer_limit=1, inner_limit=3, is_ticket=True) == 1
+def test_ticket_review_findings_consume_the_same_ci_allowance() -> None:
+    job = {"ci_recovery": new_ticket_ci_recovery_budget(review_required=True),
+           "review_budget": {"development_used": 100},
+           "integration_recovery": {"developments_used": 100}}
+    observe_repairable_ci_failure(job, head_sha="first", outer_limit=2, inner_limit=2, is_ticket=True)
+    mark_ci_repair(job, outer_limit=2, inner_limit=2, is_ticket=True)
+    assert not checkpoint_after_reviewer_failure(job, outer_limit=2, inner_limit=2, is_ticket=True)
+    mark_ci_repair(job, outer_limit=2, inner_limit=2, is_ticket=True)
+    assert checkpoint_after_reviewer_failure(job, outer_limit=2, inner_limit=2, is_ticket=True)
+    assert job["ci_recovery"]["checkpoint_reason"] == "ci_development_budget_exhausted"
+    reset_exhausted_ci_budget(job, outer_limit=2, inner_limit=2, is_ticket=True)
+    assert job["review_budget"] == {"development_used": 100}
+    assert job["integration_recovery"] == {"developments_used": 100}
 
 
 def test_same_head_replay_and_unstarted_refund_do_not_spend_a_round() -> None:
@@ -160,5 +165,15 @@ def test_missing_or_incompatible_ci_budget_fails_closed() -> None:
     job["ci_recovery"]["repairs_used"] = 1
     with pytest.raises(ValueError, match="unused CI recovery"):
         ensure_ci_recovery_budget(
-            job, outer_limit=3, inner_limit=3, is_ticket=True
+            job, outer_limit=3, inner_limit=3, is_ticket=False
         )
+
+
+def test_ticket_ci_investigation_without_code_still_consumes_development() -> None:
+    job = {"ci_recovery": new_ticket_ci_recovery_budget()}
+    observe_repairable_ci_failure(job, head_sha="failed", outer_limit=1, inner_limit=1, is_ticket=True)
+    mark_ci_repair(job, outer_limit=1, inner_limit=1, is_ticket=True)
+    refund_ci_repair_without_candidate(job, outer_limit=1, inner_limit=1, is_ticket=True)
+    assert job["ci_recovery"]["developments_used"] == 1
+    assert not job["ci_recovery"]["repair_pending"]
+    assert observe_repairable_ci_failure(job, head_sha="failed", outer_limit=1, inner_limit=1, is_ticket=True) == "exhausted"

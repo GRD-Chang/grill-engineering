@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.controller import Controller
-from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
@@ -383,7 +383,7 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
-            "ci_recovery": new_ci_recovery_budget(),
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     cleanup_job = state["ticket_jobs"]["2"]

@@ -703,7 +703,7 @@ def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
     assert prompts[0].replace("required-checks-ordinary", "CHECKOUT") == prompts[1].replace(
         "required-checks-final_ci_fix", "CHECKOUT"
     )
-    assert "下列检查失败对应当前提交" in prompts[0]
+    assert "准确失败版本的 CI 问题" in prompts[0]
     assert "EXACT_HEAD_CI_EVIDENCE" in prompts[0]
     assert "默认不再组织独立审查" in prompts[0]
 
@@ -1300,7 +1300,7 @@ def test_run_prompts_describe_run_scope_without_controller_private_records(
         name="run-acceptance",
     )
 
-    assert "下列检查失败对应当前提交" in checks_repair
+    assert "准确失败版本的 CI 问题" in checks_repair
     assert "多个子任务的整体结果" in checks_repair
     assert "具体任务的标题、正文和验收条件确定本次范围" not in checks_repair
     assert "Completion Record" not in run_acceptance
