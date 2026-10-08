@@ -31,6 +31,7 @@ from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git_errors import GitError, GitIntegrityError
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import repair_budget_context
+from agent_run.integration_development_budget import acquire_integration_development
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -64,7 +65,7 @@ def develop(
         isinstance(pending, int)
         and pending > int(job.get("modification_attempts", 0))
     )
-    if not pending_resume:
+    if not pending_resume and attempt_kind != "integration":
         stage.mark_development_attempt(job, attempt_kind=attempt_kind)
     # Persist the actual Worker attempt before invoking Codex.  This
     # makes a foreground status query truthful even while Codex is still
@@ -79,7 +80,7 @@ def develop(
     else:
         job["managed_checkout_head"] = stage.git.checkout_head(checkout)
     work_subject, generation = stage.adapter.invocation_identity(state, job)
-    budget = job.get("review_budget")
+    budget = job.get("integration_development_budget" if attempt_kind == "integration" else "review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Development is missing its Review Budget Window")
     new_semantic_attempt = pending_semantic_attempt(job, role="development") is None
@@ -92,6 +93,9 @@ def develop(
         ordinal=attempt,
         budget_window=int(budget["window"]),
     )
+    if attempt_kind == "integration":
+        acquire_integration_development(job, attempt_id=semantic_attempt["attempt_id"],
+            policy_snapshot=job["policy_snapshot"])
     select_development_thread(state, job, new_attempt=new_semantic_attempt)
     intent = job.get("candidate_commit_intent")
     if not (
@@ -110,7 +114,7 @@ def develop(
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
     request["_prompt_resources"] = state["prompt_resources"]
-    if request.get("repair_source") is not None:
+    if request.get("repair_source") is not None and attempt_kind != "integration":
         if attempt_kind == "ci_repair":
             _, inner_limit = ci_limits_for_job(job)
             request["review_budget_context"] = ci_repair_budget_context(
@@ -296,6 +300,13 @@ def commit_candidate(
         }
     )
     job.pop("next_attempt_kind", None)
+    if job["attempt_kind"] == "integration":
+        # Integration findings go back to Git checks before any next review.
+        job["phase"] = "accepted"
+        if isinstance(job.get("acceptance_record"), dict):
+            job["previous_parent_acceptance_record"] = job["acceptance_record"]
+        job.pop("acceptance_record", None)
+        job.pop("approval_grant", None)
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
     semantic_attempt = pending_semantic_attempt(job, role="development")
@@ -322,6 +333,8 @@ def _route_git_integrity_repair(
     evidence: dict[str, str],
 ) -> bool:
     """Return an integrity finding to the same Development Thread."""
+
+    integration_work = job.get("pending_attempt_kind") == "integration"
 
     expected_head = evidence.get("expected_head") or job.get("managed_checkout_head")
     if not isinstance(expected_head, str) or not expected_head:
@@ -358,6 +371,8 @@ def _route_git_integrity_repair(
     job.pop("pending_attempt", None)
     job.pop("pending_attempt_kind", None)
     job.pop("next_attempt_kind", None)
+    if integration_work:
+        job["next_attempt_kind"] = "integration"
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
     semantic_attempt = pending_semantic_attempt(job, role="development")

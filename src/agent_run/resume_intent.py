@@ -65,7 +65,7 @@ def bind_resume_intent(
     ]
     integration_development = [
         (location, subject) for location, subject in gates
-        if location.startswith("ticket:")
+        if (location.startswith("ticket:") or location == "parent")
         and subject.get("blocked_reason") == "integration_development_exhausted"
     ]
     ci_recovery = [

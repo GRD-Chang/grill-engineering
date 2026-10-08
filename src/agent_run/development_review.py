@@ -36,6 +36,7 @@ def review_is_due(job: dict[str, Any], policy: ReviewBudgetPolicy) -> bool:
     """An interrupted semantic review may finish even at the window ceiling."""
     return (
         pending_semantic_attempt(job, role="reviewer") is not None
+        or job.get("parent_integration_stage") is True
         or job.get("attempt_kind") == "ci_repair"
         or can_start_review(job, policy)
     )
@@ -53,6 +54,8 @@ def after_review(
         return ReviewDecision.ACCEPT
     if artifact.requires_human:
         return ReviewDecision.HUMAN
+    if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
+        return ReviewDecision.REPAIR
     if job.get("attempt_kind") == "ci_repair":
         outer_limit, inner_limit = ci_limits_for_job(job)
         if checkpoint_after_reviewer_failure(

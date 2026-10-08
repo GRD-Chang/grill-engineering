@@ -17,6 +17,9 @@ from typing import Any, Callable
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.development_review import advance_development_review
+from agent_run.integration_development_budget import (
+    IntegrationDevelopmentExhausted, ensure_integration_development_available,
+)
 from agent_run.delivery_step import AgentWorkRequired, DeliveryStep, DeliveryStepKind
 from agent_run.change_delivery_integration import prepare_delivery_integration
 from agent_run.change_development_review import ChangeDevelopmentReview
@@ -386,10 +389,19 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
-        if attempt_kind not in {"ordinary", "ci_repair"}:
+        if attempt_kind not in {"ordinary", "ci_repair", "integration"}:
             raise ValueError(f"unknown Development attempt kind: {attempt_kind}")
         if pending_semantic_attempt(job, role="development") is None:
-            if attempt_kind == "ci_repair":
+            if attempt_kind == "integration":
+                try:
+                    ensure_integration_development_available(job, policy_snapshot=job["policy_snapshot"])
+                except IntegrationDevelopmentExhausted:
+                    self._block(state, job, "integration_development_exhausted",
+                        "Parent integration Development allowance is exhausted; resume explicitly")
+                    state["terminal_kind"] = "waiting_human"
+                    self.save(state)
+                    return
+            elif attempt_kind == "ci_repair":
                 outer_limit, inner_limit = ci_limits_for_job(job)
                 if not can_start_ci_repair(
                     job,
@@ -572,6 +584,15 @@ class ChangeDeliveryEngine:
         ):
             return
         semantic_role = semantic_attempt.get("role")
+        integration_budget = job.get("integration_development_budget")
+        if (semantic_role == "development" and isinstance(integration_budget, dict)
+            and semantic_attempt["attempt_id"] in integration_budget["attempt_ids"]):
+            integration_budget["attempt_ids"].remove(semantic_attempt["attempt_id"])
+            integration_budget["used"] -= 1
+            job.pop("pending_attempt", None)
+            job.pop("pending_attempt_kind", None)
+            release_semantic_attempt(job)
+            return
         if (
             semantic_role == "development"
             and job.get("phase") in {"developing", "repairing"}

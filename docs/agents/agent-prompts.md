@@ -213,11 +213,11 @@ summary 简要记录实际命令、结果、验证对象与必要环境，不把
 | Git 完整性问题 | 程序接收工作树时发现了下列可在当前目录修复的完整性问题。根据证据整理文件树，只处理问题及其直接影响；不通过 commit、reset、rebase、merge 或 push 改变历史。 | `git_integrity_evidence` 原文 |
 | CI 失败 | 下列检查失败对应当前提交，并已被确定为可修改代码解决的问题。修复根因，保持有效测试、断言与检查意图。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。 | `ci_evidence` 完整原始 JSON |
 | 维护者修订 | 根据维护者原始反馈，结合当前需求和代码核验影响，完成本次所需的修复，不扩展无关功能。 | `human_feedback` 原文 |
-| Ticket 集成处理 | 按准确 source/target、候选与 HEAD/MERGE_HEAD、现场及失败操作和原始输出处理集成问题，保留双方应交付成果。原需求仅约束本次处理，不重新开发；只整理文件，程序复做 Git 检查、提交和集成。新线程、同轮续接和人工回复均保留 `repair_source=integration`；不注入旧 Acceptance/CI 来源。 | `integration_evidence` 完整现场；`stdout_json` / `stderr_json` 可用 JSON 解码恢复原始命令输出 |
+| Ticket / Parent-only 集成处理 | 按准确 source/target、候选与 HEAD/MERGE_HEAD、现场及失败操作和原始输出处理集成问题，保留双方应交付成果。原需求仅约束本次处理，不重新开发；只整理文件，程序复做 Git 检查、提交和集成。新线程、同轮续接和人工回复均保留 `repair_source=integration`；不注入旧 Acceptance/CI 来源。 | `integration_evidence` 完整现场；Parent-only 集成 Findings 同时携带原始完整 `acceptance_artifact` 和准确集成记录；`stdout_json` / `stderr_json` 可用 JSON 解码恢复原始命令输出 |
 | 合并冲突 | 解决当前工作树中的真实冲突及其对本次范围的直接影响；不借机扩展功能，也不自行执行 merge、rebase 或其他历史写入。 | `merge_conflict_evidence` 原文 |
 
 CI 修复使用独立额度；Worker 只接收准确失败证据和当前修复任务，不由它判断外层/内层计数或发布授权。
-完整需求的集成修复沿用“多个子任务的整体结果”范围，不能只证明局部修复可用。
+Parent-only 集成修复负责当前完整需求与最终组合；Git 问题和 Review Findings 均保留本地、源分支及目标分支成果，不重新开发整套需求。集成 Review 展示准确 source/target/candidate/head/tree 和冲突路径；只有同 Parent、同需求版本的完整基线可作为增量核验依据，旧结论不授权当前新成果。
 
 ## 独立验收
 

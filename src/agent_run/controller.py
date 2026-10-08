@@ -3089,6 +3089,15 @@ def apply_resume_to_state(
         budget_resumed = ticket_execution_resumed
     if explicit_resume and not budget_resumed and ticket_number is None:
         budget_resumed = _resume_run_repair_integration(state)
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        parent_job = state.get("parent_job")
+        if (isinstance(parent_job, dict) and parent_job.get("phase") == "blocked"
+            and parent_job.get("blocked_reason") == "integration_development_exhausted"):
+            renew_integration_development_budget(parent_job, policy_snapshot=budget_policy.snapshot())
+            parent_job["phase"] = "repairing" if parent_job.get("next_attempt_kind") == "integration" else "accepted"
+            parent_job.pop("blocked_reason", None)
+            state.update({"status": "parent_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            budget_resumed = True
     if explicit_resume and not budget_resumed:
         jobs = state.get("ticket_jobs", {})
         integration_jobs = [

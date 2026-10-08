@@ -2,13 +2,33 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from agent_run.git import GitError, GitRepository
+from agent_run.git import GitError, GitIntegrationResult, GitRepository
 from agent_run.github_publish import GhGitHubPublisher
+from agent_run.state import StateStore
+
+
+def _assert_durable_conflict_evidence(
+    result: GitIntegrationResult, checkout: Path, incoming: str, tmp_path: Path,
+) -> None:
+    evidence = result.failure_evidence
+    assert evidence is not None
+    assert evidence["operation"] == "integrate_remote_heads"
+    assert evidence["checkout"] == str(checkout)
+    assert evidence["command"] == ["git", "merge", "--no-ff", "--no-edit", incoming]
+    assert evidence["returncode"] == 1
+    assert "stdout" not in evidence and "stderr" not in evidence
+    assert "CONFLICT" in json.loads(evidence["stdout_json"])
+    assert json.loads(evidence["stderr_json"]) == ""
+    store = StateStore(tmp_path / "conflict-state")
+    state = {"failure": evidence}
+    store.save_run("conflict", state)
+    assert store.load_run("conflict") == state
 
 
 def _git(root: Path, *args: str) -> str:
@@ -88,6 +108,7 @@ def test_real_conflict_keeps_resolution_scene_and_commits_both_parents(
     assert result.conflict_paths == ("README.md",)
     assert result.head_sha == candidate
     assert result.merge_head_sha == source
+    _assert_durable_conflict_evidence(result, git_repo, source, tmp_path)
     assert _git(git_repo, "rev-parse", "MERGE_HEAD") == source
     assert git.integrate_remote_heads(
         git_repo, candidate_sha=candidate, source_sha=source, target_sha=target
@@ -130,6 +151,7 @@ def test_target_conflict_retains_clean_source_merge_as_first_parent(
     assert result.conflict_stage == "target"
     assert result.conflict_paths == ("README.md",)
     assert result.merge_head_sha == target
+    _assert_durable_conflict_evidence(result, git_repo, target, tmp_path)
     assert git.is_ancestor(candidate, result.head_sha)
     assert git.is_ancestor(source, result.head_sha)
     (git_repo / "README.md").write_text("agent and target\n", encoding="utf-8")

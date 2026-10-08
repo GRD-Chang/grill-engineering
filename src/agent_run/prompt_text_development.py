@@ -2,13 +2,13 @@
 
 TEXTS: dict[str, dict[str, str]] = {
     'development/repair-integration': {
-        'zh': """你负责当前 Ticket 的本地集成处理。下面记录准确源/目标版本、工作区现场及程序实际失败证据。调查并处理失败及直接影响，保留原 Ticket、本地候选、源分支与目标分支应交付的成果。原需求用于约束本次处理，不重新开发整套需求。
+        'zh': """你负责当前交付对象的本地集成处理。下面记录准确源/目标版本、工作区现场及程序实际失败证据。调查并处理失败及直接影响，保留原任务、本地候选、源分支与目标分支应交付的成果。原需求用于约束本次处理，不重新开发整套需求。
 
 保持现场中的 Git 历史与合并元数据，只整理文件内容并验证受影响功能；不要自行暂存、commit、merge、reset、rebase、push 或执行 GitHub 写入。不得削弱有效检查来制造通过。程序随后重新执行实际 Git 检查、提交及集成；你的成功说明不能替代这些结果。新会话或人工消息仍继续这项集成工作。
 
 {0}（完整原始证据）：
 {1}""",
-        'en': """You are responsible for local integration of the current Ticket. The following records exact source and target revisions, the checkout scene and actual program failure evidence. Investigate and resolve the failure and direct effects while preserving deliverable contributions from the original Ticket, local candidate, source branch and target branch. Original requirements constrain this work; do not redevelop the full requirements.
+        'en': """You are responsible for local integration of the current delivery object. The following records exact source and target revisions, the checkout scene and actual program failure evidence. Investigate and resolve the failure and direct effects while preserving deliverable contributions from the original task, local candidate, source branch and target branch. Original requirements constrain this work; do not redevelop the full requirements.
 
 Preserve Git history and merge metadata. Prepare file contents and validate affected functionality; do not stage, commit, merge, reset, rebase, push or perform GitHub writes. Do not weaken valid checks to manufacture a pass. The program will rerun actual Git checks, commit and integration; your success summary cannot replace these results. A new session or human message continues this integration work.
 

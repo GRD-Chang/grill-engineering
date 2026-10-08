@@ -45,7 +45,9 @@ def consume_review_result(
     if attempt is None:
         raise ValueError("Reviewer result is missing its Semantic Attempt")
     if attempt.get("budget_consumed") is not True:
-        if job.get("attempt_kind") == "ci_repair":
+        if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
+            pass  # Review is bounded by cumulative integration Development.
+        elif job.get("attempt_kind") == "ci_repair":
             mark_ci_review_invocation(job)
         else:
             mark_review(job, policy)

@@ -56,7 +56,7 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
         successor_seen = False
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if request.get("repair_source") != "merge_conflict":
+            if request.get("repair_source") != "integration":
                 return super().develop(request)
             assert "acceptance_artifact" not in request
             assert "ci_evidence" not in request
@@ -93,7 +93,7 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
                 assert git.is_ancestor(source, job["candidate_sha"])
                 assert git.is_ancestor(candidate, job["candidate_sha"])
                 assert job["previous_parent_acceptance_record"] == acceptance
-                assert job["review_budget_history"][0]["review_budget"] == budget
+                assert job["review_budget"] == budget
                 assert job["ci_recovery"] == ci_budget
                 assert any(item["attempt_id"] == attempt["attempt_id"] and item["outcome"] == "integration_conflict_resolved"
                            for item in job["semantic_attempt_history"])

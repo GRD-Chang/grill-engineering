@@ -259,7 +259,6 @@ def _validate_budget_history(
             # round limit.
             from agent_run.delivery_policy import (
                 parent_only_budget_policy,
-                parent_integration_budget_policy,
                 parse_policy_snapshot,
                 run_repair_budget_policy,
                 ticket_review_budget_policy,
@@ -271,11 +270,7 @@ def _validate_budget_history(
                     ticket_review_budget_policy(parsed_snapshot)
                     if policy.budget_scope == "ticket"
                     else (
-                        (
-                            parent_integration_budget_policy(parsed_snapshot)
-                            if snapshot.get("parent_integration_stage") is True
-                            else parent_only_budget_policy(parsed_snapshot)
-                        )
+                        parent_only_budget_policy(parsed_snapshot)
                         if policy.budget_scope == "parent-only"
                         else run_repair_budget_policy(parsed_snapshot)
                     )

@@ -322,17 +322,6 @@ def parent_only_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
     )
 
 
-def parent_integration_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
-    """Review-first Parent delivery window, independent of demand development."""
-
-    return ReviewBudgetPolicy(
-        development_limit=policy.run_repair_rounds,
-        review_limit=policy.run_repair_rounds + 1,
-        fallback=False,
-        budget_scope="parent-only",
-    )
-
-
 def run_repair_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
     """Derive the Run D(N)/R(N+1) review-first topology."""
 
@@ -372,18 +361,10 @@ def parent_only_budget_policy_for_job(
     if raw is None:
         # Keep the direct engine seam usable for legacy unit callers; the
         # persisted State contract rejects a missing Run Policy Snapshot.
-        return (
-            ReviewBudgetPolicy(3, 4, budget_scope="parent-only")
-            if job.get("parent_integration_stage") is True
-            else PARENT_ONLY_POLICY
-        )
+        return PARENT_ONLY_POLICY
     try:
         policy = parse_policy_snapshot(raw)
-        return (
-            parent_integration_budget_policy(policy)
-            if job.get("parent_integration_stage") is True
-            else parent_only_budget_policy(policy)
-        )
+        return parent_only_budget_policy(policy)
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Parent-only Policy Snapshot: {error}") from error
 

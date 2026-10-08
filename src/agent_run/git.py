@@ -959,7 +959,11 @@ class GitRepository:
                         merge_head_sha=incoming,
                         failure_evidence={
                             "operation": "integrate_remote_heads", "checkout": str(checkout),
-                            **failed_evidence,
+                            # StateStore removes raw output fields. Keep only
+                            # their escaped copies so returned and durable
+                            # conflict scenes have the same representation.
+                            **{key: value for key, value in failed_evidence.items()
+                               if key not in {"stdout", "stderr"}},
                             "stdout_json": json.dumps(merged.stdout, ensure_ascii=False),
                             "stderr_json": json.dumps(merged.stderr, ensure_ascii=False),
                         },

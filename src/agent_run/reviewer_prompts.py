@@ -100,6 +100,8 @@ def _previous_review(request: dict[str, Any]) -> str:
 
 
 def _integration_evidence(request: dict[str, Any]) -> str:
+    if request.get("acceptance_scope") == "parent_only" and isinstance(request.get("integration_record"), dict):
+        return resource(request, "review/parent-integration").format(pretty(request["integration_record"]))
     if request.get("acceptance_scope") != "run":
         return ""
     evidence = prompt_context(

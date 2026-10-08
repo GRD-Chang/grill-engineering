@@ -92,7 +92,7 @@ Runner App 复用相同的签发与续签实现，后续 Controller、Publisher 
 | --- | --- | --- |
 | `ticket_review_rounds` / `--ticket-review-rounds` | 3 | 正整数 N；普通需求开发最多 N+1 次，审核最多 N 次；CI 恢复使用独立额度 |
 | `parent_only_paired_rounds` / `--parent-only-paired-rounds` | 10 | 正整数 N；开发与审核各最多 N 次配对 |
-| `run_repair_rounds` / `--run-repair-rounds` | 3 | 正整数 N；Parent 集成窗口先审核一次，最多 N 次问题修复和复审，合计最多 N+1 次审核；纯冲突处理不计入 |
+| `run_repair_rounds` / `--run-repair-rounds` | 3 | 正整数 N；Parent-only 的 Git 与集成 Findings 共用累计 N 次 Development，远端追加不重置，resume 仅续期耗尽额度；多 Ticket Parent 保留既有集成窗口 |
 | `ticket_integration_development_limit` / `--ticket-integration-development-limit` | 3 | 正整数；Ticket 集成 Development 累计额度，包含冲突处理。中断续接不重复扣费，显式 resume 追加对应额度并保留累计用量 |
 | `integration_resync_limit` / `--integration-resync-limit` | 3 | 非负整数；首次集成后，同一交付对象最多自动重新同步的次数。仅外部源/目标分支新快照计数 |
 | `ci_recovery_rounds` / `--ci-recovery-rounds` | 3 | 正整数 N；每个交付对象最多 N 轮可恢复 CI 失败 |

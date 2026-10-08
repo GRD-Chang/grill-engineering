@@ -23,7 +23,8 @@ def prepare_delivery_integration(
 
     A false result hands the changed durable phase back to orchestration.
     Ordinary Ticket integration preserves demand acceptance. Parent adapters
-    retain their complete acceptance scopes and separate integration windows.
+    retain their complete acceptance scopes; Parent-only integration work uses
+    its cumulative allowance independently of demand and CI.
     """
     label = engine.contract.label
     if label.startswith("ticket-"):

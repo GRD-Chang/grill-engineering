@@ -64,6 +64,8 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     elif kind == "parent_only":
         job = common
         job["parent_generation"] = 1
+        job["parent_branch"] = "parent"
+        job["policy_snapshot"] = dict(state["policy_snapshot"])
         if phase == "candidate":
             job["parent_integration"] = dict(
                 candidate_sha=base, candidate_tree=git.resolve(f"{base}^{{tree}}"),
@@ -81,7 +83,8 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         subject = f"run-repair:{state['run_id']}"
         key = "run_repair_integration_conflict"
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,
-                    stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0)
+                    stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0,
+                    resolved_stages=[], conflict_paths=["README.md"])
     stage = SimpleNamespace(
         require_agent_work=lambda _role: None,
         release_agent_work=lambda: None,
@@ -95,7 +98,9 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         _invocation_boundary=invocation_boundary,
         _agent_is_current=lambda state, job: True,
         _reject_stale=lambda *args: None,
-        git=SimpleNamespace(checkout_head=lambda checkout: base, commit_parents=lambda head: [base, base], commit_integration_work=lambda *args, **kwargs: base),
+        git=SimpleNamespace(checkout_head=lambda checkout: base, commit_parents=lambda head: [base, base], commit_integration_work=lambda *args, **kwargs: base,
+                            is_ancestor=lambda *args: True, resolve=git.resolve,
+                            integrate_remote_heads=lambda *args, **kwargs: SimpleNamespace(status="clean", head_sha=base)),
     )
     stage._invocation_events = partial(invocation_events, stage)
     stage.conflict_key = key

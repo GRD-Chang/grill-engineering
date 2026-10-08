@@ -298,6 +298,8 @@ def _resume_kind(
         return "budget_checkpoint"
     for key in ("active_ticket_job", "parent_job", "run_acceptance"):
         subject = state.get(key)
+        if isinstance(subject, dict) and subject.get("blocked_reason") == "integration_development_exhausted":
+            return "integration_development"
         if isinstance(subject, dict) and subject.get("blocked_reason") in {
             "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }:

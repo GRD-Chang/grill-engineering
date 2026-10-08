@@ -1,6 +1,14 @@
 """独立验收的双语对象说明、证据边界与输出语义。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'review/parent-integration': {
+        'zh': """你负责当前完整 Parent 成果的集成验收。下面是准确源版本、目标版本、本地候选、最终组合及冲突路径。核验双方应交付成果、新组合风险和直接回归，对当前整体需求形成完整结论。已有适用完整基线时可以复用其证据并增量核验；没有适用基线时建立完整基线。相同 tree 不能代替范围、需求版本、基线和成果身份核验。
+准确集成事实：
+{0}""",
+        'en': """You are responsible for integration acceptance of the complete current Parent result. The following records exact source, target, local candidate, final combination and conflict paths. Verify deliverable contributions, combination risks and direct regressions, and form a complete conclusion for the current requirements. With an applicable complete baseline, reuse its evidence and verify changes incrementally; otherwise establish a complete baseline. An identical tree does not replace scope, requirement revision, baseline and result identity checks.
+Exact integration facts:
+{0}""",
+    },
     'review/read-only-validation': {
         'zh': """整个工作区保持只读；你可以启动服务、操作浏览器和创建测试数据，
 构建缓存、运行数据、日志和浏览器产物等需要写入的内容使用工作区外仅服务本轮的可定位临时路径。

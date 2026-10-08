@@ -72,6 +72,9 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     with pytest.raises(InterruptedError):
         run_conflict(stage, state, job, repo)
     attempt = deepcopy(job["pending_semantic_attempt"])
+    integration_budget = deepcopy(job.get("integration_development_budget"))
+    if kind != "run_repair":
+        assert integration_budget is not None and integration_budget["used"] == 1
     binding = deepcopy(state["active_agent_invocation"]["thread_execution_binding"])
     assert binding["thread_id"] == "conflict-thread"
     acceptance = deepcopy(job.get("acceptance_record"))
@@ -91,6 +94,7 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     assert resumed["active_agent_invocation"]["thread_execution_binding"] == binding
     _query(repo, store, run_id, "resuming")
     assert resumed_job["pending_semantic_attempt"] == attempt
+    assert resumed_job.get("integration_development_budget") == integration_budget
     assert resumed_job["candidate_sha"] == candidate
     assert resumed_job.get("acceptance_record") == acceptance
     assert resumed_job["review_budget"] == budget
@@ -114,6 +118,15 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     assert "pending_semantic_attempt" not in resumed_job
     assert resumed_job["review_budget"] == budget
     assert resumed_job["ci_recovery"] == ci_budget
-    resumed_job.pop(stage.conflict_key)
+    assert resumed_job.get("integration_development_budget") == integration_budget
+    assert resumed_job["semantic_attempt_history"][-1]["attempt_id"] == attempt["attempt_id"]
+    if kind == "parent_only":
+        assert stage.conflict_key not in resumed_job
+        record = resumed_job["parent_integration"]
+        assert record["candidate_sha"] == candidate
+        assert record["source_sha"] == record["target_sha"] == record["head_sha"] == candidate
+        assert StateStore(store.root).load_current_run(run_id) == resumed
+    else:
+        resumed_job.pop(stage.conflict_key)
     stage.save(resumed)
     _query(repo, store, run_id, "completed")

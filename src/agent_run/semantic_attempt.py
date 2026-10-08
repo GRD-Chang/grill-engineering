@@ -138,8 +138,10 @@ def allocate_semantic_attempt(
     }
     integration_budget = subject.get("integration_development_budget")
     integration_work = (
-        role == "development" and work_subject.startswith("ticket:")
-        and isinstance(subject.get("integration_conflict"), dict)
+        role == "development"
+        and (isinstance(subject.get("integration_conflict"), dict)
+             or isinstance(subject.get("parent_integration_conflict"), dict)
+             or subject.get("pending_attempt_kind") == "integration")
         and isinstance(integration_budget, dict)
     )
     budget = integration_budget if integration_work else review_budget_owner(subject).get("review_budget")

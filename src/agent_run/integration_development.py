@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,8 @@ def failure_scene(
 
 def resolve_integration_work(
     stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    *, scene_key: str = "integration_conflict",
+    finish: Callable[[], bool] | None = None,
 ) -> bool:
     """Complete one semantic Development unit, then let Git prove its result.
 
@@ -49,16 +53,17 @@ def resolve_integration_work(
     consumes the same cumulative integration allowance, with no Review.
     """
     while True:
-        result = _resolve_integration_work_once(stage, state, job, checkout)
+        result = _resolve_integration_work_once(stage, state, job, checkout, scene_key=scene_key, finish=finish)
         if result is not None:
             return result
 
 
 def _resolve_integration_work_once(
     stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    *, scene_key: str, finish: Callable[[], bool] | None,
 ) -> bool | None:
-    scene = job["integration_conflict"]
-    if isinstance(scene.get("resolution_sha"), str):
+    scene = job[scene_key]
+    if finish is None and isinstance(scene.get("resolution_sha"), str):
         if stage.git.checkout_head(checkout) != scene["resolution_sha"]:
             raise GitError("Recorded integration resolution no longer matches checkout")
         return True
@@ -68,7 +73,7 @@ def _resolve_integration_work_once(
             ensure_integration_development_available(job, policy_snapshot=job["policy_snapshot"])
         except IntegrationDevelopmentExhausted:
             stage._block(state, job, "integration_development_exhausted",
-                         "Ticket integration Development allowance is exhausted; resume explicitly to renew it")
+                         "Integration Development allowance is exhausted; resume explicitly to renew it")
             state["terminal_kind"] = "waiting_human"
             stage.save(state)
             return False
@@ -128,35 +133,50 @@ def _resolve_integration_work_once(
         clear_current_human_blocker(job)
         stage.save(state)
     stage._reject_stale(state, job, checkout,
-                        "Ticket integration work was discarded after requirements changed")
+                        "Integration work was discarded after requirements changed")
+    summary = scene["development_summary"]
+    completed_scene = deepcopy(scene)
     try:
-        resolved = stage.git.commit_integration_work(
-            checkout, expected_head_sha=str(scene["head_sha"]),
-            expected_merge_sha=scene["merge_head_sha"],
-            message=f"chore(ticket-{job['ticket_number']}): resolve integration conflict",
-        )
+        if finish is not None:
+            completed = finish()
+            resolved = None
+        else:
+            resolved = stage.git.commit_integration_work(
+                checkout, expected_head_sha=str(scene["head_sha"]),
+                expected_merge_sha=scene["merge_head_sha"],
+                message=f"chore(ticket-{job['ticket_number']}): resolve integration conflict",
+            )
     except GitError as error:
         close_semantic_attempt(job, attempt, outcome="integration_git_check_failed",
-                               result={"development_summary": scene["development_summary"]})
-        job.setdefault("integration_work_history", []).append(dict(scene))
+                               result={"development_summary": summary})
+        job.setdefault("integration_work_history", []).append(completed_scene)
         observed_head = error.evidence.get("head_sha")
         observed_merge = error.evidence.get("merge_head_sha")
-        if observed_head is not None and (
+        checkpoint = (
+            finish is not None and scene.get("stage") in scene.get("resolved_stages", [])
+            and observed_head == scene.get("resolution_sha") and observed_merge is None
+        )
+        if observed_head is not None and not checkpoint and (
             observed_head != scene["head_sha"] or observed_merge != scene["merge_head_sha"]
         ):
             scene["failure"] = error.evidence | {"error": str(error)}
             stage._block(state, job, "integration_record_invalid", str(error))
             stage.save(state)
             return False
-        job["integration_conflict"] = failure_scene(
-            stage, job, checkout, error, source=scene["source_sha"],
-            target=scene["target_sha"], paths=scene["paths"],
-        )
+        if finish is None:
+            job[scene_key] = failure_scene(
+                stage, job, checkout, error, source=scene["source_sha"],
+                target=scene["target_sha"], paths=scene["paths"],
+            )
+        else:
+            scene["failure"] = error.evidence | {"error": str(error)}
+            scene.pop("development_summary", None)
         stage.save(state)
         return None
     close_semantic_attempt(job, attempt, outcome="integration_conflict_resolved",
-                           result={"development_summary": scene["development_summary"]})
-    scene["resolution_sha"] = resolved
-    job.setdefault("integration_work_history", []).append(dict(scene))
+                           result={"development_summary": summary})
+    if finish is None:
+        scene["resolution_sha"] = resolved
+    job.setdefault("integration_work_history", []).append(completed_scene if finish is not None else deepcopy(scene))
     stage.save(state)
-    return True
+    return (True if completed else None) if finish is not None else True

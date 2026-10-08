@@ -63,8 +63,12 @@ def prepare_parent_snapshot(
             subject.get("published_sha"), subject.get("publication_sha")
         }
     )
-    git.fetch_remote_commit(source_branch, source)
-    git.fetch_remote_commit(target_branch, target)
+    try:
+        git.fetch_remote_commit(source_branch, source)
+        git.fetch_remote_commit(target_branch, target)
+    except GitError as error:
+        error.evidence.update(source_sha=source, target_sha=target, candidate_sha=candidate_sha)
+        raise
     prior = subject.get(record_key)
     previous_source = (
         str(prior["source_sha"])
@@ -112,12 +116,16 @@ def prepare_parent_snapshot(
         start = str(prior["head_sha"])
     if git.checkout_head(checkout) != start:
         git.seed_managed_checkout(checkout, expected_head=start)
-    merged = git.integrate_remote_heads(
-        checkout,
-        candidate_sha=start,
-        source_sha=source,
-        target_sha=target,
-    )
+    try:
+        merged = git.integrate_remote_heads(
+            checkout,
+            candidate_sha=start,
+            source_sha=source,
+            target_sha=target,
+        )
+    except GitError as error:
+        error.evidence.update(source_sha=source, target_sha=target, candidate_sha=candidate_sha)
+        raise
     if merged.status == "conflict":
         conflict = {
             "source_sha": source,
@@ -129,6 +137,7 @@ def prepare_parent_snapshot(
             "paths": list(merged.conflict_paths),
             "conflict_paths": list(merged.conflict_paths),
             "resolved_stages": [],
+            "failure": merged.failure_evidence,
         }
         subject[conflict_key] = conflict
         save()
@@ -192,11 +201,24 @@ def finish_parent_snapshot_conflict(
         head = str(conflict["resolution_sha"])
         if not git.is_ancestor(head, git.checkout_head(checkout)):
             raise GitError("Parent conflict resolution checkout changed")
+        if conflict.get("failure") and conflict.get("development_summary"):
+            head = git.commit_integration_work(
+                checkout, expected_head_sha=head, expected_merge_sha=None,
+                message="chore: resolve Parent integration conflict",
+            )
+            conflict["resolution_sha"] = head
+            save()
     else:
-        if len(resolved_stages) >= 2:
+        if len([item for item in resolved_stages if item != "git_check"]) >= 2:
             raise GitError("Parent integration still conflicts after bounded resolution")
         head = git.checkout_head(checkout)
-        if git.commit_parents(head) != [conflict["head_sha"], conflict["merge_head_sha"]]:
+        if stage == "git_check":
+            head = git.commit_integration_work(
+                checkout, expected_head_sha=str(conflict["head_sha"]),
+                expected_merge_sha=conflict["merge_head_sha"],
+                message="chore: resolve Parent integration conflict",
+            )
+        elif git.commit_parents(head) != [conflict["head_sha"], conflict["merge_head_sha"]]:
             head = git.commit_integration_resolution(
                 checkout,
                 expected_head_sha=str(conflict["head_sha"]),
@@ -214,7 +236,7 @@ def finish_parent_snapshot_conflict(
         target_sha=str(conflict["target_sha"]),
     )
     if merged.status == "conflict":
-        if merged.conflict_stage in resolved_stages or len(resolved_stages) >= 2:
+        if merged.conflict_stage in resolved_stages or len([item for item in resolved_stages if item != "git_check"]) >= 2:
             raise GitError("Parent integration still conflicts after bounded resolution")
         conflict.update({
             "stage": merged.conflict_stage,
@@ -222,6 +244,7 @@ def finish_parent_snapshot_conflict(
             "merge_head_sha": merged.merge_head_sha,
             "paths": list(merged.conflict_paths),
             "attempts": 0,
+            "failure": merged.failure_evidence,
         })
         conflict.pop("development_summary", None)
         for path in merged.conflict_paths:

@@ -39,9 +39,11 @@ def test_public_approve_updates_both_heads_and_requires_new_approval(git_repo: P
     assert job["approval_update"]["previous_head_sha"] == original["published_sha"]
     assert job["approval_update"]["source_sha"] == source
     assert job["approval_update"]["target_sha"] == target
-    assert job["review_budget"]["development_attempts"] == 0
-    assert job["review_budget_history"][0]["review_budget"] == original["review_budget"]
+    assert job["review_budget"]["development_attempts"] == original["review_budget"]["development_attempts"]
+    assert job["review_budget"] == original["review_budget"]
+    assert job.get("review_budget_history", []) == original.get("review_budget_history", [])
     assert job["ci_recovery"] == original["ci_recovery"]
+    assert "integration_development_budget" not in job
     git = GitRepository(managed_repo(git_repo))
     assert all(git.is_ancestor(sha, job["published_sha"]) for sha in (source, target, original["published_sha"]))
     assert job["acceptance_record"]["reviewed_candidate_sha"] == job["candidate_sha"]
@@ -171,8 +173,10 @@ def test_exhausted_update_resync_pauses_and_resume_renews_only_its_allowance(git
     assert final["pr_number"] == job["pr_number"]
     assert final["integration_resync"]["generation"] == 2
     assert final["integration_resync"]["used"] == 1
-    assert final["review_budget_history"][-1]["review_budget"] == job["review_budget"]
+    assert final["review_budget"] == job["review_budget"]
+    assert final.get("review_budget_history", []) == job.get("review_budget_history", [])
     assert final["ci_recovery"] == job["ci_recovery"]
+    assert "integration_development_budget" not in final
     assert final["acceptance_record"]["reviewed_base_sha"] == target
 
 
@@ -225,9 +229,9 @@ def test_another_target_append_during_update_reviews_the_latest_combination(
     assert final["pr_number"] == before["parent_job"]["pr_number"]
     assert final["acceptance_record"]["reviewed_base_sha"] == target
     assert final["integration_resync"]["used"] == 2
-    assert len(final["review_budget_history"]) == 2
-    assert final["review_budget"]["development_attempts"] == 0
-    assert final["review_budget"]["reviewer_invocations"] == 1
+    assert final["review_budget"] == before["parent_job"]["review_budget"]
+    assert final.get("review_budget_history", []) == before["parent_job"].get("review_budget_history", [])
+    assert "integration_development_budget" not in final
     assert GitRepository(managed_repo(git_repo)).is_ancestor(target, final["published_sha"])
 
 
@@ -289,16 +293,21 @@ def test_update_stop_resume_preserves_work_and_never_restores_grant(
     job = final["parent_job"]
     assert job.get("approval_grant") is None
     assert job["pr_number"] == original["pr_number"]
-    assert job["review_budget"]["development_attempts"] == 0
-    assert job["review_budget_history"][0]["review_budget"] == original["review_budget"]
+    assert job["review_budget"]["development_attempts"] == original["review_budget"]["development_attempts"]
+    assert job["review_budget"] == original["review_budget"]
+    assert job.get("review_budget_history", []) == original.get("review_budget_history", [])
     assert job["acceptance_record"]["reviewed_base_sha"] == target
     assert job["ci_recovery"] == original["ci_recovery"]
     assert job["review_budget"]["reviewer_invocations"] == 1
     if conflict:
+        assert job["integration_development_budget"]["used"] == 1
+        assert job["integration_development_budget"] == saved["integration_development_budget"]
         git = GitRepository(managed_repo(git_repo))
         assert all(git.is_ancestor(sha, job["published_sha"])
                    for sha in (target, original["published_sha"]))
         assert job["parent_integration"]["conflict_paths"] == ["parent-feature.txt"]
+    else:
+        assert "integration_development_budget" not in job
     if boundary in {"conflict", "review"}:
         attempt_id = saved["pending_semantic_attempt"]["attempt_id"]
         assert sum(item["attempt_id"] == attempt_id for item in job["semantic_attempt_history"]) == 1

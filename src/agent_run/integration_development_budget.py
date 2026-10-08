@@ -1,4 +1,4 @@
-"""Cumulative Ticket integration Development allowance, separate from demand work."""
+"""Cumulative integration Development allowance, separate from demand work."""
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ class IntegrationDevelopmentExhausted(ValueError):
     """A new integration Development requires explicit renewal."""
 
 
+def integration_development_limit(job: dict[str, Any], policy_snapshot: object) -> int:
+    policy = parse_policy_snapshot(policy_snapshot)
+    return policy.run_repair_rounds if "parent_branch" in job else policy.ticket_integration_development_limit
+
+
 def ensure_integration_development_available(
     job: dict[str, Any], *, policy_snapshot: object,
 ) -> dict[str, Any]:
@@ -19,11 +24,12 @@ def ensure_integration_development_available(
     if budget is None:
         budget = {
             "window": 1, "used": 0,
-            "limit": parse_policy_snapshot(policy_snapshot).ticket_integration_development_limit,
+            "limit": integration_development_limit(job, policy_snapshot),
             "attempt_ids": [], "renewals": [],
         }
         job["integration_development_budget"] = budget
-    require_integration_development_budget(budget, policy_snapshot=policy_snapshot)
+    require_integration_development_budget(budget, policy_snapshot=policy_snapshot,
+        expected_limit=integration_development_limit(job, policy_snapshot))
     pending = job.get("pending_semantic_attempt")
     pending_id = pending.get("attempt_id") if isinstance(pending, dict) else None
     if pending_id not in budget["attempt_ids"] and budget["used"] >= budget["limit"]:
@@ -37,7 +43,8 @@ def acquire_integration_development(
     """Charge each semantic attempt once, including retries after process restart."""
     existing = job.get("integration_development_budget")
     if isinstance(existing, dict):
-        require_integration_development_budget(existing, policy_snapshot=policy_snapshot)
+        require_integration_development_budget(existing, policy_snapshot=policy_snapshot,
+            expected_limit=integration_development_limit(job, policy_snapshot))
         if attempt_id in existing["attempt_ids"]:
             return False
     budget = ensure_integration_development_available(job, policy_snapshot=policy_snapshot)
@@ -57,11 +64,12 @@ def renew_integration_development_budget(
 ) -> bool:
     """Explicit resume extends only this allowance; duplicate renewal is a no-op."""
     budget = job.get("integration_development_budget")
-    require_integration_development_budget(budget, policy_snapshot=job.get("policy_snapshot"))
+    require_integration_development_budget(budget, policy_snapshot=job.get("policy_snapshot"),
+        expected_limit=integration_development_limit(job, job.get("policy_snapshot") or policy_snapshot))
     assert isinstance(budget, dict)
     if budget["used"] < budget["limit"]:
         return False
-    grant = parse_policy_snapshot(policy_snapshot).ticket_integration_development_limit
+    grant = integration_development_limit(job, policy_snapshot)
     budget["window"] += 1
     budget["limit"] += grant
     budget["renewals"].append({
@@ -70,7 +78,9 @@ def renew_integration_development_budget(
     return True
 
 
-def require_integration_development_budget(value: object, *, policy_snapshot: object) -> None:
+def require_integration_development_budget(
+    value: object, *, policy_snapshot: object, expected_limit: int | None = None,
+) -> None:
     """Reject malformed or reset cumulative counters without repairing state."""
     if not isinstance(value, dict) or set(value) != {"window", "used", "limit", "attempt_ids", "renewals"}:
         raise ValueError("integration_development_budget has invalid fields")
@@ -102,12 +112,13 @@ def require_integration_development_budget(value: object, *, policy_snapshot: ob
     initial_limit = value["limit"] - total_grants
     if initial_limit < 1 or renewals and renewals[0]["used"] != initial_limit:
         raise ValueError("integration Development initial allowance is invalid")
-    if policy_snapshot is not None and initial_limit != parse_policy_snapshot(policy_snapshot).ticket_integration_development_limit:
+    if policy_snapshot is not None and initial_limit != (expected_limit if expected_limit is not None
+        else parse_policy_snapshot(policy_snapshot).ticket_integration_development_limit):
         raise ValueError("integration Development allowance differs from frozen policy")
 
 
 def semantic_attempt_budget(owner: dict[str, Any], attempt: dict[str, Any]) -> object:
-    """Select the independent allowance only for charged Ticket integration work."""
+    """Select the independent allowance only for charged integration work."""
     budget = owner.get("integration_development_budget")
     charged = isinstance(budget, dict) and attempt.get("attempt_id") in budget.get("attempt_ids", [])
     snapshot = attempt.get("budget_snapshot")

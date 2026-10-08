@@ -8,6 +8,6 @@ Ticket Development 与 Fresh Acceptance 绑定创建 Job 时的 base 和 Candida
 
 集成失败与真实合并冲突保留现场交回 Development，并以独立累计集成额度限制。具体行为、预算和证据合同由 [ADR 0020](0020-ticket-integration-development-loop.md) 取代原“免费冲突工作及一次处理”规则。身份、权限、非追加历史及正式发布门禁不变，集成不新增 Fresh Acceptance。Parent Acceptance 仍核验最终累计结果。
 
-集成请求在 Adapter 读取历史 repair input 前选择 `repair_source=integration`，只传当前集成现场，不夹带上一轮 Acceptance 或 CI 修复来源。有效原需求审查或 fallback 凭据不因此被伪造或重置。Parent-only 与 Run Repair 暂保留其原冲突合同。
+集成请求在 Adapter 读取历史 repair input 前选择 `repair_source=integration`，只传当前集成现场，不夹带上一轮 Acceptance 或 CI 修复来源。有效原需求审查或 fallback 凭据不因此被伪造或重置。Parent-only 由 [ADR 0021](0021-parent-only-integration-loop.md) 接入共用集成 Development；Run Repair 保留原冲突合同。
 
 状态协议随新增持久字段切换；旧 Run 在外部写入前按现有 MVP 规则拒绝，不推断缺失额度，也不隐式迁移。实现沿用共享 Engine、Publisher、StateStore 和有限的 Ticket Adapter；Git 集成动作可供后续 Parent 与 CI 路径调用，但本决策不改变它们的业务流程。

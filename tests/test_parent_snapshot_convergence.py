@@ -54,7 +54,8 @@ def test_approve_rereads_a_parent_snapshot_split_by_remote_append(
     assert job["approval_update"][f"{moving_ref}_sha"] == observed[0]
     assert job["integration_resync"]["used"] == 1
     assert job["review_budget"]["reviewer_invocations"] == 1
-    assert job["review_budget_history"][0]["review_budget"] == before["parent_job"]["review_budget"]
+    assert job["review_budget"] == before["parent_job"]["review_budget"]
+    assert job["review_budget_history"] == before["parent_job"]["review_budget_history"]
     assert job["ci_recovery"] == before["parent_job"]["ci_recovery"]
     git = GitRepository(managed_repo(git_repo))
     assert all(git.is_ancestor(sha, job["published_sha"]) for sha in (target, observed[0]))

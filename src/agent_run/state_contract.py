@@ -23,7 +23,7 @@ from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
 from agent_run.integration_resync_budget import require_resync_budget
-from agent_run.integration_development_budget import require_integration_development_budget, semantic_attempt_budget
+from agent_run.integration_development_budget import integration_development_limit, require_integration_development_budget, semantic_attempt_budget
 from agent_run.operator_gate import (
     active_ticket_gate_mirror_is_consistent,
     operator_gate_identity_is_consistent,
@@ -690,6 +690,7 @@ def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
             try:
                 require_integration_development_budget(
                     development_budget, policy_snapshot=job.get("policy_snapshot") or state.get("policy_snapshot"),
+                    expected_limit=integration_development_limit(job, job.get("policy_snapshot") or state.get("policy_snapshot")),
                 )
             except (TypeError, ValueError) as error:
                 raise IncompatibleRunStateError(
@@ -2131,7 +2132,8 @@ def _change_conflict_owner_is_current(
         or conflict.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("base_sha") != job.get("base_sha")
-        or conflict.get("stage") not in ({"source", "target", "git_check"} if subject.startswith("ticket:") else {"source", "target"})
+        or conflict.get("stage") not in ({"source", "target", "git_check"}
+            if subject.startswith(("ticket:", "parent-only:")) else {"source", "target"})
         or type(conflict.get("attempts")) is not int
         or conflict["attempts"] != 1
         or (conflict.get("stage") != "git_check" and conflict.get("merge_head_sha") != conflict.get(f"{conflict.get('stage')}_sha"))

@@ -67,7 +67,9 @@ def review(
                     request["previous_acceptance_artifact"] = previous.get("artifact")
                     request["previous_review_identity"] = previous.get("review_identity")
         request["_prompt_resources"] = state["prompt_resources"]
-        if job.get("attempt_kind") == "ci_repair":
+        if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
+            request.pop("review_budget_context", None)
+        elif job.get("attempt_kind") == "ci_repair":
             _, inner_limit = ci_limits_for_job(job)
             request["review_budget_context"] = ci_reviewer_budget_context(
                 job,
@@ -204,10 +206,11 @@ def complete_review(
             key: deepcopy(review_record[key])
             for key in ("reviewer_thread_id", "candidate_sha", "review_identity")
         }
-        remember_review(
-            budget, review_record, limit=stage.review_budget_policy().review_limit,
-            human_blocker_resume=pending.get("human_blocker_resume") is True,
-        )
+        if job.get("parent_integration_stage") is not True or job.get("attempt_kind") == "ci_repair":
+            remember_review(
+                budget, review_record, limit=stage.review_budget_policy().review_limit,
+                human_blocker_resume=pending.get("human_blocker_resume") is True,
+            )
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw
@@ -218,6 +221,8 @@ def complete_review(
         job.pop("ci_repair_publication_receipt", None)
     if not artifact.is_accepted:
         job["repair_source"] = "acceptance"
+        if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
+            job["next_attempt_kind"] = "integration"
     # A first rejection has no PR to expose.  For a repair after a PR
     # already exists, update that PR's one status comment immediately so
     # it cannot keep advertising an obsolete passing Candidate.

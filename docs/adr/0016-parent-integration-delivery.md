@@ -4,7 +4,11 @@ status: accepted
 
 # 两种 Parent 在交付边界接纳远端成果并验收最终组合
 
-## 决定
+## 后续取代：Parent-only 集成循环
+
+[ADR 0021](0021-parent-only-integration-loop.md) 取代下文 Parent-only 独立集成审核窗口、免费冲突开发及 resync 重置问题修复额度的规则。Parent-only 的 Git 问题与集成 Findings 共用累计 Development 额度，初始完整审核必须通过，验收以完整身份核对复用。多 Ticket Parent 和 Run Repair 的未替代部分保持既有合同。
+
+## 决定（保留原始决策）
 
 多 Ticket Parent 等全部 Ticket 真正完成后，先集成远端 Run Branch 与默认分支，再进行首次完整 Run Acceptance。Parent-only 保留固定开发基线的 D10/R10、Reviewer 必过及无 fallback 条件；需求开发结束后集成远端 Parent Branch 与默认分支。原验收只有在准确 head、tree、base 和需求边界仍适用时复用。两条路径共用准确远端快照集成、冲突提交和 resync 计数，审查与发布仍由现有 Engine、Adapter、Publisher 和 StateStore 控制。
 

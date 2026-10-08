@@ -243,6 +243,8 @@ def invocation_boundary(
         boundary["ticket_integration_fingerprint"] = canonical_fingerprint(
             job["ticket_integration"]
         )
+    if "parent_integration" in job:
+        boundary["parent_integration_fingerprint"] = canonical_fingerprint(job["parent_integration"])
     return boundary
 
 

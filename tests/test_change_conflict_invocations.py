@@ -57,7 +57,7 @@ def test_conflict_events_round_trip_before_and_after_business_closeout(git_repo:
     assert seen == ["running", "running", "failed", "resuming", "running", "completed"]
     assert "pending_semantic_attempt" not in job
     assert job["review_budget"] == budget
-    job.pop(stage.conflict_key)
+    job.pop(stage.conflict_key, None)
     stage.save(state)
     loaded = StateStore(store.root).load_current_run(state["run_id"])
     assert loaded is not None
@@ -96,7 +96,7 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
         elif damage == "generation":
             job[{"ticket": "ticket_branch_generation", "parent_only": "parent_generation", "run_repair": "repair_generation"}[kind]] = 2
         elif damage == "budget":
-            job["integration_development_budget" if kind == "ticket" else "review_budget"]["window"] = 2
+            job["integration_development_budget" if kind in {"ticket", "parent_only"} else "review_budget"]["window"] = 2
         else:
             state["active_agent_invocation"]["role"] = "publication"
         stage.save(state)
