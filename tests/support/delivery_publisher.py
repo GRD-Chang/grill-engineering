@@ -108,6 +108,8 @@ class ScriptedPublisher:
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         del expected_head_sha, expected_base_sha
         self.created_prs += 1

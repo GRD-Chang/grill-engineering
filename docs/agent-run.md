@@ -365,7 +365,12 @@ Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type
 Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
 Publication Agent 返回合法叙事时 Semantic Attempt 即完成；之后 GitHub 写入、读取与对账失败只增加
 独立且有界的 Publication Operation Retry。该重试耗尽后进入硬 `publication_pending` 边界，`resume`
-不会清零、绕过或重新生成叙事。
+显式继续只开启该耗尽操作的新有界窗口，保留旧窗口历史、原成果、发布文案及未解决的写入意图，
+不重置开发、集成或 CI 额度，不替代最终批准。重启先核实准确 Git/远端结果：成功写入不重复，
+原边界仍有效且操作未发生时才继续；无法核实的结果保持有界等待和具体缺口。
+Ticket 的未知推送/PR 结果在暂停期间仍保留集成席位，其他 Ticket 可以继续开发，
+只能在对账确定后接纳新的集成交付。Publication Commit 在 Git 对象写入前保存准确对象意图，
+恢复时直接核验对象并安装原提交，避免重复生成提交。详见 [正式写入对账合同](adr/0022-publication-write-reconciliation.md)。
 Required Checks 全部通过（或没有配置）后状态才变为
 `run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
 commit。合并结果与已验收的预期 merge tree 一致后，Publisher 记录可重试的 Parent

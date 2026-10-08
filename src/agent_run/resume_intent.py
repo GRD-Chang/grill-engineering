@@ -83,7 +83,7 @@ def bind_resume_intent(
     ]
     publication_retry = [
         (location, subject) for location, subject in gates
-        if location.startswith("ticket:")
+        if (location.startswith("ticket:") or location in {"parent", "run_repair", "run_publication"})
         and subject.get("phase") == "publication_pending"
     ]
     ticket_failure = [

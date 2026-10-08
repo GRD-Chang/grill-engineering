@@ -310,10 +310,10 @@ def _resume_kind(
         return "operator_stopped"
     if state.get("status") == "supervision_timeout":
         return "supervision_timeout"
-    ticket_jobs = state.get("ticket_jobs")
-    if isinstance(ticket_jobs, dict) and sum(
-        isinstance(job, dict) and job.get("phase") == "publication_pending"
-        for job in ticket_jobs.values()
+    if sum(
+        subject.get("phase") == "publication_pending"
+        for location, subject in operator_gate_subjects(state)
+        if location.startswith("ticket:") or location in {"parent", "run_repair", "run_publication"}
     ) == 1:
         return "publication_operation_retry"
     if is_github_refresh_wait(state):

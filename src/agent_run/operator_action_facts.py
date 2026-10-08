@@ -174,7 +174,7 @@ def _next_action(
     if kind == "abandonment_recovery":
         return NextAction("command", "abandon", run_id)
     if kind == "publication_retry_exhausted":
-        return NextAction("command", "resume", run_id, ticket_number) if ticket_number else NextAction("publication_retry")
+        return NextAction("command", "resume", run_id, ticket_number)
     if kind == "deterministic_contradiction":
         if state.get("status") == "unsupported_scope_change":
             return NextAction("scope_change")

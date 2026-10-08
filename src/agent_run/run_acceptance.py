@@ -45,6 +45,7 @@ from agent_run.run_repair_promotion import RunRepairPromotion
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_thread_identity import prior_thread_identities
+from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 from agent_run.state import StateStore
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
@@ -115,6 +116,11 @@ class RunAcceptanceEngine:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        if not reconcile_run_pr_write(
+            state, self.github, self._save,
+            current_head_sha=self.git.resolve(str(state["run_branch"])),
+        ):
+            return state
         if not self._refresh_run_currentness(state):
             return self._save(state)
         if not self._all_tickets_completed(state):

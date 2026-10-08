@@ -31,6 +31,7 @@ def stale_job() -> dict[str, Any]:
         "candidate_sha": "old-candidate",
         "publication": {"pr_title": "old"},
         "publication_sha": "old-publication",
+        "publication_commit_intent": {"expected_sha": "old-publication"},
         "acceptance_artifact": {"e2e": "old"},
         "acceptance_record": {"reviewed_base_sha": "old-base"},
         "publication_attempts": 2,

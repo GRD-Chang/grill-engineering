@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -332,7 +333,8 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         )
 
     def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
     ) -> str:
         record = job.get("parent_integration")
         source = str(record["source_sha"]) if isinstance(record, dict) else None
@@ -347,6 +349,8 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
             base_sha=str(job["base_sha"]),
             published_sha=source,
             message=message,
+            publication_intent=job.setdefault("publication_commit_intent", {}),
+            save_intent=save_intent,
         )
 
     def prepare_validation(
@@ -361,10 +365,13 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         state: dict[str, Any],
         job: dict[str, Any],
         publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
     ) -> int:
         return self.owner.github.ensure_change_pr(
             branch=str(job["parent_branch"]),
             base_branch=str(_mapping(state, "base")["branch"]),
+            write_intent=job["ticket_write_intent"],
+            save_intent=save_intent,
             title=str(publication["pr_title"]),
             body=self.owner._render_pr_body(state, publication),
             expected_head_sha=str(job["publication_sha"]),

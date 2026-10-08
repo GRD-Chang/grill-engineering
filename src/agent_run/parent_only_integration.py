@@ -116,7 +116,7 @@ def reconcile_parent_integration(
     for key in (
         "publication", "publication_sha", "publication_parent_sha",
         "publication_prior_published_sha", "pending_publication_result",
-        "merge_intent", "approval_grant", "ticket_write_intent",
+        "merge_intent", "approval_grant", "ticket_write_intent", "publication_commit_intent",
     ):
         job.pop(key, None)
     clear_required_checks_observation(job)
@@ -216,6 +216,7 @@ def prepare_parent_integration(
             for key in (
                 "acceptance_record", "approval_grant", "publication", "publication_sha",
                 "pending_publication_result", "publication_parent_sha", "merge_intent",
+                "publication_commit_intent",
             ):
                 job.pop(key, None)
             stage.save(state)

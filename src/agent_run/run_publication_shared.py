@@ -43,6 +43,7 @@ from agent_run.required_checks_observation import (
     read_required_checks_observation,
 )
 from agent_run.run_publication_update import reconcile_publication_update, wait_for_merge_readback
+from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 
 
 class RunPublicationShared:
@@ -100,6 +101,11 @@ class RunPublicationShared:
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
+        if not reconcile_run_pr_write(
+            state, self.github, self._save,
+            current_head_sha=self.git.resolve(str(state["run_branch"])),
+        ):
+            return state
         if state["run_acceptance"].get("phase") != "pending":
             invalidate_run_acceptance(state)
         state.update(
@@ -426,7 +432,6 @@ class RunPublicationShared:
         if not record_publication_operation_failure(publication, error):
             return False
         publication["phase"] = "publication_pending"
-        publication.pop("write_intent", None)
         state.update(
             {
                 "status": "publication_pending",

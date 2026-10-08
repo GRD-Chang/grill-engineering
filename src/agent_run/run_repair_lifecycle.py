@@ -72,6 +72,12 @@ class RunRepairLifecycle:
         try:
             while True:
                 job = self._repair_job(state, run)
+                intent = job.get("ticket_write_intent")
+                if (isinstance(intent, dict) and intent.get("action") == "ensure_ticket_pr"
+                    and "target_narrative" in intent):
+                    if job.get("phase") == "blocked" or not self._repair_engine(state, job).reconcile_pending_pr_write(state, job):
+                        preserve_checkout = True
+                        break
                 require_change_checkout(
                     state, job, f"run-repair:{state['run_id']}", self.owner.states.root, self.owner.git
                 )

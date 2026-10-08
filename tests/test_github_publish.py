@@ -16,6 +16,31 @@ from agent_run.github_publish import (
 from agent_run.required_checks import is_explicitly_repairable_code_failure
 
 
+def test_final_pr_lookup_includes_closed_objects_before_replaying_creation(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    reads: list[tuple[str, ...]] = []
+    writes: list[tuple[str, ...]] = []
+
+    def list_pulls(*arguments: str) -> object:
+        reads.append(arguments)
+        return [{"number": 12}]
+
+    monkeypatch.setattr(publisher, "_json", list_pulls)
+    monkeypatch.setattr(publisher, "live_pull_request", lambda _number: {"state": "CLOSED"})
+    monkeypatch.setattr(publisher, "_require", lambda *arguments: writes.append(arguments))
+    with pytest.raises(GitHubReadError, match="CLOSED; cannot create a replacement"):
+        publisher.ensure_run_pr(
+            branch="agent-run/run-1/run", base_branch="main",
+            expected_head_sha="a" * 40, expected_base_sha="b" * 40,
+            title="current title", body="current body",
+        )
+    assert reads[0][reads[0].index("--state") + 1] == "all"
+    assert reads[0][reads[0].index("--limit") + 1] == "2"
+    assert writes == []
+
+
 def test_live_pull_request_uses_the_requested_repository_as_its_base(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

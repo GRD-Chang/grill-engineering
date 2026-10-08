@@ -1,0 +1,118 @@
+"""正式写入的未知结果保留集成席位，重启先对账再继续。"""
+
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agent_run.controller import Controller
+from agent_run.delivery_facts import multi_ticket_progress
+from agent_run.history_check_facts import checks_timeline_facts
+from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.state_contract import require_current_run_state
+from agent_run.ticket_queue import acquire, reconcile
+from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+
+
+@pytest.mark.parametrize("phase", ["blocked", "publication_pending"])
+@pytest.mark.parametrize("action", ["publish_ticket_ref", "ensure_ticket_pr"])
+def test_unresolved_write_keeps_seat_until_reconciled(phase: str, action: str) -> None:
+    owner = {"ticket_number": 2, "phase": phase, "ticket_write_intent": {"action": action}}
+    state: dict[str, Any] = {"ticket_integration_holder": 2, "ticket_integration_queue": []}
+    reconcile(state, owner)
+    sibling = {"ticket_number": 3, "phase": "accepted"}
+    assert not acquire(state, sibling)
+    assert state["ticket_integration_holder"] == 2
+    owner.pop("ticket_write_intent")
+    reconcile(state, owner)
+    assert acquire(state, sibling)
+
+
+@pytest.mark.parametrize("operation", ["publish_branch", "ensure_ticket_pr"])
+@pytest.mark.parametrize("fault,applied", [("response", False), ("response", True), ("save", True)])
+def test_resume_reconciles_write_before_sibling_integration(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, operation: str, fault: str, applied: bool,
+) -> None:
+    state, states, git, fixture = ticket_run(git_repo, (2, 3))
+    run_id = str(state["run_id"])
+    publications: list[int] = []
+    agents = TicketAgents(git_repo, (2, 3), lambda _: None, publications.append)
+    engine = ticket_engine(git, states, fixture, agents)
+    assert engine.develop_frontier(run_id, state)
+    original = getattr(engine.github, operation)
+    wrote = False
+
+    def lose_response(*args: Any, **kwargs: Any) -> Any:
+        nonlocal wrote
+        if applied:
+            result = original(*args, **kwargs)
+            wrote = True
+            if fault == "save":
+                return result
+        raise RuntimeError("response lost; remote result must be observed")
+
+    monkeypatch.setattr(engine.github, operation, lose_response)
+    original_save = states._save_run_unlocked
+    injected = False
+
+    def save_after_write(identifier: str, current: dict[str, Any]) -> None:
+        nonlocal injected
+        job = current["ticket_jobs"]["2"]
+        if fault == "save" and wrote and not injected and "ticket_write_intent" not in job:
+            injected = True
+            raise OSError("remote write applied before StateStore result save")
+        original_save(identifier, current)
+
+    monkeypatch.setattr(states, "_save_run_unlocked", save_after_write)
+    engine.deliver_ticket(run_id, 2)
+    assert injected == (fault == "save")
+    interrupted = states.load_current_run(run_id)
+    assert interrupted is not None
+    before = deepcopy(interrupted["ticket_jobs"]["2"])
+    assert before["phase"] == "blocked"
+    assert before["ticket_write_intent"]["action"] == (
+        "publish_ticket_ref" if operation == "publish_branch" else "ensure_ticket_pr"
+    )
+    assert interrupted["ticket_integration_holder"] == 2
+    require_current_run_state(interrupted)
+    unchanged = deepcopy(interrupted)
+    progress = multi_ticket_progress(interrupted, executor_activity="not_running")
+    assert progress is not None
+    progress_job = next(item for item in progress["tickets"] if item["ticket_number"] == 2)
+    assert progress_job["holds_integration"] is True
+    assert progress_job["pending_write"]["head_sha"] == before["publication_sha"]
+    assert progress_job["recovery_action"] is not None
+    facts = checks_timeline_facts(interrupted, {"kind": "ticket"})
+    assert facts["github_write_action"] == before["ticket_write_intent"]["action"]
+    assert interrupted == unchanged
+
+    # The second completed Development can wait, but cannot mutate the target.
+    ticket_engine(git, states, fixture, agents).deliver_ticket(run_id, 3)
+    queued = states.load_current_run(run_id)
+    assert queued is not None and queued["ticket_integration_holder"] == 2
+    assert queued["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
+    assert git.resolve(state["run_branch"]) == state["base"]["sha"]
+
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True, ticket_number=2,
+    )
+    assert resumed["ticket_integration_holder"] == 2
+    restarted = ticket_engine(git, states, fixture, agents)
+    completed = restarted.deliver_ticket(run_id, 2)
+    job = completed["ticket_jobs"]["2"]
+    assert job["phase"] == "completed", completed.get("diagnostics")
+    assert completed["ticket_integration_holder"] is None
+    for key in ("candidate_sha", "publication_sha", "acceptance_record", "review_budget"):
+        assert job[key] == before[key]
+    assert job["publication_attempts"] == 1
+    assert "ticket_write_intent" not in job
+    delivery = json.loads(fixture.read_text())["delivery"]
+    assert len(delivery["pull_requests"]) == 1
+    assert delivery["closed_issues"] == [2]
+    assert publications == [2]
+    assert [item["action"] for item in delivery["mutations"]].count("close_issue") == 1
+    require_current_run_state(completed)

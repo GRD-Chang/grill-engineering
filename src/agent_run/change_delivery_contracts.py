@@ -3,6 +3,7 @@ from __future__ import annotations
 """Typed contracts and mutation ports for shared Change Delivery."""
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -92,7 +93,8 @@ class ChangeDeliveryPublisher(Protocol):
     ) -> str | None: ...
 
     def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
     ) -> str: ...
 
     def prepare_validation(
@@ -104,6 +106,7 @@ class ChangeDeliveryPublisher(Protocol):
         state: dict[str, Any],
         job: dict[str, Any],
         publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
     ) -> int: ...
 
     def live_pull_request(

@@ -15,6 +15,7 @@ from agent_run.branch_publication import (
     RemoteBranchChanged,
     RemoteBranchObservation,
 )
+from agent_run.change_pr_narrative import admit_change_pr_write
 from agent_run.github import (
     GhGitHubReader,
     GitHubReadError,
@@ -207,7 +208,7 @@ class GhGitHubPublisher:
     def ensure_run_repair_branch(self, **authority: str) -> None:
         self.ensure_change_branch(**authority)
 
-    def ensure_run_repair_pr(self, **authority: str) -> int:
+    def ensure_run_repair_pr(self, **authority: Any) -> int:
         return self.ensure_change_pr(**authority)
 
     def ensure_final_run_ref(self, *, branch: str, expected_head_sha: str) -> None:
@@ -306,7 +307,9 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
             "--state",
-            "open",
+            "all",
+            "--limit",
+            "2",
             "--head",
             branch,
             "--json",
@@ -316,13 +319,19 @@ class GhGitHubPublisher:
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
             raise GitHubReadError(
-                "ambiguous_run_pr", "more than one open final Run PR exists"
+                "ambiguous_run_pr", "more than one final Run PR exists"
             )
         if not pulls:
             return None
         pr_number = _integer(_mapping(pulls[0]), "number")
+        live = self.live_pull_request(pr_number)
+        if live.get("state") in {"CLOSED", "MERGED"}:
+            raise GitHubReadError(
+                "final_run_pr_closed",
+                f"Final Run PR #{pr_number} is {live['state']}; cannot create a replacement",
+            )
         self._require_final_run_pr_identity(
-            self.live_pull_request(pr_number),
+            live,
             branch=branch,
             expected_head_sha=expected_head_sha,
             expected_base_branch=expected_base_branch,
@@ -330,7 +339,7 @@ class GhGitHubPublisher:
         )
         return pr_number
 
-    def ensure_parent_pr(self, **authority: str) -> int:
+    def ensure_parent_pr(self, **authority: Any) -> int:
         return self.ensure_change_pr(**authority)
 
     def abandon_parent_pr(self, pr_number: int) -> bool:
@@ -578,6 +587,8 @@ class GhGitHubPublisher:
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         pulls = self._change_prs(branch)
         if not pulls and self._change_prs(branch, state="all"):
@@ -599,7 +610,19 @@ class GhGitHubPublisher:
                 expected_head_sha=expected_head_sha,
                 expected_base_sha=expected_base_sha,
             )
-            if existing.get("title") != title or existing.get("body") != body:
+            if write_intent is not None and (
+                not isinstance(existing.get("title"), str)
+                or not isinstance(existing.get("body"), str)
+            ):
+                raise GitHubReadError(
+                    "github_invalid_response", "Change PR narrative snapshot is missing",
+                )
+            should_write = admit_change_pr_write(
+                intent=write_intent, save_intent=save_intent, number=number,
+                prior={"title": existing.get("title", ""), "body": existing.get("body", "")},
+                target={"title": title, "body": body},
+            )
+            if should_write:
                 self._require(
                     "pr",
                     "edit",
@@ -618,6 +641,11 @@ class GhGitHubPublisher:
                     "Change PR refresh did not produce one exact PR",
                 )
             current = _mapping(refreshed[0])
+            if _integer(current, "number") != number:
+                raise GitHubReadError(
+                    "change_pr_identity_mismatch",
+                    "Change PR readback replaced the original PR identity",
+                )
             self._require_change_pr_identity(
                 current,
                 branch=branch,
@@ -626,11 +654,19 @@ class GhGitHubPublisher:
                 expected_base_sha=expected_base_sha,
             )
             if current.get("title") != title or current.get("body") != body:
+                prior_observed = write_intent is not None and {
+                    "title": current.get("title"), "body": current.get("body"),
+                } == write_intent.get("prior_narrative")
                 raise GitHubReadError(
-                    "change_pr_narrative_readback_mismatch",
+                    "change_pr_narrative_outcome_unknown" if write_intent is not None and not prior_observed
+                    else "change_pr_narrative_readback_mismatch",
                     "Change PR narrative readback did not match publication artifact",
                 )
             return number
+        admit_change_pr_write(
+            intent=write_intent, save_intent=save_intent, number=None, prior=None,
+            target={"title": title, "body": body},
+        )
         self._require(
             "pr",
             "create",
@@ -659,16 +695,33 @@ class GhGitHubPublisher:
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
         )
+        if write_intent is not None and (
+            created.get("title") != title or created.get("body") != body
+        ):
+            raise GitHubReadError(
+                "change_pr_narrative_outcome_unknown",
+                "Created Change PR narrative readback did not match publication artifact",
+            )
         return _integer(created, "number")
 
+    def find_change_pr_number(self, *, branch: str) -> int | None:
+        pulls = self._change_prs(branch, state="all")
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_change_pr", "Original Change PR lookup is ambiguous")
+        return _integer(_mapping(pulls[0]), "number") if pulls else None
+
     def ensure_ticket_pr(
-        self,
-        *,
-        primary_ticket: int,
-        **authority: str,
+        self, *, primary_ticket: int, branch: str, base_branch: str,
+        title: str, body: str, expected_head_sha: str, expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         del primary_ticket
-        return self.ensure_change_pr(**authority)
+        return self.ensure_change_pr(
+            branch=branch, base_branch=base_branch, title=title, body=body,
+            expected_head_sha=expected_head_sha, expected_base_sha=expected_base_sha,
+            write_intent=write_intent, save_intent=save_intent,
+        )
 
     def _remote_branch_sha(self, branch: str) -> str | None:
         remote = run_read_command(
@@ -1179,6 +1232,16 @@ class GhGitHubPublisher:
         raise GitHubReadError(
             "foreign_run_pr", "Final Run PR does not match durable identity"
         )
+
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]:
+        value = _mapping(self._json(
+            "pr", "view", str(pr_number), "--repo", self.repository,
+            "--json", "title,body",
+        ))
+        title, body = value.get("title"), value.get("body")
+        if not isinstance(title, str) or not isinstance(body, str):
+            raise GitHubReadError("github_invalid_response", "PR narrative must contain title and body")
+        return {"title": title, "body": body}
 
     def run_pr_narrative_matches(
         self, pr_number: int, *, title: str, body: str

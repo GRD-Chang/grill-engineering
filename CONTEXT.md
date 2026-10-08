@@ -869,6 +869,10 @@ _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue
 
 ## Parent 集成交付补充合同
 
+正式写入中断后按 [ADR 0022](docs/adr/0022-publication-write-reconciliation.md) 核验准确 Git/远端对象，再继续同一交付。
+未知推送或 PR 结果仍保留 Ticket 集成席位；成功写入不重复执行，已持久化且绑定事实未变的 Publish 文案复用。
+需求、验收或成果变化不继承旧 CI 与 Parent 批准。Status/History 只展示意图、准确版本与实际席位，不执行对账。
+
 多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留双方成果，再启动首次完整 Run Acceptance；保留其既有集成窗口。Parent-only 先在固定开发基线完成最多 D10/R10 的完整需求开发与独立验收，Reviewer 必须通过，不使用 Ticket fallback 或 Ticket CI 豁免。交付前接纳准确远端 Parent Branch 与默认分支快照；验收复用核对完整范围、Parent 身份、需求版本、基线、候选 SHA/tree、预期合并 tree 及全部通过的独立记录，相同 tree 不足以证明结论有效。事实不变复用，事实变化则审核当前组合；已有同需求完整基线可增量核验并形成整体结论，否则建立完整基线。
 
 Parent-only 的 Git 问题与集成 Review Findings 共用 `integration_development_budget`：每对象默认累计三次 Development（`run_repair_rounds`），不使用或重置初始开发和 CI 额度。Development 复用工作执行能力，完成后返回实际 Git 检查及适用 Review，不嵌套初始开发审核。远端追加不重置该累计额度；耗尽后公开 resume 只追加对应额度，保留 used、Attempt 身份及续期记录；状态重读、重复继续和同次中断续接不重复计费。详见 [ADR 0021](docs/adr/0021-parent-only-integration-loop.md)。

@@ -28,6 +28,11 @@ Worker 进程登记不代表已放行。bootstrap gate 放行后的独立事件�
 
 定向 Resume 的 Controller 推进依据实际 PR 读取后保存的 `publication_observed_at`，不从恢复后的等待阶段或排队回执推断。
 
+正式写入中断的展示沿用 [ADR 0022](../adr/0022-publication-write-reconciliation.md)。`multi_ticket.tickets[].pending_write`
+投影当前写入意图的操作、分支及 head/base，`holds_integration` 保留未知结果的实际席位。
+History 的 `github_write_action` 同时来自 Change Job 的 `ticket_write_intent` 与 Final Run 的 `write_intent`；
+发布暂停不表示写入失败或未发生，查询不能清除意图、释放席位或替代远端核验。
+
 Reviewer 的适用结果通过 `review_attempt.finish_review_result` 统一收口；人工暂停记录由 `artifacts.record_human_blocker` 保存。返回结果先持久化，在后继读取与状态同步成功后才清除 pending 并关闭 Attempt；失败恢复不重新调用 Reviewer 或扣预算。候选与 Run 的 currentness、Acceptance Record 和后续决策仍由各自的领域入口负责。
 
 覆盖入口：`test_cli.py` 的机器/人类输出与只读查询，`test_history_*` 的身份、裁剪、转折与语言，`test_status_delivery_actions.py` 的正式/候选验收边界，`test_notification_events.py`、`test_notifications.py`、`test_cli_notifications.py` 和 `test_cli_resume_notifications.py` 的渠道选择、去重、恢复与固定语言。通知共同场景位于 `tests/support/notification.py`；不要从测试用例模块导入该构造器。

@@ -133,7 +133,7 @@ def _invalidate_ticket_publication(
     for key in (
         "publication", "publication_sha", "publication_parent_sha", "publication_prior_published_sha",
         "pending_publication_result", "merge_intent", "deterministic_integration_record",
-        "ticket_write_intent",
+        "ticket_write_intent", "publication_commit_intent",
     ):
         job.pop(key, None)
     clear_required_checks_observation(job)

@@ -6597,9 +6597,9 @@ def test_human_recovery_guidance_translates_copy_without_parsing_it() -> None:
         "repository": "example/project", "parent": {"number": 42}, "language": "en",
     }
     english = next_action(state)
-    assert "Inspect why publication retries failed" in english
-    assert "agent-run abandon 42 --repo example/project" in english
-    assert "Inspect why publication retries failed" in str(human_next_action_for_state(state))
+    assert english == "agent-run resume 42 --repo example/project"
+    assert str(human_next_action_for_state(state)) == english
+    assert next_action({**state, "language": "zh"}) == english
     raw_evidence = "外部工具原始证据: user supplied details"
     assert pause_reason(raw_evidence, "en") == raw_evidence
     assert pause_reason("review_budget_exhausted", "en") == (

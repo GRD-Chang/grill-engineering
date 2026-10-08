@@ -15,6 +15,7 @@ from agent_run.branch_publication import (
     RemoteBranchChanged,
     RemoteBranchObservation,
 )
+from agent_run.change_pr_narrative import admit_change_pr_write
 from agent_run.github import (
     GitHubReadError,
     MergeOutcomeUnknownError,
@@ -415,7 +416,7 @@ class FixtureGitHubPublisher:
             and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
-            raise ValueError("fixture contains duplicate final Run PRs")
+            raise GitHubReadError("ambiguous_run_pr", "fixture contains duplicate final Run PRs")
         if matching:
             pull = matching[0]
             self._require_final_run_pr_identity(
@@ -507,13 +508,17 @@ class FixtureGitHubPublisher:
             if isinstance(pr, dict)
             and pr.get("branch") == branch
             and pr.get("scope") == "final_run"
-            and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate final Run PRs")
         if not matching:
             return None
         pull = matching[0]
+        if pull.get("state") in {"CLOSED", "MERGED"}:
+            raise GitHubReadError(
+                "final_run_pr_closed",
+                f"Final Run PR #{pull['number']} is {pull['state']}; cannot create a replacement",
+            )
         self._require_final_run_pr_identity(
             pull,
             branch=branch,
@@ -888,6 +893,8 @@ class FixtureGitHubPublisher:
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         pulls = _mutable_list(self._delivery(), "pull_requests")
         matching = [
@@ -920,6 +927,10 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Change PR has a foreign identity")
         else:
+            admit_change_pr_write(
+                intent=write_intent, save_intent=save_intent, number=None, prior=None,
+                target={"title": title, "body": body},
+            )
             pull = {
                 "number": len(pulls) + 1,
                 "branch": branch,
@@ -934,12 +945,29 @@ class FixtureGitHubPublisher:
                 ),
             }
             pulls.append(pull)
+        if matching:
+            should_write = admit_change_pr_write(
+                intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
+                prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
+                target={"title": title, "body": body},
+            )
+            if not should_write:
+                return int(pull["number"])
         pull.update({"title": title, "body": body})
         self._save()
         self._inject_revision_drift("ensure_ticket_pr")
         self._crash_once("ensure_change_pr")
         self._crash_once("ensure_ticket_pr")
         return int(pull["number"])
+
+    def find_change_pr_number(self, *, branch: str) -> int | None:
+        pulls = [
+            pull for pull in _mutable_list(self._delivery(), "pull_requests")
+            if isinstance(pull, dict) and pull.get("branch") == branch
+        ]
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_change_pr", "Original Change PR lookup is ambiguous")
+        return int(pulls[0]["number"]) if pulls else None
 
     def ensure_ticket_pr(
         self,
@@ -951,6 +979,8 @@ class FixtureGitHubPublisher:
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         pulls = _mutable_list(self._delivery(), "pull_requests")
         matching = [
@@ -982,6 +1012,10 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Ticket PR has a foreign identity")
         else:
+            admit_change_pr_write(
+                intent=write_intent, save_intent=save_intent, number=None, prior=None,
+                target={"title": title, "body": body},
+            )
             pull = {
                 "number": len(pulls) + 1,
                 "branch": branch,
@@ -992,6 +1026,14 @@ class FixtureGitHubPublisher:
                 "base_sha": expected_base_sha,
             }
             pulls.append(pull)
+        if matching:
+            should_write = admit_change_pr_write(
+                intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
+                prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
+                target={"title": title, "body": body},
+            )
+            if not should_write:
+                return int(pull["number"])
         pull.update({"title": title, "body": body})
         self._save()
         self._inject_revision_drift("ensure_ticket_pr")
@@ -1317,6 +1359,10 @@ class FixtureGitHubPublisher:
         raise GitHubReadError(
             "foreign_run_pr", "fixture Final Run PR has a foreign identity"
         )
+
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]:
+        pull = self._pull(pr_number)
+        return {"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))}
 
     def run_pr_narrative_matches(
         self, pr_number: int, *, title: str, body: str

@@ -71,7 +71,7 @@ def checks_timeline_facts(
         and window.get("started_at") is not None
     ):
         facts["checks_wait_identity"] = _digest([window["identity"], window["started_at"]])
-    intent = subject.get("write_intent")
+    intent = subject.get("write_intent") or subject.get("ticket_write_intent")
     if isinstance(intent, dict):
         facts["github_write_action"] = intent.get("action")
     if state.get("status") in {"waiting_external", "supervision_timeout"}:

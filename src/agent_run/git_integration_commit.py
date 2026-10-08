@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError, GitIntegrityError
+from agent_run.git_publication_commit import install_publication_commit
 
 
 class GitCommitOperations(Protocol):
@@ -22,7 +24,8 @@ class GitCommitOperations(Protocol):
     def _resolve_in_optional(self, directory: Path, reference: str) -> str | None: ...
 
     def _run_in(
-        self, directory: Path, *arguments: str
+        self, directory: Path, *arguments: str, input: str | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -262,6 +265,8 @@ class IntegrationRepairCommitGit:
         published_sha: str | None = None,
         integration: dict[str, object] | None = None,
         message: str,
+        publication_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> str:
         """Keep the accepted tree while appending to the published source history."""
 
@@ -292,7 +297,7 @@ class IntegrationRepairCommitGit:
         ):
             raise GitError("Merge-resolution Candidate does not match its integration record")
         current = self._git._resolve_in(checkout, "HEAD")
-        if (
+        if not publication_intent and (
             self._git._resolve_in(checkout, "HEAD^{tree}") == tree
             and self._git.commit_parents(current) == [parent, default_head_sha]
         ):
@@ -303,6 +308,13 @@ class IntegrationRepairCommitGit:
                 current_message.stdout.partition("\n\n")[2], message
             ):
                 return current
+        if publication_intent is not None:
+            if save_intent is None:
+                raise GitError("publication commit intent requires a persistence boundary")
+            return install_publication_commit(
+                self._git, checkout, tree=tree, parents=[parent, default_head_sha],
+                message=message, intent=publication_intent, save_intent=save_intent,
+            )
         created = self._git._run_in(
             checkout,
             "commit-tree",

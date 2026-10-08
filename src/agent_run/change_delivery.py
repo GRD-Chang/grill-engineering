@@ -249,6 +249,8 @@ class ChangeDeliveryEngine:
             phase = str(job["phase"])
             if phase in {"completed", "blocked", "stale", "publication_pending", "ready_for_approval"}:
                 return self._step_result(state, job)
+            if not self.reconcile_pending_pr_write(state, job):
+                return self._step_result(state, job)
             if phase == "ready_for_integration":
                 if self.development_only or not acquire_ticket_slot(state, job):
                     return DeliveryStep(DeliveryStepKind.WAITING, str(job["phase"]), "integration_queue")
@@ -315,6 +317,11 @@ class ChangeDeliveryEngine:
         finally:
             self.release_agent_work()
             self._agent_work_allowed = True
+
+    def reconcile_pending_pr_write(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        from agent_run.change_pr_reconciliation import reconcile_pending_pr_write
+
+        return reconcile_pending_pr_write(self, state, job)
 
     def release_agent_work(self) -> None:
         if self._control_token is not None:
@@ -688,7 +695,7 @@ class ChangeDeliveryEngine:
     ) -> bool:
         exhausted = record_publication_operation_failure(job, error)
         if exhausted:
-            if self.contract.label.startswith("ticket-") and job.get("phase") in {"merging", "merged"}:
+            if job.get("phase") in {"publishing", "merging", "merged"}:
                 job["execution_resume_phase"] = job["phase"]
             job["phase"] = "publication_pending"
             state.update(

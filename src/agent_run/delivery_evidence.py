@@ -20,6 +20,7 @@ def clear_stale_delivery_evidence(job: dict[str, Any]) -> None:
         "candidate_sha",
         "publication",
         "publication_sha",
+        "publication_commit_intent",
         "acceptance_artifact",
         "acceptance_record",
         "publication_attempts",

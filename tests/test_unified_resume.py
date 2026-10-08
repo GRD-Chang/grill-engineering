@@ -81,6 +81,33 @@ def test_missing_work_facts_keeps_resume_entry_and_reports_gap() -> None:
     assert state == before
 
 
+@pytest.mark.parametrize("phase", ["waiting_external", "stale"])
+def test_final_publication_resume_preserves_saved_reconciliation_work(phase: str) -> None:
+    job = {
+        "phase": "ready_for_human", "pause_resume_phase": phase,
+        "blocked_reason": "github_write_outcome_unknown",
+        "write_intent": {"action": "create_final_pr"},
+        "artifact": {"pr_title": "Stored publication"},
+        "publication_operation_retry": {"attempts": 1, "limit": 5},
+    }
+    state = {
+        "run_id": "run", "status": "ready_for_human", "run_publication": job,
+        "run_acceptance": {"phase": "accepted"},
+    }
+    original = deepcopy(job)
+    apply_resume_to_state(
+        state, explicit_resume=True, resume_human_blocker=False,
+        new_thread=False, human_response=None, resume_budget_checkpoint=False,
+        budget_policy=DeliveryPolicy(), ticket_number=None, source_status="ready_for_human",
+    )
+    assert state["status"] == "run_publication_pending"
+    assert job["phase"] == phase
+    for key in ("artifact", "write_intent", "publication_operation_retry"):
+        assert job[key] == original[key]
+    assert "pause_resume_phase" not in job
+    assert "approval_grant" not in job
+
+
 def test_unknown_resume_does_not_authorize_changed_scope_or_final_approval() -> None:
     for status in ('unsupported_scope_change', 'requeue_required', 'parent_approval_pending'):
         state = {'run_id': 'run', 'status': status, 'parent_job': {

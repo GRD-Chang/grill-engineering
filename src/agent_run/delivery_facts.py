@@ -190,6 +190,11 @@ def multi_ticket_progress(
             "work_queue_position": work_waiters.index(number) + 1 if number in work_waiters else None,
             "has_work_slot": number in working,
             "holds_integration": number == holder,
+            "pending_write": {
+                key: job_data["ticket_write_intent"][key]
+                for key in ("action", "branch", "base_branch", "base_sha", "head_sha", "expected_remote_sha")
+                if key in job_data["ticket_write_intent"]
+            } if isinstance(job_data.get("ticket_write_intent"), dict) else None,
             "required_checks": job_data.get("required_checks_evidence"),
             "supervision": _ticket_supervision_snapshot(state, job_data),
             "blocked_reason": reason,

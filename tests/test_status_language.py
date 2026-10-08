@@ -282,7 +282,7 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
 
 @pytest.mark.parametrize(("status", "command"), [
     ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "resume"),
-    ("publication_pending", "abandon"),
+    ("publication_pending", "resume"),
 ])
 def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, status: str, command: str,

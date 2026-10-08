@@ -63,7 +63,12 @@ def reconcile(state: dict[str, Any], job: dict[str, Any]) -> None:
 
 
 def requires_integration_seat(job: dict[str, Any]) -> bool:
-    """An unresolved merge owns the seat even when its retries are paused."""
+    """Retain the exact integration boundary until a sent write is settled."""
+    intent = job.get("ticket_write_intent")
+    if isinstance(intent, dict) and intent.get("action") in {
+        "publish_ticket_ref", "ensure_ticket_pr",
+    }:
+        return True
     phase = job.get("phase")
     if (
         (phase == "publication_pending" or (

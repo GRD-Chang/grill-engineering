@@ -145,7 +145,11 @@ class GitHubPublisher(Protocol):
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int: ...
+
+    def find_change_pr_number(self, *, branch: str) -> int | None: ...
 
     def ensure_ticket_pr(
         self,
@@ -157,6 +161,8 @@ class GitHubPublisher(Protocol):
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int: ...
 
     def abandon_parent_pr(self, pr_number: int) -> bool: ...
@@ -186,6 +192,8 @@ class GitHubPublisher(Protocol):
     ) -> dict[str, Any]: ...
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]: ...
+
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]: ...
 
     def run_pr_narrative_matches(
         self, pr_number: int, *, title: str, body: str

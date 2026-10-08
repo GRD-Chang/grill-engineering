@@ -1153,8 +1153,11 @@ class ClosesAfterEnsurePublisher(ClosedUnmergedPublisher):
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         number = super().ensure_ticket_pr(
+            write_intent=write_intent, save_intent=save_intent,
             branch=branch,
             base_branch=base_branch,
             title=title,

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Ticket-specific contract for the shared Change Delivery Engine."""
 
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.commit_messages import commit_messages_match
@@ -309,7 +310,8 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
         )
 
     def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
     ) -> str:
         return self.owner.git.create_publication_commit(
             checkout,
@@ -321,6 +323,8 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
                 else job.get("published_sha")
             ),
             message=message,
+            publication_intent=job.setdefault("publication_commit_intent", {}),
+            save_intent=save_intent,
         )
 
     def prepare_validation(
@@ -335,10 +339,13 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
         state: dict[str, Any],
         job: dict[str, Any],
         publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
     ) -> int:
         return self.owner.github.ensure_ticket_pr(
             branch=str(job["ticket_branch"]),
             base_branch=str(state["run_branch"]),
+            write_intent=job["ticket_write_intent"],
+            save_intent=save_intent,
             title=str(publication["pr_title"]),
             body=self.owner._render_ticket_pr_body(state, job, publication),
             primary_ticket=int(job["ticket_number"]),

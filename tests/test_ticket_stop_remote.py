@@ -84,7 +84,7 @@ def test_stop_reconciles_lost_publish_response_before_releasing_seat(
     assert "2" not in paused["ticket_pause_requests"]
     assert published == [head]
     if lost_action == "ensure_pr":
-        assert pr_calls == [1, 1]
+        assert pr_calls == [1]
         assert job["pr_number"] == 1
     remote = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert len(remote.get("pull_requests", [])) == (1 if lost_action == "ensure_pr" else 0)

@@ -517,13 +517,25 @@ def test_run_repair_recovery_rejects_a_foreign_pr_identity_without_new_effects(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     requests_before = len(agents.development_requests)
 
-    with pytest.raises(ValueError, match="foreign identity"):
-        RunAcceptanceEngine(
-            git=git,
-            states=states,
-            agents=agents,
-            github=FixtureGitHubPublisher(fixture, git),
-        ).accept(str(state["run_id"]))
+    pending = states.load_current_run(str(state["run_id"]))["run_acceptance"]["repair_job"]
+    resumed_engine = RunAcceptanceEngine(
+        git=git, states=states, agents=agents, github=FixtureGitHubPublisher(fixture, git),
+    )
+    if "head_sha" in identity_error or "base_sha" in identity_error:
+        # These raw fixture fields conflict with its authoritative live refs;
+        # the lower-level Publisher continues to reject the inconsistent row.
+        with pytest.raises(ValueError, match="foreign identity"):
+            resumed_engine.accept(str(state["run_id"]))
+    else:
+        # Live identity/read failures now pause before old publication evidence
+        # can be discarded, leaving an explicit recovery boundary.
+        paused = resumed_engine.accept(str(state["run_id"]))
+        job = paused["run_acceptance"]["repair_job"]
+        assert job["phase"] == "blocked"
+        assert job["execution_resume_phase"] == "publishing"
+        assert job["ticket_write_intent"] == pending["ticket_write_intent"]
+        assert job["publication_sha"] == pending["publication_sha"]
+        assert paused["diagnostics"][0]["code"] == "change_pr_write_reconciliation_pending"
 
     assert len(agents.development_requests) == requests_before
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery

@@ -73,7 +73,7 @@ def continuation_phase(location: str, subject: dict[str, Any]) -> str:
         phase = subject.get(key)
         if isinstance(phase, str) and phase not in {"blocked", "ready_for_human"}:
             allowed = ({"pending", "reviewing", "repairing", "accepted"} if location == "run_acceptance"
-                       else {"pending", "publishing", "waiting_checks", "merging", "merged"} if location == "run_publication"
+                       else {"pending", "publishing", "waiting_checks", "waiting_external", "stale", "merging", "merged"} if location == "run_publication"
                        else {p.value for p in TicketPhase} - {"blocked", "completed", "publication_pending"})
             if phase not in allowed:
                 raise ValueError(f"{location}: invalid saved continuation phase {phase}")

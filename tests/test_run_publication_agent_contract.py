@@ -21,6 +21,7 @@ from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.publication_operation_retry import MAX_PUBLICATION_OPERATION_ATTEMPTS
 from agent_run.run_repair_requests import RunRepairRequests
 
 from support.seeding import seed_idle_control
@@ -28,6 +29,20 @@ from support.cli import run_internal_stage, run_cli, stdout_json
 from support.prompt_capture import _capture_public_prompt
 
 from support.run_publication import InterruptedRunPublisher, InvocationRunPublicationAgents, RunPublicationAgents
+
+
+def _exhaust_publication_operations(
+    engine: RunPublicationEngine, run_id: str,
+) -> dict[str, Any]:
+    # 未知写入每次先等待对账；真实推进到预算耗尽，不能将首次等待当作耗尽。
+    for attempt in range(1, MAX_PUBLICATION_OPERATION_ATTEMPTS + 1):
+        pending = engine.publish(run_id)
+        assert pending["run_publication"]["publication_operation_retry"]["attempts"] == attempt
+        assert pending["status"] == (
+            "publication_pending" if attempt == MAX_PUBLICATION_OPERATION_ATTEMPTS
+            else "waiting_external"
+        )
+    return pending
 
 
 def _bind_ticket_review_budget(
@@ -464,14 +479,15 @@ def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     repo = workspace.repository_root
     state, states, git, publisher = _accepted_run(repo, state_root=workspace.state_root)
 
-    pending = RunPublicationEngine(
+    interrupted_engine = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
         github=InterruptedRunPublisher(repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    pending = _exhaust_publication_operations(interrupted_engine, str(state["run_id"]))
     acceptance = pending["run_acceptance"]["acceptance_record"]
     agents = repo / "resume-publication-agents.json"
     agents.write_text(
@@ -496,7 +512,11 @@ def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     assert recovered["run_publication"]["publication_attempts"] == 1
     retry = recovered["run_publication"]["publication_operation_retry"]
     assert retry["attempts"] == retry["limit"]
-    assert recovered["run_publication"]["artifact"]
+    assert recovered["run_publication"]["artifact"] == pending["run_publication"]["artifact"]
+    assert recovered["run_publication"]["write_intent"] == pending["run_publication"]["write_intent"]
+    assert "publication_operation_retry_history" not in recovered["run_publication"]
+    remote = FixtureGitHubPublisher(repo / "github.json", git)
+    assert remote.data["delivery"].get("pull_requests", []) == []
 
 
 def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
@@ -504,20 +524,22 @@ def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
-    pending = RunPublicationEngine(
+    interrupted_engine = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
         github=InterruptedRunPublisher(git_repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    pending = _exhaust_publication_operations(interrupted_engine, str(state["run_id"]))
     publisher.data["delivery"]["required_checks"] = ["pending"]
 
+    recovered_agents = RunPublicationAgents()
     waiting = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=recovered_agents,
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
@@ -526,6 +548,11 @@ def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
     assert pending["terminal_kind"] == "publication_pending"
     assert waiting["status"] == "publication_pending"
     assert waiting["terminal_kind"] == "publication_pending"
+    assert waiting["run_publication"]["publication_operation_retry"] == pending["run_publication"]["publication_operation_retry"]
+    assert waiting["run_publication"]["artifact"] == pending["run_publication"]["artifact"]
+    assert waiting["run_publication"]["write_intent"] == pending["run_publication"]["write_intent"]
+    assert recovered_agents.requests == []
+    assert publisher.data["delivery"].get("pull_requests", []) == []
 
 def test_final_run_publication_receives_only_role_required_facts(
     git_repo: Path,
@@ -817,8 +844,14 @@ def test_retries_publication_operation_without_a_fresh_narrative_agent(
         default_head_sha=git.resolve("main"),
     )
 
+    interrupted = engine.publish(str(state["run_id"]))
+    assert interrupted["status"] == "waiting_external"
+    assert interrupted["run_publication"]["write_intent"]["action"] == "create_final_pr"
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
     retried = engine.publish(str(state["run_id"]))
 
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
+    assert "write_intent" not in retried["run_publication"]
     assert retried["status"] == "run_approval_pending"
     assert len(agents.requests) == 1
     assert retried["run_publication"]["publication_attempts"] == 1
@@ -835,7 +868,12 @@ def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) ->
         default_branch="main",
         default_head_sha=git.resolve("main"),
     )
+    interrupted = engine.publish(str(state["run_id"]))
+    assert interrupted["status"] == "waiting_external"
+    # 先读回已创建的原 PR，完成对账后再测试下一轮验收中的关闭保护。
     published = engine.publish(str(state["run_id"]))
+    assert published["status"] == "run_approval_pending"
+    assert "write_intent" not in published["run_publication"]
     prior_attempt = published["run_publication"]["semantic_attempt_history"][-1]
     assert prior_attempt["publication_operation_retry"] == {
         "attempts": 1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Concrete Change Delivery adapters for the Run Repair consumer."""
 
 from copy import deepcopy
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -252,7 +253,8 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
         )
 
     def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
     ) -> str:
         integration = job.get("run_repair_integration")
         published_sha = (
@@ -269,6 +271,8 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
                 published_sha=published_sha,
                 integration=integration if isinstance(integration, dict) else None,
                 message=message,
+                publication_intent=job.setdefault("publication_commit_intent", {}),
+                save_intent=save_intent,
             )
         return self.owner.git.create_publication_commit(
             checkout,
@@ -276,6 +280,8 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
             base_sha=str(job["base_sha"]),
             published_sha=published_sha,
             message=message,
+            publication_intent=job.setdefault("publication_commit_intent", {}),
+            save_intent=save_intent,
         )
 
     def rotate_job_checkout(
@@ -305,6 +311,7 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
         state: dict[str, Any],
         job: dict[str, Any],
         publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
     ) -> int:
         github = self.owner.github
         if github is None:
@@ -312,6 +319,8 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
         return github.ensure_change_pr(
             branch=str(job["repair_branch"]),
             base_branch=str(state["run_branch"]),
+            write_intent=job["ticket_write_intent"],
+            save_intent=save_intent,
             title=str(publication["pr_title"]),
             body=self.owner._render_run_repair_pr_body(state, publication),
             expected_head_sha=str(job["publication_sha"]),

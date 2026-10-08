@@ -29,6 +29,7 @@ def _invalidate_stale_publication(
     checkout: Path,
 ) -> None:
     job.pop("pending_publication_result", None)
+    job.pop("publication_commit_intent", None)
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is not None:
         close_semantic_attempt(
@@ -164,8 +165,16 @@ def publication(
         "pr_body_markdown": publication.pr_body_markdown,
     }
     publication_parent = str(job.get("published_sha", job["base_sha"]))
+    if "publication_commit_intent" in job and not isinstance(
+        job["publication_commit_intent"], dict
+    ):
+        raise ValueError("Publication commit intent must be an object")
+    def save_commit_intent() -> None:
+        stage.save(state)
+
     sha = stage.publisher.create_publication_commit(
-        checkout, job, publication.commit_message
+        checkout, job, publication.commit_message,
+        save_intent=save_commit_intent,
     )
     actual_parent = stage.git.commit_parents(sha)[0]
     close_semantic_attempt(
@@ -185,6 +194,7 @@ def publication(
         }
     )
     job.pop("pending_publication_result", None)
+    job.pop("publication_commit_intent", None)
     job.pop("last_publication_error", None)
     stage.save(state)
     stage._reject_stale(

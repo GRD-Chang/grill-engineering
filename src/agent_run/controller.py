@@ -3151,6 +3151,10 @@ def apply_resume_to_state(
         budget_resumed = _resume_ticket_publication_retry(
             state, ticket_number=ticket_number
         )
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        from agent_run.publication_resume import resume_parent_publication_retry
+
+        budget_resumed = resume_parent_publication_retry(state)
     if explicit_resume and not budget_resumed:
         ticket_execution_resumed = _resume_ticket_execution_failure(
             state, ticket_number=ticket_number

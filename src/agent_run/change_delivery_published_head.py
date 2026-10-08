@@ -403,25 +403,47 @@ def publish_and_merge(
         "base_sha": publication_base,
         "head_sha": str(job["publication_sha"]),
     }
-    if job.get("ticket_write_intent") != pr_intent:
+    saved_pr_intent = job.get("ticket_write_intent")
+    if not isinstance(saved_pr_intent, dict) or any(
+        saved_pr_intent.get(key) != value for key, value in pr_intent.items()
+    ):
         if stage._pause_ticket_if_requested(state, job):
             return True
         job["ticket_write_intent"] = pr_intent
         stage.save(state)
-    exhausted, pr_number = _publication_operation(
-        stage,
-        state,
-        job,
-        lambda: stage.publisher.ensure_pr(state, job, publication),
-    )
+
+    def save_pr_intent() -> None:
+        stage.save(state)
+
+    try:
+        exhausted, pr_number = _publication_operation(
+            stage,
+            state,
+            job,
+            lambda: stage.publisher.ensure_pr(
+                state, job, publication, save_intent=save_pr_intent,
+            ),
+        )
+    except GitHubReadError as error:
+        if error.code not in {
+            "change_pr_narrative_outcome_unknown", "change_pr_narrative_intent_changed",
+        }:
+            raise
+        return stage._block(state, job, error.code, str(error))
     if exhausted:
         return True
     if type(pr_number) is not int:
         raise ValueError("Publisher returned an invalid Change PR number")
+    before_pr_result = deepcopy(job)
     job.pop("ticket_write_intent", None)
     job["pr_number"] = pr_number
     sync_fallback_receipt_observation(job, pr_number)
-    stage.save(state)
+    try:
+        stage.save(state)
+    except (OSError, TimeoutError):
+        job.clear()
+        job.update(before_pr_result)
+        raise
     if stage._pause_ticket_if_requested(state, job):
         return True
     stage._reject_stale(

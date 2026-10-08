@@ -125,7 +125,7 @@ def invalidate_repair_publication(state: dict[str, Any], job: dict[str, Any]) ->
     for key in (
         "publication", "publication_sha", "publication_parent_sha",
         "publication_prior_published_sha", "pending_publication_result",
-        "merge_intent", "ticket_write_intent", "approval_grant",
+        "merge_intent", "ticket_write_intent", "approval_grant", "publication_commit_intent",
     ):
         job.pop(key, None)
     clear_required_checks_observation(job)

@@ -21,6 +21,7 @@ from agent_run.git_errors import (
 )
 from agent_run.git_integration_operation import IntegrationGitOperation
 from agent_run.git_integration_commit import IntegrationRepairCommitGit
+from agent_run.git_publication_commit import install_publication_commit
 from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
 from agent_run.git_output import run_git
@@ -665,6 +666,8 @@ class GitRepository:
         base_sha: str,
         published_sha: str | None = None,
         message: str,
+        publication_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> str:
         tree = self._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
         parents = [published_sha or base_sha]
@@ -678,7 +681,7 @@ class GitRepository:
         # record. Revalidation can produce the same accepted tree from a
         # detached repair scene whose history does not contain the new base.
         current = self._resolve_in(checkout, "HEAD")
-        if (
+        if not publication_intent and (
             self._resolve_in(checkout, "HEAD^{tree}") == tree
             and self.commit_parents(current) == parents
         ):
@@ -692,6 +695,13 @@ class GitRepository:
                 )
             ):
                 return current
+        if publication_intent is not None:
+            if save_intent is None:
+                raise GitError("publication commit intent requires a persistence boundary")
+            return install_publication_commit(
+                self, checkout, tree=tree, parents=parents, message=message,
+                intent=publication_intent, save_intent=save_intent,
+            )
         parent_arguments = [
             argument for parent in parents for argument in ("-p", parent)
         ]
@@ -721,6 +731,8 @@ class GitRepository:
         published_sha: str | None = None,
         integration: dict[str, object] | None = None,
         message: str,
+        publication_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> str:
         return self._integration_commit.create_merge_resolution_publication_commit(
             checkout,
@@ -730,6 +742,8 @@ class GitRepository:
             published_sha=published_sha,
             integration=integration,
             message=message,
+            publication_intent=publication_intent,
+            save_intent=save_intent,
         )
 
     def reset_checkout_to_base(self, checkout: Path, base_branch: str) -> None:
