@@ -29,6 +29,7 @@ from agent_run.delivery_policy import (
     ticket_budget_policy_for_job,
 )
 from agent_run.error_safety import bounded_error
+from agent_run.resume_materials import require_resume_checkout
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
@@ -354,6 +355,10 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        if explicit_resume:
+            require_resume_checkout(
+                existing, self.states.root, self.publisher.git, ticket_number=ticket_number
+            )
         retry_window = None
         if (
             (explicit_resume or validate_resume_state is not None)

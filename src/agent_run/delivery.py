@@ -22,6 +22,7 @@ from agent_run.delivery_policy import parse_policy_snapshot, policy_snapshot_for
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
+from agent_run.resume_materials import require_change_checkout
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.ticket_phase import (
     BLOCKED_MESSAGES,
@@ -170,6 +171,7 @@ class TicketDeliveryEngine:
             / run_id
             / f"ticket-{ticket_number}"
         )
+        require_change_checkout(state, job, f"ticket:{ticket_number}", self.states.root, self.git)
         preserve_checkout = False
         checkout_prepared = False
         checkout_existed_before_attempt = checkout.exists()

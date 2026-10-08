@@ -177,6 +177,17 @@ class GitRepository:
     def checkout_head(self, checkout: Path) -> str:
         return self._resolve_in(checkout, "HEAD")
 
+    def checkout_belongs_to_repository(self, checkout: Path) -> bool:
+        """Compare real common Git metadata, without creating identity markers."""
+        arguments = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+        current = self._run(*arguments)
+        observed = self._run_in(checkout, *arguments)
+        return (
+            current.returncode == observed.returncode == 0
+            and bool(current.stdout.strip())
+            and Path(current.stdout.strip()).resolve() == Path(observed.stdout.strip()).resolve()
+        )
+
     def prepare_ticket_checkout(
         self,
         *,
@@ -496,7 +507,7 @@ class GitRepository:
         expected_message = f"chore(ticket-{ticket_number}): candidate {attempt}"
         if not status.stdout.strip():
             subject = self._run_in(checkout, "log", "-1", "--format=%s")
-            if self._candidate_commit_matches_intent(
+            if self.candidate_commit_matches_intent(
                 checkout,
                 observed_head=observed_head,
                 expected_head=expected_head,
@@ -566,7 +577,7 @@ class GitRepository:
         expected_message = f"chore(run-repair): candidate {attempt}"
         if not status.stdout.strip():
             subject = self._run_in(checkout, "log", "-1", "--format=%s")
-            if self._candidate_commit_matches_intent(
+            if self.candidate_commit_matches_intent(
                 checkout,
                 observed_head=observed_head,
                 expected_head=expected_head,
@@ -788,7 +799,7 @@ class GitRepository:
             return ()
         return ("-m", f"agent-run-candidate-intent: {token}")
 
-    def _candidate_commit_matches_intent(
+    def candidate_commit_matches_intent(
         self,
         checkout: Path,
         *,
@@ -1037,6 +1048,46 @@ class GitRepository:
                 raise GitError("integration resolution did not preserve both parents")
             return result
 
+    def recovered_integration_commit_matches(
+        self, checkout: Path, *, expected_head_sha: str,
+        expected_merge_sha: str | None, message: str,
+    ) -> bool:
+        """Read-only reconciliation of an integration commit before state save."""
+        with IntegrationGitOperation(self, checkout, "commit_integration_work") as operation:
+            head = self.checkout_head(checkout)
+            if head == expected_head_sha:
+                return False
+            status = operation.run("status", "--porcelain=v1", "--untracked-files=all")
+            current_message = operation.run("cat-file", "commit", head)
+            parents = [expected_head_sha]
+            if expected_merge_sha is not None:
+                parents.append(expected_merge_sha)
+            if not (
+                self._resolve_in_optional(checkout, "MERGE_HEAD") is None
+                and status.returncode == 0 and not status.stdout
+                and self.commit_parents(head) == parents
+                and current_message.returncode == 0
+                and commit_messages_match(current_message.stdout.partition("\n\n")[2], message)
+            ):
+                return False
+            checked = operation.run("diff", "--check", expected_head_sha, head)
+            if checked.returncode != 0:
+                raise GitError(checked.stdout.strip() or checked.stderr.strip()
+                               or "recovered integration work failed Git checks")
+            return True
+
+    def merge_candidate_matches_intent(
+        self, checkout: Path, *, checkout_head: str, run_head_sha: str,
+        default_head_sha: str, expected_message: str,
+        candidate_intent: dict[str, object] | None,
+    ) -> bool:
+        """Reuse the merge-resolution Candidate's exact two-parent intent."""
+        return self._integration_commit.merge_candidate_matches_intent(
+            checkout, checkout_head=checkout_head, run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha, expected_message=expected_message,
+            candidate_intent=candidate_intent,
+        )
+
     def commit_integration_work(
         self, checkout: Path, *, expected_head_sha: str,
         expected_merge_sha: str | None, message: str,
@@ -1049,25 +1100,10 @@ class GitRepository:
             if expected_merge_sha is not None:
                 parents.append(expected_merge_sha)
             if head != expected_head_sha:
-                status = operation.run("status", "--porcelain=v1", "--untracked-files=all")
-                current_message = operation.run("cat-file", "commit", head)
-                if (
-                    merge_head is None and status.returncode == 0 and not status.stdout
-                    and self.commit_parents(head) == parents
-                    and current_message.returncode == 0
-                    and commit_messages_match(
-                        current_message.stdout.partition("\n\n")[2], message,
-                    )
+                if self.recovered_integration_commit_matches(
+                    checkout, expected_head_sha=expected_head_sha,
+                    expected_merge_sha=expected_merge_sha, message=message,
                 ):
-                    # A matching commit may have been made while paused. Check
-                    # its actual delta; the clean index cannot prove it passed
-                    # the pre-commit checks before the state save was interrupted.
-                    checked = operation.run("diff", "--check", expected_head_sha, head)
-                    if checked.returncode != 0:
-                        raise GitError(
-                            checked.stdout.strip() or checked.stderr.strip()
-                            or "recovered integration work failed Git checks"
-                        )
                     return head
                 raise GitError("integration work HEAD changed before commit")
             if merge_head != expected_merge_sha:

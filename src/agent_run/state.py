@@ -330,8 +330,14 @@ class StateStore:
         state = self.load_run(run_id)
         if state is not None:
             from agent_run.state_contract import require_current_run_state
+            from agent_run.state_errors import MissingRunMaterialsError
 
-            require_current_run_state(state)
+            try:
+                require_current_run_state(state)
+            except MissingRunMaterialsError as error:
+                raise MissingRunMaterialsError(
+                    f"{self.runs_directory / (run_id + '.json')}: {error}"
+                ) from error
         return state
 
     def find_run(self, repository: str, parent_number: int) -> dict[str, Any] | None:

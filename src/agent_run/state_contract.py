@@ -35,6 +35,7 @@ from agent_run.required_checks_observation import (
 )
 from agent_run.state_errors import (
     IncompatibleRunStateError as IncompatibleRunStateError,
+    MissingRunMaterialsError,
 )
 from agent_run.ticket_phase import TicketPhase
 from agent_run.ticket_queue import requires_integration_seat
@@ -122,12 +123,41 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
     try:
+        _require_current_run_state(state)
+    except (ValueError, KeyError, TypeError) as error:
+        # Protocol identity must be explicit. This is diagnosis of damaged new
+        # Runs, never a legacy migration or permission to fill defaults.
+        if "schema_version" in state or any(
+            type(state.get(key)) is not type(expected) or state.get(key) != expected
+            for key, expected in (
+                ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
+                ("branch_authority_protocol", 2),
+                ("review_budget_protocol", 1),
+                ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
+                ("semantic_attempt_protocol", 1),
+                ("multi_ticket_protocol", 4),
+            )
+        ):
+            raise
+        detail = str(error)
+        if error.__cause__ is not None:
+            detail += f" ({error.__cause__})"
+        raise MissingRunMaterialsError(
+            f"Run {state.get('run_id', '<missing run_id>')}: 恢复状态材料缺损：{detail}；"
+            "请从可信备份补足对应字段及原工作身份、需求、基线、成果和历史，"
+            "不要猜测验收、批准或外部写入结果；补足后使用同一 agent-run resume 重新核验。"
+        ) from error
+
+
+def _require_current_run_state(state: dict[str, Any]) -> None:
+
+    try:
         validate_resources(state.get("prompt_resources"))
         if state.get("language") not in ("zh", "en"):
             raise ValueError("Run language must be zh or en")
     except ValueError as error:
         raise IncompatibleRunStateError(
-            "Run 缺少或包含不兼容的语言或静态 Prompt 资源快照；不能恢复，请创建新 Run"
+            "Run 缺少或包含不兼容的 language / prompt_resources 语言或静态 Prompt 资源快照"
         ) from error
 
     if "schema_version" in state:

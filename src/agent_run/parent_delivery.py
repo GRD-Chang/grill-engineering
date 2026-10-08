@@ -26,6 +26,7 @@ from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     policy_snapshot_for_state,
 )
+from agent_run.resume_materials import require_change_checkout
 from agent_run.state import StateStore
 from agent_run.review_budget import new_budget, reset_budget
 from agent_run.required_checks_observation import clear_required_checks_observation
@@ -63,6 +64,7 @@ class ParentDeliveryEngine:
         if job["phase"] in {"completed", "ready_for_approval"}:
             return state
         checkout = self.states.root / "worktrees" / run_id / "parent"
+        require_change_checkout(state, job, f"parent-only:{run_id}", self.states.root, self.git)
         preserve_checkout = False
         checkout_existed_before_attempt = checkout.exists()
         prepared = self.git.ticket_checkout_matches(

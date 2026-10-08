@@ -12,6 +12,7 @@ from agent_run.change_delivery import (
     ChangeJobContract,
     ensure_change_branch_authority,
 )
+from agent_run.resume_materials import require_change_checkout
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.git import MergeConflictError
@@ -71,6 +72,9 @@ class RunRepairLifecycle:
         try:
             while True:
                 job = self._repair_job(state, run)
+                require_change_checkout(
+                    state, job, f"run-repair:{state['run_id']}", self.owner.states.root, self.owner.git
+                )
                 self._complete_pending_repair_job_rotation(state, job, checkout)
                 branch = str(job["repair_branch"])
                 repair_is_integrated = isinstance(job.get("integrated_sha"), str)

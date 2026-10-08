@@ -134,6 +134,8 @@ from agent_run.state_contract import (
     human_blocker_subject_count,
     require_current_run_state,
 )
+from agent_run.state_errors import MissingRunMaterialsError
+from agent_run.resume_materials import require_resume_checkout
 from agent_run.task_control import (
     ActionBusyError,
     ActionReconciliationError,
@@ -1080,6 +1082,8 @@ def _main_with_parser_resources(
             diagnostic_code = "executor_start_unknown"
         elif isinstance(error, TaskControlError):
             diagnostic_code = "task_control"
+        elif isinstance(error, MissingRunMaterialsError):
+            diagnostic_code = "recovery_materials_missing"
         elif incompatible_state:
             diagnostic_code = "incompatible_run_state"
         elif str(error).startswith("multiple unfinished Delivery Runs"):
@@ -1094,7 +1098,7 @@ def _main_with_parser_resources(
             )
             or isinstance(error, DirtyManagedCheckoutError)
             or diagnostic_code
-            in {"action_busy", "executor_start_unknown", "task_control"}
+            in {"action_busy", "executor_start_unknown", "task_control", "recovery_materials_missing"}
         ):
             diagnostic_message = bounded_error(str(error))
         elif diagnostic_code == "workspace_required":
@@ -1127,6 +1131,8 @@ def _main_with_parser_resources(
         diagnostic_next_action = (
             "请进入目标 Git 仓库目录后重试"
             if diagnostic_code == "workspace_required"
+            else "从可信备份补足诊断中的材料，保留原工作、历史及额度，再使用同一 agent-run resume；外部写入结果未知时先对账"
+            if diagnostic_code == "recovery_materials_missing"
             else "请排除上述原因；已有交付先运行 agent-run status 确认状态，再决定是否重试"
         )
         locator_diagnostic: dict[str, object] = {
@@ -1961,6 +1967,8 @@ def _run_lifecycle(
     if current is not None:
         frozen_worker_identity(current)
         controller._require_current_checkout(current)
+        if action_kind == "resume":
+            require_resume_checkout(current, states.root, git, ticket_number=parsed.ticket)
     try:
         existing_control = control.load(task)
     except TaskControlError:

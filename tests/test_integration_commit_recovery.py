@@ -12,6 +12,7 @@ from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.state_errors import MissingRunMaterialsError
 from agent_run.state import StateStore
 from support.delivery_agents import PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
@@ -135,31 +136,43 @@ def test_public_resume_validates_recovered_integration_commit(
     assert git.commit_parents(committed) == [candidate, source]
     agents.continued = True
     calls_before = agents.integration_calls
+    if recovery == "invalid_manual_commit":
+        before = (states.runs_directory / f"{run_id}.json").read_bytes()
+        with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):
+            controller.resume(run_id, explicit_resume=True, ticket_number=3, new_thread=True)
+        assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+        assert agents.integration_calls == calls_before
+        assert not agents.publication_requests
+        assert publisher.merged_head is None
+        assert git.checkout_head(checkout) == committed
+        assert (checkout / "new.csv").read_bytes() == b"\xef\xbb\xbfkey,value\r\n1,2\r\n"
+        assert states.load_current_run(run_id)["active_ticket_job"]["integration_development_budget"]["used"] == used
+        # The same read-only reconciler rejects the actual delta and retains raw evidence.
+        with pytest.raises(GitError) as error:
+            git.recovered_integration_commit_matches(
+                checkout, expected_head_sha=candidate, expected_merge_sha=source,
+                message="chore(ticket-3): resolve integration conflict",
+            )
+        assert error.value.evidence["command"] == ["git", "diff", "--check", candidate, committed]
+        failure = error.value.evidence
+        checked = git._run("diff", "--check", candidate, committed)
+        assert failure["returncode"] == checked.returncode != 0
+        assert "new.csv:1: trailing whitespace" in json.loads(failure["stdout_json"])
+        assert failure["head_sha"] == committed
+        assert failure["merge_head_sha"] is None
+        return
     controller.resume(run_id, explicit_resume=True, ticket_number=3, new_thread=True)
     result = TicketDeliveryEngine(git=git, states=StateStore(states.root), github=publisher,
                                   agents=agents).deliver(run_id)
     job = result["active_ticket_job"]
     assert job["integration_development_budget"]["used"] == used
     checked = git._run("diff", "--check", candidate, committed)
-    if recovery == "invalid_manual_commit":
-        assert result["status"] != "ticket_completed"
-        assert job["blocked_reason"] == "integration_record_invalid"
-        failure = job["integration_conflict"]["failure"]
-        assert failure["command"] == ["git", "diff", "--check", candidate, committed]
-        assert failure["returncode"] == checked.returncode != 0
-        assert "new.csv:1: trailing whitespace" in json.loads(failure["stdout_json"])
-        assert not agents.publication_requests
-        assert publisher.merged_head is None
-        assert git.checkout_head(checkout) == committed
-        assert (checkout / "new.csv").read_bytes() == b"\xef\xbb\xbfkey,value\r\n1,2\r\n"
-        assert agents.integration_calls == calls_before + 1
-    else:
-        assert checked.returncode == 0
-        assert result["status"] == "ticket_completed"
-        assert git.is_ancestor(committed, job["ticket_integration"]["head_sha"])
-        assert job["integration_work_history"][-1]["resolution_sha"] == committed
-        assert publisher.merged_head == job["publication_sha"]
-        assert agents.integration_calls == calls_before
+    assert checked.returncode == 0
+    assert result["status"] == "ticket_completed"
+    assert git.is_ancestor(committed, job["ticket_integration"]["head_sha"])
+    assert job["integration_work_history"][-1]["resolution_sha"] == committed
+    assert publisher.merged_head == job["publication_sha"]
+    assert agents.integration_calls == calls_before
     persisted = StateStore(states.root).load_current_run(run_id)
     assert persisted is not None
     assert persisted["active_ticket_job"].get("blocked_reason") == job.get("blocked_reason")

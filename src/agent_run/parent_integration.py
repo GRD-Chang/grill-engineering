@@ -14,6 +14,16 @@ from agent_run.integration_resync_budget import (
 )
 
 
+PARENT_INTEGRATION_COMMIT_MESSAGE = "chore: resolve Parent integration conflict"
+
+
+def parent_conflict_commit_boundary(conflict: dict[str, Any]) -> tuple[str, str | None]:
+    """Use the saved closeout checkpoint for a follow-up on a resolved stage."""
+    if conflict["stage"] in conflict["resolved_stages"]:
+        return str(conflict["resolution_sha"]), None
+    return str(conflict["head_sha"]), conflict["merge_head_sha"]
+
+
 class ParentHistoryRewritten(GitError):
     def __init__(self, branch_kind: str, previous: str, observed: str) -> None:
         super().__init__(f"{branch_kind} history changed from {previous} to {observed}")
@@ -204,7 +214,7 @@ def finish_parent_snapshot_conflict(
         if conflict.get("failure") and conflict.get("development_summary"):
             head = git.commit_integration_work(
                 checkout, expected_head_sha=head, expected_merge_sha=None,
-                message="chore: resolve Parent integration conflict",
+                message=PARENT_INTEGRATION_COMMIT_MESSAGE,
             )
             conflict["resolution_sha"] = head
             save()
@@ -216,14 +226,14 @@ def finish_parent_snapshot_conflict(
             head = git.commit_integration_work(
                 checkout, expected_head_sha=str(conflict["head_sha"]),
                 expected_merge_sha=conflict["merge_head_sha"],
-                message="chore: resolve Parent integration conflict",
+                message=PARENT_INTEGRATION_COMMIT_MESSAGE,
             )
         elif git.commit_parents(head) != [conflict["head_sha"], conflict["merge_head_sha"]]:
             head = git.commit_integration_resolution(
                 checkout,
                 expected_head_sha=str(conflict["head_sha"]),
                 expected_merge_sha=str(conflict["merge_head_sha"]),
-                message="chore: resolve Parent integration conflict",
+                message=PARENT_INTEGRATION_COMMIT_MESSAGE,
             )
         resolved_stages.append(stage)
         conflict["resolution_sha"] = head

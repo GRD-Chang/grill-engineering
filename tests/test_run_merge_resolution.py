@@ -10,6 +10,7 @@ import pytest
 
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.git import GitError
+from agent_run.state_errors import MissingRunMaterialsError
 from agent_run.github_fixture import FixtureGitHubPublisher
 
 from support.merge_faults import (
@@ -119,8 +120,9 @@ def test_merge_resolution_candidate_finding_reuses_repair_cycle(
     fixture.assert_completed(result)
 
 
+@pytest.mark.parametrize("tampered_intent", [False, True], ids=["original-intent", "wrong-intent"])
 def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
-    git_repo: Path,
+    git_repo: Path, tampered_intent: bool,
 ) -> None:
     fixture = MergeResolutionFixture(git_repo, "candidate_save_crash")
     crashing_git = CandidateSaveCrashGit(git_repo)
@@ -131,9 +133,36 @@ def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
             FixtureGitHubPublisher(fixture.fixture, crashing_git),
             fixture.default_head,
         ).accept(str(fixture.state["run_id"]))
+    run_id = str(fixture.state["run_id"])
+    interrupted = fixture.states.load_current_run(run_id)
+    assert interrupted is not None
+    job = interrupted["run_acceptance"]["repair_job"]
+    checkout = Path(job["repair_checkout"])
+    committed = fixture.git.checkout_head(checkout)
+    attempt_id = job["pending_semantic_attempt"]["attempt_id"]
+    calls_before = len(fixture.agents.development_requests)
+    used = job["review_budget"]["development_attempts"]
+    if tampered_intent:
+        job["candidate_commit_intent"]["token"] = "unrelated-intent"
+        fixture.states.save_run(run_id, interrupted)
+        state_file = fixture.states.runs_directory / f"{run_id}.json"
+        before = state_file.read_bytes()
+        with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):
+            fixture.accept()
+        assert state_file.read_bytes() == before
+        assert fixture.git.checkout_head(checkout) == committed
+        assert len(fixture.agents.development_requests) == calls_before
+        assert fixture.agents.review_requests == []
+        return
     result = fixture.accept()
 
     fixture.assert_completed(result)
+    assert result["run_acceptance"]["candidate_sha"] == committed
+    assert len(fixture.agents.development_requests) == calls_before
+    assert result["run_acceptance"]["review_budget"]["development_attempts"] == used
+    retired = result["retired_semantic_attempt_owners"][-1]
+    attempts = retired["semantic_attempt_history"]
+    assert sum(attempt["attempt_id"] == attempt_id for attempt in attempts) == 1
 
 
 @pytest.mark.parametrize(

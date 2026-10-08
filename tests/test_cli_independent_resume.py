@@ -11,7 +11,7 @@ import pytest
 
 from support.cli import load_only_run_state, run_cli
 from support.seeding import write_fixture
-from support.workspace import managed_state
+from support.workspace import managed_repo, managed_state
 
 
 # 只替换外部进程 Host。子解释器执行生产 Executor 和完整 CLI，既不 fork
@@ -57,9 +57,16 @@ raise SystemExit(cli.main(sys.argv[1:]))
 '''
 
 
-@pytest.mark.parametrize("unknown_reason,new_thread", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("unknown_reason,new_thread,missing_material", [
+    (False, False, None),
+    (True, False, None),
+    (True, True, None),
+    (False, False, "timeline"),
+    (True, True, "checkout"),
+])
 def test_first_public_resume_reenters_real_cli_in_independent_executor(
     git_repo: Path, tmp_path: Path, unknown_reason: bool, new_thread: bool,
+    missing_material: str | None,
 ) -> None:
     fixture = write_fixture(git_repo / 'github.json', issues={})
     agents = git_repo / 'agents.json'
@@ -88,6 +95,80 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     assert len(history_before) == 1
     control_file, = (managed_state(git_repo) / 'task-control').glob('*.json')
     old_control = json.loads(control_file.read_text())
+    checkout = managed_state(git_repo) / 'worktrees' / run_id / 'parent'
+    if missing_material is not None:
+        # 缺损只来自本例故障注入；修复必须使用准确备份和真实 Git 身份，
+        # 不能由 Controller 猜测历史或通过重置状态伪造后继启动。
+        state_file = managed_state(git_repo) / 'runs' / f'{run_id}.json'
+        trusted_state = state_file.read_bytes()
+        progress = (checkout / 'progress.txt').read_bytes()
+        branch = subprocess.run(
+            ['git', 'branch', '--show-current'], cwd=checkout,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=checkout,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        if missing_material == 'timeline':
+            damaged = json.loads(trusted_state)
+            del damaged['timeline']
+            state_file.write_text(json.dumps(damaged), encoding='utf-8')
+        else:
+            subprocess.run(['git', 'worktree', 'remove', '--force', str(checkout)],
+                           cwd=managed_repo(git_repo), check=True, capture_output=True)
+            assert not checkout.exists()
+        state_bytes = state_file.read_bytes()
+        control_bytes = {path.name: path.read_bytes()
+                         for path in control_file.parent.glob('*.json')}
+        rejected = run_cli(git_repo, fixture, 'resume', run_id,
+                           '--agent-fixture', str(agents))
+        assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+        diagnostic = rejected.stdout + rejected.stderr
+        assert 'recovery_materials_missing' in diagnostic
+        assert run_id in diagnostic
+        assert any(word in diagnostic.lower() for word in ('恢复', '补', 'restore'))
+        if missing_material == 'timeline':
+            assert 'timeline' in diagnostic
+        else:
+            assert str(checkout) in diagnostic
+            assert branch in diagnostic
+            assert head in diagnostic
+            assert not checkout.exists()
+        assert state_file.read_bytes() == state_bytes
+        assert {path.name: path.read_bytes()
+                for path in control_file.parent.glob('*.json')} == control_bytes
+        assert json.loads(agents.read_text()) == script
+        if missing_material == 'timeline':
+            state_file.write_bytes(trusted_state)
+        else:
+            subprocess.run(['git', 'worktree', 'add', str(checkout), branch],
+                           cwd=managed_repo(git_repo), check=True, capture_output=True)
+            (checkout / 'progress.txt').write_bytes(progress)
+            assert subprocess.run(
+                ['git', 'rev-parse', 'HEAD'], cwd=checkout,
+                check=True, capture_output=True, text=True,
+            ).stdout.strip() == head
+            # 同名分支不足以证明补建身份：Agent 启动前拒绝错误 HEAD，
+            # 保全人工补足内容，不让后续完整性修复 reset/clean 此现场。
+            subprocess.run(['git', 'commit', '--allow-empty', '-m', 'controlled wrong reconstruction head'],
+                           cwd=checkout, check=True, capture_output=True)
+            wrong_head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=checkout,
+                                        check=True, capture_output=True, text=True).stdout.strip()
+            wrong = run_cli(git_repo, fixture, 'resume', run_id, '--agent-fixture', str(agents))
+            assert wrong.returncode == 2, wrong.stdout + wrong.stderr
+            assert 'recovery_materials_missing' in wrong.stdout
+            assert head in wrong.stdout
+            assert state_file.read_bytes() == state_bytes
+            assert {path.name: path.read_bytes()
+                    for path in control_file.parent.glob('*.json')} == control_bytes
+            assert json.loads(agents.read_text()) == script
+            assert (checkout / 'progress.txt').read_bytes() == progress
+            assert subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=checkout,
+                                  check=True, capture_output=True, text=True).stdout.strip() == wrong_head
+            # 操作者在准确备份已保全的隔离测试现场修正提交边界。
+            subprocess.run(['git', 'reset', '--hard', head], cwd=checkout,
+                           check=True, capture_output=True)
     snapshot = tmp_path / 'resume-admitted.json'
     environment = os.environ.copy()
     environment.update(PYTHONPATH=str(Path(__file__).parents[1] / 'src'),
@@ -121,6 +202,8 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     assert not Path(f"/proc/{control['executor']['pid']}").exists()
     history = after['agent_invocation_history']
     assert len(history) == 2
+    assert history[0] == history_before[0]
+    assert after['timeline'][:len(before['timeline'])] == before['timeline']
     assert history[-1]['error'] == 'controlled resumed worker boundary'
     assert history[-1]['semantic_attempt']['attempt_id'] == history_before[0]['semantic_attempt']['attempt_id']
     assert history[-1]['work_subject'] == history_before[0]['work_subject']
@@ -130,7 +213,6 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
         assert after['parent_job']['human_response_history'][-1]['response'] == '已修复环境，继续原工作。'
         assert after['resume_audit']['history'][-1]['successor_invocation_started_at'] == history[-1]['started_at']
         assert after['parent_job']['pause_history'][-1]['blocked_reason'] == 'unclassified_runtime_failure'
-    checkout = managed_state(git_repo) / 'worktrees' / run_id / 'parent'
     assert (checkout / 'progress.txt').read_text() == 'first\n'
     assert (checkout / 'resumed.txt').read_text() == 'second worker started\n'
     assert after['parent_job']['modification_attempts'] == before['parent_job']['modification_attempts']

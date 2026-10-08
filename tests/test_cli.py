@@ -5218,7 +5218,7 @@ def test_cli_rejects_a_malformed_canonical_nested_state(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
     assert json.loads(state_path.read_text(encoding="utf-8")) == before
 
 
@@ -5511,13 +5511,12 @@ def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> N
     assert result.returncode == 2
     output = stdout_json(result)
     assert output["status"] == "incompatible_run_state"
-    assert output["diagnostics"] == [
-        {
-            "code": "incompatible_run_state",
-            "message": "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
-            "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run",
-        }
-    ]
+    diagnostic, = output["diagnostics"]
+    assert diagnostic["code"] == "recovery_materials_missing"
+    assert run_id in diagnostic["message"]
+    assert "Parent" in diagnostic["message"] or "parent" in diagnostic["message"]
+    assert "agent-run resume" in diagnostic["message"]
+    assert "attacker" not in diagnostic["message"]
     assert json.loads(state_path.read_text(encoding="utf-8")) == before
 
 

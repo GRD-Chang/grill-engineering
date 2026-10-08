@@ -110,7 +110,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
     assert json.loads(state_path.read_text(encoding="utf-8")) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert subprocess.run(
@@ -465,7 +465,7 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
     assert json.loads(state_path.read_text(encoding="utf-8")) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert _git_refs(managed_repo(git_repo)) == refs_before

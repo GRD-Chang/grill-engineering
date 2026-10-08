@@ -84,7 +84,7 @@ class IntegrationRepairCommitGit:
                 },
             )
         if not status.stdout.strip() and merge_head is None:
-            if self._merge_candidate_matches_intent(
+            if self.merge_candidate_matches_intent(
                 checkout,
                 checkout_head=checkout_head,
                 run_head_sha=run_head_sha,
@@ -163,7 +163,7 @@ class IntegrationRepairCommitGit:
             raise GitError("Merge-resolution Candidate parents changed unexpectedly")
         return candidate
 
-    def _merge_candidate_matches_intent(
+    def merge_candidate_matches_intent(
         self,
         checkout: Path,
         *,
@@ -174,6 +174,8 @@ class IntegrationRepairCommitGit:
         candidate_intent: dict[str, object] | None,
     ) -> bool:
         if not isinstance(candidate_intent, dict):
+            return False
+        if self._git._resolve_in_optional(checkout, "MERGE_HEAD") is not None:
             return False
         if self._git.commit_parents(checkout_head) != [run_head_sha, default_head_sha]:
             return False

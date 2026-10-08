@@ -413,10 +413,18 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     state, _ = controller.start(1)
     run_id = str(state["run_id"])
     job = state["ticket_jobs"]["3"]
+    git = GitRepository(git_repo)
+    branch = f"agent-run/{run_id}/ticket-3"
+    checkout = store.root / "worktrees" / run_id / "ticket-3"
+    git.prepare_ticket_checkout(branch=branch, base_sha=git.resolve("HEAD"), checkout=checkout)
+    preserved = checkout / "credential-interrupted-work.txt"
+    preserved.write_text("development before credential failure\n")
     job.update(
         {
             "phase": "developing",
             "ticket_branch_generation": 1,
+            "ticket_branch": branch,
+            "managed_checkout_head": git.checkout_head(checkout),
             "development_thread_id": "development-thread",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
@@ -475,6 +483,12 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     assert resumed["diagnostics"] == []
     assert resumed["active_agent_invocation"]["status"] == "resuming"
     assert resumed["ticket_jobs"]["3"]["development_failure_resume"] is True
+    assert resumed["ticket_jobs"]["3"]["pending_semantic_attempt"] == semantic_attempt
+    assert resumed["ticket_jobs"]["3"]["review_budget"] == job["review_budget"]
+    assert resumed["ticket_jobs"]["3"]["development_thread_id"] == "development-thread"
+    assert git.ticket_checkout_matches(checkout, branch)
+    assert git.checkout_head(checkout) == job["managed_checkout_head"]
+    assert preserved.read_text() == "development before credential failure\n"
 
     assert resumed["ticket_jobs"]["3"]["human_response_history"][-1]["response"] == "凭据已恢复，继续原开发。"
 

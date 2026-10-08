@@ -11,6 +11,7 @@ import pytest
 from agent_run.agents import DevelopmentResult
 from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend
 from agent_run.executor_host import FakeExecutorHost
+from agent_run.git import GitRepository
 from agent_run.run_driver import RunDriver
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
@@ -46,6 +47,16 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     workspace = prepare_workspace(git_repo)
     repo = workspace.repository_root
     state, store, job, stage = prepared_conflict(repo, kind, state_root=workspace.state_root)
+    git = GitRepository(repo)
+    name, branch_key = {
+        "ticket": ("ticket-3", "ticket_branch"),
+        "parent_only": ("parent", "parent_branch"),
+        "run_repair": ("run-repair", "repair_branch"),
+    }[kind]
+    branch = f"agent-run/{name}"
+    checkout = store.root / "worktrees" / state["run_id"] / name
+    git.prepare_ticket_checkout(branch=branch, base_sha=job["candidate_sha"], checkout=checkout)
+    job.update({branch_key: branch, "managed_checkout_head": git.checkout_head(checkout)})
     job["policy_snapshot"] = dict(state["policy_snapshot"])
     stage.save(state)
     fixture = repo / "github.json"
@@ -56,7 +67,7 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     budget = deepcopy(job["review_budget"])
     ci_budget = deepcopy(job["ci_recovery"])
     candidate = job["candidate_sha"]
-    preserved = repo / "conflict-work.txt"
+    preserved = checkout / "conflict-work.txt"
     preserved.write_text("work already completed\n")
 
     def fail(request: dict[str, Any]) -> DevelopmentResult:
@@ -70,7 +81,7 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
 
     stage.agents = ProfiledAgentBackend(SimpleNamespace(develop=fail), profiles, run_id=run_id)
     with pytest.raises(InterruptedError):
-        run_conflict(stage, state, job, repo)
+        run_conflict(stage, state, job, checkout)
     attempt = deepcopy(job["pending_semantic_attempt"])
     integration_budget = deepcopy(job.get("integration_development_budget"))
     if kind != "run_repair":
@@ -114,7 +125,7 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
         return DevelopmentResult(thread_id="conflict-thread", summary="Conflict resolved")
 
     stage.agents = ProfiledAgentBackend(SimpleNamespace(develop=complete), profiles, run_id=run_id)
-    assert run_conflict(stage, resumed, resumed_job, repo)
+    assert run_conflict(stage, resumed, resumed_job, checkout)
     assert "pending_semantic_attempt" not in resumed_job
     assert resumed_job["review_budget"] == budget
     assert resumed_job["ci_recovery"] == ci_budget

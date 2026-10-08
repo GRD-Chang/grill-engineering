@@ -411,8 +411,9 @@ def test_run_acceptance_cli_reports_incompatible_missing_integration_record(
     output = stdout_json(result)
     assert result.returncode == 2
     assert output["status"] == "incompatible_run_state"
-    assert output["diagnostics"][0]["code"] == "incompatible_run_state"
-    assert "不会迁移" in output["diagnostics"][0]["message"]
+    assert output["diagnostics"][0]["code"] == "recovery_materials_missing"
+    assert "补足" in output["diagnostics"][0]["message"]
+    assert "agent-run resume" in output["diagnostics"][0]["message"]
     assert states.load_run(str(state["run_id"])) == state_before
 
 
