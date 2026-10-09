@@ -236,6 +236,10 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
 
         def review(self, request: dict[str, Any]) -> ReviewResult:
             self.request = request
+            saved = states.load_run(str(state["run_id"]))
+            assert saved["run_acceptance"]["pending_semantic_attempt"]["review_context"] == request["review_context"]
+            assert request["review_context"]["facts"]["ticket_completion_records"] == request["ticket_completion_records"]
+            assert request["review_context"]["full_range"]["base_sha"] == request["current_review_identity"]["default_base_sha"]
             event = request["_invocation_event"]
             event("started", requested_thread_id=None, attempt_count=0)
             event("thread_started", reported_thread_id="run-reviewer", attempt_count=1)
@@ -1697,6 +1701,7 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     accepted = engine.accept(str(state["run_id"]))
 
     assert accepted["status"] == "run_publication_pending"
+    assert agents.requests[1]["review_context"]["facts"]["continuation_acceptance_artifacts"][-1] == blocked["run_acceptance"]["acceptance_artifact"]
     assert "previous_acceptance_artifact" not in agents.requests[1]
     assert "previous_review_identity" not in agents.requests[1]
     assert agents.requests[1]["review_budget_context"] == {
@@ -2135,3 +2140,33 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
     assert review_history[-2]["attempt_count"] == 3
     assert review_history[-1]["status"] == "completed"
     assert review_history[-1]["attempt_count"] == 1
+
+
+def test_repeated_human_review_resume_keeps_original_artifacts_after_reload(git_repo: Path) -> None:
+    state, states, git = _completed_run(git_repo)
+    originals = [_human_artifact(), _human_artifact()]
+    for index, artifact in enumerate(originals):
+        artifact["checks"]["e2e"]["evidence"] = f"Original blocker {index + 1}: external decision required"
+        artifact["checks"]["spec"]["evidence"] = f"Original requirement evidence {index + 1}"
+    agents = ScriptedRunAgents()
+    agents._reviews = [*deepcopy(originals), _passing_artifact()]
+    controller = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states)
+    for index in range(3):
+        result = RunAcceptanceEngine(git=git, states=states, agents=agents).accept(state["run_id"])
+        if index < 2:
+            assert result["status"] == "ready_for_human"
+            controller.resume(state["run_id"], resume_human_blocker=True, new_thread=True,
+                              human_response=f"Reply {index + 1}")
+            reloaded = states.load_current_run(state["run_id"])
+            assert reloaded["run_acceptance"]["acceptance_artifact"] == originals[index]
+    assert result["status"] == "run_publication_pending"
+    sent = agents.review_requests[-1]["review_context"]
+    assert sent["facts"]["continuation_acceptance_artifacts"] == originals
+    from agent_run.reviewer_prompts import review_prompt
+    prompt = review_prompt(agents.review_requests[-1])
+    assert "Original requirement evidence 1" in prompt and "Original requirement evidence 2" in prompt
+    assert "Reply 1" in prompt and "Reply 2" in prompt
+    saved = states.load_current_run(state["run_id"])
+    run = saved["run_acceptance"]
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["semantic_attempt_history"][-1]["review_context"] == sent

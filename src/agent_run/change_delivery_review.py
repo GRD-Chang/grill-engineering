@@ -25,6 +25,11 @@ from agent_run.change_delivery_threads import record_reviewer as _record_reviewe
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import reviewer_budget_context
+from agent_run.review_context import (
+    prepare_review_context,
+    review_context_for_result,
+    review_record_identity,
+)
 from agent_run.semantic_attempt import pending_semantic_attempt
 
 
@@ -90,9 +95,8 @@ def review(
                 stage.review_budget_policy(),
                 current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
             )
-        if semantic_attempt.get("budget_consumed") is True:
-            request.pop("previous_acceptance_artifact", None)
-            request.pop("previous_review_identity", None)
+        prepare_review_context(request, semantic_attempt, job, stage.git, state)
+        stage.save(state)
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,
@@ -180,25 +184,10 @@ def complete_review(
     )
     review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
-        candidate_sha = str(job["candidate_sha"])
-        reviewed_base_sha = str(job["base_sha"])
-        if isinstance(job.get("default_base_sha"), str):
-            review_identity = {
-                "run_base_sha": str(job["base_sha"]),
-                "repair_candidate_sha": candidate_sha,
-                "expected_merge_tree": stage.git.expected_merge_tree(
-                    default_head_sha=str(job["default_base_sha"]),
-                    run_head_sha=candidate_sha,
-                ),
-            }
-        else:
-            review_identity = {
-                "reviewed_base_sha": reviewed_base_sha,
-                "reviewed_candidate_sha": candidate_sha,
-                "reviewed_candidate_tree": stage.git.resolve(
-                    f"{candidate_sha}^{{tree}}"
-                ),
-            }
+        context = review_context_for_result(job)
+        candidate_sha = str(context["binding"]["candidate_sha"])
+        reviewed_base_sha = str(context["binding"]["base_sha"])
+        review_identity = review_record_identity(context)
         review_record = {
             "reviewer_thread_id": reviewer_thread_id,
             "candidate_sha": candidate_sha,
@@ -215,12 +204,13 @@ def complete_review(
                 budget, review_record, limit=stage.review_budget_policy().review_limit,
                 human_blocker_resume=pending.get("human_blocker_resume") is True,
             )
-    job["last_review_candidate_sha"] = str(job["candidate_sha"])
+    context = review_context_for_result(job)
+    job["last_review_candidate_sha"] = str(context["binding"]["candidate_sha"])
     prior_acceptance = job.get("acceptance_record")
     if isinstance(prior_acceptance, dict) and AcceptanceArtifact.parse(prior_acceptance.get("artifact")).is_accepted:
         job["previous_parent_acceptance_record"] = deepcopy(prior_acceptance)
     job["acceptance_record"] = stage.adapter.acceptance_record(
-        state, job, reviewer_thread_id, artifact.raw
+        state, job, reviewer_thread_id, artifact.raw, review_context=context,
     )
     if artifact.is_accepted and job.get("attempt_kind") == "ci_repair":
         job["publication_authority"] = "accepted"

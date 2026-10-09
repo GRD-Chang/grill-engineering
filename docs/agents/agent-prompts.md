@@ -460,7 +460,7 @@ Ticket CI Review 关闭时各轮均另用 `ci_repair_publication_context`：只�
 以下用于后续实现核验，不作为附加段落再次发给 Worker：
 
 1. 覆盖子任务、完整需求、整体修复与整体审查；每个角色都有清楚标注用途的需求 URL、职责与唯一输出。
-   需求正文不进入 Prompt；新会话修复也有首次读取要求。
+   开发与文案通过需求 URL 自主读取正文；Reviewer 的固定 Review Context 保存并发送本次需求事实与版本，仍须核对权威 Issue。新会话修复也有首次读取要求。
 2. 通用 Skill 不修改。开发只覆盖必要的测试、内部审查和 Git 步骤；正式审查明确代码对象与 JSON 输出例外。
    代码为初次开发选择建议一轮子 Agent 审查的指令，为修复选择修复指令，不要求 Agent 判断阶段。
    非审查协作不受内部审查轮数约束，审查子 Agent 的中立输入和 `fork_turns: "none"` 保留。
@@ -487,3 +487,16 @@ Ticket CI Review 关闭时各轮均另用 `ci_repair_publication_context`：只�
 Ticket 的 CI Development 与 CI Review 请求使用 `work_source=ci` 并携带准确 `ci_evidence`（失败 head、检查与可取得的原始日志）。Development 调查根因和直接影响，不预设失败只能修改代码解决，不重新开发整套需求，不削弱有效检查制造通过。Review 只核验该修复、证据及直接回归；初始 Ticket Review、完整 Parent 验收与人工批准不受配置影响。
 
 Review Findings 退回时 `repair_source=acceptance`，仍携带原始 CI 证据和 `work_source=ci`；新会话、同次执行续接及人工 message 保留同一来源。免审成果不生成 Acceptance，文案明确当前候选未独立验收。
+
+### 固定审核快照
+
+Ticket、Parent-only、完整 Parent（含其修复候选）在 Reviewer 调用前保存 `review_context`，
+归属于现有 Semantic Attempt，完成后随其有界历史保留；status/history 的 Attempt JSON 可读取同一快照。
+快照保存需求事实、当前/前次 review identity、原始 Acceptance Artifact、CI 与集成证据。
+`full_range` 始终描述交付基线 B 至当前候选：首次 B→C1，修复后 B→C2；有适用完整前序审核时
+`focus_range` 为 C1→C2，否则先建立完整基线。基线或需求变化不会凭相同 tree 获得前序完整审核责任。
+完整 Parent 还固定默认分支基准、预期合并 tree、Ticket Graph 与 Completion；Ticket 的 Parent 只提供背景。
+实际中英文完整及续接 Prompt 均携带该快照，新的人工 message、线程与恢复不会移除原始失败证据。同次审核的续接 Artifact 按原样有界保存（最多 64 份，保留首次及最近记录），不以最新 blocker 覆盖首次原始证据。
+返回结论使用该快照固定的事实，随后按既有 currentness 合同收口；不能从调用后的新 HEAD 或新默认基线重建旧结论。
+Reviewer 自主决定核验深度与扩大范围，程序不解析 Findings 或制定代码语义检查清单。
+本票不改变审核豁免、预算、发布或最终批准策略；跨阶段证据适用规则仍按各自既有合同判断。

@@ -1,6 +1,16 @@
 """独立验收的双语对象说明、证据边界与输出语义。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'review/context-ranges': {
+        'zh': """本次固定审核快照的需求与范围事实（原始证据在下方用途段落给出，均取自同一快照）：
+{0}
+
+full_range 是交付基线至当前候选的完整范围；focus_range 是本轮优先核验的变化，不能代替完整交付责任。has_complete_baseline 为 false 时先建立完整基线。facts 保留有效需求、原始 Findings、失败证据及当前组合；Ticket 的 parent 仅提供背景，不扩大具体任务范围。集成改变基线时按新基线核验最终组合，并检查原始集成变化。CI Review 聚焦原失败、修复与直接回归；两种 Parent 仍对当前整体形成结论。你自主决定检查深度，按具体风险扩大核验范围。""",
+        'en': """Requirements and ranges from the fixed review snapshot (original evidence appears in the purpose-specific sections below, from the same snapshot):
+{0}
+
+full_range covers the delivery base through the current candidate; focus_range identifies priority changes and does not replace full delivery responsibility. Establish a complete baseline when has_complete_baseline is false. facts retain effective requirements, original Findings, failure evidence and the current combination; a Ticket's parent is background only and does not expand its task. When integration changes the base, check the final combination against the new base and inspect the original integration changes. CI Review focuses on the original failure, repairs and direct regressions; both Parent types still conclude on the entire current result. Decide inspection depth independently and expand validation for concrete risks.""",
+    },
     'review/run-ci-object': {
         'zh': """本次验收对象：
 当前工作区是 CI 修复与默认分支合并后的未提交整体预览，HEAD 留在默认分支基准是正常情况；检查工作树中的当前整体结果。CI 修复提交差异从失败证据绑定的版本到下方 repair_candidate_sha 比较；该提交差异用于定向核验，不替代整体预览。整体开发基准与实际合并基准可能不同，实际合并基准从当前工作区的只读 Git 取得。""",

@@ -24,6 +24,7 @@ def review_prompt(request: dict[str, Any]) -> str:
         resource(request, "methods/acceptance"),
         task_brief(request, read_issues=True),
         _review_object(request),
+        _review_ranges(request),
         _ci_repair_evidence(request),
         resource(request, "review/read-only-validation"),
         _integration_evidence(request),
@@ -42,10 +43,11 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
         resource(request, "review/resume"),
         task_brief(request, read_issues=False),
         _review_object(request),
+        _review_ranges(request),
         _ci_repair_evidence(request),
         _integration_evidence(request),
         _run_review_scope(request),
-        _previous_review(request) if request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"} else "",
+        _previous_review(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
     )
@@ -144,3 +146,32 @@ def _run_review_scope(request: dict[str, Any]) -> str:
     if request.get("acceptance_scope") != "run":
         return ""
     return resource(request, "review/run-complete-scope")
+
+
+def _review_ranges(request: dict[str, Any]) -> str:
+    context = request.get("review_context")
+    if not isinstance(context, dict):
+        return ""
+    # Evidence has role-specific explanations below; render each raw artifact once.
+    facts = context["facts"]
+    displayed_facts = {
+        key: value for key, value in facts.items()
+        if key not in {
+            "current_review_identity", "previous_review_identity", "previous_acceptance_artifact",
+            "ci_evidence", "integration_record", "run_integration_record", "run_review_facts",
+            "fallback_ticket_records", "ticket_integration_records", "ci_repair_ticket_records",
+            "prior_human_blockers",
+        }
+    }
+    if request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"}:
+        displayed_facts.pop("parent_acceptance_baseline", None)
+    elif isinstance(displayed_facts.get("parent_acceptance_baseline"), dict):
+        displayed_facts["parent_acceptance_baseline"] = {
+            key: value for key, value in displayed_facts["parent_acceptance_baseline"].items()
+            if key != "artifact"
+        }
+    displayed = {
+        "facts": displayed_facts,
+        **{key: context[key] for key in ("full_range", "focus_range", "has_complete_baseline")},
+    }
+    return resource(request, "review/context-ranges").format(pretty(displayed))

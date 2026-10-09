@@ -1412,6 +1412,20 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         "current_review_attempt": 2,
         "remaining_review_attempts": 1,
     }
+    first = agents.review_requests[0]["review_context"]
+    second = agents.review_requests[1]["review_context"]
+    assert first["full_range"] == first["focus_range"]
+    assert not first["has_complete_baseline"]
+    assert second["full_range"] == {
+        "base_sha": first["full_range"]["base_sha"], "candidate_sha": job["candidate_sha"],
+    }
+    assert second["focus_range"] == {
+        "base_sha": first["full_range"]["candidate_sha"], "candidate_sha": job["candidate_sha"],
+    }
+    assert second["has_complete_baseline"]
+    assert second["facts"]["previous_acceptance_artifact"] == agents.development_requests[1]["acceptance_artifact"]
+    assert job["acceptance_record"]["reviewed_candidate_sha"] == second["full_range"]["candidate_sha"]
+    assert states.load_run(state["run_id"])["active_ticket_job"]["semantic_attempt_history"][-2]["review_context"] == second
     assert len(set(agents.reviewer_thread_ids)) == 2
     assert len(set(agents.validation_checkouts)) == 2
     assert all(not path.exists() for path in agents.validation_checkouts)
@@ -1619,6 +1633,7 @@ def test_fresh_validation_human_resume_with_new_thread_replaces_blocker_artifact
 
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
+    assert agents.review_requests[1]["review_context"]["facts"]["continuation_acceptance_artifacts"][-1] == blocked_job["acceptance_artifact"]
     assert "previous_acceptance_artifact" not in agents.review_requests[1]
     assert "previous_review_identity" not in agents.review_requests[1]
     assert agents.review_requests[1]["review_budget_context"] == {

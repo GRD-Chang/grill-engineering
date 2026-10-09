@@ -16,7 +16,7 @@ status: accepted
 
 预算固定归属于交付对象：Ticket 使用自身额度，完整 Parent（包括 Parent-only）使用自身额度；按既有用途、角色和窗口分别计数。Repair Job 使用所属对象的预算，不搬移或复制可变预算。此目标取代现有 Run Review Budget 在 Run Acceptance 与 Repair Job 之间移交、归还的持久归属要求，并消除 CI 预算双位置保存后依赖内存别名重绑的实现责任；额度上限、消费时点、累计范围和续期授权不变。
 
-Review Context 的准备与返回结论绑定由共同职责处理。上下文区分需求范围、完整交付范围和本轮重点变化，提供准确提交、适用前次结论与 Findings、CI 或集成证据；完整 Parent 还保留实际预期合并结果、Ticket Graph 与 Completion。程序固定真实事实，Reviewer 自主决定审查深度及扩大范围，不由程序解析 Findings 并生成具体检查计划。此职责集中复用既有身份与证据，不增加另一套审核状态。
+Review Context 的准备与返回结论绑定由共同职责处理。上下文区分需求范围、完整交付范围和本轮重点变化，提供准确提交、适用前次结论与 Findings、CI 或集成证据；完整 Parent 还保留实际预期合并结果、Ticket Graph 与 Completion。程序固定真实事实，Reviewer 自主决定审查深度及扩大范围，不由程序解析 Findings 并生成具体检查计划。此职责集中复用既有身份与证据，不增加另一套审核状态。实现将调用前的 Review Context 保存于既有 Semantic Attempt，按原身份形成 Acceptance Record，随有界历史保留；完整范围和重点变化独立表达。恢复使用同一快照并附加原始 Human Blocker Artifact 与本次人工回复，既有 currentness 负责否决不适用结论。
 
 本轮集中已有错误处理、Agent 修复、程序等待/对账、暂停与恢复规则，并修正已确认的执行不一致；不扩大 Agent 自动调查范围，不新增普通提交、部分 Parent fetch 或发布操作失败后的 Development 调查流程。相关权限、材料或外部条件问题继续通过现有暂停与人工 resume 处理。这项范围限制使共同机制的深化与新增修复能力分别验收。
 

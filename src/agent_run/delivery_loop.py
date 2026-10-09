@@ -6,6 +6,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
+from agent_run.review_context import candidate_review_identity
 from agent_run.commit_messages import commit_messages_match
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
@@ -183,13 +184,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "ticket": _ticket(state, job),
             "base_sha": review_base,
             "candidate_sha": job["candidate_sha"],
-            "current_review_identity": {
-                "reviewed_base_sha": review_base,
-                "reviewed_candidate_sha": str(job["candidate_sha"]),
-                "reviewed_candidate_tree": self.git.resolve(
-                    f"{job['candidate_sha']}^{{tree}}"
-                ),
-            },
+            "current_review_identity": candidate_review_identity(job, self.git),
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
             "thread_id": (
@@ -222,16 +217,14 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        reviewed_base = str(job["base_sha"])
         return {
             "acceptance_scope": "change_job",
-            "reviewed_base_sha": reviewed_base,
-            "reviewed_candidate_sha": str(job["candidate_sha"]),
-            "reviewed_candidate_tree": self.git.resolve(
-                f"{job['candidate_sha']}^{{tree}}"
-            ),
-            "effective_revision": str(job["effective_revision"]),
+            **(review_context["facts"]["current_review_identity"] if review_context is not None
+               else candidate_review_identity(job, self.git)),
+            "effective_revision": str(review_context["binding"]["effective_revision"]
+                                      if review_context is not None else job["effective_revision"]),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }

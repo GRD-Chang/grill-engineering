@@ -56,6 +56,7 @@ class ChangeDeliveryAdapter(Protocol):
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def acceptance_is_current(

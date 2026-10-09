@@ -251,9 +251,11 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
-            **self.review_identity(state, job),
+            **(review_context["facts"]["current_review_identity"] if review_context is not None
+               else self.review_identity(state, job)),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }

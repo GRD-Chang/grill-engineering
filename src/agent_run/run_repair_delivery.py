@@ -102,8 +102,11 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        record = self.candidate_acceptance.record(job, reviewer_thread_id, artifact)
+        record = self.candidate_acceptance.record(
+            job, reviewer_thread_id, artifact, review_context=review_context,
+        )
         parsed = AcceptanceArtifact.parse(artifact)
         if parsed.is_accepted:
             job.pop("unresolved_acceptance_artifact", None)

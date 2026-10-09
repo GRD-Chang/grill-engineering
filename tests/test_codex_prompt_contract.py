@@ -1783,7 +1783,7 @@ def test_role_continuations_use_short_role_specific_prompts(
     assert "CURRENT_BASE_SENTINEL" in review
     assert "CURRENT_HEAD_SENTINEL" in review
     assert "CURRENT_TREE_SENTINEL" in review
-    assert "OLD_ARTIFACT_SENTINEL" not in review
+    assert "OLD_ARTIFACT_SENTINEL" in review
     assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" not in review
     assert "交付说明" in publication
     assert "继续完成你负责的交付说明" in publication

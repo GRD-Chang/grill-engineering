@@ -1103,9 +1103,11 @@ def test_run_acceptance_binds_the_previewed_merge_tree(git_repo: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("drift,new_thread", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("drift,new_thread,during_call_drift", [
+    (False, False, False), (False, True, False), (True, False, False), (False, False, True),
+])
 def test_returned_run_review_survives_currentness_read_failure(
-    git_repo: Path, drift: bool, new_thread: bool,
+    git_repo: Path, drift: bool, new_thread: bool, during_call_drift: bool,
 ) -> None:
     """A real save/load retains the result; a changed review boundary rejects it."""
     state, states, git = _completed_run(git_repo)
@@ -1116,6 +1118,8 @@ def test_returned_run_review_survives_currentness_read_failure(
             event("started", requested_thread_id=None, attempt_count=0)
             event("thread_started", reported_thread_id="run-reviewer-1", attempt_count=1)
             result = super().review(request)
+            if during_call_drift:
+                engine.default_head_sha = git.resolve(str(state["run_branch"]))
             event("completed", reported_thread_id=result.thread_id, attempt_count=1)
             return result
 
@@ -1128,12 +1132,16 @@ def test_returned_run_review_survives_currentness_read_failure(
                 raise GitHubReadError("github_api_unavailable", "readback unavailable")
             return super()._refresh_run_currentness(current)
 
+    engine = FailingReadEngine(git=git, states=states, agents=agents)
     with pytest.raises(GitHubReadError, match="readback unavailable"):
-        FailingReadEngine(git=git, states=states, agents=agents).accept(state["run_id"])
+        engine.accept(state["run_id"])
     saved = states.load_current_run(state["run_id"])
     run = saved["run_acceptance"]
     assert run["phase"] == "reviewing"
     assert run["pending_review_result"]["record"]["artifact"] == _passing_artifact()
+    sent = agents.review_requests[0]["review_context"]
+    assert run["pending_review_result"]["record"]["reviewed_default_base_sha"] == sent["full_range"]["base_sha"]
+    assert run["pending_semantic_attempt"]["review_context"] == sent
     assert run["review_budget"]["reviewer_invocations"] == 1
     attempt_id = run["pending_semantic_attempt"]["attempt_id"]
     if drift:

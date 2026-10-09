@@ -10,6 +10,7 @@ from agent_run.change_delivery_review import complete_review
 from agent_run.github import GitHubReadError
 from agent_run.review_attempt import begin_review, consume_review_result
 from agent_run.review_budget import TICKET_POLICY, new_budget
+from agent_run.review_context import prepare_review_context
 from support.run_artifacts import _passing_artifact
 
 
@@ -22,6 +23,12 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
         job, work_subject="ticket-3", generation=1,
         boundary={"candidate_sha": "candidate"}, budget_window=1,
     )
+    prepare_review_context(
+        {"acceptance_scope": "ticket", "current_review_identity": {
+            "reviewed_base_sha": "base", "reviewed_candidate_sha": "candidate",
+            "reviewed_candidate_tree": "tree",
+        }}, attempt, job, SimpleNamespace(resolve=lambda ref: ref), {},
+    )
     artifact = consume_review_result(job, TICKET_POLICY, _passing_artifact())
     job["pending_review_result"] = {"reviewer_thread_id": "reviewer", "artifact": artifact.raw}
     state = {"active_ticket_job": job}
@@ -32,7 +39,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     stage = SimpleNamespace(
         contract=SimpleNamespace(label="ticket-3"),
         git=SimpleNamespace(resolve=lambda _ref: "tree"),
-        adapter=SimpleNamespace(acceptance_record=lambda *_args: {"artifact": artifact.raw}),
+        adapter=SimpleNamespace(acceptance_record=lambda *_args, **_kwargs: {"artifact": artifact.raw}),
         review_budget_policy=lambda: TICKET_POLICY,
         _reject_stale=lambda *_args: None,
         _record_agent_run_status=status_read_failure,

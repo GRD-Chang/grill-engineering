@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+from agent_run.review_context import prepare_review_context, run_acceptance_record
 
 from agent_run.agents import AgentBackend
 from agent_run.development_review import advance_development_review, after_review, ReviewDecision
@@ -204,9 +207,7 @@ class RunAcceptanceEngine:
                     semantic_attempt.get("budget_consumed") is True
                 ),
             )
-            if semantic_attempt.get("budget_consumed") is True:
-                request.pop("previous_acceptance_artifact", None)
-                request.pop("previous_review_identity", None)
+            context = prepare_review_context(request, semantic_attempt, run, self.git, state)
             run["phase"] = "reviewing"
             self._save(state)
             if run.get("reviewer_new_thread") is True:
@@ -267,14 +268,7 @@ class RunAcceptanceEngine:
             # re-checking because the Reviewer did complete a valid audit even
             # when a live boundary refresh discards that verdict.
             artifact = consume_review_result(run, budget_policy, review.artifact)
-            record = self._acceptance_record(
-                state, run_head, expected_merge_tree, review.thread_id, artifact.raw
-            )
-            record.update({
-                "parent_revision": request["parent"]["revision"],
-                "ticket_graph_revision": request["ticket_graph"]["revision"],
-                "ticket_completion_records": request["ticket_completion_records"],
-            })
+            record = run_acceptance_record(context, review.thread_id, artifact.raw)
             run["pending_review_result"] = {
                 "record": record,
                 "human_blocker_resume": bool(run.get("prior_human_blockers")),
@@ -503,7 +497,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "repository": str(state["repository"]),
             "parent": dict(self._mapping(state, "parent")),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
+            "ticket_graph": deepcopy(self._mapping(state, "ticket_graph")),
             "ticket_completion_records": ticket_completion_records(state),
             "run_review_facts": {
                 "parent_revision": state["parent"]["revision"],
@@ -576,27 +570,6 @@ class RunAcceptanceEngine:
         self, state: dict[str, Any], job: dict[str, Any], integrated: str
     ) -> dict[str, Any] | None:
         return self.candidate_acceptance.promotion_record(state, job, integrated)
-
-    def _acceptance_record(
-        self,
-        state: dict[str, Any],
-        run_head: str,
-        expected_merge_tree: str,
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "run",
-            "reviewed_base_sha": self._default_head(state),
-            "reviewed_default_base_sha": self._default_head(state),
-            "reviewed_head_sha": run_head,
-            "expected_merge_tree": expected_merge_tree,
-            "parent_revision": self._mapping(state, "parent")["revision"],
-            "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": ticket_completion_records(state),
-            "reviewer_thread_id": reviewer_thread_id,
-            "artifact": artifact,
-        }
 
     def _record_reviewer(
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str

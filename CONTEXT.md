@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，代码尚未实施。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，内部 Repair PR 生命周期及 Run/Repair 预算移交、双位置保存的描述仅用于解释当前实现或历史，不构成新目标要求；实施时同步替换。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，Review Context 已接入；其余目标尚未全部实施。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，内部 Repair PR 生命周期及 Run/Repair 预算移交、双位置保存的描述仅用于解释当前实现或历史，不构成新目标要求；实施时同步替换。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 
@@ -14,7 +14,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 个人配置的 `language` 仅接受 `zh`/`en`，默认中文，不跟随宿主 locale。
 个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；四份完整文件 `development.md`、`repair.md`、`acceptance.md`、`publishing.md` 分别用于开发、修复、验收和发布文案准备。
 同线程新修复与新线程修复均使用固定的完整修复正文；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
-每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
+每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。Reviewer 调用前把实际需求、范围、身份与原始证据快照保存于既有 Semantic Attempt 的 Review Context，返回结论绑定该快照；有界 Attempt 历史保留该事实，status/history 不另建审核状态。
 资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
 缺少固定语言或必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用个人语言与候选安装包的内部资源。
 短界面文案通过 `messages.text` 统一选择，`messages.selected_language` 区分个人配置与固定 Run 语言；用户方法按角色组织为 Markdown；内部指令按职责在代码中以中英文配对的完整用途块维护，共用场景组装逻辑。

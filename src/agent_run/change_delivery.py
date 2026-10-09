@@ -14,6 +14,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_run.review_context import review_context_is_current
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.development_review import advance_development_review
@@ -842,7 +843,7 @@ class ChangeDeliveryEngine:
         checkout: Path,
         message: str,
     ) -> None:
-        if not self._agent_is_current(state, job):
+        if not review_context_is_current(job) or not self._agent_is_current(state, job):
             pending_attempt = pending_semantic_attempt(job)
             if pending_attempt is not None:
                 close_semantic_attempt(

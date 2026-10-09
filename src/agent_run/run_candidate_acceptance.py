@@ -40,11 +40,13 @@ class CandidateRunAcceptance:
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        default_base = str(job["default_base_sha"])
-        candidate_sha = str(job["candidate_sha"])
+        source = {**job, **review_context["binding"]} if review_context is not None else job
+        default_base = str(source["default_base_sha"])
+        candidate_sha = str(source["candidate_sha"])
         candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
-        self._require_merge_resolution_parents(job, candidate_sha)
+        self._require_merge_resolution_parents(source, candidate_sha)
         expected_merge_tree = self.git.expected_merge_tree(
             default_head_sha=default_base,
             run_head_sha=candidate_sha,
@@ -52,17 +54,17 @@ class CandidateRunAcceptance:
         record = {
             "acceptance_scope": "run",
             "acceptance_state": "candidate",
-            "reviewed_base_sha": job["base_sha"],
+            "reviewed_base_sha": source["base_sha"],
             "reviewed_default_base_sha": default_base,
             "reviewed_candidate_sha": candidate_sha,
             "reviewed_candidate_tree": candidate_tree,
-            "repair_base_run_head_sha": job["base_sha"],
+            "repair_base_run_head_sha": source["base_sha"],
             "expected_merge_tree": expected_merge_tree,
-            "parent_revision": job["parent_revision"],
-            "ticket_graph_revision": job["ticket_graph_revision"],
-            "ticket_completion_records": deepcopy(job["ticket_completion_records"]),
+            "parent_revision": source["parent_revision"],
+            "ticket_graph_revision": source["ticket_graph_revision"],
+            "ticket_completion_records": deepcopy(source["ticket_completion_records"]),
             "reviewer_thread_id": reviewer_thread_id,
-            "repair_source": job["repair_source"],
+            "repair_source": source["repair_source"],
             "artifact": deepcopy(artifact),
         }
         history = require_candidate_acceptance_history(
@@ -77,20 +79,20 @@ class CandidateRunAcceptance:
         }[artifact_outcome]
         entry = {
             "candidate_sha": candidate_sha,
-            "repair_base_run_head_sha": str(job["base_sha"]),
+            "repair_base_run_head_sha": str(source["base_sha"]),
             "default_base_sha": default_base,
             "candidate_tree": candidate_tree,
             "expected_merge_tree": expected_merge_tree,
-            "parent_revision": job["parent_revision"],
-            "ticket_graph_revision": job["ticket_graph_revision"],
+            "parent_revision": source["parent_revision"],
+            "ticket_graph_revision": source["ticket_graph_revision"],
             "ticket_completion_records_fingerprint": canonical_fingerprint(
-                job["ticket_completion_records"]
+                source["ticket_completion_records"]
             ),
             "reviewer_thread_id": reviewer_thread_id,
             "development_thread_id": job.get("development_thread_id"),
             "pr_number": job.get("pr_number"),
             "integrated_sha": job.get("integrated_sha"),
-            "repair_source": job["repair_source"],
+            "repair_source": source["repair_source"],
             "outcome": history_outcome,
         }
         require_candidate_acceptance_history(
