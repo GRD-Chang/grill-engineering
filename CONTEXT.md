@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，共同 Agent 执行、固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次共同执行、预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次共同执行、预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 

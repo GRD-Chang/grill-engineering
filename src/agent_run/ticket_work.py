@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlBusyError
+from agent_run.work_facts import ticket_program_ready
 
 
 WORK_ROLES = frozenset({"development", "reviewer", "publication", "integration_conflict"})
@@ -52,6 +53,7 @@ def reconcile(state: dict[str, Any]) -> None:
             and number in state["frontier"]
             and str(number) not in state["ticket_pause_requests"]
             and item["generation"] == generation(state, number)
+            and not ticket_program_ready(job)
             and job.get("phase") not in {
                 "blocked", "completed", "publication_pending", "ready_for_integration",
                 "waiting_checks", "waiting_merge", "merged",
@@ -80,7 +82,11 @@ class TicketWorkAdmission:
             before = deepcopy(state["ticket_work_queue"])
             reconcile(state)
             for number in numbers:
-                if number in state["frontier"] and str(number) not in state["ticket_pause_requests"]:
+                if (
+                    number in state["frontier"]
+                    and str(number) not in state["ticket_pause_requests"]
+                    and not ticket_program_ready(state["ticket_jobs"].get(str(number), {}))
+                ):
                     enqueue(state, number, "development")
             if state["ticket_work_queue"] != before:
                 self.states._save_run_and_notify_unlocked(self.run_id, state)

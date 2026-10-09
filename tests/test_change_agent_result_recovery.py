@@ -28,14 +28,16 @@ from support.seeding import write_fixture
 
 
 class CrashBeforeResultConsumption(StateStore):
-    def __init__(self, root: Path, subject: str, role: str) -> None:
+    def __init__(self, root: Path, subject: str, role: str, *, ticket_number: int | None = None) -> None:
         super().__init__(root)
         self.subject = subject
         self.role = role
+        self.ticket_number = ticket_number
         self.crashed = False
 
     def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
-        job = state.get(self.subject)
+        job = (state["ticket_jobs"].get(str(self.ticket_number))
+               if self.ticket_number is not None else state.get(self.subject))
         if isinstance(job, dict):
             attempt = job.get("pending_semantic_attempt")
             consumed = (
@@ -196,3 +198,134 @@ def test_saved_human_blocker_resume_starts_new_thread_on_same_work(git_repo: Pat
     )
     assert closed["attempt_id"] == old_attempt["attempt_id"]
     assert completed["active_ticket_job"]["modification_attempts"] == 1
+
+
+@pytest.mark.parametrize("role", ["development", "reviewer", "publication"])
+def test_returned_ticket_result_closes_without_agent_capacity(
+    git_repo: Path, role: str,
+) -> None:
+    """Reloaded returns finish through the existing stage seam with a full FIFO."""
+    from agent_run.delivery_loop import TicketDeliveryLoop
+    from agent_run.delivery_step import DeliveryStepKind
+    from agent_run.ticket_state import TicketState
+    from agent_run.ticket_work import TicketWorkAdmission
+    from support.ticket_parallel import ticket_run
+
+    initial, original, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = initial["run_id"]
+    crashing = CrashBeforeResultConsumption(original.root, "active_ticket_job", role, ticket_number=3)
+    checkout = original.root / "worktrees" / run_id / "ticket-3"
+    agents = PassAgents(checkout)
+    publisher = FixtureGitHubPublisher(fixture, git)
+    with pytest.raises(SimulatedProcessCrash, match="Agent returned"):
+        TicketDeliveryEngine(
+            git=git, states=crashing, github=publisher, agents=agents,
+        ).deliver_ticket(run_id, 3)
+
+    restored = StateStore(original.root)
+    scoped = TicketState(restored, run_id, 3)
+    state = scoped.load_current_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    attempt_id = job["pending_semantic_attempt"]["attempt_id"]
+    calls = (len(agents.development_requests), agents.review_count, len(agents.publication_requests))
+    admission = TicketWorkAdmission(restored, run_id)
+    admission.seed([2])
+    lease = admission.acquire(2, 1, "development")
+    assert lease is not None
+    sibling = deepcopy(restored.load_current_run(run_id)["ticket_jobs"].get("2"))
+    loop = TicketDeliveryLoop(git=git, states=scoped, github=publisher, agents=agents)
+    engine = loop._engine(state, job)
+    try:
+        for _ in range(8):
+            step = engine.advance(state, job, checkout, allow_agent=False)
+            if step.kind != DeliveryStepKind.CONTINUE:
+                break
+        else:
+            pytest.fail("Returned Agent work did not reach its next boundary")
+        assert step.kind == (
+            DeliveryStepKind.COMPLETED if role == "publication" else DeliveryStepKind.NEEDS_AGENT
+        )
+        closed = [entry for entry in job["semantic_attempt_history"] if entry["attempt_id"] == attempt_id]
+        assert len(closed) == 1 and "returned_result" not in closed[0]
+        assert calls == (len(agents.development_requests), agents.review_count, len(agents.publication_requests))
+        current = restored.load_current_run(run_id)
+        assert current["ticket_jobs"].get("2") == sibling
+        assert [entry["lease_id"] for entry in current["ticket_work_queue"] if entry["lease_id"]] == [lease]
+        assert job["modification_attempts"] == 1
+    finally:
+        admission.release(lease)
+        git.remove_worktree(checkout)
+
+
+def test_dispatch_consumes_reloaded_return_while_sibling_owns_last_slot(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event, Thread
+    from agent_run.ticket_work import TicketWorkAdmission
+    from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+
+    initial, original, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
+    run_id = initial["run_id"]
+    crashing = CrashBeforeResultConsumption(
+        original.root, "active_ticket_job", "development", ticket_number=3,
+    )
+    calls: list[int] = []
+    sibling_started = Event()
+
+    def develop(number: int) -> None:
+        calls.append(number)
+        if number == 2:
+            sibling_started.set()
+
+    agents = TicketAgents(git_repo, (2, 3), develop)
+    with pytest.raises(SimulatedProcessCrash, match="Agent returned"):
+        ticket_engine(git, crashing, fixture, agents).deliver_ticket(run_id, 3)
+    restored = StateStore(original.root)
+    admission = TicketWorkAdmission(restored, run_id)
+    admission.seed([2])
+    lease = admission.acquire(2, 1, "development")
+    assert lease is not None
+    closing, release_closeout = Event(), Event()
+    errors: list[BaseException] = []
+    original_revision = FixtureGitHubPublisher.current_effective_revision
+
+    def revision(publisher: FixtureGitHubPublisher, **kwargs: Any) -> str:
+        current = restored.load_current_run(run_id)
+        if kwargs["ticket_number"] == 3 and current["ticket_jobs"]["3"]["phase"] == "committing_candidate":
+            closing.set()
+            assert release_closeout.wait(10)
+        return original_revision(publisher, **kwargs)
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "current_effective_revision", revision)
+    engine = ticket_engine(git, restored, fixture, agents)
+
+    def dispatch() -> None:
+        try:
+            current = restored.load_current_run(run_id)
+            assert current is not None
+            engine.develop_frontier(run_id, current)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=dispatch)
+    thread.start()
+    try:
+        assert closing.wait(10), errors
+        current = restored.load_current_run(run_id)
+        assert current["ticket_jobs"]["3"]["phase"] == "committing_candidate"
+        assert [entry["lease_id"] for entry in current["ticket_work_queue"] if entry["lease_id"]] == [lease]
+        assert calls == [3]
+        admission.release(lease)
+        # The program lane is still in I/O, but owns no Agent capacity.
+        assert sibling_started.wait(10), errors
+        assert not release_closeout.is_set()
+    finally:
+        admission.release(lease)
+        release_closeout.set()
+        thread.join(10)
+    assert not thread.is_alive() and not errors, errors
+    assert calls == [3, 2]
+    assert restored.load_current_run(run_id)["ticket_work_queue"] == []
+    for number in (2, 3):
+        git.remove_worktree(restored.root / "worktrees" / run_id / f"ticket-{number}")

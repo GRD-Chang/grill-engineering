@@ -2,17 +2,16 @@ from __future__ import annotations
 
 """Shared, deterministic delivery lifecycle for a change job.
 
-The controller owns this lifecycle.  A typed job descriptor supplies only
+Delivery stages own this lifecycle. A typed job descriptor supplies only
 deterministic identity and branch facts; a semantic adapter supplies request
 construction and currentness decisions.  Controller/Publisher side effects
 and StateStore persistence are kept in their own seam.  In particular,
 neither layer gets a shortcut from development to a Run Branch write.
 """
 
-from contextvars import Token
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.review_context import review_context_is_current
@@ -58,7 +57,7 @@ from agent_run.review_budget import (
     policy_for_subject,
 )
 
-from agent_run.worker_control import worker_control
+from agent_run.agent_work import AgentWorkScope
 
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 
@@ -153,19 +152,17 @@ class ChangeDeliveryEngine:
         self.state_store = state_store
         self.development_only = development_only
         self._current_job: dict[str, Any] | None = None
-        self._agent_work_allowed = True
-        self._work_token: str | None = None
-        self._control_token: Token[Callable[[], None] | None] | None = None
-        self._work_admission = None
+        admission = None
         if contract.label.startswith("ticket-"):
             from agent_run.ticket_state import TicketState
             from agent_run.ticket_work import TicketWorkAdmission
 
             store = state_store.states
-            self._work_admission = TicketWorkAdmission(
+            admission = TicketWorkAdmission(
                 store.states if isinstance(store, TicketState) else store,
                 state_store.run_id,
             )
+        self.agent_work = AgentWorkScope(admission)
 
     def _pause_ticket_if_requested(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -241,7 +238,12 @@ class ChangeDeliveryEngine:
                 raise ValueError("Delivery step requires the active Ticket Job")
             sync_active_ticket_job(state)
         self._current_job = job
-        self._agent_work_allowed = allow_agent
+        with self.agent_work.step(job, allow_agent=allow_agent):
+            return self._advance_stage(state, job, checkout)
+
+    def _advance_stage(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    ) -> DeliveryStep:
         try:
             ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
             if self._pause_ticket_if_requested(state, job):
@@ -293,7 +295,7 @@ class ChangeDeliveryEngine:
                 return self._step_result(state, job, waiting=terminal)
             raise ValueError(f"unknown Ticket phase: {job['phase']}")
         except AgentWorkRequired as work:
-            if self._work_admission is not None and allow_agent and self._agent_work_allowed:
+            if self.agent_work.capacity_wait:
                 return DeliveryStep(DeliveryStepKind.WAITING, str(job["phase"]), "work_capacity")
             return DeliveryStep(DeliveryStepKind.NEEDS_AGENT, str(job["phase"]), work.role)
         except _TerminalChangeJob:
@@ -306,18 +308,13 @@ class ChangeDeliveryEngine:
             )
             ensure_supervision_window(state)
             self.save(state)
-            if self._work_admission is not None:
-                self._work_admission.cancel_waiter(int(job["ticket_number"]), int(job["ticket_branch_generation"]))
+            self.agent_work.defer()
             return self._step_result(state, job, waiting=True)
         except InitialCredentialUnavailable as error:
             self._refund_unstarted_credential_invocation(state, job)
             self._wait_for_initial_credential(state, job, http_status=error.http_status)
-            if self._work_admission is not None:
-                self._work_admission.cancel_waiter(int(job["ticket_number"]), int(job["ticket_branch_generation"]))
+            self.agent_work.defer()
             return self._step_result(state, job, waiting=True)
-        finally:
-            self.release_agent_work()
-            self._agent_work_allowed = True
 
     def reconcile_pending_pr_write(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         from agent_run.change_pr_reconciliation import reconcile_pending_pr_write
@@ -325,29 +322,10 @@ class ChangeDeliveryEngine:
         return reconcile_pending_pr_write(self, state, job)
 
     def release_agent_work(self) -> None:
-        if self._control_token is not None:
-            worker_control.reset(self._control_token)
-            self._control_token = None
-        if self._work_token is not None:
-            assert self._work_admission is not None
-            self._work_admission.release(self._work_token)
-            self._work_token = None
+        self.agent_work.release()
 
     def require_agent_work(self, role: str) -> None:
-        if not self._agent_work_allowed and self._work_admission is None:
-            raise AgentWorkRequired(role)
-        if self._work_admission is not None:
-            assert self._current_job is not None
-            self._work_token = self._work_admission.acquire(
-                int(self._current_job["ticket_number"]),
-                int(self._current_job["ticket_branch_generation"]), role,
-                allow_start=self._agent_work_allowed,
-            )
-            if self._work_token is None:
-                raise AgentWorkRequired(role)
-            admission, token = self._work_admission, self._work_token
-            self._control_token = worker_control.set(lambda: admission.check_control(token))
-        self._agent_work_allowed = False
+        self.agent_work.require(role)
 
     @staticmethod
     def _step_result(

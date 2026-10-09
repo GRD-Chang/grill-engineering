@@ -167,3 +167,70 @@ class DeliveryRunEngine:
             ):
                 return state
         return state
+
+
+def parent_stage_state(
+    state: dict[str, Any], *, parent_only: bool,
+) -> dict[str, Any]:
+    """Project the ready Parent's stage from its existing delivery records.
+
+    Graph scheduling proves readiness; this layer interprets the business
+    successor. Pause phases stay visible instead of using their saved
+    continuation as authority to proceed.
+    """
+    from agent_run.publication_pending import publication_pending_diagnostic
+    from agent_run.work_facts import work_phase
+
+    diagnostics: list[dict[str, Any]] = []
+    if parent_only:
+        subject = state.get("parent_job")
+        default_status = "parent_delivery_pending"
+    else:
+        acceptance = state.get("run_acceptance")
+        subject = state.get("run_publication")
+        default_status = (
+            "run_publication_pending"
+            if isinstance(acceptance, dict) and acceptance.get("phase") == "accepted"
+            else "run_acceptance_pending"
+        )
+        if default_status == "run_acceptance_pending":
+            subject = None
+
+    phase = (
+        subject.get("phase")
+        if isinstance(subject, dict) and subject.get("phase") in {
+            "blocked", "ready_for_human", "escalating",
+        }
+        else work_phase(subject) if isinstance(subject, dict) else None
+    )
+    if parent_only and isinstance(subject, dict) and subject.get("phase") in {
+        "blocked", "escalating",
+    }:
+        status = "blocked"
+        diagnostics = list(state.get("diagnostics", []))
+    elif phase == "completed" and parent_only:
+        status = "completed"
+    elif phase == "ready_for_approval":
+        status = "parent_approval_pending" if parent_only else "run_approval_pending"
+    elif phase == "waiting_checks":
+        status = "waiting_checks"
+    elif phase == "publication_pending":
+        status = "publication_pending"
+        diagnostics = [publication_pending_diagnostic(
+            subject_key="change_job" if parent_only else "delivery_run",
+            subject="parent-only" if parent_only else str(state["run_id"]),
+        )]
+    elif phase == ("merging" if parent_only else "merged"):
+        status = "parent_closeout_pending"
+    else:
+        status = default_status
+    return {
+        "status": status,
+        "diagnostics": diagnostics,
+        "terminal_kind": (
+            "all_tickets_completed" if status == "run_acceptance_pending"
+            else "completed" if status == "completed"
+            else "publication_pending" if status == "publication_pending"
+            else None
+        ),
+    }

@@ -8,6 +8,7 @@ from threading import Lock
 from time import monotonic
 from typing import Any, Callable, TYPE_CHECKING
 
+from agent_run.work_facts import ticket_program_ready
 from agent_run.executor_admission import close_admission_on_failure, close_executor_admission
 from agent_run.external_supervision import ExternalSupervisor
 from agent_run.runner_credentials import runner_credential_scope
@@ -129,7 +130,10 @@ def develop_frontier(
             with observer_lock:
                 owned = active | ({observer_ticket} if observer_ticket is not None else set())
             ready, pending_wait = candidates(current, frozenset(owned))
-            admission.seed([number for number in ready if number not in active])
+            admission.seed([
+                number for number in ready if number not in active
+                and not ticket_program_ready(current["ticket_jobs"].get(str(number), {}))
+            ])
             current = engine.states.load_current_run(run_id)
             assert current is not None
             if notify_completion and after_lane is not None and (
@@ -139,18 +143,28 @@ def develop_frontier(
                 notify_completion = False
             waiting = [item["ticket_number"] for item in current["ticket_work_queue"] if item["lease_id"] is None]
             occupied = sum(
-                item["lease_id"] is not None or item["ticket_number"] in active
+                item["lease_id"] is not None or (
+                    item["ticket_number"] in active
+                    and not ticket_program_ready(current["ticket_jobs"].get(str(item["ticket_number"]), {}))
+                )
                 for item in current["ticket_work_queue"]
             )
             for number in ready:
                 if len(futures) >= pipeline_limit:
                     break
-                if number not in active and str(number) in current["ticket_pause_requests"]:
+                job = current["ticket_jobs"].get(str(number), {})
+                # A returned result or Candidate commit is program work. It
+                # can reach the next Agent boundary without a free lease;
+                # that boundary still competes through the durable FIFO.
+                closeout = ticket_program_ready(job)
+                if number not in active and (closeout or str(number) in current["ticket_pause_requests"]):
                     futures[pool.submit(copy_context().run, advance, number)] = number
             # Queue order, not role or a new thread's startup order, owns priority.
             for number in waiting:
                 if occupied >= limit or len(futures) >= pipeline_limit:
                     break
+                if number in futures.values():
+                    continue
                 if number not in ready or number in active:
                     break
                 futures[pool.submit(copy_context().run, advance, number)] = number

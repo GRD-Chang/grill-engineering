@@ -101,3 +101,18 @@ def work_identity(state: dict[str, Any], location: str, subject: dict[str, Any])
     prefix = {"parent": "parent-only", "run_repair": "run-repair",
               "run_acceptance": "run-acceptance", "run_publication": "run-publication"}.get(location)
     return location if location.startswith("ticket:") else f"{prefix or location}:{state['run_id']}"
+
+
+def ticket_program_ready(job: dict[str, Any]) -> bool:
+    """Whether saved Ticket results need deterministic consumption first.
+
+    This does not choose the next role or bypass a gate. The Ticket stage
+    still owns currentness validation and the allowed business successor.
+    """
+    from agent_run.agent_return import has_returned_agent_result
+
+    return (
+        has_returned_agent_result(job)
+        or job.get("phase") == "committing_candidate"
+        or isinstance(job.get("pending_review_result"), dict)
+    )

@@ -54,3 +54,7 @@ History 的原 Review Context、文案 Attempt 与批准事实不随当前证据
 共同执行已保存的 `pending_semantic_attempt.returned_result` 是当前工作事实。成功返回使 `work_role` 投影为程序收口，不再显示需要新的 Agent 调用；Human Blocker/blocked Review 仍显示原角色，明确 resume 清除其返回后继续原 Attempt。展示只读取该事实，不能清除返回、改变预算或放行 currentness。返回缓存不复制到已完成 Attempt 或 Invocation 历史，正式结果继续从原有角色产物取得。
 
 历史阶段事件仍关联实际执行的 Agent：优先从 pending Attempt 读取角色与轮次，Thread 使用其保存的返回或同 Attempt 的 Invocation，再读取角色对应的线程字段。成功返回后的程序收口不会抹去这些历史关联，也不能拿其他角色或其他 Attempt 的线程补齐。
+
+调度使用 `work_facts.ticket_program_ready` 识别已有返回和待提交 Candidate 的机械收口，
+不以空闲 Agent 名额作为这些工作的前置条件。角色与阶段解释仍来自原 Job/Attempt；
+`AgentWorkScope` 的执行许可只限制实际新调用，不能改变 status/history/resume 的暂停或授权事实。

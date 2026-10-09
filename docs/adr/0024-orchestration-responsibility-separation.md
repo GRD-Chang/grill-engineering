@@ -30,3 +30,56 @@ Review Context 的准备与返回结论绑定由共同职责处理。上下文�
 返回保存在 pending Attempt 的 `returned_result`，经角色 schema 校验后先保存，再交回阶段。成功返回可在阶段结果保存、提交或发布前中断后重载消费；currentness 失效仍走原失效路径，不以缓存放行漂移现场。Human Blocker 与 blocked Review 返回先保存，明确人工继续时清除这份阻塞返回，以同一 Attempt 接收后续答复。完成 Attempt 不归档该缓存，避免长期重复保存 Artifact。status/resume 从同一事实区分已返回的程序收口与仍需 Agent 答复的工作，不新增持久工作状态机。
 
 这一实现参考 [Temporal Tasks 的结果重放边界](https://docs.temporal.io/tasks)：已经记录的非确定执行结果在恢复时直接消费。这里只使用既有 StateStore 和 Semantic Attempt 保存单次返回，不引入 Temporal、事件溯源或通用事务框架；现有 Backend 的格式修复、有界调用恢复与执行所有权保持。
+
+## 任务调度与交付阶段的实现边界
+
+图刷新通过 `graph.schedule_from_graph` 选择有依赖授权的 Ticket，并证明 Parent 是否就绪；它不读取 Parent 的审核、发布或 CI 阶段。公开 `state_from_graph` 组合图调度事实与 `run_orchestration.parent_stage_state` 的阶段投影。Parent-only 直接开发，多 Ticket Parent 必须等每张 Ticket 的真实完成记录成立后进入整体集成与首次完整审核；Issue 关闭或 Ticket PR 合并本身不代替完成记录。
+
+`ChangeDeliveryEngine.advance` 决定当前 Change 的允许后继，复用 `development_review` 和已有集成推进；完整 Parent 继续由 `RunAcceptanceEngine`、Run 集成及发布引擎承担整体责任。集成 Git/Review 修复留在集成循环，CI 修复回当前对象开发循环。Ticket 集成不新增 Review，初始末轮豁免与 CI 可选审核保持，两种 Parent 保留完整审核与最终人工批准。
+
+`AgentWorkScope` 只管理当前阶段的 Agent 许可与执行控制令牌，不选择角色或后继。许可在新工作分配及扣费前取得；已有 `returned_result` 通过共同执行校验与恢复，不重新申请 Agent lease。角色返回后的机械收口立即释放许可，阶段退出也负责异常清理。`ticket_scheduling` 消费 `work_facts.ticket_program_ready`，在名额占满时仍派发已有结果和 Candidate 提交的收口；其后新 Agent 工作仍按同一持久 FIFO 竞争。程序流水线上限继续为两倍 Agent 名额加一个监督线程，不增加资源政策。
+
+正常集成、发布、CI 等待及合入继续使用单席；CI 等待不占 Agent 名额，CI 修复释放席位后重新排队。未知写入保留原意图及必要席位，先读回实际结果；机械可推进不意味着绕过暂停、currentness、准确 PR/CI 或人工批准。status/history/resume 仍读取同一份 Job、Attempt 和集成现场，机械就绪事实不另行持久化，也不生成新恢复状态机。
+
+职责边界参考 [Temporal Task Queues](https://docs.temporal.io/task-queue) 中工作队列与 Worker 容量分开的做法；本项目继续使用现有 StateStore、持久 FIFO 与 Engine，不引入该平台，也不采用其多分区排序政策。
+
+```mermaid
+flowchart TB
+    S["图、FIFO、Agent 名额、集成席位与 Parent 就绪"] --> F["当前对象的阶段推进"]
+    F --> A["共同 Agent 执行：Development / Review / Publish"]
+    F --> O["既有 Git / PR / CI / 合并操作"]
+    S -.-> W["Job / Semantic Attempt / 集成现场 / 暂停与证据"]
+    F -.-> W
+    A -.-> W
+    O -.-> W
+```
+
+```mermaid
+flowchart LR
+    D["Development：初始开发或 CI 修复"] --> R["适用 Review"]
+    R -->|Findings| D
+    D -->|既定审核豁免| I["集成与 Git 检查"]
+    R -->|通过| I
+    I -->|Git 问题| ID["Development：集成修复"]
+    ID --> I
+    I --> IR["适用集成 Review"]
+    IR -->|Findings| ID
+    I -->|无需审核或结论适用| P["Publish 与程序发布"]
+    IR -->|通过| P
+```
+
+```mermaid
+flowchart TB
+    T["Ticket"] --> D["开发—审核循环"]
+    PO["Parent-only"] --> D
+    PA["Parent：全部 Ticket 真正完成"] -->|首次完整审核| I["集成、Git 检查与适用审核"]
+    D --> I
+    I --> P["Publish 与当前交付 PR"]
+    P --> C["准确 CI"]
+    C -->|失败| D
+    C -->|Ticket 门禁通过| TM["合入 Run Branch"]
+    C -->|Parent 门禁通过| H["当前成果人工批准"]
+    H --> M["最终复核与合入默认分支"]
+```
+
+上图省略共同暂停出口及批准失效后的回流；内部 Repair PR 的删除仍由 ADR 0025 的后续切片负责，本切片保留既有内部交付路径。

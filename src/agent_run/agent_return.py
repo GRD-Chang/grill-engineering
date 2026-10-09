@@ -15,6 +15,15 @@ from agent_run.artifacts import (
 AgentReturn: TypeAlias = DevelopmentResult | HumanBlockerResult | ReviewResult | PublicationResult | dict[str, Any]
 
 
+def has_returned_agent_result(subject: dict[str, Any], *, role: str | None = None) -> bool:
+    attempt = subject.get("pending_semantic_attempt")
+    return (
+        isinstance(attempt, dict) and attempt.get("status") == "pending"
+        and (role is None or attempt.get("role") == role)
+        and "returned_result" in attempt
+    )
+
+
 def store_agent_return(result: AgentReturn, attempt: dict[str, Any]) -> dict[str, Any]:
     record: dict[str, Any]
     if isinstance(result, HumanBlockerResult):
