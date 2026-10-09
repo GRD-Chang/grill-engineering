@@ -6,6 +6,7 @@ Status/History 的 `scheduler` 从准确 Executor 的活性与既有 `ticket_res
 
 | 规则 | 维护归属 | 消费者 |
 | --- | --- | --- |
+| 暂停前继续阶段、实际工作角色与身份 | `work_facts.py` | resume、Status、History、人工待办、State 查询 |
 | 角色族、当前 Work Subject、Candidate/PR 诊断身份、Ticket 进度 | `delivery_facts.py` | Status、CLI、History、通知、State 查询 |
 | 全部 Operator Gate 对象枚举；对象、Generation、原始证据、局部/全局范围及结构化恢复动作 | `operator_gate.py` / `operator_action_facts.py` | Status、History、操作指引、通知 |
 | 按真实 Attempt ID 去重、pending 选择、机器 JSON 字段筛选 | `attempt_projection.py` | CLI、通知、Status 计时 |
@@ -41,3 +42,5 @@ Reviewer 的适用结果通过 `review_attempt.finish_review_result` 统一收�
 `failure_head`、`review_required`、`reviewer_invocations`、`checkpoint_reason` 与 `history`。
 两种 Parent 始终要求 Review，内部 Repair PR 与最终 PR 显示同一 Run 的用量；新失败版本不重置。
 Status/History 只读展示当前额度和续期历史，不补造旧内外层计数或执行续期。
+
+集成工作中的 `run-integration:<run_id>` 是实际工作身份，`run_acceptance` 是保存位置；人工待办、消息与恢复审计使用实际身份和同一 Generation。Job 暂停阶段与保存的继续阶段分开解释；角色优先读取 pending Attempt，集成结果已保存时进入程序收口，不把它解释为新的开发调用。展示不修改旧历史记录。该解释沿用现有状态字段与协议，不增加旧 Run 迁移或补造缺损材料。

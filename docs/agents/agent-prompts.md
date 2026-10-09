@@ -500,3 +500,7 @@ Ticket、Parent-only、完整 Parent（含其修复候选）在 Reviewer 调用�
 返回结论使用该快照固定的事实，随后按既有 currentness 合同收口；不能从调用后的新 HEAD 或新默认基线重建旧结论。
 Reviewer 自主决定核验深度与扩大范围，程序不解析 Findings 或制定代码语义检查清单。
 本票不改变审核豁免、预算、发布或最终批准策略；跨阶段证据适用规则仍按各自既有合同判断。
+
+## 集成 Development 的人工续接
+
+Ticket、Parent-only 与完整 Parent 集成求助后的实际 Development 输入保留原集成证据、原始求助与当前 Generation 的人工回复。`--new-thread` 创建该开发角色的新会话，不因完整 Parent 的保存容器名选择 Reviewer；会话变化不改变任务目标、范围或原 Attempt。已有程序收口结果不再次调用 Agent，message 不成为正式需求或批准。覆盖入口为 `test_run_integration_work.py` 的公开 resume、StateStore 重载及实际调用输入，`test_unified_resume.py` 的无活动 Invocation 组合，及既有集成恢复和 Prompt 回归。

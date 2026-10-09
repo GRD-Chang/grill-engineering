@@ -5031,7 +5031,8 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
     assert "类型: 交付记录与实际结果不一致" in status_view
     assert "对象: 子任务 #3" in status_view
-    assert "阶段: 已受阻" in status_view
+    assert "阶段: 发布中" in status_view
+    assert state["status"] == "blocked"
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable_fixture["delivery"]["closed_issues"] == []
     assert mutable_fixture["delivery"]["pull_requests"][0]["state"] == "OPEN"

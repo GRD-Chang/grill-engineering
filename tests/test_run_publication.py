@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run import cli_presentation
 from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
@@ -30,6 +31,19 @@ from support.workspace import prepare_workspace
 from support.cli import run_internal_stage, run_cli, stdout_json
 
 from support.run_publication import CountingNarrativeRefreshPublisher, DelayedChecksRunPublisher, HumanThenRunPublicationAgents, InterruptedFinalRefPublisher, RunPublicationAgents, UnknownNarrativeWritePublisher, WaitingThenInterruptedChecksPublisher
+from support.run_publication import InvocationRunPublicationAgents
+
+
+def _assert_program_continuation(state: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    cli_presentation._print_status(state, as_json=True)
+    status = json.loads(capsys.readouterr().out)
+    assert status["worker"] is None
+    recent_agent = status["progress"]["current_agent"]
+    assert recent_agent is None or recent_agent["is_active"] is False
+    event = next(event for event in reversed(state["timeline"]) if event["kind"] == "run_publication")
+    assert event.get("worker") is None
+    assert event.get("thread_id") is None
+    assert state["run_publication"]["thread_id"]  # Retained historical output.
 
 
 def test_repairable_final_run_ci_failure_opens_independent_recovery_round(
@@ -80,10 +94,10 @@ def test_repairable_final_run_ci_failure_after_approval_opens_recovery_round(
 
 
 def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
-    git_repo: Path,
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
-    agents = RunPublicationAgents()
+    agents = InvocationRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -96,6 +110,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     published = engine.publish(str(state["run_id"]))
 
     assert published["status"] == "run_approval_pending"
+    _assert_program_continuation(published, capsys)
     final = published["run_publication"]
     assert final["phase"] == "ready_for_approval"
     assert len(agents.requests) == 1
@@ -120,6 +135,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     completed = engine.approve(str(state["run_id"]))
 
     assert completed["status"] == "completed"
+    _assert_program_continuation(completed, capsys)
     merged = publisher.live_pull_request(int(final["pr_number"]))
     assert merged["state"] == "MERGED"
     assert merged["integrated_parents"] == [
@@ -131,11 +147,11 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert publisher.data["parent"]["state"] == "CLOSED"
 
 def test_final_pr_read_lag_waits_without_recreating_publication(
-    git_repo: Path,
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     state, states, git, _publisher = _accepted_run(git_repo)
     publisher = DelayedChecksRunPublisher(git_repo / "github.json", git)
-    agents = RunPublicationAgents()
+    agents = InvocationRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -148,6 +164,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     waiting = engine.publish(str(state["run_id"]))
 
     assert waiting["status"] == "waiting_external"
+    _assert_program_continuation(waiting, capsys)
     assert waiting["run_publication"]["phase"] == "waiting_external"
     assert waiting["diagnostics"][0]["waiting_for"] == (
         "Run PR #1 Required Checks observation"
@@ -157,6 +174,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     resumed = engine.publish(str(state["run_id"]))
 
     assert resumed["status"] == "run_approval_pending"
+    _assert_program_continuation(resumed, capsys)
     assert len(agents.requests) == 1
 
 def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
@@ -450,7 +468,7 @@ def test_final_publication_human_resume_clears_current_blocker(
         assert "类型: 需要人工处理" in view.stdout
         assert "对象: 整体交付" in view.stdout
         if command == "status":
-            assert "阶段:       等待人工处理" in view.stdout
+            assert "阶段:       待发布" in view.stdout
         assert (
             "原因: GitHub denied access; tried gh issue view; grant Issue read access."
             in view.stdout
@@ -478,6 +496,7 @@ def test_final_publication_human_resume_clears_current_blocker(
     assert any(
         event.get("worker") == "运行发布工作代理"
         and event.get("thread_id") == "blocked-publication-thread"
+        and event.get("phase") == "pending"
         and event.get("human_blockers")
         for event in history["timeline"]
     )
@@ -665,12 +684,14 @@ def test_run_publication_record_response_loss_is_read_back_without_duplicate(
     assert len(publisher.data["delivery"]["run_publication_records"]) == 1
 
 
-def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None:
+def test_parent_closeout_recovers_without_a_second_merge(
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=InvocationRunPublicationAgents(),
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
@@ -685,6 +706,7 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert pending is not None
     assert pending["run_publication"]["phase"] == "merged"
     assert pending["status"] == "parent_closeout_pending"
+    _assert_program_continuation(pending, capsys)
     step = engine.advance(str(state["run_id"]))
     assert step.kind == DeliveryStepKind.WAITING
     assert step.reason == "parent_closeout_pending"

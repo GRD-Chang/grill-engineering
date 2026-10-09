@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import redirect_stdout
+from io import StringIO
+import json
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -11,6 +14,7 @@ import pytest
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend
 from agent_run.controller import Controller
+from agent_run import cli_presentation
 from agent_run.executor_host import FakeExecutorHost
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -69,6 +73,13 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
             event("thread_started", reported_thread_id="development-thread-1")
             current = StateStore(states.root).load_current_run(run_id)
             assert current is not None
+            output = StringIO()
+            with redirect_stdout(output):
+                cli_presentation._print_status(current, as_json=True)
+            ordinal = current["parent_job"]["pending_semantic_attempt"]["ordinal"]
+            assert json.loads(output.getvalue())["worker"]["attempt"] == ordinal
+            assert current["timeline"][-1]["attempt"] == ordinal
+            assert current["active_agent_invocation"]["semantic_attempt"]["ordinal"] == ordinal
             assert current["active_agent_invocation"]["phase"] == "integration_conflict"
             assert current["parent_job"]["repair_source"] == "acceptance"
             if not self.resume_conflict and interruption == "worker":
@@ -130,6 +141,12 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
     assert failed is not None
     job = failed["parent_job"]
     attempt = deepcopy(job["pending_semantic_attempt"])
+    if interruption == "worker":
+        output = StringIO()
+        with redirect_stdout(output):
+            cli_presentation._print_status(failed, as_json=True)
+        assert json.loads(output.getvalue())["worker"]["attempt"] == attempt["ordinal"]
+        assert failed["timeline"][-1]["attempt"] == attempt["ordinal"]
     binding = (deepcopy(failed["active_agent_invocation"]["thread_execution_binding"])
                if interruption == "worker" else None)
     candidate = job["candidate_sha"]
@@ -183,6 +200,8 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
     loaded = StateStore(states.root).load_current_run(run_id)
     assert loaded is not None
     assert loaded["parent_job"]["integration_development_budget"] == integration_budget
+    assert not loaded["parent_job"].get("development_failure_resume")
+    assert not loaded["parent_job"].get("development_new_thread")
     assert agents.integration_calls == (2 if interruption == "worker" else 1)
     if interruption in {"commit", "cli-commit"}:
         assert git.is_ancestor(committed, loaded["parent_job"]["candidate_sha"])

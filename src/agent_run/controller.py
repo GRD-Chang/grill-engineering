@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
+from agent_run.resume_work import continuation_phase
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
@@ -1706,7 +1707,7 @@ def _resume_agent_human_blocker(
         )
         acceptance.update(
             {
-                "phase": str(acceptance.get("human_blocker_phase", "pending")),
+                "phase": continuation_phase("run_acceptance", acceptance),
                 "prior_human_blockers": blockers,
             }
         )
@@ -1723,7 +1724,7 @@ def _resume_agent_human_blocker(
     if location == "run_publication" and isinstance(publication, dict):
         publication.update(
             {
-                "phase": str(publication.get("human_blocker_phase", "pending")),
+                "phase": continuation_phase("run_publication", publication),
                 "prior_human_blockers": _human_blockers(publication),
             }
         )
@@ -2446,6 +2447,10 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         if role == "development":
+            from agent_run.work_facts import integration_scene
+            scene = integration_scene(job)
+            if scene is not None and scene.get("development_summary"):
+                return
             previous_thread = invocation.get("reported_thread_id") or job.get(
                 "development_thread_id"
             ) or invocation.get("requested_thread_id")
@@ -2478,32 +2483,32 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
 
 
 def _clear_successor_thread(state: dict[str, Any], ticket_number: int | None) -> None:
-    """Apply a Thread choice to the next role when no Invocation owns it yet."""
+    """Apply a Thread choice to retained work without a pending Invocation."""
     from agent_run.resume_work import resume_message_owner
     target = resume_message_owner(state, ticket_number)
     if target is None:
         raise ValueError("--new-thread requires current work facts")
     work_subject, subject, _generation = target
-    phase = subject.get("phase")
-    if work_subject.startswith("run-acceptance:") and phase == "repairing":
+    from agent_run.work_facts import work_role
+    location = "run_acceptance" if work_subject.startswith(("run-acceptance:", "run-integration:")) else None
+    role = work_role(subject, location=location)
+    if work_subject.startswith("run-acceptance:") and subject.get("phase") == "repairing":
         request = subject.get("repair_request")
         if isinstance(request, dict):
             subject = request
-            phase = "repairing"
-    integration_work = any(isinstance(subject.get(key), dict) for key in (
-        "integration_conflict", "parent_integration_conflict", "run_repair_integration_conflict",
-    ))
-    if phase in {"developing", "repairing"} or integration_work:
+    if role is None:
+        return  # A returned result belongs to deterministic continuation.
+    if role == "development":
         previous = subject.pop("development_thread_id", None)
         if isinstance(previous, str) and previous:
             history = subject.setdefault("development_thread_history", [])
             if previous not in history:
                 history.append(previous)
         subject["development_new_thread"] = True
-    elif work_subject.startswith("run-acceptance:"):
+    elif role == "reviewer" and location == "run_acceptance":
         subject.pop("reviewer_resume_thread_id", None)
         subject["reviewer_new_thread"] = True
-    elif phase in {"candidate", "reviewing"}:
+    elif role == "reviewer":
         subject.pop("review_resume_thread_id", None)
         subject["review_new_thread"] = True
     else:
@@ -2562,6 +2567,10 @@ def _restore_current_invocation_thread(
         if not isinstance(thread_id, str) or not thread_id.strip():
             return
         if role == "development":
+            from agent_run.work_facts import integration_scene
+            scene = integration_scene(job)
+            if scene is not None and scene.get("development_summary"):
+                return
             job["development_thread_id"] = thread_id
             job.pop("development_new_thread", None)
             job["development_failure_resume"] = True
@@ -2821,6 +2830,7 @@ def _resume_change_job(
     _resume_change_job_owner(value, human_response=human_response)
     if ticket:
         state["active_ticket_job"] = value
+        state["active_agent_invocation"] = state.get("ticket_agent_invocations", {}).get(str(value["ticket_number"]))
         status = "active"
     elif "ticket_number" in value:
         status = "active"
@@ -2870,7 +2880,7 @@ def _resume_change_job_owner(
         human_response,
         generation=_subject_generation(value),
     )
-    resume_phase = str(value.get("human_blocker_phase", "developing"))
+    resume_phase = continuation_phase("change", value)
     if (
         value.get("attempt_kind") == "ci_repair"
         and isinstance(value.get("integration_conflict"), dict)
@@ -2933,15 +2943,6 @@ def _human_blockers(subject: dict[str, Any]) -> list[str]:
     ):
         raise ValueError("Agent Human Blocker is missing raw blocker strings")
     return list(value)
-
-
-def _run_acceptance_human_blocker(state: dict[str, Any]) -> bool:
-    acceptance = state.get("run_acceptance")
-    return isinstance(acceptance, dict) and (
-        acceptance.get("phase") == "ready_for_human"
-        and acceptance.get("blocked_reason")
-        in {"agent_requires_human", "reviewer_requires_human"}
-    )
 
 
 def _validated_human_response(value: str) -> str:
@@ -3130,7 +3131,6 @@ def apply_resume_to_state(
     if ticket_number is not None:
         state["active_ticket_job"] = state["ticket_jobs"][str(ticket_number)]
         state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(ticket_number))
-    resuming_run_acceptance = False
     ticket_execution_resumed = False
     budget_resumed = (
         _resume_review_budget_window(
@@ -3264,7 +3264,6 @@ def apply_resume_to_state(
     if budget_resumed:
         resumed_subject = True
     elif resume_human_blocker:
-        resuming_run_acceptance = _run_acceptance_human_blocker(state)
         resumed_subject = _resume_agent_human_blocker(
             state, ticket_number=ticket_number
         )
@@ -3292,9 +3291,7 @@ def apply_resume_to_state(
         else:
             _clear_successor_thread(state, ticket_number)
     elif new_thread:
-        if resuming_run_acceptance:
-            _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
-        elif not isinstance(invocation, dict):
+        if not isinstance(invocation, dict) or not invocation_attempt_is_pending(state, invocation):
             _clear_successor_thread(state, ticket_number)
         else:
             _clear_current_invocation_thread(state)

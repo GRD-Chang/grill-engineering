@@ -1676,6 +1676,23 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     blocked = engine.accept(str(state["run_id"]))
     assert blocked["status"] == "ready_for_human"
     assert all(not checkout.exists() for checkout in agents.checkouts)
+    from support.inprocess_cli import invoke_cli_inprocess
+    state_file = states.runs_directory / f"{state['run_id']}.json"
+    saved = state_file.read_bytes()
+    views = {}
+    for command in ("status", "history"):
+        query = invoke_cli_inprocess(
+            git_repo, None, command, state["run_id"], "--state-dir", str(states.root), "--json",
+        )
+        assert query.returncode == 0, query.stdout + query.stderr
+        views[command] = json.loads(query.stdout)
+    worker = views["status"]["worker"]
+    marker = views["history"]["timeline"][-1]
+    assert worker["role"] == marker["worker"] == "运行验收工作代理"
+    assert worker["attempt"] == marker["attempt"] == 1
+    assert worker["thread_id"] == marker["thread_id"] == "blocked-run-reviewer"
+    assert worker["phase"] == marker["phase"] == blocked["run_acceptance"]["human_blocker_phase"]
+    assert state_file.read_bytes() == saved
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states

@@ -10,6 +10,7 @@ from agent_run.parent_integration import (
 )
 from agent_run.resume_intent import is_ticket_execution_recovery
 from agent_run.resume_work import resume_message_owner
+from agent_run.work_facts import work_phase
 from agent_run.state_errors import MissingRunMaterialsError
 
 
@@ -49,7 +50,7 @@ def require_change_checkout(
         name, branch_key = "parent", "parent_branch"
     elif subject.startswith("run-repair:"):
         name, branch_key = "run-repair", "repair_branch"
-    elif subject.startswith("run-acceptance:"):
+    elif subject.startswith(("run-acceptance:", "run-integration:")):
         # Review checkouts are disposable, unfinished integration work is not.
         if not isinstance(job.get("run_integration_conflict"), dict):
             return
@@ -64,8 +65,7 @@ def require_change_checkout(
     pending = job.get("pending_semantic_attempt")
     pending_development = (isinstance(pending, dict) and pending.get("status") == "pending"
                            and pending.get("role") == "development")
-    continuation = (job.get("execution_resume_phase") or job.get("pause_resume_phase")
-                    or job.get("human_blocker_phase") or phase)
+    continuation = work_phase(job)
     scene_key = next((key for key in (
         "integration_conflict", "parent_integration_conflict", "run_repair_integration_conflict",
         "run_integration_conflict",

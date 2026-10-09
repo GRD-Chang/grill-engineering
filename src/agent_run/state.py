@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_run.delivery_facts import current_work_subject
+from agent_run.work_facts import work_attempt, work_phase, work_role
 
 import fcntl
 import json
@@ -623,16 +624,16 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             and publication.get("phase") in {"ready_for_human", "waiting_external", "waiting_checks", "ready_for_approval"}
         )
     ) and isinstance(publication, dict) and publication_is_current:
-        phase = str(publication.get("phase", "pending"))
-        role = _worker_role(publication, phase)
+        phase = work_phase(publication) or "pending"
+        role = work_role(publication, location="run_publication")
         approval_grant = publication.get("approval_grant")
         required_checks = publication.get("required_checks_evidence")
         return _with_human_blockers({
             "kind": "run_publication",
             "status": status,
             "worker": _worker_name(role, run=True),
-            "attempt": _worker_attempt(publication, role),
-            "thread_id": _thread_id_for_role(publication, role),
+            "attempt": work_attempt(publication, role),
+            "thread_id": _thread_id_for_role(publication, role) if role is not None else None,
             "phase": phase,
             "pr_number": publication.get("pr_number"),
             "commit_sha": publication.get("integrated_sha"),
@@ -661,13 +662,13 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
         phase = str(run_acceptance.get("phase", "pending"))
         repair = run_acceptance.get("repair_job")
         subject = repair if isinstance(repair, dict) else run_acceptance
-        subject_phase = str(subject.get("phase", phase))
-        role = _worker_role(subject, subject_phase)
+        subject_phase = work_phase(subject) or phase
+        role = work_role(subject, location="run_repair" if isinstance(repair, dict) else "run_acceptance")
         return _with_human_blockers({
             "kind": "run_acceptance",
             "status": status,
             "worker": _worker_name(role, run=not isinstance(repair, dict)),
-            "attempt": _worker_attempt(subject, role),
+            "attempt": work_attempt(subject, role),
             "thread_id": _thread_id_for_role(subject, role),
             "phase": subject_phase,
             "pr_number": subject.get("pr_number"),
@@ -683,8 +684,8 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
 
 
 def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
-    phase = str(job.get("phase", "pending"))
-    role = _worker_role(job, phase)
+    phase = work_phase(job) or "pending"
+    role = work_role(job)
     ticket = job.get("ticket_number")
     grant = job.get("approval_grant")
     return _with_human_blockers({
@@ -692,11 +693,11 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         "status": status,
         "ticket": ticket if isinstance(ticket, int) else None,
         "worker": _worker_name(role),
-        "attempt": _worker_attempt(job, role),
+        "attempt": work_attempt(job, role),
         "thread_id": _thread_id_for_role(
             job,
             role,
-            hide_pending_development=phase in {"developing", "repairing"},
+            hide_pending_development=job.get("phase") in {"developing", "repairing"},
         ),
         "phase": phase,
         "pr_number": job.get("pr_number"),
@@ -716,28 +717,6 @@ def _with_human_blockers(
     return marker
 
 
-def _worker_role(subject: dict[str, Any], phase: str) -> str | None:
-    blocked_reason = subject.get("blocked_reason")
-    if blocked_reason == "reviewer_requires_human":
-        return "reviewer"
-    if phase in {"reviewing", "validating"}:
-        return "reviewer"
-    if phase in {"developing", "repairing", "committing_candidate"}:
-        return "development"
-    if phase in {"publishing", "publication_pending"}:
-        return "publication"
-    if phase not in {"blocked", "ready_for_human"}:
-        return None
-    blocked_phase = str(subject.get("human_blocker_phase", ""))
-    if blocked_phase in {"developing", "repairing"}:
-        return "development"
-    if blocked_phase in {"candidate", "reviewing", "validating"}:
-        return "reviewer"
-    if blocked_phase in {"accepted", "publishing", "pending"}:
-        return "publication"
-    return None
-
-
 def _worker_name(role: str | None, *, run: bool = False) -> str | None:
     if role == "development":
         return "开发工作代理"
@@ -746,18 +725,6 @@ def _worker_name(role: str | None, *, run: bool = False) -> str | None:
     if role == "publication":
         return "运行发布工作代理" if run else "发布工作代理"
     return None
-
-
-def _worker_attempt(subject: dict[str, Any], role: str | None) -> int | None:
-    if role == "development":
-        value = subject.get("pending_attempt", subject.get("modification_attempts"))
-    elif role == "reviewer":
-        value = subject.get("validation_attempts")
-    elif role == "publication":
-        value = subject.get("publication_attempts")
-    else:
-        return None
-    return value if isinstance(value, int) else None
 
 
 def _thread_id_for_role(

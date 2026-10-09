@@ -10,6 +10,7 @@ import pytest
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult
 from agent_run.controller import Controller
+from agent_run import cli_presentation
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.development_prompts import development_prompt
@@ -23,7 +24,7 @@ from support.seeding import write_fixture
 
 @pytest.mark.parametrize("mode", ["direct", "quota", "interrupted", "human"])
 def test_git_check_returns_raw_failure_to_development_then_delivers(
-    git_repo: Path, tmp_path: Path, mode: str,
+    git_repo: Path, tmp_path: Path, mode: str, capsys: pytest.CaptureFixture[str],
 ) -> None:
     limit = 1 if mode == "quota" else 3
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -53,6 +54,12 @@ def test_git_check_returns_raw_failure_to_development_then_delivers(
             event("thread_started", reported_thread_id=thread)
             current = StateStore(states.root).load_current_run(run_id)
             assert current is not None
+            cli_presentation._print_status(current, as_json=True)
+            status = json.loads(capsys.readouterr().out)
+            ordinal = current["active_ticket_job"]["pending_semantic_attempt"]["ordinal"]
+            assert status["worker"]["attempt"] == ordinal
+            assert current["timeline"][-1]["attempt"] == ordinal
+            assert current["active_agent_invocation"]["semantic_attempt"]["ordinal"] == ordinal
             owned = [item for item in current["ticket_work_queue"] if item["ticket_number"] == 3]
             assert len(owned) == 1 and owned[0]["lease_id"] is not None
             scene = json.loads(request["integration_evidence"])
@@ -106,6 +113,12 @@ def test_git_check_returns_raw_failure_to_development_then_delivers(
         assert paused["blocked_reason"] == ("ticket_execution_failed" if mode == "interrupted" else "agent_requires_human")
         budget_before = deepcopy(paused["integration_development_budget"])
         semantic_id = paused["pending_semantic_attempt"]["attempt_id"]
+        cli_presentation._print_status(result, as_json=True)
+        assert json.loads(capsys.readouterr().out)["worker"]["attempt"] == paused["pending_semantic_attempt"]["ordinal"]
+        saved = StateStore(states.root).load_current_run(run_id)
+        assert saved is not None
+        phase_event = next(event for event in reversed(saved["timeline"]) if event.get("worker") == "开发工作代理")
+        assert phase_event["attempt"] == paused["pending_semantic_attempt"]["ordinal"]
         assert budget_before["used"] == 2
         agents.continued = True
         controller.resume(run_id, explicit_resume=True, ticket_number=3, new_thread=True,

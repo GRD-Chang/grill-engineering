@@ -76,4 +76,7 @@
 
 多 Ticket Parent 的未完成集成现场位于 `run-integration`，由 Run Acceptance 的 `run_integration_conflict` 保存准确边界；它同样需要恢复原文件和集成现场，不能当作一次性审核工作区自动重建。公开 resume 与集成引擎推进都会先核验材料，缺损时保留原 Attempt、历史和累计额度；补足后沿用原集成工作继续。
 
+集成 Development 求助后，`resume --new-thread --message "处理事实"` 继续原开发工作；完整 Parent 的 `run_acceptance` 存储位置不表示当前角色是 Reviewer。status/history 展示原继续阶段、实际开发身份及求助证据。新会话保留 Attempt、Generation、已有文件和集成材料，不重复扣同轮额度。已返回的开发结果继续由程序检查与提交；待确认的发布写入先对账。定向 `--ticket N` 只解除该 Ticket 的适用暂停，不代替其他对象的人工门禁。
+
+
 补足后执行 `agent-run resume <parent-issue> --repo OWNER/REPO --message "已补足的事实及处理说明"`，会话不可用时加 `--new-thread`，局部 Ticket 使用 `--ticket N`。入口重新核验原需求、工作身份、范围、基线和成果，后继沿用原工作与额度；旧审核、CI、文案和批准仍须满足各自当前对象门禁。通过 `status`/`history` 确认实际后继 Invocation 已启动，不能仅凭状态改变判断恢复完成。外部写入结果未知时先对账；恢复不补造副作用记录，不接受正式需求或任务图变更。

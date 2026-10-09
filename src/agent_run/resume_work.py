@@ -6,6 +6,7 @@ from typing import Any
 
 from agent_run.operator_gate import operator_gate_subjects
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
+from agent_run.work_facts import work_identity, work_phase
 
 
 def paused_work(state: dict[str, Any], ticket_number: int | None = None
@@ -56,9 +57,7 @@ def resume_message_owner(state: dict[str, Any], ticket_number: int | None = None
         location, owner = "run_acceptance", state.get("run_acceptance")
     if not isinstance(owner, dict):
         return None
-    prefix = {"parent": "parent-only", "run_repair": "run-repair",
-              "run_acceptance": "run-acceptance", "run_publication": "run-publication"}.get(location)
-    subject = location if prefix is None else f"{prefix}:{state['run_id']}"
+    subject = work_identity(state, location, owner)
     generation_key = {"parent": "parent_generation", "run_repair": "repair_generation",
                       "run_acceptance": "acceptance_generation"}.get(location, "ticket_branch_generation")
     generation = owner.get(generation_key, 1)
@@ -69,15 +68,14 @@ def resume_message_owner(state: dict[str, Any], ticket_number: int | None = None
 
 def continuation_phase(location: str, subject: dict[str, Any]) -> str:
     """Require a saved operation or pending role; never initialize missing work."""
-    for key in ("execution_resume_phase", "pause_resume_phase", "human_blocker_phase"):
-        phase = subject.get(key)
-        if isinstance(phase, str) and phase not in {"blocked", "ready_for_human"}:
-            allowed = ({"pending", "reviewing", "repairing", "accepted"} if location == "run_acceptance"
-                       else {"pending", "publishing", "waiting_checks", "waiting_external", "stale", "merging", "merged"} if location == "run_publication"
-                       else {p.value for p in TicketPhase} - {"blocked", "completed", "publication_pending"})
-            if phase not in allowed:
-                raise ValueError(f"{location}: invalid saved continuation phase {phase}")
-            return phase
+    phase = work_phase(subject)
+    if phase not in {None, "blocked", "ready_for_human"}:
+        allowed = ({"pending", "reviewing", "repairing", "accepted"} if location == "run_acceptance"
+                   else {"pending", "publishing", "waiting_checks", "waiting_external", "stale", "merging", "merged"} if location == "run_publication"
+                   else {p.value for p in TicketPhase} - {"blocked", "completed", "publication_pending"})
+        if phase not in allowed:
+            raise ValueError(f"{location}: invalid saved continuation phase {phase}")
+        return phase
     attempt = subject.get("pending_semantic_attempt")
     if isinstance(attempt, dict) and attempt.get("status") == "pending":
         role = attempt.get("role")

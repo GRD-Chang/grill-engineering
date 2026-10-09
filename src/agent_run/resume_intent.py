@@ -244,13 +244,17 @@ def _subject_identity(
         **{
             key: subject.get(key)
             for key in (
-                "ticket_number", "generation", "acceptance_generation",
+                "ticket_number", "generation", "acceptance_generation", "parent_generation", "repair_generation",
                 "candidate_sha", "phase", "blocked_reason", "human_blockers",
                 "ticket_branch_generation", "pause_resume_phase",
                 "execution_resume_phase", "human_blocker_phase", "repair_source",
                 "acceptance_record", "publication_sha", "artifact", "last_ticket_resume",
                 "pending_semantic_attempt", "integration_development_budget",
                 "publication_operation_retry",
+                "integration_conflict", "parent_integration_conflict",
+                "run_repair_integration_conflict", "run_integration_conflict",
+                "pending_review_result", "ticket_write_intent", "write_intent",
+                "integration_publication_intent",
             )
         },
     }

@@ -3,12 +3,14 @@ from __future__ import annotations
 from support.run_scenarios import _accepted_run
 
 import subprocess
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from agent_run import cli_presentation
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
@@ -186,7 +188,7 @@ class MergeBoundaryDriftPublisher(FixtureGitHubPublisher):
 
 
 def test_final_run_publish_and_approve_share_exact_head_observation(
-    git_repo: Path,
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     state, states, git, _publisher = _accepted_run(git_repo)
     publisher = SnapshotOnlyRunPublisher(git_repo / "github.json", git)
@@ -220,6 +222,11 @@ def test_final_run_publish_and_approve_share_exact_head_observation(
     second_observation = waiting["run_publication"]["required_checks_evidence"]
 
     assert waiting["status"] == "waiting_checks"
+    cli_presentation._print_status(waiting, as_json=True)
+    status = json.loads(capsys.readouterr().out)
+    assert status["worker"] is None
+    assert status["progress"]["current_agent"] is None
+    assert waiting["timeline"][-1].get("worker") is None
     assert second_observation["pr_number"] == published["run_publication"]["pr_number"]
     assert second_observation["head_sha"] == run_head
     assert second_observation["result"] == "pending"

@@ -30,8 +30,8 @@ def _git(checkout: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _two_ticket_run(git_repo: Path, tmp_path: Path, *, conflict: bool = True):
-    state, states, git = _completed_run(git_repo)
+def _two_ticket_run(git_repo: Path, tmp_path: Path, *, conflict: bool = True, state_root: Path | None = None):
+    state, states, git = _completed_run(git_repo, state_root=state_root)
     fixture = git_repo / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["issues"]["3"] = {
@@ -319,17 +319,22 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
     assert resumed["ticket_jobs"] == accepted["ticket_jobs"]
 
 
-@pytest.mark.parametrize("missing_scene", [False, True])
+@pytest.mark.parametrize("missing_scene,new_thread", [(False, False), (False, True), (True, True)])
 def test_integration_human_response_returns_to_same_work_and_retains_origin(
-    git_repo: Path, tmp_path: Path, missing_scene: bool,
+    git_repo: Path, tmp_path: Path, missing_scene: bool, new_thread: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, states, git, publisher = _two_ticket_run(git_repo, tmp_path)
+    from support.workspace import prepare_workspace
+    workspace = prepare_workspace(git_repo)
+    git_repo = workspace.repository_root
+    state, states, git, publisher = _two_ticket_run(git_repo, tmp_path, state_root=workspace.state_root)
 
     class HumanAgents(CsvIntegrationAgents):
         def develop(self, request: dict[str, Any]):
             event = request["_invocation_event"]
             event("started", requested_thread_id=request.get("thread_id"))
-            event("thread_started", reported_thread_id="run-integration-developer")
+            thread = "fresh-integration-developer" if new_thread and self.development_requests else "run-integration-developer"
+            event("thread_started", reported_thread_id=thread)
             if not self.development_requests:
                 self.development_requests.append(request)
                 (Path(request["checkout"]) / "prior-work.txt").write_text("original unsaved outcome\n")
@@ -337,17 +342,26 @@ def test_integration_human_response_returns_to_same_work_and_retains_origin(
                 return HumanBlockerResult("run-integration-developer", ("需要确认 CSV 编码",))
             assert request["prior_human_blockers"] == ["需要确认 CSV 编码"]
             assert request["human_response_history"][-1]["response"] == "使用 UTF-8 LF"
-            assert request["thread_id"] == "run-integration-developer"
+            assert request["thread_id"] == (None if new_thread else "run-integration-developer")
+            if new_thread:
+                assert request["_invocation_mode"] == "new-thread"
+            assert json.loads(request["integration_evidence"])["source_sha"] == original_scene["source_sha"]
+            assert not self.review_requests
             assert (Path(request["checkout"]) / "prior-work.txt").read_text() == "original unsaved outcome\n"
             self.development_requests.append(request)
             (Path(request["checkout"]) / "README.md").write_text("resolved encoding contract\n", encoding="utf-8")
             event("completed")
-            return DevelopmentResult("run-integration-developer", "按人工确认完成组合修复。")
+            return DevelopmentResult("fresh-integration-developer" if new_thread else "run-integration-developer", "按人工确认完成组合修复。")
+
+        def review(self, request: dict[str, Any]):
+            super().review(request)
+            raise RuntimeError("controlled integration review boundary")
 
     agents = HumanAgents(0)
     engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
     paused = engine.accept(state["run_id"])
     assert paused["run_acceptance"]["blocked_reason"] == "agent_requires_human"
+    original_scene = deepcopy(paused["run_acceptance"]["run_integration_conflict"])
     original_attempt = deepcopy(paused["run_acceptance"]["pending_semantic_attempt"])
     controller = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states)
     if missing_scene:
@@ -377,18 +391,51 @@ def test_integration_human_response_returns_to_same_work_and_retains_origin(
         merge = git._run_in(checkout, "merge", "--no-ff", "--no-commit", scene["merge_head_sha"])
         assert merge.returncode == 1  # Reconstruct the original real merge conflict.
         (checkout / "prior-work.txt").write_bytes(backup)
-    controller.resume(
-        state["run_id"], explicit_resume=True, resume_human_blocker=True,
-        human_response="使用 UTF-8 LF",
-    )
-    completed = engine.accept(state["run_id"])
+    # Invoke the public CLI after reloading durable state, using only the
+    # existing external Agent/Executor seams. Stop after Git consumes the
+    # Development result so this test does not exercise final publication.
+    from agent_run import cli
+    from agent_run.executor_host import FakeExecutorHost
+    from agent_run.state import StateStore
+    from agent_run.task_control import TaskControlStore, TaskKey
+    from support.inprocess_cli import invoke_cli_inprocess
+    from support.seeding import seed_idle_control
+
+    seed_idle_control(TaskControlStore(states.root), TaskKey(git_repo, state["repository"], 1), state["run_id"])
+    monkeypatch.setattr(cli, "FakeExecutorHost", lambda **kwargs: FakeExecutorHost())
+    monkeypatch.setattr(cli, "_agent_backend", lambda *args, **kwargs: agents)
+    for query in ("status", "history"):
+        result = invoke_cli_inprocess(git_repo, None, query, state["run_id"], "--state-dir", str(states.root), "--json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        view = json.loads(result.stdout)
+        actions = view["operator_actions"]
+        assert actions[0]["work_subject"] == f"run-integration:{state['run_id']}"
+        assert actions[0]["phase"] == paused["run_acceptance"]["human_blocker_phase"]
+        assert actions[0]["role"] == "development"
+        assert actions[0]["trigger_invocation"]["role"] == "development"
+        assert actions[0]["generation"] == original_attempt["generation"]
+        if query == "status":
+            assert view["worker"]["attempt"] == original_attempt["ordinal"]
+            assert view["worker"]["thread_id"] == "run-integration-developer"
+        else:
+            assert view["timeline"][-1]["attempt"] == original_attempt["ordinal"]
+            assert view["timeline"][-1]["worker"] == "开发工作代理"
+    arguments = ["resume", state["run_id"], "--state-dir", str(states.root), "--json", "--message", "使用 UTF-8 LF"]
+    if new_thread:
+        arguments.append("--new-thread")
+    with pytest.raises(RuntimeError, match="controlled integration review boundary"):
+        result = invoke_cli_inprocess(git_repo, git_repo / "github.json", *arguments)
+        pytest.fail(result.stdout + result.stderr)
+    completed = StateStore(states.root).load_current_run(state["run_id"])
     run = completed["run_acceptance"]
-    assert completed["status"] == "run_publication_pending"
+    assert "reviewer_new_thread" not in run
     assert run["review_budget"]["development_attempts"] == 1
     assert run["semantic_attempt_history"][0]["attempt_id"] == original_attempt["attempt_id"]
     invocations = [entry for entry in completed["agent_invocation_history"]
                    if entry["phase"] == "run_integration_conflict"]
     assert len(invocations) == 2
+    assert invocations[-1]["requested_thread_id"] == (None if new_thread else "run-integration-developer")
+    assert invocations[-1]["reported_thread_id"] == ("fresh-integration-developer" if new_thread else "run-integration-developer")
     assert {entry["semantic_attempt"]["attempt_id"] for entry in invocations} == {original_attempt["attempt_id"]}
     assert invocations[-1]["resume_id"] == completed["resume_audit"]["history"][-1]["resume_id"]
     assert run["integration_work_history"][-1]["human_blockers"] == ["需要确认 CSV 编码"]

@@ -16,6 +16,7 @@ from agent_run.attempt_projection import (
 )
 from agent_run.delivery_facts import active_ticket_job, current_delivery_identity, current_work_subject
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.work_facts import work_attempt, work_phase, work_role
 
 from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
@@ -528,23 +529,25 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
     if current is None:
         return None
     location, subject = current
-    if location == "run_publication" and subject.get("phase") == "publishing":
+    role = work_role(subject, location=location)
+    if location == "run_publication" and role == "publication":
         return {
             "role": "运行发布工作代理",
-            "attempt": subject.get("publication_attempts"),
+            "attempt": work_attempt(subject, role),
             "thread_id": subject.get("thread_id"),
-            "phase": subject.get("phase"),
+            "phase": work_phase(subject),
         }
     if location == "run_repair":
         return _worker_from_job(subject, run_repair=True)
-    if location == "run_acceptance" and isinstance(subject.get("run_integration_conflict"), dict):
+    if (location == "run_acceptance" and isinstance(subject.get("run_integration_conflict"), dict)
+            and role == "development"):
         return {
             "role": "运行集成开发工作代理",
-            "attempt": subject.get("integration_conflict_agent_ordinal"),
+            "attempt": work_attempt(subject, role),
             "thread_id": subject.get("development_thread_id"),
             "phase": "integration",
         }
-    if location == "run_acceptance" and subject.get("phase") == "reviewing":
+    if location == "run_acceptance" and role == "reviewer":
         reviewer_ids = subject.get("reviewer_thread_ids")
         thread_id = (
             reviewer_ids[-1]
@@ -553,9 +556,9 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
         )
         return {
             "role": "运行验收工作代理",
-            "attempt": subject.get("validation_attempts"),
+            "attempt": work_attempt(subject, role),
             "thread_id": thread_id,
-            "phase": subject.get("phase"),
+            "phase": work_phase(subject),
         }
     if location.startswith("ticket:") or location == "parent":
         return _worker_from_job(subject)
@@ -565,40 +568,41 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
 def _current_phase(state: dict[str, object]) -> object:
     current = current_work_subject(state)
     if current is not None:
-        return current[1].get("phase")
+        return work_phase(current[1])
     return state.get("status")
 
 
 def _worker_from_job(
     job: dict[str, object], *, run_repair: bool = False
 ) -> dict[str, object] | None:
-    phase = str(job.get("phase"))
+    phase = work_phase(job)
+    role = work_role(job)
     review_role = "运行修复验收工作代理" if run_repair else "独立验收工作代理"
     publication_role = "运行修复发布工作代理" if run_repair else "发布工作代理"
     development_role = "运行修复开发工作代理" if run_repair else "开发工作代理"
-    if phase in {"reviewing", "validating"}:
+    if role == "reviewer":
         reviewer_ids = job.get("reviewer_thread_ids")
         thread_id = reviewer_ids[-1] if isinstance(reviewer_ids, list) and reviewer_ids else None
         return {
             "role": review_role,
-            "attempt": job.get("validation_attempts"),
+            "attempt": work_attempt(job, role),
             "thread_id": thread_id,
             "phase": phase,
         }
-    if phase in {"publishing", "publication_pending"}:
+    if role == "publication":
         return {
             "role": publication_role,
-            "attempt": job.get("publication_attempts"),
+            "attempt": work_attempt(job, role),
             "thread_id": job.get("publication_thread_id"),
             "phase": phase,
         }
-    if phase in {"developing", "repairing"}:
+    if role == "development":
         return {
             "role": development_role,
-            "attempt": job.get("pending_attempt", job.get("modification_attempts")),
+            "attempt": work_attempt(job, role),
             "thread_id": (
                 None
-                if isinstance(job.get("pending_attempt"), int)
+                if job.get("phase") in {"developing", "repairing"} and isinstance(job.get("pending_attempt"), int)
                 else job.get("development_thread_id")
             ),
             "phase": phase,

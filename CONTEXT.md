@@ -26,6 +26,11 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 
 ## Language
 
+**Retained Work（保留的当前工作）**:
+暂停条件与业务进度分别解释：现有 `human_blocker_phase`、`execution_resume_phase`、`pause_resume_phase` 保存继续阶段，`blocked_reason` 与原始证据保存人工门禁；Job 的暂停阶段是调度边界，不能代替继续阶段。`pending_semantic_attempt` 与集成现场保存实际角色、用途、Generation 和工作身份，Invocation 保存 Thread 与执行事实。`work_facts` 从这些权威记录派生继续阶段、角色与身份，供 resume、status/history 共同使用，不另存展示状态或第二套工作状态机。
+完整 Parent 集成 Development 虽保存在 `run_acceptance`，实际身份是 `run-integration:<run_id>`；新线程和 message 作用于原 Development 工作及 Generation，不变成 Reviewer 调用、正式需求或批准。已保存开发结果先由程序集成检查、提交与对账消费；未知外部写入保持原意图，不能由新线程请求推定未发生。各 Ticket 独立保留成果和人工门禁，active 只选择当前对象。
+_Avoid_: 按存储容器选角色、以 blocked 丢失继续阶段、重复调用已返回结果的 Agent、以 message 放行其他对象
+
 **Review Context（审核上下文）**:
 一次 Review 所依据的准确需求范围、完整交付范围、本轮重点变化与适用前序证据；完整交付范围说明当前成果应满足的整体责任，本轮重点变化说明这次需优先核验的修复或集成影响。审核结论对应实际审核的成果与需求事实，具体检查深度和扩展范围由 Reviewer 根据证据判断。
 _Avoid_: 仅有 from/to commit 的 diff、完整 Prompt 文本、把本轮重点变化等同于全部交付责任

@@ -40,7 +40,7 @@ def operator_action_views(
                 include_parent_for_run=True,
             ),
             "trigger_invocation": (
-                _triggering_invocation(state, location, generation=fact["generation"])
+                _triggering_invocation(state, location, work_subject=fact["work_subject"], generation=fact["generation"])
                 if fact["action_kind"] == "human_blocker" else None
             ),
             "preserved": _preserved_results(subject, {} if location.startswith("ticket:") else current_identity),
@@ -165,15 +165,9 @@ def _operator_action_label(kind: str) -> str:
 
 
 def _triggering_invocation(
-    state: dict[str, Any], location: str, *, generation: object = None
+    state: dict[str, Any], location: str, *, work_subject: str, generation: object = None
 ) -> dict[str, Any] | None:
-    run_id = state.get("run_id")
-    expected_subject = {
-        "parent": f"parent-only:{run_id}",
-        "run_acceptance": f"run-acceptance:{run_id}",
-        "run_repair": f"run-repair:{run_id}",
-        "run_publication": f"run-publication:{run_id}",
-    }.get(location, location if location.startswith("ticket:") else None)
+    expected_subject = work_subject
     active = state.get("active_agent_invocation")
     invocations = state.get("ticket_agent_invocations")
     if location.startswith("ticket:") and isinstance(invocations, dict):

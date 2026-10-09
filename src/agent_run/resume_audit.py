@@ -19,6 +19,7 @@ from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
 )
 from agent_run.state_contract import human_blocker_subject_count
+from agent_run.work_facts import work_identity
 
 
 def append_explicit_resume_audit(
@@ -133,9 +134,7 @@ def append_explicit_resume_audit(
             event["work_subject"], _owner, event["generation"] = executor_target
     elif human_owner is not None:
         location, subject = human_owner
-        event["work_subject"] = location if location.startswith("ticket:") else (
-            f"parent-only:{state['run_id']}" if location == "parent" else f"{location.replace('_', '-')}:{state['run_id']}"
-        )
+        event["work_subject"] = work_identity(state, location, subject)
         event["generation"] = subject.get(
             "ticket_branch_generation",
             subject.get("repair_generation", subject.get("acceptance_generation", 1)),

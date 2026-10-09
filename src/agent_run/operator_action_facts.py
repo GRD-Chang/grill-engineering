@@ -6,6 +6,7 @@ from typing import Any
 from agent_run.final_approval_operation import has_final_approval
 from agent_run.guidance_actions import NextAction
 from agent_run.operator_gate import operator_gate_evidence, operator_gate_sources
+from agent_run.work_facts import work_identity, work_phase, work_role
 
 
 _REASON_KINDS = {
@@ -47,7 +48,7 @@ def operator_action_facts(state: dict[str, Any]) -> list[dict[str, Any]]:
     sources = operator_gate_sources(state)
     for source in sources:
         location, subject, scope = source.location, source.subject, source.scope
-        work_subject = _work_subject(state, location)
+        work_subject = work_identity(state, location, subject)
         bound_local = (
             binding is not None and binding["work_subject"] == work_subject
             and binding["reason"] == subject.get("blocked_reason")
@@ -62,16 +63,20 @@ def operator_action_facts(state: dict[str, Any]) -> list[dict[str, Any]]:
         )
         if top_level and not reason:
             reason = _diagnostic_code(state)
-        phase = subject.get("phase", state.get("status"))
+        gate_phase = subject.get("phase", state.get("status"))
+        phase = work_phase(subject)
+        if evidence and phase in {None, "blocked", "ready_for_human"}:
+            phase = evidence["phase"]
+        phase = phase or gate_phase
         status_code = (
             state.get("status") if top_level else
-            "publication_pending" if phase == "publication_pending" else
+            "publication_pending" if gate_phase == "publication_pending" else
             "operator_stopped" if reason == "ticket_paused" else
             "supervision_timeout" if reason == "ticket_supervision_timeout" else
             "execution_failed" if reason == "ticket_execution_failed" else
             "ready_for_human"
         )
-        if phase == "ready_for_approval" and not source.top_level:
+        if gate_phase == "ready_for_approval" and not source.top_level:
             status_code = "parent_approval_pending" if location == "parent" else "run_approval_pending"
         if evidence:
             kind = evidence["action_kind"]
@@ -96,19 +101,12 @@ def operator_action_facts(state: dict[str, Any]) -> list[dict[str, Any]]:
         blockers = subject.get("human_blockers")
         if kind == "human_blocker" and isinstance(blockers, list):
             reasons = [str(item) for item in blockers]
-            phase = subject.get("human_blocker_phase", phase)
         else:
             reasons = [str(item["message"]) for item in diagnostics
                        if isinstance(item, dict) and item.get("message")] if isinstance(diagnostics, list) else []
             if isinstance(execution_failure, str) and execution_failure:
                 reasons = [execution_failure]
             reasons = reasons or (["Run abandonment recovery is incomplete."] if kind == "abandonment_recovery" and not reason else [str(reason or status_code)])
-            if reason in {"ticket_execution_failed", "ticket_supervision_timeout"}:
-                phase = subject.get("execution_resume_phase", phase)
-            elif reason in {"ticket_paused", "ci_investigation_paused"}:
-                phase = subject.get("pause_resume_phase", phase)
-            elif evidence:
-                phase = evidence["phase"]
         result.append({
             "location": location, "work_subject": work_subject,
             "generation": _generation(state, location, subject),
@@ -123,15 +121,10 @@ def operator_action_facts(state: dict[str, Any]) -> list[dict[str, Any]]:
             },
             "scope": scope, "action_kind": kind, "phase": phase,
             "status_code": status_code, "subject": subject,
+            "role": work_role(subject, location=location),
             "action": _next_action(state, location, kind, reason, scope),
         })
     return result
-
-
-def _work_subject(state: dict[str, Any], location: str) -> str:
-    prefix = {"parent": "parent-only", "run_acceptance": "run-acceptance",
-              "run_repair": "run-repair", "run_publication": "run-publication"}.get(location, location)
-    return location if location.startswith("ticket:") else f"{prefix}:{state.get('run_id')}"
 
 
 def _generation(state: dict[str, Any], location: str, subject: dict[str, Any]) -> object:

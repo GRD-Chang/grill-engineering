@@ -3089,6 +3089,7 @@ def test_timeline_projects_semantic_invocation_output_and_retry_counters(
         "ticket": 3,
         "worker": "发布工作代理",
         "phase": "publication_pending",
+        "attempt": 2,
         "semantic_attempt_id": "attempt-publication-2",
         "semantic_attempt_role": "publication",
         "semantic_attempt_ordinal": 2,
