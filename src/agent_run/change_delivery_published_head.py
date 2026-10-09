@@ -426,7 +426,7 @@ def publish_and_merge(
         )
     except GitHubReadError as error:
         if error.code not in {
-            "change_pr_narrative_outcome_unknown", "change_pr_narrative_intent_changed",
+            "github_write_outcome_unknown",
         }:
             raise
         return stage._block(state, job, error.code, str(error))

@@ -390,6 +390,10 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
     initial["run_publication"]["phase"] = "waiting_external"
     initial["status"] = "waiting_external"
     initial["terminal_kind"] = "waiting_external"
+    publisher.data["delivery"]["pull_requests"][0].update(
+        title="Previous title", body="Previous body",
+    )
+    publisher._save()
     states.save_run(str(state["run_id"]), initial)
     uncertain_publisher = UnknownNarrativeWritePublisher(
         git_repo / "github.json", git

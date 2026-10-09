@@ -15,7 +15,7 @@ from agent_run.branch_publication import (
     RemoteBranchChanged,
     RemoteBranchObservation,
 )
-from agent_run.change_pr_narrative import admit_change_pr_write
+from agent_run.pr_write import admit_pr_write
 from agent_run.github import (
     GitHubReadError,
     MergeOutcomeUnknownError,
@@ -926,7 +926,7 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Change PR has a foreign identity")
         else:
-            admit_change_pr_write(
+            admit_pr_write(
                 intent=write_intent, save_intent=save_intent, number=None, prior=None,
                 target={"title": title, "body": body},
             )
@@ -945,7 +945,7 @@ class FixtureGitHubPublisher:
             }
             pulls.append(pull)
         if matching:
-            should_write = admit_change_pr_write(
+            should_write = admit_pr_write(
                 intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
                 prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
                 target={"title": title, "body": body},
@@ -1011,7 +1011,7 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Ticket PR has a foreign identity")
         else:
-            admit_change_pr_write(
+            admit_pr_write(
                 intent=write_intent, save_intent=save_intent, number=None, prior=None,
                 target={"title": title, "body": body},
             )
@@ -1026,7 +1026,7 @@ class FixtureGitHubPublisher:
             }
             pulls.append(pull)
         if matching:
-            should_write = admit_change_pr_write(
+            should_write = admit_pr_write(
                 intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
                 prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
                 target={"title": title, "body": body},
@@ -1358,12 +1358,6 @@ class FixtureGitHubPublisher:
     def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]:
         pull = self._pull(pr_number)
         return {"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))}
-
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool:
-        pull = self._pull(pr_number)
-        return pull.get("title") == title and pull.get("body") == body
 
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]

@@ -17,6 +17,16 @@ Publish 只准备文案。程序在正式 Git/GitHub 写入前保存准确操作
 | 合并 | 已发送的 merge intent、准确 PR/head/base、实际合入提交/tree 与 Required Checks；Parent 同时保留准确人工批准 |
 | 交付收尾 | 已核验的合入结果、程序身份、关闭意图/事件及收尾记录；已完成的评论、关闭与分支删除不重复写入 |
 
+Change PR（Ticket、Parent-only）与最终 Run PR 共用 `pr_write` 的写入准入和实际结果观察。
+写前固定原 PR number（创建时为空）、原文案与目标文案；正常发布、同边界重试及失效前只读对账
+使用同一身份与文案判定。正式调用返回后仍需读回目标值，不能仅凭成功响应推进。
+原目标已存在时只收口，不再发出更新；原值仍在时仅在当前授权边界有效的正常发布中继续写入。
+只读失效对账不发出写入，目标分支追加本身不阻止确认原操作，但不能授权重放旧操作。
+Change 在对账成功保存时清除意图；Final 未失效时保留意图交给正常发布消费，失效时先确认再退役。
+各自的重试窗口、人工批准、席位与 currentness 策略不由共用观察决定。
+Final 同边界未知文案继续有界操作等待，耗尽后显式 resume 续期；失效前只读对账无法确认时保持人工暂停。
+关闭对象继续报告实际 PR 状态并要求人工处理，不创建替代品。
+
 读失败不能当成对象不存在；异常不能清除未知写入意图。远端写入成功后本地 save 失败时，
 Final Run 回读最后持久化的发布边界，再记录有界等待，不以已经修改的内存对象覆盖恢复依据。
 Change PR 的业务结果保存失败时，恢复保存前的 Job 边界，避免后续异常处理清除未知写入意图。
@@ -58,3 +68,12 @@ Ticket 的推送/PR 意图尚未核实时，即使进入执行失败、监督超
 
 远端事实查询沿用 Git 的 [ls-remote](https://git-scm.com/docs/git-ls-remote) 接口：读取准确 ref 和 commit ID，
 成功读取且无匹配 ref 与查询失败必须区分。这里深化已有发布边界，不引入独立通用事务框架。
+
+本轮等效覆盖：`test_change_pr_narrative_recovery.py` 保留 Ticket/Parent-only 更新故障与公开恢复；
+`test_run_pr_reconciliation.py` 补充最终创建响应丢失、结果保存失败及公开 resume 的真实 Git/StateStore 重载；
+`test_run_publication.py` 的更新恢复仍覆盖实际旧值到目标值（准确文本相同时不再制造重复更新）；
+`test_run_publication_drift_recovery.py` 保留默认分支追加与第三文案的失效对账。
+共用规则替代 `change_pr_narrative` 与 Final 的单独文案比较 API，没有删除推送、合并及收尾保障。
+
+PR 读取和更新沿用 GitHub CLI 的 [pr list](https://cli.github.com/manual/gh_pr_list) 与
+[pr edit](https://cli.github.com/manual/gh_pr_edit)，恢复查找使用全部 PR 状态，关闭和歧义对象不能作为未创建处理。

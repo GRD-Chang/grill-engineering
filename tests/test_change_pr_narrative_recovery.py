@@ -13,6 +13,32 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
 
 
+def _mock_pr_readback(publisher: GhGitHubPublisher, monkeypatch: pytest.MonkeyPatch) -> None:
+    def pull(number: int) -> dict[str, Any]:
+        matches = [item for item in publisher._change_prs("unused", state="all") if item["number"] == number]
+        if len(matches) != 1:
+            raise GitHubReadError("github_read_failed", "Original PR is missing")
+        return matches[0]
+
+    def live(number: int) -> dict[str, Any]:
+        current = pull(number)
+        head, base = current["head"], current["base"]
+        return {
+            "state": "OPEN", "head_branch": head["ref"], "head_sha": head["sha"],
+            "head_repository": head["repo"]["full_name"], "base_branch": base["ref"],
+            "base_sha": base["sha"], "base_repository": base["repo"]["full_name"],
+        }
+
+    def narrative(number: int) -> dict[str, str]:
+        current = pull(number)
+        if not all(isinstance(current.get(key), str) for key in ("title", "body")):
+            raise GitHubReadError("github_invalid_response", "PR narrative must contain title and body")
+        return {"title": current["title"], "body": current["body"]}
+
+    monkeypatch.setattr(publisher, "live_pull_request", live)
+    monkeypatch.setattr(publisher, "read_run_pr_narrative", narrative)
+
+
 @pytest.mark.parametrize("fault", ["response", "result_save"])
 @pytest.mark.parametrize("observed", ["target", "prior", "external"])
 def test_change_pr_unknown_write_reconciles_saved_narrative(
@@ -41,6 +67,7 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
 
     def publisher() -> GhGitHubPublisher:
         result = GhGitHubPublisher("example/project", git)
+        _mock_pr_readback(result, monkeypatch)
         monkeypatch.setattr(result, "_change_prs", lambda *_args, **_kwargs: [deepcopy(remote)])
 
         def write(*args: str) -> None:
@@ -88,7 +115,7 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
     elif observed == "external":
         remote.update(title="Maintainer title", body="Maintainer body")
     if observed == "external":
-        with pytest.raises(GitHubReadError, match="neither the saved prior nor target"):
+        with pytest.raises(GitHubReadError, match="neither .*saved prior nor target"):
             ensure(current)
         assert remote["body"] == "Maintainer body"
         assert current["ticket_write_intent"] == intent
@@ -104,6 +131,7 @@ def test_change_pr_read_failure_does_not_admit_write(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    _mock_pr_readback(publisher, monkeypatch)
     writes: list[tuple[str, ...]] = []
     monkeypatch.setattr(publisher, "_change_prs", lambda *_args, **_kwargs: (_ for _ in ()).throw(GitHubReadError("github_read_failed", "read unavailable")))
     monkeypatch.setattr(publisher, "_require", lambda *args: writes.append(args))
@@ -215,6 +243,7 @@ def test_saved_change_pr_identity_and_narrative_cannot_be_guessed(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, observation: str,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    _mock_pr_readback(publisher, monkeypatch)
     head = "a" * 40
     base = "b" * 40
     pull: dict[str, Any] = {
@@ -249,6 +278,7 @@ def test_change_pr_readback_external_edit_preserves_pending_intent(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, existing: bool,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    _mock_pr_readback(publisher, monkeypatch)
     pull = {
         "number": 12, "title": "Old", "body": "Old body",
         "head": {"ref": "ticket", "sha": "a" * 40, "repo": {"full_name": "example/project"}},
@@ -269,7 +299,7 @@ def test_change_pr_readback_external_edit_preserves_pending_intent(
             expected_head_sha="a" * 40, expected_base_sha="b" * 40,
             write_intent=intent, save_intent=lambda: None,
         )
-    assert error.value.code == "change_pr_narrative_outcome_unknown"
+    assert error.value.code == "github_write_outcome_unknown"
     assert intent["target_narrative"] == {"title": "Target", "body": "Target body"}
     assert len(writes) == 1
     assert pull["body"] == "Maintainer body"
@@ -279,6 +309,7 @@ def test_change_pr_readback_prior_value_allows_continuation(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    _mock_pr_readback(publisher, monkeypatch)
     pull = {
         "number": 12, "title": "Old", "body": "Old body",
         "head": {"ref": "ticket", "sha": "a" * 40, "repo": {"full_name": "example/project"}},
@@ -301,7 +332,7 @@ def test_change_pr_readback_prior_value_allows_continuation(
     }
     with pytest.raises(GitHubReadError) as error:
         publisher.ensure_change_pr(**authority)
-    assert error.value.code == "change_pr_narrative_readback_mismatch"
+    assert error.value.code == "github_write_failed"
     assert intent["prior_narrative"] == {"title": "Old", "body": "Old body"}
     assert publisher.ensure_change_pr(**authority) == 12
     assert len(writes) == 2

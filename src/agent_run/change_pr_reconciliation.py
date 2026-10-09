@@ -7,6 +7,7 @@ from typing import Any
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.github import GitHubReadError
 from agent_run.git_errors import GitError
+from agent_run.pr_write import observe_pr_write
 
 
 def reconcile_pending_pr_write(
@@ -20,37 +21,11 @@ def reconcile_pending_pr_write(
     if "target_narrative" not in intent:
         return True
     try:
-        number = intent.get("pr_number")
-        if number is None:
-            number = stage.github.find_change_pr_number(branch=str(intent["branch"]))
-        if number is None:
-            if intent.get("prior_narrative") is not None:
-                raise GitHubReadError("change_pr_identity_mismatch", "Original Change PR is missing")
-        else:
-            if type(number) is not int:
-                raise GitHubReadError("github_invalid_response", "Invalid original Change PR number")
-            live = stage.github.live_pull_request(number)
-            if not (
-                live.get("state") == "OPEN"
-                and live.get("head_branch") == intent.get("branch")
-                and live.get("head_sha") == intent.get("head_sha")
-                and live.get("head_repository") == state.get("repository")
-                and live.get("base_branch") == intent.get("base_branch")
-                and live.get("base_repository") == state.get("repository")
-            ):
-                raise GitHubReadError(
-                    "change_pr_identity_mismatch", "Original Change PR no longer matches its saved write identity",
-                )
-            # Target advancement cannot authorize a replay of this old write.
-            # Only its exact PR and prior/target text can settle its outcome;
-            # the normal integration gate observes the new target afterwards.
-            narrative = stage.github.read_run_pr_narrative(number)
-            if narrative != intent["target_narrative"] and narrative != intent.get("prior_narrative"):
-                raise GitHubReadError(
-                    "change_pr_narrative_outcome_unknown",
-                    "Original Change PR matches neither its saved prior nor target narrative; "
-                    "reconcile this write before preparing another publication",
-                )
+        observed = observe_pr_write(
+            github=stage.github, repository=state["repository"],
+            authority=intent, intent=intent,
+        )
+        number = observed.number
     except (GitHubReadError, GitError, OSError, TimeoutError) as error:
         stage._block(state, job, "change_pr_write_reconciliation_pending", str(error))
         return False

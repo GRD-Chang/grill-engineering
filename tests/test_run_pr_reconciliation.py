@@ -1,5 +1,6 @@
 """Original Final Run authority survives incomplete or conflicting readback."""
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -131,3 +132,110 @@ def test_lost_create_uses_unique_original_pr_lookup_before_retiring(observation:
     else:
         assert publication["write_intent"] == intent
         assert state["status"] == "ready_for_human"
+
+
+@pytest.mark.parametrize("fault", ["response", "result_save"])
+def test_final_create_restart_uses_public_resume_and_never_repeats_completed_write(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    from agent_run.controller import Controller
+    from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+    from agent_run.run_publication import RunPublicationEngine
+    from agent_run.state import StateStore
+    from support.run_publication import RunPublicationAgents
+    from support.run_scenarios import _accepted_run
+
+    state, states, git, publisher = _accepted_run(git_repo)
+    run_id = str(state["run_id"])
+    agents = RunPublicationAgents()
+    original_create = publisher.ensure_run_pr
+    created = False
+
+    def create(**authority: Any) -> int:
+        nonlocal created
+        durable = StateStore(states.root).load_current_run(run_id)["run_publication"]
+        assert durable["write_intent"]["action"] == "create_final_pr"
+        assert durable["write_intent"]["target_narrative"] == {
+            "title": authority["title"], "body": authority["body"],
+        }
+        number = original_create(**authority)
+        created = True
+        if fault == "response":
+            raise OSError("Final create response lost")
+        return number
+
+    monkeypatch.setattr(publisher, "ensure_run_pr", create)
+    original_save = states._save_run_unlocked
+    failed = False
+
+    def save(identifier: str, current: dict[str, Any]) -> None:
+        nonlocal failed
+        if fault == "result_save" and created and not failed and "write_intent" not in current["run_publication"]:
+            failed = True
+            raise OSError("Final create result checkpoint lost")
+        original_save(identifier, current)
+
+    monkeypatch.setattr(states, "_save_run_unlocked", save)
+    waiting = RunPublicationEngine(
+        git=git, states=states, agents=agents, github=publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    ).publish(run_id)
+    assert waiting["status"] == "waiting_external"
+    assert failed is (fault == "result_save")
+    before = StateStore(states.root).load_current_run(run_id)["run_publication"]
+    assert before["write_intent"]["action"] == "create_final_pr"
+    assert len(agents.requests) == 1
+
+    fresh_states = StateStore(states.root)
+    fresh_publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
+    # A conflicting result exhausts the existing bounded operation window;
+    # public resume renews only that window and preserves the original write.
+    fresh_publisher.data["delivery"]["pull_requests"][0].update(
+        title="Maintainer", body="Unconfirmed text",
+    )
+    fresh_publisher._save()
+    uncertain = RunPublicationEngine(
+        git=git, states=fresh_states, agents=agents, github=fresh_publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    for _ in range(6):
+        paused = uncertain.publish(run_id)
+    assert paused["status"] == "publication_pending"
+    assert paused["run_publication"]["write_intent"] == before["write_intent"]
+    assert StateStore(states.root).load_current_run(run_id)["run_publication"]["write_intent"] == before["write_intent"]
+    assert len(agents.requests) == 1
+    fresh_publisher.data["delivery"]["pull_requests"][0].update(before["write_intent"]["target_narrative"])
+    fresh_publisher._save()
+    Controller(FixtureGitHubReader(git_repo / "github.json"), git, StateStore(states.root)).resume(
+        run_id, explicit_resume=True,
+    )
+    fresh_publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
+    read_numbers: list[int] = []
+    original_read = fresh_publisher.read_run_pr_narrative
+
+    def read(number: int) -> dict[str, str]:
+        read_numbers.append(number)
+        return original_read(number)
+
+    def forbidden_write(**_authority: Any) -> None:
+        raise AssertionError("completed Final PR write must only be read back")
+
+    monkeypatch.setattr(fresh_publisher, "read_run_pr_narrative", read)
+    monkeypatch.setattr(fresh_publisher, "ensure_run_pr", forbidden_write)
+    monkeypatch.setattr(fresh_publisher, "refresh_run_pr_narrative", forbidden_write)
+    engine = RunPublicationEngine(
+        git=git, states=fresh_states, agents=agents, github=fresh_publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    recovered = engine.publish(run_id)
+    assert recovered["status"] == "run_approval_pending"
+    publication = recovered["run_publication"]
+    assert read_numbers and set(read_numbers) == {publication["pr_number"]}
+    assert publication["artifact"] == before["artifact"]
+    assert "write_intent" not in publication
+    assert "approval_grant" not in publication
+    assert publication["record"]["run_head_sha"] == before["write_intent"]["authority"]["head_sha"]
+    assert len(fresh_publisher.data["delivery"]["pull_requests"]) == 1
+    assert len(agents.requests) == 1
+    assert engine.publish(run_id)["status"] == "run_approval_pending"
+    assert len(agents.requests) == 1

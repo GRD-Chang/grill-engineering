@@ -2761,3 +2761,53 @@ def test_ci_evidence_waits_for_the_exact_completed_job(
     with pytest.raises(GitHubReadError) as failure:
         publisher.required_check_evidence(12, expected_head_sha="failed-head")
     assert failure.value.code == "github_check_evidence_observation_pending"
+
+
+@pytest.mark.parametrize("observation", ["target", "external", "read_failure"])
+def test_saved_change_pr_write_reads_original_before_new_publication(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, observation: str,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    prior = {"title": "Prior", "body": "Prior body"}
+    target = {"title": "Target", "body": "Target body"}
+    intent = {
+        "pr_number": 12, "prior_narrative": prior, "target_narrative": target,
+    }
+    writes: list[tuple[str, ...]] = []
+    reads: list[int] = []
+
+    def live(number: int) -> dict[str, str]:
+        reads.append(number)
+        if observation == "read_failure":
+            raise GitHubReadError("github_read_failed", "read unavailable")
+        return {
+            "state": "OPEN", "head_branch": "ticket-2", "head_sha": "head",
+            "head_repository": "example/project", "base_branch": "main",
+            "base_sha": "advanced-base", "base_repository": "example/project",
+        }
+
+    monkeypatch.setattr(publisher, "live_pull_request", live)
+    monkeypatch.setattr(
+        publisher, "read_run_pr_narrative",
+        lambda _number: target if observation == "target" else {"title": "External", "body": "External body"},
+    )
+    monkeypatch.setattr(publisher, "_require", lambda *args: writes.append(args))
+
+    def publish() -> int:
+        return publisher.ensure_change_pr(
+            branch="ticket-2", base_branch="main", expected_head_sha="head",
+            expected_base_sha="old-base", **target, write_intent=intent,
+            save_intent=lambda: None,
+        )
+
+    if observation == "target":
+        assert publish() == 12
+    else:
+        with pytest.raises(GitHubReadError) as error:
+            publish()
+        assert error.value.code == (
+            "github_read_failed" if observation == "read_failure" else "github_write_outcome_unknown"
+        )
+    assert reads == [12]
+    assert writes == []
+    assert intent == {"pr_number": 12, "prior_narrative": prior, "target_narrative": target}

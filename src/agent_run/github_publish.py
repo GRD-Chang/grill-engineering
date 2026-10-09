@@ -15,7 +15,7 @@ from agent_run.branch_publication import (
     RemoteBranchChanged,
     RemoteBranchObservation,
 )
-from agent_run.change_pr_narrative import admit_change_pr_write
+from agent_run.pr_write import admit_pr_write, observe_pr_write
 from agent_run.github import (
     GhGitHubReader,
     GitHubReadError,
@@ -589,6 +589,23 @@ class GhGitHubPublisher:
         write_intent: dict[str, Any] | None = None,
         save_intent: Callable[[], None] | None = None,
     ) -> int:
+        authority = {
+            "branch": branch, "head_sha": expected_head_sha,
+            "base_branch": base_branch, "base_sha": expected_base_sha,
+        }
+        if write_intent is not None and "target_narrative" in write_intent:
+            observed = observe_pr_write(
+                github=self, repository=self.repository, authority=authority,
+                intent=write_intent,
+            )
+            if observed.completed:
+                admit_pr_write(
+                    intent=write_intent, save_intent=save_intent, number=observed.number,
+                    prior=write_intent["target_narrative"],
+                    target={"title": title, "body": body},
+                )
+                assert observed.number is not None
+                return observed.number
         pulls = self._change_prs(branch)
         if not pulls and self._change_prs(branch, state="all"):
             raise GitHubReadError(
@@ -616,7 +633,7 @@ class GhGitHubPublisher:
                 raise GitHubReadError(
                     "github_invalid_response", "Change PR narrative snapshot is missing",
                 )
-            should_write = admit_change_pr_write(
+            should_write = admit_pr_write(
                 intent=write_intent, save_intent=save_intent, number=number,
                 prior={"title": existing.get("title", ""), "body": existing.get("body", "")},
                 target={"title": title, "body": body},
@@ -633,6 +650,8 @@ class GhGitHubPublisher:
                     "--body",
                     body,
                 )
+            if write_intent is not None:
+                return self._confirm_pr_write(authority, write_intent)
             refreshed = self._change_prs(branch)
             if len(refreshed) != 1:
                 raise GitHubReadError(
@@ -653,16 +672,12 @@ class GhGitHubPublisher:
                 expected_base_sha=expected_base_sha,
             )
             if current.get("title") != title or current.get("body") != body:
-                prior_observed = write_intent is not None and {
-                    "title": current.get("title"), "body": current.get("body"),
-                } == write_intent.get("prior_narrative")
                 raise GitHubReadError(
-                    "change_pr_narrative_outcome_unknown" if write_intent is not None and not prior_observed
-                    else "change_pr_narrative_readback_mismatch",
+                    "change_pr_narrative_readback_mismatch",
                     "Change PR narrative readback did not match publication artifact",
                 )
             return number
-        admit_change_pr_write(
+        admit_pr_write(
             intent=write_intent, save_intent=save_intent, number=None, prior=None,
             target={"title": title, "body": body},
         )
@@ -680,6 +695,8 @@ class GhGitHubPublisher:
             "--body",
             body,
         )
+        if write_intent is not None:
+            return self._confirm_pr_write(authority, write_intent)
         recovered = self._change_prs(branch)
         if len(recovered) != 1:
             raise GitHubReadError(
@@ -694,14 +711,19 @@ class GhGitHubPublisher:
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
         )
-        if write_intent is not None and (
-            created.get("title") != title or created.get("body") != body
-        ):
-            raise GitHubReadError(
-                "change_pr_narrative_outcome_unknown",
-                "Created Change PR narrative readback did not match publication artifact",
-            )
         return _integer(created, "number")
+
+    def _confirm_pr_write(
+        self, authority: dict[str, str], intent: dict[str, Any],
+    ) -> int:
+        observed = observe_pr_write(
+            github=self, repository=self.repository, authority=authority, intent=intent,
+        )
+        if not observed.completed or observed.number is None:
+            raise GitHubReadError(
+                "github_write_failed", "PR narrative readback still matches the saved prior value",
+            )
+        return observed.number
 
     def find_change_pr_number(self, *, branch: str) -> int | None:
         pulls = self._change_prs(branch, state="all")
@@ -1236,16 +1258,6 @@ class GhGitHubPublisher:
         if not isinstance(title, str) or not isinstance(body, str):
             raise GitHubReadError("github_invalid_response", "PR narrative must contain title and body")
         return {"title": title, "body": body}
-
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool:
-        value = self._json(
-            "pr", "view", str(pr_number), "--repo", self.repository,
-            "--json", "title,body",
-        )
-        data = _mapping(value)
-        return data.get("title") == title and data.get("body") == body
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)

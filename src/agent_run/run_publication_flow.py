@@ -33,6 +33,7 @@ from agent_run.publication_operation_retry import begin_publication_operation_at
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
+from agent_run.pr_write import admit_pr_write, observe_pr_write
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
@@ -351,6 +352,40 @@ class RunPublicationFlow(RunPublicationShared):
         )
         self._save(state)
 
+    def _admit_pr_write(
+        self, state: dict[str, Any], publication: dict[str, Any],
+        action: str, authority: dict[str, str], *, number: int | None,
+        prior: dict[str, str] | None, target: dict[str, str],
+    ) -> bool:
+        intent: dict[str, Any] = {"action": action, "authority": authority}
+        return admit_pr_write(
+            intent=intent, number=number, prior=prior, target=target,
+            save_intent=lambda: self._persist_pr_intent(state, publication, intent),
+        )
+
+    def _persist_pr_intent(
+        self, state: dict[str, Any], publication: dict[str, Any], intent: dict[str, Any],
+    ) -> None:
+        self._persist_write_intent(
+            state, publication, str(intent["action"]), intent["authority"],
+            prior_narrative=intent.get("prior_narrative"),
+            target_narrative=intent["target_narrative"], pr_number=intent.get("pr_number"),
+        )
+
+    def _confirm_pr_write(
+        self, state: dict[str, Any], publication: dict[str, Any],
+        authority: dict[str, str], number: int,
+    ) -> None:
+        intent = self._mapping(publication, "write_intent")
+        observation = observe_pr_write(
+            github=self.github, repository=str(state["repository"]),
+            authority=authority, intent=intent,
+        )
+        if observation.number != number or not observation.completed:
+            raise GitHubReadError(
+                "github_write_failed", "PR write has not reached its saved target narrative",
+            )
+
     def _final_run_ref_write_is_pending(self, publication: dict[str, Any]) -> bool:
         intent = publication.get("write_intent")
         return isinstance(intent, dict) and intent.get("action") == "ensure_final_run_ref"
@@ -399,15 +434,6 @@ class RunPublicationFlow(RunPublicationShared):
                 }
             )
         return self._save(state)
-
-    def _write_intent_matches(
-        self, pr_number: int | None, expected_title: str, expected_body: str
-    ) -> bool:
-        if pr_number is None:
-            return False
-        return self.github.run_pr_narrative_matches(
-            pr_number, title=expected_title, body=expected_body
-        )
 
     def _publication_failed(
         self,
@@ -714,32 +740,31 @@ class RunPublicationFlow(RunPublicationShared):
             intent = self._mapping(publication, "write_intent")
             if intent.get("authority") != ref_authority:
                 raise GitError("Final Run PR intent no longer matches durable authority")
-            if self._write_intent_matches(existing, artifact.pr_title, narrative):
-                publication.pop("write_intent", None)
-                write_intent_resolved = True
-            elif intent.get("action") == "create_final_pr" and existing is None:
-                # Exact PR identity lookup proved creation has not occurred.
-                publication.pop("write_intent", None)
-            elif (
-                intent.get("action") == "refresh_final_pr_narrative"
-                and isinstance(existing, int)
-                and isinstance(intent.get("prior_narrative"), dict)
-                and self.github.read_run_pr_narrative(existing) == intent["prior_narrative"]
-            ):
-                # The original narrative is still present on the exact PR.
-                publication.pop("write_intent", None)
-            else:
-                return self._wait_for_github_convergence(
-                    state, publication, GitHubReadError(
-                        "github_write_failed", "Final Run PR write outcome remains unknown",
-                    ),
+            try:
+                pr_observation = observe_pr_write(
+                    github=self.github, repository=str(state["repository"]),
+                    authority=ref_authority, intent=intent,
                 )
+            except GitHubReadError as error:
+                if error.code != "github_write_outcome_unknown":
+                    raise
+                # Same-boundary publication retains its bounded retry window;
+                # invalidation readback above retains its human pause policy.
+                return self._wait_for_github_convergence(
+                    state, publication, GitHubReadError("github_write_failed", error.message),
+                )
+            existing = pr_observation.number
+            write_intent_resolved = pr_observation.completed
+            # An unchanged prior or an absent creation can continue under the
+            # same current authority. Unknown outcomes never reach this point.
+            publication.pop("write_intent", None)
         pr_number = existing
         created_pr = pr_number is None
         if pr_number is None:
-            self._persist_write_intent(
+            self._admit_pr_write(
                 state, publication, "create_final_pr", ref_authority,
-                target_narrative={"title": artifact.pr_title, "body": narrative},
+                number=None, prior=None,
+                target={"title": artifact.pr_title, "body": narrative},
             )
             pr_number = self.github.ensure_run_pr(
                 branch=str(state["run_branch"]),
@@ -749,6 +774,7 @@ class RunPublicationFlow(RunPublicationShared):
                 title=artifact.pr_title,
                 body=narrative,
             )
+            self._confirm_pr_write(state, publication, ref_authority, pr_number)
             publication.pop("write_intent", None)
             publication["pr_number"] = pr_number
             self._save(state)
@@ -763,21 +789,22 @@ class RunPublicationFlow(RunPublicationShared):
             and not write_intent_resolved
             and publication.get("record") != record
         ):
-            self._persist_write_intent(
+            should_write = self._admit_pr_write(
                 state, publication, "refresh_final_pr_narrative", ref_authority,
-                prior_narrative=self.github.read_run_pr_narrative(pr_number),
-                target_narrative={"title": artifact.pr_title, "body": narrative},
-                pr_number=pr_number,
+                number=pr_number, prior=self.github.read_run_pr_narrative(pr_number),
+                target={"title": artifact.pr_title, "body": narrative},
             )
-            self.github.refresh_run_pr_narrative(
-                pr_number=pr_number,
-                expected_head_branch=str(state["run_branch"]),
-                expected_head_sha=run_head,
-                expected_base_branch=self.default_branch,
-                expected_base_sha=self.default_head_sha,
-                title=artifact.pr_title,
-                body=narrative,
-            )
+            if should_write:
+                self.github.refresh_run_pr_narrative(
+                    pr_number=pr_number,
+                    expected_head_branch=str(state["run_branch"]),
+                    expected_head_sha=run_head,
+                    expected_base_branch=self.default_branch,
+                    expected_base_sha=self.default_head_sha,
+                    title=artifact.pr_title,
+                    body=narrative,
+                )
+            self._confirm_pr_write(state, publication, ref_authority, pr_number)
             publication.pop("write_intent", None)
         try:
             ensure_linked_branch_display(

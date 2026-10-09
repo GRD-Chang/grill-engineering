@@ -477,6 +477,8 @@ _Avoid_: Run Branch 本身、Reviewer 的只读工作区、Agent 自行发布、
 
 **Run Repair Job（运行修复任务）**:
 完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环，不拥有独立内部 PR 的交付生命周期；这是 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 已确认、尚待实施的目标定义。
+
+当前尚未切换的内部 Repair PR 实现中，Job 未集成时复用原 branch/PR；已集成 Job 的 Candidate revalidation 在新的 default head 上又产生 Finding 时，Controller 归档旧 Job/PR，并以新的 base、branch 和 PR 身份轮转出后继 Job，同时保留 Repair Cycle 的累计用量、Run Repair Thread 与 Integration-repair Worktree。这段说明仅对应现有实现和历史记录，不要求 ADR 0025 的目标架构保留内部 PR 轮转。
 _Avoid_: Ticket Job、独立修复流水线、另有一份 Parent 预算
 
 **Repair Cycle（修复周期）**:

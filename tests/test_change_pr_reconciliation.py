@@ -133,3 +133,62 @@ def test_run_repair_checks_pending_write_before_source_observation(monkeypatch: 
     monkeypatch.setattr("agent_run.run_repair_lifecycle.observe_repair_source", forbidden)
     assert lifecycle._repair(state, {}) == "blocked"
     assert job["ticket_write_intent"] == original["ticket_write_intent"]
+
+
+@pytest.mark.parametrize("invalidation", ["publication", "phase"])
+def test_invalidated_change_write_survives_reload_until_original_result_is_known(
+    tmp_path: Path, invalidation: str,
+) -> None:
+    from agent_run.state import StateStore
+
+    state, job = boundary()
+    if invalidation == "publication":
+        job["publication_sha"] = "replacement-head"
+    else:
+        job["phase"] = "stale"
+    state["job"] = job
+    states = StateStore(tmp_path / "states")
+    states.save_run("test", state)
+    original = deepcopy(job)
+    reads: list[int] = []
+    target = original["ticket_write_intent"]["target_narrative"]
+    observed = {"title": "Maintainer", "body": "Unconfirmed text"}
+
+    def read(number: int) -> dict[str, str]:
+        reads.append(number)
+        return observed
+
+    def block(current: dict[str, Any], current_job: dict[str, Any], code: str, message: str) -> None:
+        current_job.update(phase="blocked", execution_resume_phase=current_job["phase"])
+        current["diagnostics"] = [{"code": code, "message": message}]
+        states.save_run("test", current)
+
+    stage = SimpleNamespace(
+        github=SimpleNamespace(
+            live_pull_request=lambda number: {
+                "state": "OPEN", "head_branch": "source", "head_sha": "original-head",
+                "head_repository": "example/project", "base_repository": "example/project",
+                "base_branch": "main", "base_sha": "advanced-base",
+            },
+            read_run_pr_narrative=read,
+        ),
+        save=lambda current: states.save_run("test", current), _block=block,
+    )
+    loaded = StateStore(states.root).load_run("test")
+    assert loaded is not None
+    assert not reconcile_pending_pr_write(stage, loaded, loaded["job"])
+    reloaded = StateStore(states.root).load_run("test")
+    assert reloaded is not None
+    assert reloaded["job"]["ticket_write_intent"] == original["ticket_write_intent"]
+    assert reloaded["job"]["publication_sha"] == original["publication_sha"]
+    assert reloaded["job"]["execution_resume_phase"] == original["phase"]
+    # A later exact target observation permits only settlement of the original
+    # PR. No write API is available on this Publisher, even after invalidation.
+    observed = target
+    assert reconcile_pending_pr_write(stage, reloaded, reloaded["job"])
+    final = StateStore(states.root).load_run("test")
+    assert final is not None
+    assert final["job"]["pr_number"] == 12
+    assert final["job"]["publication_sha"] == original["publication_sha"]
+    assert "ticket_write_intent" not in final["job"]
+    assert reads == [12, 12]

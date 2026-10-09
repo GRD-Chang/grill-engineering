@@ -195,10 +195,6 @@ class GitHubPublisher(Protocol):
 
     def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]: ...
 
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool: ...
-
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]
     ) -> None: ...

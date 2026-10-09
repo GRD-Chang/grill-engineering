@@ -8,6 +8,7 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.github import GitHubReadError
 from agent_run.git import GitError
 from agent_run.error_safety import bounded_error
+from agent_run.pr_write import observe_pr_write
 
 
 def reconcile_run_pr_write(
@@ -24,49 +25,22 @@ def reconcile_run_pr_write(
     }:
         return True
     try:
-        if github is None:
-            raise GitHubReadError("github_write_outcome_unknown", "Original PR write requires GitHub readback")
         authority = intent.get("authority")
-        target = intent.get("target_narrative")
-        if (
-            not isinstance(authority, dict)
-            or not all(isinstance(authority.get(key), str) and authority[key] for key in (
-                "branch", "head_sha", "base_branch", "base_sha",
-            ))
-            or not isinstance(target, dict)
-            or not all(isinstance(target.get(key), str) for key in ("title", "body"))
-        ):
-            raise GitHubReadError("github_write_outcome_unknown", "Original PR write is missing its saved authority or target narrative")
-        number = intent.get("pr_number", publication.get("pr_number"))
-        if number is None:
-            number = github.find_change_pr_number(branch=str(authority["branch"]))
+        authority = authority if isinstance(authority, dict) else {}
+        observation = observe_pr_write(
+            github=github, repository=str(state.get("repository")),
+            authority=authority, intent=intent,
+        )
+        number = observation.number
         retired = publication.get("phase") == "stale" or (
             current_head_sha is not None and current_head_sha != authority["head_sha"]
         )
         if number is None:
-            if intent.get("action") != "create_final_pr":
-                raise GitHubReadError("github_write_outcome_unknown", "Original Final Run PR is missing")
+            assert github is not None
             _, base = github.live_branch_heads(str(authority["branch"]), str(authority["base_branch"]))
             retired = retired or base != authority["base_sha"]
         else:
-            if type(number) is not int:
-                raise GitHubReadError("github_write_outcome_unknown", "Original Final Run PR number is invalid")
-            live = github.live_pull_request(number)
-            if not (
-                live.get("state") == "OPEN"
-                and live.get("head_branch") == authority.get("branch")
-                and live.get("head_sha") == authority.get("head_sha")
-                and live.get("head_repository") == state.get("repository")
-                and live.get("base_branch") == authority.get("base_branch")
-                and live.get("base_repository") == state.get("repository")
-            ):
-                raise GitHubReadError("github_write_outcome_unknown", "Original Final Run PR no longer matches its saved write identity")
-            # The default branch may advance. It cannot authorize replacing
-            # the old intent or treating externally edited text as a new prior.
-            narrative = github.read_run_pr_narrative(number)
-            if narrative != target and narrative != intent.get("prior_narrative"):
-                raise GitHubReadError("github_write_outcome_unknown", "Original Final Run PR matches neither its saved prior nor target narrative")
-            retired = retired or live.get("base_sha") != authority["base_sha"]
+            retired = retired or observation.base_sha != authority["base_sha"]
         previous = dict(publication)
         if retired or (number is not None and publication.get("pr_number") is None):
             if number is not None:
