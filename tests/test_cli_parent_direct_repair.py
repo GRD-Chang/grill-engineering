@@ -16,24 +16,30 @@ from support.published_run import prepare_accepted_run
 from support.workspace import managed_repo
 
 
+@pytest.mark.parametrize("failure", ["permission", "lost_response"])
 def test_parent_repair_run_branch_permission_resume_reuses_saved_results(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
     fixture, _ = prepare_accepted_run(
         git_repo, delivery={"required_checks": ["fail", "pass"]},
     )
     agents = _resume_repair_agents(git_repo / "agents.json", expected_thread_id=None)
 
-    def deny_write(
+    publish_branch = FixtureGitHubPublisher.publish_branch
+
+    def interrupt_write(
         self: FixtureGitHubPublisher, branch: str, head_sha: str,
         *, expected_remote_sha: str,
     ) -> Any:
-        raise GitHubReadError("github_forbidden", "Run Branch rules denied this write")
+        if failure == "permission":
+            raise GitHubReadError("github_forbidden", "Run Branch rules denied this write")
+        publish_branch(self, branch, head_sha, expected_remote_sha=expected_remote_sha)
+        raise OSError("push response lost")
 
     # The public CLI fixture Executor forks, preserving the controllable
     # external boundary. The resume below uses a fresh real CLI process.
     with monkeypatch.context() as scoped:
-        scoped.setattr(FixtureGitHubPublisher, "publish_branch", deny_write)
+        scoped.setattr(FixtureGitHubPublisher, "publish_branch", interrupt_write)
         rejected = invoke_cli_inprocess(
             git_repo, fixture, "run", "1", "--agent-fixture", str(agents), "--json",
         )
@@ -42,7 +48,19 @@ def test_parent_repair_run_branch_permission_resume_reuses_saved_results(
     assert paused["status"] == "ready_for_human"
     job = paused["run_acceptance"]["repair_job"]
     assert job["blocked_reason"] == "run_branch_write_failed"
-    assert paused["diagnostics"][0]["message"] == "Run Branch rules denied this write"
+    assert paused["diagnostics"][0]["message"] == (
+        "Run Branch rules denied this write" if failure == "permission" else "push response lost"
+    )
+    assert job["pause_resume_phase"] == "accepted"
+    for command in ("status", "history"):
+        queried = invoke_cli_inprocess(git_repo, fixture, command, str(paused["run_id"]), "--json")
+        assert queried.returncode == 0, queried.stdout + queried.stderr
+        actions = stdout_json(queried)["operator_actions"]
+        repair_action = next(action for action in actions if action["location"] == "run_repair")
+        assert repair_action["phase"] == "accepted"
+        assert repair_action["role"] is None
+        assert repair_action["reason"] == "run_branch_write_failed"
+    assert load_only_run_state(git_repo) == paused
     checkout = Path(job["repair_checkout"])
     assert checkout.exists()
     assert (checkout / "run-repair.txt").read_text(encoding="utf-8") == "recovered\n"
@@ -52,7 +70,9 @@ def test_parent_repair_run_branch_permission_resume_reuses_saved_results(
     git = GitRepository(managed_repo(git_repo))
     assert git.resolve(paused["run_branch"]) == job["base_sha"]
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
-    assert delivery["published_branches"][paused["run_branch"]] == job["base_sha"]
+    assert delivery["published_branches"][paused["run_branch"]] == (
+        job["base_sha"] if failure == "permission" else candidate
+    )
     repair_invocations = [
         invocation for invocation in paused["agent_invocation_history"]
         if invocation.get("work_subject") == f"run-repair:{paused['run_id']}"

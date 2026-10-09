@@ -10,12 +10,14 @@ from agent_run.controller import Controller
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.operator_action_facts import operator_action_facts
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.work_facts import work_phase
 from support.run_agents import ScriptedRunAgents
 from support.run_scenarios import _completed_run
 
 
-@pytest.mark.parametrize("failure", ["permission", "lost_response"])
+@pytest.mark.parametrize("failure", ["permission", "lost_response", "read_before", "read_after"])
 def test_parent_repair_write_reloads_and_reconciles_without_repeating_agents(
     git_repo: Path, failure: str,
 ) -> None:
@@ -30,9 +32,21 @@ def test_parent_repair_write_reloads_and_reconciles_without_repeating_agents(
         writes = 0
         interrupted = False
 
+        def live_branch_heads(self, branch: str, base_branch: str) -> tuple[str | None, str]:
+            saved = states.load_current_run(str(state["run_id"]))
+            saved_job = (saved or {}).get("run_acceptance", {}).get("repair_job", {})
+            intent = saved_job.get("run_branch_write_intent")
+            if isinstance(intent, dict) and not self.interrupted and (
+                (failure == "read_before" and self.writes == 0)
+                or (failure == "read_after" and self.writes == 1)
+            ):
+                self.interrupted = True
+                raise OSError("Run Branch readback unavailable")
+            return super().live_branch_heads(branch, base_branch)
+
         def publish_branch(self, branch: str, head_sha: str, *, expected_remote_sha: str) -> Any:
             self.writes += 1
-            if not self.interrupted:
+            if not self.interrupted and failure in {"permission", "lost_response"}:
                 self.interrupted = True
                 if failure == "permission":
                     raise GitError("repository rule rejects Run Branch updates")
@@ -51,6 +65,14 @@ def test_parent_repair_write_reloads_and_reconciles_without_repeating_agents(
     assert blocked["status"] == "ready_for_human"
     job = blocked["run_acceptance"]["repair_job"]
     assert job["blocked_reason"] == "run_branch_write_failed"
+    loaded = states.load_current_run(str(state["run_id"]))
+    assert loaded is not None
+    retained_job = loaded["run_acceptance"]["repair_job"]
+    assert retained_job["pause_resume_phase"] == "accepted"
+    assert work_phase(retained_job) == "accepted"
+    action = next(item for item in operator_action_facts(loaded) if item["location"] == "run_repair")
+    assert action["phase"] == "accepted"
+    assert action["role"] is None
     intent = dict(job["run_branch_write_intent"])
     assert intent["base_sha"] == old_head
     assert Path(job["repair_checkout"]).exists()
@@ -60,6 +82,7 @@ def test_parent_repair_write_reloads_and_reconciles_without_repeating_agents(
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     resumed, _changed = controller.resume(str(state["run_id"]), explicit_resume=True)
     assert resumed["run_acceptance"]["repair_job"]["run_branch_write_intent"] == intent
+    assert resumed["run_acceptance"]["repair_job"]["phase"] == action["phase"]
     result = engine.accept(str(state["run_id"]))
     assert result["status"] == "run_publication_pending"
     assert result["run_acceptance"]["integration_resync"]["used"] == 0

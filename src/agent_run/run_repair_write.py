@@ -96,7 +96,12 @@ def update_run_branch(
             if result.returncode != 0:
                 raise GitError(result.stderr.strip() or "Run Branch local compare-and-swap failed")
     except (GitError, GitHubReadError, OSError, TimeoutError) as error:
-        job.update({"phase": "blocked", "blocked_reason": "run_branch_write_failed"})
+        # The reviewed Candidate still awaits deterministic write/readback.
+        # Retain that stage for the shared status/history/resume projection.
+        job.update({
+            "phase": "blocked", "pause_resume_phase": "accepted",
+            "blocked_reason": "run_branch_write_failed",
+        })
         state.update({
             "status": "ready_for_human", "terminal_kind": "waiting_human",
             "diagnostics": [{"code": "run_branch_write_failed", "message": str(error)}],
