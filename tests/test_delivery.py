@@ -23,6 +23,8 @@ from agent_run.agents import (
     ReviewResult,
 )
 from agent_run.branch_publication import RemoteBranchChanged, RemoteBranchObservation
+from agent_run.agent_execution import execute_agent_work
+from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.agent_invocation import (
     canonical_fingerprint,
     select_publication_thread,
@@ -288,20 +290,24 @@ def test_change_publication_invocation_binds_subject_generation_and_currentness(
     )
     request = {"acceptance_scope": "test", "_callback": object()}
 
-    semantic_attempt = {
-        "attempt_id": "semantic-attempt",
-        "role": "publication",
-    }
-    event = engine._invocation_events(
-        state,
-        job,
-        request,
-        phase="publication",
-        semantic_attempt=semantic_attempt,
+    state["prompt_resources"] = {}
+    semantic_attempt = allocate_semantic_attempt(
+        job, role="publication", work_subject=work_subject, generation=generation,
+        currentness_boundary=engine._invocation_boundary(job), ordinal=1,
     )
-    event("started", requested_thread_id=None, attempt_count=0)
-    event("thread_started", reported_thread_id="publication-thread", attempt_count=1)
-    event("completed", reported_thread_id="publication-thread", attempt_count=1)
+
+    def publication(request: dict[str, Any]) -> dict[str, Any]:
+        event = request["_invocation_event"]
+        event("started", requested_thread_id=None, attempt_count=0)
+        event("thread_started", reported_thread_id="publication-thread", attempt_count=1)
+        event("completed", reported_thread_id="publication-thread", attempt_count=1)
+        return {"commit_message": "feat: deliver", "pr_title": "Deliver work", "pr_body_markdown": "完成当前需求。"}
+
+    execute_agent_work(
+        state, job, request, semantic_attempt, agents=SimpleNamespace(publication=publication),
+        save=engine.save, phase="publication", boundary=engine._invocation_boundary(job),
+        is_current=lambda: True,
+    )
 
     invocation = state["active_agent_invocation"]
     assert invocation["work_subject"] == work_subject

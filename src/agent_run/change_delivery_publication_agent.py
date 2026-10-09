@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
 
 from agent_run.agents import HumanBlockerResult, PublicationResult
-from agent_run.agent_invocation import invocation_event_recorder
+from agent_run.agent_execution import execute_agent_work
 from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
-from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.publication_evidence import publication_is_current
 from agent_run.git_publication_commit import observe_publication_commit
@@ -116,24 +115,16 @@ def publication(
             )
         stage.save(state)
         request = stage.adapter.publication_request(state, job, checkout)
-        request["_prompt_resources"] = state["prompt_resources"]
-        request["_invocation_event"] = stage._invocation_events(
-            state,
-            job,
-            request,
-            role="publication",
-            phase="publication",
-            semantic_attempt=semantic_attempt,
-        )
-        request["_currentness_check"] = lambda: stage._publication_is_current(
-            state, job
-        )
-        if job.get("publication_new_thread") is True:
-            request["_invocation_mode"] = "new-thread"
-        elif job.get("publication_failure_resume") is True:
-            request["_invocation_mode"] = "resume"
         try:
-            raw = stage.agents.publication(request)
+            raw = cast(
+                PublicationResult | HumanBlockerResult | dict[str, Any],
+                execute_agent_work(
+                    state, job, request, semantic_attempt,
+                    agents=stage.agents, save=stage.save, phase="publication",
+                    boundary=stage._invocation_boundary(job),
+                    is_current=lambda: stage._publication_is_current(state, job),
+                ),
+            )
         finally:
             stage.release_agent_work()
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
@@ -237,33 +228,6 @@ def publication(
     stage.save(state)
     stage._reject_stale(
         state, job, checkout, "Publication was discarded after requirements changed"
-    )
-
-
-def invocation_events(
-    stage: ChangeDeliveryStage,
-    state: dict[str, Any],
-    job: dict[str, Any],
-    request: dict[str, Any],
-    *,
-    role: str = "publication",
-    phase: str,
-    semantic_attempt: dict[str, Any],
-) -> Callable[..., None]:
-    work_subject, generation = stage.adapter.invocation_identity(state, job)
-    boundary = stage._invocation_boundary(job)
-    invocation_deadline_seconds = invocation_deadline_for_state(state, role)
-    return invocation_event_recorder(
-        state,
-        role=role,
-        phase=phase,
-        work_subject=work_subject,
-        generation=generation,
-        invocation_input=request,
-        currentness_boundary=boundary,
-        semantic_attempt=semantic_attempt,
-        save=stage.save,
-        invocation_deadline_seconds=invocation_deadline_seconds,
     )
 
 

@@ -1,12 +1,11 @@
 """Small conflict-call fixture: real Controller, resolver, recorder and StateStore."""
 from __future__ import annotations
 
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent_run.change_delivery_publication_agent import invocation_boundary, invocation_events
+from agent_run.change_delivery_publication_agent import invocation_boundary
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import Controller
@@ -85,6 +84,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         job = common
         job.update(repair_generation=1, repair_mode="squash", policy_snapshot=dict(state["policy_snapshot"]))
         state["run_acceptance"] = dict(phase="repairing", repair_job=job,
+            reviewer_thread_ids=[], development_thread_history=[],
             policy_snapshot=dict(state["policy_snapshot"]),
             **budgets,
             repair_integration_budgets={"1": {"policy_snapshot": dict(state["policy_snapshot"])}})
@@ -113,7 +113,6 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
                             is_ancestor=lambda *args: True, resolve=git.resolve,
                             integrate_remote_heads=lambda *args, **kwargs: SimpleNamespace(status="clean", head_sha=base)),
     )
-    stage._invocation_events = partial(invocation_events, stage)
     stage.conflict_key = key
     stage.kind = kind
     stage.save(state)

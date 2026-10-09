@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，共同 Agent 执行、固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次共同执行、预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 
@@ -28,7 +28,7 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 
 **Retained Work（保留的当前工作）**:
 暂停条件与业务进度分别解释：现有 `human_blocker_phase`、`execution_resume_phase`、`pause_resume_phase` 保存继续阶段，`blocked_reason` 与原始证据保存人工门禁；Job 的暂停阶段是调度边界，不能代替继续阶段。`pending_semantic_attempt` 与集成现场保存实际角色、用途、Generation 和工作身份，Invocation 保存 Thread 与执行事实。`work_facts` 从这些权威记录派生继续阶段、角色与身份，供 resume、status/history 共同使用，不另存展示状态或第二套工作状态机。
-完整 Parent 集成 Development 虽保存在 `run_acceptance`，实际身份是 `run-integration:<run_id>`；新线程和 message 作用于原 Development 工作及 Generation，不变成 Reviewer 调用、正式需求或批准。已保存开发结果先由程序集成检查、提交与对账消费；未知外部写入保持原意图，不能由新线程请求推定未发生。各 Ticket 独立保留成果和人工门禁，active 只选择当前对象。
+完整 Parent 集成 Development 虽保存在 `run_acceptance`，实际身份是 `run-integration:<run_id>`；新线程和 message 作用于原 Development 工作及 Generation，不变成 Reviewer 调用、正式需求或批准。`agent_execution` 共用会话准备、Invocation 关联、角色调用与返回保存；返回在当前 Semantic Attempt 的 `returned_result` 中先持久化，阶段再消费角色产物并决定业务后继。成功返回在重载、`--new-thread` 和后续远端读取失败后仍复用；Human Blocker 返回仅在明确人工继续时清除，保留同一 Attempt、用途和 Generation。完成归档去掉返回缓存，沿用角色产物和有界历史。已保存开发结果先由程序集成检查、提交与对账消费；未知外部写入保持原意图，不能由新线程请求推定未发生。各 Ticket 独立保留成果和人工门禁，active 只选择当前对象。
 _Avoid_: 按存储容器选角色、以 blocked 丢失继续阶段、重复调用已返回结果的 Agent、以 message 放行其他对象
 
 **Review Context（审核上下文）**:

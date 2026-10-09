@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from agent_run.agent_invocation import invocation_event_recorder
-from agent_run.agents import HumanBlockerResult
+from agent_run.agent_execution import execute_agent_work, select_development_thread
+from agent_run.agents import DevelopmentResult, HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker, record_human_blocker
 from agent_run.change_delivery_threads import (
     record_development_thread,
     require_development_thread,
-    select_development_thread,
 )
 from agent_run.human_responses import current_human_response_history
 from agent_run.review_budget import can_start_development, ensure_budget, mark_development
@@ -79,19 +78,7 @@ def resolve_run_integration_work(
             "thread_id": run.get("development_thread_id"),
             "human_response_history": current_human_response_history(run, generation=int(run["acceptance_generation"])),
             "prior_human_blockers": run.get("prior_human_blockers", []),
-            "_prompt_resources": state["prompt_resources"],
         }
-        request["_invocation_event"] = invocation_event_recorder(
-            state,
-            role="development",
-            phase="run_integration_conflict",
-            work_subject=f"run-integration:{state['run_id']}",
-            generation=int(run["acceptance_generation"]),
-            invocation_input=request,
-            currentness_boundary=boundary,
-            semantic_attempt=semantic,
-            save=owner._save,
-        )
         completions = ticket_completion_records(state)
         github = owner.github
         assert github is not None
@@ -115,14 +102,10 @@ def resolve_run_integration_work(
                 and ticket_completion_records(state) == completions
             )
 
-        request["_currentness_check"] = scene_is_current
-        if run.get("development_new_thread") is True:
-            request["thread_id"] = None
-            request["_invocation_mode"] = "new-thread"
-        elif run.get("development_failure_resume") is True:
-            request["_invocation_mode"] = "resume"
-        owner._save(state)
-        result = owner.agents.develop(request)
+        result = cast(DevelopmentResult | HumanBlockerResult, execute_agent_work(
+            state, run, request, semantic, agents=owner.agents, save=owner._save,
+            phase="run_integration_conflict", boundary=boundary, is_current=scene_is_current,
+        ))
         require_development_thread(
             run, result.thread_id, requested_thread=request.get("thread_id")
         )
@@ -140,7 +123,7 @@ def resolve_run_integration_work(
         if not result.summary.strip():
             _pause(owner, state, run, "integration_conflict_unresolved", "Conflict Agent returned no result")
             return False
-        if not request["_currentness_check"]():
+        if not scene_is_current():
             _pause(owner, state, run, "run_integration_failed", "Run integration work no longer matches the recorded requirements or source/target")
             return False
         conflict["development_summary"] = result.summary

@@ -62,7 +62,6 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
         mark_development_attempt=lambda state, job, *, attempt_kind: mark_development(job, TICKET_POLICY, attempt_kind=attempt_kind),
         review_budget_policy=lambda: TICKET_POLICY,
         _reject_stale=lambda *args: None, _invocation_boundary=lambda job: {"base_sha": "base"},
-        _invocation_events=lambda *args, **kwargs: lambda *args, **kwargs: None,
         _agent_is_current=lambda *args: True, save=lambda state: saved.append(deepcopy(job)),
         release_agent_work=lambda: None,
     )
@@ -76,11 +75,14 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
     assert first_attempt["budget_window"] == (2 if source == "new_budget_window" else 1)
     assert first_budget["development_attempts"] == (4 if source == "final_ci_fix" else 1 if source == "new_budget_window" else 2)
     assert first_budget["final_ci_fix_used"] is (source == "final_ci_fix")
-    # Simulate re-entry with the persisted pending allocation, before closeout.
+    # Re-entry after a returned result continues closeout without new Agent work.
     job.update(deepcopy(saved[-1]))
     job["phase"] = "repairing"
     develop(stage, state, job, tmp_path)
-    assert requests[1]["thread_id"] == "new"
+    assert len(requests) == 1
+    assert job["development_thread_id"] == "new"
+    assert job["development_summary"] == "Work retained"
+    assert (tmp_path / "uncommitted.txt").read_text() == "existing work"
     assert job["pending_semantic_attempt"] == first_attempt
     assert job["review_budget"] == first_budget
     assert job["candidate_sha"] == "candidate"

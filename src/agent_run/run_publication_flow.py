@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, cast
 
-from agent_run.agent_invocation import (
-    fail_interrupted_invocation,
-    invocation_event_recorder,
-)
+from agent_run.agent_invocation import fail_interrupted_invocation
+from agent_run.agent_execution import execute_agent_work
 from agent_run.artifacts import (
     PublicationArtifact,
     append_human_blocker_history,
@@ -14,7 +12,6 @@ from agent_run.artifacts import (
 )
 from agent_run.change_delivery import ensure_linked_branch_display
 from agent_run.branch_publication import RemoteBranchChanged
-from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.delivery_step import DeliveryStep, DeliveryStepKind
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
@@ -150,6 +147,9 @@ class RunPublicationFlow(RunPublicationShared):
         if publication["phase"] == "publishing":
             if (
                 not isinstance(publication.get("artifact"), dict)
+                and not isinstance(
+                    publication.get("pending_semantic_attempt", {}).get("returned_result"), dict
+                )
                 and fail_interrupted_invocation(
                     state, role="final_publication", save=self._save
                 )
@@ -158,6 +158,16 @@ class RunPublicationFlow(RunPublicationShared):
             publication["phase"] = "pending"
         if not self._acceptance_is_current(state, run):
             return self._step(self._invalidate_for_fresh_acceptance(state))
+        # A remote read can fail between the durable Agent return and Artifact
+        # closeout. Resume that closeout before entering the PR operation path.
+        if (
+            publication["phase"] == "waiting_external"
+            and not isinstance(publication.get("artifact"), dict)
+            and isinstance(
+                publication.get("pending_semantic_attempt", {}).get("returned_result"), dict
+            )
+        ):
+            publication["phase"] = "pending"
         if isinstance(publication.get("artifact"), dict) and not self._publication_result_is_current(state):
             if not reconcile_run_pr_write(
                 state, self.github, self._save,
@@ -480,22 +490,18 @@ class RunPublicationFlow(RunPublicationShared):
                 head_sha=self.git.resolve(str(state["run_branch"])), checkout=checkout
             )
             request = self._publication_request(state, checkout)
-            request["_prompt_resources"] = state["prompt_resources"]
-            request["_invocation_event"] = self._invocation_events(
-                state, request, semantic_attempt
-            )
-            request["_currentness_check"] = lambda: (
+            is_current = lambda: (
                 self._refresh_currentness(state)
                 and self._acceptance_is_current(
                     state, self._mapping(state, "run_acceptance")
                 )
             )
-            if publication.get("publication_new_thread") is True:
-                request["_invocation_mode"] = "new-thread"
-            elif publication.get("publication_failure_resume") is True:
-                request["_invocation_mode"] = "resume"
             try:
-                raw = self.agents.run_publication(request)
+                raw = cast(dict[str, Any], execute_agent_work(
+                    state, publication, request, semantic_attempt,
+                    agents=self.agents, save=self._save, phase="run_publication",
+                    boundary=self._publication_boundary(state), is_current=is_current,
+                ))
             except InitialCredentialUnavailable as error:
                 # No final-publication Worker started, so this does not spend
                 # a publication attempt or turn an availability outage into
@@ -574,30 +580,6 @@ class RunPublicationFlow(RunPublicationShared):
         finally:
             self.git.remove_worktree(checkout)
             self._remove_empty_directories(checkout)
-
-    def _invocation_events(
-        self,
-        state: dict[str, Any],
-        request: dict[str, Any],
-        semantic_attempt: dict[str, Any],
-    ) -> Callable[..., None]:
-        run = self._mapping(state, "run_acceptance")
-        acceptance = self._mapping(run, "acceptance_record")
-        invocation_deadline_seconds = invocation_deadline_for_state(
-            state, "final_publication"
-        )
-        return invocation_event_recorder(
-            state,
-            role="final_publication",
-            phase="run_publication",
-            work_subject=f"run-publication:{state['run_id']}",
-            generation=int(run.get("acceptance_generation", 1)),
-            invocation_input=request,
-            currentness_boundary=self._publication_boundary(state),
-            semantic_attempt=semantic_attempt,
-            save=self._save,
-            invocation_deadline_seconds=invocation_deadline_seconds,
-        )
 
     def _publication_boundary(self, state: dict[str, Any]) -> dict[str, Any]:
         run = self._mapping(state, "run_acceptance")

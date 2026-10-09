@@ -49,7 +49,6 @@ def _stage(job: dict[str, Any], develop: Any, *, fail_checks: bool) -> Any:
         ),
         contract=SimpleNamespace(label="parent-only"), require_agent_work=lambda role: None,
         release_agent_work=lambda: None, _invocation_boundary=lambda job: {},
-        _invocation_events=lambda *args, **kwargs: lambda *args, **kwargs: None,
         _agent_is_current=lambda state, job: True, _reject_stale=lambda *args: None,
         _block=lambda state, job, code, message: job.update(blocked_reason=code),
     )

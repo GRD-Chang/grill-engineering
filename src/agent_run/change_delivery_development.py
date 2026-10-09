@@ -3,12 +3,13 @@ from __future__ import annotations
 """Development and Candidate commit stage for Change Delivery."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from agent_run.delivery_budget import delivery_budget_owner
 
-from agent_run.agents import HumanBlockerResult
+from agent_run.agents import DevelopmentResult, HumanBlockerResult
+from agent_run.agent_execution import execute_agent_work, select_development_thread
 from agent_run.artifacts import AcceptanceArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.ci_recovery_budget import (
@@ -22,7 +23,6 @@ from agent_run.change_delivery_fallback import (
 )
 from agent_run.change_delivery_threads import (
     record_development_thread as _record_development_thread,
-    select_development_thread,
     require_development_thread,
 )
 from agent_run.credential_availability import (
@@ -127,7 +127,6 @@ def develop(
         request["work_source"] = "ci"
         request["ci_evidence"] = job.get("ci_evidence")
         request["ci_failure_context"] = job.get("required_checks_origin")
-    request["_prompt_resources"] = state["prompt_resources"]
     if request.get("repair_source") is not None and attempt_kind != "integration":
         if attempt_kind == "ci_repair" and (
             not stage.contract.label.startswith("ticket-")
@@ -143,21 +142,16 @@ def develop(
             request["review_budget_context"] = repair_budget_context(
                 delivery_budget_owner(state, job), stage.review_budget_policy()
             )
-    request["_invocation_event"] = stage._invocation_events(
-        state,
-        job,
-        request,
-        role="development",
-        phase=str(job["phase"]),
-        semantic_attempt=semantic_attempt,
-    )
-    request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
-    if job.get("development_new_thread") is True:
-        request["_invocation_mode"] = "new-thread"
-    elif job.get("development_failure_resume") is True:
-        request["_invocation_mode"] = "resume"
     try:
-        result = stage.agents.develop(request)
+        result = cast(
+            DevelopmentResult | HumanBlockerResult,
+            execute_agent_work(
+                state, job, request, semantic_attempt,
+                agents=stage.agents, save=stage.save, phase=str(job["phase"]),
+                boundary=stage._invocation_boundary(job),
+                is_current=lambda: stage._agent_is_current(state, job),
+            ),
+        )
     finally:
         stage.release_agent_work()
     require_development_thread(

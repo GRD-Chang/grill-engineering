@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_run.delivery_budget import delivery_budget_owner, repair_integration_budget_owner
 
-from agent_run.agents import HumanBlockerResult
+from agent_run.agents import DevelopmentResult, HumanBlockerResult
+from agent_run.agent_execution import execute_agent_work, select_development_thread
 from agent_run.artifacts import clear_current_human_blocker
 from agent_run.change_delivery_threads import (
     record_development_thread,
     require_development_thread,
-    select_development_thread,
 )
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.git import GitError
@@ -305,7 +305,7 @@ def resolve_parent_conflict(
         }
     # Select this invocation's evidence before the adapter reads historical repair input.
     request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
-    request.update({**conflict_input, "_prompt_resources": state["prompt_resources"]})
+    request.update(conflict_input)
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     if attempt is None:
         ordinal_key = f"{record_key}_conflict_ordinal"
@@ -323,18 +323,13 @@ def resolve_parent_conflict(
         budget_owner=delivery_budget_owner(state, job),
         budget_window=int(delivery_budget_owner(state, job)["review_budget"]["window"]),
     )
-    request["_invocation_event"] = stage._invocation_events(
-        state, job, request, role="development", phase="integration_conflict",
-        semantic_attempt=attempt,
-    )
-    request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
-    if job.get("development_new_thread") is True:
-        request["_invocation_mode"] = "new-thread"
-    elif job.get("development_failure_resume") is True:
-        request["_invocation_mode"] = "resume"
     stage.save(state)
     if "development_summary" not in conflict:
-        result = stage.agents.develop(request)
+        result = cast(DevelopmentResult | HumanBlockerResult, execute_agent_work(
+                state, job, request, attempt, agents=stage.agents, save=stage.save,
+                phase="integration_conflict", boundary=stage._invocation_boundary(job),
+                is_current=lambda: stage._agent_is_current(state, job),
+            ))
         require_development_thread(job, result.thread_id, requested_thread=request.get("thread_id"))
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
         record_development_thread(job, result.thread_id, result.replaced_thread_id)

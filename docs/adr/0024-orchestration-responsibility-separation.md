@@ -20,4 +20,13 @@ Review Context 的准备与返回结论绑定由共同职责处理。上下文�
 
 本轮集中已有错误处理、Agent 修复、程序等待/对账、暂停与恢复规则，并修正已确认的执行不一致；不扩大 Agent 自动调查范围，不新增普通提交、部分 Parent fetch 或发布操作失败后的 Development 调查流程。相关权限、材料或外部条件问题继续通过现有暂停与人工 resume 处理。这项范围限制使共同机制的深化与新增修复能力分别验收。
 
-这是一项已确认的目标设计；固定预算归属已实施，其余职责深化尚未完成。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。
+这是一项已确认的目标设计；共同 Agent 执行、固定预算归属与 Review Context 已实施，确定操作与内部 Repair PR 的剩余职责深化由后续切片完成。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。
+
+
+## 共同 Agent 执行的实现边界
+
+`agent_execution.py` 集中开发会话轮换、角色续接模式、Invocation 与现有 Semantic Attempt 的关联、角色调用及返回持久化。阶段只提供当前业务输入、准确 Attempt/边界与 currentness 核验；业务额度、角色交付物消费、Git/PR 操作及后继选择仍归阶段。Change 的普通开发、CI 与集成 Development、Review/Publish，以及完整 Run 的集成 Development、Review/Publish 均经过此边界；Run Repair 仍使用 Change 角色的会话规则。
+
+返回保存在 pending Attempt 的 `returned_result`，经角色 schema 校验后先保存，再交回阶段。成功返回可在阶段结果保存、提交或发布前中断后重载消费；currentness 失效仍走原失效路径，不以缓存放行漂移现场。Human Blocker 与 blocked Review 返回先保存，明确人工继续时清除这份阻塞返回，以同一 Attempt 接收后续答复。完成 Attempt 不归档该缓存，避免长期重复保存 Artifact。status/resume 从同一事实区分已返回的程序收口与仍需 Agent 答复的工作，不新增持久工作状态机。
+
+这一实现参考 [Temporal Tasks 的结果重放边界](https://docs.temporal.io/tasks)：已经记录的非确定执行结果在恢复时直接消费。这里只使用既有 StateStore 和 Semantic Attempt 保存单次返回，不引入 Temporal、事件溯源或通用事务框架；现有 Backend 的格式修复、有界调用恢复与执行所有权保持。

@@ -79,6 +79,7 @@ from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_a
 from agent_run.resume_intent import is_ticket_execution_recovery, resume_pause_state
 from agent_run.publication_operation_retry import require_publication_operation_retry
 from agent_run.scope_changes import reconcile_structure
+from agent_run.agent_return import clear_blocked_agent_return
 from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
@@ -1711,6 +1712,7 @@ def _resume_agent_human_blocker(
                 "prior_human_blockers": blockers,
             }
         )
+        clear_blocked_agent_return(acceptance)
         acceptance.pop("blocked_reason", None)
         state.update(
             {
@@ -1734,6 +1736,7 @@ def _resume_agent_human_blocker(
             human_response,
             generation=_publication_generation(state),
         )
+        clear_blocked_agent_return(publication)
         publication.pop("blocked_reason", None)
         state.update(
             {
@@ -2426,6 +2429,15 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
     if not isinstance(invocation, dict):
         raise ValueError("--new-thread requires a current Agent Invocation")
+    from agent_run.agent_return import agent_return_requires_human
+    from agent_run.semantic_attempt import semantic_attempt_subjects
+    bound = invocation.get("semantic_attempt")
+    for owner in semantic_attempt_subjects(state):
+        pending = owner.get("pending_semantic_attempt")
+        if isinstance(pending, dict) and isinstance(bound, dict) and pending.get("attempt_id") == bound.get("attempt_id"):
+            returned = pending.get("returned_result")
+            if isinstance(returned, dict) and not agent_return_requires_human(returned):
+                return  # A saved response retains its original Thread for closeout.
     role = invocation.get("role")
     if role == "reviewer":
         run = _run_acceptance_for_invocation(state, invocation)
@@ -2897,6 +2909,7 @@ def _resume_change_job_owner(
         value["review_human_blocker_resume"] = True
     else:
         value.pop("review_human_blocker_resume", None)
+    clear_blocked_agent_return(value)
     value.pop("blocked_reason", None)
 
 

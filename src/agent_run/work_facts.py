@@ -35,6 +35,11 @@ def work_role(subject: dict[str, Any], *, location: str | None = None) -> str | 
     scene = integration_scene(subject)
     attempt = subject.get("pending_semantic_attempt")
     if isinstance(attempt, dict) and attempt.get("status") == "pending":
+        returned = attempt.get("returned_result")
+        if isinstance(returned, dict):
+            from agent_run.agent_return import agent_return_requires_human
+            if not agent_return_requires_human(returned):
+                return None
         role = attempt.get("role")
         if role == "development" and scene is not None and scene.get("development_summary"):
             return None

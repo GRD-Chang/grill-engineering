@@ -87,7 +87,6 @@ from agent_run.change_delivery_fallback import (
 )
 from agent_run.change_delivery_publication_agent import (
     invocation_boundary,
-    invocation_events,
     invocation_identity,
     publication,
 )
@@ -482,26 +481,6 @@ class ChangeDeliveryEngine:
             candidate_tree=candidate_tree,
             location=self.contract.label.replace("ticket-", "ticket_jobs[", 1)
             + "]",
-        )
-
-    def _invocation_events(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        request: dict[str, Any],
-        *,
-        role: str = "publication",
-        phase: str,
-        semantic_attempt: dict[str, Any],
-    ) -> Callable[..., None]:
-        return invocation_events(
-            self,
-            state,
-            job,
-            request,
-            role=role,
-            phase=phase,
-            semantic_attempt=semantic_attempt,
         )
 
     def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]:

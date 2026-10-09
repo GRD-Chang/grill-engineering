@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from agent_run.models import same_repository
-from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
 
@@ -394,13 +394,13 @@ def _append_timeline_event(
 ) -> None:
     marker = _timeline_marker(state)
     marker.update(checks_timeline_facts(state, marker))
-    marker.update(_execution_timeline_projection(state))
+    marker.update(_execution_timeline_projection(state, marker))
     marker["result"] = _timeline_result(state)
     previous_marker: dict[str, object] | None = None
     if previous is not None:
         previous_marker = _timeline_marker(previous)
         previous_marker.update(checks_timeline_facts(previous, previous_marker))
-        previous_marker.update(_execution_timeline_projection(previous))
+        previous_marker.update(_execution_timeline_projection(previous, previous_marker))
         previous_marker["result"] = _timeline_result(previous)
         if marker == previous_marker:
             return
@@ -522,29 +522,37 @@ def _timeline_event(
     return event
 
 
-def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
-    """Project independent Agent counters without storing unbounded payloads."""
-
+def _execution_timeline_projection(
+    state: dict[str, Any], marker: dict[str, object],
+) -> dict[str, object]:
+    """Project counters for the same work owner as the timeline marker."""
     projection: dict[str, object] = {}
+    subject_key = {
+        "ticket_phase": "active_ticket_job", "parent_phase": "parent_job",
+        "run_acceptance": "run_acceptance", "run_publication": "run_publication",
+    }.get(str(marker.get("kind")))
+    subject = state.get(subject_key) if subject_key is not None else None
+    if (marker.get("kind") == "run_acceptance" and isinstance(subject, dict)
+            and isinstance(subject.get("repair_job"), dict)):
+        subject = subject["repair_job"]
+    pending = subject.get("pending_semantic_attempt") if isinstance(subject, dict) else None
+    attempt = pending if isinstance(pending, dict) else None
     invocation = state.get("active_agent_invocation")
-    invocation_attempt = (
-        invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    bound = invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    if marker.get("kind") == "run_status" and isinstance(bound, dict):
+        # Transitional Run statuses have no stage owner in their marker.
+        # Keep the actual Invocation continuation without mixing stage facts.
+        subject = next((owner for owner in semantic_attempt_subjects(state)
+                        if isinstance(owner.get("pending_semantic_attempt"), dict)
+                        and owner["pending_semantic_attempt"].get("attempt_id") == bound.get("attempt_id")), None)
+        attempt = subject["pending_semantic_attempt"] if subject is not None else bound
+    invocation_matches = (
+        attempt is not None and isinstance(bound, dict) and isinstance(invocation, dict)
+        and isinstance(attempt.get("attempt_id"), str)
+        and bound.get("attempt_id") == attempt["attempt_id"]
+        and bound.get("work_subject") == attempt.get("work_subject")
+        and invocation.get("work_subject", bound.get("work_subject")) == attempt.get("work_subject")
     )
-    attempt = invocation_attempt if isinstance(invocation_attempt, dict) else None
-    subjects = semantic_attempt_subjects(state)
-    invocation_attempt_id = attempt.get("attempt_id") if attempt is not None else None
-    selected_subject: dict[str, Any] | None = None
-    for subject in subjects:
-        pending = subject.get("pending_semantic_attempt")
-        if not isinstance(pending, dict):
-            continue
-        if (
-            invocation_attempt_id is None
-            or pending.get("attempt_id") == invocation_attempt_id
-        ):
-            attempt = pending
-            selected_subject = subject
-            break
     if attempt is not None:
         projection.update(
             {
@@ -554,7 +562,7 @@ def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
                 "budget_window": attempt.get("budget_window"),
             }
         )
-    if isinstance(invocation, dict):
+    if invocation_matches and isinstance(invocation, dict):
         projection.update(
             {
                 "agent_invocation_started_at": invocation.get("started_at"),
@@ -562,17 +570,14 @@ def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
                 "output_attempt": invocation.get("attempt_count"),
             }
         )
-    retry_subjects = [selected_subject] if selected_subject is not None else subjects
-    for subject in retry_subjects:
-        retry = subject.get("publication_operation_retry")
-        if isinstance(retry, dict):
-            projection.update(
-                {
-                    "publication_operation_retry_attempts": retry.get("attempts"),
-                    "publication_operation_retry_limit": retry.get("limit"),
-                }
-            )
-            break
+    retry = subject.get("publication_operation_retry") if isinstance(subject, dict) else None
+    if isinstance(retry, dict):
+        projection.update(
+            {
+                "publication_operation_retry_attempts": retry.get("attempts"),
+                "publication_operation_retry_limit": retry.get("limit"),
+            }
+        )
     resume = latest_resume_audit(state)
     if resume is not None:
         projection.update(
@@ -625,15 +630,15 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
         )
     ) and isinstance(publication, dict) and publication_is_current:
         phase = work_phase(publication) or "pending"
-        role = work_role(publication, location="run_publication")
+        role, attempt, thread_id = _history_work_context(state, publication, location="run_publication")
         approval_grant = publication.get("approval_grant")
         required_checks = publication.get("required_checks_evidence")
         return _with_human_blockers({
             "kind": "run_publication",
             "status": status,
             "worker": _worker_name(role, run=True),
-            "attempt": work_attempt(publication, role),
-            "thread_id": _thread_id_for_role(publication, role) if role is not None else None,
+            "attempt": attempt,
+            "thread_id": thread_id,
             "phase": phase,
             "pr_number": publication.get("pr_number"),
             "commit_sha": publication.get("integrated_sha"),
@@ -663,29 +668,33 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
         repair = run_acceptance.get("repair_job")
         subject = repair if isinstance(repair, dict) else run_acceptance
         subject_phase = work_phase(subject) or phase
-        role = work_role(subject, location="run_repair" if isinstance(repair, dict) else "run_acceptance")
+        role, attempt, thread_id = _history_work_context(
+            state, subject, location="run_repair" if isinstance(repair, dict) else "run_acceptance",
+        )
         return _with_human_blockers({
             "kind": "run_acceptance",
             "status": status,
             "worker": _worker_name(role, run=not isinstance(repair, dict)),
-            "attempt": work_attempt(subject, role),
-            "thread_id": _thread_id_for_role(subject, role),
+            "attempt": attempt,
+            "thread_id": thread_id,
             "phase": subject_phase,
             "pr_number": subject.get("pr_number"),
             "commit_sha": subject.get("integrated_sha"),
         }, subject)
     active = state.get("active_ticket_job")
     if isinstance(active, dict):
-        return _job_timeline_marker(active, status)
+        return _job_timeline_marker(state, active, status)
     parent_job = state.get("parent_job")
     if isinstance(parent_job, dict):
-        return _job_timeline_marker(parent_job, status)
+        return _job_timeline_marker(state, parent_job, status)
     return {"kind": "run_status", "status": status}
 
 
-def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
+def _job_timeline_marker(state: dict[str, Any], job: dict[str, Any], status: str) -> dict[str, object]:
     phase = work_phase(job) or "pending"
-    role = work_role(job)
+    role, attempt, thread_id = _history_work_context(
+        state, job, hide_pending_development=job.get("phase") in {"developing", "repairing"},
+    )
     ticket = job.get("ticket_number")
     grant = job.get("approval_grant")
     return _with_human_blockers({
@@ -693,12 +702,8 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         "status": status,
         "ticket": ticket if isinstance(ticket, int) else None,
         "worker": _worker_name(role),
-        "attempt": work_attempt(job, role),
-        "thread_id": _thread_id_for_role(
-            job,
-            role,
-            hide_pending_development=job.get("phase") in {"developing", "repairing"},
-        ),
+        "attempt": attempt,
+        "thread_id": thread_id,
         "phase": phase,
         "pr_number": job.get("pr_number"),
         "approval_granted_at": grant.get("granted_at") if isinstance(grant, dict) else None,
@@ -706,6 +711,55 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         or job.get("publication_sha")
         or job.get("candidate_sha"),
     }, job)
+
+
+def _history_work_context(
+    state: dict[str, Any], subject: dict[str, Any], *,
+    location: str | None = None, hide_pending_development: bool = False,
+) -> tuple[str | None, int | None, object]:
+    """History attributes a saved return to its Agent, even during program closeout."""
+    pending = subject.get("pending_semantic_attempt")
+    if isinstance(pending, dict) and pending.get("status") == "pending":
+        role = pending.get("role")
+        if role in {"development", "reviewer", "publication"}:
+            ordinal = pending.get("ordinal")
+            attempt = ordinal if isinstance(ordinal, int) else work_attempt(subject, role)
+            returned = pending.get("returned_result")
+            if isinstance(returned, dict):
+                thread_id = returned.get("thread_id")
+                artifact = returned.get("artifact")
+                if thread_id is None and isinstance(artifact, dict):
+                    thread_id = artifact.get("_thread_id")
+                if isinstance(thread_id, str):
+                    return role, attempt, thread_id
+            invocation = state.get("active_agent_invocation")
+            if isinstance(invocation, dict):
+                bound = invocation.get("semantic_attempt")
+                if (isinstance(bound, dict) and isinstance(pending.get("attempt_id"), str)
+                        and bound.get("attempt_id") == pending["attempt_id"]
+                        and bound.get("work_subject") == pending.get("work_subject")
+                        and invocation.get("work_subject", bound.get("work_subject")) == pending.get("work_subject")):
+                    thread_id = invocation.get("reported_thread_id") or invocation.get("requested_thread_id")
+                    return role, attempt, thread_id if isinstance(thread_id, str) else None
+            if role == "reviewer":
+                prefix = "reviewer" if location == "run_acceptance" else "review"
+                if subject.get(f"{prefix}_new_thread"):
+                    return role, attempt, None
+                resume_thread = subject.get(f"{prefix}_resume_thread_id")
+                if isinstance(resume_thread, str):
+                    return role, attempt, resume_thread
+                human_resume = (subject.get("prior_human_blockers") if prefix == "reviewer"
+                                else subject.get("review_human_blocker_resume"))
+                if not human_resume:
+                    return role, attempt, None
+            return role, attempt, _thread_id_for_role(
+                subject, role, hide_pending_development=hide_pending_development,
+            )
+    role = work_role(subject, location=location)
+    return role, work_attempt(subject, role), (
+        _thread_id_for_role(subject, role, hide_pending_development=hide_pending_development)
+        if role is not None else None
+    )
 
 
 def _with_human_blockers(

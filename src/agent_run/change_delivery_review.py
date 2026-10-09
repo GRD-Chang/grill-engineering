@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from agent_run.agent_execution import execute_agent_work
+from agent_run.agents import ReviewResult
 from agent_run.delivery_budget import delivery_budget_owner
 
 from agent_run.artifacts import (
@@ -83,7 +85,6 @@ def review(
             request["ci_failure_context"] = deepcopy(job.get("required_checks_origin"))
             request["attempt_kind"] = "ci_repair"
             request["work_source"] = "ci"
-        request["_prompt_resources"] = state["prompt_resources"]
         if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
             request.pop("review_budget_context", None)
         elif job.get("attempt_kind") == "ci_repair":
@@ -101,21 +102,16 @@ def review(
             )
         prepare_review_context(request, semantic_attempt, job, stage.git, state)
         stage.save(state)
-        request["_invocation_event"] = stage._invocation_events(
-            state,
-            job,
-            request,
-            role="fresh_acceptance",
-            phase="reviewing",
-            semantic_attempt=semantic_attempt,
-        )
-        request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
-        if job.get("review_new_thread") is True:
-            request["_invocation_mode"] = "new-thread"
-        elif job.get("review_failure_resume") is True:
-            request["_invocation_mode"] = "resume"
         try:
-            review = stage.agents.review(request)
+            review = cast(
+                ReviewResult,
+                execute_agent_work(
+                    state, job, request, semantic_attempt,
+                    agents=stage.agents, save=stage.save, phase="reviewing",
+                    boundary=stage._invocation_boundary(job),
+                    is_current=lambda: stage._agent_is_current(state, job),
+                ),
+            )
         finally:
             stage.release_agent_work()
     finally:

@@ -2,6 +2,9 @@
 
 状态：2026-09-20 中英文资源及 Run 固定语言合同已同步。
 
+
+三个角色共用调用与返回保存边界。初始开发、CI 修复、集成修复的目标与证据仍由各自的业务输入确定；会话准备不重写任务用途。新线程、同轮继续和人工 message 均保留原角色、Generation、失败版本与原始证据。成功返回后由程序消费原结果继续检查、提交或发布，后续程序操作中断不重新要求 Agent 完成已返回的工作。Human Blocker 的明确人工继续接收后续答复，保持原语义工作身份；它不授权新的需求或其他门禁。此合同对中英文输入相同。
+
 ## 双语资源与个人方法
 
 用户方法正文的权威来源为 `src/agent_run/resources/{zh,en}/`；内部固定文案由代码按职责维护，中英文同用途配对。四份 `methods/*.md`（`development.md`、`repair.md`、`acceptance.md`、`publishing.md`）分别完整定义开发、修复、验收和发布的职责、方法、验证要求与完成标准。个人目录为 `$XDG_CONFIG_HOME/agent-run/prompts/<language>/`（未设置时使用 `~/.config/agent-run/prompts/<language>/`），文件名与内置方法一致，跨项目共用。程序读取完整文件，不按标题或章节路由。

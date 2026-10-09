@@ -50,3 +50,7 @@ History 的原 Review Context、文案 Attempt 与批准事实不随当前证据
 普通 resume/message 不表示批准，待确认的正式写入仍显示原操作并先核验结果。
 
 集成工作中的 `run-integration:<run_id>` 是实际工作身份，`run_acceptance` 是保存位置；人工待办、消息与恢复审计使用实际身份和同一 Generation。Job 暂停阶段与保存的继续阶段分开解释；角色优先读取 pending Attempt，集成结果已保存时进入程序收口，不把它解释为新的开发调用。展示不修改旧历史记录。该解释沿用现有状态字段与协议，不增加旧 Run 迁移或补造缺损材料。
+
+共同执行已保存的 `pending_semantic_attempt.returned_result` 是当前工作事实。成功返回使 `work_role` 投影为程序收口，不再显示需要新的 Agent 调用；Human Blocker/blocked Review 仍显示原角色，明确 resume 清除其返回后继续原 Attempt。展示只读取该事实，不能清除返回、改变预算或放行 currentness。返回缓存不复制到已完成 Attempt 或 Invocation 历史，正式结果继续从原有角色产物取得。
+
+历史阶段事件仍关联实际执行的 Agent：优先从 pending Attempt 读取角色与轮次，Thread 使用其保存的返回或同 Attempt 的 Invocation，再读取角色对应的线程字段。成功返回后的程序收口不会抹去这些历史关联，也不能拿其他角色或其他 Attempt 的线程补齐。

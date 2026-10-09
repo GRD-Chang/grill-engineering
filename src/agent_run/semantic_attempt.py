@@ -264,6 +264,11 @@ def require_semantic_attempt_record(
     }
     if attempt.get("attempt_id") != canonical_fingerprint(identity):
         raise ValueError("Semantic Agent Attempt identity is invalid")
+    if "returned_result" in attempt:
+        if expected_status != "pending":
+            raise ValueError("completed Semantic Attempt retains an Agent return")
+        from agent_run.agent_return import restore_agent_return
+        restore_agent_return(attempt["returned_result"], attempt)
     if expected_status == "completed" and (
         not isinstance(attempt.get("outcome"), str) or not attempt["outcome"]
     ):
@@ -298,6 +303,7 @@ def close_semantic_attempt(
     if pending is None or pending.get("attempt_id") != attempt.get("attempt_id"):
         raise ValueError("Semantic Agent Attempt closeout does not match pending work")
     completed = deepcopy(pending)
+    completed.pop("returned_result", None)
     completed.update({"status": "completed", "outcome": outcome})
     if isinstance(result, dict):
         # Keep only the small, human-facing result facts needed when the

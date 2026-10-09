@@ -30,6 +30,14 @@ def prepare_review_context(
     git: GitRepository, state: dict[str, Any],
 ) -> dict[str, Any]:
     """Freeze facts before dispatch, keeping full scope separate from repair focus."""
+    # A saved return belongs to the already dispatched snapshot. A later
+    # operator message must not retroactively become evidence for that audit.
+    if isinstance(attempt.get("returned_result"), dict):
+        saved = attempt.get("review_context")
+        if not isinstance(saved, dict):
+            raise ValueError("Saved Reviewer return is missing its Review Context")
+        request["review_context"] = deepcopy(saved)
+        return deepcopy(saved)
     facts = deepcopy({key: request[key] for key in _REQUEST_FACTS if key in request})
     if request["acceptance_scope"] == "run":
         for key in ("parent", "ticket_graph"):

@@ -1460,7 +1460,10 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     resumed_job = resumed_run["repair_job"]
     assert resumed_job["repair_generation"] == old_generation
     assert resumed_job["phase"] == "developing"
-    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert "returned_result" not in resumed_job["pending_semantic_attempt"]
+    assert resumed_job["pending_semantic_attempt"] == {
+        key: value for key, value in old_attempt.items() if key != "returned_result"
+    }
     assert resumed_run["review_budget"] == old_budget
     assert resumed_job["development_thread_id"] == "run-repair-development-blocked"
     assert resumed_job["human_response_history"] == [
@@ -1527,7 +1530,10 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert resumed_job["repair_generation"] == old_generation
     assert resumed_job["phase"] == "candidate"
     assert resumed_job["candidate_sha"] == old_candidate
-    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert "returned_result" not in resumed_job["pending_semantic_attempt"]
+    assert resumed_job["pending_semantic_attempt"] == {
+        key: value for key, value in old_attempt.items() if key != "returned_result"
+    }
     assert resumed_run["review_budget"] == old_budget
     assert resumed_job["reviewer_thread_ids"][-1] == "run-reviewer-2"
     assert resumed_job["review_human_blocker_resume"] is True
@@ -1601,7 +1607,10 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     assert resumed_job["repair_generation"] == old_generation
     assert resumed_job["phase"] == "accepted"
     assert resumed_job["candidate_sha"] == old_candidate
-    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert "returned_result" not in resumed_job["pending_semantic_attempt"]
+    assert resumed_job["pending_semantic_attempt"] == {
+        key: value for key, value in old_attempt.items() if key != "returned_result"
+    }
     assert resumed_run["review_budget"] == old_budget
     assert resumed_job["publication_attempts"] == 1
     assert resumed_job["publication_thread_id"] == "run-repair-publication-blocked"

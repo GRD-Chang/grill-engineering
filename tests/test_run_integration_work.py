@@ -471,3 +471,202 @@ def test_internal_repair_base_publication_recovers_lost_response_without_repeat_
     assert "integration_publication_intent" not in completed["run_acceptance"]
     assert len(agents.review_requests) == 2
     assert completed["ticket_jobs"] == state["ticket_jobs"]
+
+
+def test_run_integration_return_is_reused_before_git_closeout(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.state import StateStore, SimulatedProcessCrash
+
+    state, states, git, publisher = _two_ticket_run(git_repo, tmp_path)
+    agents = CsvIntegrationAgents(0)
+    original_save = states.save_run
+    interrupted = False
+
+    def crash_after_return(run_id: str, current: dict[str, Any]) -> None:
+        nonlocal interrupted
+        original_save(run_id, current)
+        attempt = current.get("run_acceptance", {}).get("pending_semantic_attempt", {})
+        if not interrupted and attempt.get("role") == "development" and "returned_result" in attempt:
+            interrupted = True
+            raise SimulatedProcessCrash("interrupt before integration result consumption")
+
+    monkeypatch.setattr(states, "save_run", crash_after_return)
+    with pytest.raises(SimulatedProcessCrash, match="before integration"):
+        RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(state["run_id"])
+    reloaded = StateStore(states.root)
+    saved = reloaded.load_current_run(state["run_id"])
+    run = saved["run_acceptance"]
+    attempt_id = run["pending_semantic_attempt"]["attempt_id"]
+    assert run["pending_semantic_attempt"]["returned_result"]["summary"] == "修复组合成果与 Git 集成检查。"
+    assert "development_summary" not in run["run_integration_conflict"]
+    Controller(FixtureGitHubReader(git_repo / "github.json"), git, reloaded).resume(state["run_id"])
+    result = RunAcceptanceEngine(git=git, states=reloaded, agents=agents, github=publisher).accept(state["run_id"])
+    assert result["status"] == "run_publication_pending"
+    assert agents.events == ["development", "review"]
+    assert result["run_acceptance"]["review_budget"]["development_attempts"] == 1
+    closed = next(item for item in result["run_acceptance"]["semantic_attempt_history"] if item["attempt_id"] == attempt_id)
+    assert closed["outcome"] == "integration_conflict_resolved"
+    assert "returned_result" not in closed
+    assert _git(git_repo, "show", f"{result['run_branch']}:market.csv") == "code,value\nA,1"
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+@pytest.mark.parametrize("command", ["run", "resume"])
+def test_saved_run_review_settles_before_default_branch_reintegration(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    conflicting: bool, command: str,
+) -> None:
+    from agent_run import cli
+    from agent_run.agents import ReviewResult
+    from agent_run.executor_host import FakeExecutorHost
+    from agent_run.state import StateStore
+    from agent_run.task_control import TaskControlStore, TaskKey
+    from support.inprocess_cli import invoke_cli_inprocess
+    from support.run_publication import RunPublicationAgents
+    from support.seeding import seed_idle_control
+    from support.workspace import prepare_workspace
+
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git, publisher = _two_ticket_run(
+        repo, tmp_path, conflict=conflicting, state_root=workspace.state_root,
+    )
+    run_id = state["run_id"]
+
+    class Agents(RunPublicationAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reviews: list[dict[str, Any]] = []
+            self.developments: list[dict[str, Any]] = []
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.reviews.append(deepcopy(request))
+            return ReviewResult(f"saved-run-review-{len(self.reviews)}", _passing_artifact())
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.developments.append(deepcopy(request))
+            assert request["repair_source"] == "integration"
+            (Path(request["checkout"]) / "README.md").write_text(
+                f"resolved combined behavior {len(self.developments)}\n", encoding="utf-8",
+            )
+            return DevelopmentResult(
+                request.get("thread_id") or f"integration-worker-{len(self.developments)}",
+                "Resolved the current default branch integration conflict.",
+            )
+
+    agents = Agents()
+    original_save = states.save_run
+    interrupted = False
+
+    def interrupt_after_return(identifier: str, saved: dict[str, Any]) -> None:
+        nonlocal interrupted
+        original_save(identifier, saved)
+        pending = saved.get("run_acceptance", {}).get("pending_semantic_attempt", {})
+        if not interrupted and pending.get("role") == "reviewer" and "returned_result" in pending:
+            interrupted = True
+            raise RuntimeError("interrupted after saved review")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(states, "save_run", interrupt_after_return)
+        with pytest.raises(RuntimeError, match="after saved review"):
+            RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(run_id)
+    old_attempt = StateStore(states.root).load_current_run(run_id)["run_acceptance"]["pending_semantic_attempt"]
+    old_context = deepcopy(old_attempt["review_context"])
+    if command == "resume":
+        assert Controller(FixtureGitHubReader(repo / "github.json"), git, states).record_execution_failure(
+            run_id, "interrupted after saved Run review",
+        )
+    assert len(agents.reviews) == 1
+    filename = "README.md" if conflicting else "new-default.txt"
+    (repo / filename).write_text("new default after saved review\n", encoding="utf-8")
+    _git(repo, "add", filename)
+    _git(repo, "commit", "-m", "advance default after saved Run review")
+    live = json.loads((repo / "github.json").read_text())
+    live["default_head_sha"] = git.resolve("main")
+    (repo / "github.json").write_text(json.dumps(live), encoding="utf-8")
+    seed_idle_control(TaskControlStore(states.root), TaskKey(repo, state["repository"], 1), run_id)
+    monkeypatch.setattr(cli, "FakeExecutorHost", lambda **kwargs: FakeExecutorHost())
+    monkeypatch.setattr(cli, "_agent_backend", lambda *args, **kwargs: agents)
+    result = invoke_cli_inprocess(
+        git_repo, repo / "github.json", command, "1" if command == "run" else run_id,
+        "--state-dir", str(states.root), "--json",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    completed = StateStore(states.root).load_current_run(run_id)
+    run = completed["run_acceptance"]
+    assert completed["status"] == "run_approval_pending"
+    old = next(item for item in run["semantic_attempt_history"]
+               if item["attempt_id"] == old_attempt["attempt_id"])
+    assert old["outcome"] == "currentness_invalidated"
+    assert old["review_context"] == old_context
+    assert old["budget_consumed"] is True
+    assert len(agents.reviews) == 2
+    assert len(agents.developments) == (2 if conflicting else 0)
+    budget = run["review_budget"]
+    assert budget["reviewer_invocations"] == 2
+    assert [item["reviewer_thread_id"] for item in budget["review_artifacts"]] == [
+        "saved-run-review-1", "saved-run-review-2",
+    ]
+    assert run["acceptance_record"]["reviewed_default_base_sha"] == git.resolve("main")
+    assert agents.reviews[1]["review_context"] != old_context
+    assert git.is_ancestor(git.resolve("main"), git.resolve(state["run_branch"]))
+
+
+def test_saved_local_review_is_invalidated_before_conflicting_merge_tree_check(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.agents import ReviewResult
+    from agent_run.state import StateStore
+
+    state, states, git, publisher = _two_ticket_run(git_repo, tmp_path, conflict=False)
+    run_id = state["run_id"]
+
+    class Agents:
+        reviews = 0
+        developments = 0
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.reviews += 1
+            return ReviewResult(f"local-review-{self.reviews}", _passing_artifact())
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.developments += 1
+            assert request["repair_source"] == "integration"
+            (Path(request["checkout"]) / "ticket-2.txt").write_text("resolved combination\n")
+            return DevelopmentResult("local-integration-developer", "Resolved default integration.")
+
+    agents = Agents()
+    original_save = states.save_run
+
+    def interrupt_saved_return(identifier: str, saved: dict[str, Any]) -> None:
+        original_save(identifier, saved)
+        pending = saved.get("run_acceptance", {}).get("pending_semantic_attempt", {})
+        if "returned_result" in pending:
+            raise RuntimeError("saved local review interrupted")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(states, "save_run", interrupt_saved_return)
+        with pytest.raises(RuntimeError, match="local review interrupted"):
+            RunAcceptanceEngine(git=git, states=states, agents=agents).accept(run_id)
+    attempt = StateStore(states.root).load_current_run(run_id)["run_acceptance"]["pending_semantic_attempt"]
+    (git_repo / "ticket-2.txt").write_text("conflicting default addition\n")
+    _git(git_repo, "add", "ticket-2.txt")
+    _git(git_repo, "commit", "-m", "advance default after saved local review")
+    publisher.data["default_head_sha"] = git.resolve("main")
+    publisher._save()
+    engine = RunAcceptanceEngine(
+        git=git, states=StateStore(states.root), agents=agents, github=publisher,
+        default_head_sha=git.resolve("main"),
+    )
+    stale = engine.accept(run_id)
+    run = stale["run_acceptance"]
+    assert run["phase"] == "pending"
+    assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt["attempt_id"]
+    assert run["semantic_attempt_history"][-1]["outcome"] == "currentness_invalidated"
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert agents.reviews == 1 and agents.developments == 0
+    result = engine.accept(run_id)
+    assert result["status"] == "run_publication_pending"
+    assert agents.reviews == 2 and agents.developments == 1
+    assert result["run_acceptance"]["review_budget"]["reviewer_invocations"] == 2

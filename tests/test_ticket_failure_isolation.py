@@ -81,13 +81,14 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
     pending = deepcopy(paused["ticket_jobs"]["3"]["pending_semantic_attempt"])
     other_job = deepcopy(paused["ticket_jobs"]["2"])
     other_invocation = deepcopy(paused["ticket_agent_invocations"]["2"])
-    successor_thread = "replacement-3" if new_thread else "developer-3"
-    agents.backends[3].data["developments"].append({
-        "expected_thread_id": None if new_thread else "developer-3",
-        "thread_id": successor_thread,
-        "summary": "Recovered the same attempt",
-        "expected_files": {"ticket-3.txt": "done\n"},
-    })
+    successor_thread = "replacement-3" if new_thread and not target_completed else "developer-3"
+    if not target_completed:
+        agents.backends[3].data["developments"].append({
+            "expected_thread_id": None if new_thread else "developer-3",
+            "thread_id": successor_thread,
+            "summary": "Recovered the same attempt",
+            "expected_files": {"ticket-3.txt": "done\n"},
+        })
     agents.backends[3].data["publications"][0]["thread_id"] = successor_thread
 
     resumed, _ = controller.resume(
@@ -104,11 +105,15 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
         item for item in result["agent_invocation_history"]
         if item["work_subject"] == "ticket:3" and item["role"] == "development"
     ]
-    assert len(successor) == 2
+    assert ("returned_result" in pending) is target_completed
+    assert len(successor) == (1 if target_completed else 2)
     assert successor[-1]["status"] == "completed"
-    assert successor[-1]["requested_thread_id"] == (None if new_thread else "developer-3")
-    assert successor[-1]["mode"] == ("new-thread" if new_thread else "resume")
-    assert successor[-1]["semantic_attempt"] == pending
+    if target_completed:
+        assert successor[-1] == paused["ticket_agent_invocations"]["3"]
+    else:
+        assert successor[-1]["requested_thread_id"] == (None if new_thread else "developer-3")
+        assert successor[-1]["mode"] == ("new-thread" if new_thread else "resume")
+        assert successor[-1]["semantic_attempt"] == pending
     attempts = [item for item in job["semantic_attempt_history"] if item["role"] == "development"]
     assert len(attempts) == 1
     assert attempts[0]["attempt_id"] == pending["attempt_id"]
