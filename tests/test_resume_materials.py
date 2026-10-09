@@ -89,14 +89,16 @@ def test_global_ticket_resume_checks_later_runnable_scene_but_not_local_pause(
 
 
 @pytest.mark.parametrize("phase", ["developing", "committing_candidate"])
+@pytest.mark.parametrize("kind", ["parent", "run_parent", "run_parent_saved_result"])
 def test_rebuilt_checkout_on_advanced_branch_is_rejected_without_erasing_files(
-    git_repo: Path, tmp_path: Path, phase: str,
+    git_repo: Path, tmp_path: Path, phase: str, kind: str,
 ) -> None:
     git = GitRepository(git_repo)
     git.ensure_checkout_identity()
     head = git.resolve("HEAD")
     root = tmp_path / "state"
-    checkout = root / "worktrees" / "original" / "parent"
+    name = "parent" if kind == "parent" else "run-integration"
+    checkout = root / "worktrees" / "original" / name
     branch = "agent-run/parent"
     git.prepare_ticket_checkout(branch=branch, base_sha=head, checkout=checkout)
     (checkout / "advanced.txt").write_text("manual branch advance\n")
@@ -109,6 +111,15 @@ def test_rebuilt_checkout_on_advanced_branch_is_rejected_without_erasing_files(
         "phase": phase, "parent_branch": branch, "managed_checkout_head": head,
         "pending_attempt": 1, "candidate_commit_intent": {"expected_head": head, "token": "original-intent"},
         "pending_semantic_attempt": {"role": "development", "status": "pending"}}}
+    if kind != "parent":
+        job = state.pop("parent_job")
+        job["run_integration_conflict"] = {
+            "stage": "git_check", "resolved_stages": [], "head_sha": head, "merge_head_sha": None,
+        }
+        if kind == "run_parent_saved_result":
+            job.pop("pending_semantic_attempt")
+            job["run_integration_conflict"]["development_summary"] = "saved Development result"
+        state.update(run_acceptance=job, run_branch=branch)
     before = deepcopy(state)
     with pytest.raises(MissingRunMaterialsError, match="HEAD 不符") as caught:
         require_resume_checkout(state, root, git)
@@ -143,7 +154,7 @@ def test_committed_continuation_can_rebuild_legitimately_cleaned_checkout(
     assert not root.exists()  # Admission is read-only; the lane rebuilds and revalidates.
 
 
-@pytest.mark.parametrize("kind", ["parent", "run_repair"])
+@pytest.mark.parametrize("kind", ["parent", "run_repair", "run_parent"])
 @pytest.mark.parametrize("stage", ["source", "target", "git_check", "resolved_followup", "missing_checkpoint"])
 def test_parent_snapshot_commit_recovery_uses_its_exact_stage_boundary(
     git_repo: Path, tmp_path: Path, kind: str, stage: str,
@@ -158,7 +169,7 @@ def test_parent_snapshot_commit_recovery_uses_its_exact_stage_boundary(
     finally:
         git.remove_worktree(source_checkout)
     root = tmp_path / "state"
-    name = "parent" if kind == "parent" else "run-repair"
+    name = {"parent": "parent", "run_repair": "run-repair", "run_parent": "run-integration"}[kind]
     checkout = root / "worktrees" / "original" / name
     branch = f"agent-run/{name}"
     git.prepare_ticket_checkout(branch=branch, base_sha=base, checkout=checkout)
@@ -175,7 +186,8 @@ def test_parent_snapshot_commit_recovery_uses_its_exact_stage_boundary(
     if stage == "missing_checkpoint":
         scene.update(stage="source", resolved_stages=["source"])
     scene["development_summary"] = "saved result"
-    scene_key = "parent_integration_conflict" if kind == "parent" else "run_repair_integration_conflict"
+    scene_key = {"parent": "parent_integration_conflict", "run_repair": "run_repair_integration_conflict",
+                 "run_parent": "run_integration_conflict"}[kind]
     job = {"phase": "blocked", "execution_resume_phase": "accepted",
            "managed_checkout_head": base, scene_key: scene,
            "pending_semantic_attempt": {"role": "development", "status": "pending"},
@@ -183,8 +195,11 @@ def test_parent_snapshot_commit_recovery_uses_its_exact_stage_boundary(
     state = {"run_id": "original", "status": "execution_failed"}
     if kind == "parent":
         state["parent_job"] = job
-    else:
+    elif kind == "run_repair":
         state["run_acceptance"] = {"phase": "repairing", "repair_job": job}
+    else:
+        job.pop("managed_checkout_head")  # Run integration persists its boundary in the scene.
+        state.update(run_acceptance=job, run_branch=branch)
     before = deepcopy(state)
     if stage == "missing_checkpoint":
         with pytest.raises(MissingRunMaterialsError, match="集成提交边界缺损.*resolution_sha"):

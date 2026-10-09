@@ -24,6 +24,7 @@ from agent_run.semantic_attempt import (
 )
 
 from agent_run.run_integration_development import resolve_run_integration_work
+from agent_run.resume_materials import require_change_checkout
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
@@ -42,6 +43,8 @@ def prepare_run_parent_integration(
         return observe_run_repair_snapshot(owner, state, run)
     run.setdefault("base_sha", str(state["base"]["sha"]))
     checkout = owner.states.root / "worktrees" / str(state["run_id"]) / "run-integration"
+    # Check before preparation or cleanup can replace an interrupted scene.
+    require_change_checkout(state, run, f"run-acceptance:{state['run_id']}", owner.states.root, owner.git)
     keep_checkout = False
     try:
         if isinstance(run.get("integration_publication_intent"), dict):

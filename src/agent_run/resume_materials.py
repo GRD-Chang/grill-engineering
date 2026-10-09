@@ -49,6 +49,11 @@ def require_change_checkout(
         name, branch_key = "parent", "parent_branch"
     elif subject.startswith("run-repair:"):
         name, branch_key = "run-repair", "repair_branch"
+    elif subject.startswith("run-acceptance:"):
+        # Review checkouts are disposable, unfinished integration work is not.
+        if not isinstance(job.get("run_integration_conflict"), dict):
+            return
+        name, branch_key = "run-integration", "run_branch"
     else:
         return
     phase = job.get("phase")
@@ -63,6 +68,7 @@ def require_change_checkout(
                     or job.get("human_blocker_phase") or phase)
     scene_key = next((key for key in (
         "integration_conflict", "parent_integration_conflict", "run_repair_integration_conflict",
+        "run_integration_conflict",
     ) if isinstance(job.get(key), dict)), None)
     scene = job[scene_key] if scene_key is not None else None
     # "repairing" may denote a new, not-yet-started Development after a
@@ -75,13 +81,21 @@ def require_change_checkout(
     }
     if not needs_scene:
         return
-    branch = job.get(branch_key)
+    branch = state.get(branch_key) if name == "run-integration" else job.get(branch_key)
     if not branch and not job.get("managed_checkout_head") and not pending_development:
         # A budget owner may exist before a concrete repair Job has started.
         # An immutable failed publication is not evidence of a lost worktree.
         return
     head = (job.get("managed_checkout_head") if pending_development else
             job.get("publication_sha") or job.get("candidate_sha") or job.get("managed_checkout_head"))
+    if name == "run-integration" and scene is not None:
+        try:
+            head, _merge_head = parent_conflict_commit_boundary(scene)
+        except (KeyError, TypeError, ValueError) as error:
+            raise MissingRunMaterialsError(
+                f"Run {state['run_id']} / {subject}: {scene_key} 的集成提交边界缺损：{error}；"
+                "请从可信状态备份补足原集成阶段及提交边界，再使用同一 agent-run resume 重新核验。"
+            ) from error
     if not isinstance(head, str) or not head:
         if pending_development:
             raise MissingRunMaterialsError(
@@ -96,10 +110,12 @@ def require_change_checkout(
         # same-named branch that a manual reconstruction happened to advance.
         # Do this before calling the Worker so integrity recovery cannot erase
         # the operator's reconstructed materials as Agent-owned mutations.
-        if pending_development:
+        if pending_development or name == "run-integration":
             expected = scene.get("head_sha", head) if scene is not None else head
             expected_merge = scene.get("merge_head_sha") if scene is not None else None
-            parent_scene = scene_key in {"parent_integration_conflict", "run_repair_integration_conflict"}
+            parent_scene = scene_key in {
+                "parent_integration_conflict", "run_repair_integration_conflict", "run_integration_conflict",
+            }
             if parent_scene and scene is not None:
                 try:
                     expected, expected_merge = parent_conflict_commit_boundary(scene)
@@ -112,6 +128,8 @@ def require_change_checkout(
             try:
                 observed = git.checkout_head(checkout)
                 boundary_matches = observed == expected
+                if boundary_matches and name == "run-integration":
+                    boundary_matches = git.checkout_merge_head(checkout) == expected_merge
                 if not boundary_matches and scene is not None:
                     boundary_matches = git.recovered_integration_commit_matches(
                         checkout, expected_head_sha=str(expected),
@@ -153,7 +171,7 @@ def require_change_checkout(
             if not valid:
                 raise MissingRunMaterialsError(
                     f"Run {state['run_id']} / {subject}: managed checkout 恢复身份或 HEAD 不符：{checkout}；"
-                    f"要求原受管仓库、branch={branch}, head={expected}；{failure}"
+                    f"要求原受管仓库、branch={branch}, head={expected}, merge_head={expected_merge}；{failure}"
                     "请保全人工补足文件并恢复准确工作边界，不能强制 reset/clean 丢弃材料；"
                     "补足后使用同一 agent-run resume 重新核验。"
                 )

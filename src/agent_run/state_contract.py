@@ -2172,8 +2172,7 @@ def _change_conflict_owner_is_current(
         or conflict.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("candidate_sha") != job["candidate_sha"]
         or boundary.get("base_sha") != job.get("base_sha")
-        or conflict.get("stage") not in ({"source", "target", "git_check"}
-            if subject.startswith(("ticket:", "parent-only:")) else {"source", "target"})
+        or conflict.get("stage") not in {"source", "target", "git_check"}
         or type(conflict.get("attempts")) is not int
         or conflict["attempts"] != 1
         or (conflict.get("stage") != "git_check" and conflict.get("merge_head_sha") != conflict.get(f"{conflict.get('stage')}_sha"))

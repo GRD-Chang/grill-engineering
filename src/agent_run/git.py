@@ -178,6 +178,9 @@ class GitRepository:
     def checkout_head(self, checkout: Path) -> str:
         return self._resolve_in(checkout, "HEAD")
 
+    def checkout_merge_head(self, checkout: Path) -> str | None:
+        return self._resolve_in_optional(checkout, "MERGE_HEAD")
+
     def checkout_belongs_to_repository(self, checkout: Path) -> bool:
         """Compare real common Git metadata, without creating identity markers."""
         arguments = ("rev-parse", "--path-format=absolute", "--git-common-dir")

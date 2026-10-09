@@ -49,7 +49,13 @@ def repair_checkout_is_active(job: dict[str, Any]) -> bool:
         phase == "blocked"
         and (job.get("blocked_reason") == "ci_investigation_paused" or (
             job.get("blocked_reason") == "agent_requires_human"
-            and job.get("human_blocker_phase") in {"developing", "repairing"}
+            and (
+                job.get("human_blocker_phase") in {"developing", "repairing"}
+                or (
+                    job.get("human_blocker_phase") == "accepted"
+                    and isinstance(job.get("run_repair_integration_conflict"), dict)
+                )
+            )
         ))
     )
 

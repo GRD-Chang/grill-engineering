@@ -74,4 +74,6 @@
 
 未完成 Development 或程序集成收口需要保留未提交成果及现场；若该 managed checkout 丢失，诊断提供准确路径、分支、提交及提交对象可用性。已固化 Candidate 后的 Review、Publication、CI 等阶段允许正常清理 checkout，由交付流程按准确提交重建并重新检查既有门禁，不据此判定材料遗失。核对受管仓库中的原分支仍指向该提交后，在该受管仓库内使用 `git worktree add <诊断路径> <原分支>` 补建；如提交缺失，先从可信备份取回对象与准确原分支。不要强制重置已有分支或删除其他工作区。还须恢复有备份的未提交文件及必要集成现场；没有这些材料时继续报告缺口，不声称已恢复丢失成果。若程序已创建提交但状态尚未落盘，仍按对应工作类型的准确父提交、文案、Candidate intent 及 Git 检查对账，不能放行任意前进的 HEAD。
 
+多 Ticket Parent 的未完成集成现场位于 `run-integration`，由 Run Acceptance 的 `run_integration_conflict` 保存准确边界；它同样需要恢复原文件和集成现场，不能当作一次性审核工作区自动重建。公开 resume 与集成引擎推进都会先核验材料，缺损时保留原 Attempt、历史和累计额度；补足后沿用原集成工作继续。
+
 补足后执行 `agent-run resume <parent-issue> --repo OWNER/REPO --message "已补足的事实及处理说明"`，会话不可用时加 `--new-thread`，局部 Ticket 使用 `--ticket N`。入口重新核验原需求、工作身份、范围、基线和成果，后继沿用原工作与额度；旧审核、CI、文案和批准仍须满足各自当前对象门禁。通过 `status`/`history` 确认实际后继 Invocation 已启动，不能仅凭状态改变判断恢复完成。外部写入结果未知时先对账；恢复不补造副作用记录，不接受正式需求或任务图变更。

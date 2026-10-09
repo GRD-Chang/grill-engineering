@@ -19,6 +19,7 @@ from agent_run.github import GitHubReadError
 from agent_run.history_facts import history_records
 from agent_run.review_budget import review_budget_owner
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.state_errors import MissingRunMaterialsError
 from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _passing_artifact, _repair_artifact
 from support.run_scenarios import _completed_run
@@ -319,21 +320,29 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
     assert resumed["ticket_jobs"] == accepted["ticket_jobs"]
 
 
+@pytest.mark.parametrize("missing_scene", [False, True])
 def test_integration_human_response_returns_to_same_work_and_retains_origin(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, missing_scene: bool,
 ) -> None:
     state, states, git, publisher = _two_ticket_run(git_repo, tmp_path)
 
     class HumanAgents(CsvIntegrationAgents):
         def develop(self, request: dict[str, Any]):
+            event = request["_invocation_event"]
+            event("started", requested_thread_id=request.get("thread_id"))
+            event("thread_started", reported_thread_id="run-integration-developer")
             if not self.development_requests:
                 self.development_requests.append(request)
+                (Path(request["checkout"]) / "prior-work.txt").write_text("original unsaved outcome\n")
+                event("completed")
                 return HumanBlockerResult("run-integration-developer", ("需要确认 CSV 编码",))
             assert request["prior_human_blockers"] == ["需要确认 CSV 编码"]
             assert request["human_response_history"][-1]["response"] == "使用 UTF-8 LF"
             assert request["thread_id"] == "run-integration-developer"
+            assert (Path(request["checkout"]) / "prior-work.txt").read_text() == "original unsaved outcome\n"
             self.development_requests.append(request)
             (Path(request["checkout"]) / "README.md").write_text("resolved encoding contract\n", encoding="utf-8")
+            event("completed")
             return DevelopmentResult("run-integration-developer", "按人工确认完成组合修复。")
 
     agents = HumanAgents(0)
@@ -341,7 +350,35 @@ def test_integration_human_response_returns_to_same_work_and_retains_origin(
     paused = engine.accept(state["run_id"])
     assert paused["run_acceptance"]["blocked_reason"] == "agent_requires_human"
     original_attempt = deepcopy(paused["run_acceptance"]["pending_semantic_attempt"])
-    Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
+    controller = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states)
+    if missing_scene:
+        checkout = states.root / "worktrees" / state["run_id"] / "run-integration"
+        scene = paused["run_acceptance"]["run_integration_conflict"]
+        backup = (checkout / "prior-work.txt").read_bytes()
+        before = states.load_current_run(state["run_id"])
+        git.remove_worktree(checkout)
+        with pytest.raises(MissingRunMaterialsError, match="缺少 managed checkout.*run-integration") as caught:
+            controller.resume(state["run_id"], explicit_resume=True, message="使用 UTF-8 LF")
+        assert str(state["run_branch"]) in str(caught.value)
+        assert scene["head_sha"] in str(caught.value)
+        assert states.load_current_run(state["run_id"]) == before
+        # Admission and direct engine advancement both protect the lost scene.
+        with pytest.raises(MissingRunMaterialsError, match="缺少 managed checkout"):
+            engine.accept(state["run_id"])
+        assert len(agents.development_requests) == 1
+        assert not checkout.exists()
+        git.prepare_run_repair_checkout(branch=state["run_branch"], checkout=checkout)
+        (checkout / "prior-work.txt").write_bytes(backup)
+        # Exact HEAD alone does not restore an unfinished merge's identity.
+        with pytest.raises(MissingRunMaterialsError, match="恢复身份或 HEAD 不符") as mismatch:
+            controller.resume(state["run_id"], explicit_resume=True, message="使用 UTF-8 LF")
+        assert f"merge_head={scene['merge_head_sha']}" in str(mismatch.value)
+        assert (checkout / "prior-work.txt").read_bytes() == backup
+        assert states.load_current_run(state["run_id"]) == before
+        merge = git._run_in(checkout, "merge", "--no-ff", "--no-commit", scene["merge_head_sha"])
+        assert merge.returncode == 1  # Reconstruct the original real merge conflict.
+        (checkout / "prior-work.txt").write_bytes(backup)
+    controller.resume(
         state["run_id"], explicit_resume=True, resume_human_blocker=True,
         human_response="使用 UTF-8 LF",
     )
@@ -350,7 +387,13 @@ def test_integration_human_response_returns_to_same_work_and_retains_origin(
     assert completed["status"] == "run_publication_pending"
     assert run["review_budget"]["development_attempts"] == 1
     assert run["semantic_attempt_history"][0]["attempt_id"] == original_attempt["attempt_id"]
+    invocations = [entry for entry in completed["agent_invocation_history"]
+                   if entry["phase"] == "run_integration_conflict"]
+    assert len(invocations) == 2
+    assert {entry["semantic_attempt"]["attempt_id"] for entry in invocations} == {original_attempt["attempt_id"]}
+    assert invocations[-1]["resume_id"] == completed["resume_audit"]["history"][-1]["resume_id"]
     assert run["integration_work_history"][-1]["human_blockers"] == ["需要确认 CSV 编码"]
+    assert git._run("show", f"{run['run_integration']['head_sha']}:prior-work.txt").stdout == "original unsaved outcome\n"
 
 
 def test_internal_repair_base_publication_recovers_lost_response_without_repeat_write(
