@@ -306,7 +306,7 @@ Required Check 失败时，Controller 读取失败 check 的名称、workflow、
 Actions job 的当前 head、状态及可取得的原始日志。准确失败不要求先被程序分类为代码可修：
 Ticket 和两种 Parent 共用开发循环，由 Development 定向调查失败与直接影响；Parent 的 Reviewer
 基于适用完整基线增量核验并对当前整体负责。pending、unknown 和证据尚未收敛继续有界监督。
-同一 Parent 的内部修复 PR、最终 PR、后继提交和目标追加共用累计 CI 开发额度，默认 3 次；
+同一 Parent 的修复工作、最终 PR、后继提交和目标追加共用累计 CI 开发额度，默认 3 次；
 耗尽后显式 resume 仅续期该额度并保留历史，修复后的当前成果须重新通过准确 CI 和人工批准。
 
 新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、Runner 独立仓库根、state 目录及 Repository/Parent 路由身份，最多保留
@@ -343,8 +343,8 @@ Completion Record、
 Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
 Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改先形成不可变 repair Candidate，由全新的 Candidate Run Acceptance Reviewer 按完整 Parent 范围
-检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后仍须经过 repair PR Publication、
-Required Checks、Published-Head Gate 与实际合入；Controller 只在 Candidate tree、repair base、实际 Run tree、
+检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后由程序核验准确源与默认分支必要祖先关系，并直接更新 Run Branch，
+不创建内部修复 PR、调用内部 Publish 或等待内部 CI。Controller 只在 Candidate tree、repair base、实际 Run tree、
 default head、Parent/Graph revision 和 Ticket Completion records 全部精确匹配时提升该结论。若仅 default head
 前进，Controller 在原 Repair Cycle 重新预演并验收最新组合；其余权威边界失配才废弃 Candidate，并进入新的
 Run Acceptance Generation。
@@ -352,7 +352,7 @@ Run Acceptance Generation。
 Reviewer Thread，但仍创建新的 Validation Checkout，并以角色化短 Prompt 提供准确验收对象、适用的
 当前失败或 blocker 证据以及维护者最新回复。
 无代码变化不消耗预算，配置的 `N` 次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
-通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。`run` 随后推进
+通过只进入 `run_publication_pending`，尚未完成最终 PR 发布或默认分支合入。`run` 随后推进
 正常 Run Publication Attempt：由新的、只读的 Run Publication Codex 根据
 Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；同一 Publication Agent 因
 `execution_failed` 或 Human Blocker 继续当前对象时复用对应 Run Publication Thread，并只补充当前必要
@@ -378,8 +378,8 @@ Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并�
 新组合仍先完成整体 Run Acceptance；其 Findings 与最终 PR Required Checks 失败进入已有有界 Run Repair。Run Repair 遵循
 Repair → Candidate Run Acceptance → 严格 promotion 的路径；若 promotion 的 Candidate、repair base、实际
 Run tree、Parent、Graph 或 Completion 任一非 default 绑定失配，才回退到 fresh Run Acceptance。若只有
-default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；已集成 Job 在 revalidation 中又收到 Finding 时，
-Controller 保留 Repair Thread、Integration-repair Worktree 与计数，归档旧 Job/PR 并轮转新的 branch/PR。
+default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；准确写入后的成果在重新验收中又收到 Finding 时，
+Controller 保留原修复工作身份、Repair Thread、受管 Worktree、本地分支与累计计数，继续当前 Parent 开发和集成循环。
 
 两种 Parent 的 `approve` 先在终端说明自动更新规则：若默认分支或原任务分支新增可接纳的提交，将自动更新与复验，并重新请求批准。确认存在这类变化后，会向已启用的飞书提交更新通知，无需再次确认。旧批准段结束后，同一 Run 自动同步；真实冲突携原始证据交给修复，再完成 Reviewer 与适用检查，更新原 PR。此时可用 `stop` 和 `resume`，保留成果及有效预算历史。`action.status=updating` / `action_audit.result_status=updating` 仅表示更新已启动；新组合通过后仍需再次 `approve`，这次最终合并及必要收尾仍不可取消。通知不可用不阻止更新；需求或图谱变化仍按原门禁处理，身份、权限或非追加历史仍暂停处理。resync 额度耗尽时暂停并通知；显式 `resume` 只续期该额度，不重置需求、集成验收或 CI 的有效预算。
 
@@ -590,3 +590,5 @@ Ticket 原开发—审核与规定上限后的末轮跳过保持原合同；取�
 `--ticket-integration-development-limit` 默认 3，为独立累计额度，包含冲突工作。新失败和远端追加不清零，重复读状态及同一 Semantic Attempt 的中断续接不额外扣费。耗尽时 `integration_development_exhausted` 保留工作树，`resume <run-id> --ticket <number>` 只追加对应集成额度并保留历史，不重置需求、CI 或 resync 额度；重复恢复不重复授权。`--new-thread` 使用完整集成 Prompt，`--message` 继续进入同一工作来源。普通未知原因恢复不续期其他额度，也不解除其他 Ticket 的人工门禁。
 
 status/history 区分需求开发与集成开发累计用量、额度窗口及语义工作。Git 机械操作限时 30 秒，超时保留现场和输出；工作使用原共享 Ticket Agent 名额与 FIFO，集成交付继续单席，正常 CI 等待不占 Agent 名额。新状态不迁移旧 Run。详见 [ADR 0020](adr/0020-ticket-integration-development-loop.md)。
+
+新 Run 使用 `branch_authority_protocol=3`。旧 Run 明确拒绝继续，不自动迁移、兼容读取或删除既有成果。完整 Parent 的直接 Run Branch 更新仍受实际运行凭据和仓库规则约束；权限或规则拒绝时保全修复成果与写入意图，说明缺口并暂停，由维护者处理后通过 `resume` 继续。未知推送先对账，不通过强推、重置、改规则或内部修复 PR 兜底。

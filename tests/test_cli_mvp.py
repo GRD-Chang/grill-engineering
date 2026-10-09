@@ -969,7 +969,7 @@ def test_run_supervises_initial_repository_read_lag_in_one_call(
     assert state["base"]["branch"] == "main"
 
 
-@pytest.mark.parametrize("legacy_protocol", [None, 1, 2.0, "2"])
+@pytest.mark.parametrize("legacy_protocol", [None, 1, 2, 3.0, "3"])
 def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
     git_repo: Path,
     tmp_path: Path,

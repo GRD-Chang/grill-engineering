@@ -436,8 +436,8 @@ def _waiting_object(state: dict[str, Any]) -> str:
         return f"Ticket PR #{active['pr_number']} 的 GitHub 对账"
     acceptance = state.get("run_acceptance")
     repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-    if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
-        return f"Run Repair PR #{repair['pr_number']} 的 GitHub 对账"
+    if isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+        return "Parent 修复 Run Branch 写入对账"
     publication = state.get("run_publication")
     if isinstance(publication, dict) and isinstance(publication.get("pr_number"), int):
         return f"Run PR #{publication['pr_number']} 的 GitHub 对账"

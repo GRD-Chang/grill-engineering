@@ -183,10 +183,10 @@ def test_merge_resolution_candidate_validation_default_drift_reprepares_boundary
     fixture.assert_completed(resumed)
 
 
-def test_merge_resolution_publication_default_drift_reprepares_boundary(
+def test_merge_resolution_run_branch_write_default_drift_reprepares_boundary(
     git_repo: Path,
 ) -> None:
-    fixture = MergeResolutionFixture(git_repo, "publication_default_drift")
+    fixture = MergeResolutionFixture(git_repo, "run_branch_write_default_drift")
 
     interrupted = fixture.accept()
     fixture.assert_reprepare_pending(interrupted)
@@ -481,13 +481,6 @@ def test_merge_resolution_staged_development_interruption_resumes_same_thread(
                         "thread_id": "integration-repair-developer",
                         "summary": "Recovered the staged conflict resolution.",
                         "expected_files": {"shared.txt": "resolved\n"},
-                    }
-                ],
-                "publications": [
-                    {
-                        **fixture.agents.publication({}),
-                        "expected_thread_id": "integration-repair-developer",
-                        "thread_id": "integration-repair-developer",
                     }
                 ],
                 "run_reviews": [

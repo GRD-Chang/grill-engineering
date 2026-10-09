@@ -64,33 +64,8 @@ from agent_run.task_control import TASK_CONTROL_PROTOCOL
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
 _ACTIVE_RUN_REPAIR_PHASES = frozenset(
     {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-        "accepted",
-        "publishing",
-        "publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "escalating",
-        "merging",
-        "merged",
-        "blocked",
-    }
-)
-_INTEGRATED_REVALIDATION_MERGE_PHASES = frozenset(
-    {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-        "accepted",
-        "escalating",
-        "merged",
-        "blocked",
+        "developing", "repairing", "committing_candidate", "candidate",
+        "reviewing", "accepted", "escalating", "blocked",
     }
 )
 _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
@@ -111,14 +86,6 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
         "outcome",
     }
 )
-_INTEGRATED_REVALIDATION_MERGE_KEYS = frozenset(
-    {
-        "base_sha",
-        "default_base_sha",
-        "candidate_sha",
-        "publication_sha",
-    }
-)
 def require_current_run_state(state: dict[str, Any]) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
@@ -131,7 +98,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
             type(state.get(key)) is not type(expected) or state.get(key) != expected
             for key, expected in (
                 ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
-                ("branch_authority_protocol", 2),
+                ("branch_authority_protocol", 3),
                 ("review_budget_protocol", 2),
                 ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
                 ("semantic_attempt_protocol", 1),
@@ -170,7 +137,7 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
         )
     if type(state.get("branch_authority_protocol")) is not int or state.get(
         "branch_authority_protocol"
-    ) != 2:
+    ) != 3:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible branch authority protocol"
         )
@@ -237,6 +204,7 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
 
     require_ticket_resume_receipts(state)
     _require_ticket_agent_invocations(state)
+    _require_run_branch_write_intent(state)
     _require_run_gate_exclusivity(state)
     if (
         not operator_gate_identity_is_consistent(state)
@@ -263,7 +231,6 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
-    _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
     from agent_run.review_attempt import require_pending_run_review
 
@@ -651,6 +618,36 @@ def _require_candidate_acceptance_histories(state: dict[str, Any]) -> None:
             )
 
 
+def _require_run_branch_write_intent(state: dict[str, Any]) -> None:
+    """A saved Parent write remains bound to the original reviewed result."""
+    run = state.get("run_acceptance")
+    job = run.get("repair_job") if isinstance(run, dict) else None
+    if not isinstance(job, dict):
+        return
+    if job.get("phase") in {
+        "publishing", "publication_pending", "waiting_checks", "waiting_merge",
+        "merging", "merged",
+    }:
+        raise IncompatibleRunStateError("Parent repair contains a retired internal PR phase")
+    retired_keys = {
+        "pr_number", "ticket_write_intent", "merge_intent", "repair_job_rotation",
+        "publication", "publication_commit_intent", "integrated_revalidation_merge",
+    }
+    if retired_keys.intersection(job):
+        raise IncompatibleRunStateError("Parent repair contains retired internal PR lifecycle facts")
+    intent = job.get("run_branch_write_intent")
+    if intent is None:
+        return
+    keys = {"branch", "base_sha", "candidate_sha", "default_base_sha"}
+    if (not isinstance(intent, dict) or set(intent) != keys
+            or not all(isinstance(intent[key], str) and intent[key] for key in keys)):
+        raise IncompatibleRunStateError("Parent Run Branch write intent is incomplete")
+    if (intent["branch"] != state.get("run_branch")
+            or any(intent[key] != job.get(key) for key in keys - {"branch"})
+            or not isinstance(job.get("acceptance_record"), dict)):
+        raise IncompatibleRunStateError("Parent Run Branch write intent differs from its reviewed candidate")
+
+
 def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
     acceptance = state.get("run_acceptance")
     if not isinstance(acceptance, dict):
@@ -662,41 +659,6 @@ def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid run_acceptance.repair_job.repair_mode"
         )
-
-
-def _require_integrated_revalidation_merge(state: dict[str, Any]) -> None:
-    """Validate the persisted authority snapshot used after a merged repair drifts."""
-
-    acceptance = state.get("run_acceptance")
-    if not isinstance(acceptance, dict):
-        return
-    repair = acceptance.get("repair_job")
-    if not isinstance(repair, dict) or "integrated_revalidation_merge" not in repair:
-        return
-    marker = repair["integrated_revalidation_merge"]
-    location = "run_acceptance.repair_job.integrated_revalidation_merge"
-    if not isinstance(marker, dict):
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} object"
-        )
-    if set(marker) != _INTEGRATED_REVALIDATION_MERGE_KEYS:
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} field set"
-        )
-    if repair.get("phase") not in _INTEGRATED_REVALIDATION_MERGE_PHASES:
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} phase"
-        )
-    if repair.get("repair_mode") != "squash":
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} repair mode"
-        )
-    for key in _INTEGRATED_REVALIDATION_MERGE_KEYS:
-        value = marker[key]
-        if not isinstance(value, str) or not value.strip():
-            raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
-            )
 
 
 def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
@@ -1753,7 +1715,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
                 (
                     "run_acceptance.repair_job",
                     repair,
-                    {"development", "reviewer", "publication"},
+                    {"development", "reviewer"},
                     f"run-repair:{run_id}",
                     int(repair.get("repair_generation", 1)),
                 )
@@ -1794,7 +1756,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             (
                 f"retired_semantic_attempt_owners[{index}]",
                 owner,
-                {"development", "reviewer", "publication"},
+                {"development", "reviewer"},
                 f"run-repair:{run_id}",
                 int(owner["generation"]),
             )

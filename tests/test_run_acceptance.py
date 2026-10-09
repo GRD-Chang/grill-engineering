@@ -1540,82 +1540,24 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert resumed_run["repair_cycle"]["status"] == "active"
     assert resumed_run.get("repair_cycle_history", []) == []
 
-def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
-    git_repo: Path,
-) -> None:
-    workspace = prepare_workspace(git_repo)
-    repo = workspace.repository_root
-    state, states, git = _completed_run(repo, state_root=workspace.state_root)
-    fixture = repo / "github.json"
+def test_parent_repair_does_not_call_internal_publication_agent(git_repo: Path) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
 
-    class BlockedRunRepairPublication(ScriptedRunAgents):
-        def publication(
-            self, request: dict[str, Any]
-        ) -> HumanBlockerResult:
-            del request
-            return HumanBlockerResult(
-                thread_id="run-repair-publication-blocked",
-                human_blockers=(
-                    "GitHub denied access; tried gh issue view; grant Issue read access.",
-                ),
-            )
+    class NoInternalPublication(ScriptedRunAgents):
+        def publication(self, request: dict[str, Any]) -> dict[str, str]:
+            pytest.fail("Parent repair must not invoke an internal Publish role")
 
-    blocked = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=BlockedRunRepairPublication(),
+    delivered = RunAcceptanceEngine(
+        git=git, states=states, agents=NoInternalPublication(),
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
+    assert delivered["status"] == "run_publication_pending"
+    assert delivered["run_acceptance"]["phase"] == "accepted"
+    assert json.loads(fixture.read_text())["delivery"]["pull_requests"] == []
+    assert not any(invocation.get("role") == "publication"
+                   for invocation in delivered["agent_invocation_history"])
 
-    assert blocked["status"] == "ready_for_human"
-    repair = blocked["run_acceptance"]["repair_job"]
-    assert repair["phase"] == "blocked"
-    assert repair["human_blocker_phase"] == "accepted"
-    assert repair["publication_thread_id"] == "run-repair-publication-blocked"
-    assert repair["publication_attempts"] == 1
-    assert "publication_sha" not in repair
-    old_generation = repair["repair_generation"]
-    old_attempt = deepcopy(repair["pending_semantic_attempt"])
-    old_budget = deepcopy(blocked["run_acceptance"]["review_budget"])
-    old_candidate = repair["candidate_sha"]
-    old_checkout = Path(str(repair["repair_checkout"]))
-    assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
-    assert not old_checkout.exists()
-    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
-        "pull_requests"
-    ] == []
-    history = stdout_json(
-        invoke_cli_inprocess(repo, fixture, "history", str(state["run_id"]), "--json")
-    )
-    assert any(
-        event.get("worker") == "发布工作代理"
-        and event.get("attempt") == 1
-        and event.get("thread_id") == "run-repair-publication-blocked"
-        and event.get("human_blockers")
-        for event in history["timeline"]
-    )
-
-    resumed, _ = Controller(
-        FixtureGitHubReader(fixture), git, states
-    ).resume(
-        str(state["run_id"]),
-        resume_human_blocker=True,
-        human_response="Publication access has been restored.",
-    )
-    resumed_run = resumed["run_acceptance"]
-    resumed_job = resumed_run["repair_job"]
-    assert resumed_job["repair_generation"] == old_generation
-    assert resumed_job["phase"] == "accepted"
-    assert resumed_job["candidate_sha"] == old_candidate
-    assert "returned_result" not in resumed_job["pending_semantic_attempt"]
-    assert resumed_job["pending_semantic_attempt"] == {
-        key: value for key, value in old_attempt.items() if key != "returned_result"
-    }
-    assert resumed_run["review_budget"] == old_budget
-    assert resumed_job["publication_attempts"] == 1
-    assert resumed_job["publication_thread_id"] == "run-repair-publication-blocked"
-    assert resumed_run["repair_cycle"]["status"] == "active"
-    assert resumed_run.get("repair_cycle_history", []) == []
 
 def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
     git_repo: Path,

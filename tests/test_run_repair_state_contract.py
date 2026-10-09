@@ -71,7 +71,7 @@ def _git_refs(repo: Path) -> str:
     ).stdout
 
 
-@pytest.mark.parametrize("phase", ["developing", "escalating", "merged"])
+@pytest.mark.parametrize("phase", ["developing", "escalating", "accepted"])
 @pytest.mark.parametrize("repair_mode", [None, "legacy", 1])
 def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     git_repo: Path, repair_mode: object, phase: str
@@ -264,20 +264,15 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
         _require_repair_state(state)
 
 
-def test_waiting_run_repair_requires_an_exact_head_observation(
+def test_final_run_pr_requires_an_exact_head_observation(
     valid_run_state: dict[str, Any],
 ) -> None:
     state = valid_run_state
-    state["run_acceptance"] = {
-        "phase": "repairing",
+    state["run_publication"] = {
+        "phase": "waiting_checks",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "repair_job": {
-            "phase": "waiting_checks",
-            "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "repair_mode": "squash",
-            "pr_number": 17,
-            "publication_sha": "repair-head",
-        },
+        "pr_number": 17,
+        "publication_sha": "final-head",
     }
 
     with pytest.raises(IncompatibleRunStateError, match="required_checks_evidence"):
@@ -288,21 +283,18 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     valid_run_state: dict[str, Any],
 ) -> None:
     state = valid_run_state
-    state["run_acceptance"] = {
-        "phase": "repairing",
+    state["run_publication"] = {
+        "phase": "waiting_checks",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "repair_job": {
-            "phase": "developing",
-            "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "repair_mode": "squash",
-            "required_checks": "fail",
-            "required_checks_mode": "configured",
-            "required_checks_evidence": {
-                "pr_number": 17,
-                "head_sha": "repair-head",
-                "result": "pass",
-                "checks": [{"name": "quality", "bucket": "pass"}],
-            },
+        "pr_number": 17,
+        "publication_sha": "final-head",
+        "required_checks": "fail",
+        "required_checks_mode": "configured",
+        "required_checks_evidence": {
+            "pr_number": 17,
+            "head_sha": "final-head",
+            "result": "pass",
+            "checks": [{"name": "quality", "bucket": "pass"}],
         },
     }
 
@@ -325,21 +317,16 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
     valid_run_state: dict[str, Any], result: str, checks: list[dict[str, str]]
 ) -> None:
     state = valid_run_state
-    state["run_acceptance"] = {
-        "phase": "repairing",
+    state["run_publication"] = {
+        "phase": "waiting_checks",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "repair_job": {
-            "phase": "waiting_checks",
-            "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "repair_mode": "squash",
+        "pr_number": 17,
+        "publication_sha": "final-head",
+        "required_checks_evidence": {
             "pr_number": 17,
-            "publication_sha": "repair-head",
-            "required_checks_evidence": {
-                "pr_number": 17,
-                "head_sha": "repair-head",
-                "result": result,
-                "checks": checks,
-            },
+            "head_sha": "final-head",
+            "result": result,
+            "checks": checks,
         },
     }
 
@@ -453,7 +440,7 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     assert _git_refs(managed_repo(git_repo)) == refs_before
 
 
-def test_canonical_integrated_revalidation_merge_passes_state_validation(
+def test_retired_integrated_revalidation_merge_is_rejected(
     valid_run_state: dict[str, Any],
 ) -> None:
     state = valid_run_state
@@ -468,25 +455,27 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
         },
     }
 
-    _require_repair_state(state)
+    with pytest.raises(IncompatibleRunStateError, match="retired internal PR lifecycle"):
+        _require_repair_state(state)
 
 
-def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
-    valid_run_state: dict[str, Any],
+@pytest.mark.parametrize("phase", ["candidate", "accepted", "developing"])
+def test_retired_merge_marker_is_rejected_in_current_repair_phases(
+    valid_run_state: dict[str, Any], phase: str,
 ) -> None:
     state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_job": {
-            "phase": "completed",
+            "phase": phase,
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
             "integrated_revalidation_merge": _integrated_revalidation_merge(),
         },
     }
 
-    with pytest.raises(IncompatibleRunStateError, match="phase"):
+    with pytest.raises(IncompatibleRunStateError, match="retired internal PR lifecycle"):
         _require_repair_state(state)
 
 
@@ -511,3 +500,22 @@ def test_resume_rejects_previous_budget_protocol_without_changing_materials(
     assert state_path.read_bytes() == before
     assert fixture.read_bytes() == fixture_before
     assert _git_refs(managed_repo(git_repo)) == refs_before
+
+
+@pytest.mark.parametrize("phase", [
+    "publishing", "publication_pending", "waiting_checks", "waiting_merge",
+    "merging", "merged",
+])
+def test_parent_repair_rejects_retired_internal_pr_phase(
+    valid_run_state: dict[str, Any], phase: str,
+) -> None:
+    state = valid_run_state
+    state["run_acceptance"] = {
+        "phase": "repairing", "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        "repair_job": {
+            "phase": phase, "repair_mode": "squash",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        },
+    }
+    with pytest.raises(IncompatibleRunStateError, match="retired internal PR phase"):
+        _require_repair_state(state)

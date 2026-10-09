@@ -3112,7 +3112,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
         # Both busy paths must reject without applying or persisting the Resume.
         if diagnostic["code"] == "task_control":
             assert diagnostic["message"] == (
-                "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
+                "control transaction: Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
             )
         else:
             assert diagnostic["code"] == "action_busy", rejected.stdout + rejected.stderr

@@ -679,7 +679,7 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             "thread_id": thread_id,
             "phase": subject_phase,
             "pr_number": subject.get("pr_number"),
-            "commit_sha": subject.get("integrated_sha"),
+            "commit_sha": subject.get("integrated_sha") or subject.get("candidate_sha"),
         }, subject)
     active = state.get("active_ticket_job")
     if isinstance(active, dict):

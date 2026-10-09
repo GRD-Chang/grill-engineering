@@ -719,14 +719,10 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         "development_thread_id": "repair-developer",
         "publication_attempts": 0,
     }
-    publication_request = repair_requests.publication(
-        state, repair_job, git_repo / "checkout"
-    )
     review_request = repair_requests.review(
         state, repair_job, git_repo / "validation"
     )
 
-    assert "ticket_integration_records" not in publication_request
     reviewer_records = review_request["ticket_integration_records"]
     assert len(reviewer_records) == 1
     assert reviewer_records[0]["ticket_number"] == 2
@@ -747,19 +743,19 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         },
         name="final-publication-role-facts",
     )
-    run_repair_publication_prompt = _capture_public_prompt(
+    parent_only_publication_prompt = _capture_public_prompt(
         tmp_path,
         monkeypatch,
         "publication",
         {
-            "acceptance_scope": "run",
+            "acceptance_scope": "parent_only",
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "acceptance_artifact": {},
             "fallback_ticket_records": fallback_ticket_records,
             "previous_review_identity": previous_review_identity,
             "ticket_integration_records": integration_records,
         },
-        name="run-repair-publication-role-facts",
+        name="parent-only-publication-role-facts",
     )
     reviewer_prompt = _capture_public_prompt(
         tmp_path,
@@ -783,7 +779,7 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         name="reviewer-integration-facts",
     )
 
-    for prompt in (final_publication_prompt, run_repair_publication_prompt):
+    for prompt in (final_publication_prompt, parent_only_publication_prompt):
         assert "ticket_integration_records" not in prompt
         assert "reviewer-only integration evidence" not in prompt
         assert "fallback-ticket-record-publication-leak" not in prompt

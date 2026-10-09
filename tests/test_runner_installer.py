@@ -821,6 +821,22 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
         encoding="utf-8",
     )
     codex.chmod(0o755)
+    # This test exercises cleanup of an already running nested process.
+    # Start its short timeout only after that process signals readiness;
+    # Python startup under parallel load is not the boundary under test.
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "            output, error_output = _read_candidate_probe_output(",
+            "            import time\n"
+            "            ready_deadline = time.monotonic() + 5\n"
+            f"            while not Path({str(pid_file)!r}).is_file():\n"
+            "                if time.monotonic() >= ready_deadline:\n"
+            "                    raise AssertionError('nested probe was not ready')\n"
+            "                time.sleep(0.01)\n"
+            "            output, error_output = _read_candidate_probe_output(",
+        ),
+        encoding="utf-8",
+    )
     probe_tmp = tmp_path / "probe-tmp"
     probe_tmp.mkdir()
     monkeypatch.setenv("TMPDIR", str(probe_tmp))

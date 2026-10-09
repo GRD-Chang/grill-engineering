@@ -1,9 +1,10 @@
-"""Run Repair collaboration against a second clone and durable PR state."""
+"""Parent repairs retain real remote Run Branch appends without internal PRs."""
 
 from __future__ import annotations
 
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -12,515 +13,278 @@ import pytest
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
 from agent_run.delivery_policy import DeliveryPolicy
+from agent_run.delivery_step import AgentWorkRequired
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
-from agent_run.state import StateStore
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.state import StateStore
 from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
-from support.merge_resolution import MergeResolutionFixture
-from support.run_scenarios import _completed_run
 from support.run_publication import RunPublicationAgents
+from support.run_scenarios import _completed_run
 
-@pytest.mark.parametrize(
-    "scenario", [
-        "source_and_target", "conflict", "conflict_git_check", "target_only",
-        "target_interrupted", "target_interrupted_rewritten",
-        "target_interrupted_fetch_retry",
-    ]
-)
-def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
-    git_repo: Path, tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch
+
+def _git(root: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments], cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize("scenario", [
+    "append", "conflict", "conflict_git_check", "interrupted",
+    "interrupted_rewritten", "interrupted_fetch_retry",
+])
+def test_run_repair_preserves_remote_run_append_and_resumes_same_work(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
 ) -> None:
     conflict = scenario.startswith("conflict")
-    git_check_retry = scenario == "conflict_git_check"
-    interrupted = scenario.startswith("target_interrupted")
-    append_source = scenario == "source_and_target" or conflict
-    append_target = not conflict
-    # Remote append now retains cumulative work allowances; these scenarios
-    # need capacity for the original repair and the later combined review.
+    git_check = scenario == "conflict_git_check"
+    interrupted = scenario.startswith("interrupted")
     state, states, git = _completed_run(
         git_repo, delivery_policy=DeliveryPolicy(run_repair_rounds=3)
     )
+    run_id = str(state["run_id"])
     fixture = git_repo / "github.json"
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["required_checks"] = ["pending"]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
+
     class AppendAgents(ScriptedRunAgents):
+        def publication(self, request: dict[str, Any]) -> dict[str, str]:
+            raise AssertionError("Parent repair must not call internal Publish")
+
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if (request.get("repair_source") not in {"merge_conflict", "integration"}
-                or (request.get("repair_source") == "integration"
-                    and "acceptance_artifact" in json.loads(request["integration_evidence"]))):
+            if request.get("repair_source") != "integration" or "acceptance_artifact" in json.loads(request["integration_evidence"]):
                 result = super().develop(request)
                 if interrupted and len(self.development_requests) == 2:
-                    (Path(str(request["checkout"])) / "follow-up-repair.txt").write_text(
-                        "second repair\n", encoding="utf-8"
-                    )
+                    (Path(request["checkout"]) / "follow-up-repair.txt").write_text("second repair\n")
                 return result
+            self.development_requests.append(request)
             event = request["_invocation_event"]
             event("started", requested_thread_id="run-repair-developer", attempt_count=1)
             event("thread_started", reported_thread_id="run-repair-developer")
-            assert StateStore(states.root).load_current_run(state["run_id"]) is not None
-            self.development_requests.append(request)
-            checkout = Path(str(request["checkout"]))
-            if git_check_retry:
-                integration_calls = sum(item.get("repair_source") == "integration"
-                                        for item in self.development_requests)
+            assert StateStore(states.root).load_current_run(run_id) is not None
+            checkout = Path(request["checkout"])
+            integration_calls = sum(item.get("repair_source") == "integration" for item in self.development_requests)
+            if git_check:
                 if integration_calls == 2:
                     evidence = json.loads(request["integration_evidence"])
                     assert "diff --cached --check" in evidence["failure"]["error"]
                     assert "market.csv" in evidence["failure"]["error"]
                     assert (checkout / "market.csv").read_bytes().endswith(b"\r\n")
                 (checkout / "market.csv").write_bytes(
-                    b"code,value\r\nA,1\r\n" if integration_calls == 1
-                    else b"code,value\nA,1\n"
+                    b"code,value\r\nA,1\r\n" if integration_calls == 1 else b"code,value\nA,1\n"
                 )
-            (checkout / "run-repair.txt").write_text(
-                "repaired with human change\n", encoding="utf-8"
-            )
+            (checkout / "run-repair.txt").write_text("repaired with human change\n")
             event("completed")
-            assert StateStore(states.root).load_current_run(state["run_id"]) is not None
-            return DevelopmentResult(
-                thread_id="run-repair-developer",
-                summary="Resolved both repair changes.",
-            )
+            return DevelopmentResult("run-repair-developer", "Resolved both contributions")
 
         def review(self, request: dict[str, Any]) -> ReviewResult:
             self.review_requests.append(request)
-            if request.get("candidate_acceptance") is True:
-                content = (Path(str(request["checkout"])) / "run-repair.txt").read_text(
-                    encoding="utf-8"
+            if request.get("candidate_acceptance"):
+                assert (Path(request["checkout"]) / "run-repair.txt").read_text() == (
+                    "repaired with human change\n" if conflict and len(self.review_requests) > 2 else "repaired\n"
                 )
-                assert content == (
-                    "repaired with human change\n" if conflict and len(self.review_requests) > 2
-                    else "repaired\n"
-                )
-            return ReviewResult(
-                thread_id=f"run-reviewer-{len(self.review_requests)}",
-                artifact=self._reviews.pop(0),
-            )
+            return ReviewResult(f"run-reviewer-{len(self.review_requests)}", self._reviews.pop(0))
 
     agents = AppendAgents()
-    first = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-    job = first["run_acceptance"]["repair_job"]
-    assert job["phase"] == "waiting_checks"
-    branch = str(job["repair_branch"])
-    original_publication = str(job["publication_sha"])
-    original_pr = int(job["pr_number"])
-    original_ci = json.loads(json.dumps(first["run_acceptance"]["ci_recovery"]))
 
-    def command(root: Path, *args: str) -> str:
-        return subprocess.run(
-            ["git", *args], cwd=root, check=True, capture_output=True, text=True
-        ).stdout.strip()
-
-    remote = tmp_path / "remote.git"
-    command(tmp_path, "clone", "--bare", str(git_repo), str(remote))
-    command(git_repo, "remote", "add", "origin", str(remote))
-    command(git_repo, "push", "origin", f"{original_publication}:refs/heads/{branch}")
-    command(git_repo, "push", "origin", f"{job['base_sha']}:refs/heads/{state['run_branch']}")
-    collaborator = tmp_path / "collaborator"
-    command(tmp_path, "clone", str(remote), str(collaborator))
-    command(collaborator, "config", "user.name", "Collaborator")
-    command(collaborator, "config", "user.email", "collaborator@example.invalid")
-    command(collaborator, "checkout", branch)
-    human_file = (
-        "run-repair.txt" if conflict else
-        "human-target.txt" if scenario == "target_only" or interrupted
-        else "human.txt"
-    )
-    human_sha = original_publication
-    if append_source:
-        (collaborator / human_file).write_text("human repair\n", encoding="utf-8")
-        command(collaborator, "add", human_file)
-        command(collaborator, "commit", "-m", "fix: complete repair manually")
-        human_sha = command(collaborator, "rev-parse", "HEAD")
-        command(collaborator, "push", "origin", branch)
-
-    target_sha = None
-    if append_target:
-        # The Run branch advances only on the remote; the local managed ref
-        # stays at the previously confirmed boundary during Repair review.
-        command(collaborator, "checkout", str(state["run_branch"]))
-        (collaborator / "human-target.txt").write_text("human target\n", encoding="utf-8")
-        command(collaborator, "add", "human-target.txt")
-        command(collaborator, "commit", "-m", "fix: append to Run branch")
-        target_sha = command(collaborator, "rev-parse", "HEAD")
-        command(collaborator, "push", "origin", str(state["run_branch"]))
-
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    delivery = data["delivery"]
-    delivery["published_branches"][branch] = human_sha
-    if target_sha is not None:
-        delivery["published_branches"][str(state["run_branch"])] = target_sha
-        delivery["pull_requests"][0]["base_sha"] = target_sha
-    delivery["pull_requests"][0]["head_sha"] = human_sha
-    delivery["required_checks"] = ["none"]
-    delivery["check_position"] = 0
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents._reviews = (
-        [_candidate_finding_artifact(), _passing_artifact()]
-        if interrupted else [_passing_artifact()]
-    )
-    if interrupted:
-        save_run = states.save_run
-
-        def interrupt_after_candidate(run_id: str, value: dict[str, Any]) -> None:
-            save_run(run_id, value)
-            repair = value.get("run_acceptance", {}).get("repair_job", {})
-            if repair.get("phase") == "candidate" and len(agents.development_requests) == 2:
-                raise OSError("interrupted after new repair Candidate was saved")
-
-        with monkeypatch.context() as interruption:
-            interruption.setattr(states, "save_run", interrupt_after_candidate)
-            with pytest.raises(OSError, match="interrupted after new repair Candidate"):
-                RunAcceptanceEngine(
+    def accept() -> dict[str, Any]:
+        for _ in range(4):
+            try:
+                return RunAcceptanceEngine(
                     git=git, states=states, agents=agents,
                     github=FixtureGitHubPublisher(fixture, git),
-                ).accept(str(state["run_id"]))
-        saved = states.load_current_run(str(state["run_id"]))
+                ).accept(run_id)
+            except AgentWorkRequired:
+                # Public orchestration re-admits each independent Agent work unit.
+                continue
+        raise AssertionError("Repair did not finish within the existing work budget")
+
+    save = states.save_run
+
+    def stop_after_review(identifier: str, value: dict[str, Any]) -> None:
+        save(identifier, value)
+        if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
+            raise OSError("interrupt before Run Branch update")
+
+    with monkeypatch.context() as pause:
+        pause.setattr(states, "save_run", stop_after_review)
+        with pytest.raises(OSError, match="interrupt before Run Branch update"):
+            accept()
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    job = saved["run_acceptance"]["repair_job"]
+    original_job_id = job["repair_generation"]
+    original_ci = deepcopy(saved["run_acceptance"]["ci_recovery"])
+    original_candidate = job["candidate_sha"]
+    branch = str(state["run_branch"])
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
+    collaborator = tmp_path / "collaborator"
+    _git(tmp_path, "clone", "-b", branch, str(remote), str(collaborator))
+    _git(collaborator, "config", "user.name", "Collaborator")
+    _git(collaborator, "config", "user.email", "collaborator@example.invalid")
+    human_file = "run-repair.txt" if conflict else "human-target.txt"
+    (collaborator / human_file).write_text("human repair\n")
+    _git(collaborator, "add", human_file)
+    _git(collaborator, "commit", "-m", "fix: append human contribution to Run")
+    human_sha = _git(collaborator, "rev-parse", "HEAD")
+    _git(collaborator, "push", "origin", branch)
+    data = json.loads(fixture.read_text())
+    data.setdefault("delivery", {}).setdefault("published_branches", {})[branch] = human_sha
+    fixture.write_text(json.dumps(data))
+    agents._reviews = [_candidate_finding_artifact(), _passing_artifact()] if interrupted else [_passing_artifact()]
+    if interrupted:
+        def stop_after_candidate(identifier: str, value: dict[str, Any]) -> None:
+            save(identifier, value)
+            repair = value.get("run_acceptance", {}).get("repair_job", {})
+            if repair.get("phase") == "candidate" and len(agents.development_requests) == 2:
+                raise OSError("interrupt after repair Candidate")
+        with monkeypatch.context() as pause:
+            pause.setattr(states, "save_run", stop_after_candidate)
+            with pytest.raises(OSError, match="interrupt after repair Candidate"):
+                accept()
+        saved = states.load_current_run(run_id)
         assert saved is not None
         saved_job = saved["run_acceptance"]["repair_job"]
         assert saved_job["phase"] == "candidate"
-        assert git.resolve(str(state["run_branch"])) != target_sha
-        assert saved_job["base_sha"] == target_sha
-        assert saved_job["pr_number"] == original_pr
+        assert saved_job["base_sha"] == human_sha
+        assert saved_job["repair_generation"] == original_job_id
+        assert "pr_number" not in saved_job
         assert saved["run_acceptance"]["ci_recovery"] == original_ci
-        if scenario == "target_interrupted_fetch_retry":
-            (collaborator / "later-target.txt").write_text(
-                "later target\n", encoding="utf-8"
-            )
-            command(collaborator, "add", "later-target.txt")
-            command(collaborator, "commit", "-m", "fix: append after interruption")
-            later_target = command(collaborator, "rev-parse", "HEAD")
-            command(collaborator, "push", "origin", str(state["run_branch"]))
-            data = json.loads(fixture.read_text(encoding="utf-8"))
-            data["delivery"]["published_branches"][str(state["run_branch"])] = later_target
-            data["delivery"]["pull_requests"][0]["base_sha"] = later_target
-            fixture.write_text(json.dumps(data), encoding="utf-8")
-        if scenario == "target_interrupted_rewritten":
+        if scenario == "interrupted_rewritten":
             rewritten = git.resolve("main")
-            command(
-                git_repo, "push", "--force", "origin",
-                f"{rewritten}:refs/heads/{state['run_branch']}",
-            )
-            data = json.loads(fixture.read_text(encoding="utf-8"))
-            data["delivery"]["published_branches"][str(state["run_branch"])] = rewritten
-            data["delivery"]["pull_requests"][0]["base_sha"] = rewritten
-            fixture.write_text(json.dumps(data), encoding="utf-8")
-            blocked, _ = Controller(
-                FixtureGitHubReader(fixture), git, states
-            ).resume(str(state["run_id"]))
-            assert blocked["status"] == "blocked"
-            assert blocked["diagnostics"][0]["code"] == "change_pr_base_changed_externally"
-            assert blocked["run_acceptance"]["repair_job"]["pr_number"] == original_pr
-            assert command(
-                git_repo, "ls-remote", "origin", f"refs/heads/{state['run_branch']}"
-            ).split()[0] == rewritten
+            _git(git_repo, "push", "--force", "origin", f"{rewritten}:refs/heads/{branch}")
+            data = json.loads(fixture.read_text())
+            data["delivery"]["published_branches"][branch] = rewritten
+            fixture.write_text(json.dumps(data))
+            blocked, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(run_id)
+            assert blocked["status"] == "run_acceptance_pending"
+            blocked = accept()
+            assert blocked["status"] == "ready_for_human"
+            assert blocked["diagnostics"][0]["code"] == "integration_history_rewritten"
+            assert _git(git_repo, "ls-remote", "origin", f"refs/heads/{branch}").split()[0] == rewritten
+            assert blocked["run_acceptance"]["repair_job"]["candidate_sha"] == saved_job["candidate_sha"]
             return
-        if scenario == "target_interrupted_fetch_retry":
+        if scenario == "interrupted_fetch_retry":
+            (collaborator / "later-target.txt").write_text("later target\n")
+            _git(collaborator, "add", "later-target.txt")
+            _git(collaborator, "commit", "-m", "fix: append after interruption")
+            later = _git(collaborator, "rev-parse", "HEAD")
+            _git(collaborator, "push", "origin", branch)
+            data = json.loads(fixture.read_text())
+            data["delivery"]["published_branches"][branch] = later
+            fixture.write_text(json.dumps(data))
             fetch = git.fetch_remote_commit
             failed = False
-
-            def fail_once(branch: str, sha: str) -> None:
+            def fail_once(ref: str, sha: str) -> str:
                 nonlocal failed
                 if not failed:
                     failed = True
                     raise GitError("temporary fetch failure")
-                fetch(branch, sha)
-
-            with monkeypatch.context() as transient:
-                transient.setattr(git, "fetch_remote_commit", fail_once)
-                resumed, resumed_existing = Controller(
-                    FixtureGitHubReader(fixture), git, states
-                ).resume(str(state["run_id"]))
+                return fetch(ref, sha)
+            with monkeypatch.context() as retry:
+                retry.setattr(git, "fetch_remote_commit", fail_once)
+                resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(run_id)
+                paused = accept()
             assert failed
+            assert paused["status"] == "ready_for_human"
+            assert paused["diagnostics"][0]["code"] == "run_integration_failed"
+            resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(run_id, explicit_resume=True)
         else:
-            resumed, resumed_existing = Controller(
-                FixtureGitHubReader(fixture), git, states
-            ).resume(str(state["run_id"]))
-        assert resumed_existing
+            resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(run_id)
         assert resumed["status"] == "run_acceptance_pending", resumed.get("diagnostics")
-        resumed_job = resumed["run_acceptance"]["repair_job"]
-        assert resumed_job["pr_number"] == original_pr
+        assert resumed["run_acceptance"]["repair_job"]["candidate_sha"] == saved_job["candidate_sha"]
         assert resumed["run_acceptance"]["ci_recovery"] == original_ci
-        assert resumed_job["candidate_sha"] == saved_job["candidate_sha"]
-    result = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    assert result["status"] == "run_publication_pending", (
-        result["status"], result.get("diagnostics"),
-        result["run_acceptance"].get("repair_job", {}).get("blocked_reason"),
-        result.get("terminal_kind"), result["run_acceptance"].get("phase"),
-        result["run_acceptance"].get("discarded_repair_thread_ids"),
-        len(agents.development_requests),
-        result["run_acceptance"].get("review_budget"),
-    )
-    if conflict:
-        loaded = StateStore(states.root).load_current_run(state["run_id"])
-        assert loaded is not None
-        assert any(item["phase"] == "integration_conflict" and item["status"] == "completed"
-                   for item in loaded["agent_invocation_history"])
-    completed = result["run_acceptance"]["completed_repair_jobs"][0]
-    assert result["run_acceptance"]["repair_pr_number"] == original_pr
-    assert git.is_ancestor(human_sha, completed["publication_sha"])
-    assert len(agents.development_requests) == (
-        3 if git_check_retry else 2 if conflict or interrupted else 1
-    )
-    if git_check_retry:
-        loaded = StateStore(states.root).load_current_run(state["run_id"])
-        assert loaded is not None
-        assert loaded["run_acceptance"]["review_budget"]["development_attempts"] == 3
-        integration_attempts = [item["semantic_attempt"] for item in loaded["agent_invocation_history"]
-                                if item["phase"] == "integration_conflict" and item["status"] == "completed"]
-        assert [item["budget_snapshot"]["development_attempts"] for item in integration_attempts] == [2, 3]
-        assert len({item["attempt_id"] for item in integration_attempts}) == 2
-        assert command(git_repo, "show", f"{result['run_branch']}:market.csv") == "code,value\nA,1"
-    assert sum(
-        request.get("candidate_acceptance") is True
-        for request in agents.review_requests
-    ) == (3 if interrupted else 2)
+    result = accept()
+    assert result["status"] == "run_publication_pending", result.get("diagnostics")
+    completed = result["run_acceptance"]["completed_repair_jobs"][-1]
+    assert "repair_pr_number" not in result["run_acceptance"]
+    assert not json.loads(fixture.read_text())["delivery"].get("pull_requests")
+    assert git.is_ancestor(human_sha, completed["integrated_sha"])
+    assert git.is_ancestor(str(state["base"]["sha"]), completed["integrated_sha"])
+    assert git.resolve(f"{original_candidate}^{{tree}}") != git.resolve(f"{completed['candidate_sha']}^{{tree}}")
     assert result["run_acceptance"]["ci_recovery"] == original_ci
-    merged_content = command(git_repo, "show", f"{result['run_branch']}:{human_file}")
-    assert merged_content == (
-        "repaired with human change" if conflict else
-        "human target" if scenario == "target_only" or interrupted
-        else "human repair"
+    assert len(agents.development_requests) == (3 if git_check else 2 if conflict or interrupted else 1)
+    if git_check:
+        assert result["run_acceptance"]["review_budget"]["development_attempts"] == 3
+        attempts = [item["semantic_attempt"] for item in result["agent_invocation_history"]
+                    if item["phase"] == "integration_conflict" and item["status"] == "completed"]
+        assert [item["budget_snapshot"]["development_attempts"] for item in attempts] == [2, 3]
+        assert len({item["attempt_id"] for item in attempts}) == 2
+        assert _git(git_repo, "show", f"{branch}:market.csv") == "code,value\nA,1"
+    assert _git(git_repo, "show", f"{branch}:{human_file}") == (
+        "repaired with human change" if conflict else "human repair"
     )
-    if target_sha is not None:
-        assert command(git_repo, "show", f"{result['run_branch']}:human-target.txt") == "human target"
-        final_engine = RunPublicationEngine(
-            git=git, states=states, agents=RunPublicationAgents(),
-            github=FixtureGitHubPublisher(fixture, git),
-            default_branch="main", default_head_sha=str(state["base"]["sha"]),
-        )
-        assert final_engine.publish(str(state["run_id"]))["status"] == "run_approval_pending"
-        assert final_engine.approve(str(state["run_id"]))["status"] == "completed"
-        assert command(git_repo, "show", "main:human-target.txt") == "human target"
-        if interrupted:
-            assert command(git_repo, "show", "main:follow-up-repair.txt") == "second repair"
-        if scenario == "target_interrupted_fetch_retry":
-            assert command(git_repo, "show", "main:later-target.txt") == "later target"
-
-
-@pytest.mark.parametrize("rewritten_branch", ["source", "target"])
-def test_run_repair_pauses_when_published_source_history_is_rewritten(
-    git_repo: Path, rewritten_branch: str,
-) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["required_checks"] = ["pending"]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = ScriptedRunAgents()
-    waiting = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-    job = waiting["run_acceptance"]["repair_job"]
-    assert job["phase"] == "waiting_checks"
-    published = str(job["published_sha"])
-    original_pr = int(job["pr_number"])
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    delivery = data["delivery"]
-    assert delivery["published_branches"][str(job["repair_branch"])] == published
-    if rewritten_branch == "source":
-        delivery["published_branches"][str(job["repair_branch"])] = str(job["base_sha"])
-        delivery["pull_requests"][0]["head_sha"] = str(job["base_sha"])
-    else:
-        rewritten = git.resolve("main")
-        delivery["published_branches"][str(state["run_branch"])] = rewritten
-        delivery["pull_requests"][0]["base_sha"] = rewritten
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-
-    result = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    blocked = result["run_acceptance"]["repair_job"]
-    assert result["status"] == "ready_for_human"
-    if rewritten_branch == "source":
-        assert blocked["blocked_reason"] == "remote_source_changed"
-    else:
-        # Run Acceptance owns the Run branch as its source. It rejects the
-        # rewritten target before re-entering the nested Repair Job.
-        assert result["diagnostics"][0]["code"] == "integration_history_rewritten"
-        assert blocked["phase"] == "waiting_checks"
-    assert blocked["published_sha"] == published
-    assert blocked["pr_number"] == original_pr
-    assert len(agents.development_requests) == 1
-
-
-def test_merge_resolution_repair_promotes_integrated_remote_append(
-    git_repo: Path, tmp_path: Path,
-) -> None:
-    fixture = MergeResolutionFixture(git_repo, "happy_path")
-    data = json.loads(fixture.fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["required_checks"] = ["pending"]
-    fixture.fixture.write_text(json.dumps(data), encoding="utf-8")
-    waiting = fixture.accept()
-    job = waiting["run_acceptance"]["repair_job"]
-    assert job["repair_mode"] == "merge_resolution"
-    assert job["phase"] == "waiting_checks"
-    first_publication = str(job["publication_sha"])
-    branch = str(job["repair_branch"])
-    pr_number = int(job["pr_number"])
-
-    def command(root: Path, *args: str) -> str:
-        return subprocess.run(
-            ["git", *args], cwd=root, check=True, capture_output=True, text=True
-        ).stdout.strip()
-
-    remote = tmp_path / "remote.git"
-    command(tmp_path, "clone", "--bare", str(git_repo), str(remote))
-    command(git_repo, "remote", "add", "origin", str(remote))
-    command(git_repo, "push", "origin", f"{first_publication}:refs/heads/{branch}")
-    command(git_repo, "push", "origin", f"{job['base_sha']}:refs/heads/{fixture.run_branch}")
-    collaborator = tmp_path / "collaborator"
-    command(tmp_path, "clone", str(remote), str(collaborator))
-    command(collaborator, "config", "user.name", "Collaborator")
-    command(collaborator, "config", "user.email", "collaborator@example.invalid")
-    command(collaborator, "checkout", branch)
-    (collaborator / "human.txt").write_text("human repair\n", encoding="utf-8")
-    command(collaborator, "add", "human.txt")
-    command(collaborator, "commit", "-m", "fix: complete repair manually")
-    human_sha = command(collaborator, "rev-parse", "HEAD")
-    command(collaborator, "push", "origin", branch)
-
-    data = json.loads(fixture.fixture.read_text(encoding="utf-8"))
-    delivery = data["delivery"]
-    delivery["published_branches"][branch] = human_sha
-    delivery["pull_requests"][0]["head_sha"] = human_sha
-    delivery["required_checks"] = ["none"]
-    delivery["check_position"] = 0
-    fixture.fixture.write_text(json.dumps(data), encoding="utf-8")
-    promoted = fixture.accept()
-
-    assert promoted["status"] == "run_publication_pending"
-    run = promoted["run_acceptance"]
-    completed = run["completed_repair_jobs"][-1]
-    publication = str(completed["publication_sha"])
-    assert completed["candidate_sha"] == run["candidate_sha"]
-    assert run["repair_pr_number"] == pr_number
-    assert fixture.git.commit_parents(publication) == [human_sha, fixture.default_head]
-    assert fixture.git.is_ancestor(first_publication, publication)
-    assert fixture.git.resolve(f"{publication}^{{tree}}") == fixture.git.resolve(
-        f"{run['candidate_sha']}^{{tree}}"
+    final = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=FixtureGitHubPublisher(fixture, git), default_branch="main",
+        default_head_sha=str(state["base"]["sha"]),
     )
-    assert command(git_repo, "show", f"{fixture.run_branch}:human.txt") == "human repair"
-    final_engine = RunPublicationEngine(
-        git=fixture.git, states=fixture.states, agents=RunPublicationAgents(),
-        github=FixtureGitHubPublisher(fixture.fixture, fixture.git),
-        default_branch="main", default_head_sha=fixture.default_head,
+    assert final.publish(run_id)["status"] == "run_approval_pending"
+    assert final.approve(run_id)["status"] == "completed"
+    assert _git(git_repo, "show", f"main:{human_file}") == (
+        "repaired with human change" if conflict else "human repair"
     )
-    published = final_engine.publish(str(fixture.state["run_id"]))
-    assert published["status"] == "run_approval_pending"
-    approved = final_engine.approve(str(fixture.state["run_id"]))
-    assert approved["status"] == "completed"
-    assert command(git_repo, "show", "main:human.txt") == "human repair"
+    if interrupted:
+        assert _git(git_repo, "show", "main:follow-up-repair.txt") == "second repair"
+    if scenario == "interrupted_fetch_retry":
+        assert _git(git_repo, "show", "main:later-target.txt") == "later target"
 
 
-def test_run_repair_integrates_remote_append_before_pr_creation(
-    git_repo: Path, tmp_path: Path,
+def test_merge_resolution_repair_preserves_default_ancestor_and_remote_run_append(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["crash_after_ensure_change_branch_once"] = True
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = ScriptedRunAgents()
-    with pytest.raises(OSError, match="lost response"):
-        RunAcceptanceEngine(
-            git=git, states=states, agents=agents,
-            github=FixtureGitHubPublisher(fixture, git),
-        ).accept(str(state["run_id"]))
-    saved = states.load_current_run(str(state["run_id"]))
+    from support.merge_resolution import MergeResolutionFixture
+
+    scene = MergeResolutionFixture(git_repo, "happy_path")
+    save = scene.states.save_run
+
+    def stop_after_review(run_id: str, value: dict[str, Any]) -> None:
+        save(run_id, value)
+        if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
+            raise OSError("interrupt before Run Branch update")
+
+    with monkeypatch.context() as pause:
+        pause.setattr(scene.states, "save_run", stop_after_review)
+        with pytest.raises(OSError, match="interrupt before Run Branch update"):
+            scene.accept()
+    saved = scene.states.load_current_run(str(scene.state["run_id"]))
     assert saved is not None
     job = saved["run_acceptance"]["repair_job"]
-    branch = str(job["repair_branch"])
-
-    def command(root: Path, *args: str) -> str:
-        return subprocess.run(
-            ["git", *args], cwd=root, check=True, capture_output=True, text=True
-        ).stdout.strip()
-
+    assert job["repair_mode"] == "merge_resolution"
+    original_candidate = str(job["candidate_sha"])
+    assert scene.git.is_ancestor(scene.default_head, original_candidate)
     remote = tmp_path / "remote.git"
-    command(tmp_path, "clone", "--bare", str(git_repo), str(remote))
-    command(git_repo, "remote", "add", "origin", str(remote))
-    command(git_repo, "push", "origin", f"{job['base_sha']}:refs/heads/{branch}")
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
     collaborator = tmp_path / "collaborator"
-    command(tmp_path, "clone", str(remote), str(collaborator))
-    command(collaborator, "config", "user.name", "Collaborator")
-    command(collaborator, "config", "user.email", "collaborator@example.invalid")
-    command(collaborator, "checkout", branch)
-    (collaborator / "human-before-pr.txt").write_text("human\n", encoding="utf-8")
-    command(collaborator, "add", "human-before-pr.txt")
-    command(collaborator, "commit", "-m", "fix: append before PR")
-    human_sha = command(collaborator, "rev-parse", "HEAD")
-    command(collaborator, "push", "origin", branch)
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["published_branches"][branch] = human_sha
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents._reviews.append(_passing_artifact())
-
-    result = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    assert result["status"] == "run_publication_pending"
-    completed = result["run_acceptance"]["completed_repair_jobs"][0]
-    assert git.is_ancestor(human_sha, completed["publication_sha"])
-    assert command(git_repo, "show", f"{result['run_branch']}:human-before-pr.txt") == "human"
-    assert len(agents.development_requests) == 1
-    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
-
-
-def test_run_repair_does_not_accept_an_append_from_a_foreign_pr(
-    git_repo: Path,
-) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["required_checks"] = ["pending"]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = ScriptedRunAgents()
-    waiting = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-    job = waiting["run_acceptance"]["repair_job"]
-    published = str(job["published_sha"])
-    appended = subprocess.run(
-        ["git", "commit-tree", git.resolve(f"{published}^{{tree}}"),
-         "-p", published, "-m", "fix: append from another writer"],
-        cwd=git_repo, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    delivery = data["delivery"]
-    delivery["published_branches"][str(job["repair_branch"])] = appended
-    delivery["pull_requests"][0].update({
-        "head_sha": appended,
-        "base_repository": "foreign/project",
-    })
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    reviews_before = len(agents.review_requests)
-
-    result = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    blocked = result["run_acceptance"]["repair_job"]
-    assert result["status"] == "ready_for_human"
-    assert blocked["blocked_reason"] == "published_head_mismatch"
-    assert blocked["published_sha"] == published
-    assert len(agents.review_requests) == reviews_before
-    assert len(delivery["pull_requests"]) == 1
+    _git(tmp_path, "clone", "-b", scene.run_branch, str(remote), str(collaborator))
+    _git(collaborator, "config", "user.name", "Collaborator")
+    _git(collaborator, "config", "user.email", "collaborator@example.invalid")
+    (collaborator / "human.txt").write_text("human repair\n")
+    _git(collaborator, "add", "human.txt")
+    _git(collaborator, "commit", "-m", "fix: append to Run Branch")
+    human = _git(collaborator, "rev-parse", "HEAD")
+    _git(collaborator, "push", "origin", scene.run_branch)
+    data = json.loads(scene.fixture.read_text())
+    data.setdefault("delivery", {}).setdefault("published_branches", {})[scene.run_branch] = human
+    scene.fixture.write_text(json.dumps(data))
+    promoted = scene.accept()
+    assert promoted["status"] == "run_publication_pending", promoted.get("diagnostics")
+    completed = promoted["run_acceptance"]["completed_repair_jobs"][-1]
+    integrated = completed["integrated_sha"]
+    assert integrated == completed["candidate_sha"]
+    assert scene.git.is_ancestor(scene.default_head, integrated)
+    assert scene.git.is_ancestor(human, integrated)
+    assert scene.git.is_ancestor(original_candidate, integrated)
+    assert not json.loads(scene.fixture.read_text())["delivery"].get("pull_requests")
+    assert _git(git_repo, "show", f"{scene.run_branch}:human.txt") == "human repair"
+    final = RunPublicationEngine(
+        git=scene.git, states=scene.states, agents=RunPublicationAgents(),
+        github=FixtureGitHubPublisher(scene.fixture, scene.git),
+        default_branch="main", default_head_sha=scene.default_head,
+    )
+    assert final.publish(str(scene.state["run_id"]))["status"] == "run_approval_pending"
+    assert final.approve(str(scene.state["run_id"]))["status"] == "completed"
+    assert _git(git_repo, "show", "main:human.txt") == "human repair"

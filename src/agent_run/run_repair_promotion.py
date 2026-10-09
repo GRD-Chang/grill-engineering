@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from agent_run.run_repair_cycle import remove_repair_job
 
-from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.integration_resync_budget import complete_integration_window
-from agent_run.parent_integration import parent_integration_record_is_valid
 from agent_run.required_checks_observation import (
     bind_new_publication_head,
     clear_required_checks_observation,
@@ -100,15 +98,12 @@ class RunRepairPromotion:
                 job, stale_attempt, outcome="currentness_invalidated"
             )
             detach_active_invocation(state, stale_attempt)
-        publication_was_integrated = (
+        candidate_was_written = (
             isinstance(job.get("integrated_sha"), str)
-            and job.get("integrated_publication_sha") == job.get("publication_sha")
-        )
-        integrated_merge_resolution = publication_was_integrated and uses_merge_resolution(
-            job
+            and job.get("integrated_sha") == job.get("publication_sha")
+            and job.get("candidate_sha") == job.get("integrated_sha")
         )
         prior_default_head = str(job["default_base_sha"])
-        prior_publication_sha = job.get("publication_sha")
         acceptance_artifact = job.get("acceptance_artifact")
         if (
             job.get("repair_source") == "acceptance"
@@ -116,24 +111,20 @@ class RunRepairPromotion:
         ):
             job["unresolved_acceptance_artifact"] = deepcopy(acceptance_artifact)
         job["default_base_sha"] = default_head
+        if candidate_was_written:
+            job.pop("run_branch_write_intent", None)
         # The prior exact source/target record describes a Candidate built
         # against the old default merge scene. Reprepare owns the new scene;
         # retaining that record would replay its old Candidate during the
         # next integration and can resurrect a resolved conflict.
         job.pop("run_repair_integration", None)
-        if integrated_merge_resolution:
+        if candidate_was_written:
             # The controlled two-parent result is now the actual Run head.  A
             # later default-only drift validates that Run head as an ordinary
             # Candidate against the new default.  If the new combination
             # conflicts, the existing squash-to-merge-resolution conversion
             # prepares a fresh three-way scene without ending this Cycle.
             integrated = str(job["integrated_sha"])
-            job["integrated_revalidation_merge"] = {
-                "base_sha": job.get("base_sha"),
-                "default_base_sha": prior_default_head,
-                "candidate_sha": job.get("candidate_sha"),
-                "publication_sha": job.get("publication_sha"),
-            }
             job.update(
                 {
                     "repair_mode": "squash",
@@ -148,15 +139,11 @@ class RunRepairPromotion:
         stale_keys = [
             "acceptance_record",
             "acceptance_artifact",
-            "merge_intent",
-            "ticket_write_intent",
             "review_resume_thread_id",
             "review_human_blocker_resume",
             "review_new_thread",
             "pending_review_result",
         ]
-        if not publication_was_integrated:
-            stale_keys.extend(("publication", "publication_sha"))
         for key in stale_keys:
             job.pop(key, None)
         clear_required_checks_observation(job)
@@ -165,7 +152,7 @@ class RunRepairPromotion:
         finding_snapshot_sha = job.get("integration_finding_snapshot_sha")
         pending_attempt = job.get("pending_attempt")
         reprepare_merge_resolution = (
-            not publication_was_integrated
+            not candidate_was_written
             and uses_merge_resolution(job)
             and (
                 isinstance(candidate_sha, str)
@@ -188,15 +175,6 @@ class RunRepairPromotion:
                     superseded.append(candidate_sha)
                 job["integration_reprepare_candidate_sha"] = candidate_sha
             job["integration_reprepare_default_sha"] = prior_default_head
-            if isinstance(prior_publication_sha, str):
-                publications = job.setdefault("superseded_publication_shas", [])
-                if not isinstance(publications, list) or not all(
-                    isinstance(sha, str) for sha in publications
-                ):
-                    raise ValueError("superseded_publication_shas must contain strings")
-                if prior_publication_sha not in publications:
-                    publications.append(prior_publication_sha)
-                job["integration_reprepare_publication_sha"] = prior_publication_sha
             job["integration_reprepare_required"] = True
             if (
                 prior_phase == "committing_candidate"
@@ -223,7 +201,7 @@ class RunRepairPromotion:
         }:
             publication["phase"] = "stale"
             clear_required_checks_observation(publication)
-            for key in ("artifact", "write_intent", "approval_grant"):
+            for key in ("artifact", "approval_grant"):
                 publication.pop(key, None)
         state.update(
             {
@@ -270,7 +248,6 @@ class RunRepairPromotion:
     ) -> None:
         superseded_candidate = job.get("integration_reprepare_candidate_sha")
         superseded_default = job.get("integration_reprepare_default_sha")
-        superseded_publication = job.get("integration_reprepare_publication_sha")
         if superseded_candidate is not None and not isinstance(
             superseded_candidate, str
         ):
@@ -294,11 +271,6 @@ class RunRepairPromotion:
             default_head_sha=str(job["default_base_sha"]),
             superseded_candidate_sha=superseded_candidate,
             superseded_default_head_sha=superseded_default,
-            superseded_publication_sha=(
-                superseded_publication
-                if isinstance(superseded_publication, str)
-                else None
-            ),
             squash_candidate_sha=(
                 str(job["integration_squash_candidate_sha"])
                 if isinstance(job.get("integration_squash_candidate_sha"), str)
@@ -337,7 +309,6 @@ class RunRepairPromotion:
             )
         job.pop("integration_reprepare_candidate_sha", None)
         job.pop("integration_reprepare_default_sha", None)
-        job.pop("integration_reprepare_publication_sha", None)
         job.pop("integration_reprepare_discard_invocation_changes", None)
         job.pop("integration_reprepare_preserved_changes", None)
         job.pop("integration_reprepare_required", None)
@@ -353,145 +324,20 @@ class RunRepairPromotion:
             state, job, default_head_sha=self.owner._default_head(state)
         )
 
-    def after_merge(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        _live_before_merge: dict[str, Any],
+    def after_update(
+        self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
-        if self.owner.github is None:
-            raise ValueError("Run Repair requires the Publisher")
         candidate_history = require_candidate_acceptance_history(
             job.get("candidate_acceptance_history", []),
             "run_acceptance.repair_job.candidate_acceptance",
         )
-        raw_run = state.get("run_acceptance")
-        if not isinstance(raw_run, dict):
-            raise ValueError("run_acceptance must be an object")
         run_history = require_candidate_acceptance_history(
-            raw_run.get("candidate_acceptance_history", []),
+            self.owner._run_state(state).get("candidate_acceptance_history", []),
             "run_acceptance.candidate_acceptance",
         )
-        currentness = self.owner.repair_currentness
-        if currentness is None:
-            raise ValueError("Run Repair requires the Publisher")
-        live = currentness.live_pull_request(
-            state,
-            int(job["pr_number"]),
-            waiting_for=f"merged Run Repair PR #{int(job['pr_number'])} promotion",
-        )
-        integrated = job.get("integrated_sha")
-        publication = self.owner._mapping(job, "publication")
-        merge_resolution = uses_merge_resolution(job)
-        revalidation_merge = job.get("integrated_revalidation_merge")
-        published_as_merge_resolution = merge_resolution or isinstance(
-            revalidation_merge, dict
-        )
-        published_base = (
-            revalidation_merge.get("base_sha")
-            if isinstance(revalidation_merge, dict)
-            else job.get("base_sha")
-        )
-        published_default = (
-            revalidation_merge.get("default_base_sha")
-            if isinstance(revalidation_merge, dict)
-            else job.get("default_base_sha")
-        )
-        published_candidate = (
-            revalidation_merge.get("candidate_sha")
-            if isinstance(revalidation_merge, dict)
-            else job.get("candidate_sha")
-        )
-        published_publication = (
-            revalidation_merge.get("publication_sha")
-            if isinstance(revalidation_merge, dict)
-            else job.get("publication_sha")
-        )
-        expected_parents = (
-            [published_base, published_publication]
-            if published_as_merge_resolution
-            else [published_base]
-        )
-        publication_sha = str(published_publication)
-        publication_parent = (
-            job.get("publication_parent_sha")
-            if not isinstance(revalidation_merge, dict)
-            else None
-        )
-        publication_parents = self.owner.git.commit_parents(publication_sha)
-        integration = job.get("run_repair_integration")
-        if not published_as_merge_resolution or isinstance(revalidation_merge, dict):
-            candidate_boundary_valid = True
-        elif isinstance(integration, dict):
-            candidate_boundary_valid = (
-                parent_integration_record_is_valid(
-                    self.owner.git, {**job, "parent_integration": integration}
-                )
-                and bool(publication_parents)
-                and integration["source_sha"] == publication_parents[0]
-                and self.owner.git.is_ancestor(
-                    str(published_default), str(published_candidate)
-                )
-            )
-        else:
-            candidate_boundary_valid = self.owner.git.commit_parents(
-                str(published_candidate)
-            ) == [published_base, published_default]
-        publication_boundary_valid = (
-            self.owner.git.is_ancestor(str(published_base), publication_sha)
-            and self.owner.git.is_ancestor(
-                str(job.get("publication_prior_published_sha", published_base)),
-                publication_sha,
-            )
-            and self.owner.git.resolve(f"{publication_sha}^{{tree}}")
-            == self.owner.git.resolve(f"{published_candidate}^{{tree}}")
-            and candidate_boundary_valid
-            and (
-                not published_as_merge_resolution
-                or (
-                    len(publication_parents) == 2
-                    and publication_parents[1] == published_default
-                    and (
-                        publication_parent is None
-                        or publication_parents[0] == publication_parent
-                    )
-                )
-            )
-            and (
-                publication_parent is None
-                or (
-                    bool(publication_parents)
-                    and publication_parents[0] == publication_parent
-                )
-            )
-        )
-        if (
-            live.get("state") != "MERGED"
-            or not isinstance(integrated, str)
-            or live.get("integrated_sha") != integrated
-            or live.get("head_sha") != job.get("publication_sha")
-            or live.get("base_branch") != state.get("run_branch")
-            or live.get("head_tree") != live.get("integrated_tree")
-            or (
-                not published_as_merge_resolution
-                and not commit_messages_match(
-                    live.get("integrated_message"), publication.get("commit_message")
-                )
-            )
-            or live.get("integrated_parents") != expected_parents
-            or not publication_boundary_valid
-            or (
-                published_as_merge_resolution
-                and (
-                    not self.owner.git.is_ancestor(
-                        str(published_default), str(published_candidate)
-                    )
-                    or not self.owner.git.is_ancestor(
-                        str(published_default), publication_sha
-                    )
-                    or not self.owner.git.is_ancestor(str(published_default), integrated)
-                )
-            )
+        integrated = str(job["integrated_sha"])
+        if integrated != job.get("candidate_sha") or not self.owner.git.is_ancestor(
+            str(job["base_sha"]), integrated
         ):
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
@@ -502,7 +348,7 @@ class RunRepairPromotion:
             return False
         promoted = self.owner._candidate_promotion_record(state, job, integrated)
         if promoted is None:
-            # A merged Candidate is not automatically an accepted Run.  Any
+            # A written Candidate is not automatically an accepted Run.  Any
             # mismatch at this seam discards the Candidate and starts a fresh
             # Run Acceptance generation against the live authorities.
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
@@ -558,7 +404,6 @@ class RunRepairPromotion:
                 ),
                 "candidate_sha": job["candidate_sha"],
                 "publication_sha": job["publication_sha"],
-                "repair_pr_number": job["pr_number"],
                 "integrated_sha": integrated,
                 "reviewed_head_sha": integrated,
                 "acceptance_record": promoted,
@@ -621,7 +466,7 @@ class RunRepairPromotion:
                 publication_state, str(run["publication_sha"])
             )
             publication_state["phase"] = "stale"
-            for key in ("artifact", "write_intent", "approval_grant"):
+            for key in ("artifact", "approval_grant"):
                 publication_state.pop(key, None)
         state["status"] = "run_publication_pending"
         state["terminal_kind"] = "run_acceptance_passed"

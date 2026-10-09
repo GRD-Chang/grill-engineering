@@ -27,12 +27,12 @@ def test_publication_prompts_keep_human_blocker_semantics(
         {"acceptance_scope": "ticket", "acceptance_artifact": {}},
         name="ticket-publication",
     )
-    run_repair = _capture_public_prompt(
+    parent_only = _capture_public_prompt(
         tmp_path,
         monkeypatch,
         "publication",
-        {"acceptance_scope": "run", "acceptance_artifact": {}},
-        name="run-repair-publication",
+        {"acceptance_scope": "parent_only", "acceptance_artifact": {}},
+        name="parent-only-publication",
     )
     final_run = _capture_public_prompt(
         tmp_path,
@@ -42,7 +42,7 @@ def test_publication_prompts_keep_human_blocker_semantics(
         name="final-run-publication",
     )
 
-    for prompt in (ticket, run_repair, final_run):
+    for prompt in (ticket, parent_only, final_run):
         assert "human_blocker" in prompt
         assert "commit_message" in prompt
         assert "pr_body_markdown" in prompt
@@ -262,7 +262,7 @@ def test_first_ticket_ci_repair_prompt_does_not_claim_new_review_or_ci(
     assert "尚未取得新版本 CI 结果" in prompt
 
 
-def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
+def test_prompt_roles_distinguish_ticket_parent_review_and_final_run_publication(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ticket = _capture_public_prompt(
@@ -279,20 +279,20 @@ def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
         {"acceptance_scope": "parent_only"},
         name="parent-role",
     )
-    run_repair = _capture_public_prompt(
+    final_run = _capture_public_prompt(
         tmp_path,
         monkeypatch,
-        "publication",
-        {"acceptance_scope": "run", "acceptance_artifact": {}},
-        name="run-repair-role",
+        "run_publication",
+        {"acceptance_artifact": {}},
+        name="final-run-role",
     )
 
     assert "独立验收工程师" in ticket
     assert "具体任务的标题、正文和验收条件确定本次范围" in ticket
     assert "独立验收工程师" in parent
     assert "该需求的标题、正文和全部验收条件确定本次范围" in parent
-    assert "交付说明" in run_repair
-    assert "读取最终子任务及依赖" in run_repair
+    assert "交付说明" in final_run
+    assert "读取最终子任务及依赖" in final_run
 
 
 def test_development_prompt_keeps_role_specific_human_blocker_semantics(
@@ -1128,15 +1128,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             },
             (parent_url, "ARTIFACT_SENTINEL"),
         ),
-        (
-            "run_repair_publication",
-            "publication",
-            {
-                "acceptance_scope": "run",
-                "acceptance_artifact": artifact,
-            },
-            (parent_url, "ARTIFACT_SENTINEL"),
-        ),
+        # Parent repair publishes through the final Run role below.
         (
             "final_run_publication",
             "run_publication",
@@ -1170,7 +1162,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     prior_blockers = ["  PRIOR_BLOCKER_SENTINEL must remain verbatim.  "]
 
     # Keep every prompt/continuation pair, but let xdist schedule the matrix
-    # across workers instead of serializing all 44 calls in one test item.
+    # across workers instead of serializing the role matrix in one test item.
     for index, (name, method, role_request, required) in enumerate(cases):
         if index % 4 != case_group:
             continue
@@ -1884,7 +1876,7 @@ def test_custom_methods_reach_actual_development_calls(
     assert str(tmp_path / "custom") in prompt
 
 
-@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("publication", "run"), ("run_publication", "run")])
+@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("run_publication", "run")])
 def test_custom_review_and_publication_methods_reach_actual_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, scope: str,
 ) -> None:
@@ -1975,7 +1967,7 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
         ),
         ("publication", {"acceptance_scope": "ticket", "acceptance_artifact": {}},
          "publication", ("publishing",)),
-        ("publication", {"acceptance_scope": "run", "acceptance_artifact": {}},
+        ("publication", {"acceptance_scope": "parent_only", "acceptance_artifact": {}},
          "publication", ("publishing",)),
         ("run_publication", {"acceptance_artifact": {}}, "publication", ("publishing",)),
     ],

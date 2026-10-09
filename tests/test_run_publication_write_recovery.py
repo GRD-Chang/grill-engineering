@@ -236,7 +236,7 @@ def test_public_resume_reconciles_reopened_pr_then_checks_and_requires_approval(
     assert publisher.live_pull_request(int(pull["number"]))["state"] == "OPEN"
 
 
-@pytest.mark.parametrize("location", ["parent", "run_repair"])
+@pytest.mark.parametrize("location", ["parent"])
 @pytest.mark.parametrize("phase", ["publishing", "merging", "merged"])
 def test_change_publication_resume_retains_exact_stage(location: str, phase: str) -> None:
     from copy import deepcopy

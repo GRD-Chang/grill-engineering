@@ -271,14 +271,14 @@ def _prepared_resume(
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "repair_job": {
-                "phase": "accepted",
+                "phase": "candidate",
                 "policy_snapshot": dict(state["policy_snapshot"]),
                 "repair_generation": 2,
                 "repair_mode": "squash",
-                "publication_thread_id": "current-repair-thread",
+                "review_resume_thread_id": "current-repair-thread",
             }
         }
-        role = "publication"
+        role = "fresh_acceptance"
         work_subject = f"run-repair:{run_id}"
         attempt_owner = state["run_acceptance"]["repair_job"]
     elif subject_kind == "final_publication":
@@ -313,7 +313,8 @@ def _prepared_resume(
     invocation: dict[str, Any] = {
         "role": role,
         "work_subject": work_subject,
-        "phase": "run_publication" if role == "final_publication" else "publication",
+        "phase": ("run_publication" if role == "final_publication" else
+                  "reviewing" if role == "fresh_acceptance" else "publication"),
         "mode": "fresh",
         "input_fingerprint": "fixture",
         "currentness_boundary": {},
@@ -332,11 +333,12 @@ def _prepared_resume(
     if type(invocation_generation) is int:
         semantic_attempt = allocate_semantic_attempt(
             attempt_owner,
-            role="publication",
+            role="reviewer" if role == "fresh_acceptance" else "publication",
             work_subject=work_subject,
             generation=invocation_generation,
             currentness_boundary={},
             ordinal=1,
+            budget_window=1 if role == "fresh_acceptance" else None,
         )
         invocation["semantic_attempt"] = dict(semantic_attempt)
     state["active_agent_invocation"] = invocation
@@ -352,7 +354,7 @@ def _prepared_resume(
     "subject_kind", ["ticket", "run_repair", "final_publication"]
 )
 @pytest.mark.parametrize("new_thread", [False, True])
-def test_resume_fails_closed_for_stale_publication_generation(
+def test_resume_fails_closed_for_stale_agent_generation(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     subject_kind: str,
@@ -500,7 +502,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     ],
 )
 @pytest.mark.parametrize("new_thread", [False, True])
-def test_publication_failure_resume_marks_the_successor_mode(
+def test_agent_failure_resume_marks_the_successor_mode(
     git_repo: Path,
     subject_kind: str,
     invocation_generation: int,
@@ -521,10 +523,11 @@ def test_publication_failure_resume_marks_the_successor_mode(
         publication = resumed["ticket_jobs"]["3"]
     else:
         publication = resumed["parent_job"]
+    resume_key = "review_failure_resume" if subject_kind == "run_repair" else "publication_failure_resume"
     if new_thread:
-        assert "publication_failure_resume" not in publication
+        assert resume_key not in publication
     else:
-        assert publication["publication_failure_resume"] is True
+        assert publication[resume_key] is True
 
 
 _MISSING = object()
@@ -556,4 +559,24 @@ def test_parent_only_resume_rejects_invalid_generation_without_mutation(
         controller.resume(run_id, new_thread=new_thread)
 
     assert save_calls == []
+    assert store.load_run(run_id) == before
+
+
+def test_parent_repair_rejects_internal_publication_attempt(git_repo: Path) -> None:
+    controller, store, run_id = _prepared_resume(
+        git_repo, subject_kind="run_repair", invocation_generation=2,
+    )
+    state = store.load_run(run_id)
+    assert state is not None
+    job = state["run_acceptance"]["repair_job"]
+    job.pop("pending_semantic_attempt")
+    allocate_semantic_attempt(
+        job, role="publication", work_subject=f"run-repair:{run_id}",
+        generation=2, currentness_boundary={}, ordinal=1,
+    )
+    state["active_agent_invocation"] = None
+    store.save_run(run_id, state)
+    before = store.load_run(run_id)
+    with pytest.raises(IncompatibleRunStateError, match="owner mismatch"):
+        controller.resume(run_id)
     assert store.load_run(run_id) == before

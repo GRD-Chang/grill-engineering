@@ -4,6 +4,11 @@ status: accepted
 
 # 统一 Ticket 工作并发额度，保留单席集成交付
 
+## 后续取代：完整 Parent 修复直接交付
+
+[ADR 0025](0025-parent-repair-without-internal-pr.md) 取代本文中 Run Repair 使用内部 Publish、PR、CI 与 PR 合并生命周期的条款。完整 Parent 的修复仍共用 Agent 执行、预算、证据与准确写入核验能力，但直接由程序更新 Run Branch，仅最终 Run PR 承担文案、必要 CI 与人工批准。Ticket、Parent-only 及其余祖先关系、未知写入先对账与恢复合同保持有效；下文相关内部 PR 描述保留为历史决策。
+
+
 同一 Delivery Run 保留固定基线上的并行 Ticket 工作与单一 Run Branch 集成席位：普通远端追加在交付时接纳，正常集成、发布、CI 等待及合入期间持席，CI 代码修复与已确认可安全让位的异常暂停释放。未知推送、PR 与合并结果先按 [ADR 0022](0022-publication-write-reconciliation.md) 对账，再让出原席位。多个集成候选同时推进会增加版本失效与 CI 重跑；当前选择让开发利用等待时间，同时保持集成交付顺序简单。
 
 需求开发、Review、CI 修复、冲突处理等实际 Agent 工作共用 Ticket Work Concurrency，纯 CI 等待、排队与程序监督不占名额。Runner 必须在其他 Ticket 执行长时间 Agent 工作时持续观测 CI，并推进已满足交付条件的 Ticket；并发上限为 1 也不能停止外部监督。统一额度防止修复阶段额外扩大资源使用，但不表示控制 Agent 内部所有子进程的总数。

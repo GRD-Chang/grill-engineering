@@ -258,7 +258,6 @@ def test_approval_waits_keep_generation_budget_and_revocation_boundaries(changed
 @pytest.mark.parametrize("owner,expected_subject", [
     ("active_ticket_job", "ticket:3"),
     ("parent_job", "parent-only:run-example"),
-    ("repair_job", "run-repair:run-example"),
     ("run_publication", "run-publication:run-example"),
 ])
 def test_persisted_waits_bind_the_actual_owner_generation_and_budget(
@@ -293,30 +292,34 @@ def test_persisted_waits_bind_the_actual_owner_generation_and_budget(
     assert event["required_checks_head_sha"] == "head-1"
 
 
-def test_active_repair_checks_do_not_inherit_a_stale_publication_owner(tmp_path: Path) -> None:
+def test_pending_repair_write_does_not_inherit_stale_final_pr_checks(tmp_path: Path) -> None:
     from agent_run.state import StateStore
 
-    stale_publication = {
-        "phase": "stale", "pr_number": 236,
-        "required_checks_evidence": {"pr_number": 236, "head_sha": "stale-head", "result": "pass", "checks": []},
-    }
-    repair = {
-        "phase": "waiting_checks", "repair_generation": 2, "pr_number": 237,
-        "review_budget": {"window": 3},
-        "required_checks_evidence": {"pr_number": 237, "head_sha": "repair-head", "result": "pending", "checks": []},
-    }
     state = {
-        "run_id": "run-example", "status": "waiting_checks",
-        "run_publication": stale_publication,
+        "run_id": "run-example", "status": "ready_for_human",
+        "run_publication": {
+            "phase": "stale", "pr_number": 236,
+            "required_checks_evidence": {
+                "pr_number": 236, "head_sha": "stale-head", "result": "pass", "checks": [],
+            },
+        },
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 1,
-            "repair_job": repair,
+            "review_budget": {"window": 3},
+            "repair_job": {
+                "phase": "blocked", "blocked_reason": "run_branch_write_failed",
+                "repair_generation": 2, "candidate_sha": "repair-head",
+                "run_branch_write_intent": {"candidate_sha": "repair-head"},
+            },
         },
     }
     store = StateStore(tmp_path)
     store.save_run("run-example", state)
     event = store.load_run("run-example")["timeline"][-1]
-    assert event["pr_number"] == 237
-    assert event["required_checks_head_sha"] == "repair-head"
+    assert event.get("pr_number") is None
+    assert event.get("required_checks_head_sha") is None
+    assert event["github_write_action"] == "update_run_branch"
+    assert event["commit_sha"] == "repair-head"
     assert event["history_work_subject"] == "run-repair:run-example"
     assert event["history_generation"] == 2
+    assert event["history_budget_window"] == 3

@@ -20,7 +20,7 @@ Review Context 的准备与返回结论绑定由共同职责处理。上下文�
 
 本轮集中已有错误处理、Agent 修复、程序等待/对账、暂停与恢复规则，并修正已确认的执行不一致；不扩大 Agent 自动调查范围，不新增普通提交、部分 Parent fetch 或发布操作失败后的 Development 调查流程。相关权限、材料或外部条件问题继续通过现有暂停与人工 resume 处理。这项范围限制使共同机制的深化与新增修复能力分别验收。
 
-这是一项已确认的目标设计；共同 Agent 执行、固定预算归属与 Review Context 已实施，确定操作与内部 Repair PR 的剩余职责深化由后续切片完成。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。
+共同 Agent 执行、固定预算归属、Review Context 与准确发布对账已接入；完整 Parent 修复由程序更新 Run Branch，不保留内部 Repair PR 生命周期。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。
 
 
 ## 共同 Agent 执行的实现边界
@@ -72,14 +72,20 @@ flowchart LR
 flowchart TB
     T["Ticket"] --> D["开发—审核循环"]
     PO["Parent-only"] --> D
-    PA["Parent：全部 Ticket 真正完成"] -->|首次完整审核| I["集成、Git 检查与适用审核"]
-    D --> I
-    I --> P["Publish 与当前交付 PR"]
+    PA["Parent：全部 Ticket 真正完成"] -->|首次完整审核| RI["Run 集成、Git 检查与完整审核"]
+    RI -->|Findings| RD["Parent 修复开发与审核"]
+    RD --> RW["程序准确更新 Run Branch"]
+    RW --> RI
+    RI --> RP["最终 Run PR Publish 与程序发布"]
+    RP --> C
+    D --> I["Change 集成、Git 检查与适用审核"]
+    I --> P["Ticket 或 Parent-only Publish 与交付 PR"]
     P --> C["准确 CI"]
-    C -->|失败| D
+    C -->|Ticket 或 Parent-only 失败| D
+    C -->|完整 Parent 失败| RD
     C -->|Ticket 门禁通过| TM["合入 Run Branch"]
     C -->|Parent 门禁通过| H["当前成果人工批准"]
     H --> M["最终复核与合入默认分支"]
 ```
 
-上图省略共同暂停出口及批准失效后的回流；内部 Repair PR 的删除仍由 ADR 0025 的后续切片负责，本切片保留既有内部交付路径。
+上图省略共同暂停出口及批准失效后的回流。完整 Parent 的修复按 ADR 0025 直接更新 Run Branch，由最终 Run PR 承担 CI 与人工批准；图调度与 Agent 许可分界不恢复内部 Repair PR 生命周期。

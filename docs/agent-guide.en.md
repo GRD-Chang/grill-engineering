@@ -64,3 +64,7 @@ Run mutation commands from any directory with the actual Parent and `--repo OWNE
 | Abandon | Follow `abandon` boundaries; preserve uncommitted work by default and require explicit authorization for forced discard |
 
 For exhausted limits, changed scope, or incompatible state, report the decision needed. Recover through the public CLI; never edit persistent run state to bypass gates. See [local state and cleanup](agent-run.md#本地状态与清理) for directory ownership and retention.
+
+For a multi-ticket Parent, Findings and final-PR CI repairs cover the complete Parent and preserve completed Tickets. The program updates the Run Branch after applicable integration and acceptance; only the final Run PR has publication copy, Hosted CI and human approval. There is no internal Repair PR. Ticket PRs and Parent-only delivery retain their own checks and delivery gates.
+
+New Runs use `branch_authority_protocol=3`; old Runs are rejected without migration or deletion of their results. A denied Run Branch update preserves the repair checkout, candidate and write intent and pauses for human action. After the missing permission or repository condition is resolved, continue through `resume`. An unknown push result is reconciled first. Repository write permission alone does not prove that branch rules allow a new head; the Runner does not change rules, force-push or restore an internal PR fallback.

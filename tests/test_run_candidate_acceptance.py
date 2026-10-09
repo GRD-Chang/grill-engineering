@@ -36,28 +36,13 @@ from support.cli import run_cli, stdout_json
 
 from support.run_agents import ScriptedRunAgents
 
-@pytest.mark.parametrize(
-    ("display_outcome", "expected_display_status"),
-    [
-        ("linked", "linked"),
-        ("api_error", "unavailable"),
-        ("empty", "unavailable"),
-        ("missing_readback", "unavailable"),
-    ],
-)
-def test_run_acceptance_repairs_then_rechecks_the_whole_run(
-    git_repo: Path, display_outcome: str, expected_display_status: str
-) -> None:
+def test_run_acceptance_repairs_then_rechecks_the_whole_run(git_repo: Path) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
-    repair_branch = f"agent-run-repair/{state['run_id']}/1"
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {}).setdefault("published_branches", {})[
-        repair_branch
-    ] = git.resolve(str(state["run_branch"]))
-    data["delivery"]["linked_branch_display_outcomes"] = display_outcome
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = ScriptedRunAgents()
+    class NoInternalPublicationAgents(ScriptedRunAgents):
+        def publication(self, request: dict[str, Any]) -> dict[str, str]:
+            raise AssertionError("Parent repair must not call Publish")
+    agents = NoInternalPublicationAgents()
 
     result = RunAcceptanceEngine(
         git=git,
@@ -144,28 +129,12 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert len({str(checkout) for checkout in validation_checkouts}) == 2
     assert all(not checkout.exists() for checkout in validation_checkouts)
     fixture_data = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
-    repair_prs = fixture_data["delivery"]["pull_requests"]
-    assert len(repair_prs) == 1
-    assert repair_prs[0]["scope"] == "run_repair"
-    assert repair_prs[0]["base_branch"] == state["run_branch"]
-    assert repair_prs[0]["body"].startswith(
-        "Parent Issue: #1\nDelivery Type: Run Repair\n\n"
-    )
-    repair_statuses = fixture_data["delivery"]["agent_run_status"]
-    assert repair_statuses[0]["scope"] == "run-repair-1"
-    assert repair_statuses[0]["candidate_sha"] == run["candidate_sha"]
+    assert fixture_data["delivery"]["pull_requests"] == []
     assert fixture_data["delivery"]["closed_issues"] == []
-    assert not (
-        states.root / "worktrees" / str(state["run_id"]) / "run-repair"
-    ).exists()
+    assert fixture_data["delivery"]["published_branches"][state["run_branch"]] == run["candidate_sha"]
+    assert not (states.root / "worktrees" / str(state["run_id"]) / "run-repair").exists()
     repair_branch = run["completed_repair_jobs"][0]["repair_branch"]
-    assert run["completed_repair_jobs"][0]["linked_branch_display"] == {
-        "display_attempted": True,
-        "status": expected_display_status,
-    }
-    assert fixture_data["delivery"]["linked_branches"] == (
-        {"1": repair_branch} if expected_display_status == "linked" else {}
-    )
+    assert "pr_number" not in run["completed_repair_jobs"][0]
     assert repair_branch not in fixture_data["delivery"]["published_branches"]
     with pytest.raises(GitError):
         git.resolve(repair_branch)
@@ -370,9 +339,7 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
 @pytest.mark.parametrize(
     ("job_phase", "run_status"),
     [
-        ("publishing", "active"),
-        ("waiting_checks", "waiting_external"),
-        ("waiting_merge", "waiting_external"),
+        ("accepted", "active"),
     ],
 )
 def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
@@ -393,19 +360,6 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
             "artifact": _passing_artifact(),
         },
     }
-    if job_phase == "waiting_checks":
-        repair_job.update(
-            {
-                "pr_number": 1,
-                "publication_sha": candidate_sha,
-                "required_checks_evidence": {
-                    "pr_number": 1,
-                    "head_sha": candidate_sha,
-                    "result": "pending",
-                    "checks": [{"name": "quality", "bucket": "pending"}],
-                },
-            }
-        )
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
@@ -435,11 +389,6 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     assert repair_status["candidate_validation_status"] == "pass"
     assert repair_status["candidate_validation_phase"] == "pass"
     assert "当前版本验收 已通过" in text_status.stdout
-    phase_label = {
-        "publishing": "发布中", "waiting_checks": "等待合并前检查",
-        "waiting_merge": "等待合并确认",
-    }[job_phase]
-    assert f"阶段:       {phase_label}" in text_status.stdout
 
 def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
     git_repo: Path,
@@ -669,90 +618,3 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     }
     state["run_acceptance"]["ci_recovery"] = new_ci_recovery_budget()
     require_current_run_state(state)
-
-@pytest.mark.parametrize(
-    ("changed_field", "changed_value", "expected"),
-    [
-        (None, None, None),
-        ("head_sha", "foreign-head", "change_pr_head_changed_externally"),
-        ("base_branch", "foreign-base", "change_pr_base_changed_externally"),
-        ("base_sha", "foreign-base", "change_pr_base_changed_externally"),
-        ("integrated_sha", "foreign-merge", "change_pr_integrated_sha_changed_externally"),
-        ("integrated_tree", "foreign-tree", "change_pr_integrated_tree_changed_externally"),
-        ("integrated_parents", [], "change_pr_integrated_parents_changed_externally"),
-    ],
-)
-def test_integrated_revalidation_pr_exemption_requires_exact_live_facts(
-    git_repo: Path,
-    changed_field: str | None,
-    changed_value: object,
-    expected: str | None,
-) -> None:
-    git = GitRepository(git_repo)
-    base = git.resolve("main")
-    tree = git.resolve(f"{base}^{{tree}}")
-
-    def commit_tree(message: str, *parents: str) -> str:
-        command = ["git", "commit-tree", tree]
-        for parent in parents:
-            command.extend(("-p", parent))
-        return subprocess.run(
-            command,
-            cwd=git_repo,
-            input=f"{message}\n",
-            text=True,
-            check=True,
-            capture_output=True,
-        ).stdout.strip()
-
-    default = commit_tree("default", base)
-    candidate = commit_tree("candidate", base, default)
-    integrated = commit_tree("integrated", base, candidate)
-    state = {"run_branch": "agent-run/run-1"}
-    job = {
-        "pr_number": 7,
-        "integrated_sha": integrated,
-        "integrated_revalidation_merge": {
-            "base_sha": base,
-            "default_base_sha": default,
-            "candidate_sha": candidate,
-            "publication_sha": candidate,
-        },
-    }
-    live: dict[str, object] = {
-        "state": "MERGED",
-        "head_sha": candidate,
-        "base_branch": state["run_branch"],
-        "base_sha": integrated,
-        "integrated_sha": integrated,
-        "head_tree": tree,
-        "integrated_tree": tree,
-        "integrated_parents": [base, candidate],
-    }
-    canonical_live = dict(live)
-    if changed_field is not None:
-        live[changed_field] = changed_value
-
-    class Reader:
-        def live_pull_request(self, pr_number: int) -> dict[str, Any]:
-            assert pr_number == 7
-            return dict(live)
-
-    assert unknown_pr_mutation(
-        state, "run-repair:1", job, Reader(), git
-    ) == expected
-
-    foreign_trees = {
-        **canonical_live,
-        "head_tree": "foreign-tree",
-        "integrated_tree": "foreign-tree",
-    }
-
-    class ForeignTreeReader:
-        def live_pull_request(self, pr_number: int) -> dict[str, Any]:
-            assert pr_number == 7
-            return foreign_trees
-
-    assert unknown_pr_mutation(
-        state, "run-repair:1", job, ForeignTreeReader(), git
-    ) == "change_pr_head_tree_changed_externally"

@@ -204,12 +204,6 @@ class GhGitHubPublisher:
     def ensure_parent_branch(self, **authority: str) -> None:
         self.ensure_change_branch(**authority)
 
-    def ensure_run_repair_branch(self, **authority: str) -> None:
-        self.ensure_change_branch(**authority)
-
-    def ensure_run_repair_pr(self, **authority: Any) -> int:
-        return self.ensure_change_pr(**authority)
-
     def ensure_final_run_ref(self, *, branch: str, expected_head_sha: str) -> None:
         self._ensure_remote_run_branch(branch, expected_head_sha)
 

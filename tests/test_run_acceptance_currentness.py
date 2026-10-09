@@ -129,15 +129,6 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     repair_branch = f"agent-run-repair/{state['run_id']}/1"
-    publisher.ensure_run_repair_branch(
-        branch=repair_branch, base_branch=str(state["run_branch"])
-    )
-    pr_number = publisher.ensure_run_repair_pr(
-        branch=repair_branch,
-        base_branch=str(state["run_branch"]),
-        title="old repair",
-        body="old repair body",
-    )
     run = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -163,7 +154,6 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
             "acceptance_artifact": _repair_artifact(),
             "development_thread_id": "repair-old",
             "reviewer_thread_ids": ["repair-reviewer-old"],
-            "pr_number": pr_number,
             "publication_sha": git.resolve(str(state["run_branch"])),
         },
     }
@@ -178,7 +168,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     assert "requeue_required" not in refreshed
     assert "repair_job" not in refreshed["run_acceptance"]
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
-    assert pulls[0]["state"] == "OPEN"
+    assert all(pull.get("scope") != "run_repair" for pull in pulls)
 
 
 def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout(
@@ -201,13 +191,10 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     git.ensure_run_branch(
         ticket_branch, str(state["ticket_jobs"]["2"]["integrated_sha"])
     )
-    publisher.ensure_run_repair_branch(
-        branch=ticket_branch, base_branch=str(state["run_branch"])
+    publisher.sync_run_branch(
+        run_branch=ticket_branch, integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"])
     )
     repair_branch = f"agent-run-repair/{run_id}/1"
-    publisher.ensure_run_repair_branch(
-        branch=repair_branch, base_branch=str(state["run_branch"])
-    )
     checkout = states.root / "worktrees" / run_id / "run-repair"
     git.prepare_ticket_checkout(
         branch=repair_branch,
@@ -411,7 +398,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         for mutation in recovered_delivery["mutations"]
         if mutation.get("action") == "delete_managed_branch"
         and mutation.get("branch") == repair_branch
-    ] == [{"action": "delete_managed_branch", "branch": repair_branch}]
+    ] == []
     assert recovered_state["retired_semantic_attempt_owners"] == persisted[
         "retired_semantic_attempt_owners"
     ]

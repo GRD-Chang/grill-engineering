@@ -1054,6 +1054,12 @@ class Controller:
         *,
         check_requeue_currentness: bool = False,
     ) -> dict[str, Any]:
+        run = state.get("run_acceptance")
+        repair = run.get("repair_job") if isinstance(run, dict) else None
+        if isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+            # Let the original Run Branch write settle before projecting new
+            # graph/currentness facts onto its still-pending authority.
+            return state
         try:
             repository = self.github.repository()
             default_head = self.publisher.resolve_base(
@@ -1185,6 +1191,11 @@ class Controller:
         subject, job, _ = current_change_job(state)
         if job is None:
             return
+        if subject.startswith("run-repair:") and isinstance(job.get("run_branch_write_intent"), dict):
+            # A pending Run Branch mutation belongs to its deterministic
+            # write owner. Resume must retain it until remote readback has
+            # resolved the original operation, even when facts drifted.
+            return
         phase = job.get("phase")
         if phase == "publication_pending" and job.get("execution_resume_phase") in {"merging", "merged"}:
             phase = job["execution_resume_phase"]
@@ -1230,7 +1241,7 @@ class Controller:
                 "change_pr_head_changed_externally",
                 "change_pr_base_changed_externally",
             }
-            and subject.startswith(("run-repair:", "parent-only:"))
+            and subject.startswith("parent-only:")
             # A failed remote read cannot prove a rewrite. Delivery will
             # re-read the exact snapshot before reviewing or publishing.
             and _change_pr_is_append_only(
@@ -1401,7 +1412,7 @@ class Controller:
                 or self.publisher.git.runner_identity or {"source": "host"}
             ),
             "prompt_resources": resolve_resources(language),
-            "branch_authority_protocol": 2,
+            "branch_authority_protocol": 3,
             "review_budget_protocol": 2,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
             "multi_ticket_protocol": 4,
@@ -2102,9 +2113,7 @@ def _resume_ci_recovery_window(
         origin = repair_job.get("required_checks_origin")
         budget = job["ci_recovery"]
         publication = state.get("run_publication")
-        expected_pr = repair_job.get("pr_number")
-        if type(expected_pr) is not int and isinstance(publication, dict):
-            expected_pr = publication.get("pr_number")
+        expected_pr = publication.get("pr_number") if isinstance(publication, dict) else None
         origin = require_required_checks_observation(
             origin,
             location="run_acceptance.repair_job.required_checks_origin",

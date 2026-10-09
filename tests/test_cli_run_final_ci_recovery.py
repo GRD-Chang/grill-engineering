@@ -5,24 +5,25 @@ from pathlib import Path
 from typing import Any
 
 from support.cli import load_only_run_state, run_cli, stdout_json
-from support.cli_payloads import passing_acceptance, publication
+from support.cli_payloads import passing_acceptance
 from support.cli_supervision import _resume_repair_agents
 from support.published_run import prepare_accepted_run, prepare_published_run
-from support.workspace import managed_state
+from agent_run.git import GitRepository
+from support.workspace import managed_repo, managed_state
 
 
 def _two_round_ci_repair_agents(path: Path) -> Path:
     agents = _resume_repair_agents(path, expected_thread_id=None)
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["developments"].append({
-        "expected_thread_id": "run-repair-developer-1",
-        "thread_id": "run-repair-developer-1",
-        "summary": "Repaired the internal PR check after the final PR failure.",
-        "write_files": {"run-repair.txt": "recovered internal CI\n"},
+        "expected_thread_id": None,
+        "thread_id": "run-repair-developer-2",
+        "summary": "Repaired the updated final PR after its check failed again.",
+        "write_files": {"run-repair.txt": "recovered final CI\n"},
     })
-    data["publications"].append(publication())
+    data["run_publications"].append(data["run_publications"][0])
     data["run_reviews"].append(passing_acceptance(
-        "run-reviewer-internal-ci", "The internal PR CI repair passed."
+        "run-reviewer-second-ci", "The second final PR CI repair passed."
     ))
     agents.write_text(json.dumps(data), encoding="utf-8")
     return agents
@@ -35,10 +36,12 @@ def _assert_final_ci_repair_then_approve(
     run = state["run_acceptance"]
     final = state["run_publication"]
     failed = paused["run_publication"]["required_checks_evidence"]
-    original_evidence = run["ci_failed_evidence"]
+    original_evidence = run["completed_repair_jobs"][0]["ci_evidence"]
     assert original_evidence["pr_number"] == failed["pr_number"]
     assert original_evidence["checks"][0]["job"]["head_sha"] == failed["head_sha"]
     assert original_evidence["checks"][0]["description"] == "The fixture required check failed."
+    assert run["ci_failed_evidence"]["pr_number"] == failed["pr_number"]
+    assert run["ci_failed_evidence"]["checks"][0]["job"]["head_sha"] == run["ci_recovery"]["failure_head"]
     assert run["review_budget"] == ordinary_budget
     budget = run["ci_recovery"]
     assert budget["window"] == 1
@@ -55,20 +58,24 @@ def _assert_final_ci_repair_then_approve(
     pulls = delivery["pull_requests"]
     final_pulls = [pull for pull in pulls if pull.get("scope") == "final_run"]
     repair_pulls = [pull for pull in pulls if pull.get("scope") == "run_repair"]
-    assert len(final_pulls) == len(repair_pulls) == 1
+    assert len(final_pulls) == 1
+    assert repair_pulls == []
     assert final_pulls[0]["number"] == final["pr_number"] == failed["pr_number"]
     assert final_pulls[0]["state"] == "OPEN"
-    assert repair_pulls[0]["state"] == "MERGED"
     final_head = delivery["published_branches"][state["run_branch"]]
     assert final["required_checks_evidence"]["head_sha"] == final_head
     assert final["required_checks_evidence"]["result"] == "pass"
     assert final_head != failed["head_sha"]
     assert "approval_grant" not in final
-    archived = run["completed_repair_jobs"][-1]["ci_evidence"]
-    assert archived["pr_number"] == repair_pulls[0]["number"]
-    assert archived["head_sha"] == budget["failure_head"]
-    assert archived["result"] == "fail"
-    assert archived["checks"][0]["bucket"] == "fail"
+    archived = run["completed_repair_jobs"][-1]
+    assert "pr_number" not in archived
+    assert archived["integrated_sha"] == final_head
+    assert archived["candidate_sha"] == final_head
+    assert not any(
+        item.get("work_subject") == f"run-repair:{state['run_id']}"
+        and item.get("role") == "publication"
+        for item in state["agent_invocation_history"]
+    )
 
     record = run["acceptance_record"]
     assert run["phase"] == "accepted"
@@ -87,6 +94,15 @@ def _assert_final_ci_repair_then_approve(
     final_pull = next(pull for pull in delivery["pull_requests"] if pull["number"] == final["pr_number"])
     assert final_pull["state"] == "MERGED"
     assert 1 in delivery["closed_issues"]
+    git = GitRepository(managed_repo(repo))
+    integrated = delivered["run_publication"]["integrated_sha"]
+    assert git.resolve("main") == integrated
+    assert git.is_ancestor(final_head, integrated)
+    assert git.is_ancestor(state["base"]["sha"], integrated)
+    assert git.is_ancestor(budget["failure_head"], final_head)
+    assert git.is_ancestor(state["base"]["sha"], final_head)
+    assert delivered["ticket_jobs"]["3"]["phase"] == "completed"
+
 
 
 def test_run_supervises_initial_final_check_evidence_reads(
@@ -144,8 +160,8 @@ def test_run_supervises_initial_final_check_evidence_reads(
     assert recovered.returncode == 0, recovered.stderr
     completed = load_only_run_state(git_repo)
     assert stdout_json(recovered)["status"] == "run_approval_pending"
-    assert completed["run_acceptance"]["repair_generation"] == 1
-    assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
+    assert completed["run_acceptance"]["repair_generation"] == 2
+    assert completed["run_acceptance"]["ci_recovery"]["developments_used"] == 2
     _assert_final_ci_repair_then_approve(
         git_repo, fixture, completed, paused_state,
         accepted["run_acceptance"]["review_budget"],
@@ -222,14 +238,14 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
     assert "approval_grant" not in completed["run_publication"]
     failed = completed["run_acceptance"]["ci_failed_evidence"]
     assert failed["pr_number"] == grant["pr_number"]
-    assert failed["checks"][0]["job"]["head_sha"] == grant["head_sha"]
+    assert completed["run_acceptance"]["completed_repair_jobs"][0]["ci_evidence"]["checks"][0]["job"]["head_sha"] == grant["head_sha"]
     assert not any(
         pull.get("scope") == "final_run" and pull.get("state") == "MERGED"
         for pull in json.loads(fixture.read_text())["delivery"]["pull_requests"]
     )
 
-    assert completed["run_acceptance"]["repair_generation"] == 1
-    assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
+    assert completed["run_acceptance"]["repair_generation"] == 2
+    assert completed["run_acceptance"]["ci_recovery"]["developments_used"] == 2
     _assert_final_ci_repair_then_approve(
         git_repo, fixture, completed, waiting_state,
         awaiting["run_acceptance"]["review_budget"],

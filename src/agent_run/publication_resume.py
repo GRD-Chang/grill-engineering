@@ -11,7 +11,7 @@ from agent_run.publication_operation_retry import require_publication_operation_
 def resume_parent_publication_retry(state: dict[str, Any]) -> bool:
     paused = [
         (location, subject) for location, subject in operator_gate_subjects(state)
-        if location in {"parent", "run_repair", "run_publication"}
+        if location in {"parent", "run_publication"}
         and subject.get("phase") == "publication_pending"
     ]
     if not paused:

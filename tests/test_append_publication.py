@@ -177,112 +177,52 @@ def test_remote_change_between_read_and_push_preserves_collaborator_ref(
     assert (remote_ref.split()[0] if remote_ref else None) == collaborator_head
 
 
-def test_merge_resolution_publication_keeps_prior_source_and_default_ancestors(
-    git_repo: Path
-) -> None:
-    git = GitRepository(git_repo)
-    base = _git(git_repo, "rev-parse", "HEAD")
-    default = _candidate(git_repo, "default.txt", "default\n")
-    tree = _git(git_repo, "rev-parse", f"{default}^{{tree}}")
-    first_candidate = _git(
-        git_repo, "commit-tree", tree, "-p", base, "-p", default, "-m", "resolve"
-    )
-    first = git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=first_candidate, run_head_sha=base,
-        default_head_sha=default, message="first",
-    )
-    (git_repo / "repair.txt").write_text("repair\n", encoding="utf-8")
-    _git(git_repo, "add", "repair.txt")
-    repaired_tree = _git(git_repo, "write-tree")
-    second_candidate = _git(
-        git_repo, "commit-tree", repaired_tree, "-p", base, "-p", default,
-        "-m", "resolve again",
-    )
-    second = git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=second_candidate, run_head_sha=base,
-        default_head_sha=default, published_sha=first, message="second",
-    )
-    assert git.commit_parents(second) == [first, default]
-    assert git.is_ancestor(first, second)
-    assert git.is_ancestor(default, second)
-    assert git.resolve(f"{second}^{{tree}}") == git.resolve(
-        f"{second_candidate}^{{tree}}"
-    )
-    (git_repo / "followup.txt").write_text("followup\n", encoding="utf-8")
-    third_candidate = git.commit_merge_resolution_candidate(
-        git_repo, run_head_sha=base, default_head_sha=default,
-        published_sha=second, attempt=3,
-    )
-    assert isinstance(third_candidate, str)
-    third = git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=third_candidate, run_head_sha=base,
-        default_head_sha=default, published_sha=second, message="third",
-    )
-    assert git.commit_parents(third) == [second, default]
-    assert git.is_ancestor(first, third)
-
-
-def test_merge_resolution_publication_uses_exact_integrated_candidate(
+def test_parent_merge_resolution_candidate_keeps_run_and_default_ancestors(
     git_repo: Path,
 ) -> None:
     git = GitRepository(git_repo)
-    run_head = _git(git_repo, "rev-parse", "HEAD")
+    base = git.resolve("HEAD")
     default = _candidate(git_repo, "default.txt", "default\n")
-    original = _git(
-        git_repo, "commit-tree", _git(git_repo, "write-tree"),
-        "-p", run_head, "-p", default, "-m", "resolve",
-    )
-    first = git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=original, run_head_sha=run_head,
-        default_head_sha=default, message="first",
-    )
-    source = _candidate(git_repo, "human.txt", "human\n")
+    original = _git(git_repo, "commit-tree", git.resolve(f"{default}^{{tree}}"),
+                    "-p", base, "-p", default, "-m", "resolve")
+    _git(git_repo, "reset", "--hard", original)
     (git_repo / "repair.txt").write_text("repair\n", encoding="utf-8")
-    _git(git_repo, "add", "repair.txt")
-    integrated_tree = _git(git_repo, "write-tree")
-    integrated = _git(
-        git_repo, "commit-tree", integrated_tree,
-        "-p", original, "-p", source, "-m", "integrate",
+    candidate = git.commit_merge_resolution_candidate(
+        git_repo, run_head_sha=base, default_head_sha=default, attempt=2,
     )
-    record: dict[str, object] = {
+    assert isinstance(candidate, str)
+    assert git.commit_parents(candidate) == [base, default]
+    assert git.is_ancestor(base, candidate)
+    assert git.is_ancestor(default, candidate)
+    assert (git_repo / "default.txt").read_text() == "default\n"
+    assert (git_repo / "repair.txt").read_text() == "repair\n"
+
+
+def test_parent_repair_integration_record_requires_exact_result_and_ancestors(
+    git_repo: Path,
+) -> None:
+    from agent_run.parent_integration import parent_integration_record_is_valid
+
+    git = GitRepository(git_repo)
+    run_head = git.resolve("HEAD")
+    source = _candidate(git_repo, "source.txt", "source\n")
+    original = _candidate(git_repo, "repair.txt", "repair\n")
+    integrated_tree = git.resolve(f"{original}^{{tree}}")
+    integrated = _git(git_repo, "commit-tree", integrated_tree,
+                      "-p", original, "-p", source, "-m", "integrate")
+    record = {
         "candidate_sha": original,
         "candidate_tree": git.resolve(f"{original}^{{tree}}"),
-        "source_sha": source,
-        "target_sha": run_head,
-        "head_sha": integrated,
-        "head_tree": integrated_tree,
-        "conflict_paths": [],
+        "source_sha": source, "target_sha": run_head,
+        "head_sha": integrated, "head_tree": integrated_tree, "conflict_paths": [],
     }
-    publication = git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=integrated, run_head_sha=run_head,
-        default_head_sha=default, published_sha=source,
-        integration=record, message="integrated repair",
+    assert parent_integration_record_is_valid(
+        git, {"candidate_sha": integrated, "base_sha": run_head, "parent_integration": record},
     )
-    assert git.commit_parents(publication) == [source, default]
-    assert git.resolve(f"{publication}^{{tree}}") == integrated_tree
-    assert git.is_ancestor(first, publication)
-    assert git.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=integrated, run_head_sha=run_head,
-        default_head_sha=default, published_sha=source,
-        integration=record, message="integrated repair",
-    ) == publication
-
-    for changed in ({"head_tree": record["candidate_tree"]},
-                    {"source_sha": first}, {"target_sha": default},
-                    {"candidate_sha": source}):
-        with pytest.raises(GitError, match="integration record"):
-            git.create_merge_resolution_publication_commit(
-                git_repo, candidate_sha=integrated, run_head_sha=run_head,
-                default_head_sha=default, published_sha=source,
-                integration={**record, **changed}, message="forged",
-            )
-    rewritten = _git(
-        git_repo, "commit-tree", integrated_tree, "-m", "rewritten source"
-    )
-    with pytest.raises(GitError, match="no longer descends"):
-        git.create_merge_resolution_publication_commit(
-            git_repo, candidate_sha=integrated, run_head_sha=run_head,
-            default_head_sha=default, published_sha=rewritten,
-            integration={**record, "source_sha": rewritten}, message="rewritten",
+    rewritten = _git(git_repo, "commit-tree", integrated_tree, "-m", "foreign history")
+    for changed in ({"head_tree": git.resolve(f"{run_head}^{{tree}}")},
+                    {"source_sha": rewritten}, {"target_sha": rewritten},
+                    {"candidate_sha": rewritten}):
+        assert not parent_integration_record_is_valid(
+            git, {"candidate_sha": integrated, "base_sha": run_head, "parent_integration": {**record, **changed}},
         )
-    assert git.checkout_head(git_repo) == publication

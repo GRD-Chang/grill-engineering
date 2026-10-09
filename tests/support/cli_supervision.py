@@ -16,7 +16,7 @@ from support.cli_fixtures import run_agents
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_state
 from support.cli import PROJECT_ROOT, load_only_run_state, stdout_json
-from support.cli_payloads import parent_publication, passing_acceptance, publication
+from support.cli_payloads import parent_publication, passing_acceptance
 
 _WAIT_FIELDS = {
     "kind",
@@ -299,15 +299,12 @@ def _repair_agents(path: Path, *, repair_generations: int) -> Path:
     for generation in range(1, repair_generations + 1):
         data["developments"].append(
             {
-                "expected_thread_id": (
-                    None if generation == 1 else "run-repair-developer-1"
-                ),
-                "thread_id": "run-repair-developer-1",
+                "expected_thread_id": None,
+                "thread_id": f"run-repair-developer-{generation}",
                 "summary": f"Repaired final Run check generation {generation}.",
                 "write_files": {"run-repair.txt": f"repair-{generation}\n"},
             }
         )
-        data["publications"].append(publication())
         data["run_reviews"].append(
             passing_acceptance(
                 f"run-reviewer-{generation + 1}",
@@ -329,7 +326,7 @@ def _resume_repair_agents(path: Path, *, expected_thread_id: str | None) -> Path
                         "write_files": {"run-repair.txt": "recovered\n"},
                     }
                 ],
-                "publications": [publication()],
+                "publications": [],
                 "reviews": [],
                 "run_reviews": [
                     passing_acceptance(

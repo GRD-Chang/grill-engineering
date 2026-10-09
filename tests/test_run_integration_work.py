@@ -442,7 +442,7 @@ def test_integration_human_response_returns_to_same_work_and_retains_origin(
     assert git._run("show", f"{run['run_integration']['head_sha']}:prior-work.txt").stdout == "original unsaved outcome\n"
 
 
-def test_internal_repair_base_publication_recovers_lost_response_without_repeat_write(
+def test_parent_repair_base_snapshot_recovers_lost_response_without_repeat_write(
     git_repo: Path, tmp_path: Path,
 ) -> None:
     state, states, git, original_publisher = _two_ticket_run(git_repo, tmp_path)
@@ -454,7 +454,8 @@ def test_internal_repair_base_publication_recovers_lost_response_without_repeat_
             result = super().publish_branch(branch, sha, expected_remote_sha=expected_remote_sha)
             if branch == state["run_branch"]:
                 self.writes += 1
-                raise GitHubReadError("lost_write_response", "Lost Run integration publication response")
+                if self.writes == 1:
+                    raise GitHubReadError("lost_write_response", "Lost Run integration publication response")
             return result
 
     publisher = LostResponsePublisher(original_publisher.path, git)
@@ -467,7 +468,9 @@ def test_internal_repair_base_publication_recovers_lost_response_without_repeat_
     assert publisher.live_branch_heads(state["run_branch"], "main")[0] == intent["head_sha"]
     completed = engine.accept(state["run_id"])
     assert completed["status"] == "run_publication_pending"
-    assert publisher.writes == 1
+    # One integrated base snapshot and one reviewed repair Candidate,
+    # without repeating the lost-response base write.
+    assert publisher.writes == 2
     assert "integration_publication_intent" not in completed["run_acceptance"]
     assert len(agents.review_requests) == 2
     assert completed["ticket_jobs"] == state["ticket_jobs"]

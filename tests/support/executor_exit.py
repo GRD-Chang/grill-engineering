@@ -25,7 +25,7 @@ def create_exit_run(
         "parent": {"number": 1, "title": "退出告警", "revision": "parent-v1"},
         "base": {"branch": "main", "sha": "a" * 40},
         "prompt_resources": builtin_resources("zh"),
-        "branch_authority_protocol": 2, "review_budget_protocol": 2,
+        "branch_authority_protocol": 3, "review_budget_protocol": 2,
         "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
         "multi_ticket_protocol": 4, "semantic_attempt_protocol": 1,
         "human_response_audit_protocol": 1,

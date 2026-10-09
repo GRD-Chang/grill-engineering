@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Run Repair worker request construction and PR narrative framing."""
+"""Parent repair Development and Review requests."""
 
 import json
 from dataclasses import dataclass
@@ -9,10 +9,8 @@ from typing import Any
 
 from agent_run.delivery_budget import delivery_budget_owner
 
-from agent_run.agent_invocation import select_publication_thread
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
-    MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     latest_reviewer_thread,
 )
 from agent_run.delivery_protocol import GitHubPublisher
@@ -83,29 +81,6 @@ class RunRepairRequests:
                 "run_repair_integration": integration,
                 "acceptance_artifact": request.get("acceptance_artifact"),
             }, ensure_ascii=False, sort_keys=True)
-        _add_human_resume_fields(request, job)
-        return request
-
-    def publication(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "run",
-            "parent_issue_url": _issue_url(
-                state, int(_mapping(state, "parent")["number"])
-            ),
-            "repository": str(state["repository"]),
-            "parent": _mapping(state, "parent"),
-            "ticket_graph": _mapping(state, "ticket_graph"),
-            "ticket_completion_records": ticket_completion_records(state),
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "checkout": str(checkout),
-            "thread_id": select_publication_thread(
-                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
-            ),
-            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
-        }
         _add_human_resume_fields(request, job)
         return request
 
@@ -185,19 +160,6 @@ class RunRepairRequests:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]
         return request
-
-    @staticmethod
-    def render_pr_body(
-        state: dict[str, Any], publication: dict[str, Any]
-    ) -> str:
-        parent = _mapping(state, "parent")
-        narrative = str(publication["pr_body_markdown"]).strip()
-        return (
-            f"Parent Issue: #{int(parent['number'])}\n"
-            "Delivery Type: Run Repair\n\n"
-            f"{narrative}"
-        )
-
 
 def _add_human_resume_fields(
     request: dict[str, Any], job: dict[str, Any]

@@ -1,5 +1,10 @@
 # 正式写入中断后的对账与发布续接
 
+## 后续取代：完整 Parent 修复直接交付
+
+[ADR 0025](0025-parent-repair-without-internal-pr.md) 取代本文中 Run Repair 使用内部 Publish、PR、CI 与 PR 合并生命周期的条款。完整 Parent 的修复仍共用 Agent 执行、预算、证据与准确写入核验能力，但直接由程序更新 Run Branch，仅最终 Run PR 承担文案、必要 CI 与人工批准。Ticket、Parent-only 及其余祖先关系、未知写入先对账与恢复合同保持有效；下文相关内部 PR 描述保留为历史决策。
+
+
 <!-- status: accepted -->
 
 ## 决定

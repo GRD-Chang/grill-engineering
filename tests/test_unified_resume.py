@@ -17,8 +17,7 @@ from agent_run.resume_intent import ResumeIntentError, bind_resume_intent, valid
     ("repair_integration_budgets", "2", "integration_resync", "used"),
     ("repair_job", "run_repair_integration_conflict"),
     ("repair_job", "pending_review_result"),
-    ("repair_job", "ticket_write_intent"),
-    ("repair_job", "write_intent"),
+    ("repair_job", "run_branch_write_intent"),
     ("repair_job", "integration_publication_intent"),
     ("repair_job", "pending_semantic_attempt", "review_context"),
 ])
@@ -28,8 +27,7 @@ def test_repair_resume_binds_owned_budgets_and_retained_work(path: tuple[str, ..
         "pause_resume_phase": "accepted", "repair_generation": 2,
         "run_repair_integration_conflict": {"failure": "original Git evidence"},
         "pending_review_result": {"summary": "returned Review"},
-        "ticket_write_intent": {"head_sha": "ticket-head"},
-        "write_intent": {"head_sha": "final-head"},
+        "run_branch_write_intent": {"candidate_sha": "repair-head"},
         "integration_publication_intent": {"head_sha": "integration-head"},
         "pending_semantic_attempt": {
             "status": "pending", "role": "development",
@@ -58,7 +56,8 @@ def test_repair_resume_binds_owned_budgets_and_retained_work(path: tuple[str, ..
 
 @pytest.mark.parametrize('location,role', [
     (location, role) for location in ('ticket:2', 'parent', 'run_repair')
-    for role in ('development', 'reviewer', 'publication')
+    for role in (('development', 'reviewer') if location == 'run_repair'
+                 else ('development', 'reviewer', 'publication'))
 ] + [('run_acceptance', 'reviewer'), ('run_publication', 'publication')])
 @pytest.mark.parametrize("new_thread", [False, True])
 def test_unknown_reason_preserves_current_work_and_budgets(location: str, role: str, new_thread: bool) -> None:

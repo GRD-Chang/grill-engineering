@@ -218,7 +218,7 @@ summary 简要记录实际命令、结果、验证对象与必要环境，不把
 | 维护者修订 | 根据维护者原始反馈，结合当前需求和代码核验影响，完成本次所需的修复，不扩展无关功能。 | `human_feedback` 原文 |
 | Ticket / Parent-only 集成处理 | 按准确 source/target、候选与 HEAD/MERGE_HEAD、现场及失败操作和原始输出处理集成问题，保留双方应交付成果。原需求仅约束本次处理，不重新开发；只整理文件，程序复做 Git 检查、提交和集成。新线程、同轮续接和人工回复均保留 `repair_source=integration`；不注入旧 Acceptance/CI 来源。 | `integration_evidence` 完整现场；Parent-only 集成 Findings 同时携带原始完整 `acceptance_artifact` 和准确集成记录；`stdout_json` / `stderr_json` 可用 JSON 解码恢复原始命令输出 |
 | 完整 Run 集成处理 | 核验完整 Parent、Ticket Set/Completion、累计成果和真实组合；按准确现场与原始 Git 错误处理问题，保留双方成果，不重开完成子任务或重新开发全部需求。文件整理完成后由程序检查、提交和集成。新线程、同轮续接、人工消息保持集成来源。 | `integration_evidence`（含原始操作/输出、source/target、Candidate、HEAD/MERGE_HEAD） |
-| 整体 Findings 修复 | 同一完整 Run 范围内处理 Findings 及直接回归，保留既有内部 Repair PR/CI 与整体验收责任；返回程序集成及适用审核。 | `acceptance_artifact` 原始 Findings |
+| 整体 Findings 修复 | 同一完整 Run 范围内处理 Findings 及直接回归，保留整体验收责任；返回程序集成及适用审核，由程序更新 Run Branch，最终 Run PR 承担文案、CI 和人工批准。 | `acceptance_artifact` 原始 Findings |
 | 合并冲突 | 解决当前工作树中的真实冲突及其对本次范围的直接影响；不借机扩展功能，也不自行执行 merge、rebase 或其他历史写入。 | `merge_conflict_evidence` 原文 |
 
 CI 修复使用独立累计额度；Worker 接收准确失败证据和当前修复任务，不由它判断累计额度或发布授权。两种 Parent 的 CI Review 始终开启：Parent-only 对完整需求负责，多 Ticket Parent 对完整 Run、Ticket Set/Completion 与累计成果负责，不重开已完成 Ticket。有同范围、同需求版本的适用完整基线时，Review 增量核验修复及直接回归并对当前整体形成结论；否则建立完整基线。原始 CI 证据与最新 Findings 分别保留，增量核验不缩减 Parent 的完整责任。

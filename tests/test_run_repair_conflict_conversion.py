@@ -21,7 +21,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
     [
         pytest.param("development", False, False, id="development"),
         pytest.param("candidate_validation", False, False, id="candidate-validation"),
-        pytest.param("publication", False, False, id="publication"),
+        pytest.param("run_branch_write", False, False, id="run-branch-write"),
         pytest.param(
             "candidate_validation", True, False, id="conversion-crash-resume"
         ),
@@ -72,7 +72,17 @@ def test_squash_repair_default_drift_conflict_converts_to_merge_resolution(
     execution_git: GitRepository = (
         CrashAfterConversionGit(git_repo) if conversion_crash else git
     )
-    publisher = FixtureGitHubPublisher(fixture, execution_git)
+    written_heads: list[str] = []
+
+    class DriftingRunPublisher(FixtureGitHubPublisher):
+        def publish_branch(self, branch: str, head_sha: str, *, expected_remote_sha: str) -> Any:
+            result = super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
+            written_heads.append(head_sha)
+            if drift_boundary == "run_branch_write" and not advanced_default:
+                advance_default()
+            return result
+
+    publisher = DriftingRunPublisher(fixture, execution_git)
     repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
     advanced_default: list[str] = []
 
@@ -154,19 +164,7 @@ def test_squash_repair_default_drift_conflict_converts_to_merge_resolution(
             )
 
         def publication(self, request: dict[str, Any]) -> dict[str, str]:
-            self.publication_requests.append(request)
-            if drift_boundary == "publication" and not advanced_default:
-                advance_default()
-            return {
-                "commit_message": "fix(run): reconcile repair with latest default",
-                "pr_title": "fix(run): reconcile repair with latest default",
-                "pr_body_markdown": (
-                    "## What Problem This Solves\n\nThe repair conflicted with default.\n\n"
-                    "## Why This Change Was Made\n\nThe exact conflict was resolved.\n\n"
-                    "## User Impact\n\nThe Run remains mergeable.\n\n"
-                    "## Evidence\n\nThe latest two-parent Candidate passed validation."
-                ),
-            }
+            raise AssertionError("Parent repair must not call internal Publish")
 
     agents = ConflictConvertingAgents()
     current_default = initial_default
@@ -201,7 +199,7 @@ def test_squash_repair_default_drift_conflict_converts_to_merge_resolution(
             if post_crash_drift:
                 advance_default(again=True)
             execution_git = git
-            publisher = FixtureGitHubPublisher(fixture, execution_git)
+            publisher = DriftingRunPublisher(fixture, execution_git)
             continue
         if result["status"] == "run_publication_pending":
             break
@@ -222,7 +220,9 @@ def test_squash_repair_default_drift_conflict_converts_to_merge_resolution(
     assert {Path(str(request["checkout"])) for request in agents.development_requests} == {
         repair_checkout
     }
-    assert git.commit_parents(candidate) == [run_head, latest_default]
+    assert git.commit_parents(candidate) == [
+        written_heads[0] if drift_boundary == "run_branch_write" else run_head, latest_default,
+    ]
     assert git.resolve(f"{candidate}^{{tree}}") == git.resolve(
         f"{integrated}^{{tree}}"
     )

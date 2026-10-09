@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Live source and target integration for a Run Repair Change Job."""
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +16,6 @@ from agent_run.parent_integration import (
     record_parent_integration_failure,
 )
 from agent_run.parent_only_integration import resolve_parent_conflict
-from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 RECORD = "run_repair_integration"
@@ -46,147 +44,18 @@ def repair_run_branch_is_current(
     )
 
 
-def observe_repair_source(owner: Any, state: dict[str, Any], job: dict[str, Any]) -> bool:
-    """Allow an append-only live source past initial exact-ref creation.
-
-    Return true when the source already exists and is a descendant of the
-    durable publication boundary. The shared snapshot stage then integrates
-    its actual contents before any new publication.
-    """
-
-    github = owner.github
-    if github is None:
-        raise ValueError("Run Repair requires the Publisher")
-    branch = str(job["repair_branch"])
-    source, _target = github.live_branch_heads(branch, str(state["run_branch"]))
-    expected = str(job.get("published_sha", job["base_sha"]))
-    if source is None or source == expected:
-        return False
-    intent = job.get("ticket_write_intent")
-    if (
-        isinstance(intent, dict)
-        and intent.get("action") == "publish_ticket_ref"
-        and intent.get("head_sha") == source
-    ):
-        return False
-    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", source) is None:
-        # An invalid ref value has no commit object to retry reading. Let the
-        # exact branch-authority gate preserve its remote_source_changed proof.
-        return False
-    try:
-        owner.git.fetch_remote_commit(branch, source)
-    except GitError as error:
-        # A transient read failure cannot prove that the remote was rewritten.
-        # Keep the PR and Candidate intact for an explicit retry.
-        job.update({"phase": "blocked", "blocked_reason": "integration_failed"})
-        state.update({
-            "status": "ready_for_human",
-            "terminal_kind": "waiting_human",
-            "diagnostics": [{"code": "integration_failed", "message": str(error)}],
-        })
-        owner._save(state)
-        return True
-    if not owner.git.is_ancestor(expected, source):
-        return False
-    pr_number = job.get("pr_number")
-    if type(pr_number) is int:
-        live = github.live_pull_request(pr_number)
-        if (
-            live.get("state") != "OPEN"
-            or live.get("head_branch") != branch
-            or live.get("head_repository") != state.get("repository")
-            or live.get("base_repository") != state.get("repository")
-            or live.get("base_branch") != state.get("run_branch")
-            or live.get("head_sha") != source
-        ):
-            job.update({"phase": "blocked", "blocked_reason": "published_head_mismatch"})
-            state["status"] = "blocked"
-            state["diagnostics"] = [{
-                "code": "published_head_mismatch",
-                "message": "Run Repair PR identity does not match the live source branch",
-            }]
-            owner._save(state)
-            return True
-    if job.get("phase") in {"publishing", "waiting_checks", "waiting_merge"}:
-        invalidate_repair_publication(state, job)
-        owner._save(state)
-    elif isinstance(intent, dict) and intent.get("action") == "ensure_change_branch":
-        # The ref was created before its response was lost. Its descendant is
-        # now the live source authority, so the old exact creation intent is
-        # satisfied and must not be replayed against the older base.
-        job.pop("ticket_write_intent", None)
-        owner._save(state)
-    return True
-
-
-def invalidate_repair_publication(state: dict[str, Any], job: dict[str, Any]) -> None:
-    job["phase"] = "accepted"
-    for key in (
-        "publication", "publication_sha", "publication_parent_sha",
-        "publication_prior_published_sha", "pending_publication_result",
-        "merge_intent", "ticket_write_intent", "approval_grant", "publication_commit_intent",
-    ):
-        job.pop(key, None)
-    clear_required_checks_observation(job)
-    state["status"] = "run_acceptance_pending"
-    state["diagnostics"] = []
+def needs_repair_integration(stage: Any, job: dict[str, Any]) -> bool:
+    _source, target = stage.github.live_branch_heads(stage.contract.branch, stage.contract.base_branch)
+    return isinstance(job.get(RECORD), dict) or target != job["base_sha"]
 
 
 def reconcile_repair_integration(stage: Any, state: dict[str, Any], job: dict[str, Any]) -> bool:
-    record = job.get(RECORD)
-    if isinstance(record, dict) and not parent_integration_record_is_valid(stage.git, {
-        **job, "parent_integration": record,
-    }):
-        stage._block(state, job, "integration_record_invalid", "Run Repair integration record is invalid")
+    _source, target = stage.github.live_branch_heads(stage.contract.branch, stage.contract.base_branch)
+    if target != job["base_sha"]:
+        job["phase"] = "accepted"
         stage.save(state)
         return False
-    source, target = stage.github.live_branch_heads(stage.contract.branch, stage.contract.base_branch)
-    published = job.get("published_sha")
-    if isinstance(published, str):
-        try:
-            if source is None:
-                raise GitError("Run Repair source ref disappeared")
-            stage.git.fetch_remote_commit(stage.contract.branch, source)
-            if not stage.git.is_ancestor(published, source):
-                raise ParentHistoryRewritten("source", published, source)
-        except ParentHistoryRewritten as error:
-            job["run_repair_integration_history_rewrite"] = {
-                "branch": error.branch_kind,
-                "previous_sha": error.previous,
-                "observed_sha": error.observed,
-            }
-            _pause(stage, state, job, "integration_history_rewritten", str(error))
-            return False
-        except GitError as error:
-            _pause(stage, state, job, "integration_failed", str(error))
-            return False
-    intent = job.get("ticket_write_intent")
-    own_source = source == job.get("publication_sha") and (
-        source == job.get("published_sha")
-        or (isinstance(intent, dict) and intent.get("action") == "publish_ticket_ref" and intent.get("head_sha") == source)
-    )
-    expected_source = (
-        record["source_sha"] if isinstance(record, dict)
-        else str(job.get("published_sha", job["base_sha"]))
-    )
-    expected_target = (
-        record["target_sha"] if isinstance(record, dict) else job["base_sha"]
-    )
-    if (source == expected_source or own_source) and target == expected_target:
-        return True
-    invalidate_repair_publication(state, job)
-    stage.save(state)
-    return False
-
-
-def needs_repair_integration(stage: Any, job: dict[str, Any]) -> bool:
-    if isinstance(job.get(RECORD), dict):
-        return True
-    source, target = stage.github.live_branch_heads(
-        stage.contract.branch, stage.contract.base_branch
-    )
-    expected_source = str(job.get("published_sha", job["base_sha"]))
-    return bool(source != expected_source or target != str(job["base_sha"]))
+    return True
 
 
 def prepare_repair_integration(
@@ -196,12 +65,6 @@ def prepare_repair_integration(
 
     while True:
         try:
-            intent = job.get("ticket_write_intent")
-            own_source = (
-                intent.get("head_sha")
-                if isinstance(intent, dict) and intent.get("action") == "publish_ticket_ref"
-                else job.get("published_sha")
-            )
             result = prepare_parent_snapshot(
                 git=stage.git,
                 github=stage.github,
@@ -209,12 +72,13 @@ def prepare_repair_integration(
                 budget_owner=repair_integration_budget_owner(state, job),
                 checkout=checkout,
                 source_branch=stage.contract.branch,
+                local_source_sha=str(job["base_sha"]),
                 target_branch=stage.contract.base_branch,
                 candidate_sha=str(job["candidate_sha"]),
                 policy_snapshot=job["policy_snapshot"],
                 record_key=RECORD,
                 save=lambda: stage.save(state),
-                own_source_write=own_source if isinstance(own_source, str) else False,
+                own_source_write=False,
                 handoff_git_failures=True,
             )
         except ParentHistoryRewritten as error:

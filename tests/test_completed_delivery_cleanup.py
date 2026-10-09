@@ -4,6 +4,7 @@ from support.run_scenarios import _completed_run
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,6 +33,9 @@ class NewWorkAfterMergePublisher(FixtureGitHubPublisher):
             if pull.get("integrated_sha") == integrated_sha
         )
         branch = str(pull["branch"])
+        self._append_source(branch)
+
+    def _append_source(self, branch: str) -> None:
         head = self.git.resolve(branch)
         self.newer_head = subprocess.run(
             ["git", "commit-tree", self.git.resolve(f"{head}^{{tree}}"), "-p", head],
@@ -51,7 +55,14 @@ def test_completed_delivery_finally_preserves_a_new_source_commit(
 ) -> None:
     if subject == "run_repair":
         state, states, git = _completed_run(git_repo)
-        publisher = NewWorkAfterMergePublisher(git_repo / "github.json", git)
+        class NewWorkAfterWritePublisher(NewWorkAfterMergePublisher):
+            def publish_branch(self, branch: str, head_sha: str, *, expected_remote_sha: str) -> Any:
+                result = super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
+                if self.newer_head is None:
+                    self._append_source(f"agent-run-repair/{state['run_id']}/1")
+                return result
+
+        publisher = NewWorkAfterWritePublisher(git_repo / "github.json", git)
         engine = RunAcceptanceEngine(
             git=git, states=states, github=publisher, agents=ScriptedRunAgents(),
         )

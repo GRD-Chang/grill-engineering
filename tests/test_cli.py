@@ -3802,17 +3802,21 @@ def test_seed_run_preserves_the_managed_run_branch_side_effect(
     assert not (git_repo / ".agent-run").exists()
 
 
-def test_run_repair_docs_describe_job_rotation_and_candidate_promotion() -> None:
+def test_run_repair_docs_describe_direct_delivery_and_exact_candidate_promotion() -> None:
     context = (PROJECT_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     operator_guide = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(
         encoding="utf-8"
     )
 
-    assert "一个 Cycle 可依次包含多个 Run Repair Job" in context
-    assert "轮转出后继 Job" in context
+    assert "程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准" in context
+    assert "修复保留身份、受管工作区、必要本地分支、候选与历史" in context
     assert "Candidate Run Acceptance → 严格 promotion" in operator_guide
-    assert "归档旧 Job/PR 并轮转新的 branch/PR" in operator_guide
-    assert "一个活跃 Run Repair Job 实现一个 Repair Cycle" not in context
+    assert "不创建内部修复 PR、调用内部 Publish 或等待内部 CI" in operator_guide
+    assert "未知推送先对账" in operator_guide
+    assert "权限或规则拒绝时保全修复成果与写入意图" in operator_guide
+    assert "一个 Cycle 可依次包含多个 Run Repair Job" not in context
+    assert "轮转出后继 Job" not in context
+    assert "归档旧 Job/PR 并轮转新的 branch/PR" not in operator_guide
     assert "Run Repair → fresh Run Acceptance → 新 PR" not in operator_guide
 
 

@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次共同执行、预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构合同见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)。共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context、同类证据适用规则及准确发布对账共同支持三种交付对象。完整 Parent 的修复直接纳入自身开发、集成和审核，程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度。Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。修复保留身份、受管工作区、必要本地分支、候选与历史；不兼容读取或迁移旧 Run。审核范围、额度策略、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 
@@ -128,8 +128,8 @@ Development 在实现或修复完成验证与自行检查后的内部质量预�
 _Avoid_: 内部验收、只审已提交 HEAD、遗漏未跟踪文件、把一轮等同于一个 Reviewer、把开发结论作为审查前提、修复后常规再派 Reviewer、无新增关键风险仍重复审查、Fresh Acceptance
 
 **Development–Acceptance Engine（开发验收引擎）**:
-Controller 复用的单一自动变更循环：Development 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，正常 pass 或 Ticket 预算耗尽后的 Fallback Publication Receipt 允许 Publisher 推送普通 PR，随后等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并；兜底 Ticket 只有在准确 head 形成 Deterministic Integration Record 后才取得合并权限。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
-Development–Review 阶段由同一有限循环推进：Ticket 与 Parent-only 从 Development 开始，完整 Parent 在既有远端集成后从 Review 开始。候选提交、审核结果恢复、Findings 后修复和预算暂停共用推进与记账规则；完整 Parent 仍独立审查完整需求、Ticket Set、累计变化及准确预期合并结果。完整 Parent 的 Repair 保留既有集成、PR 与验收提升边界，当前候选通过不能自行代替最终交付。已返回的 Run Review 结果先与 Semantic Attempt、预算一同落盘；版本回读中断时续接该结果，边界变化则丢弃结论。
+Controller 复用 Development–Review 的共同变更循环：Development 修改 checkout，程序创建准确 Candidate，Fresh Reviewer 输出 Acceptance Artifact，Findings 原样返回开发。Ticket 与 Parent-only 验收后调用 Publish 并由程序推送对应 PR，等待准确 Required Checks 与 Published-Head Gate，再按对象门禁合入；Ticket 兜底只有在准确 head 形成 Deterministic Integration Record 后取得合入权限。完整 Parent 的修复共用开发、Review、预算与结果续接能力，在适用集成和验收后由程序直接更新 Run Branch；不经过内部 Publish、PR、CI 或合并生命周期。Parent-only 的人工批准只授予准确对象的合并权限，批准后的重新核验、合并与恢复仍由同一交付能力执行。
+Development–Review 阶段由同一有限循环推进：Ticket 与 Parent-only 从 Development 开始，完整 Parent 在既有远端集成后从 Review 开始。候选提交、审核结果恢复、Findings 后修复和预算暂停共用推进与记账规则；完整 Parent 仍独立审查完整需求、Ticket Set、累计变化及准确预期合并结果。完整 Parent 的 Repair 保留准确集成、Run Branch 写入与验收提升边界，当前候选通过不能自行代替最终交付。已返回的 Run Review 结果先与 Semantic Attempt、预算一同落盘；版本回读中断时续接该结果，边界变化则丢弃结论。
 
 集成交付提供单步推进结果（可继续、等待、需要 Agent、暂停、完成），完整交付入口调用同一能力。编排方未提供 Agent 名额时，程序仍可进行机械集成、已发布版本的 CI 观测和合入对账；真实冲突、适用审核或新文案在分配 Attempt 前交还编排。一轮准入最多执行一次 Agent 工作，后续工作再次交还。该接口不自行调度其他 Ticket，也不改变最终完成权威。
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
@@ -151,7 +151,7 @@ Development Codex 在交付当前 Ticket 时实际发现前序已集成代码存
 _Avoid_: 发现问题后机械停工、为同一修复恢复已完成 Ticket、主动审计全部历史、借机扩大产品范围
 
 **Change Job Contract（变更任务契约）**:
-Development–Acceptance Engine 处理 Ticket Job、Parent-only Delivery 或 Run Repair Job 时遵守的确定性事实与任务特有规则，包括需求源、有效 Revision、base/head branch、目标 PR 类型、开发与 Reviewer Prompt、修复预算以及完成规则。Controller 固定这些内容，智能 Agent 不选择或修改。
+Development–Acceptance Engine 处理 Ticket Job、Parent-only Delivery 或 Run Repair Job 时遵守的确定性事实与任务特有规则，包括需求源、有效 Revision、base/head branch、适用 PR 类型或 Run Branch 写入对象、开发与 Reviewer Prompt、修复预算以及完成规则。Controller 固定这些内容，智能 Agent 不选择或修改。
 _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 
 **Development Thread（开发线程）**:
@@ -174,7 +174,7 @@ Run 创建时从个人默认与显式覆盖解析并固定：`reuse`（默认）
 _Avoid_: 每次进程启动新会话、每张 Ticket 新会话、单次人工替换 Thread、Reviewer Thread 策略
 
 **Change Job Record（变更任务记录）**:
-Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、CI Recovery Budget 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。固定预算归属协议为 `review_budget_protocol=2`，旧协议或 Repair Job 携带可变 Review/CI 预算的状态在继续前拒绝；拒绝不授权删除或迁移旧成果。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
+Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 共用执行与结果记录骨架，分别保留适用的交付生命周期，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、CI Recovery Budget 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。新 Run 的分支权限协议为 `branch_authority_protocol=3`，旧 Run 不兼容读取、不自动迁移或删除成果。固定预算归属协议为 `review_budget_protocol=2`，旧协议或 Repair Job 携带可变 Review/CI 预算的状态在继续前拒绝；拒绝不授权删除或迁移旧成果。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
 **Job Generation（任务世代）**:
@@ -486,17 +486,17 @@ _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 _Avoid_: Run Branch 本身、Reviewer 的只读工作区、Agent 自行发布、每次 Finding 都丢弃原修复现场
 
 **Run Repair Job（运行修复任务）**:
-完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环，不拥有独立内部 PR 的交付生命周期；这是 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 已确认、尚待实施的目标定义。
+完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环，不拥有独立内部 PR 的交付生命周期，见 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)。
 
-当前尚未切换的内部 Repair PR 实现中，Job 未集成时复用原 branch/PR；已集成 Job 的 Candidate revalidation 在新的 default head 上又产生 Finding 时，Controller 归档旧 Job/PR，并以新的 base、branch 和 PR 身份轮转出后继 Job，同时保留 Repair Cycle 的累计用量、Run Repair Thread 与 Integration-repair Worktree。这段说明仅对应现有实现和历史记录，不要求 ADR 0025 的目标架构保留内部 PR 轮转。
+程序将审核通过且绑定事实仍有效的准确成果更新到 Run Branch，不因内部 PR 已合并而轮换 Job、分支或 PR。默认分支前进后在原修复工作中核验最新组合，保存重载和 resume 保留工作身份与已保存结果。
 _Avoid_: Ticket Job、独立修复流水线、另有一份 Parent 预算
 
 **Repair Cycle（修复周期）**:
-为解决同一准确 Run Acceptance、Run PR CI 或集成问题而连续执行的有界工作；一个 Cycle 可依次包含多个 Run Repair Job，但任一时刻只允许一个活跃 Job。集成 Git 问题与整体 Findings 使用独立的累计集成额度；准确 CI 失败的 Development 与 Review Findings 修改使用同一 Parent 的累计 CI Recovery Budget。状态观察、机械 Git 检查和 Required Checks 重读不扣 Agent 工作额度；实际新 Development 调查即使无代码候选也计费，同一语义工作的中断续接不重复计费。CI 失败绑定准确 PR/head 和 Observation 后携检查事实与可取得日志交给 Development，不使用 code-failure-steps 白名单或可修性分类；pending、unknown 与未匹配证据进入有界监督。默认分支追加、内部 Repair PR、新失败版本和 revalidation 不自动重置额度。Candidate 提升、人工暂停与预算耗尽保存 Cycle 历史；公开 resume 仅续期实际耗尽项，最终仍需当前整体验收、CI 和人工批准。
+为解决同一准确 Run Acceptance、Run PR CI 或集成问题而连续执行的有界工作；一个 Cycle 保持当前 Run Repair Job 的工作身份，任一时刻只允许一个活跃修复工作；默认分支前进或准确 Run Branch 写入不产生交付轮换。集成 Git 问题与整体 Findings 使用独立的累计集成额度；准确 CI 失败的 Development 与 Review Findings 修改使用同一 Parent 的累计 CI Recovery Budget。状态观察、机械 Git 检查和 Required Checks 重读不扣 Agent 工作额度；实际新 Development 调查即使无代码候选也计费，同一语义工作的中断续接不重复计费。CI 失败绑定准确 PR/head 和 Observation 后携检查事实与可取得日志交给 Development，不使用 code-failure-steps 白名单或可修性分类；pending、unknown 与未匹配证据进入有界监督。默认分支追加、Run Branch 更新、新失败版本和 revalidation 不自动重置额度。Candidate 提升、人工暂停与预算耗尽保存 Cycle 历史；公开 resume 仅续期实际耗尽项，最终仍需当前整体验收、CI 和人工批准。
 _Avoid_: 用 Delivery Run 的历史累计修改数作为当前预算、把流程重试计作代码修改、base 漂移重置同一问题的预算
 
 **Run Repair PR（运行修复拉取请求）**:
-旧交付路径中从独立修复分支指向 Run Branch 的内部 PR，承载修复的独立 CI 与合并记录。[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 已决定取消此交付路径；当前代码尚未完成切换，此术语仅用于解释现有实现和历史记录。
+旧交付路径中从独立修复分支指向 Run Branch 的内部 PR，承载修复的独立 CI 与合并记录。[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 取消此交付路径；此术语仅用于解释历史记录，不是当前交付对象。
 _Avoid_: 最终 Run PR、Ticket PR、新架构必须保留的交付对象
 
 **Merge-resolution Candidate（合并解决候选）**:
@@ -504,7 +504,7 @@ _Avoid_: 最终 Run PR、Ticket PR、新架构必须保留的交付对象
 _Avoid_: Agent 自行提交 merge、squash 丢失集成祖先、把冲突只当作文本补丁
 
 **Run Acceptance Repair Loop（运行验收修复循环）**:
-完整 Parent 为解决整体验收 Findings 或最终 PR 的 CI 失败而进行的有界修复，复用开发—审核与集成—Git 检查—适用审核两个循环；修复始终覆盖当前 Parent 的工作范围。按 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 的目标设计，程序准确更新 Run Branch 后由最终 PR 的 CI 和人工批准继续把关，保留成果、证据和累计用量供后续修复或 resume。
+完整 Parent 为解决整体验收 Findings 或最终 PR 的 CI 失败而进行的有界修复，复用开发—审核与集成—Git 检查—适用审核两个循环；修复始终覆盖当前 Parent 的工作范围。按 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，程序准确更新 Run Branch 后由最终 PR 的 CI 和人工批准继续把关，保留成果、证据和累计用量供后续修复或 resume。
 _Avoid_: 独立内部 PR 流水线、仅修复局部 Ticket、无依据复用旧审核、Agent 直接更新 Run Branch
 
 **Run Feedback Revision（运行反馈版本）**:
@@ -588,7 +588,7 @@ GitHub Issue 页面上可选显示的开发分支关联。它只帮助人阅读 
 _Avoid_: 远端分支身份、PR 身份、恢复门禁
 
 **Candidate Commit（候选提交）**:
-Controller 在每轮 Development Codex 编辑返回后，于 Change Job working branch 创建的不可变候选快照。Git 完整性检查和修复边界必须绑定其 SHA；每轮修复产生新的 Candidate Commit。它使用程序生成的临时 commit message，例如 `chore(ticket-12): candidate 2`，首次推送前会被压缩，不进入公开历史。
+Controller 在每轮 Development Codex 编辑返回后，于 Change Job working branch 创建的不可变候选快照。Git 完整性检查和修复边界必须绑定其 SHA；每轮修复产生新的 Candidate Commit。它使用程序生成的临时 commit message，例如 `chore(ticket-12): candidate 2`，Ticket 与 Parent-only 的首次 PR 发布按发布合同压缩；完整 Parent 的修复由程序使用准确候选形成 Run Branch 更新，不调用内部 Publish。
 _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
 
 **Forward Candidate Repair（前进式候选修复）**:
@@ -596,7 +596,7 @@ _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
 _Avoid_: 改写 Candidate 历史、为同一边界的每条 Finding 新开 worktree、复用旧 Validation Checkout、要求人工先还原文件、把可自动修复的 diff 收缩误报为 Human Blocker
 
 **Publication Commit（发布提交）**:
-Publisher 根据 Publication Artifact 保持候选 tree 不变，并使用 Agent 编写的语义 commit message 创建待发布提交。首次发布以准确 base 为父；已发布源分支的后继提交以已记录的远端发布 head 为父，冲突 Run Repair 还保留默认分支祖先。Publisher 只用普通快进推送更新同一有效 PR；远端 head 意外变化时记录实际观测、保留本地 Candidate 并阻止覆盖。正常模式的发布权威输入是 Fresh Acceptance；Ticket 确定性兜底模式在 CI 尚未运行时由 Fallback Publication Receipt 只授权创建或更新 PR，不授权合入 Run Branch。Publisher 必须验证 Publication Commit 与对应记录绑定的 Candidate Commit tree 相同；随后 Hosted CI Gate 与 Published-Head Gate 将远端 PR head 绑定其准确 SHA，新 head 的 CI 与批准不能继承旧 SHA 结果。
+Publisher 根据 Publication Artifact 保持候选 tree 不变，并使用 Agent 编写的语义 commit message 创建待发布提交。首次发布以准确 base 为父；已发布源分支的后继提交以已记录的远端发布 head 为父，Parent 集成结果同时保留必要默认分支祖先。Publisher 只用普通快进推送更新同一有效 PR；远端 head 意外变化时记录实际观测、保留本地 Candidate 并阻止覆盖。正常模式的发布权威输入是 Fresh Acceptance；Ticket 确定性兜底模式在 CI 尚未运行时由 Fallback Publication Receipt 只授权创建或更新 PR，不授权合入 Run Branch。Publisher 必须验证 Publication Commit 与对应记录绑定的 Candidate Commit tree 相同；随后 Hosted CI Gate 与 Published-Head Gate 将远端 PR head 绑定其准确 SHA，新 head 的 CI 与批准不能继承旧 SHA 结果。
 _Avoid_: Candidate Commit、机械 checkpoint、远端 PR head
 
 **Development Summary（开发摘要）**:
@@ -608,7 +608,7 @@ Candidate Commit 取得当前路径所需的发布权威后，由独立、只读
 _Avoid_: Development Summary、独立发现工作流、验证记录
 
 **PR Narrative（PR 语义正文）**:
-Publication Codex 为 Ticket PR、Run Repair PR 与 Run PR 编写并保持准确的统一耐久说明，顶部身份分别使用 `Primary Ticket: #N`、`Delivery Run: <id>`、或 `Parent Spec: #N` 加 `Delivery Run: <id>`，正文默认按 `What Problem This Solves`、`Why This Change Was Made`、`User Impact` 和 `Evidence` 组织，分别说明改动前后的问题与行为、方案理由与取舍、实际用户影响及必要操作、已有验证的结果与覆盖范围；按规模调整篇幅或合并章节，不按固定标题验收。Ticket PR 还可包含 Cross-Ticket Note。`Evidence` 记录独立 Fresh Acceptance、Run Acceptance，或明确标注为非语义验收的 Deterministic Ticket Fallback 真实背景，每条以“场景 → 实际操作或命令 → 可观察结果”表达；兜底 PR 只可读总结已使用 Reviewer Artifacts、最后一次 Reviewer Artifact 之后的 Development response 与代码 delta，不得自行断言 Findings 已关闭，也不得使用 Reviewer pass、CI pass 或语义验收措辞。Required Check 结果、Candidate、SHA、门禁和生命周期等机器事实只由 Publisher 的 Agent Run Status 评论呈现，不触发 CI 通过后的 PR Narrative 重写。UI、交互或可视输出变化时才加入 before/after 图片或视频，无内容的可选段落必须整个省略。
+Publication Codex 为 Ticket PR、Parent-only PR 与 Run PR 编写并保持准确的统一耐久说明，顶部身份分别使用 `Primary Ticket: #N`、`Parent Spec: #N`、或 `Parent Spec: #N` 加 `Delivery Run: <id>`，正文默认按 `What Problem This Solves`、`Why This Change Was Made`、`User Impact` 和 `Evidence` 组织，分别说明改动前后的问题与行为、方案理由与取舍、实际用户影响及必要操作、已有验证的结果与覆盖范围；按规模调整篇幅或合并章节，不按固定标题验收。Ticket PR 还可包含 Cross-Ticket Note。`Evidence` 记录独立 Fresh Acceptance、Run Acceptance，或明确标注为非语义验收的 Deterministic Ticket Fallback 真实背景，每条以“场景 → 实际操作或命令 → 可观察结果”表达；兜底 PR 只可读总结已使用 Reviewer Artifacts、最后一次 Reviewer Artifact 之后的 Development response 与代码 delta，不得自行断言 Findings 已关闭，也不得使用 Reviewer pass、CI pass 或语义验收措辞。Required Check 结果、Candidate、SHA、门禁和生命周期等机器事实只由 Publisher 的 Agent Run Status 评论呈现，不触发 CI 通过后的 PR Narrative 重写。UI、交互或可视输出变化时才加入 before/after 图片或视频，无内容的可选段落必须整个省略。
 _Avoid_: Files changed 复述、通用 checklist、Agent 内部元数据
 
 **Cross-Ticket Note（跨 Ticket 说明）**:
@@ -681,7 +681,7 @@ Publisher 在创建、压缩、推送和合并候选时执行的确定性 Git �
 _Avoid_: Hosted CI Gate、Fresh Acceptance、本地代码 Validation、独立 Git-fix 状态机、Git-fix 专用预算、授予 Development 发布权限
 
 **Required Checks Observation（合并前检查观测）**:
-仓库规定合并前必须通过的自动检查（Required Checks）在一张 Published PR 准确 head 上的一次完整观测，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only、Run Repair 与 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。人类视图统一称为“合并前检查”，有明细时带实际检查名称；范围仅为仓库规定必须通过的自动检查，不包含人工批准、Agent 本地验收或全部合并条件，也不代表所有 CI。未配置强制检查不等于仓库没有 CI。
+仓库规定合并前必须通过的自动检查（Required Checks）在一张 Published PR 准确 head 上的一次完整观测，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only 与最终 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。人类视图统一称为“合并前检查”，有明细时带实际检查名称；范围仅为仓库规定必须通过的自动检查，不包含人工批准、Agent 本地验收或全部合并条件，也不代表所有 CI。未配置强制检查不等于仓库没有 CI。
 _Avoid_: 面向用户单独使用“必需检查”、将合并前检查等同全部 CI、把未配置强制检查称为没有 CI、仅有汇总结果、旧 head 的观察、CI Failure Evidence、为满足字段形状合成空 Check
 
 **CI Failure Evidence（CI 失败证据）**:
@@ -834,8 +834,8 @@ _Avoid_: Ticket Review Budget Window、把 `N` 次 Development 与 `N+1` 次 Rev
 _Avoid_: 把 CI 修复计入普通需求开发次数、隐式额外 Reviewer
 
 **CI Recovery Budget（CI 恢复预算）**:
-Ticket CI 失败准确绑定当前发布 head 和检查后，交给同一开发—审核循环调查；不要求程序先认定为代码可修。pending、unknown 或尚未收敛的证据使用有界等待，无法开展工作时保留可继续暂停。`ticket_ci_review` 默认关闭，开启则所有修复轮次一致审核；免审不形成 Acceptance。`ticket_ci_development_limit` 默认 3，为同一 Ticket 的 CI Development 与 Findings 修改共用累计额度，独立于初始开发和集成；新 head、提交或 PR 更新不重置。重复观察不扣费，同一语义工作续接不重复扣费；耗尽后显式 resume 仅续期 CI 窗口，保留历史。两种 Parent 使用同一累计实现，`parent_ci_development_limit` 默认 3，始终要求完整 Parent Review；内部 Repair PR 与最终 PR 共用 Run 额度。见 [ADR 0023](docs/adr/0023-parent-ci-development-loop.md)；Ticket 合同见 [ADR 0021](docs/adr/0021-ticket-ci-development-loop.md)。
-最终 Run PR 的发布检查与批准复查共用失败证据匹配、完整 PR 身份回读、CI 预算、修复排队及暂停规则，见 [ADR 0016](docs/adr/0016-parent-integration-delivery.md)。pending/unknown、失败明细与 Observation 不匹配进入有界等待；PR/head 身份漂移仍使验收失效。最终 PR 与内部 Repair PR 共用同一 Run CI 额度。修复使旧批准失效，新组合只有取得正式 Run Acceptance、必要检查与新批准后才可最终合并。
+Ticket CI 失败准确绑定当前发布 head 和检查后，交给同一开发—审核循环调查；不要求程序先认定为代码可修。pending、unknown 或尚未收敛的证据使用有界等待，无法开展工作时保留可继续暂停。`ticket_ci_review` 默认关闭，开启则所有修复轮次一致审核；免审不形成 Acceptance。`ticket_ci_development_limit` 默认 3，为同一 Ticket 的 CI Development 与 Findings 修改共用累计额度，独立于初始开发和集成；新 head、提交或 PR 更新不重置。重复观察不扣费，同一语义工作续接不重复扣费；耗尽后显式 resume 仅续期 CI 窗口，保留历史。两种 Parent 使用同一累计实现，`parent_ci_development_limit` 默认 3，始终要求完整 Parent Review；修复与最终 PR 使用同一 Run 额度，Run Branch 更新不重置用量。见 [ADR 0023](docs/adr/0023-parent-ci-development-loop.md)；Ticket 合同见 [ADR 0021](docs/adr/0021-ticket-ci-development-loop.md)。
+最终 Run PR 的发布检查与批准复查共用失败证据匹配、完整 PR 身份回读、CI 预算、修复排队及暂停规则，见 [ADR 0016](docs/adr/0016-parent-integration-delivery.md)。pending/unknown、失败明细与 Observation 不匹配进入有界等待；PR/head 身份漂移仍使验收失效。同一 Run 的后继修复和最终 PR 共用累计 CI 额度。修复使旧批准失效，新组合只有取得正式 Run Acceptance、必要检查与新批准后才可最终合并。
 _Avoid_: 同一失败 head 重复计轮、把 CI 修复记作需求修复、无证据跳过 Reviewer
 
 **Ticket Resume Command（Ticket 恢复命令）**:
@@ -891,7 +891,7 @@ _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue
 未知推送或 PR 结果仍保留 Ticket 集成席位；成功写入不重复执行，已持久化且绑定事实未变的 Publish 文案复用。
 需求、验收或成果变化不继承旧 CI 与 Parent 批准。Status/History 只展示意图、准确版本与实际席位，不执行对账。
 
-多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留本地、远端源分支和目标分支的成果，再启动首次完整 Run Acceptance。Reviewer 看到 Parent、Ticket 完成与 fallback、Ticket/Run 集成记录及准确合并结果；这一次审核属于当前集成窗口的首次审核。默认累计集成开发上限为 3 次，首次审核另计；Git 问题与整体验收 Findings 共用开发额度，普通 Git 失败以准确操作、原始输出和版本交回 Development。内部 Run Repair 仍经真实 PR/CI 与准确 Candidate Acceptance 提升交付。
+多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留本地、远端源分支和目标分支的成果，再启动首次完整 Run Acceptance。Reviewer 看到 Parent、Ticket 完成与 fallback、Ticket/Run 集成记录及准确合并结果；这一次审核属于当前集成窗口的首次审核。默认累计集成开发上限为 3 次，首次审核另计；Git 问题与整体验收 Findings 共用开发额度，普通 Git 失败以准确操作、原始输出和版本交回 Development。Parent 修复经准确 Candidate Acceptance 核验后由程序更新 Run Branch；最终 Run PR 的必要 CI、人工批准与最终复核仍保护默认分支。
 
 Parent-only 先在固定开发基线完成最多 D10/R10 的完整需求开发与独立验收，Reviewer 必须通过，不使用 Ticket fallback 或 Ticket CI 豁免。交付前接纳准确远端 Parent Branch 与默认分支快照；验收复用核对完整范围、Parent 身份、需求版本、基线、候选 SHA/tree、预期合并 tree 及全部通过的独立记录，相同 tree 不足以证明结论有效。事实不变复用，事实变化则审核当前组合；已有同需求完整基线可增量核验并形成整体结论，否则建立完整基线。
 

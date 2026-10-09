@@ -476,9 +476,9 @@ def test_blocked_repair_history_ignores_stale_publication_thread(
         ),
         (
             "agent_requires_human",
-            "accepted",
-            "发布工作代理",
-            "blocked-publication-thread",
+            "repairing",
+            "开发工作代理",
+            "development-thread",
         ),
     ],
 )

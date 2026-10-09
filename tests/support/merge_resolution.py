@@ -111,7 +111,7 @@ class MergeResolutionAgents:
             else fixture.default_head
         )
         checkout_head = _git_output(checkout, "rev-parse", "HEAD")
-        assert checkout_head == fixture.run_head
+        assert checkout_head == (fixture.written_before_default_drift or fixture.run_head)
         assert _git_output(checkout, "rev-parse", "MERGE_HEAD") == expected_default
         conflict_status = _git_output(checkout, "status", "--porcelain=v1")
         shared_status = next(
@@ -286,8 +286,8 @@ class MergeResolutionFixture:
             "candidate_finding_default_drift_clean_replay_conflict",
             "candidate_finding_default_drift_clean_replay_modify_conflict",
         }
-        self.publication_default_drift = scenario == "publication_default_drift"
-        self.published_before_default_drift: str | None = None
+        self.run_branch_write_default_drift = scenario == "run_branch_write_default_drift"
+        self.written_before_default_drift: str | None = None
         self.development_default_drift = scenario in {
             "development_default_drift",
             "development_default_drift_clean",
@@ -302,7 +302,7 @@ class MergeResolutionFixture:
         self.delete_conflict_path = scenario == "delete_conflict_path"
         self.default_drift = (
             self.candidate_default_drift
-            or self.publication_default_drift
+            or self.run_branch_write_default_drift
             or self.development_default_drift
             or self.candidate_finding_default_drift
         )
@@ -388,8 +388,8 @@ class MergeResolutionFixture:
 
     def accept(self) -> dict[str, Any]:
         publisher: FixtureGitHubPublisher
-        if self.publication_default_drift:
-            publisher = PublicationDefaultDriftPublisher(
+        if self.run_branch_write_default_drift:
+            publisher = RunBranchWriteDefaultDriftPublisher(
                 self.fixture, self.git, self
             )
         else:
@@ -425,6 +425,14 @@ class MergeResolutionFixture:
         job = run["repair_job"]
         repair_checkout = Path(str(job["repair_checkout"]))
         assert result["status"] == "run_acceptance_pending"
+        if self.run_branch_write_default_drift:
+            assert job["phase"] == "candidate"
+            assert job["candidate_sha"] == job["base_sha"] == self.written_before_default_drift
+            assert job["default_base_sha"] == self.advanced_default_heads[-1]
+            assert self.git.commit_parents(str(job["candidate_sha"])) == [self.run_head, self.default_head]
+            assert self.git.checkout_head(repair_checkout) == job["candidate_sha"]
+            assert repair_checkout.exists()
+            return
         assert job["phase"] == "repairing"
         assert "candidate_sha" not in job
         assert job["integration_reprepare_required"] is True
@@ -473,16 +481,6 @@ class MergeResolutionFixture:
                 self.run_head,
                 self.default_head,
             ]
-            if self.publication_default_drift:
-                first_publication = str(job["superseded_publication_shas"][-1])
-                assert self.git.commit_parents(first_publication) == [
-                    self.run_head,
-                    self.default_head,
-                ]
-                assert self.git.resolve(f"{first_publication}^{{tree}}") == (
-                    self.git.resolve(f"{first_candidate}^{{tree}}")
-                )
-                assert self.git.checkout_head(repair_checkout) == first_publication
         assert repair_checkout.exists()
 
     def assert_thread_and_worktree_reused(
@@ -548,18 +546,14 @@ class MergeResolutionFixture:
             if self.advanced_default_heads
             else self.default_head
         )
-        assert self.git.commit_parents(candidate) == [self.run_head, accepted_default]
-        previous_publication = self.published_before_default_drift
-        assert self.git.commit_parents(publication) == [
-            previous_publication or self.run_head,
-            accepted_default,
-        ]
-        if self.publication_default_drift:
-            assert previous_publication is not None
-            assert self.git.is_ancestor(self.run_head, previous_publication)
-            assert self.git.is_ancestor(self.default_head, previous_publication)
-            assert self.git.is_ancestor(previous_publication, publication)
-        assert self.git.commit_parents(integrated) == [self.run_head, publication]
+        source_head = self.written_before_default_drift or self.run_head
+        assert self.git.commit_parents(candidate) == [source_head, accepted_default]
+        assert publication == integrated == candidate
+        assert self.git.is_ancestor(self.run_head, candidate)
+        if self.run_branch_write_default_drift:
+            assert self.written_before_default_drift is not None
+            assert self.git.is_ancestor(self.default_head, self.written_before_default_drift)
+            assert self.git.is_ancestor(self.written_before_default_drift, candidate)
         assert self.git.resolve(f"{candidate}^{{tree}}") == self.git.resolve(
             f"{integrated}^{{tree}}"
         )
@@ -616,7 +610,7 @@ class MergeResolutionFixture:
         ).exists()
 
 
-class PublicationDefaultDriftPublisher(FixtureGitHubPublisher):
+class RunBranchWriteDefaultDriftPublisher(FixtureGitHubPublisher):
     def __init__(
         self,
         fixture: Path,
@@ -639,7 +633,7 @@ class PublicationDefaultDriftPublisher(FixtureGitHubPublisher):
             expected_remote_sha=expected_remote_sha,
         )
         if not self.scenario.advanced_default_heads:
-            self.scenario.published_before_default_drift = head_sha
+            self.scenario.written_before_default_drift = head_sha
             self.scenario.advance_default()
         return result
 

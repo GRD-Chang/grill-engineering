@@ -236,7 +236,13 @@ def test_revise_parent_intent_creates_a_successor_at_the_next_human_boundary(
     assert current["status"] == "run_approval_pending"
     assert current["run_acceptance"]["repair_generation"] == 2
     assert current["run_acceptance"]["modification_attempts"] == attempts_before == 1
-    assert len(current["agent_invocation_history"]) == invocation_count_before + 4
+    successor_invocations = current["agent_invocation_history"][invocation_count_before:]
+    assert [(item["work_subject"], item["role"]) for item in successor_invocations] == [
+        (f"run-repair:{run_id}", "development"),
+        (f"run-repair:{run_id}", "fresh_acceptance"),
+        (f"run-publication:{run_id}", "final_publication"),
+    ]
+    assert all(item["status"] == "completed" for item in successor_invocations)
     control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     control = json.loads(control_path.read_text(encoding="utf-8"))
     assert control["action"]["action_id"] == repeated_output["action_audit"]["action_id"]

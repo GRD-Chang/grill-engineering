@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Any
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
     ChangeDeliveryAdapter,
-    ChangeDeliveryEngine,
-    ChangeDeliveryPublisher,
     StaleDisposition,
 )
 from agent_run.git import GitRepository
@@ -26,26 +24,6 @@ from agent_run.run_thread_identity import prior_thread_identities
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
     from agent_run.run_repair_promotion import RunRepairPromotion
-
-
-class RunRepairJobRotationRequired(Exception):
-    """A new Candidate needs a fresh Run Repair Job and PR identity."""
-
-    def __init__(
-        self,
-        *,
-        candidate_sha: str,
-        base_sha: str,
-        repair_branch: str,
-        repair_job_attempt: int,
-        modification_attempt: int,
-    ) -> None:
-        super().__init__("integrated Run Repair publication cannot carry a new Candidate")
-        self.candidate_sha = candidate_sha
-        self.base_sha = base_sha
-        self.repair_branch = repair_branch
-        self.repair_job_attempt = repair_job_attempt
-        self.modification_attempt = modification_attempt
 
 
 class RunRepairAdapter(ChangeDeliveryAdapter):
@@ -89,7 +67,7 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
     def publication_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
-        return self.requests.publication(state, job, checkout)
+        raise ValueError("Parent repair does not have an internal publication stage")
 
     def review_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -175,7 +153,7 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
         return self.default_head_sha or str(_mapping(state, "base")["sha"])
 
 
-class RunRepairPublisher(ChangeDeliveryPublisher):
+class RunRepairPublisher:
     """Run Repair mutations behind the shared Publisher seam."""
 
     def __init__(
@@ -232,150 +210,47 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
             return None
         job.pop("integration_squash_candidate_sha", None)
         job.pop("integration_finding_snapshot_sha", None)
-        integrated = job.get("integrated_sha")
-        publication_sha = job.get("publication_sha")
-        if not (
-            isinstance(integrated, str)
-            and isinstance(publication_sha, str)
-            and job.get("integrated_publication_sha") == publication_sha
-            and self.owner.git.resolve(f"{candidate}^{{tree}}")
-            != self.owner.git.resolve(f"{publication_sha}^{{tree}}")
-        ):
-            return candidate
-        repair_job_attempt = int(job.get("repair_job_attempt", 1)) + 1
-        repair_branch = (
-            f"agent-run-repair/{job['run_id']}/{job['repair_generation']}"
-            f"-job-{repair_job_attempt}"
-        )
-        raise RunRepairJobRotationRequired(
-            candidate_sha=candidate,
-            base_sha=integrated,
-            repair_branch=repair_branch,
-            repair_job_attempt=repair_job_attempt,
-            modification_attempt=attempt,
-        )
-
-    def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str,
-        *, save_intent: Callable[[], None],
-    ) -> str:
-        integration = job.get("run_repair_integration")
-        published_sha = (
-            str(integration["source_sha"])
-            if isinstance(integration, dict)
-            else job.get("published_sha")
-        )
-        if uses_merge_resolution(job):
-            return self.owner.git.create_merge_resolution_publication_commit(
-                checkout,
-                candidate_sha=str(job["candidate_sha"]),
-                run_head_sha=str(job["base_sha"]),
-                default_head_sha=str(job["default_base_sha"]),
-                published_sha=published_sha,
-                integration=integration if isinstance(integration, dict) else None,
-                message=message,
-                publication_intent=job.setdefault("publication_commit_intent", {}),
-                save_intent=save_intent,
-            )
-        return self.owner.git.create_publication_commit(
-            checkout,
-            candidate_sha=str(job["candidate_sha"]),
-            base_sha=str(job["base_sha"]),
-            published_sha=published_sha,
-            message=message,
-            publication_intent=job.setdefault("publication_commit_intent", {}),
-            save_intent=save_intent,
-        )
-
-    def rotate_job_checkout(
-        self,
-        *,
-        checkout: Path,
-        current_branch: str,
-        next_branch: str,
-        candidate_sha: str,
-        current_publication_sha: str,
-    ) -> None:
-        self.owner.git.rotate_run_repair_checkout(
-            checkout=checkout,
-            current_branch=current_branch,
-            next_branch=next_branch,
-            candidate_sha=candidate_sha,
-            current_publication_sha=current_publication_sha,
-        )
+        return candidate
 
     def prepare_validation(
         self, checkout: Path, job: dict[str, Any], validation: Path
     ) -> None:
         self.owner._prepare_repair_validation(checkout, job, validation)
 
-    def ensure_pr(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        publication: dict[str, Any],
-        *, save_intent: Callable[[], None],
-    ) -> int:
-        github = self.owner.github
-        if github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        return github.ensure_change_pr(
-            branch=str(job["repair_branch"]),
-            base_branch=str(state["run_branch"]),
-            write_intent=job["ticket_write_intent"],
-            save_intent=save_intent,
-            title=str(publication["pr_title"]),
-            body=self.owner._render_run_repair_pr_body(state, publication),
-            expected_head_sha=str(job["publication_sha"]),
-            expected_base_sha=str(job["base_sha"]),
-        )
-
-    def live_pull_request(
-        self, state: dict[str, Any], _job: dict[str, Any], pr_number: int
-    ) -> dict[str, Any]:
-        currentness = self.owner.repair_currentness
-        if currentness is None:
-            raise ValueError("Run Repair requires the Publisher")
-        return currentness.live_pull_request(
-            state,
-            pr_number,
-            waiting_for=f"Run Repair PR #{pr_number} readback",
-        )
-
     def invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         self.promotion.invalidate_stale(state, job, checkout)
 
+    def create_publication_commit(
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
+    ) -> str:
+        raise ValueError("Parent repair has no internal publication")
+
+    def ensure_pr(
+        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
+    ) -> int:
+        raise ValueError("Parent repair has no internal PR")
+
+    def live_pull_request(
+        self, state: dict[str, Any], job: dict[str, Any], pr_number: int,
+    ) -> dict[str, Any]:
+        raise ValueError("Parent repair has no internal PR")
+
     def after_merge(
-        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any],
     ) -> bool:
-        return self.promotion.after_merge(state, job, live)
+        raise ValueError("Parent repair updates the Run Branch directly")
 
     def merge(
-        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any],
     ) -> str:
-        github = self.owner.github
-        if github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        if uses_merge_resolution(job):
-            return github.normal_merge(
-                pr_number=int(job["pr_number"]),
-                expected_head_sha=str(job["publication_sha"]),
-            )
-        return github.squash_merge(
-            pr_number=int(job["pr_number"]),
-            expected_head_sha=str(job["publication_sha"]),
-            run_branch=str(state["run_branch"]),
-            commit_message=str(publication["commit_message"]),
-        )
+        raise ValueError("Parent repair has no internal merge")
 
     def merge_description(self, job: dict[str, Any]) -> str:
-        return (
-            "ordinary merge"
-            if uses_merge_resolution(job)
-            else "squash merge"
-        )
+        raise ValueError("Parent repair has no internal merge")
 
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str

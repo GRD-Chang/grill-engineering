@@ -82,10 +82,16 @@ def test_candidate_promotion_proves_actual_result_and_preserves_original_review(
 
     state, _states, git, _publisher = _accepted_run(git_repo)
     base = git.resolve("main")
-    candidate = git.resolve(str(state["run_branch"]))
-    tree = git.resolve(f"{candidate}^{{tree}}")
+    run_head = git.resolve(str(state["run_branch"]))
+    tree = git.resolve(f"{run_head}^{{tree}}")
+    candidate = subprocess.run(
+        ["git", "commit-tree", tree, "-p", run_head, "-m", "reviewed repair candidate"],
+        cwd=git_repo, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    assert git.is_ancestor(run_head, candidate)
+    assert git.is_ancestor(base, candidate)
     job = {
-        "base_sha": base, "default_base_sha": base, "candidate_sha": candidate,
+        "base_sha": run_head, "default_base_sha": base, "candidate_sha": candidate,
         "parent_revision": state["parent"]["revision"],
         "ticket_graph_revision": state["ticket_graph"]["revision"],
         "ticket_completion_records": ticket_completion_records(state),
@@ -94,11 +100,12 @@ def test_candidate_promotion_proves_actual_result_and_preserves_original_review(
     evidence = CandidateRunAcceptance(git, default_head_sha=base)
     job["acceptance_record"] = evidence.record(job, "candidate-reviewer", _passing_artifact())
     original = deepcopy(job["acceptance_record"])
-    integrated = subprocess.run(
-        ["git", "commit-tree", tree, "-p", base, "-m", "actual integrated result"],
-        cwd=git_repo, text=True, capture_output=True, check=True,
-    ).stdout.strip()
-    subprocess.run(["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated], cwd=git_repo, check=True)
+    # The program installs the exact reviewed candidate with an accurate source lease.
+    integrated = candidate
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated, run_head],
+        cwd=git_repo, check=True,
+    )
     promoted = evidence.promotion_record(state, job, integrated)
     assert promoted is not None
     assert promoted["reviewed_head_sha"] == integrated
@@ -108,7 +115,16 @@ def test_candidate_promotion_proves_actual_result_and_preserves_original_review(
         job["acceptance_record"] = {**original, field: [] if field == "ticket_completion_records" else "changed"}
         assert evidence.promotion_record(state, job, integrated) is None
     job["acceptance_record"] = original
-    # Identical tree on a commit that is not the actual Run result cannot be promoted.
+    # Identical tree and valid ancestry still do not authorize a different commit.
+    same_tree = subprocess.run(
+        ["git", "commit-tree", tree, "-p", candidate, "-m", "same-tree unreviewed result"],
+        cwd=git_repo, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{state['run_branch']}", same_tree, candidate],
+        cwd=git_repo, check=True,
+    )
+    assert evidence.promotion_record(state, job, same_tree) is None
     assert evidence.promotion_record(state, job, candidate) is None
     assert job["acceptance_record"] == original
     assert job["candidate_acceptance_history"][0]["outcome"] == "accepted"

@@ -26,7 +26,7 @@ def _git(root: Path, *arguments: str) -> str:
 
 
 def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, states, git = _completed_run(
         git_repo, delivery_policy=DeliveryPolicy(run_repair_rounds=1)
@@ -37,30 +37,45 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     agents = ScriptedRunAgents()
 
+    save = states.save_run
+    interrupt = True
+    interrupted_candidates: set[str] = set()
+
+    def stop_after_acceptance(run_id: str, value: dict) -> None:
+        save(run_id, value)
+        repair = value.get("run_acceptance", {}).get("repair_job", {})
+        candidate = str(repair.get("candidate_sha"))
+        if interrupt and repair.get("phase") == "accepted" and candidate not in interrupted_candidates:
+            interrupted_candidates.add(candidate)
+            raise OSError("interrupt before Run Branch update")
+
     def accept() -> dict:
-        return RunAcceptanceEngine(
-            git=git, states=states, agents=agents,
-            github=FixtureGitHubPublisher(fixture, git),
-        ).accept(str(state["run_id"]))
+        with monkeypatch.context() as pause:
+            pause.setattr(states, "save_run", stop_after_acceptance)
+            try:
+                return RunAcceptanceEngine(
+                    git=git, states=states, agents=agents,
+                    github=FixtureGitHubPublisher(fixture, git),
+                ).accept(str(state["run_id"]))
+            except OSError as error:
+                assert str(error) == "interrupt before Run Branch update"
+                result = states.load_current_run(str(state["run_id"]))
+                assert result is not None
+                return result
 
     waiting = accept()
     job = waiting["run_acceptance"]["repair_job"]
-    assert job["phase"] == "waiting_checks"
+    assert job["phase"] == "accepted"
     assert waiting["run_acceptance"]["review_budget"]["development_attempts"] == 1
     assert waiting["run_acceptance"]["review_budget"]["reviewer_invocations"] == 2
     assert "review_budget" not in job
     assert "review_budget_history" not in job
-    branch = str(job["repair_branch"])
-    pr_number = job["pr_number"]
+    branch = str(state["run_branch"])
+    job_generation = job["repair_generation"]
     ci_budget = deepcopy(waiting["run_acceptance"]["ci_recovery"])
     remote = tmp_path / "remote.git"
     _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
     _git(git_repo, "remote", "add", "origin", str(remote))
-    _git(
-        git_repo, "push", "origin",
-        f"{job['publication_sha']}:refs/heads/{branch}",
-        f"{job['base_sha']}:refs/heads/{state['run_branch']}",
-    )
     collaborator = tmp_path / "collaborator"
     _git(tmp_path, "clone", "-b", branch, str(remote), str(collaborator))
     _git(collaborator, "config", "user.name", "Collaborator")
@@ -68,9 +83,6 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
 
     windows = []
     for index in (1, 2, 3):
-        if index > 1:
-            _git(git_repo, "push", "origin", f"{job['publication_sha']}:refs/heads/{branch}")
-            _git(collaborator, "pull", "--ff-only")
         (collaborator / f"human-{index}.txt").write_text(
             f"human contribution {index}\n", encoding="utf-8"
         )
@@ -81,7 +93,6 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
         data = json.loads(fixture.read_text(encoding="utf-8"))
         delivery = data["delivery"]
         delivery["published_branches"][branch] = human_sha
-        delivery["pull_requests"][0]["head_sha"] = human_sha
         delivery["required_checks"] = ["pending"]
         delivery["check_position"] = 0
         fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -95,13 +106,14 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
         if index in (1, 3):
             assert waiting["status"] == "ready_for_human"
             assert job["phase"] == "blocked"
-            assert job["blocked_reason"] == "review_budget_exhausted"
+            assert job["blocked_reason"] == "review_budget_exhausted", json.dumps({"index": index, "resync": waiting["run_acceptance"]["repair_integration_budgets"]})
             assert waiting["run_acceptance"]["review_budget"]["reviewer_invocations"] == 2
             assert waiting["run_acceptance"]["review_budget"]["development_attempts"] == 1
             assert waiting["run_acceptance"]["review_budget"]["window"] == previous_budget["window"]
             assert waiting["run_acceptance"]["review_budget_history"] == previous_history
             assert len(agents.review_requests) == review_count
-            assert job["pr_number"] == pr_number
+            assert job["repair_generation"] == job_generation
+            assert "pr_number" not in job
             assert waiting["run_acceptance"]["ci_recovery"] == ci_budget
             candidate = job["candidate_sha"]
             renewed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
@@ -109,7 +121,8 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
             )
             renewed_job = renewed["run_acceptance"]["repair_job"]
             assert renewed_job["candidate_sha"] == candidate
-            assert renewed_job["pr_number"] == pr_number
+            assert renewed_job["repair_generation"] == job_generation
+            assert "pr_number" not in renewed_job
             assert renewed["run_acceptance"]["ci_recovery"] == ci_budget
             assert renewed["run_acceptance"]["review_budget"]["development_attempts"] == 1
             assert renewed["run_acceptance"]["review_budget"]["reviewer_invocations"] == 0
@@ -120,9 +133,10 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
             job = waiting["run_acceptance"]["repair_job"]
         else:
             assert waiting["run_acceptance"]["review_budget_history"] == previous_history
-        assert job["phase"] == "waiting_checks", job.get("blocked_reason")
-        assert job["pr_number"] == pr_number
-        assert git.is_ancestor(human_sha, str(job["publication_sha"]))
+        assert job["phase"] == "accepted", job.get("blocked_reason")
+        assert job["repair_generation"] == job_generation
+        assert "pr_number" not in job
+        assert git.is_ancestor(human_sha, str(job["candidate_sha"]))
         assert waiting["run_acceptance"]["ci_recovery"] == ci_budget
         assert "review_budget" not in job
         assert "review_budget_history" not in job
@@ -130,10 +144,15 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
         assert waiting["run_acceptance"]["review_budget"]["reviewer_invocations"] == (2 if index == 2 else 1)
         windows.append(waiting["run_acceptance"]["review_budget"]["window"])
 
+    interrupt = False
+    completed = accept()
+    assert completed["status"] == "run_publication_pending", completed.get("diagnostics")
+    assert not json.loads(fixture.read_text())["delivery"].get("pull_requests")
+    assert completed["run_acceptance"]["ci_recovery"] == ci_budget
     assert windows == [2, 2, 3]
     assert len(agents.review_requests) == 5  # Initial Run, first Repair, three appends.
     for index in (1, 2, 3):
-        assert _git(git_repo, "show", f"{job['publication_sha']}:human-{index}.txt") == f"human contribution {index}"
+        assert _git(git_repo, "show", f"{job['candidate_sha']}:human-{index}.txt") == f"human contribution {index}"
 
 
 @pytest.mark.parametrize("external_append", [False, True])
@@ -153,23 +172,34 @@ def test_temporary_repair_fetch_failure_resumes_without_duplicate_review(
             github=FixtureGitHubPublisher(fixture, git),
         ).accept(str(state["run_id"]))
 
-    waiting = accept()
+    save = states.save_run
+
+    def stop_after_acceptance(run_id: str, value: dict) -> None:
+        save(run_id, value)
+        if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
+            raise OSError("interrupt before Run Branch update")
+
+    with monkeypatch.context() as pause:
+        pause.setattr(states, "save_run", stop_after_acceptance)
+        with pytest.raises(OSError, match="interrupt before Run Branch update"):
+            accept()
+    waiting = states.load_current_run(str(state["run_id"]))
+    assert waiting is not None
     job = waiting["run_acceptance"]["repair_job"]
-    assert job["phase"] == "waiting_checks"
-    original_pr = job["pr_number"]
-    original_publication = job["publication_sha"]
+    assert job["phase"] == "accepted"
+    original_generation = job["repair_generation"]
+    original_candidate = job["candidate_sha"]
     original_ci = deepcopy(waiting["run_acceptance"]["ci_recovery"])
     review_count = len(agents.review_requests)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     if external_append:
         checkout = tmp_path / "human"
-        _git(git_repo, "worktree", "add", "--detach", str(checkout), str(original_publication))
+        _git(git_repo, "worktree", "add", "--detach", str(checkout), str(job["base_sha"]))
         (checkout / "human.txt").write_text("human contribution\n", encoding="utf-8")
         _git(checkout, "add", "human.txt")
         _git(checkout, "commit", "-m", "fix: append human contribution")
         human_sha = _git(checkout, "rev-parse", "HEAD")
-        data["delivery"]["published_branches"][str(job["repair_branch"])] = human_sha
-        data["delivery"]["pull_requests"][0]["head_sha"] = human_sha
+        data["delivery"]["published_branches"][str(state["run_branch"])] = human_sha
     data["delivery"]["required_checks"] = ["none"]
     data["delivery"]["check_position"] = 0
     fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -178,7 +208,7 @@ def test_temporary_repair_fetch_failure_resumes_without_duplicate_review(
 
     def fail_once(branch: str, sha: str) -> str:
         nonlocal failed
-        if branch == job["repair_branch"] and not failed:
+        if branch == state["run_branch"] and not failed:
             failed = True
             raise GitError("temporary fetch transport failure")
         return original_fetch(branch, sha)
@@ -188,10 +218,11 @@ def test_temporary_repair_fetch_failure_resumes_without_duplicate_review(
     assert failed
     blocked_job = blocked["run_acceptance"]["repair_job"]
     assert blocked["status"] == "ready_for_human"
-    assert blocked_job["blocked_reason"] == "integration_failed"
+    assert blocked["diagnostics"][0]["code"] == "run_integration_failed"
     assert "run_repair_integration_history_rewrite" not in blocked_job
-    assert blocked_job["pr_number"] == original_pr
-    assert blocked_job["publication_sha"] == original_publication
+    assert blocked_job["repair_generation"] == original_generation
+    assert "pr_number" not in blocked_job
+    assert blocked_job["candidate_sha"] == original_candidate
     monkeypatch.setattr(git, "fetch_remote_commit", original_fetch)
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
@@ -202,6 +233,7 @@ def test_temporary_repair_fetch_failure_resumes_without_duplicate_review(
         agents._reviews.append(_passing_artifact())
     completed = accept()
     assert completed["status"] == "run_publication_pending"
-    assert completed["run_acceptance"]["repair_pr_number"] == original_pr
+    assert "repair_pr_number" not in completed["run_acceptance"]
+    assert not json.loads(fixture.read_text())["delivery"].get("pull_requests")
     assert completed["run_acceptance"]["ci_recovery"] == original_ci
     assert len(agents.review_requests) == review_count + int(external_append)

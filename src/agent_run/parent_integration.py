@@ -54,6 +54,7 @@ def prepare_parent_snapshot(
     save: Callable[[], object],
     own_source_write: bool | str = False,
     confirmed_source_sha: str | None = None,
+    local_source_sha: str | None = None,
     handoff_git_failures: bool = False,
     budget_owner: dict[str, Any] | None = None,
 ) -> ParentSnapshotResult:
@@ -66,11 +67,13 @@ def prepare_parent_snapshot(
     owner = budget_owner if budget_owner is not None else subject
     conflict_key = f"{record_key}_conflict"
     source, target = github.live_branch_heads(source_branch, target_branch)
+    if local_source_sha is not None:
+        source = local_source_sha
     if source is None:
         raise GitError(f"remote source ref {source_branch!r} is missing")
     # A caller may know that its last publication was pushed, but that does
     # not make every later source head an own write.
-    own_source_write = (
+    own_source_write = local_source_sha is not None or (
         source == own_source_write
         if isinstance(own_source_write, str)
         else own_source_write and source in {
@@ -78,7 +81,8 @@ def prepare_parent_snapshot(
         }
     )
     try:
-        git.fetch_remote_commit(source_branch, source)
+        if local_source_sha is None:
+            git.fetch_remote_commit(source_branch, source)
         git.fetch_remote_commit(target_branch, target)
     except GitError as error:
         error.evidence.update(source_sha=source, target_sha=target, candidate_sha=candidate_sha)

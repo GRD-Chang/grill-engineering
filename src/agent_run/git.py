@@ -289,15 +289,6 @@ class GitRepository:
         if self.checkout_head(checkout) != expected_head:
             raise GitError("managed repair checkout seed did not match its Candidate")
 
-    def rotate_run_repair_checkout(
-        self, *, checkout: Path, current_branch: str, next_branch: str,
-        candidate_sha: str, current_publication_sha: str,
-    ) -> None:
-        self._retirement.rotate_run_repair_checkout(
-            checkout=checkout, current_branch=current_branch, next_branch=next_branch,
-            candidate_sha=candidate_sha, current_publication_sha=current_publication_sha,
-        )
-
     def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
         if not checkout.exists():
             return False
@@ -723,31 +714,6 @@ class GitRepository:
         if publication_tree != tree:
             raise GitError("publication commit changed the accepted candidate tree")
         return publication_sha
-
-    def create_merge_resolution_publication_commit(
-        self,
-        checkout: Path,
-        *,
-        candidate_sha: str,
-        run_head_sha: str,
-        default_head_sha: str,
-        published_sha: str | None = None,
-        integration: dict[str, object] | None = None,
-        message: str,
-        publication_intent: dict[str, Any] | None = None,
-        save_intent: Callable[[], None] | None = None,
-    ) -> str:
-        return self._integration_commit.create_merge_resolution_publication_commit(
-            checkout,
-            candidate_sha=candidate_sha,
-            run_head_sha=run_head_sha,
-            default_head_sha=default_head_sha,
-            published_sha=published_sha,
-            integration=integration,
-            message=message,
-            publication_intent=publication_intent,
-            save_intent=save_intent,
-        )
 
     def reset_checkout_to_base(self, checkout: Path, base_branch: str) -> None:
         """Discard an invalidated Candidate from its managed checkout."""

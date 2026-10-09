@@ -87,6 +87,11 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
         assert run["acceptance_record"]["reviewed_default_base_sha"] == target
         assert run["acceptance_record"]["acceptance_state"] == "integrated"
         assert len(run["candidate_acceptance_history"]) == 1
-        assert len(repair_pulls) == 1
-        assert repair_pulls[0]["state"] == "MERGED"
+        assert repair_pulls == []
+        assert not any(
+            invocation.get("work_subject") == f"run-repair:{state['run_id']}"
+            and invocation.get("role") == "publication"
+            for invocation in state["agent_invocation_history"]
+        )
+        assert run["completed_repair_jobs"][-1]["candidate_sha"] == run["integrated_sha"]
         assert state["run_publication"]["required_checks_evidence"]["result"] == "pass"

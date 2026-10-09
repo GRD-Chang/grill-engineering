@@ -65,6 +65,8 @@ def work_role(subject: dict[str, Any], *, location: str | None = None) -> str | 
         return "publication"
     if location == "run_acceptance" and phase == "pending":
         return "reviewer"
+    if location == "run_repair" and phase == "accepted":
+        return None
     if phase == "accepted" or (
         phase == "pending" and subject.get("phase") in {"blocked", "ready_for_human"}
         and subject.get("human_blocker_phase") == "pending"

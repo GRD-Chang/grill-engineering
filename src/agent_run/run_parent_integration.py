@@ -226,7 +226,7 @@ def _published_run_head(state: dict[str, Any], git: GitRepository) -> str | None
 
 
 def ensure_run_repair_base(owner: RunAcceptanceEngine, state: dict[str, Any], run: dict[str, Any]) -> None:
-    """Publish a proven integration as the internal Repair PR's exact base.
+    """Publish the exact integration snapshot needed by Parent repair work.
 
     A durable intent and exact ref readback recover a lost write response. This
     updates only the Run Branch, never creates or approves the final Run PR.

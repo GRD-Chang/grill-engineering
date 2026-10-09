@@ -57,7 +57,7 @@ def _ticket(
     }
 
 
-@pytest.mark.parametrize("legacy_protocol", [None, 1, 2.0, "2"])
+@pytest.mark.parametrize("legacy_protocol", [None, 1, 2, 3.0, "3"])
 def test_legacy_branch_authority_state_is_rejected_before_reuse(
     git_repo: Path, legacy_protocol: object
 ) -> None:
@@ -84,7 +84,7 @@ def test_legacy_branch_authority_state_is_rejected_before_reuse(
     replacement, resumed = controller.start_or_resume_unfinished(1)
 
     assert not resumed
-    assert replacement["branch_authority_protocol"] == 2
+    assert replacement["branch_authority_protocol"] == 3
     assert states.load_current_run(str(replacement["run_id"])) is not None
 
 
@@ -1999,7 +1999,13 @@ def test_deterministic_ticket_conflict_allows_independent_frontier(
     assert resumed["ticket_jobs"]["3"]["ticket_number"] == 3
 
 
-def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -> None:
+def test_waiting_ci_holds_slot_while_independent_ticket_queues(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_run.external_supervision as supervision
+
+    clock = [1000.25]
+    monkeypatch.setattr(supervision, "monotonic", lambda: clock[0])
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
@@ -2047,6 +2053,25 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -
     checks["delivery"]["required_checks"] = ["pass"]
     fixture.write_text(json.dumps(checks))
     publisher.data = checks
+    # GitHub may converge while the durable next observation is still in
+    # backoff. Advancing the repository fixture does not advance that clock.
+    window = waiting["supervision_window"]
+    next_retry = window.get("next_retry_at")
+    if next_retry is not None:
+        assert isinstance(next_retry, (int, float))
+        assert next_retry > clock[0]
+        before_due = engine.deliver(state["run_id"])
+        assert before_due["ticket_integration_holder"] == 2
+        assert before_due["ticket_jobs"]["2"]["phase"] == "waiting_checks"
+        assert before_due["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
+        assert [entry["ticket_number"] for entry in before_due["ticket_integration_queue"]] == [3]
+        assert json.loads(fixture.read_text())["delivery"]["closed_issues"] == []
+        clock[0] = float(next_retry)
+    else:
+        # A window with no planned retry still permits its first observation.
+        assert window["retry_count"] == 0
+        assert window["started_at"] == clock[0]
+
     completed = engine.deliver(state["run_id"])
     assert completed["ticket_integration_holder"] is None
     assert completed["ticket_integration_queue"] == []

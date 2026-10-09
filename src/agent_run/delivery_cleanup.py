@@ -66,9 +66,8 @@ class DeliveryCleanupEngine:
     def complete_run_repairs(
         self, state: dict[str, Any], jobs: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Retire every Job identity used by one completed Repair Cycle."""
+        """Retire completed Parent repair work without remote branch writes."""
 
-        # Rotated Jobs reuse one checkout; retire its final owner first.
         for job in reversed(jobs):
             if job.get("phase") != "completed" or not isinstance(
                 job.get("integrated_sha"), str
@@ -292,7 +291,7 @@ class DeliveryCleanupEngine:
                         if self.github is not None
                         else None
                     )
-                    if callable(remote_delete):
+                    if item.get("kind") != "run_repair" and callable(remote_delete):
                         remote_delete(branch, expected_head_sha=expected_remote_head)
                     self._remove_empty_directories(checkout)
                 except (OSError, RuntimeError) as error:

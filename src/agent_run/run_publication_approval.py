@@ -530,11 +530,6 @@ def _change_pr_numbers(state: dict[str, Any]) -> list[int]:
         for job in jobs.values():
             if isinstance(job, dict) and isinstance(job.get("pr_number"), int):
                 numbers.add(int(job["pr_number"]))
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
-            numbers.add(int(repair["pr_number"]))
     return sorted(numbers)
 
 

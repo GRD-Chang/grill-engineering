@@ -29,8 +29,8 @@ class RunDevelopmentReview:
         return False
 
     def develop(self) -> bool:
-        # A full Parent repair retains its existing branch, integration and PR
-        # lifecycle. Its local work also uses the shared loop; promotion proves
+        # A full Parent repair retains its local branch and integration work.
+        # Its development uses the shared loop; direct promotion proves
         # the reviewed Candidate is exactly the integrated result.
         repair = self.engine._repair(self.state, self.job)
         if repair in {"waiting", "promoted"}:

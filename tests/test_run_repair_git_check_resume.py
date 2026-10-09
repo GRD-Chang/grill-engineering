@@ -48,7 +48,7 @@ def test_repair_checkout_retains_unfinished_integration_human_work(
 
 
 def test_run_repair_hook_failure_reloads_and_resumes_same_work(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, states, git = _completed_run(
         git_repo, delivery_policy=DeliveryPolicy(run_repair_rounds=3)
@@ -95,13 +95,25 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
             return DevelopmentResult("run-repair-developer", "Fixed integration hook")
 
     agents = HookAgents()
-    first = RunAcceptanceEngine(
-        git=git, states=states, agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(run_id)
+    save_run = states.save_run
+
+    def interrupt_after_acceptance(run_id: str, value: dict[str, Any]) -> None:
+        save_run(run_id, value)
+        if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
+            raise OSError("interrupt before Run Branch update")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(states, "save_run", interrupt_after_acceptance)
+        with pytest.raises(OSError, match="interrupt before Run Branch update"):
+            RunAcceptanceEngine(
+                git=git, states=states, agents=agents,
+                github=FixtureGitHubPublisher(fixture, git),
+            ).accept(run_id)
+    first = states.load_current_run(run_id)
+    assert first is not None
     job = first["run_acceptance"]["repair_job"]
-    assert job["phase"] == "waiting_checks"
-    original_pr = job["pr_number"]
+    assert job["phase"] == "accepted"
+    assert "pr_number" not in job
 
     def command(*args: str) -> str:
         return subprocess.run(
@@ -119,7 +131,6 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
         git.remove_worktree(target_checkout)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["published_branches"][str(state["run_branch"])] = target
-    data["delivery"]["pull_requests"][0]["base_sha"] = target
     data["delivery"]["required_checks"] = ["none"]
     data["delivery"]["check_position"] = 0
     fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -179,7 +190,8 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
     assert result["status"] == "run_publication_pending", result.get("diagnostics")
     loaded = StateStore(states.root).load_current_run(run_id)
     assert loaded is not None
-    assert loaded["run_acceptance"]["repair_pr_number"] == original_pr
+    assert "repair_pr_number" not in loaded["run_acceptance"]
+    assert not json.loads(fixture.read_text())["delivery"].get("pull_requests")
     assert loaded["run_acceptance"]["review_budget"]["development_attempts"] == 2
     assert any(item["semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
                and item["status"] == "completed"

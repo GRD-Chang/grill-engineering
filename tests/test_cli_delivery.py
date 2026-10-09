@@ -4808,11 +4808,11 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
 @pytest.mark.parametrize(
     ("resume_args", "expected_thread", "successor_mode"),
     [
-        ((), "run-repair-publication-1", "resume"),
+        ((), "run-repair-developer", "resume"),
         (("--new-thread",), None, "new-thread"),
     ],
 )
-def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
+def test_resume_targets_failed_run_repair_development_not_completed_ticket(
     git_repo: Path,
     resume_args: tuple[str, ...],
     expected_thread: str | None,
@@ -4820,161 +4820,84 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     ticket_agents = git_repo / "ticket-agents.json"
-    ticket_agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "ticket-developer",
-                        "summary": "Delivered the Ticket candidate.",
-                        "write_files": {"feature.txt": "ticket\n"},
-                    }
-                ],
-                "publications": [publication()],
-                "reviews": [
-                    passing_acceptance("ticket-reviewer", "Ticket passed.")
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    ticket_agents.write_text(json.dumps({
+        "developments": [{
+            "expected_thread_id": None, "thread_id": "ticket-developer",
+            "summary": "Delivered the Ticket candidate.",
+            "write_files": {"feature.txt": "ticket\n"},
+        }],
+        "publications": [publication()],
+        "reviews": [passing_acceptance("ticket-reviewer", "Ticket passed.")],
+    }), encoding="utf-8")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(ticket_agents),
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents),
     )
     assert delivered.returncode == 0, delivered.stderr
 
     failed_agents = git_repo / "failed-run-repair-agents.json"
-    failed_agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "run-repair-developer",
-                        "summary": "Repaired the accumulated Run.",
-                        "write_files": {"run-repair.txt": "repaired\n"},
-                    }
-                ],
-                "publications": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "run-repair-publication-1",
-                        "invalid": "publication",
-                    }
-                ],
-                "run_reviews": [
-                    repair_acceptance("run-reviewer-1"),
-                    passing_acceptance(
-                        "run-repair-reviewer", "Run repair candidate passed."
-                    ),
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    failed = run_internal_stage(
-        git_repo,
-        fixture,
-        "accept-run",
-        run_id,
-        "--agent-fixture",
-        str(failed_agents),
-    )
+    failed_agents.write_text(json.dumps({
+        "developments": [{
+            "expected_thread_id": None, "thread_id": "run-repair-developer",
+            "summary": "unused after failure",
+            "write_files": {"partial-repair.txt": "preserve pending work\n"},
+            "error_after_writes": "simulated Parent repair Development failure",
+        }],
+        "run_reviews": [repair_acceptance("run-reviewer-1")],
+    }), encoding="utf-8")
+    failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(failed_agents))
     assert failed.returncode == 2, failed.stderr
     assert stdout_json(failed)["status"] == "execution_failed"
 
     state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     failed_state = load_only_run_state(git_repo)
     completed_ticket = failed_state["ticket_jobs"]["3"]
+    assert completed_ticket["phase"] == "completed"
     completed_ticket["publication_thread_id"] = "completed-ticket-publication"
     repair_job = failed_state["run_acceptance"]["repair_job"]
-    repair_job["publication_thread_id"] = "run-repair-publication-1"
+    pending_attempt = repair_job["pending_semantic_attempt"]
     original_invocation = failed_state["active_agent_invocation"]
-    failed_state["active_agent_invocation"] = {
-        "work_subject": f"run-repair:{run_id}",
-        "generation": repair_job["repair_generation"],
-        "role": "publication",
-        "phase": "publication",
-        "mode": "fresh",
-        "input_fingerprint": "fixture",
-        "currentness_boundary": original_invocation["currentness_boundary"],
-        "semantic_attempt": repair_job["pending_semantic_attempt"],
-        "status": "failed",
-        "requested_thread_id": None,
-        "reported_thread_id": "run-repair-publication-1",
-        "attempt_count": 1,
-        "started_at": "2026-08-11T00:00:00+00:00",
-        "ended_at": "2026-08-11T00:00:01+00:00",
-        "error": "invalid publication",
-        "return_code": 0,
-        "signal": None,
-    }
-    state_path.write_text(
-        json.dumps(failed_state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    assert original_invocation["work_subject"] == f"run-repair:{run_id}"
+    assert original_invocation["role"] == "development"
+    assert original_invocation["reported_thread_id"] == "run-repair-developer"
+    state_path.write_text(json.dumps(failed_state), encoding="utf-8")
 
     resume_agents = git_repo / "resume-run-repair-agents.json"
-    resume_agents.write_text(
-        json.dumps(
-            {
-                "developments": [],
-                "publications": [
-                    {
-                        **publication(),
-                        "expected_thread_id": expected_thread,
-                        "thread_id": (
-                            expected_thread or "run-repair-publication-2"
-                        ),
-                    }
-                ],
-                "run_reviews": [
-                    passing_acceptance("run-reviewer-2", "Complete Run passed.")
-                ],
-                "run_publications": [final_run_publication()],
-            }
-        ),
-        encoding="utf-8",
-    )
+    resume_agents.write_text(json.dumps({
+        "developments": [{
+            "expected_thread_id": expected_thread,
+            "thread_id": expected_thread or "run-repair-developer-2",
+            "summary": "Completed the pending Parent repair.",
+            "expected_files": {"partial-repair.txt": "preserve pending work\n"},
+            "write_files": {"run-repair.txt": "repaired\n"},
+        }],
+        "run_reviews": [passing_acceptance("run-reviewer-2", "Complete Run passed.")],
+        "run_publications": [final_run_publication()],
+    }), encoding="utf-8")
     resumed = run_cli(
-        git_repo,
-        fixture,
-        "resume",
-        run_id,
-        "--agent-fixture",
-        str(resume_agents),
+        git_repo, fixture, "resume", run_id, "--agent-fixture", str(resume_agents),
         *resume_args,
     )
-
     assert resumed.returncode == 0, resumed.stderr
     resumed_state = load_only_run_state(git_repo)
     assert resumed_state["status"] == "run_approval_pending"
-    assert (
-        resumed_state["ticket_jobs"]["3"]["publication_thread_id"]
-        == "completed-ticket-publication"
-    )
+    assert resumed_state["ticket_jobs"]["3"]["publication_thread_id"] == "completed-ticket-publication"
     repair_successor = next(
-        invocation
-        for invocation in reversed(resumed_state["agent_invocation_history"])
+        invocation for invocation in reversed(resumed_state["agent_invocation_history"])
         if invocation.get("work_subject") == f"run-repair:{run_id}"
-        and invocation.get("role") == "publication"
+        and invocation.get("role") == "development"
         and invocation.get("status") == "completed"
     )
-    assert repair_successor["work_subject"] == f"run-repair:{run_id}"
     assert repair_successor["mode"] == successor_mode
     assert repair_successor["requested_thread_id"] == expected_thread
-    assert repair_successor["reported_thread_id"] == (
-        expected_thread or "run-repair-publication-2"
-    )
-    # The resumed repair remains the formal Run Acceptance boundary even
-    # though the same Executor has since published the final Run candidate.
+    assert repair_successor["reported_thread_id"] == (expected_thread or "run-repair-developer-2")
+    assert repair_successor["semantic_attempt"]["attempt_id"] == pending_attempt["attempt_id"]
     assert resumed_state["run_acceptance"]["phase"] == "accepted"
+    assert not any(
+        invocation.get("work_subject") == f"run-repair:{run_id}"
+        and invocation.get("role") == "publication"
+        for invocation in resumed_state["agent_invocation_history"]
+    )
 
 
 def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:

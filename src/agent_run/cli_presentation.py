@@ -644,6 +644,7 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "code_modification_limit": policy.development_limit,
         "validation_attempts": cycle.get("validation_attempts", 0),
         "candidate_sha": job.get("candidate_sha"),
+        "run_branch_write_intent": job.get("run_branch_write_intent"),
         "development_thread_id": cycle.get("development_thread_id"),
         "worktree": cycle.get("worktree"),
     }

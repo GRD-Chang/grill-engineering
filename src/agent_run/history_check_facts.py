@@ -50,7 +50,8 @@ def checks_timeline_facts(
     facts: dict[str, Any] = {}
     if not isinstance(subject, dict):
         return facts
-    if type(marker.get("pr_number")) is int:
+    if (type(marker.get("pr_number")) is int
+            or isinstance(subject.get("run_branch_write_intent"), dict)):
         facts.update(_subject_scope(state, subject, marker))
     observation = subject.get("required_checks_evidence")
     if (
@@ -74,6 +75,8 @@ def checks_timeline_facts(
     intent = subject.get("write_intent") or subject.get("ticket_write_intent")
     if isinstance(intent, dict):
         facts["github_write_action"] = intent.get("action")
+    elif isinstance(subject.get("run_branch_write_intent"), dict):
+        facts["github_write_action"] = "update_run_branch"
     if state.get("status") in {"waiting_external", "supervision_timeout"}:
         diagnostics = state.get("diagnostics")
         if isinstance(diagnostics, list) and diagnostics and isinstance(diagnostics[0], dict):

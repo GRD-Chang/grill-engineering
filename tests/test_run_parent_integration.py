@@ -268,7 +268,7 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
     budget["used"] = budget["limit"]
     budget["open"] = False
     run["repair_job"] = {
-        "phase": "merging",
+        "phase": "developing",
         "repair_mode": "squash",
         "policy_snapshot": deepcopy(run["policy_snapshot"]),
     }
@@ -287,8 +287,15 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
     assert resumed["run_acceptance"]["phase"] == "repairing"
     assert resumed["run_acceptance"]["repair_job"] == repair_before
     assert resumed["run_acceptance"]["integration_resync"]["generation"] == 2
+    assert resumed["run_acceptance"]["integration_resync"]["used"] == 0
+    assert resumed["run_acceptance"]["integration_resync"]["history"][-1] == {
+        "generation": 2, "renewed": True,
+    }
     assert resumed["status"] == "run_acceptance_pending"
-    assert states.load_current_run(str(state["run_id"]))["run_acceptance"]["phase"] == "repairing"
+    persisted = states.load_current_run(str(state["run_id"]))["run_acceptance"]
+    assert persisted["phase"] == "repairing"
+    assert persisted["repair_job"] == repair_before
+    assert persisted["integration_resync"] == resumed["run_acceptance"]["integration_resync"]
 
 
 def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> None:
@@ -302,6 +309,13 @@ def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> No
     ).accept(str(state["run_id"]))
     run = accepted["run_acceptance"]
     failed_head = git.resolve(str(state["run_branch"]))
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.ensure_final_run_ref(branch=str(state["run_branch"]), expected_head_sha=failed_head)
+    final_pr = publisher.ensure_run_pr(
+        branch=str(state["run_branch"]), base_branch="main",
+        expected_head_sha=failed_head, expected_base_sha=git.resolve("main"),
+        title="Final Parent delivery", body="Current full Parent candidate.",
+    )
     assert observe_repairable_ci_failure(
         run, head_sha=failed_head, limit=3,
         is_ticket=False,
@@ -316,7 +330,7 @@ def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> No
         "phase": "ready_for_human", "blocked_reason": "ci_development_budget_exhausted",
     })
     failed_observation = {
-        "pr_number": 1, "head_sha": failed_head, "result": "fail",
+        "pr_number": final_pr, "head_sha": failed_head, "result": "fail",
         "checks": [{
             "bucket": "fail", "workflow": "fixture-ci",
             "name": "fixture-required-check", "link": "https://example.invalid/checks/fixture",
@@ -328,12 +342,11 @@ def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> No
         "escalation_code": "ci_development_budget_exhausted",
         "repair_mode": "squash",
         "repair_source": "acceptance",
-        "pr_number": 1,
         "publication_sha": failed_head,
         "required_checks_origin": failed_observation,
         "policy_snapshot": deepcopy(run["policy_snapshot"]),
     }
-    accepted["run_publication"] = {"phase": "stale"}
+    accepted["run_publication"] = {"phase": "stale", "pr_number": final_pr}
     accepted.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
     states.save_run(str(state["run_id"]), accepted)
     review_before = dict(run["review_budget"])

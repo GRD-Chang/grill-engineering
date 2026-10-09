@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
-from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError, GitIntegrityError
-from agent_run.git_publication_commit import install_publication_commit
 
 
 class GitCommitOperations(Protocol):
@@ -254,93 +251,3 @@ class IntegrationRepairCommitGit:
             or line.startswith(marker_lines[2])
             for line in candidate.read_bytes().splitlines()
         )
-
-    def create_merge_resolution_publication_commit(
-        self,
-        checkout: Path,
-        *,
-        candidate_sha: str,
-        run_head_sha: str,
-        default_head_sha: str,
-        published_sha: str | None = None,
-        integration: dict[str, object] | None = None,
-        message: str,
-        publication_intent: dict[str, Any] | None = None,
-        save_intent: Callable[[], None] | None = None,
-    ) -> str:
-        """Keep the accepted tree while appending to the published source history."""
-
-        tree = self._git._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
-        parent = published_sha or run_head_sha
-        if not self._git.is_ancestor(run_head_sha, parent):
-            raise GitError("published Repair head no longer descends from the Run boundary")
-        if integration is None:
-            if self._git.commit_parents(candidate_sha) != [run_head_sha, default_head_sha]:
-                raise GitError("Merge-resolution Candidate parents do not match its boundary")
-        elif not (
-            set(integration) == {
-                "candidate_sha", "candidate_tree", "source_sha", "target_sha",
-                "head_sha", "head_tree", "conflict_paths",
-            }
-            and isinstance(integration.get("candidate_sha"), str)
-            and integration.get("candidate_tree")
-            == self._git._resolve_in(checkout, f"{integration['candidate_sha']}^{{tree}}")
-            and isinstance(integration.get("conflict_paths"), list)
-            and integration.get("head_sha") == candidate_sha
-            and integration.get("head_tree") == tree
-            and integration.get("target_sha") == run_head_sha
-            and integration.get("source_sha") == parent
-            and self._git.is_ancestor(str(integration["candidate_sha"]), candidate_sha)
-            and self._git.is_ancestor(parent, candidate_sha)
-            and self._git.is_ancestor(run_head_sha, candidate_sha)
-            and self._git.is_ancestor(default_head_sha, candidate_sha)
-        ):
-            raise GitError("Merge-resolution Candidate does not match its integration record")
-        current = self._git._resolve_in(checkout, "HEAD")
-        if not publication_intent and (
-            self._git._resolve_in(checkout, "HEAD^{tree}") == tree
-            and self._git.commit_parents(current) == [parent, default_head_sha]
-        ):
-            current_message = self._git._run_in(
-                checkout, "cat-file", "commit", current
-            )
-            if current_message.returncode == 0 and commit_messages_match(
-                current_message.stdout.partition("\n\n")[2], message
-            ):
-                return current
-        if publication_intent is not None:
-            if save_intent is None:
-                raise GitError("publication commit intent requires a persistence boundary")
-            return install_publication_commit(
-                self._git, checkout, tree=tree, parents=[parent, default_head_sha],
-                message=message, intent=publication_intent, save_intent=save_intent,
-            )
-        created = self._git._run_in(
-            checkout,
-            "commit-tree",
-            tree,
-            "-p",
-            parent,
-            "-p",
-            default_head_sha,
-            "-m",
-            message,
-        )
-        if created.returncode != 0:
-            raise GitError(
-                created.stderr.strip()
-                or "could not create Merge-resolution publication commit"
-            )
-        publication = created.stdout.strip()
-        reset = self._git._run_in(checkout, "reset", "--hard", publication)
-        if reset.returncode != 0:
-            raise GitError(
-                reset.stderr.strip()
-                or "could not install Merge-resolution publication commit"
-            )
-        if (
-            self._git._resolve_in(checkout, f"{publication}^{{tree}}") != tree
-            or self._git.commit_parents(publication) != [parent, default_head_sha]
-        ):
-            raise GitError("Merge-resolution publication changed the accepted boundary")
-        return publication

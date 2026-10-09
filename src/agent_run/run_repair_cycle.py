@@ -2,10 +2,8 @@ from __future__ import annotations
 
 """Repair Cycle state, counters, and terminal transitions."""
 
-from copy import deepcopy
 from typing import Any
 
-from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 _ACTIVE_CHECKOUT_PHASES = frozenset(
@@ -16,11 +14,6 @@ _ACTIVE_CHECKOUT_PHASES = frozenset(
         "candidate",
         "reviewing",
         "accepted",
-        "publishing",
-        "publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "merging",
     }
 )
 
@@ -47,7 +40,7 @@ def repair_checkout_is_active(job: dict[str, Any]) -> bool:
     phase = job.get("phase")
     return phase in _ACTIVE_CHECKOUT_PHASES or (
         phase == "blocked"
-        and (job.get("blocked_reason") == "ci_investigation_paused" or (
+        and (job.get("blocked_reason") in {"ci_investigation_paused", "run_branch_write_failed", "run_branch_write_unknown"} or (
             job.get("blocked_reason") == "agent_requires_human"
             and (
                 job.get("human_blocker_phase") in {"developing", "repairing"}
@@ -99,88 +92,6 @@ def sync_repair_cycle_counters(
         cycle["worktree"] = checkout
     run["code_modification_attempts"] = modifications
     run["modification_attempts"] = modifications
-
-
-def rotate_repair_job(
-    run: dict[str, Any],
-    job: dict[str, Any],
-    *,
-    candidate_sha: str,
-    base_sha: str,
-    repair_branch: str,
-    repair_job_attempt: int,
-    modification_attempt: int,
-    repair_checkout: str,
-) -> dict[str, Any]:
-    """Replace an integrated Job while preserving its active Repair Cycle."""
-
-    completed_repairs = run.setdefault("completed_repair_jobs", [])
-    if not isinstance(completed_repairs, list):
-        raise ValueError("completed_repair_jobs must be a list")
-    completed = {
-        "phase": "completed",
-        "repair_branch": job["repair_branch"],
-        "publication_sha": job["publication_sha"],
-        "pr_number": job["pr_number"],
-        "integrated_sha": job["integrated_sha"],
-        "candidate_sha": job["candidate_sha"],
-        "acceptance_state": "revalidation_finding",
-    }
-    origin = job.get("required_checks_origin")
-    if isinstance(origin, dict):
-        completed["ci_evidence"] = deepcopy(origin)
-    completed_repairs.append(completed)
-    del completed_repairs[:-32]
-
-    rotated = dict(job)
-    clear_required_checks_observation(rotated)
-    trigger = rotated.get("repair_trigger")
-    if isinstance(trigger, dict):
-        trigger = dict(trigger)
-        trigger["head_sha"] = base_sha
-        rotated["repair_trigger"] = trigger
-    for key in (
-        "acceptance_record",
-        "publication",
-        "publication_sha",
-        "published_sha",
-        "integrated_sha",
-        "integrated_publication_sha",
-        "pr_number",
-        "merge_intent",
-        "merge_reconciliation_history",
-        "ticket_write_intent",
-        "linked_branch_display",
-        "pending_attempt",
-        "integrated_revalidation_merge",
-        "deterministic_integration_record",
-    ):
-        rotated.pop(key, None)
-    rotated.update(
-        {
-            "phase": "candidate",
-            "repair_attempt": int(job["repair_attempt"]) + 1,
-            "repair_job_attempt": repair_job_attempt,
-            "repair_branch": repair_branch,
-            "base_sha": base_sha,
-            "repair_base_run_head_sha": base_sha,
-            "candidate_sha": candidate_sha,
-            "repair_source": "acceptance",
-            "repair_input_artifact": _mapping(job, "acceptance_artifact"),
-            "modification_attempts": modification_attempt,
-            "code_modification_attempts": modification_attempt,
-            "publication_attempts": 0,
-            "repair_checkout": repair_checkout,
-            "repair_job_rotation": {
-                "current_branch": str(job["repair_branch"]),
-                "next_branch": repair_branch,
-                "candidate_sha": candidate_sha,
-            },
-        }
-    )
-    run["repair_job"] = rotated
-    sync_repair_cycle_counters(run, rotated)
-    return rotated
 
 
 def escalate_repair(

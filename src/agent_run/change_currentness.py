@@ -89,86 +89,6 @@ def unknown_pr_mutation(
     if not isinstance(pr_number, int):
         return None
     live = github.live_pull_request(pr_number)
-    if (
-        subject.startswith("run-repair:")
-        and live.get("state") == "MERGED"
-        and job.get("repair_mode") == "squash"
-        and not isinstance(job.get("integrated_revalidation_merge"), dict)
-        and isinstance(job.get("integrated_sha"), str)
-        and job.get("integrated_publication_sha") == job.get("publication_sha")
-    ):
-        # A controlled squash merge can still need Review after default drift.
-        # Retain that Candidate only while the exact merge readback is proven.
-        squash_integrated = str(job["integrated_sha"])
-        publication = str(job["publication_sha"])
-        base = str(job["base_sha"])
-        try:
-            tree = git.resolve(f"{publication}^{{tree}}")
-            valid = (
-                git.commit_parents(squash_integrated) == [base]
-                and git.resolve(f"{squash_integrated}^{{tree}}") == tree
-                and git.resolve(f"{job['candidate_sha']}^{{tree}}") == tree
-                and git.is_ancestor(base, publication)
-            )
-        except (GitError, ValueError, KeyError):
-            valid = False
-            tree = None
-        if (
-            valid
-            and live.get("head_sha") == publication
-            and live.get("base_branch") == state.get("run_branch")
-            and live.get("base_sha") == squash_integrated
-            and live.get("integrated_sha") == squash_integrated
-            and live.get("head_tree") == tree
-            and live.get("integrated_tree") == tree
-            and live.get("integrated_parents") == [base]
-        ):
-            return None
-        return "change_pr_integrated_authority_changed_externally"
-    if (
-        subject.startswith("run-repair:")
-        and live.get("state") == "MERGED"
-        and isinstance(job.get("integrated_revalidation_merge"), dict)
-    ):
-        marker = _mapping(job, "integrated_revalidation_merge")
-        integrated = job.get("integrated_sha")
-        published_base = marker.get("base_sha")
-        published_default = marker.get("default_base_sha")
-        published_candidate = marker.get("candidate_sha")
-        published_head = marker.get("publication_sha")
-        try:
-            published_head_tree = git.resolve(f"{published_head}^{{tree}}")
-            integrated_tree = git.resolve(f"{integrated}^{{tree}}")
-            local_facts_match = (
-                git.commit_parents(str(published_candidate))
-                == [published_base, published_default]
-                and git.commit_parents(str(published_head))
-                == [published_base, published_default]
-                and git.commit_parents(str(integrated))
-                == [published_base, published_head]
-                and git.is_ancestor(str(published_default), str(integrated))
-            )
-        except (GitError, ValueError):
-            published_head_tree = None
-            integrated_tree = None
-            local_facts_match = False
-        if live.get("head_sha") != published_head:
-            return "change_pr_head_changed_externally"
-        if live.get("base_branch") != state.get("run_branch"):
-            return "change_pr_base_changed_externally"
-        if not isinstance(integrated, str) or live.get("integrated_sha") != integrated:
-            return "change_pr_integrated_sha_changed_externally"
-        if live.get("base_sha") != integrated:
-            return "change_pr_base_changed_externally"
-        if live.get("head_tree") != published_head_tree:
-            return "change_pr_head_tree_changed_externally"
-        if live.get("integrated_tree") != integrated_tree:
-            return "change_pr_integrated_tree_changed_externally"
-        if live.get("integrated_parents") != [published_base, published_head]:
-            return "change_pr_integrated_parents_changed_externally"
-        if not local_facts_match:
-            return "change_pr_integrated_authority_changed_externally"
-        return None
     if live.get("state") != "OPEN":
         return "change_pr_closed_or_merged_externally"
     known_heads = {job.get("publication_sha")}
@@ -203,16 +123,7 @@ def unknown_pr_mutation(
             return "change_pr_base_changed_externally"
     elif not subject.startswith("ticket:"):
         local_base = git.resolve(expected_base_branch)
-        if subject.startswith("run-repair:") and repair_run_branch_is_current(
-            git, job, local_base
-        ):
-            # The published PR can already target an integrated remote Run
-            # snapshot while the managed local ref remains at its anchor.
-            # A newer live target still needs the append-only check in the
-            # Controller, followed by fresh integration and review.
-            expected_base = job.get("base_sha")
-        else:
-            expected_base = local_base
+        expected_base = local_base
         if live.get("base_sha") != expected_base:
             return "change_pr_base_changed_externally"
     return None

@@ -115,6 +115,14 @@ class RunAcceptanceEngine:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        run = state.get("run_acceptance")
+        repair = run.get("repair_job") if isinstance(run, dict) else None
+        if isinstance(run, dict) and isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+            # Resolve the original remote write before graph/currentness
+            # refresh or integration can replace its authority or charge it
+            # as an external source update.
+            self._repair(state, run)
+            return self._save(state)
         if not reconcile_run_pr_write(
             state, self.github, self._save,
             current_head_sha=self.git.resolve(str(state["run_branch"])),
@@ -398,11 +406,6 @@ class RunAcceptanceEngine:
 
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
         return self._repair_lifecycle._repair(state, run)
-
-    def _render_run_repair_pr_body(
-        self, state: dict[str, Any], publication: dict[str, Any]
-    ) -> str:
-        return self._repair_lifecycle._render_run_repair_pr_body(state, publication)
 
     def _prepare_repair_validation(
         self, checkout: Path, job: dict[str, Any], validation: Path

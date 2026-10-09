@@ -114,25 +114,26 @@ def test_creation_recovery_lookup_includes_closed_and_ambiguous_objects(
 def test_run_repair_checks_pending_write_before_source_observation(monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_run.run_repair_lifecycle import RunRepairLifecycle
 
-    state, job = boundary()
-    original = deepcopy(job)
+    intent = {"branch": "run", "base_sha": "base", "candidate_sha": "candidate", "default_base_sha": "default"}
+    state: dict[str, Any] = {"run_id": "run-1"}
+    job: dict[str, Any] = {"phase": "accepted", "run_branch_write_intent": dict(intent)}
     owner = SimpleNamespace(github=object(), _repair_checkout=lambda _state: Path("unused"))
     lifecycle = RunRepairLifecycle(owner, SimpleNamespace())
     monkeypatch.setattr(lifecycle, "_repair_job", lambda _state, _run: job)
 
-    def reconcile(_state: Any, current: Any) -> bool:
-        assert current["ticket_write_intent"] == original["ticket_write_intent"]
-        current.update(phase="blocked", execution_resume_phase="publishing")
+    def reconcile(_owner: Any, _promotion: Any, _state: Any, current: Any) -> bool:
+        assert current["run_branch_write_intent"] == intent
+        current.update(phase="blocked", blocked_reason="run_branch_write_failed")
         return False
 
-    monkeypatch.setattr(lifecycle, "_repair_engine", lambda *_args: SimpleNamespace(reconcile_pending_pr_write=reconcile))
-
     def forbidden(*_args: Any) -> None:
-        raise AssertionError("source observation must not invalidate an unresolved PR write")
+        raise AssertionError("checkout or integration must not precede unresolved Run Branch write")
 
-    monkeypatch.setattr("agent_run.run_repair_lifecycle.observe_repair_source", forbidden)
+    monkeypatch.setattr("agent_run.run_repair_lifecycle.update_run_branch", reconcile)
+    monkeypatch.setattr("agent_run.run_repair_lifecycle.require_change_checkout", forbidden)
+    monkeypatch.setattr("agent_run.run_repair_lifecycle.prepare_delivery_integration", forbidden)
     assert lifecycle._repair(state, {}) == "blocked"
-    assert job["ticket_write_intent"] == original["ticket_write_intent"]
+    assert job["run_branch_write_intent"] == intent
 
 
 @pytest.mark.parametrize("invalidation", ["publication", "phase"])

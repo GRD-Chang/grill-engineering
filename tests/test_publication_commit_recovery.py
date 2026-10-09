@@ -200,13 +200,13 @@ def test_publication_intent_mismatch_rejects_before_any_write(
     assert git.checkout_head(git_repo) == sha
 
 
-def test_merge_resolution_object_response_loss_reuses_exact_two_parent_commit(
+def test_diverged_publication_response_loss_reuses_exact_two_parent_commit(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     git = GitRepository(git_repo)
     base = git.resolve("HEAD")
     default = git._run_in(
-        git_repo, "commit-tree", f"{base}^{{tree}}", "-p", base, "-m", "default",
+        git_repo, "commit-tree", f"{base}^{{tree}}", "-m", "default",
     ).stdout.strip()
     candidate = git._run_in(
         git_repo, "commit-tree", f"{base}^{{tree}}", "-p", base, "-p", default,
@@ -231,16 +231,16 @@ def test_merge_resolution_object_response_loss_reuses_exact_two_parent_commit(
 
     monkeypatch.setattr(GitRepository, "_run_in", lose_response)
     with pytest.raises(SimulatedProcessCrash, match="object response"):
-        git.create_merge_resolution_publication_commit(
-            git_repo, candidate_sha=candidate, run_head_sha=base,
-            default_head_sha=default, message="published merge resolution\n\n",
+        git.create_publication_commit(
+            git_repo, candidate_sha=candidate, published_sha=base,
+            base_sha=default, message="published merge resolution\n\n",
             publication_intent=intent,
             save_intent=lambda: persisted.append(deepcopy(intent)),
         )
     restored = GitRepository(git_repo)
-    publication = restored.create_merge_resolution_publication_commit(
-        git_repo, candidate_sha=candidate, run_head_sha=base,
-        default_head_sha=default, message="published merge resolution\n\n",
+    publication = restored.create_publication_commit(
+        git_repo, candidate_sha=candidate, published_sha=base,
+        base_sha=default, message="published merge resolution\n\n",
         publication_intent=deepcopy(persisted[0]),
         save_intent=lambda: pytest.fail("persisted intent must be reused"),
     )

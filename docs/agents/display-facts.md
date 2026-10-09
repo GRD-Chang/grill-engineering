@@ -40,7 +40,7 @@ Reviewer 的适用结果通过 `review_attempt.finish_review_result` 统一收�
 
 三种对象的 CI 恢复共用累计额度投影：`window`、`developments_used`、`development_limit`、
 `failure_head`、`review_required`、`reviewer_invocations`、`checkpoint_reason` 与 `history`。
-两种 Parent 始终要求 Review，内部 Repair PR 与最终 PR 显示同一 Run 的用量；新失败版本不重置。
+两种 Parent 始终要求 Review，修复工作与最终 PR 显示同一 Run 的用量；新失败版本不重置。
 Status/History 只读展示当前额度和续期历史，不补造旧内外层计数或执行续期。
 
 审核记录适用性由 `review_evidence` 维护，展示不自行用 tree 或 passed 判断交付权限。
@@ -54,6 +54,8 @@ History 的原 Review Context、文案 Attempt 与批准事实不随当前证据
 共同执行已保存的 `pending_semantic_attempt.returned_result` 是当前工作事实。成功返回使 `work_role` 投影为程序收口，不再显示需要新的 Agent 调用；Human Blocker/blocked Review 仍显示原角色，明确 resume 清除其返回后继续原 Attempt。展示只读取该事实，不能清除返回、改变预算或放行 currentness。返回缓存不复制到已完成 Attempt 或 Invocation 历史，正式结果继续从原有角色产物取得。
 
 历史阶段事件仍关联实际执行的 Agent：优先从 pending Attempt 读取角色与轮次，Thread 使用其保存的返回或同 Attempt 的 Invocation，再读取角色对应的线程字段。成功返回后的程序收口不会抹去这些历史关联，也不能拿其他角色或其他 Attempt 的线程补齐。
+
+完整 Parent 的修复工作展示准确 Job、Generation、Candidate、工作区与程序更新 Run Branch 的待完成操作；不显示内部 Repair PR 发布、CI 等待或合并待办。历史中既有 PR 记录保留原含义，不补造当前修复 PR。修复完成只表示成果准确进入 Run Branch，不表示最终 PR CI、人工批准或默认分支交付完成。未知 Run Branch 推送保留原写入意图；status/history 不能把暂停解释为未写入，也不能代替对账或恢复。
 
 调度使用 `work_facts.ticket_program_ready` 识别已有返回和待提交 Candidate 的机械收口，
 不以空闲 Agent 名额作为这些工作的前置条件。角色与阶段解释仍来自原 Job/Attempt；

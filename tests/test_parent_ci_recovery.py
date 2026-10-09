@@ -227,7 +227,7 @@ def test_parent_only_published_source_append_reuses_pr(
     assert agents.review_requests[-1]["candidate_sha"] == final["candidate_sha"]
 
 
-def test_run_final_ci_repair_shares_budget_with_internal_pr(git_repo: Path) -> None:
+def test_run_final_ci_repair_uses_parent_budget_and_same_final_pr(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     run_id = str(state["run_id"])
     publisher.data["delivery"]["required_checks"] = ["fail", "pass", "pass"]
@@ -266,7 +266,7 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     state, states, git, publisher = _accepted_run(git_repo)
     run_id = str(state["run_id"])
     publisher.data["delivery"]["required_checks"] = [
-        "fail", "pass", "fail", "pass", "pass",
+        "fail", "fail", "pass",
     ]
     publisher._save()
     publication = RunPublicationEngine(
@@ -337,10 +337,10 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     assert len(agents.review_requests) == 4
 
 
-def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> None:
+def test_repeated_final_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     run_id = str(state["run_id"])
-    publisher.data["delivery"]["required_checks"] = ["fail", "fail", "pass", "pass"]
+    publisher.data["delivery"]["required_checks"] = ["fail", "fail", "pass"]
     publisher._save()
     publication = RunPublicationEngine(
         git=git, states=states, agents=RunPublicationAgents(), github=publisher,
@@ -354,6 +354,11 @@ def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> N
         git=git, states=states, agents=agents, github=publisher,
     )
 
+    first_repair = acceptance.accept(run_id)
+    assert first_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 1
+    failed_again = publication.publish(run_id)
+    assert failed_again["status"] == "run_acceptance_pending"
+    assert failed_again["run_publication"]["pr_number"] == final_pr
     repaired = acceptance.accept(run_id)
 
     assert repaired["status"] == "run_publication_pending"
@@ -678,10 +683,16 @@ def test_run_ci_target_append_findings_use_shared_integration_owner(git_repo: Pa
     agents._reviews = [_repair_artifact(), _passing_artifact(), _passing_artifact(),
                        _candidate_finding_artifact(), _passing_artifact()]
     engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    initial = engine.accept(run_id)
+    assert initial["status"] == "run_publication_pending"
+    publication = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(), github=publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    failed = publication.publish(run_id)
+    assert failed["status"] == "run_acceptance_pending"
     result = engine.accept(run_id)
-    if result["status"] == "run_acceptance_pending":
-        result = engine.accept(run_id)
-    assert result["status"] == "run_publication_pending", result["diagnostics"]
+    assert result["status"] == "run_publication_pending", (result["diagnostics"], result["terminal_kind"], result["run_acceptance"].get("repair_job"))
     run = result["run_acceptance"]
     assert run["ci_recovery"]["developments_used"] == 1
     assert run["ci_recovery"]["reviewer_invocations"] == 1
@@ -690,5 +701,5 @@ def test_run_ci_target_append_findings_use_shared_integration_owner(git_repo: Pa
     assert agents.development_requests[-1]["work_source"] == "integration"
     assert agents.development_requests[-1]["repair_source"] == "integration"
     assert "ci_evidence" not in agents.development_requests[-1]
-    assert run["completed_repair_jobs"][-1]["ci_evidence"]["head_sha"] == agents.review_requests[2]["ci_evidence"]["head_sha"]
+    assert run["completed_repair_jobs"][-1]["ci_evidence"]["head_sha"] == agents.review_requests[2]["ci_failure_context"]["head_sha"]
     assert git.is_ancestor(targets[0], git.resolve(target_branch))

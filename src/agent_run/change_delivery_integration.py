@@ -52,6 +52,6 @@ def prepare_delivery_integration(
             # Run Repair ordinary quota is the Parent integration allowance.
             job["attempt_kind"] = "ordinary"
             engine.save(state)
-        if not isinstance(job.get("integrated_sha"), str) and needs_repair_integration(engine, job):
+        if needs_repair_integration(engine, job):
             return prepare_repair_integration(engine, state, job, checkout)
     return True

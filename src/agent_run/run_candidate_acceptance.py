@@ -148,7 +148,9 @@ class CandidateRunAcceptance:
         except (GitError, KeyError, TypeError, ValueError):
             return None
         if (
-            not artifact.is_accepted
+            integrated != candidate_sha
+            or not self.git.is_ancestor(str(job["base_sha"]), candidate_sha)
+            or not artifact.is_accepted
             or not review_record_matches(record, identity)
             or expected_merge_tree != candidate_expected_merge_tree
             or self._default_head(state) != default_base

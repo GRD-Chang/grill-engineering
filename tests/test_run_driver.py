@@ -657,8 +657,8 @@ def test_direct_operations_fence_controller_github_and_publisher(
     for operation in (
         lambda: operations.controller.resume("run-1"),
         lambda: operations.github_reader.repository(),
-        lambda: operations.publisher.ensure_run_repair_branch(
-            branch="agent-run/test", base_branch="main"
+        lambda: operations.publisher.publish_branch(
+            "agent-run/test", git.resolve("main"), expected_remote_sha=git.resolve("main")
         ),
     ):
         with pytest.raises(ActionReconciliationError):

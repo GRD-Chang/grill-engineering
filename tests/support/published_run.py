@@ -36,7 +36,7 @@ def prepare_accepted_run(
     integration = state["ticket_jobs"][str(ticket_number)]["deterministic_integration_record"]
     pulls = data["delivery"].setdefault("pull_requests", [])
     # FixtureGitHubPublisher allocates len(pulls) + 1. Preserve the historical
-    # Ticket PR so Final and Repair PRs cannot reuse its integration identity.
+    # Ticket PR so the Final PR cannot reuse its integration identity.
     assert integration["pr_number"] == integration["pr"]["number"] == len(pulls) + 1
     pulls.append({
         **integration["pr"],
