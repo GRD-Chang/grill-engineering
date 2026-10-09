@@ -114,19 +114,7 @@ and check the saved settings. These settings apply to new tasks; check actual de
 
 ### Automatic CI repair
 
-To allow Runner to repair code failures in CI, declare the eligible steps in the target repository's `pyproject.toml`:
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
-
-Names must match the actual `workflow::job display name::step`. Code repair requires a completed, failed Actions job for the current PR head, with every failed step declared above.
-Missing, pending, canceled, ambiguous, or platform-related failures remain under supervision.
-This configuration does not create required checks or change acceptance or repair limits. See the [operation reference](agent-run.md).
+CI repair uses exact PR/head failure observations and available job facts and logs. It no longer requires a `code-failure-steps` allowlist in `pyproject.toml`; Development investigates real failures, including platform or unknown categories. Pending, unknown, or mismatched evidence remains under bounded supervision. Parent review stays mandatory and changed results require fresh CI and human approval. Configure the cumulative allowances in [user defaults](user-defaults.md); see the [operation reference](agent-run.md).
 
 ## Update, rollback, and uninstall
 

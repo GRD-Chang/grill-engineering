@@ -113,19 +113,11 @@ App 元数据统一由 settings 管理，默认采用安装授权范围；Worker
 
 ### CI 自动修复
 
-需要让 Runner 自动修复 CI 中的代码失败时，在目标 `pyproject.toml` 声明允许修复的步骤：
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
-
-名称须匹配实际 `workflow::job显示名::step`。只有当前 PR head 的已完成 Actions job 明确失败，
-且所有失败步骤都在声明内，才触发代码修复。检查未触发、仍在等待、取消、证据不明或平台故障继续按监督流程处理。
-该配置不创建必需检查，也不改变验收或修复额度；运行规则见[运行说明](agent-run.md)。
+CI 修复使用当前准确 PR/head 的失败 Observation、job 事实与可取得的原始日志，
+不再要求在 `pyproject.toml` 配置 `code-failure-steps` 白名单。Development 定向调查真实失败，
+平台或未知类别同样可以调查；pending、unknown 或证据不匹配继续有界监督。
+Parent Review 始终必需，成果改变须重验 CI 和人工批准。累计额度在
+[个人运行配置](user-defaults.md)设置，运行规则见[运行说明](agent-run.md)。
 
 ## 更新、回滚与卸载
 

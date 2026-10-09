@@ -467,7 +467,7 @@ def test_final_check_failure_enters_shared_run_repair(git_repo: Path) -> None:
     ],
     ids=("cancelled", "platform", "unknown"),
 )
-def test_final_non_repairable_check_failure_is_supervised_without_candidate(
+def test_final_real_failure_categories_route_to_full_run_development(
     git_repo: Path, check: dict[str, str]
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -491,11 +491,14 @@ def test_final_non_repairable_check_failure_is_supervised_without_candidate(
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
 
-    assert waiting["status"] == "waiting_external"
-    assert waiting["terminal_kind"] == "waiting_external"
-    assert waiting["supervision_window"]["kind"] == "github_convergence"
-    assert waiting["run_acceptance"] == before_run
-    assert "repair_request" not in waiting["run_acceptance"]
+    assert waiting["status"] == "run_acceptance_pending"
+    run = waiting["run_acceptance"]
+    assert run["phase"] == "repairing"
+    assert run["repair_request"]["repair_source"] == "required_checks"
+    assert run["repair_request"]["ci_evidence"]["checks"][0]["name"] == check["name"]
+    assert run["review_budget"] == before_run["review_budget"]
+    assert run["ci_recovery"]["developments_used"] == 0
+
 
 def test_final_check_evidence_for_a_new_head_cannot_repair_the_approved_head(
     git_repo: Path,

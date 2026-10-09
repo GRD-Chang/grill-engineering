@@ -9,7 +9,7 @@ import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import (
     Controller,
     _change_job_for_invocation,

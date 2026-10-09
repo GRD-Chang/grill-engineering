@@ -24,7 +24,6 @@ from agent_run.github import (
 )
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
-from agent_run.required_checks import annotate_configured_code_failures
 
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
 _AGENT_RUN_STATUS_MARKER = "<!-- agent-run:agent-run-status -->"
@@ -939,11 +938,6 @@ class GhGitHubPublisher:
                 except (GitHubReadError, OSError, TimeoutError) as error:
                     check["logs_unavailable"] = str(error)[:4096]
             failed.append(check)
-        failed = annotate_configured_code_failures(
-            failed,
-            self.git.root,
-            expected_head_sha=expected_head_sha,
-        )
         return {"pr_number": pr_number, "checks": failed}
 
     def _checks(self, pr_number: int, fields: str) -> list[object]:

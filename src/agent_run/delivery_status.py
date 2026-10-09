@@ -47,18 +47,10 @@ from agent_run.presentation_helpers import (
 
 
 def _ci_recovery_usage(recovery: dict[str, Any]) -> str:
-    if "window" in recovery:
-        return display_text('presentation.status.ticket_ci_usage',
-                            window=recovery.get('window'),
-                            used=recovery.get('developments_used'),
-                            limit=recovery.get('development_limit'))
-    return display_text('presentation.status.ci_recovery_usage',
-                        outer_window=recovery.get('outer_window'),
-                        rounds_used=recovery.get('rounds_used'),
-                        rounds_limit=recovery.get('rounds_limit'),
-                        inner_window=recovery.get('inner_window'),
-                        repairs_used=recovery.get('repairs_used'),
-                        repairs_limit=recovery.get('repairs_limit'))
+    return display_text('presentation.status.ci_development_usage',
+                        window=recovery.get('window'),
+                        used=recovery.get('developments_used'),
+                        limit=recovery.get('development_limit'))
 
 
 def _ci_recovery_details(recovery: dict[str, Any]) -> list[str]:

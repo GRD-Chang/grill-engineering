@@ -41,12 +41,15 @@ def _assert_final_ci_repair_then_approve(
     assert original_evidence["checks"][0]["description"] == "The fixture required check failed."
     assert run["review_budget"] == ordinary_budget
     budget = run["ci_recovery"]
-    assert budget["rounds_used"] == 2
-    assert budget["repairs_used"] == 1
+    assert budget["window"] == 1
+    assert budget["developments_used"] == 2
     assert budget["reviewer_invocations"] == 2
-    assert budget["history"] == [{
-        "kind": "round", "round": 1, "failure_head": failed["head_sha"], "repairs_used": 1,
-    }]
+    assert budget["history"][0] == {
+        "kind": "failure", "failure_head": failed["head_sha"], "developments_used": 0,
+    }
+    assert budget["history"][1]["kind"] == "failure"
+    assert budget["history"][1]["developments_used"] == 1
+
 
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     pulls = delivery["pull_requests"]

@@ -287,7 +287,7 @@ def _resume_kind(
         reason = job.get("blocked_reason")
         if reason in {"agent_requires_human", "reviewer_requires_human"}:
             return "human_blocker"
-        if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}:
+        if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_development_budget_exhausted"}:
             return "budget_checkpoint"
         if reason == "integration_development_exhausted":
             return "integration_development"
@@ -325,7 +325,7 @@ def _resume_kind(
         if isinstance(subject, dict) and subject.get("blocked_reason") == "integration_development_exhausted":
             return "integration_development"
         if isinstance(subject, dict) and subject.get("blocked_reason") in {
-            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted"
         }:
             return "budget_checkpoint"
     for job in state.get("ticket_jobs", {}).values():

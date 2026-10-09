@@ -36,3 +36,8 @@ History 的 `github_write_action` 同时来自 Change Job 的 `ticket_write_inte
 Reviewer 的适用结果通过 `review_attempt.finish_review_result` 统一收口；人工暂停记录由 `artifacts.record_human_blocker` 保存。返回结果先持久化，在后继读取与状态同步成功后才清除 pending 并关闭 Attempt；失败恢复不重新调用 Reviewer 或扣预算。候选与 Run 的 currentness、Acceptance Record 和后续决策仍由各自的领域入口负责。
 
 覆盖入口：`test_cli.py` 的机器/人类输出与只读查询，`test_history_*` 的身份、裁剪、转折与语言，`test_status_delivery_actions.py` 的正式/候选验收边界，`test_notification_events.py`、`test_notifications.py`、`test_cli_notifications.py` 和 `test_cli_resume_notifications.py` 的渠道选择、去重、恢复与固定语言。通知共同场景位于 `tests/support/notification.py`；不要从测试用例模块导入该构造器。
+
+三种对象的 CI 恢复共用累计额度投影：`window`、`developments_used`、`development_limit`、
+`failure_head`、`review_required`、`reviewer_invocations`、`checkpoint_reason` 与 `history`。
+两种 Parent 始终要求 Review，内部 Repair PR 与最终 PR 显示同一 Run 的用量；新失败版本不重置。
+Status/History 只读展示当前额度和续期历史，不补造旧内外层计数或执行续期。

@@ -19,7 +19,7 @@ from agent_run.semantic_attempt import semantic_attempt_subjects
 
 from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
-from agent_run.ci_recovery_budget import ci_limits_for_job
+from agent_run.ci_recovery_budget import ci_limit_for_job
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     run_repair_budget_policy_for_job,
@@ -678,7 +678,7 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
     budget = subject.get("ci_recovery")
     if not isinstance(budget, dict):
         return None
-    outer_limit, inner_limit = ci_limits_for_job(subject)
+    limit = ci_limit_for_job(subject)
     failure_head = budget.get("failure_head")
     evidence = subject.get("ci_evidence") or subject.get("ci_failed_evidence")
     if not isinstance(evidence, dict) or evidence.get("head_sha") != failure_head:
@@ -699,30 +699,16 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
             for check in raw_checks
             if isinstance(check, dict) and check.get("bucket") == "fail"
         ]
-    if location.startswith("ticket:"):
-        return {
-            "window": budget.get("window"),
-            "developments_used": budget.get("developments_used"),
-            "development_limit": inner_limit,
-            "review_required": budget.get("review_required"),
-            "checkpoint_reason": budget.get("checkpoint_reason"),
-            "failure_head": failure_head,
-            "failed_checks": failed_checks,
-        }
     return {
-        "outer_window": budget.get("outer_window"),
-        "rounds_used": budget.get("rounds_used"),
-        "rounds_limit": outer_limit,
-        "inner_window": budget.get("inner_window"),
-        "repairs_used": budget.get("repairs_used"),
-        "repairs_limit": (
-            1 if location.startswith("ticket:") and budget.get("review_required") is False
-            else inner_limit
-        ),
+        "window": budget.get("window"),
+        "developments_used": budget.get("developments_used"),
+        "development_limit": limit,
         "review_required": budget.get("review_required"),
         "checkpoint_reason": budget.get("checkpoint_reason"),
         "failure_head": failure_head,
         "failed_checks": failed_checks,
+        "history": budget.get("history"),
+        "reviewer_invocations": budget.get("reviewer_invocations"),
     }
 
 

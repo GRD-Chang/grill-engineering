@@ -49,7 +49,9 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     class AppendAgents(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if request.get("repair_source") not in {"merge_conflict", "integration"}:
+            if (request.get("repair_source") not in {"merge_conflict", "integration"}
+                or (request.get("repair_source") == "integration"
+                    and "acceptance_artifact" in json.loads(request["integration_evidence"]))):
                 result = super().develop(request)
                 if interrupted and len(self.development_requests) == 2:
                     (Path(str(request["checkout"])) / "follow-up-repair.txt").write_text(

@@ -181,6 +181,9 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         ):
             request["human_response_history"] = history
         previous = self.compatible_review_baseline(state, job)
+        baseline = self.compatible_review_baseline(state, job, accepted_only=True)
+        if baseline is not None:
+            request["parent_acceptance_baseline"] = baseline
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = {
@@ -210,7 +213,7 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         }
 
     def compatible_review_baseline(
-        self, state: dict[str, Any], job: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any], *, accepted_only: bool = False
     ) -> dict[str, Any] | None:
         for key in ("acceptance_record", "previous_parent_acceptance_record"):
             record = job.get(key)
@@ -233,6 +236,8 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             try:
                 artifact = AcceptanceArtifact.parse(record.get("artifact"))
             except ValueError:
+                continue
+            if accepted_only and not artifact.is_accepted:
                 continue
             if not any(
                 check["status"] == "blocked" for check in artifact.checks.values()

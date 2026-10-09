@@ -3335,7 +3335,7 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
     assert len(agents.development_requests) == 1
     assert "next_attempt_kind" not in job
     assert completed["diagnostics"][0]["code"] == (
-        "github_check_failure_not_repairable"
+        "github_check_evidence_observation_pending"
     )
 
 

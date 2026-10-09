@@ -25,7 +25,7 @@ from agent_run.change_delivery_integration import prepare_delivery_integration
 from agent_run.change_development_review import ChangeDevelopmentReview
 from agent_run.ci_recovery_budget import (
     can_start_ci_repair,
-    ci_limits_for_job,
+    ci_limit_for_job,
     mark_ci_repair,
     refund_ci_repair_without_candidate,
 )
@@ -409,17 +409,15 @@ class ChangeDeliveryEngine:
                     self.save(state)
                     return
             elif attempt_kind == "ci_repair":
-                outer_limit, inner_limit = ci_limits_for_job(job)
+                limit = ci_limit_for_job(job)
                 if not can_start_ci_repair(
                     job,
-                    outer_limit=outer_limit,
-                    inner_limit=inner_limit,
+                    limit=limit,
                     is_ticket=self.contract.label.startswith("ticket-"),
                 ):
                     self._checkpoint_ci_budget(
                         state, job,
-                        "ci_development_budget_exhausted" if self.contract.label.startswith("ticket-")
-                        else "ci_inner_budget_exhausted",
+                        "ci_development_budget_exhausted",
                     )
                     return
             elif not can_start_development(
@@ -586,11 +584,10 @@ class ChangeDeliveryEngine:
             and job["pending_attempt"] > int(job.get("modification_attempts", 0))
         ):
             if job.get("pending_attempt_kind") == "ci_repair":
-                outer_limit, inner_limit = ci_limits_for_job(job)
+                limit = ci_limit_for_job(job)
                 refund_ci_repair_without_candidate(
                     job,
-                    outer_limit=outer_limit,
-                    inner_limit=inner_limit,
+                    limit=limit,
                     is_ticket=self.contract.label.startswith("ticket-"),
                 )
             elif budget["development_attempts"] > 0:
@@ -628,11 +625,10 @@ class ChangeDeliveryEngine:
         self, job: dict[str, Any], *, attempt_kind: str
     ) -> int:
         if attempt_kind == "ci_repair":
-            outer_limit, inner_limit = ci_limits_for_job(job)
+            limit = ci_limit_for_job(job)
             return mark_ci_repair(
                 job,
-                outer_limit=outer_limit,
-                inner_limit=inner_limit,
+                limit=limit,
                 is_ticket=self.contract.label.startswith("ticket-"),
             )
         return mark_development(

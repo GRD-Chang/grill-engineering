@@ -161,13 +161,12 @@ def allocate_semantic_attempt(
     ci_budget = subject.get("ci_recovery")
     ci_work = (
         role in {"development", "reviewer"}
-        and work_subject.startswith("ticket:")
         and (subject.get("pending_attempt_kind") == "ci_repair" if role == "development" else subject.get("attempt_kind") == "ci_repair")
         and isinstance(ci_budget, dict) and "developments_used" in ci_budget
     )
     if ci_work and isinstance(ci_budget, dict):
-        from agent_run.ci_recovery_budget import ci_limits_for_job
-        _, ci_limit = ci_limits_for_job(subject)
+        from agent_run.ci_recovery_budget import ci_limit_for_job
+        ci_limit = ci_limit_for_job(subject)
         attempt["budget_snapshot"] = {
             "window": budget_window,
             "ci_developments_used": ci_budget["developments_used"],
@@ -403,6 +402,8 @@ def retire_semantic_attempt_owner(
     # whole mutable Job or its private Agent request payload.
     for key in (
         "review_budget_history",
+        "ci_recovery",
+        "integration_development_budget",
         "development_summary",
         "acceptance_artifact",
         "acceptance_record",

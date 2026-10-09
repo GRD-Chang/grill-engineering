@@ -78,7 +78,7 @@ Delivery Policy 的取值优先级是内置默认值、用户级默认值、单�
 
 ```bash
 agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --ci-recovery-rounds 3 --ci-repairs-per-round 3 --review-deadline 2h
+agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --parent-ci-development-limit 3 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 
@@ -157,17 +157,10 @@ Revision、绑定来源及其他内部身份只由 `status --json` 的 Machine A
 显示当前没有运行中的 Agent；`history --json` 保留每次启动的完整审计事实，包括仍在运行中的
 Invocation。
 
-会触发代码修复的 Required Check 必须由 GitHub Actions job API 准确绑定当前 PR head，且失败
-只发生在仓库 `pyproject.toml` 显式列出的稳定 `workflow::name::step`；缺少或矛盾的
-job/step 事实、runner/network 等平台步骤失败和未配置 step 都会 fail closed 地留在 Controller 监督：
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
+Required Check 真实失败绑定当前 PR/head 的 Observation 与失败明细后，交给 Development 调查。
+Actions job 的准确 head、完成状态与原始日志提供证据，不再读取仓库的 `code-failure-steps` 白名单。
+平台、取消或未知类别的真实失败也可调查；pending、unknown、身份不匹配和证据尚未收敛继续有界监督。
+两种 Parent 必须取得当前整体 Review，成果改变重新验证 CI 与人工批准。
 
 `status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
 外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
@@ -310,8 +303,11 @@ Run-wide Operator Gate 时，
 同一 Parent 的显式 `run` 也可开启新窗口；否则必须先执行该门禁要求的专用动作。两条超时恢复路径
 均不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 读取失败 check 的名称、workflow、描述和链接，并读取其
-Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
-被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
+Actions job 的当前 head、状态及可取得的原始日志。准确失败不要求先被程序分类为代码可修：
+Ticket 和两种 Parent 共用开发循环，由 Development 定向调查失败与直接影响；Parent 的 Reviewer
+基于适用完整基线增量核验并对当前整体负责。pending、unknown 和证据尚未收敛继续有界监督。
+同一 Parent 的内部修复 PR、最终 PR、后继提交和目标追加共用累计 CI 开发额度，默认 3 次；
+耗尽后显式 resume 仅续期该额度并保留历史，修复后的当前成果须重新通过准确 CI 和人工批准。
 
 新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、Runner 独立仓库根、state 目录及 Repository/Parent 路由身份，最多保留
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；

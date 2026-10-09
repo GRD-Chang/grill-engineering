@@ -210,7 +210,7 @@ def test_lifecycle_consumes_resume_accepted_at_driver_exit(tmp_path: Path) -> No
     assert control.load(task)['executor']['status'] == 'exited'
 
 
-@pytest.mark.parametrize('override', ['ticket_development_workers', 'ci_recovery_rounds'])
+@pytest.mark.parametrize('override', ['ticket_development_workers', 'parent_ci_development_limit'])
 def test_active_resume_cannot_change_other_work_budgets(paused_ticket, override: str) -> None:
     from agent_run.ticket_work import TicketWorkAdmission, generation
 

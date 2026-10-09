@@ -13,7 +13,6 @@ from agent_run.github_publish import (
     _matches_ref,
     _render_agent_run_status,
 )
-from agent_run.required_checks import is_explicitly_repairable_code_failure
 
 
 def test_final_pr_lookup_includes_closed_objects_before_replaying_creation(
@@ -68,7 +67,7 @@ def test_live_pull_request_uses_the_requested_repository_as_its_base(
     assert "baseRepository" not in calls[0][-1]
 
 
-def test_real_publisher_applies_repository_owned_check_repairability(
+def test_real_publisher_preserves_exact_job_and_logs_without_repairability_policy(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (git_repo / "pyproject.toml").write_text(
@@ -130,11 +129,12 @@ def test_real_publisher_applies_repository_owned_check_repairability(
     evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
     assert evidence["checks"][0]["logs"] == "RAW_ACTIONS_LOG"
-    assert evidence["checks"][0]["repairability"] == "code_failure"
-    assert is_explicitly_repairable_code_failure(evidence) is True
+    assert "repairability" not in evidence["checks"][0]
+    assert evidence["checks"][0]["job"]["head_sha"] == head
+    assert evidence["checks"][0]["job"]["steps"][0]["name"] == "Run tests"
 
 
-def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable(
+def test_real_publisher_preserves_platform_failure_evidence(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (git_repo / "pyproject.toml").write_text(
@@ -199,7 +199,8 @@ def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable
     evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
     assert "repairability" not in evidence["checks"][0]
-    assert is_explicitly_repairable_code_failure(evidence) is False
+    assert evidence["checks"][0]["job"]["steps"][0]["conclusion"] == "failure"
+    assert evidence["checks"][0]["logs"] == "RAW_ACTIONS_LOG"
 
 
 def test_supersession_status_renders_the_receipt_fields() -> None:

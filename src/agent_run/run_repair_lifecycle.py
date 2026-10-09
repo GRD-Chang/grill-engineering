@@ -470,6 +470,9 @@ class RunRepairLifecycle:
             if not isinstance(feedback, str) or not feedback.strip():
                 raise ValueError("human revision feedback must be non-empty")
             job["human_feedback"] = feedback
+        baseline = run.get("acceptance_record")
+        if isinstance(baseline, dict):
+            job["previous_parent_acceptance_record"] = deepcopy(baseline)
         if repair_source == "required_checks":
             evidence = repair_request.get("ci_evidence")
             if not isinstance(evidence, dict):

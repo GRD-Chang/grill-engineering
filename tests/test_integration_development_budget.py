@@ -67,7 +67,7 @@ def test_public_resume_renews_only_integration_and_preserves_other_budgets() -> 
            "policy_snapshot": policy.snapshot(), "phase": "blocked",
            "blocked_reason": "integration_development_exhausted",
            "review_budget": {"window": 2, "development_attempts": 4},
-           "integration_resync": {"used": 3}, "ci_recovery": {"rounds_used": 2}}
+           "integration_resync": {"used": 3}, "ci_recovery": {"developments_used": 2}}
     acquire_integration_development(job, attempt_id="first", policy_snapshot=policy.snapshot())
     retained = deepcopy({key: job[key] for key in ("review_budget", "integration_resync", "ci_recovery")})
     state = {"status": "ready_for_human", "ticket_jobs": {"400": job},

@@ -14,7 +14,7 @@ from support.workspace import managed_repo, managed_state, prepare_workspace
 
 import agent_run.cli as cli_module
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_retry import MAX_READ_ATTEMPTS

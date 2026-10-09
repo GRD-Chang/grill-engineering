@@ -29,8 +29,8 @@ def test_policy_resolution_uses_builtin_user_then_command_precedence() -> None:
 
     assert policy.ticket_review_rounds == 1
     assert policy.integration_resync_limit == 3
-    assert policy.ci_recovery_rounds == 3
-    assert policy.ci_repairs_per_round == 3
+    assert policy.parent_ci_development_limit == 3
+    assert policy.ticket_ci_development_limit == 3
     assert policy.review_deadline_seconds == 30
     assert policy.development_deadline_seconds == 5 * 60 * 60
     assert policy.publication_deadline_seconds == 60 * 60
@@ -87,12 +87,12 @@ def test_run_repair_policy_derives_review_first_rounds() -> None:
 
 def test_ci_recovery_limits_are_independent_and_frozen() -> None:
     policy = resolve_delivery_policy(
-        user_defaults={"ci_recovery_rounds": 2},
-        command_overrides={"ci_repairs_per_round": 5},
+        user_defaults={"parent_ci_development_limit": 2},
+        command_overrides={"ticket_ci_development_limit": 5},
     )
 
-    assert policy.ci_recovery_rounds == 2
-    assert policy.ci_repairs_per_round == 5
+    assert policy.parent_ci_development_limit == 2
+    assert policy.ticket_ci_development_limit == 5
     assert parse_policy_snapshot(policy.snapshot()) == policy
 
 
@@ -117,12 +117,12 @@ def test_cli_accepts_both_ci_recovery_policy_overrides() -> None:
     from agent_run.cli import _policy_overrides, build_parser
 
     parsed = build_parser().parse_args([
-        "settings", "configure", "--ci-recovery-rounds", "2",
-        "--ci-repairs-per-round", "4",
+        "settings", "configure", "--parent-ci-development-limit", "2",
+        "--ticket-ci-development-limit", "4",
     ])
 
     assert _policy_overrides(parsed) == {
-        "ci_recovery_rounds": 2, "ci_repairs_per_round": 4
+        "parent_ci_development_limit": 2, "ticket_ci_development_limit": 4
     }
 
 
@@ -152,8 +152,8 @@ def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
         {"run_repair_rounds": True},
         {"integration_resync_limit": -1},
         {"integration_resync_limit": True},
-        {"ci_recovery_rounds": 0},
-        {"ci_repairs_per_round": True},
+        {"parent_ci_development_limit": 0},
+        {"ticket_ci_development_limit": True},
         {"ticket_development_workers": 0},
         {"ticket_development_workers": True},
         {"invocation_deadlines": {"review": "0s"}},

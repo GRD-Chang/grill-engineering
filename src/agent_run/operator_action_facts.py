@@ -18,8 +18,6 @@ _REASON_KINDS = {
     "modification_budget_exhausted": "review_budget_checkpoint",
     "review_budget_exhausted": "review_budget_checkpoint",
     "ci_development_budget_exhausted": "review_budget_checkpoint",
-    "ci_inner_budget_exhausted": "review_budget_checkpoint",
-    "ci_outer_budget_exhausted": "review_budget_checkpoint",
     "integration_development_exhausted": "review_budget_checkpoint",
     "integration_resync_exhausted": "review_budget_checkpoint",
     "acceptance_record_mismatch": "deterministic_contradiction",

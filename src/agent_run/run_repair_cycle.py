@@ -47,8 +47,10 @@ def repair_checkout_is_active(job: dict[str, Any]) -> bool:
     phase = job.get("phase")
     return phase in _ACTIVE_CHECKOUT_PHASES or (
         phase == "blocked"
-        and job.get("blocked_reason") == "agent_requires_human"
-        and job.get("human_blocker_phase") in {"developing", "repairing"}
+        and (job.get("blocked_reason") == "ci_investigation_paused" or (
+            job.get("blocked_reason") == "agent_requires_human"
+            and job.get("human_blocker_phase") in {"developing", "repairing"}
+        ))
     )
 
 
@@ -181,8 +183,7 @@ def escalate_repair(
     job["blocked_reason"] = code
     if code in {
         "modification_budget_exhausted",
-        "ci_inner_budget_exhausted",
-        "ci_outer_budget_exhausted",
+        "ci_development_budget_exhausted",
     }:
         cycle = run.get("repair_cycle")
         if isinstance(cycle, dict):

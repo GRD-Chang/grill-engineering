@@ -36,7 +36,7 @@ def _ticket(number: int) -> dict[str, Any]:
 
 @pytest.mark.parametrize("blocked_reason", [
     "agent_requires_human", "reviewer_requires_human", "modification_budget_exhausted",
-    "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+    "ci_development_budget_exhausted",
     "ticket_execution_failed", "ticket_paused",
 ])
 def test_graph_refresh_preserves_known_ticket_pauses_for_currentness_check(blocked_reason: str) -> None:

@@ -204,7 +204,7 @@ def test_run_repair_promotion_rejects_each_authority_binding(
     ],
     ids=("unknown-status", "cancelled", "platform-failure", "unknown-evidence"),
 )
-def test_run_repair_non_repairable_required_checks_wait_without_new_candidate(
+def test_run_repair_unknown_checks_wait_and_real_failures_enter_investigation(
     git_repo: Path, checks: str, evidence: dict[str, object] | None,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -226,15 +226,25 @@ def test_run_repair_non_repairable_required_checks_wait_without_new_candidate(
 
     run = result["run_acceptance"]
     job = run["repair_job"]
-    assert result["status"] == "waiting_external"
-    assert result["terminal_kind"] == "waiting_external"
-    assert job["phase"] == "waiting_checks"
-    assert job["modification_attempts"] == 1
-    assert run["repair_cycle"]["code_modification_attempts"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    assert run["repair_cycle"]["code_modification_attempts"] == (1 if checks == "unknown" else 2)
     assert len(job["candidate_acceptance_history"]) == 1
-    assert len(agents.development_requests) == 1
     assert run.get("completed_repair_jobs", []) == []
-    assert result["supervision_window"]["kind"] == "github_convergence"
+    if checks == "unknown":
+        assert result["status"] == result["terminal_kind"] == "waiting_external"
+        assert job["phase"] == "waiting_checks"
+        assert len(agents.development_requests) == 1
+        assert result["supervision_window"]["kind"] == "github_convergence"
+    else:
+        # The scripted investigator produces no new code. Its real CI work is
+        # charged and paused for an explicit resume, irrespective of category.
+        assert result["status"] == "ready_for_human"
+        assert job["blocked_reason"] == "ci_investigation_paused"
+        assert job["ci_recovery"]["developments_used"] == 1
+        assert len(agents.development_requests) == 2
+        request = agents.development_requests[-1]
+        assert request["repair_source"] == "required_checks"
+        assert request["ci_evidence"]["checks"] == evidence["checks"]
 
 
 @pytest.mark.parametrize("reason", ["integration_resync_exhausted", "integration_failed"])
@@ -824,7 +834,7 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
         assert run["repair_job"]["default_base_sha"] == initial_default
         assert run["repair_job"]["integrated_sha"] == git.resolve(str(state["run_branch"]))
         assert run["repair_job"]["modification_attempts"] == 1
-        assert run["ci_recovery"]["rounds_used"] == 0
+        assert run["ci_recovery"]["developments_used"] == 0
         assert len(first_agents.review_requests) == 2
         assert states.load_current_run(str(state["run_id"])) == first
         return
@@ -1200,7 +1210,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             )
             assert "本次授权已用：开发 0 / 3 次" in text_status.stdout
             assert "验收 0 / 4 次" in text_status.stdout
-            assert "CI 外层窗口 1：轮数 1/3；内层窗口 1：修复 1/3" in text_status.stdout
+            assert "CI 窗口 1：累计开发 1/3" in text_status.stdout
             assert "等待人工批准" not in text_status.stdout
             assert "当前对象:   整体交付" not in text_status.stdout
 

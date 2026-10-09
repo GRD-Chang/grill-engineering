@@ -189,10 +189,11 @@ def test_controller_reprepare_intent_fails_closed_after_boundary_tampering() -> 
         require_controller_reprepare_intent(job)
 
 
+@pytest.mark.parametrize("work_subject", ["ticket:403", "parent:399", "run-repair:1"])
 @pytest.mark.parametrize("role", ["development", "reviewer"])
-def test_ticket_ci_attempt_binds_ci_window_and_preserves_snapshot_on_resume(role: str) -> None:
+def test_ci_attempt_binds_ci_window_and_preserves_snapshot_on_resume(role: str, work_subject: str) -> None:
     from agent_run.integration_development_budget import semantic_attempt_budget
-    from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+    from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
     from agent_run.delivery_policy import DeliveryPolicy
 
     ci = new_ticket_ci_recovery_budget(review_required=True)
@@ -203,13 +204,13 @@ def test_ticket_ci_attempt_binds_ci_window_and_preserves_snapshot_on_resume(role
         "pending_attempt_kind": "ci_repair", "attempt_kind": "ci_repair",
     }
     first = allocate_semantic_attempt(
-        job, role=role, work_subject="ticket:403", generation=1,
+        job, role=role, work_subject=work_subject, generation=1,
         currentness_boundary=_boundary(), ordinal=1, budget_window=2,
     )
     assert first["budget_snapshot"]["ci_developments_used"] == 1
     assert semantic_attempt_budget(job, first) is ci
     resumed = allocate_semantic_attempt(
-        job, role=role, work_subject="ticket:403", generation=1,
+        job, role=role, work_subject=work_subject, generation=1,
         currentness_boundary=_boundary(), ordinal=2, budget_window=2,
     )
     assert resumed is first
@@ -217,3 +218,32 @@ def test_ticket_ci_attempt_binds_ci_window_and_preserves_snapshot_on_resume(role
     assert ci["developments_used"] == 1
     ci["developments_used"] = 2
     assert first["budget_snapshot"]["ci_developments_used"] == 1
+
+
+def test_retired_ci_attempt_keeps_independent_budget_window() -> None:
+    from agent_run.delivery_policy import DeliveryPolicy
+    from agent_run.ci_recovery_budget import new_ci_recovery_budget
+    from agent_run.integration_development_budget import semantic_attempt_budget
+    from agent_run.semantic_attempt import retire_semantic_attempt_owner
+
+    ci = new_ci_recovery_budget()
+    ci.update(window=2, developments_used=1, failure_head="failed-head")
+    job: dict[str, Any] = {
+        "ci_recovery": ci, "review_budget": {"window": 1},
+        "pending_attempt_kind": "ci_repair",
+        "policy_snapshot": DeliveryPolicy().snapshot(),
+    }
+    attempt = allocate_semantic_attempt(
+        job, role="development", work_subject="run-repair:run-1", generation=1,
+        currentness_boundary=_boundary(), ordinal=1, budget_window=2,
+    )
+    close_semantic_attempt(job, attempt, outcome="completed")
+    state: dict[str, Any] = {}
+    retire_semantic_attempt_owner(
+        state, job, owner_kind="run_repair", work_subject="run-repair:run-1", generation=1,
+    )
+    archived = state["retired_semantic_attempt_owners"][0]
+    archived_attempt = archived["semantic_attempt_history"][0]
+    ci["window"] = 3
+    assert semantic_attempt_budget(archived, archived_attempt)["window"] == 2
+    assert archived_attempt["budget_snapshot"]["window"] == 2

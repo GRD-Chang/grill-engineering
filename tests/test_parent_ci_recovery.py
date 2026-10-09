@@ -18,10 +18,10 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
 from support.delivery_agents import PassAgents
-from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
+from support.run_artifacts import _candidate_finding_artifact, _passing_artifact, _repair_artifact
 from support.run_agents import ScriptedRunAgents
 from support.run_publication import RunPublicationAgents
-from support.run_scenarios import _accepted_run
+from support.run_scenarios import _accepted_run, _completed_run
 from support.seeding import write_fixture
 
 
@@ -75,26 +75,42 @@ def test_parent_only_ci_repair_reviews_final_candidate_and_keeps_pr(git_repo: Pa
     states = StateStore(git_repo / ".agent-run")
     state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
     run_id = str(state["run_id"])
-    publisher = FixtureGitHubPublisher(fixture, git)
-    publisher.data["delivery"]["required_checks"] = ["fail", "pass"]
+    class UnknownFailurePublisher(FixtureGitHubPublisher):
+        def required_check_evidence(self, pr_number: int, *, expected_head_sha: str | None = None) -> dict[str, Any]:
+            return {**super().required_check_evidence(pr_number, expected_head_sha=expected_head_sha),
+                    "repairability": "unknown", "log": "RAW_PLATFORM_FAILURE"}
+
+    publisher = UnknownFailurePublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["pending", "fail", "pass"]
     publisher._save()
     agents = ParentCIAgents(states.root / "worktrees" / run_id / "parent")
 
     engine = ParentDeliveryEngine(
         git=git, states=states, github=publisher, agents=agents,
     )
+    waiting = engine.deliver(run_id)
+    assert waiting["parent_job"]["phase"] == "waiting_checks"
+    assert waiting["parent_job"]["ci_recovery"]["developments_used"] == 0
     failed = engine.deliver(run_id)
     assert failed["parent_job"]["phase"] == "repairing"
     result = engine.deliver(run_id)
 
     job = result["parent_job"]
     assert result["status"] == "parent_approval_pending", (job["phase"], job.get("blocked_reason"))
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert job["ci_recovery"]["repairs_used"] == 1
+    assert job["ci_recovery"]["window"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
     assert job["ci_recovery"]["reviewer_invocations"] == 1
     assert len(agents.review_requests) == 2
     assert agents.review_requests[-1]["candidate_sha"] == job["candidate_sha"]
     assert len(publisher.data["delivery"]["pull_requests"]) == 1
+    review_request = agents.review_requests[-1]
+    assert review_request["work_source"] == "ci"
+    assert review_request["ci_evidence"]["log"] == "RAW_PLATFORM_FAILURE"
+    assert review_request["parent_acceptance_baseline"]["acceptance_scope"] == "parent_only"
+    assert not engine.has_current_approval_grant(run_id)
+    approved = engine.approve(run_id)
+    assert approved["status"] == "completed"
+    assert git.is_ancestor(job["published_sha"], git.resolve("main"))
 
 
 def test_parent_only_published_source_rollback_pauses_without_repush(git_repo: Path) -> None:
@@ -212,16 +228,22 @@ def test_run_final_ci_repair_shares_budget_with_internal_pr(git_repo: Path) -> N
 
     assert repaired["status"] == "run_publication_pending"
     assert len(agents.review_requests) == 1
-    assert repaired["run_acceptance"]["ci_recovery"]["repairs_used"] == 1
+    assert repaired["run_acceptance"]["ci_recovery"]["developments_used"] == 1
     assert repaired["run_acceptance"]["review_budget"]["development_attempts"] == 0
     assert repaired["run_acceptance"]["completed_repair_jobs"]
     published = publication.publish(run_id)
     assert published["status"] == "run_approval_pending"
     assert published["run_publication"]["pr_number"] == final_pr
-    assert published["run_acceptance"]["ci_recovery"]["rounds_used"] == 1
+    assert published["run_acceptance"]["ci_recovery"]["window"] == 1
+    review_request = agents.review_requests[-1]
+    assert review_request["work_source"] == "ci"
+    assert review_request["parent_acceptance_baseline"]["ticket_completion_records"]
+    assert not publication.has_current_approval_grant(run_id)
+    approved = publication.approve(run_id)
+    assert approved["status"] == "completed"
 
 
-def test_run_second_failed_final_head_uses_next_round_and_same_pr(git_repo: Path) -> None:
+def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     run_id = str(state["run_id"])
     publisher.data["delivery"]["required_checks"] = [
@@ -245,11 +267,11 @@ def test_run_second_failed_final_head_uses_next_round_and_same_pr(git_repo: Path
     failed_again = publication.publish(run_id)
     assert failed_again["status"] == "run_acceptance_pending"
     assert failed_again["run_publication"]["pr_number"] == final_pr
-    assert failed_again["run_acceptance"]["ci_recovery"]["rounds_used"] == 2
+    assert failed_again["run_acceptance"]["ci_recovery"]["window"] == 1
 
     second_repair = acceptance.accept(run_id)
     assert second_repair["status"] == "run_publication_pending"
-    assert second_repair["run_acceptance"]["ci_recovery"]["repairs_used"] == 1
+    assert second_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 2
     assert second_repair["run_acceptance"]["review_budget"]["development_attempts"] == 0
     published = publication.publish(run_id)
     assert published["status"] == "run_approval_pending"
@@ -278,8 +300,8 @@ def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> N
 
     assert repaired["status"] == "run_publication_pending"
     recovery = repaired["run_acceptance"]["ci_recovery"]
-    assert recovery["rounds_used"] == 2
-    assert recovery["repairs_used"] == 1
+    assert recovery["window"] == 1
+    assert recovery["developments_used"] == 2
     assert len(agents.development_requests) == 2
     assert len(agents.review_requests) == 2
     assert repaired["run_acceptance"]["review_budget"]["development_attempts"] == 0
@@ -288,7 +310,7 @@ def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> N
     assert published["run_publication"]["pr_number"] == final_pr
 
 
-def test_run_ci_reviewer_exhausts_inner_without_advancing_outer(git_repo: Path) -> None:
+def test_run_ci_reviewer_exhausts_shared_development_allowance(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     run_id = str(state["run_id"])
     publisher.data["delivery"]["required_checks"] = ["fail", "pass"]
@@ -307,13 +329,19 @@ def test_run_ci_reviewer_exhausts_inner_without_advancing_outer(git_repo: Path) 
 
     assert blocked["status"] == "ready_for_human"
     run = blocked["run_acceptance"]
-    assert run["blocked_reason"] == "ci_inner_budget_exhausted"
-    assert run["ci_recovery"]["rounds_used"] == 1
-    assert run["ci_recovery"]["repairs_used"] == 3
+    assert run["blocked_reason"] == "ci_development_budget_exhausted"
+    assert run["ci_recovery"]["window"] == 1
+    assert run["ci_recovery"]["developments_used"] == 3
     assert review_budget_owner(run)["review_budget"]["development_attempts"] == 0
     assert len(agents.review_requests) == 3
+    original_ci = agents.development_requests[0]["ci_evidence"]
+    assert all(request["work_source"] == "ci" and request["ci_evidence"] == original_ci
+               for request in agents.development_requests)
+    assert agents.development_requests[1]["repair_source"] == "acceptance"
+    assert all(request["parent_acceptance_baseline"]["artifact"] == _passing_artifact()
+               for request in agents.review_requests)
     assert run["repair_cycle"]["status"] == "budget_exhausted"
-    assert run["repair_cycle"]["ended_reason"] == "ci_inner_budget_exhausted"
+    assert run["repair_cycle"]["ended_reason"] == "ci_development_budget_exhausted"
     assert _run_repair_status(blocked)["code_modification_attempts"] == 0
     job = run["repair_job"]
     job["attempt_kind"] = "ordinary"
@@ -339,11 +367,10 @@ def test_run_ci_reviewer_exhausts_inner_without_advancing_outer(git_repo: Path) 
         recovered["run_acceptance"]["ci_recovery"],
         len(new_agents.development_requests), len(new_agents.review_requests),
     )
-    assert recovered["run_acceptance"]["ci_recovery"]["rounds_used"] == 1
-    assert recovered["run_acceptance"]["ci_recovery"]["inner_window"] == 2
+    assert recovered["run_acceptance"]["ci_recovery"]["window"] == 2
 
 
-def test_parent_only_ci_inner_resume_keeps_outer_round(git_repo: Path) -> None:
+def test_parent_only_ci_resume_renews_only_exhausted_allowance(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     git = GitRepository(git_repo)
     states = StateStore(git_repo / ".agent-run")
@@ -373,16 +400,21 @@ def test_parent_only_ci_inner_resume_keeps_outer_round(git_repo: Path) -> None:
     blocked = engine.deliver(run_id)
     assert blocked["status"] == "blocked"
     job = blocked["parent_job"]
-    assert job["blocked_reason"] == "ci_inner_budget_exhausted"
-    assert job["ci_recovery"]["rounds_used"] == 1
-    assert job["ci_recovery"]["repairs_used"] == 3
+    assert job["blocked_reason"] == "ci_development_budget_exhausted"
+    assert job["ci_recovery"]["window"] == 1
+    assert job["ci_recovery"]["developments_used"] == 3
     ordinary_budget = job["review_budget"].copy()
+    original_ci = agents.development_requests[1]["ci_evidence"]
+    assert all(request["ci_evidence"] == original_ci
+               for request in agents.development_requests[1:])
+    assert agents.development_requests[-1]["repair_source"] == "acceptance"
+    assert all(request["parent_acceptance_baseline"]["artifact"] == _passing_artifact()
+               for request in agents.review_requests[1:])
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         run_id, explicit_resume=True,
     )
-    assert resumed["parent_job"]["ci_recovery"]["inner_window"] == 2
-    assert resumed["parent_job"]["ci_recovery"]["rounds_used"] == 1
+    assert resumed["parent_job"]["ci_recovery"]["window"] == 2
     assert resumed["parent_job"]["review_budget"] == ordinary_budget
     passing_agents = ParentCIAgents(states.root / "worktrees" / run_id / "parent")
     recovered = ParentDeliveryEngine(
@@ -390,4 +422,209 @@ def test_parent_only_ci_inner_resume_keeps_outer_round(git_repo: Path) -> None:
     ).deliver(run_id)
     assert recovered["status"] == "parent_approval_pending"
     assert recovered["parent_job"]["pr_number"] == blocked["parent_job"]["pr_number"]
-    assert recovered["parent_job"]["ci_recovery"]["rounds_used"] == 1
+    assert recovered["parent_job"]["ci_recovery"]["window"] == 2
+
+
+def test_parent_only_no_change_ci_investigation_resumes_same_scope(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
+    run_id = str(state["run_id"])
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["fail", "pass"]
+    publisher._save()
+
+    class InvestigationAgents(ParentCIAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            if request.get("work_source") == "ci":
+                self.development_requests.append(request)
+                return DevelopmentResult(thread_id=str(request.get("thread_id")), summary="Investigated platform failure; no code changed")
+            return super().develop(request)
+
+    agents = InvestigationAgents(states.root / "worktrees" / run_id / "parent")
+    engine = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
+    engine.deliver(run_id)
+    blocked = engine.deliver(run_id)
+    assert blocked["parent_job"]["blocked_reason"] == "ci_investigation_paused"
+    assert blocked["parent_job"]["ci_recovery"]["developments_used"] == 1
+    ordinary = blocked["parent_job"]["review_budget"]
+    Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True, message="PLATFORM_RESTORED", new_thread=True,
+    )
+    resumed_agents = ParentCIAgents(agents.checkout)
+    resumed_agents.review_requests = list(agents.review_requests)
+    resumed_agents.review_count = agents.review_count
+    result = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=resumed_agents).deliver(run_id)
+    assert result["status"] == "parent_approval_pending"
+    assert result["parent_job"]["ci_recovery"]["developments_used"] == 2
+    assert result["parent_job"]["review_budget"] == ordinary
+    request = resumed_agents.development_requests[-1]
+    assert request["ci_evidence"] == agents.development_requests[-1]["ci_evidence"]
+    assert request["work_source"] == "ci"
+    assert "PLATFORM_RESTORED" in str(request["human_response_history"])
+
+
+def test_run_no_change_ci_investigation_resumes_without_renewal(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    run_id = str(state["run_id"])
+    publisher.data["delivery"]["required_checks"] = ["fail", "pass", "pass"]
+    publisher._save()
+    publication = RunPublicationEngine(git=git, states=states, agents=RunPublicationAgents(), github=publisher,
+                                       default_branch="main", default_head_sha=git.resolve("main"))
+    publication.publish(run_id)
+
+    class InvestigationAgents(RunCIAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.development_requests.append(request)
+            return DevelopmentResult(thread_id="run-ci-investigator", summary="Investigated failure; no code changed")
+
+    agents = InvestigationAgents()
+    blocked = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(run_id)
+    job = blocked["run_acceptance"]["repair_job"]
+    assert job["blocked_reason"] == "ci_investigation_paused"
+    assert job["ci_recovery"]["developments_used"] == 1
+    ordinary = job["review_budget"]
+    Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
+        run_id, explicit_resume=True, message="PLATFORM_RESTORED", new_thread=True,
+    )
+    resumed_agents = RunCIAgents()
+    resumed_agents._reviews = [_passing_artifact()]
+    result = RunAcceptanceEngine(git=git, states=states, agents=resumed_agents, github=publisher).accept(run_id)
+    assert result["status"] == "run_publication_pending"
+    assert result["run_acceptance"]["ci_recovery"]["developments_used"] == 2
+    assert result["run_acceptance"]["review_budget"] == ordinary
+    request = resumed_agents.development_requests[-1]
+    assert request["ci_evidence"] == agents.development_requests[-1]["ci_evidence"]
+    assert "PLATFORM_RESTORED" in str(request["human_response_history"])
+
+
+def test_parent_ci_target_append_findings_use_integration_allowance(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
+    run_id = str(state["run_id"])
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["fail", "pass"]
+    publisher._save()
+    target_heads: list[str] = []
+
+    class AppendTargetAgents(ParentCIAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            if request.get("repair_source") == "integration":
+                self.development_requests.append(request)
+                (self.checkout / "integration-fix.txt").write_text("fixed combination\n")
+                return DevelopmentResult(thread_id=str(request["thread_id"]), summary="Fixed integration regression")
+            return super().develop(request)
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.review_requests.append(request)
+            ordinal = len(self.review_requests)
+            if ordinal == 2:
+                assert request["work_source"] == "ci"
+                collaborator = git_repo.parent / "ci-target-append"
+                previous = git.resolve("main")
+                subprocess.run(["git", "worktree", "add", "--detach", str(collaborator), previous],
+                               cwd=git_repo, check=True, capture_output=True)
+                try:
+                    (collaborator / "target-after-ci.txt").write_text("new target\n")
+                    subprocess.run(["git", "add", "target-after-ci.txt"], cwd=collaborator, check=True)
+                    subprocess.run(["git", "commit", "-m", "append target during CI review"],
+                                   cwd=collaborator, check=True, capture_output=True)
+                    target = subprocess.run(["git", "rev-parse", "HEAD"], cwd=collaborator,
+                                            check=True, capture_output=True, text=True).stdout.strip()
+                finally:
+                    subprocess.run(["git", "worktree", "remove", "--force", str(collaborator)],
+                                   cwd=git_repo, check=True, capture_output=True)
+                subprocess.run(["git", "update-ref", "refs/heads/main", target, previous],
+                               cwd=git_repo, check=True)
+                publisher.data["default_head_sha"] = target
+                publisher.data["delivery"]["published_branches"]["main"] = target
+                for pull in publisher.data["delivery"]["pull_requests"]:
+                    pull["base_sha"] = target
+                publisher._save()
+                target_heads.append(target)
+            return ReviewResult(thread_id=f"append-reviewer-{ordinal}",
+                                artifact=_candidate_finding_artifact() if ordinal == 3 else _passing_artifact())
+
+    agents = AppendTargetAgents(states.root / "worktrees" / run_id / "parent")
+    engine = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
+    engine.deliver(run_id)
+    result = engine.deliver(run_id)
+    assert result["status"] == "parent_approval_pending", (result["diagnostics"], result["parent_job"].get("blocked_reason"))
+    job = result["parent_job"]
+    assert job["ci_recovery"]["developments_used"] == 1
+    assert job["ci_recovery"]["reviewer_invocations"] == 1
+    assert job["integration_development_budget"]["used"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    assert [request.get("work_source") for request in agents.review_requests[1:]] == ["ci", "integration", "integration"]
+    assert agents.development_requests[-1]["repair_source"] == "integration"
+    assert "ci_evidence" not in agents.development_requests[-1]
+    assert job["ci_evidence"] == agents.review_requests[1]["ci_evidence"]
+    assert job["ci_recovery"]["failure_head"] == job["ci_evidence"]["head_sha"]
+    assert git.is_ancestor(target_heads[0], job["candidate_sha"])
+
+
+def test_run_ci_target_append_findings_use_shared_integration_owner(git_repo: Path) -> None:
+    state, states, git = _completed_run(git_repo)
+    run_id = str(state["run_id"])
+    target_branch = str(state["run_branch"])
+    targets: list[str] = []
+
+    class AppendPublisher(FixtureGitHubPublisher):
+        def live_branch_heads(self, source_branch: str, base_branch: str) -> tuple[str | None, str]:
+            current = states.load_run(run_id)
+            job = current.get("run_acceptance", {}).get("repair_job", {}) if current else {}
+            if (base_branch == target_branch and not targets and job.get("phase") == "accepted"
+                and job.get("ci_recovery", {}).get("developments_used") == 1):
+                checkout = git_repo.parent / "run-ci-target-append"
+                previous = git.resolve(target_branch)
+                subprocess.run(["git", "worktree", "add", "--detach", str(checkout), previous],
+                               cwd=git_repo, check=True, capture_output=True)
+                try:
+                    (checkout / "run-target-after-ci.txt").write_text("new Run contribution\n")
+                    subprocess.run(["git", "add", "run-target-after-ci.txt"], cwd=checkout, check=True)
+                    subprocess.run(["git", "commit", "-m", "append Run target after CI"],
+                                   cwd=checkout, check=True, capture_output=True)
+                    target = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
+                                            check=True, capture_output=True, text=True).stdout.strip()
+                finally:
+                    subprocess.run(["git", "worktree", "remove", "--force", str(checkout)],
+                                   cwd=git_repo, check=True, capture_output=True)
+                self.data["delivery"]["published_branches"][target_branch] = target
+                for pull in self.data["delivery"]["pull_requests"]:
+                    if pull["base_branch"] == target_branch:
+                        pull["base_sha"] = target
+                self._save()
+                targets.append(target)
+            return super().live_branch_heads(source_branch, base_branch)
+
+    publisher = AppendPublisher(git_repo / "github.json", git)
+    publisher.data["delivery"]["required_checks"] = ["fail", "pass", "pass"]
+    publisher._save()
+    class IntegrationAgents(RunCIAgents):
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            if not self.review_requests:
+                self.review_requests.append(request)
+                return ReviewResult(thread_id="run-ci-reviewer-1", artifact=self._reviews.pop(0))
+            return super().review(request)
+
+    agents = IntegrationAgents()
+    agents._reviews = [_repair_artifact(), _passing_artifact(), _passing_artifact(),
+                       _candidate_finding_artifact(), _passing_artifact()]
+    engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    result = engine.accept(run_id)
+    if result["status"] == "run_acceptance_pending":
+        result = engine.accept(run_id)
+    assert result["status"] == "run_publication_pending", result["diagnostics"]
+    run = result["run_acceptance"]
+    assert run["ci_recovery"]["developments_used"] == 1
+    assert run["ci_recovery"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["development_attempts"] == 2
+    assert [request.get("work_source") for request in agents.review_requests[2:]] == ["ci", "integration", "integration"]
+    assert agents.development_requests[-1]["work_source"] == "integration"
+    assert agents.development_requests[-1]["repair_source"] == "integration"
+    assert "ci_evidence" not in agents.development_requests[-1]
+    assert run["completed_repair_jobs"][-1]["ci_evidence"]["head_sha"] == agents.review_requests[2]["ci_evidence"]["head_sha"]
+    assert git.is_ancestor(targets[0], git.resolve(target_branch))

@@ -22,7 +22,7 @@ from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_history import history_records
 from agent_run.delivery_status import _status_style
 from agent_run.execution_timing import invocation_execution_seconds

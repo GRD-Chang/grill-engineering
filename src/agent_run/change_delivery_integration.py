@@ -37,10 +37,21 @@ def prepare_delivery_integration(
             return False
         return True
     if label == "parent-only":
-        if before_review and not isinstance(job.get("parent_integration"), dict):
+        if not before_review and job.get("attempt_kind") == "ci_repair":
+            # CI Development–Review has finished. New combination findings
+            # belong to integration, while the original CI evidence stays saved.
+            job["attempt_kind"] = "integration"
+            engine.save(state)
+        if before_review and (job.get("attempt_kind") == "ci_repair" or not isinstance(job.get("parent_integration"), dict)):
             return True
         return prepare_parent_integration(engine, state, job, checkout)
     if label.startswith("run-repair-"):
+        if before_review and job.get("attempt_kind") == "ci_repair":
+            return True
+        if not before_review and job.get("attempt_kind") == "ci_repair":
+            # Run Repair ordinary quota is the Parent integration allowance.
+            job["attempt_kind"] = "ordinary"
+            engine.save(state)
         if not isinstance(job.get("integrated_sha"), str) and needs_repair_integration(engine, job):
             return prepare_repair_integration(engine, state, job, checkout)
     return True

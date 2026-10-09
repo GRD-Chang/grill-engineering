@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Run Repair worker request construction and PR narrative framing."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_run.agent_invocation import select_publication_thread
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     latest_reviewer_thread,
@@ -71,6 +73,14 @@ class RunRepairRequests:
             request["human_feedback"] = str(job["human_feedback"])
         elif source == "merge_conflict":
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
+        integration = job.get("run_repair_integration")
+        if isinstance(integration, dict) and source == "acceptance" and job.get("pending_attempt_kind") != "ci_repair":
+            request["repair_source"] = "integration"
+            request["work_source"] = "integration"
+            request["integration_evidence"] = json.dumps({
+                "run_repair_integration": integration,
+                "acceptance_artifact": request.get("acceptance_artifact"),
+            }, ensure_ascii=False, sort_keys=True)
         _add_human_resume_fields(request, job)
         return request
 
@@ -135,6 +145,10 @@ class RunRepairRequests:
                 else None
             ),
         }
+        integration = job.get("run_repair_integration")
+        if isinstance(integration, dict) and job.get("attempt_kind") != "ci_repair":
+            request["work_source"] = "integration"
+            request["run_integration_record"] = integration
         _add_human_resume_fields(request, job)
         fallbacks = ticket_fallback_records(state)
         if fallbacks:
@@ -142,6 +156,28 @@ class RunRepairRequests:
         integrations = ticket_integration_records(state)
         if integrations:
             request["ticket_integration_records"] = integrations
+        baseline = job.get("previous_parent_acceptance_record")
+        if isinstance(baseline, dict) and (
+            baseline.get("acceptance_scope") == "run"
+            and baseline.get("parent_revision") == state["parent"]["revision"]
+            and baseline.get("ticket_graph_revision") == state["ticket_graph"]["revision"]
+            and baseline.get("ticket_completion_records") == ticket_completion_records(state)
+            and all(isinstance(baseline.get(field), str) and baseline[field].strip()
+                    for field in ("reviewer_thread_id", "reviewed_default_base_sha", "expected_merge_tree"))
+            and isinstance(baseline.get("reviewed_head_sha", baseline.get("reviewed_candidate_sha")), str)
+        ):
+            try:
+                accepted = AcceptanceArtifact.parse(baseline.get("artifact")).is_accepted
+            except ValueError:
+                accepted = False
+            if accepted:
+                request["parent_acceptance_baseline"] = baseline
+                request["previous_acceptance_artifact"] = baseline["artifact"]
+                request["previous_review_identity"] = {
+                    "run_head_sha": baseline.get("reviewed_head_sha", baseline.get("reviewed_candidate_sha")),
+                    "default_base_sha": baseline.get("reviewed_default_base_sha"),
+                    "expected_merge_tree": baseline.get("expected_merge_tree"),
+                }
         previous = previous_review_context(job)
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]

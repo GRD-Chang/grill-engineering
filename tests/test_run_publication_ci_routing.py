@@ -134,12 +134,12 @@ def test_final_check_classification_preserves_unrelated_budgets(
     assert run["review_budget"] == before["review_budget"]
     assert run["modification_attempts"] == before["modification_attempts"]
     assert run["policy_snapshot"] == before["policy_snapshot"]
-    if scenario == "repairable":
+    if scenario in {"repairable", "cancelled", "platform", "unclassified"}:
         assert state["status"] == "run_acceptance_pending"
         assert run["repair_request"] == {"repair_source": "required_checks", "ci_evidence": evidence}
         assert run["ci_failed_evidence"] == evidence
-        assert run["ci_recovery"]["rounds_used"] == 1
-        assert run["ci_recovery"]["repairs_used"] == 0  # Charged only on actual development.
+        assert run["ci_recovery"]["window"] == 1
+        assert run["ci_recovery"]["developments_used"] == 0  # Charged only on actual development.
         assert "repair_job" not in run
     else:
         assert run == before
@@ -150,25 +150,24 @@ def test_final_check_classification_preserves_unrelated_budgets(
         )
 
 
-@pytest.mark.parametrize("exhaustion", ["inner", "outer"])
+@pytest.mark.parametrize("new_failure_versions", [False, True])
 def test_final_ci_checkpoint_replay_and_renewal_preserve_exact_history(
     ci_context: tuple[RunPublicationShared, ChecksPublisher, dict[str, Any]],
-    exhaustion: str,
+    new_failure_versions: bool,
 ) -> None:
     engine, publisher, state = ci_context
     run = state["run_acceptance"]
     before_review = deepcopy(run["review_budget"])
-    for index in range(1 if exhaustion == "inner" else 3):
+    for index in range(3):
         observe_repairable_ci_failure(
-            run, head_sha=_HEAD if exhaustion == "inner" else f"failed-{index}",
-            outer_limit=3, inner_limit=3, is_ticket=False,
+            run, head_sha=f"failed-{index}" if new_failure_versions else _HEAD,
+            limit=3, is_ticket=False,
         )
-        for _ in range(3 if exhaustion == "inner" else 1):
-            mark_ci_repair(run, outer_limit=3, inner_limit=3, is_ticket=False)
+        mark_ci_repair(run, limit=3, is_ticket=False)
     engine._route_required_checks(
         state, state["run_publication"], 2, _HEAD, publisher.evidence,
     )
-    reason = f"ci_{exhaustion}_budget_exhausted"
+    reason = "ci_development_budget_exhausted"
     assert state["status"] == "ready_for_human"
     assert run["blocked_reason"] == state["diagnostics"][0]["code"] == reason
     assert state["run_publication"]["phase"] == "stale"
@@ -180,7 +179,7 @@ def test_final_ci_checkpoint_replay_and_renewal_preserve_exact_history(
     )
     assert state == paused == engine.states.load_run(state["run_id"])
     budget_before = deepcopy(run["ci_recovery"])
-    reset_exhausted_ci_budget(run, outer_limit=3, inner_limit=3, is_ticket=False)
+    reset_exhausted_ci_budget(run, limit=3, is_ticket=False)
     engine._route_required_checks(
         state, state["run_publication"], 2, _HEAD, publisher.evidence,
     )
@@ -189,14 +188,12 @@ def test_final_ci_checkpoint_replay_and_renewal_preserve_exact_history(
     assert budget["history"][-1] == {
         "kind": "resume", "reason": reason,
         **{key: budget_before[key] for key in (
-            "outer_window", "rounds_used", "inner_window", "repairs_used", "failure_head",
+            "window", "developments_used", "failure_head",
         )},
     }
     assert budget["failure_head"] == _HEAD
-    assert budget["outer_window"] == (2 if exhaustion == "outer" else 1)
-    assert budget["inner_window"] == (2 if exhaustion == "inner" else 1)
-    assert budget["rounds_used"] == 1
-    assert budget["repairs_used"] == 0
+    assert budget["window"] == 2
+    assert budget["developments_used"] == 0
     assert run["review_budget"] == before_review
     assert state["status"] == "run_acceptance_pending"
     assert run["repair_request"]["ci_evidence"] == publisher.evidence

@@ -36,8 +36,6 @@ BLOCKED_MESSAGES = {
         "Ticket Review budget requires an explicit new window"
     ),
     "ci_development_budget_exhausted": "Ticket CI Development allowance requires explicit resume",
-    "ci_inner_budget_exhausted": "Ticket CI repair allowance requires explicit resume",
-    "ci_outer_budget_exhausted": "Ticket CI recovery allowance requires explicit resume",
     "ticket_close_external_conflict": (
         "Ticket close evidence conflicts with the Publisher intent"
     ),

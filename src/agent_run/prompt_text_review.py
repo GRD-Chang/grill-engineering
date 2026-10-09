@@ -1,6 +1,12 @@
 """独立验收的双语对象说明、证据边界与输出语义。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'review/run-ci-object': {
+        'zh': """本次验收对象：
+当前工作区是 CI 修复与默认分支合并后的未提交整体预览，HEAD 留在默认分支基准是正常情况；检查工作树中的当前整体结果。CI 修复提交差异从失败证据绑定的版本到下方 repair_candidate_sha 比较；该提交差异用于定向核验，不替代整体预览。整体开发基准与实际合并基准可能不同，实际合并基准从当前工作区的只读 Git 取得。""",
+        'en': """Current acceptance review object:
+The workspace is an uncommitted preview of the CI repair merged with the default branch. HEAD remaining at the default-branch base is normal; inspect the entire current result in the working tree. Compare the CI repair commit delta from the revision bound by the failure evidence to repair_candidate_sha below; this delta supports targeted verification and does not replace the integrated preview. The overall development base and actual merge base may differ. Obtain the actual merge base using read-only Git in the workspace.""",
+    },
     'review/ci-object': {
         'zh': """当前工作区包含待审核的 CI 修复提交。下列身份用于准确绑定成果；审查差异以 CI 失败证据中的 head_sha 到当前 reviewed_candidate_sha 为准，原开发基线只提供需求与历史约束，不要求重复审查其全部累计改动。""",
         'en': """The checkout contains the CI repair commit under review. The identities below bind the exact result; review the delta from head_sha in the CI failure evidence to the current reviewed_candidate_sha. The original development base provides requirement and historical constraints, without requiring a repeated review of all cumulative changes.""",
@@ -15,6 +21,24 @@ TEXTS: dict[str, dict[str, str]] = {
 CI 失败（完整原始证据）：
 {}""",
         'en': """You are responsible for reviewing the current Ticket's CI repair. The complete review and validation scope of this round is this CI repair and its direct regressions. Select tests based on actual risk; a full suite is not mandatory each round, but expand validation when a concrete risk requires it. Original requirements constrain this repair. Independently verify root-cause handling, repair evidence and directly affected regressions against the exact failed revision, failed checks and available original logs; do not review the full requirements again. Do not weaken valid tests, assertions or checks to manufacture a pass. Developer claims and checks on an older revision do not prove the current result passed. Findings, human replies and new sessions remain part of this CI repair.
+
+CI failure (complete original evidence):
+{}""",
+    },
+    'review/parent-ci-baseline': {
+        'zh': """已有完整 Parent 验收基线（准确对象及原始结果）：
+{}
+基线用于复用旧验证证据；独立核验本次变化并对当前整体成果形成结论，旧结果不能直接授权新成果。""",
+        'en': """Existing complete Parent acceptance baseline (exact identities and original result):
+{}
+Reuse prior validation evidence from this baseline; independently verify current changes and conclude on the entire current result. The old result cannot authorize a new result directly.""",
+    },
+    'review/parent-ci-repair': {
+        'zh': """你负责当前完整 Parent 成果的 CI 修复审核。围绕准确失败版本、失败检查、原始日志和直接回归定向核验；原需求约束本次修复，不重新开发已完成 Ticket。已有适用完整 Parent 验收基线时，复用其验证证据并增量核验变化，但必须对当前完整 Parent 需求及整体成果形成结论；没有适用完整基线时建立完整基线，具体风险需要时扩大验证。不得削弱有效检查伪造通过。Review Findings、人工回复和新会话仍保留原始 CI 证据及当前整体责任。
+
+CI 失败（完整原始证据）：
+{}""",
+        'en': """You are responsible for CI repair review of the complete current Parent result. Verify the exact failed revision, failed checks, original logs and direct regressions. Original requirements constrain this repair; do not redevelop completed Tickets. With an applicable complete Parent acceptance baseline, reuse its validation evidence and verify changes incrementally, while concluding on the complete current Parent requirements and result. Without an applicable complete baseline, establish one; expand validation when concrete risks require it. Do not weaken valid checks to manufacture a pass. Review Findings, human replies and new sessions retain the original CI evidence and overall responsibility.
 
 CI failure (complete original evidence):
 {}""",

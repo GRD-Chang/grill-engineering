@@ -8,7 +8,7 @@ from typing import Any
 
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
+    ci_limit_for_job,
     observe_repairable_ci_failure,
 )
 from agent_run.change_delivery_fallback import (
@@ -23,8 +23,7 @@ from agent_run.external_supervision import (
 )
 from agent_run.github import GitHubReadError
 from agent_run.required_checks import (
-    is_explicitly_repairable_code_failure,
-    supervise_unrepairable_check_failure,
+    supervise_check_evidence_mismatch,
 )
 from agent_run.required_checks_observation import (
     clear_required_checks_observation,
@@ -59,12 +58,11 @@ def _route_repairable_ci_failure(
     job: dict[str, Any],
     evidence: dict[str, Any],
 ) -> bool:
-    outer_limit, inner_limit = ci_limits_for_job(job)
+    limit = ci_limit_for_job(job)
     decision = observe_repairable_ci_failure(
         job,
         head_sha=str(job["publication_sha"]),
-        outer_limit=outer_limit,
-        inner_limit=inner_limit,
+        limit=limit,
         is_ticket=stage.contract.label.startswith("ticket-"),
     )
     budget = job["ci_recovery"]
@@ -84,13 +82,7 @@ def _route_repairable_ci_failure(
         job["next_attempt_kind"] = "ci_repair"
     else:
         job["phase"] = "escalating"
-        job["escalation_code"] = (
-            "ci_development_budget_exhausted"
-            if stage.contract.label.startswith("ticket-")
-            else "ci_inner_budget_exhausted"
-            if decision == "inner_exhausted"
-            else "ci_outer_budget_exhausted"
-        )
+        job["escalation_code"] = "ci_development_budget_exhausted"
         job.pop("next_attempt_kind", None)
     should_yield = _resume_change_delivery_after_evidence(stage, state, job)
     stage.save(state)
@@ -390,19 +382,6 @@ def observe_required_checks(
                 "head_sha": str(job["publication_sha"]),
                 "result": "fail",
             }
-            if (
-                not stage.contract.label.startswith("ticket-")
-                and not is_explicitly_repairable_code_failure(evidence)
-            ):
-                job["ci_evidence"] = deepcopy(evidence)
-                supervise_unrepairable_check_failure(
-                    state,
-                    job,
-                    phase="waiting_checks",
-                    waiting_for=f"Change PR #{pr_number} Required Check repairability",
-                )
-                stage.save(state)
-                return True, checks
             return _route_repairable_ci_failure(
                 stage, state, job, evidence
             ), checks
@@ -446,16 +425,13 @@ def observe_required_checks(
             evidence,
             pr_number=pr_number,
             head_sha=str(job["publication_sha"]),
-        ) or (
-            not stage.contract.label.startswith("ticket-")
-            and not is_explicitly_repairable_code_failure(evidence)
         ):
             job["ci_evidence"] = canonical_evidence
-            supervise_unrepairable_check_failure(
+            supervise_check_evidence_mismatch(
                 state,
                 job,
                 phase="waiting_checks",
-                waiting_for=f"Change PR #{pr_number} Required Check repairability",
+                waiting_for=f"Change PR #{pr_number} Required Check failure evidence",
             )
             stage.save(state)
             return True, checks

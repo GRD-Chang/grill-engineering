@@ -12,7 +12,7 @@ from agent_run.ci_recovery_budget import (
     new_ci_recovery_budget, observe_repairable_ci_failure,
 )
 from agent_run.delivery_policy import DeliveryPolicy
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader, FixtureGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -43,7 +43,7 @@ def save_run_with_ci_fixture(
             isinstance(request, dict)
             and request.get("repair_source") == "required_checks"
             and isinstance(ci_budget, dict)
-            and ci_budget.get("rounds_used") == 0
+            and ci_budget.get("developments_used") == 0
         ):
             evidence = request.get("ci_evidence")
             checks = evidence.get("checks") if isinstance(evidence, dict) else None
@@ -55,7 +55,7 @@ def save_run_with_ci_fixture(
             if isinstance(head_sha, str):
                 observe_repairable_ci_failure(
                     run, head_sha=head_sha,
-                    outer_limit=3, inner_limit=3, is_ticket=False,
+                    limit=3, is_ticket=False,
                 )
     if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
         run["repair_job"].setdefault("ci_recovery", deepcopy(run["ci_recovery"]))

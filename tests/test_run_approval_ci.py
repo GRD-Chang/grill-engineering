@@ -29,10 +29,9 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
         run = before["run_acceptance"]
         for index in range(3):
             observe_repairable_ci_failure(
-                run, head_sha=f"previous-ci-head-{index}", outer_limit=3,
-                inner_limit=3, is_ticket=False,
+                run, head_sha=f"previous-ci-head-{index}", limit=3, is_ticket=False,
             )
-            mark_ci_repair(run, outer_limit=3, inner_limit=3, is_ticket=False)
+            mark_ci_repair(run, limit=3, is_ticket=False)
         StateStore(managed_state(git_repo)).save_run(before["run_id"], before)
         agents = update_agents(git_repo)
     else:
@@ -67,13 +66,13 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
     if exhausted:
         assert updated.returncode == 2, updated.stdout + updated.stderr
         assert state["status"] == "ready_for_human"
-        assert run["blocked_reason"] == "ci_outer_budget_exhausted"
+        assert run["blocked_reason"] == "ci_development_budget_exhausted"
         previous = before["run_acceptance"]["ci_recovery"]
-        assert run["ci_recovery"]["history"] == [*previous["history"], {
-            "kind": "round", "round": 3, "failure_head": previous["failure_head"],
-            "repairs_used": 1,
-        }]
-        assert run["ci_recovery"]["rounds_used"] == 3
+        assert run["ci_recovery"]["history"][:-1] == previous["history"]
+        assert run["ci_recovery"]["history"][-1]["kind"] == "failure"
+        assert run["ci_recovery"]["history"][-1]["developments_used"] == 3
+        assert run["ci_recovery"]["window"] == 1
+        assert run["ci_recovery"]["developments_used"] == 3
         assert not repair_pulls
         assert "repair_job" not in run
         assert "repair_request" not in run
@@ -81,8 +80,8 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
         assert updated.returncode == 0, updated.stdout + updated.stderr
         assert stdout_json(updated)["action"]["status"] == "updating"
         assert state["status"] == "run_approval_pending"
-        assert run["ci_recovery"]["rounds_used"] == 1
-        assert run["ci_recovery"]["repairs_used"] == 1
+        assert run["ci_recovery"]["window"] == 1
+        assert run["ci_recovery"]["developments_used"] == 1
         assert run["ci_recovery"]["reviewer_invocations"] == 1
         assert run["repair_cycle"]["status"] == "promoted"
         assert run["acceptance_record"]["reviewed_default_base_sha"] == target

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.controller import Controller
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_loop import TicketDeliveryLoop
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError

@@ -488,8 +488,8 @@ def test_run_supervises_repair_trigger_live_pr_readback(
     assert stdout_json(queued)["status"] == "run_acceptance_pending"
     queued_state = load_only_run_state(git_repo)
     original_head = queued_state["run_acceptance"]["ci_recovery"]["failure_head"]
-    assert queued_state["run_acceptance"]["ci_recovery"]["rounds_used"] == 1
-    assert queued_state["run_acceptance"]["ci_recovery"]["repairs_used"] == 0
+    assert queued_state["run_acceptance"]["ci_recovery"]["window"] == 1
+    assert queued_state["run_acceptance"]["ci_recovery"]["developments_used"] == 0
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock_multiplier"] = 120
@@ -548,8 +548,8 @@ def test_run_supervises_repair_trigger_live_pr_readback(
     assert completed_run["repair_generation"] == 1
     assert completed_run["repair_cycle"]["status"] == "promoted"
     assert completed_run["repair_cycle"]["code_modification_attempts"] == 1
-    assert completed_run["ci_recovery"]["rounds_used"] == 1
-    assert completed_run["ci_recovery"]["repairs_used"] == 1
+    assert completed_run["ci_recovery"]["window"] == 1
+    assert completed_run["ci_recovery"]["developments_used"] == 1
     repaired_head = completed["run_publication"]["record"]["run_head_sha"]
     assert repaired_head != original_head
     assert completed_run["ci_recovery"]["repair_pending"] is True
@@ -560,9 +560,9 @@ def test_run_supervises_repair_trigger_live_pr_readback(
     assert next_failure.returncode == 0, next_failure.stderr
     next_state = load_only_run_state(git_repo)
     next_budget = next_state["run_acceptance"]["ci_recovery"]
-    assert next_budget["rounds_used"] == 2
+    assert next_budget["window"] == 1
     assert next_budget["failure_head"] == repaired_head
-    assert next_budget["repairs_used"] == 0
+    assert next_budget["developments_used"] == 1
     assert next_state["run_acceptance"]["repair_request"]["repair_source"] == "required_checks"
 
 @pytest.mark.parametrize("error_type", ["github"])
@@ -687,6 +687,7 @@ def test_run_supervises_required_check_trigger_fingerprint_reads(
     assert stdout_json(recovered)["status"] == "run_approval_pending"
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
+    assert completed["run_acceptance"]["ci_recovery"]["developments_used"] == 1
 
 @pytest.mark.parametrize(
     ("fixture_role", "invocation_role", "phase"),

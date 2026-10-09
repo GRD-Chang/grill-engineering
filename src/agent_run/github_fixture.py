@@ -22,7 +22,6 @@ from agent_run.github import (
     _merge_identity_matches,
 )
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
-from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
 
 
@@ -1239,11 +1238,7 @@ class FixtureGitHubPublisher:
             normalized_checks = [
                 _fixture_check_for_head(check, actual_head_sha) for check in checks
             ]
-            evidence["checks"] = annotate_configured_code_failures(
-                normalized_checks,
-                self.git.root,
-                expected_head_sha=expected_head_sha,
-            )
+            evidence["checks"] = normalized_checks
         return evidence
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:

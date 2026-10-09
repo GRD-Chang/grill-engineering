@@ -10,11 +10,12 @@ from support.prompt_capture import _capture_public_prompt
 @pytest.mark.parametrize("language", ["zh", "en"])
 @pytest.mark.parametrize("mode", ["new-thread", "resume"])
 @pytest.mark.parametrize("source", ["required_checks", "acceptance"])
+@pytest.mark.parametrize("scope", ["ticket", "run", "parent_only"])
 def test_ci_development_retains_failure_scope_after_findings_and_resume(
-    tmp_path: Path, monkeypatch: Any, language: str, mode: str, source: str,
+    tmp_path: Path, monkeypatch: Any, language: str, mode: str, source: str, scope: str,
 ) -> None:
     prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", {
-        "language": language, "acceptance_scope": "ticket", "work_source": "ci",
+        "language": language, "acceptance_scope": scope, "work_source": "ci",
         "repair_source": source, "_invocation_mode": mode,
         "ci_evidence": {"head_sha": "FAILED_REVISION", "log": "RAW_RUNNER_FAILURE"},
         "acceptance_artifact": {"finding": "DIRECT_REGRESSION"},
@@ -75,3 +76,32 @@ def test_unreviewed_ci_publication_does_not_assume_failure_category_or_resolutio
         assert "Do not presume a failure category or claim its root cause is resolved" in prompt
         assert "explicitly repairable code-check failure" not in prompt
         assert "This candidate addresses that failure" not in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("scope", ["run", "parent_only"])
+@pytest.mark.parametrize("mode", ["new-thread", "resume"])
+def test_parent_ci_review_retains_overall_responsibility_and_baseline(
+    tmp_path: Path, monkeypatch: Any, language: str, scope: str, mode: str,
+) -> None:
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, "review", {
+        "language": language, "acceptance_scope": scope, "work_source": "ci",
+        "_invocation_mode": mode, "thread_id": "parent-ci-review",
+        "current_review_identity": ({"repair_candidate_sha": "CURRENT_PARENT", "run_base_sha": "DEVELOPMENT_BASE", "expected_merge_tree": "INTEGRATED_TREE"} if scope == "run" else {"reviewed_candidate_sha": "CURRENT_PARENT"}),
+        "ci_evidence": {"head_sha": "FAILED_PARENT", "log": "ORIGINAL_FAILURE"},
+        "parent_acceptance_baseline": {"artifact": {"evidence": "FULL_PARENT_BASELINE"}},
+        "previous_acceptance_artifact": {"findings": "LATEST_REVIEW_FINDING"},
+        "previous_review_identity": {"reviewed_candidate_sha": "PREVIOUS_PARENT"},
+        "human_response_history": [{"response": "HUMAN_MESSAGE"}],
+    }, name="parent-ci-review")
+    for fact in ("FAILED_PARENT", "ORIGINAL_FAILURE", "HUMAN_MESSAGE", "FULL_PARENT_BASELINE", "LATEST_REVIEW_FINDING", "PREVIOUS_PARENT"):
+        assert fact in prompt
+    assert ("对当前完整 Parent 需求及整体成果形成结论" if language == "zh" else "concluding on the complete current Parent requirements and result") in prompt
+    assert ("没有适用完整基线时建立完整基线" if language == "zh" else "Without an applicable complete baseline, establish one") in prompt
+
+    if scope == "run" and mode == "new-thread":
+        assert "CURRENT_PARENT" in prompt and "INTEGRATED_TREE" in prompt
+        assert "repair_candidate_sha" in prompt
+        assert "当前 reviewed_candidate_sha" not in prompt
+        assert "current reviewed_candidate_sha" not in prompt
+        assert ("未提交整体预览" if language == "zh" else "uncommitted preview") in prompt

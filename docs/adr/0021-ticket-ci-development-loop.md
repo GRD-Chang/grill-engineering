@@ -8,7 +8,7 @@ Ticket 的准确 CI 失败回到现有 Development–Review 循环，完成后�
 
 配置 `ticket_ci_review`（CLI `--ticket-ci-review/--no-ticket-ci-review`）默认 false，开启时所有 CI 修复均审核；删除固定首轮特例。关闭时形成绑定准确原发布授权、失败 Observation 和新 Candidate 的免审发布收据，保留事实而不生成虚假 Acceptance。连续修复只保留上次授权的必要身份，不递归复制收据。此配置不影响初始 Ticket Review、两种 Parent 完整验收或最终人工批准。
 
-`ticket_ci_development_limit`（CLI `--ticket-ci-development-limit`）默认 3，必须为正整数。同一 Ticket 的 CI Development 与 Review Findings 修改使用一份独立累计额度；新失败 head、提交及 PR 更新不重置。只有新语义 Development 工作计费，状态观察不计费，中断后续接同一工作不再收费。已完成但无代码修改的调查仍计费：有剩余额度时记录 `ci_investigation_paused`，显式 resume 启动新的 CI Development 并计费一次，保留原失败对象、证据、来源及其他额度；普通 run 不解除暂停。调查用尽额度时进入相同 CI 额度检查点，resume 仅续期 CI 窗口。耗尽产生 `ci_development_budget_exhausted`，显式 resume 只续期这一窗口；幂等 resume 不重复续期，历史和其他额度保留。Ticket 不再持有外层/内层双预算。两种 Parent 暂保留 ADR 0016 的 CI 路径，由 Parent CI 切片收敛，不迁移旧 Run 状态。
+`ticket_ci_development_limit`（CLI `--ticket-ci-development-limit`）默认 3，必须为正整数。同一 Ticket 的 CI Development 与 Review Findings 修改使用一份独立累计额度；新失败 head、提交及 PR 更新不重置。只有新语义 Development 工作计费，状态观察不计费，中断后续接同一工作不再收费。已完成但无代码修改的调查仍计费：有剩余额度时记录 `ci_investigation_paused`，显式 resume 启动新的 CI Development 并计费一次，保留原失败对象、证据、来源及其他额度；普通 run 不解除暂停。调查用尽额度时进入相同 CI 额度检查点，resume 仅续期 CI 窗口。耗尽产生 `ci_development_budget_exhausted`，显式 resume 只续期这一窗口；幂等 resume 不重复续期，历史和其他额度保留。Ticket 不再持有外层/内层双预算。两种 Parent 使用同一累计 CI 开发路径，但强制完整 Parent Review，见 [ADR 0023](0023-parent-ci-development-loop.md)。不迁移旧 Run 状态。
 
 沿用 ADR 0019 的并发责任：CI 等待保留唯一交付席位，不占 Agent 名额；进入 CI Development 释放交付席位，之后重新排队，所有真实 Agent 工作仍共享原名额。局部暂停不停止独立 Ticket。status/history 显示累计窗口、Development 用量、审核策略和准确失败对象。
 

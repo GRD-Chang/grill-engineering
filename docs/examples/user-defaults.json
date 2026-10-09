@@ -5,8 +5,7 @@
     "ticket_review_rounds": 3,
     "parent_only_paired_rounds": 10,
     "run_repair_rounds": 3,
-    "ci_recovery_rounds": 3,
-    "ci_repairs_per_round": 3,
+    "parent_ci_development_limit": 3,
     "invocation_deadlines": {
       "development": "5h",
       "review": "2h",

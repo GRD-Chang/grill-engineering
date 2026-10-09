@@ -64,7 +64,7 @@ def _repair_evidence(request: dict[str, Any]) -> str:
     if request.get("acceptance_scope") == "run":
         if source == "integration":
             instruction = "development/repair-run-integration"
-        elif source == "acceptance":
+        elif source == "acceptance" and request.get("work_source") != "ci":
             return resource(request, "development/run-integration-scope") + "\n\n" + resource(request, instruction).format(field, raw)
     return resource(request, instruction).format(field, raw)
 

@@ -5,7 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
+    ci_limit_for_job,
     new_ci_recovery_budget,
     observe_repairable_ci_failure,
 )
@@ -37,10 +37,9 @@ def prepare_run_repair(
     if repair_request["repair_source"] == "required_checks":
         evidence = repair_request["ci_evidence"]
         failed_head = evidence["checks"][0]["job"]["head_sha"]
-        outer_limit, inner_limit = ci_limits_for_job(run)
+        limit = ci_limit_for_job(run)
         assert observe_repairable_ci_failure(
-            run, head_sha=failed_head, outer_limit=outer_limit,
-            inner_limit=inner_limit, is_ticket=False,
+            run, head_sha=failed_head, limit=limit, is_ticket=False,
         ) == "repair"
         run["ci_failed_evidence"] = deepcopy(evidence)
     state["run_acceptance"] = run

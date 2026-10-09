@@ -280,7 +280,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
         "candidate_sha": ci_candidate, "phase": "candidate", "attempt_kind": "ci_repair",
         "acceptance_record": {"reviewed_candidate_sha": first_head},
     })
-    ci_budget = {"rounds_used": 1, "repairs_used": 1}
+    ci_budget = {"window": 1, "developments_used": 1}
     job["ci_recovery"] = ci_budget
 
     assert prepare_parent_integration(stage, state, job, git_repo) is False
@@ -296,7 +296,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
     assert job["review_budget"]["window"] == first_window
 
 
-def test_parent_ci_candidate_after_unchanged_first_integration_reviews_new_base(
+def test_parent_ci_candidate_reviews_before_rejoining_integration(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     collaborator, git, github, base = _setup(git_repo, tmp_path)
@@ -336,7 +336,7 @@ def test_parent_ci_candidate_after_unchanged_first_integration_reviews_new_base(
         "attempt_kind": "ci_repair", "repair_source": "required_checks",
         "ci_recovery": new_ci_recovery_budget(),
     })
-    job["ci_recovery"].update(rounds_used=1, repairs_used=1, failure_head=candidate,
+    job["ci_recovery"].update(developments_used=1, failure_head=candidate,
                               repair_pending=True, review_required=True)
     reviewed: list[tuple[str, str]] = []
 
@@ -347,12 +347,16 @@ def test_parent_ci_candidate_after_unchanged_first_integration_reviews_new_base(
     monkeypatch.setattr(engine, "_review", capture_review)
     engine.run(state, job, git_repo)
 
-    assert reviewed == [(target, job["parent_integration"]["head_sha"])]
-    assert job["parent_integration_stage"] is True
+    assert reviewed == [(base, repaired_candidate)]
+    # CI Review completes the development loop before current target integration.
+    assert target != base
+    assert job["parent_integration"]["head_sha"] == candidate
+    assert "parent_integration_stage" not in job
     assert job["review_budget"]["window"] == 1
     assert job["review_budget"]["reviewer_invocations"] == 6
     assert job["review_budget_history"] == []
-    assert all(git.is_ancestor(sha, reviewed[0][1]) for sha in (repaired_candidate, target))
+    assert git.is_ancestor(repaired_candidate, reviewed[0][1])
+    assert not git.is_ancestor(target, reviewed[0][1])
 
 
 def test_second_conflict_stage_requires_its_own_resolution(

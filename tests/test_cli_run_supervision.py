@@ -388,8 +388,13 @@ def test_run_routes_pending_parent_only_check_failure_through_repair(
     assert completed.returncode == 0, completed.stderr
     assert stdout_json(completed)["status"] == "parent_approval_pending"
     state = load_only_run_state(git_repo)
-    assert state["parent_job"]["modification_attempts"] == 1
-    assert state["parent_job"]["phase"] == "ready_for_approval"
+    job = state["parent_job"]
+    assert job["modification_attempts"] == 2
+    assert job["phase"] == "ready_for_approval"
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
+    assert job["ci_recovery"]["reviewer_invocations"] == 1
+    assert job["ci_recovery"]["review_required"] is True
 
 def test_run_routes_pending_final_run_check_failure_through_repair(
     git_repo: Path,

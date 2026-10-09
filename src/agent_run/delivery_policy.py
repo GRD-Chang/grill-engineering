@@ -18,7 +18,7 @@ from agent_run.review_budget import (
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 8
+DELIVERY_POLICY_PROTOCOL = 9
 _POLICY_KEYS = frozenset(
     {
         "ticket_development_workers",
@@ -29,8 +29,7 @@ _POLICY_KEYS = frozenset(
         "ticket_integration_development_limit",
         "ticket_ci_development_limit",
         "ticket_ci_review",
-        "ci_recovery_rounds",
-        "ci_repairs_per_round",
+        "parent_ci_development_limit",
         "development_thread_policy",
         "invocation_deadlines",
     }
@@ -56,8 +55,7 @@ class DeliveryPolicy:
     ticket_integration_development_limit: int = 3
     ticket_ci_development_limit: int = 3
     ticket_ci_review: bool = False
-    ci_recovery_rounds: int = 3
-    ci_repairs_per_round: int = 3
+    parent_ci_development_limit: int = 3
     parent_only_paired_rounds: int = 10
     run_repair_rounds: int = 3
     development_deadline_seconds: float = 5 * 60 * 60
@@ -85,7 +83,7 @@ class DeliveryPolicy:
         )
         if type(self.ticket_ci_review) is not bool:
             raise DeliveryPolicyError("ticket_ci_review must be boolean")
-        for field in ("ci_recovery_rounds", "ci_repairs_per_round", "ticket_integration_development_limit", "ticket_ci_development_limit"):
+        for field in ("parent_ci_development_limit", "ticket_integration_development_limit", "ticket_ci_development_limit"):
             object.__setattr__(self, field, _positive_integer(getattr(self, field), field))
         object.__setattr__(
             self,
@@ -120,8 +118,7 @@ class DeliveryPolicy:
             "ticket_integration_development_limit": self.ticket_integration_development_limit,
             "ticket_ci_development_limit": self.ticket_ci_development_limit,
             "ticket_ci_review": self.ticket_ci_review,
-            "ci_recovery_rounds": self.ci_recovery_rounds,
-            "ci_repairs_per_round": self.ci_repairs_per_round,
+            "parent_ci_development_limit": self.parent_ci_development_limit,
             "development_thread_policy": self.development_thread_policy,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -205,8 +202,7 @@ def normalize_policy_overrides(
         "ticket_integration_development_limit": "ticket_integration_development_limit",
         "ticket_ci_development_limit": "ticket_ci_development_limit",
         "ticket_ci_review": "ticket_ci_review",
-        "ci_recovery_rounds": "ci_recovery_rounds",
-        "ci_repairs_per_round": "ci_repairs_per_round",
+        "parent_ci_development_limit": "parent_ci_development_limit",
     }
     flat_deadline_aliases = {
         role: {
@@ -270,8 +266,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
             "ticket_integration_development_limit": value.get("ticket_integration_development_limit"),
             "ticket_ci_development_limit": value.get("ticket_ci_development_limit"),
             "ticket_ci_review": value.get("ticket_ci_review"),
-            "ci_recovery_rounds": value.get("ci_recovery_rounds"),
-            "ci_repairs_per_round": value.get("ci_repairs_per_round"),
+            "parent_ci_development_limit": value.get("parent_ci_development_limit"),
             "development_thread_policy": value.get("development_thread_policy", "reuse"),
             "invocation_deadlines": dict(deadlines),
         }
@@ -448,11 +443,8 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
             values.get("ticket_ci_development_limit"), "ticket_ci_development_limit"
         ),
         ticket_ci_review=cast(bool, values.get("ticket_ci_review")),
-        ci_recovery_rounds=_positive_integer(
-            values.get("ci_recovery_rounds"), "ci_recovery_rounds"
-        ),
-        ci_repairs_per_round=_positive_integer(
-            values.get("ci_repairs_per_round"), "ci_repairs_per_round"
+        parent_ci_development_limit=_positive_integer(
+            values.get("parent_ci_development_limit"), "parent_ci_development_limit"
         ),
         development_deadline_seconds=_positive_duration(
             deadlines["development"], "development deadline"

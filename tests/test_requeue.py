@@ -12,7 +12,7 @@ import pytest
 
 from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mutation
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.cli_presentation import _next_action
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine

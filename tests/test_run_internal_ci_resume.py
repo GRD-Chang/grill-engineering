@@ -48,7 +48,7 @@ class InternalCIAgents(ScriptedRunAgents):
         )
 
 
-@pytest.mark.parametrize("exhaustion", ["inner", "outer"])
+@pytest.mark.parametrize("exhaustion", ["review_findings", "new_failed_head"])
 def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
     git_repo: Path, exhaustion: str
 ) -> None:
@@ -57,12 +57,12 @@ def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     publisher.data["delivery"]["required_checks"] = (
-        ["fail", "pass"] if exhaustion == "inner" else ["fail"] * 4 + ["pass"]
+        ["fail", "pass"] if exhaustion == "review_findings" else ["fail"] * 4 + ["pass"]
     )
     publisher._save()
     ci_reviews = (
         [_candidate_finding_artifact()] * 3
-        if exhaustion == "inner"
+        if exhaustion == "review_findings"
         else [_passing_artifact()] * 3
     )
     agents = InternalCIAgents([_repair_artifact(), _passing_artifact(), *ci_reviews])
@@ -72,15 +72,15 @@ def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
 
     assert blocked["status"] == "ready_for_human"
     run = blocked["run_acceptance"]
-    assert run["blocked_reason"] == f"ci_{exhaustion}_budget_exhausted"
+    assert run["blocked_reason"] == "ci_development_budget_exhausted"
     assert "ci_failed_evidence" not in run
     job = run["repair_job"]
     failed_pr = job["pr_number"]
     failed_head = job["publication_sha"]
     assert job["required_checks_origin"]["head_sha"] == failed_head
     assert job["required_checks_origin"]["pr_number"] == failed_pr
-    if exhaustion == "inner":
-        assert "ci_evidence" not in job
+    if exhaustion == "review_findings":
+        assert job["ci_evidence"]["head_sha"] == failed_head
         assert job["repair_source"] == "acceptance"
     else:
         assert job["ci_evidence"]["head_sha"] == failed_head
@@ -98,9 +98,9 @@ def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
     assert review_budget_owner(resumed_run)["review_budget"] == ordinary_budget
     assert resumed_run["ci_recovery"] == resumed_run["repair_job"]["ci_recovery"]
     assert resumed_run["ci_recovery"]["failure_head"] == failed_head
-    assert resumed_run["ci_recovery"]["rounds_used"] == 1
-    assert resumed_run["ci_recovery"]["outer_window"] == (2 if exhaustion == "outer" else 1)
-    assert resumed_run["ci_recovery"]["inner_window"] == (2 if exhaustion == "inner" else 1)
+    assert resumed_run["ci_recovery"]["window"] == 2
+    assert resumed_run["ci_recovery"]["developments_used"] == 0
+    assert resumed_run["ci_recovery"]["history"][-1]["developments_used"] == 3
     assert "repair_request" not in resumed_run
 
     passing_agents = InternalCIAgents(
@@ -111,7 +111,7 @@ def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
     ).accept(run_id)
     assert recovered["status"] == "run_publication_pending"
     assert recovered["run_acceptance"]["review_budget"] == ordinary_budget
-    assert recovered["run_acceptance"]["ci_recovery"]["rounds_used"] == 1
+    assert recovered["run_acceptance"]["ci_recovery"]["window"] == 2
     assert recovered["run_acceptance"]["completed_repair_jobs"][-1]["repair_branch"] == job["repair_branch"]
     assert len(publisher.data["delivery"]["pull_requests"]) == 1
     assert len(passing_agents.development_requests) == 1

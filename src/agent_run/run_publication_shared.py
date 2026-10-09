@@ -9,7 +9,7 @@ from agent_run.review_budget import remove_repair_job
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
+    ci_limit_for_job,
     observe_repairable_ci_failure,
 )
 from agent_run.delivery_protocol import GitHubPublisher
@@ -34,8 +34,7 @@ from agent_run.publication_operation_retry import (
 )
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.required_checks import (
-    is_explicitly_repairable_code_failure,
-    supervise_unrepairable_check_failure,
+    supervise_check_evidence_mismatch,
 )
 from agent_run.required_checks_observation import (
     clear_required_checks_observation,
@@ -85,9 +84,18 @@ class RunPublicationShared:
         record = run.get("acceptance_record")
         if not isinstance(record, dict) or run.get("phase") != "accepted":
             return False
+        try:
+            artifact = AcceptanceArtifact.parse(record.get("artifact"))
+        except ValueError:
+            return False
         run_head = self.git.resolve(str(state["run_branch"]))
         return (
-            record.get("reviewed_head_sha") == run_head
+            record.get("acceptance_scope") == "run"
+            and artifact.is_accepted
+            and record.get("artifact") == run.get("acceptance_artifact")
+            and isinstance(record.get("reviewer_thread_id"), str)
+            and bool(record["reviewer_thread_id"].strip())
+            and record.get("reviewed_head_sha") == run_head
             and record.get("reviewed_default_base_sha") == self.default_head_sha
             and record.get("expected_merge_tree")
             == self.git.expected_merge_tree(
@@ -181,18 +189,16 @@ class RunPublicationShared:
                 failure_evidence_matches_observation(
                     observation, evidence, pr_number=pr_number, head_sha=run_head
                 )
-                and is_explicitly_repairable_code_failure(evidence)
             ):
-                supervise_unrepairable_check_failure(
+                supervise_check_evidence_mismatch(
                     state, publication, phase="waiting_external",
-                    waiting_for=f"Run PR #{pr_number} Required Check repairability",
+                    waiting_for=f"Run PR #{pr_number} Required Check failure evidence",
                 )
                 return self._save(state)
             run = self._mapping(state, "run_acceptance")
-            outer_limit, inner_limit = ci_limits_for_job(run)
+            limit = ci_limit_for_job(run)
             decision = observe_repairable_ci_failure(
-                run, head_sha=run_head, outer_limit=outer_limit,
-                inner_limit=inner_limit, is_ticket=False,
+                run, head_sha=run_head, limit=limit, is_ticket=False,
             )
             run["ci_failed_evidence"] = evidence
             if decision == "repair":
@@ -200,7 +206,7 @@ class RunPublicationShared:
                     state, repair_source="required_checks", ci_evidence=evidence
                 )
             else:
-                reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
+                reason = "ci_development_budget_exhausted"
                 run.update({"phase": "ready_for_human", "blocked_reason": reason})
                 publication["phase"] = "stale"
                 publication.pop("approval_grant", None)

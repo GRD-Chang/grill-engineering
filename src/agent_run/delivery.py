@@ -7,7 +7,7 @@ from typing import Any, Callable
 from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
-from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+from agent_run.ci_development_budget import new_ci_development_budget
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_loop import (
     TicketDeliveryLoop,
@@ -456,7 +456,7 @@ class TicketDeliveryEngine:
             "policy_snapshot": policy_snapshot_for_state(state),
             "review_budget": new_budget(),
             "review_budget_history": [],
-            "ci_recovery": new_ticket_ci_recovery_budget(
+            "ci_recovery": new_ci_development_budget(
                 review_required=parse_policy_snapshot(policy_snapshot_for_state(state)).ticket_ci_review
             ),
         }

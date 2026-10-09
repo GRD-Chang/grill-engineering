@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-"""Ticket CI Development uses one durable quota, across failed versions."""
+"""CI Development uses one durable quota, across failed versions."""
 
 from typing import Any
 
 EXHAUSTED = "ci_development_budget_exhausted"
 
 
-def new_ticket_ci_recovery_budget(*, review_required: bool = False) -> dict[str, Any]:
+def new_ci_development_budget(*, review_required: bool = False) -> dict[str, Any]:
     return {
         "window": 1,
         "developments_used": 0,
@@ -23,21 +23,21 @@ def new_ticket_ci_recovery_budget(*, review_required: bool = False) -> dict[str,
     }
 
 
-def ensure_ticket_ci_budget(job: dict[str, Any], limit: int) -> dict[str, Any]:
+def ensure_ci_development_budget(job: dict[str, Any], limit: int) -> dict[str, Any]:
     if type(limit) is not int or limit < 1:
-        raise ValueError("Ticket CI Development limit must be a positive integer")
+        raise ValueError("CI Development limit must be a positive integer")
     budget = job.get("ci_recovery")
-    if not isinstance(budget, dict) or set(budget) != set(new_ticket_ci_recovery_budget()):
-        raise ValueError("missing canonical Ticket ci_recovery")
+    if not isinstance(budget, dict) or set(budget) != set(new_ci_development_budget()):
+        raise ValueError("missing canonical ci_recovery")
     for key, minimum in (("window", 1), ("developments_used", 0), ("reviewer_invocations", 0)):
         if type(budget[key]) is not int or budget[key] < minimum:
             raise ValueError(f"ci_recovery.{key} is invalid")
     if budget["developments_used"] > limit:
-        raise ValueError("Ticket CI Development usage exceeds its limit")
+        raise ValueError("CI Development usage exceeds its limit")
     for key in ("repair_pending", "review_required"):
         if type(budget[key]) is not bool:
             raise ValueError(f"ci_recovery.{key} must be boolean")
-    if job.get("policy_snapshot") is not None:
+    if "ticket_number" in job and job.get("policy_snapshot") is not None:
         from agent_run.delivery_policy import parse_policy_snapshot
         if budget["review_required"] != parse_policy_snapshot(job["policy_snapshot"]).ticket_ci_review:
             raise ValueError("Ticket CI Review differs from its frozen policy")
@@ -64,10 +64,10 @@ def ensure_ticket_ci_budget(job: dict[str, Any], limit: int) -> dict[str, Any]:
     return budget
 
 
-def observe_ticket_ci_failure(job: dict[str, Any], *, head_sha: str, limit: int) -> str:
+def observe_ci_failure(job: dict[str, Any], *, head_sha: str, limit: int) -> str:
     if not isinstance(head_sha, str) or not head_sha:
         raise ValueError("CI failure must identify its published head")
-    budget = ensure_ticket_ci_budget(job, limit)
+    budget = ensure_ci_development_budget(job, limit)
     if budget["failure_head"] != head_sha:
         budget["history"].append({"kind": "failure", "failure_head": head_sha, "developments_used": budget["developments_used"]})
         budget["failure_head"] = head_sha
@@ -78,8 +78,8 @@ def observe_ticket_ci_failure(job: dict[str, Any], *, head_sha: str, limit: int)
     return "repair"
 
 
-def mark_ticket_ci_development(job: dict[str, Any], *, limit: int, semantic_work_id: str | None = None) -> int:
-    budget = ensure_ticket_ci_budget(job, limit)
+def mark_ci_development(job: dict[str, Any], *, limit: int, semantic_work_id: str | None = None) -> int:
+    budget = ensure_ci_development_budget(job, limit)
     if semantic_work_id is not None and (not isinstance(semantic_work_id, str) or not semantic_work_id):
         raise ValueError("CI semantic work id must be a non-empty string")
     if semantic_work_id is not None and semantic_work_id in budget["semantic_work_ids"]:
@@ -93,8 +93,8 @@ def mark_ticket_ci_development(job: dict[str, Any], *, limit: int, semantic_work
     return int(budget["developments_used"])
 
 
-def renew_ticket_ci_budget(job: dict[str, Any], *, limit: int) -> str:
-    budget = ensure_ticket_ci_budget(job, limit)
+def renew_ci_development_budget(job: dict[str, Any], *, limit: int) -> str:
+    budget = ensure_ci_development_budget(job, limit)
     if budget["checkpoint_reason"] is None:
         return ""  # A repeated request cannot open a second window.
     budget["history"].append({"kind": "resume", "reason": EXHAUSTED, "window": budget["window"], "developments_used": budget["developments_used"], "failure_head": budget["failure_head"]})

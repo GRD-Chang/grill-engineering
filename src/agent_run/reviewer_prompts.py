@@ -45,6 +45,7 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
         _ci_repair_evidence(request),
         _integration_evidence(request),
         _run_review_scope(request),
+        _previous_review(request) if request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"} else "",
         review_budget(request, reviewer=True),
         human_continuation(request),
     )
@@ -55,7 +56,7 @@ def _review_object(request: dict[str, Any]) -> str:
     identity = request.get("current_review_identity")
     facts = identity if isinstance(identity, dict) else {}
     if request.get("work_source") == "ci":
-        description = resource(request, "review/ci-object")
+        description = resource(request, "review/run-ci-object" if request.get("acceptance_scope") == "run" else "review/ci-object")
     elif request.get("acceptance_scope") != "run":
         description = resource(request, "review/commit-object")
     elif request.get("repair_scope") == "run_repair":
@@ -81,7 +82,8 @@ def _ci_repair_evidence(request: dict[str, Any]) -> str:
     evidence = request.get("ci_evidence")
     if not isinstance(evidence, dict):
         raise ValueError("CI Review requires original ci_evidence")
-    return resource(request, "review/ci-repair").format(pretty(evidence))
+    key = "review/ci-repair" if request.get("acceptance_scope") not in {"run", "parent_only"} else "review/parent-ci-repair"
+    return resource(request, key).format(pretty(evidence))
 
 
 def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[str]:
@@ -105,13 +107,21 @@ def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[s
 
 def _previous_review(request: dict[str, Any]) -> str:
     artifact = request.get("previous_acceptance_artifact")
-    if not isinstance(artifact, dict):
-        return resource(request, "review/ci-initial-baseline" if request.get("work_source") == "ci" else "review/initial-baseline")
-    identity = request.get("previous_review_identity")
-    facts = identity if isinstance(identity, dict) else {}
-    return resource(request, "review/previous-result").format(
-        "\n".join(_identity_lines(facts, request)), pretty(artifact)
-    )
+    parent_ci = request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"}
+    baseline = request.get("parent_acceptance_baseline") if parent_ci else None
+    blocks = []
+    if parent_ci:
+        blocks.append(resource(request, "review/parent-ci-baseline").format(pretty(baseline))
+                      if isinstance(baseline, dict) else resource(request, "review/initial-baseline"))
+    if isinstance(artifact, dict) and (not isinstance(baseline, dict) or baseline.get("artifact") != artifact):
+        identity = request.get("previous_review_identity")
+        facts = identity if isinstance(identity, dict) else {}
+        blocks.append(resource(request, "review/previous-result").format(
+            "\n".join(_identity_lines(facts, request)), pretty(artifact)
+        ))
+    elif not parent_ci:
+        blocks.append(resource(request, "review/ci-initial-baseline" if request.get("work_source") == "ci" else "review/initial-baseline"))
+    return "\n\n".join(blocks)
 
 
 def _integration_evidence(request: dict[str, Any]) -> str:

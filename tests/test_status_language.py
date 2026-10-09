@@ -113,8 +113,7 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
         "policy_snapshot": {
             "ticket_development_workers": 2,
             "ticket_review_rounds": 3,
-            "ci_recovery_rounds": 3,
-            "ci_repairs_per_round": 3,
+            "parent_ci_development_limit": 3,
             "integration_resync_limit": 3,
         },
         "ticket_graph": {"tickets": {
@@ -418,7 +417,7 @@ def test_ticket_ci_status_reports_cumulative_budget_without_fake_acceptance(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool, language: str,
 ) -> None:
     from agent_run.delivery_policy import default_delivery_policy
-    from agent_run.ticket_ci_budget import new_ticket_ci_recovery_budget
+    from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
     budget = new_ticket_ci_recovery_budget()
     budget.update(developments_used=2, failure_head="failed-head")
     job = {"ticket_number": 2, "phase": "repairing", "policy_snapshot": default_delivery_policy().snapshot(),

@@ -72,7 +72,7 @@ def bind_resume_intent(
         (location, subject)
         for location, subject in gates
         if subject.get("blocked_reason") in {
-            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted"
         }
     ]
     human = [

@@ -49,8 +49,8 @@ def test_repairable_final_run_ci_failure_opens_independent_recovery_round(
     assert failed["status"] == "run_acceptance_pending"
     assert run["phase"] == "repairing"
     assert run["repair_request"]["repair_source"] == "required_checks"
-    assert run["ci_recovery"]["rounds_used"] == 1
-    assert run["ci_recovery"]["repairs_used"] == 0
+    assert run["ci_recovery"]["window"] == 1
+    assert run["ci_recovery"]["developments_used"] == 0
     assert run["review_budget"]["development_attempts"] == 0
 
 
@@ -73,9 +73,9 @@ def test_repairable_final_run_ci_failure_after_approval_opens_recovery_round(
     assert failed["status"] == "run_acceptance_pending"
     run = failed["run_acceptance"]
     assert run["repair_request"]["repair_source"] == "required_checks"
-    assert run["ci_recovery"]["rounds_used"] == 1
+    assert run["ci_recovery"]["window"] == 1
     assert run["ci_recovery"]["failure_head"] == git.resolve(str(state["run_branch"]))
-    assert run["ci_recovery"]["repairs_used"] == 0
+    assert run["ci_recovery"]["developments_used"] == 0
     assert states.load_current_run(str(state["run_id"])) == failed
 
 

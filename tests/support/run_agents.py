@@ -53,10 +53,17 @@ class ScriptedRunAgents:
                 "repair_base_run_head_sha",
                 "expected_merge_result",
                 "acceptance_artifact",
-                "ci_evidence",
                 "human_feedback",
                 "merge_conflict_evidence",
             }.intersection(request)
+        if request.get("work_source") == "ci":
+            assert isinstance(request.get("ci_evidence"), dict)
+            evidence = request["ci_evidence"]
+            checks = evidence.get("checks", [])
+            assert evidence.get("head_sha") or any(
+                isinstance(check, dict) and isinstance(check.get("job"), dict) and check["job"].get("head_sha")
+                for check in checks
+            )
         return ReviewResult(
             thread_id=f"run-reviewer-{len(self.review_requests)}",
             artifact=self._reviews.pop(0),

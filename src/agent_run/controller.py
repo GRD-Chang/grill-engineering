@@ -93,7 +93,7 @@ from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.ticket_queue import acquire as acquire_ticket_slot, reconcile_all as reconcile_ticket_slots
 from agent_run.integration_resync_budget import renew_resync_budget
 from agent_run.integration_development_budget import renew_integration_development_budget
-from agent_run.ci_recovery_budget import ci_limits_for_job, reset_exhausted_ci_budget
+from agent_run.ci_recovery_budget import ci_limit_for_job, reset_exhausted_ci_budget
 
 
 class GitHubReader(Protocol):
@@ -2057,7 +2057,7 @@ def _resume_ticket_publication_retry(
 def _resume_ci_recovery_window(
     state: dict[str, Any], *, ticket_number: int | None = None
 ) -> bool:
-    """Renew only one exhausted CI layer and preserve all other budgets."""
+    """Renew only one exhausted CI allowance and preserve all other budgets."""
 
     candidates: list[tuple[str, dict[str, Any]]] = []
     jobs = state.get("ticket_jobs")
@@ -2076,7 +2076,7 @@ def _resume_ci_recovery_window(
     exhausted = [
         (kind, job) for kind, job in candidates
         if job.get("blocked_reason") in {
-            "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            "ci_development_budget_exhausted"
         }
         and (
             ticket_number is None
@@ -2088,7 +2088,7 @@ def _resume_ci_recovery_window(
     if len(exhausted) != 1:
         raise ValueError("multiple CI recovery checkpoints require an unambiguous resume target")
     kind, job = exhausted[0]
-    outer_limit, inner_limit = ci_limits_for_job(job)
+    limit = ci_limit_for_job(job)
     repair_job = job.get("repair_job") if kind == "run_acceptance" else None
     if repair_job is not None:
         if not isinstance(repair_job, dict) or repair_job.get("ci_recovery") != job.get("ci_recovery"):
@@ -2115,7 +2115,7 @@ def _resume_ci_recovery_window(
     elif kind == "run_acceptance" and not isinstance(job.get("ci_failed_evidence"), dict):
         raise ValueError("Run CI recovery requires its failed check evidence")
     reset_exhausted_ci_budget(
-        job, outer_limit=outer_limit, inner_limit=inner_limit,
+        job, limit=limit,
         is_ticket=kind == "ticket",
     )
     job.pop("blocked_reason", None)
@@ -2130,7 +2130,7 @@ def _resume_ci_recovery_window(
             repair_job["next_attempt_kind"] = "ci_repair"
             cycle = job.get("repair_cycle")
             if isinstance(cycle, dict) and cycle.get("ended_reason") in {
-                "ci_development_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+                "ci_development_budget_exhausted"
             }:
                 cycle["status"] = "active"
                 cycle.pop("ended_reason", None)

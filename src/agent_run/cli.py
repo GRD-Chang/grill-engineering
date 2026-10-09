@@ -3941,16 +3941,10 @@ def _add_policy_options(
         help=cli_message("cli.ticket_ci_review_help"),
     )
     parser.add_argument(
-        "--ci-recovery-rounds",
-        dest=f"{dest_prefix}ci_recovery_rounds",
+        "--parent-ci-development-limit",
+        dest=f"{dest_prefix}parent_ci_development_limit",
         type=_positive_integer,
-        help=cli_message('cli.ci_recovery_rounds_help'),
-    )
-    parser.add_argument(
-        "--ci-repairs-per-round",
-        dest=f"{dest_prefix}ci_repairs_per_round",
-        type=_positive_integer,
-        help=cli_message('cli.ci_repairs_per_round_help'),
+        help=cli_message('cli.parent_ci_development_limit_help'),
     )
     for role, label in (
         ("development", "Development"),
@@ -3978,8 +3972,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "ticket_integration_development_limit",
         "ticket_ci_development_limit",
         "ticket_ci_review",
-        "ci_recovery_rounds",
-        "ci_repairs_per_round",
+        "parent_ci_development_limit",
         "development_thread_policy",
     ):
         value = getattr(parsed, f"policy_{key}", None)

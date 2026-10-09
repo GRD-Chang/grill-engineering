@@ -295,7 +295,7 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
     assert states.load_current_run(str(state["run_id"]))["run_acceptance"]["phase"] == "repairing"
 
 
-def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) -> None:
+def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
     agents = ScriptedRunAgents()
@@ -307,17 +307,17 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     run = accepted["run_acceptance"]
     failed_head = git.resolve(str(state["run_branch"]))
     assert observe_repairable_ci_failure(
-        run, head_sha=failed_head, outer_limit=3, inner_limit=3,
+        run, head_sha=failed_head, limit=3,
         is_ticket=False,
     ) == "repair"
     for _ in range(3):
-        mark_ci_repair(run, outer_limit=3, inner_limit=3, is_ticket=False)
+        mark_ci_repair(run, limit=3, is_ticket=False)
     assert observe_repairable_ci_failure(
-        run, head_sha=failed_head, outer_limit=3, inner_limit=3,
+        run, head_sha=failed_head, limit=3,
         is_ticket=False,
-    ) == "inner_exhausted"
+    ) == "exhausted"
     run.update({
-        "phase": "ready_for_human", "blocked_reason": "ci_inner_budget_exhausted",
+        "phase": "ready_for_human", "blocked_reason": "ci_development_budget_exhausted",
     })
     failed_observation = {
         "pr_number": 1, "head_sha": failed_head, "result": "fail",
@@ -328,8 +328,8 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     }
     run["repair_job"] = {
         "phase": "blocked",
-        "blocked_reason": "ci_inner_budget_exhausted",
-        "escalation_code": "ci_inner_budget_exhausted",
+        "blocked_reason": "ci_development_budget_exhausted",
+        "escalation_code": "ci_development_budget_exhausted",
         "repair_mode": "squash",
         "repair_source": "acceptance",
         "pr_number": 1,
@@ -351,9 +351,8 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     )
 
     resumed_run = resumed["run_acceptance"]
-    assert resumed_run["ci_recovery"]["inner_window"] == 2
-    assert resumed_run["ci_recovery"]["outer_window"] == 1
-    assert resumed_run["ci_recovery"]["rounds_used"] == 1
+    assert resumed_run["ci_recovery"]["window"] == 2
+    assert resumed_run["ci_recovery"]["developments_used"] == 0
     assert resumed_run["repair_job"]["ci_recovery"] == resumed_run["ci_recovery"]
     assert resumed_run["repair_job"]["phase"] == "repairing"
     assert resumed_run["repair_job"]["next_attempt_kind"] == "ci_repair"
@@ -364,8 +363,8 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     assert "repair_request" not in resumed_run
     assert resumed["run_publication"]["phase"] == "stale"
     assert _public_ci_recovery(resumed) == {
-        "outer_window": 1, "rounds_used": 1, "rounds_limit": 3,
-        "inner_window": 2, "repairs_used": 0, "repairs_limit": 3,
+        "window": 2, "developments_used": 0, "development_limit": 3,
+        "history": resumed_run["ci_recovery"]["history"], "reviewer_invocations": 0,
         "review_required": True, "checkpoint_reason": None,
         "failure_head": resumed_run["ci_recovery"]["failure_head"],
         "failed_checks": [{

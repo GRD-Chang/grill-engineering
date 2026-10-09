@@ -17,7 +17,7 @@ from agent_run.review_attempt import (
     review_ordinal,
 )
 from agent_run.ci_recovery_budget import (
-    ci_limits_for_job,
+    ci_limit_for_job,
     ci_reviewer_budget_context,
 )
 from agent_run.change_delivery_state import require_mapping as _mapping
@@ -51,7 +51,7 @@ def review(
         boundary=stage._invocation_boundary(job),
         budget_window=int(
             job["ci_recovery"]["window"]
-            if job.get("attempt_kind") == "ci_repair" and stage.contract.label.startswith("ticket-")
+            if job.get("attempt_kind") == "ci_repair"
             else budget["window"]
         ),
     )
@@ -69,7 +69,7 @@ def review(
                 if isinstance(previous, dict):
                     request["previous_acceptance_artifact"] = previous.get("artifact")
                     request["previous_review_identity"] = previous.get("review_identity")
-        if stage.contract.label.startswith("ticket-") and job.get("attempt_kind") == "ci_repair":
+        if job.get("attempt_kind") == "ci_repair":
             request["ci_evidence"] = deepcopy(job.get("ci_evidence"))
             request["ci_failure_context"] = deepcopy(job.get("required_checks_origin"))
             request["attempt_kind"] = "ci_repair"
@@ -78,10 +78,10 @@ def review(
         if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
             request.pop("review_budget_context", None)
         elif job.get("attempt_kind") == "ci_repair":
-            _, inner_limit = ci_limits_for_job(job)
+            limit = ci_limit_for_job(job)
             request["review_budget_context"] = ci_reviewer_budget_context(
                 job,
-                inner_limit=inner_limit,
+                limit=limit,
                 is_ticket=stage.contract.label.startswith("ticket-"),
             )
         else:
@@ -165,11 +165,11 @@ def complete_review(
     # repair input when it is itself an Acceptance Repair.  A passing review
     # after CI repair still needs the exact CI failure as Publication context;
     # Ticket CI findings retain that original failure for the next CI Worker.
-    ticket_ci = stage.contract.label.startswith("ticket-") and job.get("attempt_kind") == "ci_repair"
-    if not artifact.is_accepted and not ticket_ci:
+    ticket_ci = job.get("attempt_kind") == "ci_repair"
+    if not artifact.is_accepted and not ticket_ci and stage.contract.label.startswith("ticket-"):
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
-    elif not ticket_ci and previous_repair_source != "required_checks":
+    elif not ticket_ci and previous_repair_source != "required_checks" and stage.contract.label.startswith("ticket-"):
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
     clear_required_checks_observation(job)
@@ -216,6 +216,9 @@ def complete_review(
                 human_blocker_resume=pending.get("human_blocker_resume") is True,
             )
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
+    prior_acceptance = job.get("acceptance_record")
+    if isinstance(prior_acceptance, dict) and AcceptanceArtifact.parse(prior_acceptance.get("artifact")).is_accepted:
+        job["previous_parent_acceptance_record"] = deepcopy(prior_acceptance)
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw
     )
@@ -258,7 +261,7 @@ def complete_review(
             "Review budget is exhausted and the current Candidate still needs modification",
         )
     elif decision in {
-        ReviewDecision.CI_EXHAUSTED, ReviewDecision.TICKET_CI_EXHAUSTED,
+        ReviewDecision.CI_EXHAUSTED,
         ReviewDecision.DEVELOPMENT_EXHAUSTED,
     }:
         job.update({"phase": "escalating", "escalation_code": decision.value})

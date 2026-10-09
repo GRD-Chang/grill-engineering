@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.prompt_resources import validate_resources
-from agent_run.ci_recovery_budget import ci_limits_for_job, ensure_ci_recovery_budget
+from agent_run.ci_recovery_budget import ci_limit_for_job, ensure_ci_recovery_budget
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     parent_only_budget_policy_for_job,
@@ -492,23 +492,12 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
                 isinstance(ci_budget, dict)
                 and isinstance(ci_evidence, dict)
                 and isinstance(required_checks_origin, dict)
-                and (
-                    type(ci_budget.get("developments_used")) is int
-                    or (type(ci_budget.get("rounds_used")) is int and ci_budget["rounds_used"] > 1)
-                )
+                and type(ci_budget.get("developments_used")) is int
                 and isinstance(ci_budget.get("failure_head"), str)
                 and required_checks_origin.get("head_sha") == ci_budget.get("failure_head")
                 and ci_evidence.get("pr_number") == required_checks_origin.get("pr_number")
                 and isinstance(ci_evidence.get("checks"), list)
                 and bool(ci_evidence["checks"])
-                and (
-                    type(ci_budget.get("developments_used")) is int
-                    or all(
-                        isinstance(check, dict)
-                        and check.get("repairability") == "code_failure"
-                        for check in ci_evidence["checks"]
-                    )
-                )
             )
             if current_ci_failure:
                 origin_pr_number = required_checks_origin["pr_number"]
@@ -767,11 +756,11 @@ def _require_ci_recovery_budgets(state: dict[str, Any]) -> None:
         subjects.append(("run_acceptance.repair_job", run["repair_job"], False))
     for location, job, is_ticket in subjects:
         try:
-            outer_limit, inner_limit = ci_limits_for_job(
+            limit = ci_limit_for_job(
                 job, state_snapshot=state.get("policy_snapshot")
             )
             ensure_ci_recovery_budget(
-                job, outer_limit=outer_limit, inner_limit=inner_limit,
+                job, limit=limit,
                 is_ticket=is_ticket,
             )
         except (TypeError, ValueError) as error:

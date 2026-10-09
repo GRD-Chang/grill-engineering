@@ -2538,7 +2538,7 @@ def test_completed_parent_closeout_assets_remain_frozen_after_graph_drift(
     ]
 
 
-def test_parent_only_approve_supervises_unrepairable_required_checks(
+def test_parent_only_approve_routes_platform_failure_without_old_grant(
     git_repo: Path,
 ) -> None:
     # Preserve repeated real checks; detailed backoff lives in test_external_supervision.
@@ -2595,40 +2595,18 @@ def test_parent_only_approve_supervises_unrepairable_required_checks(
     approval = run_cli(git_repo, fixture, "approve", run_id)
 
     assert approval.returncode == 2, approval.stderr
-    assert stdout_json(approval)["status"] == "supervision_timeout"
+    assert stdout_json(approval)["status"] == "parent_delivery_pending"
     state = load_only_run_state(git_repo)
-    assert state["supervision_wait"]["retry_count"] >= 2
     job = state["parent_job"]
-    assert job["phase"] == "waiting_checks"
-    assert job["required_checks_evidence"] == {
-        "pr_number": job["pr_number"],
-        "head_sha": job["publication_sha"],
-        "result": "fail",
-        "checks": job["ci_evidence"]["checks"],
-    }
-    assert state["diagnostics"][0]["code"] == "supervision_timeout"
-    assert state["diagnostics"][0]["last_error"]["code"] == (
-        "github_check_failure_not_repairable"
-    )
-    assert {
-        "candidate_sha": job["candidate_sha"],
-        "development_thread_id": job["development_thread_id"],
-        "modification_attempts": job["modification_attempts"],
-        "validation_attempts": job["validation_attempts"],
-        "review_budget": job["review_budget"],
-    } == {
-        "candidate_sha": before["candidate_sha"],
-        "development_thread_id": before["development_thread_id"],
-        "modification_attempts": before["modification_attempts"],
-        "validation_attempts": before["validation_attempts"],
-        "review_budget": before["review_budget"],
-    }
-    assert state["agent_invocation_history"] == before_state[
-        "agent_invocation_history"
-    ]
-    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
-        "pull_requests"
-    ]
+    assert job["phase"] == "repairing"
+    assert job["next_attempt_kind"] == "ci_repair"
+    assert job["ci_evidence"]["checks"][0]["job"]["steps"][0]["name"] == "Provision runner"
+    assert job["ci_recovery"]["developments_used"] == 0
+    assert "approval_grant" not in job
+    assert job["candidate_sha"] == before["candidate_sha"]
+    assert job["review_budget"] == before["review_budget"]
+    assert state["agent_invocation_history"] == before_state["agent_invocation_history"]
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert len(pulls) == 1
     assert pulls[0]["state"] == "OPEN"
 
