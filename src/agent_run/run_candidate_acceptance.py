@@ -124,6 +124,9 @@ class CandidateRunAcceptance:
             and acceptance.get("reviewed_candidate_sha") == candidate_sha
             and acceptance.get("reviewed_candidate_tree") == candidate_tree
             and acceptance.get("expected_merge_tree") == expected_merge_tree
+            and acceptance.get("parent_revision") == _mapping(state, "parent").get("revision")
+            and acceptance.get("ticket_graph_revision") == _mapping(state, "ticket_graph").get("revision")
+            and acceptance.get("ticket_completion_records") == ticket_completion_records(state)
             and self._default_head(state) == default_base
             and repair_run_branch_is_current(
                 self.git, job, self.git.resolve(str(state["run_branch"]))

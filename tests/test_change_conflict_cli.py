@@ -65,6 +65,8 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     profiles = AgentProfileStore(store.root)
     profiles.initialize(run_id)
     budget = deepcopy(job["review_budget"])
+    if kind == "run_repair":
+        budget["development_attempts"] += 1
     ci_budget = deepcopy(job["ci_recovery"])
     candidate = job["candidate_sha"]
     preserved = checkout / "conflict-work.txt"

@@ -474,6 +474,9 @@ class RunAcceptanceEngine:
         if (
             record.get("reviewed_head_sha") == current_head
             and record.get("reviewed_default_base_sha") == self._default_head(state)
+            and record.get("expected_merge_tree") == self.git.expected_merge_tree(
+                default_head_sha=self._default_head(state), run_head_sha=current_head,
+            )
             and record.get("parent_revision") == parent.get("revision")
             and record.get("ticket_graph_revision") == graph.get("revision")
             and record.get("ticket_completion_records")
@@ -502,6 +505,12 @@ class RunAcceptanceEngine:
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
             "ticket_completion_records": ticket_completion_records(state),
+            "run_review_facts": {
+                "parent_revision": state["parent"]["revision"],
+                "ticket_graph_revision": state["ticket_graph"]["revision"],
+                "ticket_set": state["ticket_graph"]["ordered_ticket_numbers"],
+                "ticket_completion_records": ticket_completion_records(state),
+            },
             "base_sha": default_head,
             "run_head_sha": run_head,
             "current_review_identity": {

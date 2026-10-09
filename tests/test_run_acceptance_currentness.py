@@ -793,7 +793,7 @@ def test_default_branch_drift_invalidates_run_acceptance_and_rechecks_merge_prev
     ).accept(str(state["run_id"]))
 
     assert result["status"] == "run_publication_pending"
-    assert result["run_acceptance"]["validation_attempts"] == 1
+    assert result["run_acceptance"]["validation_attempts"] == 2
     assert result["run_acceptance"]["integration_resync"]["window"] == 2
     assert result["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] == git.resolve("main")
 
@@ -850,7 +850,7 @@ def test_promoted_run_repair_readback_preserves_integration_and_review_window(
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
     assert refreshed["run_acceptance"]["integration_resync"]["used"] == budget["used"] + 1
-    assert refreshed["run_acceptance"]["review_budget"]["window"] == review_window + 1
+    assert refreshed["run_acceptance"]["review_budget"]["window"] == review_window
     assert len(fresh_agents.review_requests) == 1
 
 
@@ -1174,6 +1174,20 @@ def test_returned_review_finishes_before_new_integration_work(
 ) -> None:
     from agent_run.agents import HumanBlockerResult
     from agent_run.git import GitError
+    from agent_run.git_integration_operation import IntegrationGitOperation
+
+    failed_merges: list[subprocess.CompletedProcess[str]] = []
+    run_command = IntegrationGitOperation.run
+
+    def capture_merge(
+        operation: IntegrationGitOperation, *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        result = run_command(operation, *arguments)
+        if arguments[0] == "merge" and result.returncode != 0:
+            failed_merges.append(result)
+        return result
+
+    monkeypatch.setattr(IntegrationGitOperation, "run", capture_merge)
 
     state, states, git = _completed_run(git_repo)
     run_id = state["run_id"]
@@ -1197,7 +1211,8 @@ def test_returned_review_finishes_before_new_integration_work(
     class Agents(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> HumanBlockerResult:
             self.development_requests.append(request)
-            assert request["repair_source"] == "merge_conflict"
+            assert request["repair_source"] == "integration"
+            assert "integration_evidence" in request
             return HumanBlockerResult("conflict-developer", ("Choose the README version",))
 
     agents = Agents()
@@ -1241,11 +1256,22 @@ def test_returned_review_finishes_before_new_integration_work(
         assert result["status"] == "ready_for_human"
         assert run["blocked_reason"] == (
             "run_integration_failed" if next_integration == "git_failure"
-            else "integration_conflict_requires_human"
+            else "agent_requires_human"
         )
         assert run["review_budget"]["reviewer_invocations"] == 1
         assert len(agents.review_requests) == 1
         if next_integration == "conflict":
             assert run["pending_semantic_attempt"]["role"] == "development"
             assert len(agents.development_requests) == 1
-    assert states.load_current_run(run_id) == result
+    persisted = states.load_current_run(run_id)
+    if next_integration == "conflict":
+        assert len(failed_merges) == 1
+        failure = result["run_acceptance"]["run_integration_conflict"]["failure"]
+        persisted_failure = persisted["run_acceptance"]["run_integration_conflict"]["failure"]
+        assert failure["returncode"] == failed_merges[0].returncode
+        for stream in ("stdout", "stderr"):
+            assert json.loads(failure[f"{stream}_json"]) == getattr(failed_merges[0], stream)
+            assert persisted_failure[f"{stream}_json"] == failure[f"{stream}_json"]
+            assert stream not in failure
+            assert stream not in persisted_failure
+    assert persisted == result

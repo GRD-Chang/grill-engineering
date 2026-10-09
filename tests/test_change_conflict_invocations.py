@@ -23,6 +23,8 @@ from support.conflict_invocations import prepared_conflict, run_conflict
 def test_conflict_events_round_trip_before_and_after_business_closeout(git_repo: Path, kind: str, phase: str) -> None:
     state, store, job, stage = prepared_conflict(git_repo, kind, phase)
     budget = deepcopy(job["review_budget"])
+    if kind == "run_repair":
+        budget["development_attempts"] += 1
     seen = []
 
     def develop(request: dict[str, Any]) -> DevelopmentResult:

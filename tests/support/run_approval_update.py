@@ -89,7 +89,7 @@ def invocation_gate(self, role, request, **kwargs):
             'run-update-conflict' if role == 'developments' else 'updated-run-reviewer'
         ), attempt_count=1)
         if role == 'developments':
-            assert request['repair_source'] == 'merge_conflict'
+            assert request['repair_source'] == 'integration'
             Path(request['checkout'], 'partial.txt').write_text('preserved Run conflict work\\n')
         hold()
     return original_gate(self, role, request, **kwargs)

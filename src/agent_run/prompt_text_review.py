@@ -51,6 +51,10 @@ Before finishing, stop services and browsers started during this task and remove
 
 These records help locate risks; they do not replace independent acceptance review of the current integrated result.""",
     },
+    'review/run-complete-scope': {
+        'zh': """本轮对完整 Parent 需求、全部 Ticket 集合与实际完成事实、累计变化和当前准确预期合并结果形成整体结论；Ticket 的跳过记录不是 Parent 验收豁免。首次审查必须建立完整验收基线。后续有基线时可复用旧验证证据，增量核验变更、组合及直接回归，但仍对当前完整成果负责；无适用基线时重新建立完整基线。""",
+        'en': """Conclude on the full Parent requirements, all Tickets and actual completion facts, accumulated changes and the current exact expected merge result. Skipped Ticket reviews do not exempt Parent acceptance. The first review must establish a complete acceptance baseline. Later reviews with an applicable baseline may reuse prior validation evidence and incrementally verify changes, combinations and direct regressions, while still concluding on the entire current result; without an applicable baseline, establish a complete baseline.""",
+    },
     'review/initial-baseline': {
         'zh': """按当前需求和代码检查本次完整范围，独立建立验收结论。""",
         'en': """Inspect the full scope of this task against current requirements and code, and establish an independent acceptance conclusion.""",

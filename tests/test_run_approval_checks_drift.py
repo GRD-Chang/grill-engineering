@@ -74,8 +74,11 @@ def test_public_approve_updates_append_observed_during_checks(
     run = after["run_acceptance"]
     assert run["acceptance_record"]["reviewed_default_base_sha"] == appended["target"]
     assert run["acceptance_record"]["reviewed_head_sha"] == publication["published_head_sha"]
-    assert run["review_budget"]["reviewer_invocations"] == 1
-    assert run["review_budget"]["development_attempts"] == 0
+    previous_budget = before["run_acceptance"]["review_budget"]
+    assert run["review_budget"]["reviewer_invocations"] == previous_budget["reviewer_invocations"] + 1
+    assert run["review_budget"]["development_attempts"] == previous_budget["development_attempts"]
+    assert run["review_budget"]["window"] == previous_budget["window"]
+    assert run["review_budget_history"] == before["run_acceptance"]["review_budget_history"]
     assert run["ci_recovery"] == before["run_acceptance"]["ci_recovery"]
     assert run["integration_resync"]["used"] == 1
     assert publication["required_checks_evidence"]["result"] == "pass"

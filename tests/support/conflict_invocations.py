@@ -13,7 +13,7 @@ from agent_run.controller import Controller
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.parent_only_integration import resolve_parent_conflict
-from agent_run.review_budget import new_budget
+from agent_run.review_budget import new_budget, policy_for_subject
 from agent_run.revisions import effective_revision
 from support.run_artifacts import _passing_artifact
 from agent_run.state import StateStore
@@ -95,6 +95,9 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
             development_thread_is_allowed=lambda state, thread: True,
         ),
         contract=SimpleNamespace(label="ticket-3" if kind == "ticket" else kind),
+        review_budget_policy=lambda: policy_for_subject({
+            "ticket": "ticket-3", "parent_only": "parent-only", "run_repair": "run-repair",
+        }[kind]),
         save=lambda current: store.save_run(str(current["run_id"]), current),
         _invocation_boundary=invocation_boundary,
         _agent_is_current=lambda state, job: True,

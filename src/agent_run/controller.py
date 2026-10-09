@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
@@ -65,6 +66,7 @@ from agent_run.review_budget import (
     remove_repair_job,
     budget_checkpoint_subjects,
     reset_budget,
+    renew_run_budget,
 )
 from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
@@ -2283,42 +2285,36 @@ def _resume_review_budget_window(
             {"status": "parent_delivery_pending", "terminal_kind": None, "diagnostics": []}
         )
         return True
-    if subject_kind == "run":
-        reset_budget(
-            subject,
-            run_repair_budget_policy_for_job(
-                subject, state_snapshot=state.get("policy_snapshot")
-            ),
-        )
-        subject["policy_snapshot"] = policy.snapshot()
-        state["policy_snapshot"] = policy.snapshot()
-        subject.pop("blocked_reason", None)
-        subject["phase"] = "repairing"
-        subject["repair_request"] = _budget_repair_request(subject)
-        state.update(
-            {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
-        )
-        return True
     run_state = _state_mapping(state, "run_acceptance")
-    reset_budget(
+    reason = str(subject["blocked_reason"])
+    renew_run_budget(
         run_state,
-        run_repair_budget_policy_for_job(
-            run_state,
-            state_snapshot=(
-                subject.get("policy_snapshot")
-                or state.get("policy_snapshot")
-            ),
-        ),
+        run_repair_budget_policy_for_job(run_state, state_snapshot=state.get("policy_snapshot")),
+        reason=reason,
     )
-    run_state["policy_snapshot"] = policy.snapshot()
-    state["policy_snapshot"] = policy.snapshot()
-    run_state["repair_request"] = _budget_repair_request(subject)
-    run_state["phase"] = "repairing"
+    subject.pop("blocked_reason", None)
+    subject.pop("escalation_code", None)
     run_state.pop("blocked_reason", None)
-    remove_repair_job(run_state)
-    state.update(
-        {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
-    )
+    if subject_kind == "run":
+        artifact = subject.get("acceptance_artifact")
+        has_findings = isinstance(artifact, dict) and AcceptanceArtifact.parse(artifact).has_failures
+        if isinstance(subject.get("run_integration_conflict"), dict) or not has_findings:
+            subject["phase"] = "pending"
+        else:
+            subject["phase"] = "repairing"
+            subject["repair_request"] = _budget_repair_request(subject)
+    else:
+        # Keep the active Repair, its Candidate, source evidence and delivery identity.
+        artifact = subject.get("acceptance_artifact")
+        has_findings = isinstance(artifact, dict) and AcceptanceArtifact.parse(artifact).has_failures
+        if isinstance(subject.get("run_repair_integration_conflict"), dict) or (
+            isinstance(subject.get("candidate_sha"), str) and not has_findings
+        ):
+            subject["phase"] = "candidate"
+        else:
+            _resume_change_subject_after_budget(subject)
+        run_state["phase"] = "repairing"
+    state.update({"status": "run_acceptance_pending", "terminal_kind": None, "diagnostics": []})
     return True
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Exact remote snapshot integration shared by the two Parent delivery modes."""
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ def prepare_parent_snapshot(
     save: Callable[[], object],
     own_source_write: bool | str = False,
     confirmed_source_sha: str | None = None,
+    handoff_git_failures: bool = False,
 ) -> ParentSnapshotResult:
     """Integrate one exact live snapshot and record its provenance.
 
@@ -135,7 +137,22 @@ def prepare_parent_snapshot(
         )
     except GitError as error:
         error.evidence.update(source_sha=source, target_sha=target, candidate_sha=candidate_sha)
-        raise
+        if not handoff_git_failures:
+            raise
+        head = error.evidence.get("head_sha")
+        if not isinstance(head, str):
+            # Without a reliable editable scene, the caller must pause.
+            raise
+        conflict = {
+            "source_sha": source, "target_sha": target,
+            "candidate_sha": candidate_sha, "stage": "git_check",
+            "head_sha": head, "merge_head_sha": error.evidence.get("merge_head_sha"),
+            "paths": [], "conflict_paths": [], "resolved_stages": [],
+            "failure": error.evidence | {"error": str(error)},
+        }
+        subject[conflict_key] = conflict
+        save()
+        return ParentSnapshotResult(status="conflict", conflict=conflict)
     if merged.status == "conflict":
         conflict = {
             "source_sha": source,
@@ -280,3 +297,24 @@ def finish_parent_snapshot_conflict(
     complete_integration_window(subject)
     save()
     return ParentSnapshotResult(status="clean", record=record)
+
+
+def record_parent_integration_failure(subject: dict[str, Any], scene: dict[str, Any], error: GitError) -> bool:
+    """Keep the failed operation and continue only a provable editable scene."""
+    subject.setdefault("integration_work_history", []).append(deepcopy(scene))
+    scene["failure"] = error.evidence | {"error": str(error)}
+    observed_head = error.evidence.get("head_sha")
+    observed_merge = error.evidence.get("merge_head_sha")
+    if not isinstance(observed_head, str):
+        return False
+    if scene["stage"] in scene["resolved_stages"]:
+        # The Controller's resolution commit succeeded before a later Git
+        # operation failed. Subsequent work must use that newer actual head.
+        scene.update(stage="git_check", head_sha=observed_head,
+                     merge_head_sha=observed_merge)
+        scene["resolved_stages"] = [stage for stage in scene["resolved_stages"] if stage != "git_check"]
+    elif observed_head != scene["head_sha"] or observed_merge != scene["merge_head_sha"]:
+        return False
+    scene.pop("development_summary", None)
+    scene["attempts"] = 0
+    return True

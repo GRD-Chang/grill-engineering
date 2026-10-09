@@ -46,7 +46,7 @@ def test_public_approve_updates_run_heads_and_requires_new_approval(
     assert run["run_integration"]["source_sha"] == source
     assert run["run_integration"]["target_sha"] == target
     assert run["review_budget"]["development_attempts"] == 0
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 2
     assert run["ci_recovery"] == before["run_acceptance"]["ci_recovery"]
     assert run["integration_resync"]["used"] == 1
     assert run["acceptance_record"]["reviewed_default_base_sha"] == target
@@ -155,8 +155,8 @@ def test_run_update_stop_resume_preserves_attempts_and_invalidates_old_grant(
     assert final["run_publication"].get("approval_grant") is None
     assert final["run_publication"]["pr_number"] == before["run_publication"]["pr_number"]
     assert final["ticket_jobs"] == before["ticket_jobs"]
-    assert run["review_budget"]["development_attempts"] == 0
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["development_attempts"] == (1 if conflict else 0)
+    assert run["review_budget"]["reviewer_invocations"] == 2
     assert run["ci_recovery"] == before["run_acceptance"]["ci_recovery"]
     assert run["acceptance_record"]["reviewed_default_base_sha"] == target
     assert run["integration_resync"]["used"] == 1
@@ -248,7 +248,7 @@ def test_run_update_reviews_latest_target_after_another_append(
     assert run["acceptance_record"]["reviewed_default_base_sha"] == target
     assert run["integration_resync"]["used"] == 2
     assert run["review_budget"]["development_attempts"] == 0
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 3
     assert GitRepository(managed_repo(git_repo)).is_ancestor(
         target, final["run_publication"]["published_head_sha"],
     )
@@ -278,7 +278,7 @@ def test_run_update_resume_reuses_returned_reviewer_after_readback_failure(
     paused = load_only_run_state(git_repo)
     run = paused["run_acceptance"]
     assert run["pending_review_result"]["record"]["reviewer_thread_id"] == "updated-run-reviewer"
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 2
     attempt = run["pending_semantic_attempt"]["attempt_id"]
     script = json.loads(agents.read_text())
     script["run_reviews"] = []
@@ -293,7 +293,7 @@ def test_run_update_resume_reuses_returned_reviewer_after_readback_failure(
     assert final["run_publication"].get("approval_grant") is None
     assert final["run_publication"]["pr_number"] == before["run_publication"]["pr_number"]
     assert run["acceptance_record"]["reviewed_default_base_sha"] == target
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 2
     assert "pending_review_result" not in run
     assert "pending_semantic_attempt" not in run
     assert sum(item["attempt_id"] == attempt for item in run["semantic_attempt_history"]) == 1

@@ -61,6 +61,11 @@ def _repair_evidence(request: dict[str, Any]) -> str:
         if not isinstance(evidence, dict):
             raise ValueError(f"{error_role} requires {field}")
         raw = pretty(evidence)
+    if request.get("acceptance_scope") == "run":
+        if source == "integration":
+            instruction = "development/repair-run-integration"
+        elif source == "acceptance":
+            return resource(request, "development/run-integration-scope") + "\n\n" + resource(request, instruction).format(field, raw)
     return resource(request, instruction).format(field, raw)
 
 

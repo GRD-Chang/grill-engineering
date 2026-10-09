@@ -33,6 +33,7 @@ from agent_run.run_repair_delivery import (
     RunRepairPublisher,
 )
 from agent_run.run_repair_integration import observe_repair_source
+from agent_run.run_parent_integration import ensure_run_repair_base
 from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -175,7 +176,12 @@ class RunRepairLifecycle:
                 preserve_checkout = True
             if (
                 job is not None
-                and job.get("phase") == "stale"
+                and (job.get("phase") == "stale" or (
+                    job.get("phase") == "blocked"
+                    and job.get("blocked_reason") in {
+                        "modification_budget_exhausted", "review_budget_exhausted",
+                    }
+                ))
                 and self.owner.git.managed_checkout_dirty_reason(checkout) is not None
             ):
                 preserve_checkout = True
@@ -330,6 +336,7 @@ class RunRepairLifecycle:
             existing["ci_recovery"] = run["ci_recovery"]
             self._complete_pending_repair_trigger(state, existing)
             return existing
+        ensure_run_repair_base(self.owner, state, run)
         base_sha = self.owner.git.resolve(str(state["run_branch"]))
         generation = int(run.get("repair_generation", 0)) + 1
         run["repair_generation"] = generation

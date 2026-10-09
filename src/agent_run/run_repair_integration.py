@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.git import GitError, GitRepository
 from agent_run.integration_resync_budget import ResyncBudgetExhausted
 from agent_run.parent_integration import (
@@ -14,11 +13,10 @@ from agent_run.parent_integration import (
     finish_parent_snapshot_conflict,
     parent_integration_record_is_valid,
     prepare_parent_snapshot,
+    record_parent_integration_failure,
 )
 from agent_run.parent_only_integration import resolve_parent_conflict
-from agent_run.review_budget import reset_budget
 from agent_run.required_checks_observation import clear_required_checks_observation
-from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
 
 RECORD = "run_repair_integration"
@@ -215,6 +213,7 @@ def prepare_repair_integration(
                 record_key=RECORD,
                 save=lambda: stage.save(state),
                 own_source_write=own_source if isinstance(own_source, str) else False,
+                handoff_git_failures=True,
             )
         except ParentHistoryRewritten as error:
             job["run_repair_integration_history_rewrite"] = {
@@ -242,8 +241,12 @@ def prepare_repair_integration(
                     save=lambda: stage.save(state),
                 )
             except GitError as error:
-                _pause(stage, state, job, "integration_conflict_unresolved", str(error))
-                return False
+                scene = job[f"{RECORD}_conflict"]
+                if not record_parent_integration_failure(job, scene, error):
+                    _pause(stage, state, job, "integration_failed", str(error))
+                    return False
+                stage.save(state)
+                continue
             if result.status == "conflict":
                 continue
         record = result.record
@@ -251,7 +254,6 @@ def prepare_repair_integration(
             raise ValueError("Run Repair integration returned no record")
         if record["head_sha"] != job["candidate_sha"] or record["target_sha"] != job["base_sha"]:
             job["previous_run_repair_acceptance_record"] = job.get("acceptance_record")
-            _open_repair_review_window(state, job)
             local_run_head = stage.git.resolve(stage.contract.base_branch)
             if local_run_head == job["base_sha"]:
                 job.setdefault("run_branch_local_sha", local_run_head)
@@ -264,34 +266,6 @@ def prepare_repair_integration(
             stage.save(state)
             return False
         return reconcile_repair_integration(stage, state, job)
-
-
-def _open_repair_review_window(state: dict[str, Any], job: dict[str, Any]) -> None:
-    resync = job.get("integration_resync")
-    if not isinstance(resync, dict):
-        raise ValueError("Run Repair integration resync allowance is missing")
-    current_window = int(resync["window"])
-    if current_window <= int(job.get("reviewed_integration_window", 0)):
-        return
-    run = state.get("run_acceptance")
-    if not isinstance(run, dict):
-        raise ValueError("Run Acceptance is missing during Repair integration")
-    sync_repair_cycle_counters(run, job)
-    # Run Repair owns the shared Run budget. Preserve the
-    # active Repair Cycle ordinals while opening a fresh allowance for the new
-    # externally integrated candidate; CI recovery remains a separate budget.
-    ordinals = {
-        key: job[key]
-        for key in ("modification_attempts", "validation_attempts")
-        if key in job
-    }
-    policy = run_repair_budget_policy_for_job(
-        job, state_snapshot=state.get("policy_snapshot")
-    )
-    reset_budget(run, policy)
-    job.update(ordinals)
-    job["reviewed_integration_window"] = current_window
-    sync_repair_cycle_counters(run, job)
 
 
 def _pause(stage: Any, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:

@@ -26,6 +26,7 @@ from agent_run.parent_integration import (
     prepare_parent_snapshot,
 )
 from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.review_budget import can_start_development, mark_development
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -264,19 +265,41 @@ def resolve_parent_conflict(
         )
     conflict = job[f"{record_key}_conflict"]
     attempt = pending_semantic_attempt(job, role="development")
-    if conflict.get("attempts", 0) >= 1 and attempt is None and "development_summary" not in conflict:
+    new_run_development = (
+        record_key == "run_repair_integration"
+        and attempt is None and "development_summary" not in conflict
+    )
+    if new_run_development:
+        if not can_start_development(job, stage.review_budget_policy()):
+            stage._checkpoint_budget(state, job, "modification_budget_exhausted",
+                                     "Parent integration Development allowance is exhausted")
+            return False
+    if (
+        conflict.get("attempts", 0) >= 1 and attempt is None
+        and "development_summary" not in conflict and not new_run_development
+    ):
         _pause(stage, state, job, "integration_conflict_unresolved", "Parent conflict repair already attempted")
         return False
     if "development_summary" in conflict and attempt is None:
         return True
     if "development_summary" not in conflict:
         stage.require_agent_work("integration_conflict")
+        if new_run_development:
+            # A mechanical advance may reach another Git failure after its
+            # one admitted Agent call. Denied work must not consume allowance.
+            mark_development(job, stage.review_budget_policy(), attempt_kind="ordinary")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=attempt is None)
     conflict_input = {
         "repair_source": "merge_conflict",
         "merge_conflict_evidence": json.dumps(conflict, ensure_ascii=False, sort_keys=True, indent=2),
     }
+    if record_key == "run_repair_integration":
+        conflict_input = {
+            "repair_source": "integration",
+            "integration_evidence": json.dumps(conflict, ensure_ascii=False, sort_keys=True, indent=2),
+            "work_source": "integration",
+        }
     # Select this invocation's evidence before the adapter reads historical repair input.
     request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
     request.update({**conflict_input, "_prompt_resources": state["prompt_resources"]})

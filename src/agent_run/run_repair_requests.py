@@ -52,7 +52,9 @@ class RunRepairRequests:
             "development_summary": job.get("development_summary"),
         }
         source = str(request["repair_source"])
-        if source == "git_integrity":
+        if source == "integration":
+            request["integration_evidence"] = str(job["integration_evidence"])
+        elif source == "git_integrity":
             request["git_integrity_evidence"] = _mapping(
                 job, "git_integrity_evidence"
             )
@@ -101,6 +103,12 @@ class RunRepairRequests:
         request: dict[str, Any] = {
             "acceptance_scope": "run",
             "candidate_acceptance": True,
+            "run_review_facts": {
+                "parent_revision": state["parent"]["revision"],
+                "ticket_graph_revision": state["ticket_graph"]["revision"],
+                "ticket_set": state["ticket_graph"]["ordered_ticket_numbers"],
+                "ticket_completion_records": ticket_completion_records(state),
+            },
             "repair_scope": "run_repair",
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])

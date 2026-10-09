@@ -92,6 +92,42 @@ def unknown_pr_mutation(
     if (
         subject.startswith("run-repair:")
         and live.get("state") == "MERGED"
+        and job.get("repair_mode") == "squash"
+        and not isinstance(job.get("integrated_revalidation_merge"), dict)
+        and isinstance(job.get("integrated_sha"), str)
+        and job.get("integrated_publication_sha") == job.get("publication_sha")
+    ):
+        # A controlled squash merge can still need Review after default drift.
+        # Retain that Candidate only while the exact merge readback is proven.
+        squash_integrated = str(job["integrated_sha"])
+        publication = str(job["publication_sha"])
+        base = str(job["base_sha"])
+        try:
+            tree = git.resolve(f"{publication}^{{tree}}")
+            valid = (
+                git.commit_parents(squash_integrated) == [base]
+                and git.resolve(f"{squash_integrated}^{{tree}}") == tree
+                and git.resolve(f"{job['candidate_sha']}^{{tree}}") == tree
+                and git.is_ancestor(base, publication)
+            )
+        except (GitError, ValueError, KeyError):
+            valid = False
+            tree = None
+        if (
+            valid
+            and live.get("head_sha") == publication
+            and live.get("base_branch") == state.get("run_branch")
+            and live.get("base_sha") == squash_integrated
+            and live.get("integrated_sha") == squash_integrated
+            and live.get("head_tree") == tree
+            and live.get("integrated_tree") == tree
+            and live.get("integrated_parents") == [base]
+        ):
+            return None
+        return "change_pr_integrated_authority_changed_externally"
+    if (
+        subject.startswith("run-repair:")
+        and live.get("state") == "MERGED"
         and isinstance(job.get("integrated_revalidation_merge"), dict)
     ):
         marker = _mapping(job, "integrated_revalidation_merge")

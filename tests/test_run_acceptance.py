@@ -902,6 +902,8 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "blocked_reason": "review_budget_exhausted",
             "repair_mode": "squash",
+            "repair_branch": f"agent-run-repair/{state['run_id']}/1",
+            "base_sha": run_head,
             "repair_source": "acceptance",
             "acceptance_artifact": _repair_artifact(),
             "candidate_sha": candidate,
@@ -916,23 +918,25 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
     state["status"] = "ready_for_human"
     save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
+    original_job = state["run_acceptance"]["repair_job"]
     assert _resume_review_budget_window(state)
     run = state["run_acceptance"]
     assert run["phase"] == "repairing"
-    assert "repair_job" not in run
-
-    engine = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=object(),
-        github=FixtureGitHubPublisher(git_repo / "github.json", git),
-    )
-    job = engine._repair_lifecycle._repair_job(state, run)
-    assert job["phase"] == "developing"
+    job = run["repair_job"]
+    assert job is original_job
+    assert job["phase"] == "repairing"
+    assert job["repair_source"] == "acceptance"
+    assert job["acceptance_artifact"] == _repair_artifact()
     assert job["development_thread_id"] == thread_id
     assert job["development_thread_history"] == thread_history
-    assert job["repair_seed_candidate_sha"] == candidate
+    assert job["candidate_sha"] == candidate
     assert job["repair_mode"] == "squash"
+    assert job["repair_branch"] == f"agent-run-repair/{state['run_id']}/1"
+    assert job["base_sha"] == run_head
+    assert job["review_budget"]["reviewer_invocations"] == 0
+    assert job["review_budget"]["development_attempts"] == exhausted_budget["development_attempts"]
+    assert job["review_budget_history"][-1]["review_budget"] == exhausted_budget
+    assert run["repair_generation"] == 1
 
     assert job["human_response_generation"] == 1
     assert job["human_response_history"][-1]["response"] == "额度已续期，继续原修复。"
@@ -943,13 +947,24 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
         base_sha=str(job["base_sha"]),
         checkout=checkout,
     )
-    git.seed_managed_checkout(checkout, expected_head=candidate)
-    assert git.checkout_head(checkout) == candidate
-    git.remove_worktree(checkout)
-
-    assert engine.repair_requests is not None
-    request = engine.repair_requests.development(state, job, git_repo)
-    assert request["thread_id"] == thread_id
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=object(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+    try:
+        git.seed_managed_checkout(checkout, expected_head=candidate)
+        assert git.checkout_head(checkout) == candidate
+        assert engine.repair_requests is not None
+        request = engine.repair_requests.development(state, job, checkout)
+        assert request["thread_id"] == thread_id
+        assert request["head_sha"] == candidate
+        assert request["repair_source"] == "acceptance"
+        assert request["acceptance_artifact"] == _repair_artifact()
+        assert request["human_response_history"] == job["human_response_history"]
+    finally:
+        git.remove_worktree(checkout)
 
 
 @pytest.mark.parametrize("new_thread", [False, True])

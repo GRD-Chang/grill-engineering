@@ -840,10 +840,11 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert run["repair_cycle"]["status"] == "active"
     assert run["repair_cycle"]["code_modification_attempts"] == 1
     assert run["repair_cycle"]["generation"] == generation
-    assert job["review_budget"]["window"] == 2
+    assert job["review_budget"]["window"] == 1
     assert "review_budget" not in run
-    assert job["review_budget"]["reviewer_invocations"] == 0
-    assert job["review_budget_history"][-1]["modification_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 2
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget_history"] == []
     assert repair_checkout.exists()
 
     first_ci_budget = deepcopy(run["ci_recovery"])
@@ -969,8 +970,9 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     ):
         assert internal_field not in history.stdout
 
-def test_exhausted_run_repair_budget_gets_new_review_after_external_resync(
-    git_repo: Path,
+@pytest.mark.parametrize("merged_mutation", [None, "head", "parents"])
+def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
+    git_repo: Path, merged_mutation: str | None,
 ) -> None:
     workspace = prepare_workspace(git_repo)
     repo = workspace.repository_root
@@ -1031,12 +1033,12 @@ def test_exhausted_run_repair_budget_gets_new_review_after_external_resync(
     assert len(agents.development_requests) == 3
     assert run["integration_resync"]["window"] == 2
     assert run["integration_resync"]["used"] == 1
-    assert job["review_budget"]["window"] == 2
+    assert job["review_budget"]["window"] == 1
     assert "review_budget" not in run
     assert "review_budget_history" not in run
-    assert job["review_budget"]["reviewer_invocations"] == 0
-    assert job["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 4
-    assert job["review_budget_history"][-1]["review_budget"]["development_attempts"] == 3
+    assert job["review_budget"]["reviewer_invocations"] == 4
+    assert job["review_budget_history"] == []
+    assert job["review_budget"]["development_attempts"] == 3
     assert job["candidate_sha"]
     assert run["repair_cycle"]["status"] == "active"
     ci_before = deepcopy(run["ci_recovery"])
@@ -1049,14 +1051,51 @@ def test_exhausted_run_repair_budget_gets_new_review_after_external_resync(
         currentness_reader=FixtureGitHubReader(fixture),
     ).accept(str(state["run_id"]))
 
-    assert second["status"] == "run_publication_pending"
-    assert second["run_acceptance"]["phase"] == "accepted"
+    assert second["status"] == "ready_for_human"
+    assert second["run_acceptance"]["repair_job"]["blocked_reason"] == "review_budget_exhausted"
+    assert len(agents.review_requests) == 4
+    assert len(agents.development_requests) == 3
+    from agent_run.controller import Controller
+
+    class LiveReader(FixtureGitHubReader):
+        def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+            live = super().live_pull_request(pr_number)
+            if merged_mutation == "head":
+                live["head_sha"] = git.resolve("main")
+            elif merged_mutation == "parents":
+                live["integrated_parents"] = []
+            return live
+
+    resumed, _ = Controller(LiveReader(fixture), git, states).resume(
+        str(state["run_id"]), explicit_resume=True, resume_budget_checkpoint=True,
+    )
+    budget = resumed["run_acceptance"]["repair_job"]["review_budget"]
+    if merged_mutation is not None:
+        assert resumed["status"] == "blocked"
+        assert resumed["diagnostics"][0]["code"] == "change_pr_integrated_authority_changed_externally"
+        assert budget["window"] == 1
+        assert len(agents.review_requests) == 4
+        return
+    assert budget["window"] == 2
+    assert budget["development_attempts"] == 3
+    assert budget["reviewer_invocations"] == 0
+    third = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=git.resolve("main"),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+    assert third["status"] == "run_publication_pending"
+    assert third["run_acceptance"]["phase"] == "accepted"
     assert len(agents.review_requests) == 5
-    assert second["run_acceptance"]["review_budget"]["window"] == 2
-    assert second["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
-    assert second["run_acceptance"]["integration_resync"]["used"] == 1
-    assert second["run_acceptance"]["ci_recovery"] == ci_before
-    assert states.load_current_run(str(state["run_id"])) == second
+    assert agents.review_requests[-1]["previous_acceptance_artifact"] == _passing_artifact()
+    assert agents.review_requests[-1]["previous_review_identity"] != agents.review_requests[-1]["current_review_identity"]
+    assert len(agents.development_requests) == 3
+    assert third["run_acceptance"]["review_budget"]["development_attempts"] == 3
+    assert third["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
+    assert third["run_acceptance"]["integration_resync"]["used"] == 1
+    assert third["run_acceptance"]["ci_recovery"] == ci_before
+    assert states.load_current_run(str(state["run_id"])) == third
 
 
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(

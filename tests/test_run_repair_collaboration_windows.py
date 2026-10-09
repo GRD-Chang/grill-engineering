@@ -25,7 +25,7 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def test_three_real_appends_open_new_repair_review_windows(
+def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
     git_repo: Path, tmp_path: Path,
 ) -> None:
     state, states, git = _completed_run(
@@ -87,18 +87,50 @@ def test_three_real_appends_open_new_repair_review_windows(
         fixture.write_text(json.dumps(data), encoding="utf-8")
         agents._reviews.append(_passing_artifact())
 
+        previous_budget = deepcopy(job["review_budget"])
+        previous_history = deepcopy(job["review_budget_history"])
+        review_count = len(agents.review_requests)
         waiting = accept()
         job = waiting["run_acceptance"]["repair_job"]
+        if index in (1, 3):
+            assert waiting["status"] == "ready_for_human"
+            assert job["phase"] == "blocked"
+            assert job["blocked_reason"] == "review_budget_exhausted"
+            assert job["review_budget"]["reviewer_invocations"] == 2
+            assert job["review_budget"]["development_attempts"] == 1
+            assert job["review_budget"]["window"] == previous_budget["window"]
+            assert job["review_budget_history"] == previous_history
+            assert len(agents.review_requests) == review_count
+            assert job["pr_number"] == pr_number
+            assert job["ci_recovery"] == ci_budget
+            candidate = job["candidate_sha"]
+            renewed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+                str(state["run_id"]), explicit_resume=True, resume_budget_checkpoint=True,
+            )
+            renewed_job = renewed["run_acceptance"]["repair_job"]
+            assert renewed_job["candidate_sha"] == candidate
+            assert renewed_job["pr_number"] == pr_number
+            assert renewed_job["ci_recovery"] == ci_budget
+            assert renewed_job["review_budget"]["development_attempts"] == 1
+            assert renewed_job["review_budget"]["reviewer_invocations"] == 0
+            assert renewed_job["review_budget"]["window"] == previous_budget["window"] + 1
+            assert len(renewed_job["review_budget_history"]) == len(previous_history) + 1
+            assert renewed_job["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 2
+            waiting = accept()
+            job = waiting["run_acceptance"]["repair_job"]
+        else:
+            assert job["review_budget_history"] == previous_history
         assert job["phase"] == "waiting_checks", job.get("blocked_reason")
         assert job["pr_number"] == pr_number
         assert git.is_ancestor(human_sha, str(job["publication_sha"]))
         assert job["ci_recovery"] == ci_budget
         assert "review_budget" not in waiting["run_acceptance"]
         assert "review_budget_history" not in waiting["run_acceptance"]
-        assert job["review_budget"]["window"] == index + 1
+        assert job["review_budget"]["development_attempts"] == 1
+        assert job["review_budget"]["reviewer_invocations"] == (2 if index == 2 else 1)
         windows.append(job["review_budget"]["window"])
 
-    assert windows == [2, 3, 4]
+    assert windows == [2, 2, 3]
     assert len(agents.review_requests) == 5  # Initial Run, first Repair, three appends.
     for index in (1, 2, 3):
         assert _git(git_repo, "show", f"{job['publication_sha']}:human-{index}.txt") == f"human contribution {index}"

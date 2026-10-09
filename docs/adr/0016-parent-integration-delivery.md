@@ -12,7 +12,11 @@ status: accepted
 
 多 Ticket Parent 等全部 Ticket 真正完成后，先集成远端 Run Branch 与默认分支，再进行首次完整 Run Acceptance。Parent-only 保留固定开发基线的 D10/R10、Reviewer 必过及无 fallback 条件；需求开发结束后集成远端 Parent Branch 与默认分支。原验收只有在准确 head、tree、base 和需求边界仍适用时复用。两条路径共用准确远端快照集成、冲突提交和 resync 计数，审查与发布仍由现有 Engine、Adapter、Publisher 和 StateStore 控制。
 
-普通 Parent 集成窗口先审核一次，默认最多三次有明确问题的修复及复审；Parent-only 的集成审查窗口独立于需求开发预算。纯 Git 冲突解决免费但有界，不能无限重试。真实外部 source/target 追加在旧窗口完成后开启新窗口并消耗 resync 机会；自己的发布回读及修复不重置窗口。显式 resume 只续期实际耗尽的额度。Reviewer 接收准确当前对象、上轮结果、集成记录和冲突路径，优先核销问题与直接回归。
+多 Ticket Parent 不新增初始开发，首次完整 Run Acceptance 不可跳过。完整 Run 的 Git 集成问题与整体验收 Findings 共用 `run_repair_rounds` 限制的累计 Development 额度（默认 3），Reviewer 额度默认 4；普通 Git 检查失败在可编辑且身份可核验的现场交给 Development，保留准确操作、原始输出、source/target、HEAD/MERGE_HEAD 和历史。Agent 完成后程序复做 Git 检查；失败再交回，不能以摘要代替操作成功。远端追加、内部 Repair PR 或新 Candidate 不重置这两项用量。显式 resume 只续期耗尽的 Development 或 Reviewer 额度，归档旧用量并保留另一项用量、原始来源、Candidate、线程和现场；状态重读和同一 Semantic Attempt 续接不重复扣费。resync 仍独立限制远端快照变化。Parent-only 的需求与集成窗口保持既有独立责任，其免费冲突路径不在此切片改动。
+
+完整 Parent 后续审核绑定需求、基线、head/tree、Ticket Set/Completion 与准确预期合并结果；相同 tree 不单独构成复用证据。首次审核建立完整基线，后续可复用有效验证证据，增量核验变化和直接回归，并给当前整体成果形成结论。集成 Development Prompt 指明完整 Run 范围和准确问题证据，不重开完成的 Ticket；新会话与人工回复保持本轮工作来源。
+
+整体验收 Findings 仍由既有 Run Repair 分支、内部 PR、CI 与 Candidate Acceptance 提升路径实际交付。若本地 Parent 集成已经改变 Run head，在创建内部 Repair PR 前，程序依据有效集成记录、准确 source lease 和持久发布意图将该组合发布到 Run Branch；丢失响应先读回准确 ref，再收尾，不重复写入。此操作不创建最终 Run PR 或替代完整 Run Acceptance/人工批准。
 
 Publisher 保留已发布源分支的祖先关系，以准确远端 head 为 lease 追加提交并更新原 PR。新的组合、CI head 或批准依据失效时回到相应审核或暂停边界；最终批准仍绑定当前交付对象。新增持久状态使用新的 Delivery Policy 协议号，旧 Run 在外部写入前明确拒绝，不做自动迁移。
 

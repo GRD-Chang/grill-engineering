@@ -167,7 +167,7 @@ summary 简要记录实际命令、结果、验证对象与必要环境，不把
 
 ## 定向修复
 
-适用于验收退回、Git 完整性问题、CI 失败、维护者修订、Ticket 集成处理和其他路径的合并冲突。
+适用于验收退回、Git 完整性问题、CI 失败、维护者修订、Ticket/完整 Run 集成处理和其他路径的合并冲突。
 新会话使用下列修复样稿，将“已掌握需求、按需回查”段替换为首次读取说明，
 并展开开发合同中的完整 Git、交付清理和审查子 Agent 边界；同一要求只出现一次，不带入初次开发的预检步骤。
 
@@ -214,6 +214,8 @@ summary 简要记录实际命令、结果、验证对象与必要环境，不把
 | CI 失败 | 下列检查失败对应当前提交，并已被确定为可修改代码解决的问题。修复根因，保持有效测试、断言与检查意图。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。 | `ci_evidence` 完整原始 JSON |
 | 维护者修订 | 根据维护者原始反馈，结合当前需求和代码核验影响，完成本次所需的修复，不扩展无关功能。 | `human_feedback` 原文 |
 | Ticket / Parent-only 集成处理 | 按准确 source/target、候选与 HEAD/MERGE_HEAD、现场及失败操作和原始输出处理集成问题，保留双方应交付成果。原需求仅约束本次处理，不重新开发；只整理文件，程序复做 Git 检查、提交和集成。新线程、同轮续接和人工回复均保留 `repair_source=integration`；不注入旧 Acceptance/CI 来源。 | `integration_evidence` 完整现场；Parent-only 集成 Findings 同时携带原始完整 `acceptance_artifact` 和准确集成记录；`stdout_json` / `stderr_json` 可用 JSON 解码恢复原始命令输出 |
+| 完整 Run 集成处理 | 核验完整 Parent、Ticket Set/Completion、累计成果和真实组合；按准确现场与原始 Git 错误处理问题，保留双方成果，不重开完成子任务或重新开发全部需求。文件整理完成后由程序检查、提交和集成。新线程、同轮续接、人工消息保持集成来源。 | `integration_evidence`（含原始操作/输出、source/target、Candidate、HEAD/MERGE_HEAD） |
+| 整体 Findings 修复 | 同一完整 Run 范围内处理 Findings 及直接回归，保留既有内部 Repair PR/CI 与整体验收责任；返回程序集成及适用审核。 | `acceptance_artifact` 原始 Findings |
 | 合并冲突 | 解决当前工作树中的真实冲突及其对本次范围的直接影响；不借机扩展功能，也不自行执行 merge、rebase 或其他历史写入。 | `merge_conflict_evidence` 原文 |
 
 CI 修复使用独立额度；Worker 只接收准确失败证据和当前修复任务，不由它判断累计额度或发布授权。
@@ -325,7 +327,7 @@ Standards/Spec 的并行子 Agent 安排沿用 Skill；增加 E2E 责任不额�
 只提供紧邻上一轮完整结果和对应身份，不提供更早历史或生成摘要。原始 JSON 指完整字段和值，允许序列化排版，
 不要求保留输入字节格式。上一轮身份沿用上表对应场景的字段。
 当前验收因人工求助而继续时，它自己的 blocked 结果不是“上一次验收”。
-新验收预算窗口的首轮不接收旧窗口结果；这些选择由程序完成，不向 Worker 解释窗口机制。
+Ticket 和 Parent-only 新验收预算窗口的首轮不接收旧窗口结果。完整 Run 可以提供上一窗口的准确完整基线；旧结果仅作为增量核验依据，不能直接放行当前成果。首次完整 Run 审核必须覆盖 Parent、Ticket 集合与真实 Completion、累计变化和准确组合；后续审核仍对当前整体形成结论。这些选择由程序完成，不向 Worker 解释窗口机制。
 
 ## 提交说明与 PR 文案
 

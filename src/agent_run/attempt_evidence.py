@@ -154,6 +154,7 @@ def _subject_variants(state: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]
     acceptance = state.get("run_acceptance")
     if isinstance(acceptance, dict):
         values.append((f"run-acceptance:{run_id}", acceptance))
+        values.append((f"run-integration:{run_id}", acceptance))
         repair = acceptance.get("repair_job")
         if isinstance(repair, dict):
             values.append((f"run-repair:{run_id}", repair))

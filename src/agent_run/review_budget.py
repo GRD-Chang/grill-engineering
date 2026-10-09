@@ -329,6 +329,25 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     return cast(ReviewBudget, job["review_budget"])
 
 
+def renew_run_budget(job: dict[str, Any], policy: ReviewBudgetPolicy, *, reason: str) -> None:
+    """Renew only the exhausted Parent allowance; preserve the other work facts."""
+    if reason not in {"modification_budget_exhausted", "review_budget_exhausted"}:
+        raise ValueError("unknown Parent allowance renewal")
+    owner = review_budget_owner(job)
+    current = deepcopy(ensure_budget(job, policy))
+    owner["review_budget_history"].append(deepcopy({
+        key: value for key, value in owner.items() if key != "review_budget_history"
+    }))
+    current["window"] += 1
+    current["checkpoint_reason"] = None
+    if reason == "modification_budget_exhausted":
+        current["development_attempts"] = 0
+    else:
+        current["reviewer_invocations"] = 0
+        current["review_artifacts"] = []
+    owner["review_budget"] = current
+
+
 def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
     """Return the latest saved Artifact and its own review identity.
 
@@ -337,12 +356,25 @@ def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
     review entry is therefore the only safe source for Reviewer 2+ context.
     """
 
-    budget = review_budget_owner(job).get("review_budget")
+    owner = review_budget_owner(job)
+    budget = owner.get("review_budget")
     if not isinstance(budget, dict):
         return None
     artifacts = budget.get("review_artifacts")
     if not isinstance(artifacts, list) or not artifacts:
-        return None
+        if not any(type(owner.get(key)) is int for key in ("acceptance_generation", "repair_generation")):
+            return None
+        # Full Run Review retains its last exact baseline after an explicit
+        # allowance renewal. Ticket/Parent-only windows keep their old rule.
+        history = owner.get("review_budget_history")
+        for snapshot in reversed(history if isinstance(history, list) else []):
+            old_budget = snapshot.get("review_budget") if isinstance(snapshot, dict) else None
+            previous = old_budget.get("review_artifacts") if isinstance(old_budget, dict) else None
+            if isinstance(previous, list) and previous:
+                artifacts = previous
+                break
+        else:
+            return None
     latest = artifacts[-1]
     if not isinstance(latest, dict):
         return None

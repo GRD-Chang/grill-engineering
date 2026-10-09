@@ -52,8 +52,11 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
     assert state["run_publication"]["pr_number"] == before["run_publication"]["pr_number"]
     assert state["run_publication"].get("approval_grant") is None
     assert state["ticket_jobs"] == before["ticket_jobs"]
-    assert run["review_budget"]["development_attempts"] == 0
-    assert run["review_budget"]["reviewer_invocations"] == 1
+    previous_budget = before["run_acceptance"]["review_budget"]
+    assert run["review_budget"]["development_attempts"] == previous_budget["development_attempts"]
+    assert run["review_budget"]["reviewer_invocations"] == previous_budget["reviewer_invocations"] + 1
+    assert run["review_budget"]["window"] == previous_budget["window"]
+    assert run["review_budget_history"] == before["run_acceptance"]["review_budget_history"]
     assert run["integration_resync"]["used"] == 1
     delivery = json.loads(fixture.read_text())["delivery"]
     final_pulls = [pull for pull in delivery["pull_requests"] if pull.get("scope") == "final_run"]

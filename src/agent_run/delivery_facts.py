@@ -308,6 +308,8 @@ def delivery_object_label(
     parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
     if locator == "parent" or locator.startswith("parent-only:"):
         return f"Parent Issue #{parent_number}"
+    if locator.startswith("run-integration:"):
+        return "Run Integration"
     if locator in {"run_acceptance", "run_repair"} or locator.startswith(
         ("run-acceptance:", "run-repair:")
     ):

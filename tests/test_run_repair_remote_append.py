@@ -25,7 +25,7 @@ from support.run_publication import RunPublicationAgents
 
 @pytest.mark.parametrize(
     "scenario", [
-        "source_and_target", "conflict", "target_only",
+        "source_and_target", "conflict", "conflict_git_check", "target_only",
         "target_interrupted", "target_interrupted_rewritten",
         "target_interrupted_fetch_retry",
     ]
@@ -33,12 +33,15 @@ from support.run_publication import RunPublicationAgents
 def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
     git_repo: Path, tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conflict = scenario == "conflict"
+    conflict = scenario.startswith("conflict")
+    git_check_retry = scenario == "conflict_git_check"
     interrupted = scenario.startswith("target_interrupted")
     append_source = scenario == "source_and_target" or conflict
-    append_target = scenario != "conflict"
+    append_target = not conflict
+    # Remote append now retains cumulative work allowances; these scenarios
+    # need capacity for the original repair and the later combined review.
     state, states, git = _completed_run(
-        git_repo, delivery_policy=DeliveryPolicy(run_repair_rounds=1)
+        git_repo, delivery_policy=DeliveryPolicy(run_repair_rounds=3)
     )
     fixture = git_repo / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -46,7 +49,7 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     class AppendAgents(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            if request.get("repair_source") != "merge_conflict":
+            if request.get("repair_source") not in {"merge_conflict", "integration"}:
                 result = super().develop(request)
                 if interrupted and len(self.development_requests) == 2:
                     (Path(str(request["checkout"])) / "follow-up-repair.txt").write_text(
@@ -58,7 +61,20 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
             event("thread_started", reported_thread_id="run-repair-developer")
             assert StateStore(states.root).load_current_run(state["run_id"]) is not None
             self.development_requests.append(request)
-            (Path(str(request["checkout"])) / "run-repair.txt").write_text(
+            checkout = Path(str(request["checkout"]))
+            if git_check_retry:
+                integration_calls = sum(item.get("repair_source") == "integration"
+                                        for item in self.development_requests)
+                if integration_calls == 2:
+                    evidence = json.loads(request["integration_evidence"])
+                    assert "diff --cached --check" in evidence["failure"]["error"]
+                    assert "market.csv" in evidence["failure"]["error"]
+                    assert (checkout / "market.csv").read_bytes().endswith(b"\r\n")
+                (checkout / "market.csv").write_bytes(
+                    b"code,value\r\nA,1\r\n" if integration_calls == 1
+                    else b"code,value\nA,1\n"
+                )
+            (checkout / "run-repair.txt").write_text(
                 "repaired with human change\n", encoding="utf-8"
             )
             event("completed")
@@ -241,6 +257,8 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
         result["run_acceptance"].get("repair_job", {}).get("blocked_reason"),
         result.get("terminal_kind"), result["run_acceptance"].get("phase"),
         result["run_acceptance"].get("discarded_repair_thread_ids"),
+        len(agents.development_requests),
+        (result["run_acceptance"].get("repair_job") or result["run_acceptance"]).get("review_budget"),
     )
     if conflict:
         loaded = StateStore(states.root).load_current_run(state["run_id"])
@@ -251,8 +269,17 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
     assert result["run_acceptance"]["repair_pr_number"] == original_pr
     assert git.is_ancestor(human_sha, completed["publication_sha"])
     assert len(agents.development_requests) == (
-        2 if conflict or interrupted else 1
+        3 if git_check_retry else 2 if conflict or interrupted else 1
     )
+    if git_check_retry:
+        loaded = StateStore(states.root).load_current_run(state["run_id"])
+        assert loaded is not None
+        assert loaded["run_acceptance"]["review_budget"]["development_attempts"] == 3
+        integration_attempts = [item["semantic_attempt"] for item in loaded["agent_invocation_history"]
+                                if item["phase"] == "integration_conflict" and item["status"] == "completed"]
+        assert [item["budget_snapshot"]["development_attempts"] for item in integration_attempts] == [2, 3]
+        assert len({item["attempt_id"] for item in integration_attempts}) == 2
+        assert command(git_repo, "show", f"{result['run_branch']}:market.csv") == "code,value\nA,1"
     assert sum(
         request.get("candidate_acceptance") is True
         for request in agents.review_requests

@@ -537,6 +537,13 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
         }
     if location == "run_repair":
         return _worker_from_job(subject, run_repair=True)
+    if location == "run_acceptance" and isinstance(subject.get("run_integration_conflict"), dict):
+        return {
+            "role": "运行集成开发工作代理",
+            "attempt": subject.get("integration_conflict_agent_ordinal"),
+            "thread_id": subject.get("development_thread_id"),
+            "phase": "integration",
+        }
     if location == "run_acceptance" and subject.get("phase") == "reviewing":
         reviewer_ids = subject.get("reviewer_thread_ids")
         thread_id = (

@@ -27,6 +27,7 @@ def review_prompt(request: dict[str, Any]) -> str:
         _ci_repair_evidence(request),
         resource(request, "review/read-only-validation"),
         _integration_evidence(request),
+        _run_review_scope(request),
         _previous_review(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
@@ -43,6 +44,7 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
         _review_object(request),
         _ci_repair_evidence(request),
         _integration_evidence(request),
+        _run_review_scope(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
     )
@@ -118,10 +120,17 @@ def _integration_evidence(request: dict[str, Any]) -> str:
     if request.get("acceptance_scope") != "run":
         return ""
     evidence = prompt_context(
-        request, "fallback_ticket_records", "ticket_integration_records"
+        request, "fallback_ticket_records", "ticket_integration_records",
+        "ci_repair_ticket_records", "run_integration_record", "run_review_facts",
     )
     if not evidence:
         return ""
     return (
         resource(request, "review/integration-evidence").format(pretty(evidence))
     )
+
+
+def _run_review_scope(request: dict[str, Any]) -> str:
+    if request.get("acceptance_scope") != "run":
+        return ""
+    return resource(request, "review/run-complete-scope")
