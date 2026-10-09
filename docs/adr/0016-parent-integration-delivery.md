@@ -4,6 +4,10 @@ status: accepted
 
 # 两种 Parent 在交付边界接纳远端成果并验收最终组合
 
+## 后续目标修订：取消内部 Repair PR
+
+[ADR 0025](0025-parent-repair-without-internal-pr.md) 已确认完整 Parent 修复改由程序更新 Run Branch，并通过最终 PR 的 CI 与人工批准交付，取代本文内部 Repair PR 的独立交付要求。该目标尚未实施；下文保留原决定，其余审核、预算和准确写入合同继续适用。
+
 ## 后续取代：Parent-only 集成循环
 
 [ADR 0021](0021-parent-only-integration-loop.md) 取代下文 Parent-only 独立集成审核窗口、免费冲突开发及 resync 重置问题修复额度的规则。Parent-only 的 Git 问题与集成 Findings 共用累计 Development 额度，初始完整审核必须通过，验收以完整身份核对复用。多 Ticket Parent 和 Run Repair 的未替代部分保持既有合同。

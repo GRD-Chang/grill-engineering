@@ -6,6 +6,8 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，代码尚未实施。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，内部 Repair PR 生命周期及 Run/Repair 预算移交、双位置保存的描述仅用于解释当前实现或历史，不构成新目标要求；实施时同步替换。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+
 ## 静态 Prompt 资源与个人方法
 
 新 Delivery Run 在首次持久化前一次读取并固定语言、四份角色正文及代码定义的对应语言内部静态文案。
@@ -23,6 +25,10 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 初始化、只读差异与真实组装预览见[个人运行配置](docs/user-defaults.md)；升级不覆盖个人方法，定制正文不会自动继承默认更新。
 
 ## Language
+
+**Review Context（审核上下文）**:
+一次 Review 所依据的准确需求范围、完整交付范围、本轮重点变化与适用前序证据；完整交付范围说明当前成果应满足的整体责任，本轮重点变化说明这次需优先核验的修复或集成影响。审核结论对应实际审核的成果与需求事实，具体检查深度和扩展范围由 Reviewer 根据证据判断。
+_Avoid_: 仅有 from/to commit 的 diff、完整 Prompt 文本、把本轮重点变化等同于全部交付责任
 
 **Codex Worker（Codex 工作器）**:
 在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。其 GitHub 能力由所选凭据决定；拥有写能力不授予正式发布、自我批准或完成交付的职责。
@@ -466,28 +472,28 @@ _Avoid_: Run Acceptance Reviewer、Controller 拼接正文、Run Repair Thread
 _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 
 **Integration-repair Worktree（集成修复工作区）**:
-一个活跃 Repair Cycle 唯一、持久且可写的受管工作区。默认分支与 Run Branch 的预期合并发生冲突时，Controller 在此准备真实三方合并现场；Repair Codex 可读取 Git 状态、编辑和测试以解决语义冲突，但不得提交、push、rebase、创建 PR 或合并。它与稳定 Run Branch 及每次一次性、只读的 Validation Checkout 严格分离；同一 Cycle 的后续 Acceptance Finding 返回该工作区继续前进式修复，即使已集成 Job 被轮转为新的 Job/PR 也不新建开发工作区。每次 Candidate Run Acceptance 结束后，Controller 清理其 Validation Checkout，而不是丢弃仍可能继续修复的 Integration-repair Worktree。
-_Avoid_: 在 Run Branch 直接修复、让 Reviewer 读取开发中目录、让 Codex 自行准备或发布 merge、为每个 Finding 新建 worktree
+完整 Parent 修复所使用的持久、可写受管工作区，与 Run Branch 和 Reviewer 的一次性 Validation Checkout 分离；它保存当前修复的未提交成果及必要集成现场，供同一工作的后续修改或恢复继续使用。Development 负责编辑和验证，正式提交及发布由程序负责。
+_Avoid_: Run Branch 本身、Reviewer 的只读工作区、Agent 自行发布、每次 Finding 都丢弃原修复现场
 
 **Run Repair Job（运行修复任务）**:
-Repair Cycle 中一次可发布修复使用 Change Job Contract 创建的 Development–Acceptance Engine 实例。它以当前 Run Branch 为 base、原始失败 Artifact、CI Failure Evidence 或冲突证据为修复输入；同一时刻最多一个 Run Repair Job 活跃。Job 未集成时，多轮 Development Attempt 复用该 Job 的 branch/PR；Job 已集成后，若同一 Cycle 的 Candidate revalidation 在新的 default head 上又产生 Finding，Controller 归档该 Job，并以新的 base、branch 和 PR 身份轮转出后继 Job，同时保留 Repair Cycle 的预算、Run Repair Thread 与 Integration-repair Worktree。
-_Avoid_: Ticket Job、整个 Delivery Run 唯一 PR、独立修复流水线
+完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环，不拥有独立内部 PR 的交付生命周期；这是 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 已确认、尚待实施的目标定义。
+_Avoid_: Ticket Job、独立修复流水线、另有一份 Parent 预算
 
 **Repair Cycle（修复周期）**:
 为解决同一准确 Run Acceptance、Run PR CI 或集成问题而连续执行的有界工作；一个 Cycle 可依次包含多个 Run Repair Job，但任一时刻只允许一个活跃 Job。集成 Git 问题与整体 Findings 使用独立的累计集成额度；准确 CI 失败的 Development 与 Review Findings 修改使用同一 Parent 的累计 CI Recovery Budget。状态观察、机械 Git 检查和 Required Checks 重读不扣 Agent 工作额度；实际新 Development 调查即使无代码候选也计费，同一语义工作的中断续接不重复计费。CI 失败绑定准确 PR/head 和 Observation 后携检查事实与可取得日志交给 Development，不使用 code-failure-steps 白名单或可修性分类；pending、unknown 与未匹配证据进入有界监督。默认分支追加、内部 Repair PR、新失败版本和 revalidation 不自动重置额度。Candidate 提升、人工暂停与预算耗尽保存 Cycle 历史；公开 resume 仅续期实际耗尽项，最终仍需当前整体验收、CI 和人工批准。
 _Avoid_: 用 Delivery Run 的历史累计修改数作为当前预算、把流程重试计作代码修改、base 漂移重置同一问题的预算
 
 **Run Repair PR（运行修复拉取请求）**:
-一个 Run Repair Job 独有并在该 Job 未集成前的多轮 Development Attempt 中稳定复用的 PR，其 head 是独立 run-repair branch，base 是 Run Branch。普通 Finding Repair 依次经过 Candidate、Candidate Run Acceptance、Publication、Required Checks 和 Published-Head Gate，以 squash merge 进入 Run Branch；默认分支与 Run Branch 的 Git 冲突则使用 Merge-resolution Candidate，repair PR 以普通 merge commit 进入 Run Branch，以保留已解决默认分支 head 的祖先关系。已合入的 PR 身份不可改写或复用；同一 Cycle 后续 revalidation Finding 由轮转后的新 Job/branch/PR 承载。
-_Avoid_: Run PR、Ticket PR、将冲突解法 squash 到旧 Run head、直接推送 Run Branch
+旧交付路径中从独立修复分支指向 Run Branch 的内部 PR，承载修复的独立 CI 与合并记录。[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 已决定取消此交付路径；当前代码尚未完成切换，此术语仅用于解释现有实现和历史记录。
+_Avoid_: 最终 Run PR、Ticket PR、新架构必须保留的交付对象
 
 **Merge-resolution Candidate（合并解决候选）**:
-默认分支 head `D` 与 Run Branch head `R` 发生 Git 冲突时，由 Publisher 根据 Integration-repair Worktree 的已解决文件树创建的受控双亲提交：其父提交准确为 `R` 与 `D`。它是 Candidate Run Acceptance 的候选对象；通过后，repair PR 只能以保留 `D` 祖先关系的普通 merge commit 进入 Run Branch。Publisher 必须验证实际 Run Branch 结果 tree 等于该 Candidate tree，且 `D` 仍为结果祖先，否则不得提升验收结论。
-_Avoid_: Agent 自行提交 merge、squash resolution tree、隐式 rebase Run Branch、把冲突只当作文本补丁
+程序依据修复工作区生成、记录准确 Run head 与默认分支 head 为父提交的冲突解决成果，是完整 Parent 审核的候选对象。它保留已解决的默认分支祖先关系；实际发布成果仍须与被审核的文件树和集成事实一致，才能沿用审核结论。
+_Avoid_: Agent 自行提交 merge、squash 丢失集成祖先、把冲突只当作文本补丁
 
 **Run Acceptance Repair Loop（运行验收修复循环）**:
-Run Acceptance 或已创建 Run PR 的 CI 产生可自动修复问题后，Controller 创建 Repair Cycle 与首个 Run Repair Job，并将原始 Acceptance Artifact 或 CI Failure Evidence 交给复用的 Run Repair Thread。Development–Acceptance Engine 产出 Candidate；Candidate Run Acceptance 以完整 Parent 范围检查准确 default head 与 Candidate 的预期合并结果。repair PR 的 Required Checks 与 Published-Head Gate 通过并合入 Run Branch 后，Controller 只有在 Candidate tree、repair base、实际 Run Branch tree、default head、Parent、Graph 与 Ticket Completion 均严格保持一致时，才将该 Candidate Acceptance 提升为正式 Run Acceptance。已受控合入后若仅 default head 前进，Controller 在同一 Cycle/worktree 重新预演和验收：新的 Finding 轮转新 Job/branch/PR 并继续消耗同一预算；其他 promotion 边界失配则废弃 Candidate，进入新的 Run Acceptance Generation。Git 冲突修复使用 Merge-resolution Candidate 与普通 merge，其他 repair 使用 squash merge。该循环持续到 promotion、需要人工决策或当前 Repair Cycle 耗尽策略规定的 `N` 次实际代码修复预算。
-_Avoid_: 复用不等价的旧 Reviewer、直接修改 Run Branch、仅修复局部 Ticket diff、对同一已验收树无条件重跑 Reviewer
+完整 Parent 为解决整体验收 Findings 或最终 PR 的 CI 失败而进行的有界修复，复用开发—审核与集成—Git 检查—适用审核两个循环；修复始终覆盖当前 Parent 的工作范围。按 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 的目标设计，程序准确更新 Run Branch 后由最终 PR 的 CI 和人工批准继续把关，保留成果、证据和累计用量供后续修复或 resume。
+_Avoid_: 独立内部 PR 流水线、仅修复局部 Ticket、无依据复用旧审核、Agent 直接更新 Run Branch
 
 **Run Feedback Revision（运行反馈版本）**:
 维护者通过 Final Revision Command 提交的 Run 级权威反馈及其稳定指纹。它进入 Run Repair Job 的 Effective Revision、Run Acceptance Artifact envelope 和后续 Run Acceptance 需求源，直到 Delivery Run 被批准或放弃；Controller 不总结、改写或静默丢弃该反馈。
@@ -808,7 +814,7 @@ _Avoid_: CI 修复消耗普通 Review 额度、伪造 CI 修复 Reviewer pass、
 
 **Run Review Budget Window（Run 审查预算窗口）**:
 同一 Run Acceptance Generation 内一次明确授权的、最多 `N+1` 次 Run Reviewer Invocation 与 `N` 次 Run Development 的审计单元；`N` 来自有效 Run Policy Snapshot 的 Run Repair 轮数，内置默认 `N=3`。初始 Run Reviewer 不依赖 Run Development；Git 集成 Development 与 Findings 修复共用本窗口累计开发用量；Git 检查失败可先继续开发，只有检查成功后才进入适用整体验收。每个新 Candidate 或新的准确预期合并结果接受完整 Run Acceptance 时消耗一次；Reviewer 已形成合法 Acceptance Artifact 后即消耗额度，即使随后因 Currentness Boundary 漂移而废弃该结论。Reviewer 内部工作、Output Repair、执行失败、等待和未启动 Reviewer 的确定性 currentness 检查不计数。每次 Reviewer 都调用 `code-review` skill。Reviewer 1 建立完整基线；Reviewer 2–N+1 只额外获得上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 要求优先核销上轮 Findings、审查当前 Repair delta 与直接回归，缺少具体风险依据时避免重复完整扫描，同时允许 Reviewer 按当前证据和实际影响自主扩大范围。Reviewer N+1 仍产生可修复 Finding 时进入 Review Budget Checkpoint，不使用 Ticket 的确定性集成兜底；维护者显式 `resume` 在 Currentness Boundary 仍有效时创建有编号的续期窗口，只补充耗尽项并保留另一项用量、原工作来源和当前 Repair；后继按现场先修复 Findings 或审核新组合；所有旧窗口的用量、Findings 与修复历史继续保留。该 Prompt 优化不改变 Run Acceptance、CI Failure Evidence、Repair Cycle、Publication 或合并状态机。Parent-only 复用相同的预算记录、门禁、Artifact 和 Resume 机制，只使用等量 Development/Reviewer 的配对推导策略，而不复用本窗口的 `N+1` Reviewer 拓扑。
-窗口及其历史只有一个可变权威归属：无活动 Run Repair Job 时属于 Run Acceptance；创建 Repair 时移交给该 Job，移除或归档 Repair 时归还。状态展示、恢复和历史证据通过同一 owner 解析，不再双向同步计数或合并两份 Reviewer Artifact。两者各自的 Semantic Attempt、角色身份与进度仍独立保存；CI Recovery 与 Integration Resync 窗口保持独立。旧的 Run/Repair 双预算结构明确不兼容，不迁移或双写。
+窗口及其历史属于完整 Run 的授权额度，Repair Job 使用该额度；不同用途的额度以及各自的工作身份、进度与证据保持独立。[ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 已确认固定预算归属的目标设计，取代当前实现中的 Run/Repair 移交归还方式；该调整尚待实施，计费与续期策略保持不变。
 _Avoid_: Ticket Review Budget Window、把 `N` 次 Development 与 `N+1` 次 Reviewer 混成一个计数、Reviewer N+1 失败后自动 Repair、隐式额外 Reviewer
 
 **Ticket Development Budget（Ticket 开发预算）**:

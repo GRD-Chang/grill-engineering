@@ -4,6 +4,8 @@ status: accepted
 
 # 两种 Parent 的 CI 定向开发与整体增量验收
 
+[ADR 0025](0025-parent-repair-without-internal-pr.md) 已确认取消完整 Parent 修复的内部 PR，取代本文要求保留该独立交付流程的条款；实施尚未完成。Parent CI 的审核责任、累计额度与最终批准规则保持有效。
+
 Parent-only 与多 Ticket Parent 的准确 Required Checks 失败进入共享 Development–Review 循环。Parent-only 负责完整需求；多 Ticket Parent 负责完整 Run、Ticket Set、真实 Completion 与累计成果，不重开已完成 Ticket。程序提供准确 PR/head、检查 Observation 与可取得的原始日志，不要求失败先被归类为代码可修。pending、unknown 和未匹配当前版本的证据使用有界等待。Development 自主调查失败及直接影响，不能削弱有效检查以制造通过。
 
 Parent Review 始终开启，不继承 `ticket_ci_review`。有同范围、同需求版本的完整验收基线时，Reviewer 使用原始结果与准确比较身份，核验修复及直接回归，并对当前整体成果形成结论；没有适用完整基线时建立完整基线。原 CI 证据在 Findings 修改、新会话和人工 message 中继续提供，不能被最近一轮 Findings 替代。
