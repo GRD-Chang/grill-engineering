@@ -8,6 +8,7 @@ from typing import Any
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitRepository
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.review_evidence import same_review_requirements
 
 _REQUEST_FACTS = (
     "acceptance_scope", "parent_issue_url", "task_issue_url", "parent", "ticket",
@@ -55,11 +56,7 @@ def prepare_review_context(
                     continue
                 if old["full_range"]["candidate_sha"] != previous_candidate:
                     continue
-                same_requirements = all(
-                    old["facts"].get(key) == facts.get(key)
-                    for key in ("acceptance_scope", "effective_revision", "parent",
-                                "ticket", "ticket_graph", "ticket_completion_records")
-                )
+                same_requirements = same_review_requirements(old["facts"], facts)
                 applicable = (
                     not any(lane["status"] == "blocked" for lane in parsed.checks.values())
                     and same_requirements
@@ -86,6 +83,7 @@ def prepare_review_context(
         and {key: value for key, value in saved.get("binding", {}).items() if key != "repair_source"}
         == {key: value for key, value in binding.items() if key != "repair_source"}
         and saved.get("facts", {}).get("current_review_identity") == identity
+        and same_review_requirements(saved.get("facts", {}), facts)
     ):
         context = deepcopy(saved)
     if attempt.get("budget_consumed") is True and isinstance(job.get("acceptance_artifact"), dict):

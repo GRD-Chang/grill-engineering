@@ -16,6 +16,27 @@ _KNOWN_CHECK_BUCKETS = frozenset(
 )
 
 
+def required_checks_observation_is_current(
+    observation: object,
+    *,
+    pr_number: int,
+    head_sha: str,
+    allowed_results: set[str] | frozenset[str] = REQUIRED_CHECK_RESULTS,
+) -> bool:
+    """Apply the same exact-PR/head rule at every running delivery gate."""
+    try:
+        require_required_checks_observation(
+            observation,
+            location="required_checks_evidence",
+            expected_pr_number=pr_number,
+            expected_head_sha=head_sha,
+            allowed_results=allowed_results,
+        )
+    except IncompatibleRunStateError:
+        return False
+    return True
+
+
 def derive_required_checks_result(checks: object) -> str:
     """Derive the aggregate result from the supporting check buckets."""
 

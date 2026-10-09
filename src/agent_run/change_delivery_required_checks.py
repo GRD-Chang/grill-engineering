@@ -31,6 +31,7 @@ from agent_run.required_checks_observation import (
     clear_required_checks_observation,
     failure_evidence_matches_observation,
     read_required_checks_observation,
+    required_checks_observation_is_current,
 )
 from agent_run.ticket_integration import delivery_base_sha
 
@@ -285,6 +286,13 @@ def observe_required_checks(
             job,
             "published_head_mismatch",
             "Required Checks snapshot contradicted its check buckets",
+        ), checks
+    if not required_checks_observation_is_current(
+        observation, pr_number=pr_number, head_sha=str(job["publication_sha"])
+    ):
+        return stage._block(
+            state, job, "published_head_mismatch",
+            "Required Checks observation no longer applies to the published PR",
         ), checks
     checks = str(observation["result"])
     live_identity_outcome = _verify_live_publication_identity(

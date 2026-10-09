@@ -32,6 +32,7 @@ from agent_run.state import StateStore
 from agent_run.review_budget import ensure_budget
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
 from agent_run.parent_integration import parent_integration_record_is_valid
+from agent_run.review_evidence import accepted_review_matches
 
 
 class ParentDeliveryAdapter(ChangeDeliveryAdapter):
@@ -266,17 +267,11 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         if self.revision_changed(state, job):
             return False
         try:
-            artifact = AcceptanceArtifact.parse(acceptance.get("artifact"))
-            current = self.review_identity(state, job)
+            return accepted_review_matches(
+                acceptance, self.review_identity(state, job), job.get("acceptance_artifact"),
+            )
         except (GitError, ValueError, KeyError):
             return False
-        return (
-            artifact.is_accepted
-            and isinstance(acceptance.get("reviewer_thread_id"), str)
-            and bool(acceptance["reviewer_thread_id"].strip())
-            and acceptance.get("artifact") == job.get("acceptance_artifact")
-            and all(acceptance.get(key) == value for key, value in current.items())
-        )
 
     def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         return _mapping(state, "parent").get("revision") != job.get(

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from agent_run.review_context import candidate_review_identity
+from agent_run.review_evidence import accepted_review_matches
 from agent_run.commit_messages import commit_messages_match
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
@@ -232,13 +233,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
-        reviewed_base = job.get("base_sha")
-        return (
-            acceptance.get("reviewed_base_sha") == reviewed_base
-            and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
-            and acceptance.get("reviewed_candidate_tree")
-            == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
-            and acceptance.get("effective_revision") == job.get("effective_revision")
+        return accepted_review_matches(
+            acceptance,
+            {"acceptance_scope": "change_job",
+             **candidate_review_identity(job, self.git),
+             "effective_revision": job.get("effective_revision")},
+            job.get("acceptance_artifact"),
         )
 
     def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:

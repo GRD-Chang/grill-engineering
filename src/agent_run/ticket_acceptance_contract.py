@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_run.review_evidence import review_record_matches
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.review_budget import ensure_budget
@@ -21,7 +22,7 @@ def _require_accepted_integration_authorization(
         "reviewed_candidate_tree": record["candidate_tree"],
         "effective_revision": record["effective_revision"],
     }
-    if any(authorization.get(key) != value for key, value in expected.items()):
+    if not review_record_matches(authorization, expected):
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.acceptance_record boundary is invalid"
         )

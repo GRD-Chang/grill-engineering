@@ -12,6 +12,9 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
+from agent_run.publication_evidence import publication_is_current
+from agent_run.git_publication_commit import observe_publication_commit
+from agent_run.git import GitError
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     canonical_fingerprint,
@@ -27,18 +30,39 @@ def _invalidate_stale_publication(
     state: dict[str, Any],
     job: dict[str, Any],
     checkout: Path,
+    *, delivery_is_stale: bool = True,
 ) -> None:
-    job.pop("pending_publication_result", None)
-    job.pop("publication_commit_intent", None)
+    intent = job.get("publication_commit_intent")
     semantic_attempt = pending_semantic_attempt(job, role="publication")
+    if isinstance(intent, dict):
+        try:
+            present = observe_publication_commit(stage.git, checkout, intent)
+        except (GitError, OSError, TimeoutError) as error:
+            stage._block(state, job, "publication_intent_mismatch", str(error))
+            stage.save(state)
+            return
+        if semantic_attempt is None:
+            raise ValueError("Publication commit intent is missing its Semantic Attempt")
+        semantic_attempt["publication_commit_observation"] = {
+            "expected_sha": intent["expected_sha"],
+            "result": "present" if present else "absent",
+        }
+        job.pop("publication_commit_intent")
+    original_result = job.pop("pending_publication_result", None)
     if semantic_attempt is not None:
         close_semantic_attempt(
             job,
             semantic_attempt,
             outcome="currentness_invalidated",
+            result={"publication": original_result},
         )
         detach_active_invocation(state, semantic_attempt)
-    stage._invalidate_stale(state, job, checkout)
+    if delivery_is_stale:
+        stage._invalidate_stale(state, job, checkout)
+    else:
+        # Only the narrative's input/result binding changed. Keep the valid
+        # candidate, Review, CI purpose/evidence and published PR authority.
+        job.pop("publication", None)
     stage.save(state)
 
 
@@ -54,6 +78,13 @@ def publication(
             return
         pending_result = job.get("pending_publication_result")
         if isinstance(pending_result, dict):
+            if not publication_is_current(
+                job, pending_result, stage._invocation_boundary(job)
+            ):
+                _invalidate_stale_publication(
+                    stage, state, job, checkout, delivery_is_stale=False,
+                )
+                return
             publication = PublicationArtifact.from_stored(
                 pending_result,
                 primary_ticket=(
@@ -155,6 +186,13 @@ def publication(
     clear_current_human_blocker(job)
     if not stage._publication_is_current(state, job):
         _invalidate_stale_publication(stage, state, job, checkout)
+        return
+    if not publication_is_current(
+        job, job.get("pending_publication_result"), stage._invocation_boundary(job)
+    ):
+        _invalidate_stale_publication(
+            stage, state, job, checkout, delivery_is_stale=False,
+        )
         return
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is None:

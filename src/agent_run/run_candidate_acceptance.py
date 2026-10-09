@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agent_invocation import canonical_fingerprint
+from agent_run.review_evidence import candidate_run_review_identity, review_record_matches
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitError, GitRepository
 from agent_run.run_currentness import ticket_completion_records
@@ -109,26 +110,12 @@ class CandidateRunAcceptance:
         if not isinstance(default_base, str) or not isinstance(candidate_sha, str):
             return False
         try:
-            candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
             self._require_merge_resolution_parents(job, candidate_sha)
-            expected_merge_tree = self.git.expected_merge_tree(
-                default_head_sha=default_base,
-                run_head_sha=candidate_sha,
-            )
+            identity = candidate_run_review_identity(state, job, self.git)
         except (GitError, ValueError):
             return False
         return (
-            acceptance.get("acceptance_scope") == "run"
-            and acceptance.get("acceptance_state") == "candidate"
-            and acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_default_base_sha") == default_base
-            and acceptance.get("repair_base_run_head_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_candidate_sha") == candidate_sha
-            and acceptance.get("reviewed_candidate_tree") == candidate_tree
-            and acceptance.get("expected_merge_tree") == expected_merge_tree
-            and acceptance.get("parent_revision") == _mapping(state, "parent").get("revision")
-            and acceptance.get("ticket_graph_revision") == _mapping(state, "ticket_graph").get("revision")
-            and acceptance.get("ticket_completion_records") == ticket_completion_records(state)
+            review_record_matches(acceptance, identity)
             and self._default_head(state) == default_base
             and repair_run_branch_is_current(
                 self.git, job, self.git.resolve(str(state["run_branch"]))
@@ -145,7 +132,6 @@ class CandidateRunAcceptance:
             artifact = AcceptanceArtifact.parse(record.get("artifact"))
             default_base = str(job["default_base_sha"])
             candidate_sha = str(job["candidate_sha"])
-            repair_base = str(job["base_sha"])
             candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
             integrated_tree = self.git.resolve(f"{integrated}^{{tree}}")
             run_tree = self.git.resolve(f"{state['run_branch']}^{{tree}}")
@@ -158,21 +144,12 @@ class CandidateRunAcceptance:
                 run_head_sha=integrated,
             )
             self._require_merge_resolution_parents(job, candidate_sha)
+            identity = candidate_run_review_identity(state, job, self.git)
         except (GitError, KeyError, TypeError, ValueError):
             return None
-        parent_revision = _mapping(state, "parent").get("revision")
-        graph_revision = _mapping(state, "ticket_graph").get("revision")
-        completions = ticket_completion_records(state)
         if (
             not artifact.is_accepted
-            or record.get("acceptance_scope") != "run"
-            or record.get("acceptance_state") != "candidate"
-            or record.get("reviewed_base_sha") != repair_base
-            or record.get("repair_base_run_head_sha") != repair_base
-            or record.get("reviewed_default_base_sha") != default_base
-            or record.get("reviewed_candidate_sha") != candidate_sha
-            or record.get("reviewed_candidate_tree") != candidate_tree
-            or record.get("expected_merge_tree") != candidate_expected_merge_tree
+            or not review_record_matches(record, identity)
             or expected_merge_tree != candidate_expected_merge_tree
             or self._default_head(state) != default_base
             or self.git.resolve(str(state["run_branch"])) != integrated
@@ -182,9 +159,6 @@ class CandidateRunAcceptance:
                 uses_merge_resolution(job)
                 and not self.git.is_ancestor(default_base, integrated)
             )
-            or record.get("parent_revision") != parent_revision
-            or record.get("ticket_graph_revision") != graph_revision
-            or record.get("ticket_completion_records") != completions
         ):
             return None
         promoted = dict(record)

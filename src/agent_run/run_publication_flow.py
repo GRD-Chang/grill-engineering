@@ -30,6 +30,7 @@ from agent_run.git import GitError
 from agent_run.github import GitHubReadError
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
+from agent_run.publication_evidence import publication_is_current
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
@@ -37,6 +38,7 @@ from agent_run.pr_write import admit_pr_write, observe_pr_write
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
+    canonical_fingerprint,
     close_semantic_attempt,
     detach_active_invocation,
     pending_semantic_attempt,
@@ -156,6 +158,18 @@ class RunPublicationFlow(RunPublicationShared):
             publication["phase"] = "pending"
         if not self._acceptance_is_current(state, run):
             return self._step(self._invalidate_for_fresh_acceptance(state))
+        if isinstance(publication.get("artifact"), dict) and not self._publication_result_is_current(state):
+            if not reconcile_run_pr_write(
+                state, self.github, self._save,
+                current_head_sha=self.git.resolve(str(state["run_branch"])),
+            ):
+                return self._step(state)
+            publication.pop("artifact", None)
+            publication.pop("record", None)
+            publication.pop("approval_grant", None)
+            publication["phase"] = "pending"
+            state.update(status="run_publication_pending", terminal_kind=None, diagnostics=[])
+            self._save(state)
         continue_accepted_publication = publication["phase"] in {
             "waiting_checks",
             "waiting_external",
@@ -879,8 +893,31 @@ class RunPublicationFlow(RunPublicationShared):
     def _publication_is_current(self, state: dict[str, Any]) -> bool:
         if not self._refresh_currentness(state):
             return False
-        return self._acceptance_is_current(
-            state, self._mapping(state, "run_acceptance")
+        if not self._acceptance_is_current(state, self._mapping(state, "run_acceptance")):
+            return False
+        return self._publication_result_is_current(state)
+
+    def _publication_result_is_current(self, state: dict[str, Any]) -> bool:
+        publication = self._publication_state(state)
+        artifact = publication.get("artifact")
+        if not isinstance(artifact, dict):
+            return True
+        record = publication.get("record")
+        recorded_boundary = None
+        if isinstance(record, dict):
+            recorded_boundary = {
+                "reviewed_head_sha": record.get("run_head_sha"),
+                "reviewed_default_base_sha": record.get("default_head_sha"),
+                "expected_merge_tree": record.get("expected_merge_tree"),
+                "parent_revision": record.get("parent_revision"),
+                "ticket_graph_revision": record.get("ticket_graph_revision"),
+                "ticket_completion_records_fingerprint": canonical_fingerprint(
+                    record.get("ticket_completion_records")
+                ),
+            }
+        return publication_is_current(
+            publication, artifact, self._publication_boundary(state),
+            recorded_boundary=recorded_boundary,
         )
 
     def _known_final_pr_is_authorized(

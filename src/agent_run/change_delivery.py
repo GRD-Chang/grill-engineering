@@ -779,6 +779,9 @@ class ChangeDeliveryEngine:
     def _publication_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
+        # Candidate/Review and integration authority are independent of the
+        # narrative returned for a previous candidate. Publication validates
+        # its own Attempt before using a pending result or creating a commit.
         if self.contract.label.startswith("ticket-"):
             # The original Review/fallback remains bound to the fixed
             # development Candidate. A separate deterministic integration

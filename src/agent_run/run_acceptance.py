@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.review_context import prepare_review_context, run_acceptance_record
+from agent_run.review_evidence import review_record_matches, run_review_identity
 
 from agent_run.agents import AgentBackend
 from agent_run.development_review import advance_development_review, after_review, ReviewDecision
@@ -306,11 +307,12 @@ class RunAcceptanceEngine:
             self.candidate_acceptance.update_default_head(self.default_head_sha)
         if not (
             refreshed and integration_current
-            and self.git.resolve(str(state["run_branch"])) == run_head
-            and self._default_head(state) == default_head
-            and self._mapping(state, "parent")["revision"] == record["parent_revision"]
-            and self._mapping(state, "ticket_graph")["revision"] == record["ticket_graph_revision"]
-            and ticket_completion_records(state) == record["ticket_completion_records"]
+            and review_record_matches(
+                record, run_review_identity(
+                    state, self.git, self._default_head(state),
+                    self.git.resolve(str(state["run_branch"])),
+                ),
+            )
         ):
             close_semantic_attempt(run, semantic_attempt, outcome="currentness_invalidated")
             detach_active_invocation(state, semantic_attempt)
@@ -462,18 +464,8 @@ class RunAcceptanceEngine:
         if not isinstance(record, dict):
             return
         current_head = self.git.resolve(str(state["run_branch"]))
-        parent = self._mapping(state, "parent")
-        graph = self._mapping(state, "ticket_graph")
-        if (
-            record.get("reviewed_head_sha") == current_head
-            and record.get("reviewed_default_base_sha") == self._default_head(state)
-            and record.get("expected_merge_tree") == self.git.expected_merge_tree(
-                default_head_sha=self._default_head(state), run_head_sha=current_head,
-            )
-            and record.get("parent_revision") == parent.get("revision")
-            and record.get("ticket_graph_revision") == graph.get("revision")
-            and record.get("ticket_completion_records")
-            == ticket_completion_records(state)
+        if review_record_matches(
+            record, run_review_identity(state, self.git, self._default_head(state), current_head),
         ):
             return
         invalidate_run_acceptance(state)

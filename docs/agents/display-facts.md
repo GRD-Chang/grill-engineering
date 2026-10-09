@@ -43,4 +43,10 @@ Reviewer 的适用结果通过 `review_attempt.finish_review_result` 统一收�
 两种 Parent 始终要求 Review，内部 Repair PR 与最终 PR 显示同一 Run 的用量；新失败版本不重置。
 Status/History 只读展示当前额度和续期历史，不补造旧内外层计数或执行续期。
 
+审核记录适用性由 `review_evidence` 维护，展示不自行用 tree 或 passed 判断交付权限。
+文案通过 `publication_evidence` 核对原 Publish Attempt 的成果与输入边界；文案单独失效
+保留适用 Review。CI 与批准分别继续使用准确 PR/head 观测和 `approval_grant` 的原授权对象。
+History 的原 Review Context、文案 Attempt 与批准事实不随当前证据失效而改写；
+普通 resume/message 不表示批准，待确认的正式写入仍显示原操作并先核验结果。
+
 集成工作中的 `run-integration:<run_id>` 是实际工作身份，`run_acceptance` 是保存位置；人工待办、消息与恢复审计使用实际身份和同一 Generation。Job 暂停阶段与保存的继续阶段分开解释；角色优先读取 pending Attempt，集成结果已保存时进入程序收口，不把它解释为新的开发调用。展示不修改旧历史记录。该解释沿用现有状态字段与协议，不增加旧 Run 迁移或补造缺损材料。

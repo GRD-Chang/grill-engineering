@@ -7,6 +7,7 @@ from typing import Any
 from agent_run.run_repair_cycle import remove_repair_job
 
 from agent_run.agents import AgentBackend
+from agent_run.review_evidence import accepted_review_matches, run_review_identity
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.ci_recovery_budget import (
     ci_limit_for_job,
@@ -40,6 +41,7 @@ from agent_run.required_checks_observation import (
     clear_required_checks_observation,
     failure_evidence_matches_observation,
     read_required_checks_observation,
+    required_checks_observation_is_current,
 )
 from agent_run.run_publication_update import reconcile_publication_update, wait_for_merge_readback
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
@@ -84,28 +86,11 @@ class RunPublicationShared:
         record = run.get("acceptance_record")
         if not isinstance(record, dict) or run.get("phase") != "accepted":
             return False
-        try:
-            artifact = AcceptanceArtifact.parse(record.get("artifact"))
-        except ValueError:
-            return False
         run_head = self.git.resolve(str(state["run_branch"]))
-        return (
-            record.get("acceptance_scope") == "run"
-            and artifact.is_accepted
-            and record.get("artifact") == run.get("acceptance_artifact")
-            and isinstance(record.get("reviewer_thread_id"), str)
-            and bool(record["reviewer_thread_id"].strip())
-            and record.get("reviewed_head_sha") == run_head
-            and record.get("reviewed_default_base_sha") == self.default_head_sha
-            and record.get("expected_merge_tree")
-            == self.git.expected_merge_tree(
-                default_head_sha=self.default_head_sha, run_head_sha=run_head
-            )
-            and record.get("parent_revision") == self._mapping(state, "parent").get("revision")
-            and record.get("ticket_graph_revision")
-            == self._mapping(state, "ticket_graph").get("revision")
-            and record.get("ticket_completion_records")
-            == ticket_completion_records(state)
+        return accepted_review_matches(
+            record,
+            run_review_identity(state, self.git, self.default_head_sha, run_head),
+            run.get("acceptance_artifact"),
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -417,6 +402,11 @@ class RunPublicationShared:
             )
             ensure_supervision_window(state)
             self._save(state)
+            return None
+        if not required_checks_observation_is_current(
+            observation, pr_number=pr_number, head_sha=expected_head_sha
+        ):
+            self._invalidate_for_fresh_acceptance(state)
             return None
         prior_observation_status = publication.get(
             "required_checks_observation_status"

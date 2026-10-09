@@ -17,6 +17,30 @@ class PublicationCommitGit(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
+def observe_publication_commit(
+    git: PublicationCommitGit, checkout: Path, intent: dict[str, Any],
+) -> bool:
+    """Read the original object intent without installing or resetting any ref."""
+    raw, expected = intent.get("raw_commit"), intent.get("expected_sha")
+    if not isinstance(raw, str) or not raw or not isinstance(expected, str) or not expected:
+        raise GitError("publication commit intent is missing its original object bytes/SHA")
+
+    def read(*arguments: str, input: str | None = None) -> str:
+        result = git._run_in(checkout, *arguments, input=input)
+        if result.returncode != 0:
+            raise GitError(result.stderr.strip() or "could not observe publication commit")
+        return result.stdout
+
+    if read("hash-object", "-t", "commit", "--stdin", input=raw).strip() != expected:
+        raise GitError("publication commit intent contains inconsistent object bytes")
+    observed = read("cat-file", "--batch-check", input=expected + "\n").strip()
+    if observed == f"{expected} missing":
+        return False
+    if not observed.startswith(f"{expected} commit ") or read("cat-file", "commit", expected) != raw:
+        raise GitError("publication commit object differs from its persisted intent")
+    return True
+
+
 def install_publication_commit(
     git: PublicationCommitGit,
     checkout: Path,
@@ -77,13 +101,10 @@ def install_publication_commit(
         and read("hash-object", "-t", "commit", "--stdin", input=raw).strip() == expected_sha
     ):
         raise GitError("publication commit intent contains inconsistent object bytes")
-    observed = read("cat-file", "--batch-check", input=expected_sha + "\n").strip()
-    if observed == f"{expected_sha} missing":
+    if not observe_publication_commit(git, checkout, intent):
         written = read("hash-object", "-w", "-t", "commit", "--stdin", input=raw).strip()
         if written != expected_sha:
             raise GitError("publication commit write returned an unexpected object identity")
-    elif not observed.startswith(f"{expected_sha} commit "):
-        raise GitError("publication commit object identity could not be verified")
     if read("cat-file", "commit", expected_sha) != raw:
         raise GitError("publication commit object differs from its persisted intent")
     if read("rev-parse", "HEAD").strip() != expected_sha:

@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，正在分片实施。固定预算归属与 Review Context 已接入：Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。内部 Repair PR 生命周期仍由后续切片替换，不能把本次预算和审核上下文调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，固定预算归属、Review Context 与同类证据适用规则已接入；其余目标尚未全部实施。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，Run/Repair 预算移交、双位置保存的描述仅用于解释历史，不构成新目标要求。内部 Repair PR 生命周期仍由后续切片替换，不能把本次预算、审核上下文和证据规则调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 
@@ -34,6 +34,11 @@ _Avoid_: 按存储容器选角色、以 blocked 丢失继续阶段、重复调�
 **Review Context（审核上下文）**:
 一次 Review 所依据的准确需求范围、完整交付范围、本轮重点变化与适用前序证据；完整交付范围说明当前成果应满足的整体责任，本轮重点变化说明这次需优先核验的修复或集成影响。审核结论对应实际审核的成果与需求事实，具体检查深度和扩展范围由 Reviewer 根据证据判断。
 _Avoid_: 仅有 from/to commit 的 diff、完整 Prompt 文本、把本轮重点变化等同于全部交付责任
+
+**Evidence Applicability（证据适用性）**:
+Review、CI 观测、Publish 文案与人工批准各自绑定实际对象；同类规则分别由 `review_evidence`、`required_checks_observation`、`publication_evidence` 与 `approval_grant` 维护。Review Context 固定需求、范围、基线与候选，结论按这些实际事实核验；完整 Parent 还比较 Ticket Graph/Completion、默认分支基线和预期合并结果。候选提升另外证明实际集成结果，不修改原候选记录以获得新授权。
+CI 使用准确 PR/head 与完整检查快照；pending/unknown 不表示成功。文案复用核对实际 Publish Attempt 的输入边界和原始结果，文案单独失效时保留仍适用的候选、Review 与 CI 修复用途和证据，按既有流程更新文案；旧 Publish Attempt 不决定新候选是否失效。人工批准绑定准确 PR、head/base 和完整验收指纹；resume/message 不授权新成果。失效只改变当前适用性，status/history 保留原结论与原对象；结果未知的正式写入先按原意图读回，不作为普通缓存清除。
+_Avoid_: tree 相同即复用、一套通用 passed 标志、移动历史通过标记、以恢复消息替代批准
 
 **Codex Worker（Codex 工作器）**:
 在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。其 GitHub 能力由所选凭据决定；拥有写能力不授予正式发布、自我批准或完成交付的职责。

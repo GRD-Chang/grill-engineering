@@ -97,6 +97,10 @@ def test_parent_only_ci_repair_reviews_final_candidate_and_keeps_pr(git_repo: Pa
     assert waiting["parent_job"]["ci_recovery"]["developments_used"] == 0
     failed = engine.deliver(run_id)
     assert failed["parent_job"]["phase"] == "repairing"
+    # Reload the actual CI repair with its prior publication still retained.
+    engine = ParentDeliveryEngine(
+        git=git, states=StateStore(states.root), github=publisher, agents=agents,
+    )
     result = engine.deliver(run_id)
 
     job = result["parent_job"]
@@ -104,8 +108,15 @@ def test_parent_only_ci_repair_reviews_final_candidate_and_keeps_pr(git_repo: Pa
     assert job["ci_recovery"]["window"] == 1
     assert job["ci_recovery"]["developments_used"] == 1
     assert job["ci_recovery"]["reviewer_invocations"] == 1
+    assert len(agents.development_requests) == 2
     assert len(agents.review_requests) == 2
+    assert len(agents.publication_requests) == 2
     assert agents.review_requests[-1]["candidate_sha"] == job["candidate_sha"]
+    for sha in (job["candidate_sha"], job["published_sha"]):
+        assert subprocess.run(
+            ["git", "show", f"{sha}:ci-fix.txt"], cwd=git_repo,
+            text=True, capture_output=True, check=True,
+        ).stdout == "fixed 2\n"
     assert len(publisher.data["delivery"]["pull_requests"]) == 1
     review_request = agents.review_requests[-1]
     assert review_request["work_source"] == "ci"
@@ -115,6 +126,10 @@ def test_parent_only_ci_repair_reviews_final_candidate_and_keeps_pr(git_repo: Pa
     approved = engine.approve(run_id)
     assert approved["status"] == "completed"
     assert git.is_ancestor(job["published_sha"], git.resolve("main"))
+    assert subprocess.run(
+        ["git", "show", "main:ci-fix.txt"], cwd=git_repo,
+        text=True, capture_output=True, check=True,
+    ).stdout == "fixed 2\n"
 
 
 def test_parent_only_published_source_rollback_pauses_without_repush(git_repo: Path) -> None:
@@ -348,6 +363,10 @@ def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> N
     assert len(agents.development_requests) == 2
     assert len(agents.review_requests) == 2
     assert repaired["run_acceptance"]["review_budget"]["development_attempts"] == 0
+    assert subprocess.run(
+        ["git", "show", f"{state['run_branch']}:run-repair.txt"], cwd=git_repo,
+        text=True, capture_output=True, check=True,
+    ).stdout == "repaired\nrepair 2\n"
     published = publication.publish(run_id)
     assert published["status"] == "run_approval_pending"
     assert published["run_publication"]["pr_number"] == final_pr
