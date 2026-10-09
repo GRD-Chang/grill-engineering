@@ -55,6 +55,7 @@ def prepare_parent_snapshot(
     own_source_write: bool | str = False,
     confirmed_source_sha: str | None = None,
     handoff_git_failures: bool = False,
+    budget_owner: dict[str, Any] | None = None,
 ) -> ParentSnapshotResult:
     """Integrate one exact live snapshot and record its provenance.
 
@@ -62,6 +63,7 @@ def prepare_parent_snapshot(
     owns only Git integration and the external snapshot allowance.
     """
 
+    owner = budget_owner if budget_owner is not None else subject
     conflict_key = f"{record_key}_conflict"
     source, target = github.live_branch_heads(source_branch, target_branch)
     if source is None:
@@ -116,7 +118,7 @@ def prepare_parent_snapshot(
     ):
         return ParentSnapshotResult(status="clean", record=prior)
     observe_integration_snapshot(
-        subject,
+        owner,
         source_sha=source,
         target_sha=target,
         policy_snapshot=policy_snapshot,
@@ -181,7 +183,7 @@ def prepare_parent_snapshot(
     if isinstance(prior, dict) and prior != record:
         subject.setdefault(f"{record_key}_history", []).append(prior)
     subject[record_key] = record
-    complete_integration_window(subject)
+    complete_integration_window(budget_owner if budget_owner is not None else subject)
     save()
     return ParentSnapshotResult(status="clean", record=record)
 
@@ -215,6 +217,7 @@ def finish_parent_snapshot_conflict(
     checkout: Path,
     record_key: str,
     save: Callable[[], object],
+    budget_owner: dict[str, Any] | None = None,
 ) -> ParentSnapshotResult:
     """Commit an Agent-resolved conflict and finish the exact snapshot."""
 
@@ -294,7 +297,7 @@ def finish_parent_snapshot_conflict(
         subject.setdefault(f"{record_key}_history", []).append(prior)
     subject[record_key] = record
     subject.pop(conflict_key, None)
-    complete_integration_window(subject)
+    complete_integration_window(budget_owner if budget_owner is not None else subject)
     save()
     return ParentSnapshotResult(status="clean", record=record)
 

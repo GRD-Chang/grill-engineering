@@ -6,7 +6,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，Review Context 已接入；其余目标尚未全部实施。下文尚未同步的 Engine、Job Record、PR Narrative、Repair Cycle 与 CI Recovery 等条目中，内部 Repair PR 生命周期及 Run/Repair 预算移交、双位置保存的描述仅用于解释当前实现或历史，不构成新目标要求；实施时同步替换。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
+本轮架构目标见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，设计已确认，正在分片实施。固定预算归属与 Review Context 已接入：Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度；Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。内部 Repair PR 生命周期仍由后续切片替换，不能把本次预算和审核上下文调整视为该生命周期已经取消。其余审核范围、额度政策、准确成果核验及人工批准合同继续有效。
 
 ## 静态 Prompt 资源与个人方法
 
@@ -164,7 +164,7 @@ Run 创建时从个人默认与显式覆盖解析并固定：`reuse`（默认）
 _Avoid_: 每次进程启动新会话、每张 Ticket 新会话、单次人工替换 Thread、Reviewer Thread 策略
 
 **Change Job Record（变更任务记录）**:
-Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、CI Recovery Budget 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
+Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、CI Recovery Budget 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。固定预算归属协议为 `review_budget_protocol=2`，旧协议或 Repair Job 携带可变 Review/CI 预算的状态在继续前拒绝；拒绝不授权删除或迁移旧成果。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
 **Job Generation（任务世代）**:
@@ -816,7 +816,7 @@ _Avoid_: CI 修复消耗普通 Review 额度、伪造 CI 修复 Reviewer pass、
 
 **Run Review Budget Window（Run 审查预算窗口）**:
 同一 Run Acceptance Generation 内一次明确授权的、最多 `N+1` 次 Run Reviewer Invocation 与 `N` 次 Run Development 的审计单元；`N` 来自有效 Run Policy Snapshot 的 Run Repair 轮数，内置默认 `N=3`。初始 Run Reviewer 不依赖 Run Development；Git 集成 Development 与 Findings 修复共用本窗口累计开发用量；Git 检查失败可先继续开发，只有检查成功后才进入适用整体验收。每个新 Candidate 或新的准确预期合并结果接受完整 Run Acceptance 时消耗一次；Reviewer 已形成合法 Acceptance Artifact 后即消耗额度，即使随后因 Currentness Boundary 漂移而废弃该结论。Reviewer 内部工作、Output Repair、执行失败、等待和未启动 Reviewer 的确定性 currentness 检查不计数。每次 Reviewer 都调用 `code-review` skill。Reviewer 1 建立完整基线；Reviewer 2–N+1 只额外获得上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 要求优先核销上轮 Findings、审查当前 Repair delta 与直接回归，缺少具体风险依据时避免重复完整扫描，同时允许 Reviewer 按当前证据和实际影响自主扩大范围。Reviewer N+1 仍产生可修复 Finding 时进入 Review Budget Checkpoint，不使用 Ticket 的确定性集成兜底；维护者显式 `resume` 在 Currentness Boundary 仍有效时创建有编号的续期窗口，只补充耗尽项并保留另一项用量、原工作来源和当前 Repair；后继按现场先修复 Findings 或审核新组合；所有旧窗口的用量、Findings 与修复历史继续保留。该 Prompt 优化不改变 Run Acceptance、CI Failure Evidence、Repair Cycle、Publication 或合并状态机。Parent-only 复用相同的预算记录、门禁、Artifact 和 Resume 机制，只使用等量 Development/Reviewer 的配对推导策略，而不复用本窗口的 `N+1` Reviewer 拓扑。
-窗口及其历史属于完整 Run 的授权额度，Repair Job 使用该额度；不同用途的额度以及各自的工作身份、进度与证据保持独立。[ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 已确认固定预算归属的目标设计，取代当前实现中的 Run/Repair 移交归还方式；该调整尚待实施，计费与续期策略保持不变。
+窗口及其历史固定保存在完整 Parent 的 Run Acceptance；创建、完成或轮换 Repair Job 都不搬移、归还或复制可变预算。Repair Job 的开发与审核引用该额度，工作身份、进度与证据仍属于准确修复工作。CI Recovery 同样只在所属交付对象持久保存；重载不依赖内存别名重绑。完整 Parent 的 Repair 集成 resync 额度保存在 Run 的 `repair_integration_budgets` 中，按既有修复代次保持不同 source/target 窗口独立，不与主线 resync 窗口合账。不同对象、用途、角色及窗口保持独立，计费与续期策略不变，见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md)。
 _Avoid_: Ticket Review Budget Window、把 `N` 次 Development 与 `N+1` 次 Reviewer 混成一个计数、Reviewer N+1 失败后自动 Repair、隐式额外 Reviewer
 
 **Ticket Development Budget（Ticket 开发预算）**:

@@ -12,7 +12,7 @@ Parent Review 始终开启，不继承 `ticket_ci_review`。有同范围、同�
 
 `parent_ci_development_limit`（CLI `--parent-ci-development-limit`）默认 3，必须为正整数。两种 Parent 与 Ticket 复用同一累计 CI 额度实现；Parent 的 CI Development 和 Review Findings 修改共用一份额度，初始需求、集成、resync 独立。多 Ticket Parent 的内部 Run Repair PR、最终 PR、新提交、新失败 head 和目标追加均不重置用量。状态观察不扣费，同一 Semantic Attempt 的中断续接不重复扣费。已完成但无代码候选的调查仍消耗实际工作额度。
 
-统一状态为 `ci_recovery.window/developments_used`，保存失败 head、Semantic Work 身份、Reviewer 原始结果和历史。耗尽形成 `ci_development_budget_exhausted`；公开显式 resume 仅续期耗尽的 CI 窗口并归档用量，重复请求不重复续期，普通继续不清零其他额度。人工求助保留同一工作与原始证据，可通过公开 resume/message 继续。旧内外层预算、首轮例外和可修性分类不再参与编排，旧 Run 不自动迁移。
+统一状态为 `ci_recovery.window/developments_used`，固定保存在所属交付对象：Parent-only 的 Parent Job 或完整 Parent 的 Run Acceptance；Repair Job 不保存另一份可变 CI 账本，保存重载不重建内存别名。保存失败 head、Semantic Work 身份、Reviewer 原始结果和历史。耗尽形成 `ci_development_budget_exhausted`；公开显式 resume 仅续期耗尽的 CI 窗口并归档用量，重复请求不重复续期，普通继续不清零其他额度。人工求助保留同一工作与原始证据，可通过公开 resume/message 继续。旧内外层预算、首轮例外和可修性分类不再参与编排，旧 Run 不自动迁移。
 
 ```mermaid
 flowchart LR

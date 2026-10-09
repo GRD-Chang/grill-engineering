@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent_run.review_budget import review_budget_owner
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.delivery_facts import role_family as _role_family
 
 def _budget_facts_for_attempt(
@@ -31,7 +31,7 @@ def _budget_facts_for_attempt(
             continue
         if policy_owner is None:
             policy_owner = (owner_subject, owner)
-        history = review_budget_owner(owner).get("review_budget_history")
+        history = delivery_budget_owner(state, owner).get("review_budget_history")
         if not isinstance(history, list):
             continue
         for snapshot in history:
@@ -171,10 +171,11 @@ def _subject_variants(state: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]
     variants: list[tuple[str, dict[str, Any]]] = []
     for subject, owner in values:
         variants.append((subject, owner))
-        history = review_budget_owner(owner).get("review_budget_history")
+        history = delivery_budget_owner(state, owner).get("review_budget_history")
         if isinstance(history, list):
             variants.extend(
-                (subject, snapshot)
+                (subject, snapshot.get("repair_job", snapshot)
+                 if subject.startswith("run-repair:") else snapshot)
                 for snapshot in history
                 if isinstance(snapshot, dict)
             )
@@ -194,15 +195,23 @@ def review_artifact_for_attempt(
     owners: list[dict[str, Any]],
     attempt: dict[str, Any],
     invocations: list[dict[str, Any]],
+    *, state: dict[str, Any],
 ) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
     seen_candidates: set[str] = set()
-    for owner in owners:
+    budget_owners = list(owners)
+    if str(attempt.get("work_subject", "")).startswith("run-repair:"):
+        acceptance = state.get("run_acceptance")
+        if isinstance(acceptance, dict):
+            budget_owners.append(acceptance)
+            budget_owners.extend(item for item in acceptance.get("review_budget_history", [])
+                                 if isinstance(item, dict))
+    for owner in budget_owners:
         snapshot = attempt.get("budget_snapshot")
         budget = (
-            owner.get("ci_recovery")
+            delivery_budget_owner(state, owner).get("ci_recovery")
             if isinstance(snapshot, dict) and "ci_developments_used" in snapshot
-            else review_budget_owner(owner).get("review_budget")
+            else delivery_budget_owner(state, owner).get("review_budget")
         )
         if not isinstance(budget, dict):
             continue

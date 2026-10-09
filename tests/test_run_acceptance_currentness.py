@@ -147,11 +147,11 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
         "development_thread_history": [],
         "repair_generation": 1,
         "acceptance_artifact": _repair_artifact(),
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_generation": 1,
             "repair_branch": repair_branch,
             "base_sha": "stale-run-base",
@@ -232,8 +232,6 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     repair_job = {
         "phase": "developing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": budget,
-        "review_budget_history": [],
         "repair_generation": 1,
         "repair_branch": repair_branch,
         "base_sha": "stale-run-base",
@@ -262,6 +260,8 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         "development_thread_history": [],
         "repair_generation": 1,
         "acceptance_artifact": _repair_artifact(),
+        "review_budget": budget,
+        "review_budget_history": [],
         "repair_job": repair_job,
     }
     state.update(
@@ -670,10 +670,10 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": ["run-reviewer"],
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "development_thread_id": "repair-developer",
             "development_thread_history": ["repair-developer-old"],
             "reviewer_thread_ids": ["repair-reviewer"],

@@ -1224,6 +1224,7 @@ def _history_events(
                 owners_for_attempt(state, attempt_view),
                 attempt_view,
                 [invocation],
+                state=state,
             )
             review_details = (
                 _artifact_findings(artifact)

@@ -219,7 +219,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         # a fresh Cycle.
         active_job["modification_attempts"] = 9
         active_job["code_modification_attempts"] = 9
-        active_job["review_budget"]["development_attempts"] = 9
+        active_run["review_budget"]["development_attempts"] = 9
         active_run["repair_cycle"]["code_modification_attempts"] = 9
         active_run["modification_attempts"] = 9
         active_run["code_modification_attempts"] = 9

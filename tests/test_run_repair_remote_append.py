@@ -111,7 +111,7 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
     branch = str(job["repair_branch"])
     original_publication = str(job["publication_sha"])
     original_pr = int(job["pr_number"])
-    original_ci = json.loads(json.dumps(job["ci_recovery"]))
+    original_ci = json.loads(json.dumps(first["run_acceptance"]["ci_recovery"]))
 
     def command(root: Path, *args: str) -> str:
         return subprocess.run(
@@ -189,7 +189,7 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
         assert git.resolve(str(state["run_branch"])) != target_sha
         assert saved_job["base_sha"] == target_sha
         assert saved_job["pr_number"] == original_pr
-        assert saved_job["ci_recovery"] == original_ci
+        assert saved["run_acceptance"]["ci_recovery"] == original_ci
         if scenario == "target_interrupted_fetch_retry":
             (collaborator / "later-target.txt").write_text(
                 "later target\n", encoding="utf-8"
@@ -247,7 +247,7 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
         assert resumed["status"] == "run_acceptance_pending", resumed.get("diagnostics")
         resumed_job = resumed["run_acceptance"]["repair_job"]
         assert resumed_job["pr_number"] == original_pr
-        assert resumed_job["ci_recovery"] == original_ci
+        assert resumed["run_acceptance"]["ci_recovery"] == original_ci
         assert resumed_job["candidate_sha"] == saved_job["candidate_sha"]
     result = RunAcceptanceEngine(
         git=git, states=states, agents=agents,
@@ -260,7 +260,7 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
         result.get("terminal_kind"), result["run_acceptance"].get("phase"),
         result["run_acceptance"].get("discarded_repair_thread_ids"),
         len(agents.development_requests),
-        (result["run_acceptance"].get("repair_job") or result["run_acceptance"]).get("review_budget"),
+        result["run_acceptance"].get("review_budget"),
     )
     if conflict:
         loaded = StateStore(states.root).load_current_run(state["run_id"])

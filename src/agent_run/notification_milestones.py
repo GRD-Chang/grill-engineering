@@ -1,6 +1,8 @@
 """Project delivery milestones from durable execution and acceptance facts."""
 from __future__ import annotations
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.notification_event_facts import event_copy, event_envelope, event_subject
 
 from typing import Any
@@ -51,7 +53,7 @@ def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dic
     owner = state.get("parent_job" if parent_only else "run_acceptance") or {}
     # A repair candidate's verdict is not the formal Run conclusion. Promotion
     # installs the formal record and removes the repair job atomically.
-    artifact = current_artifact(owner)
+    artifact = current_artifact(owner, budget_owner=delivery_budget_owner(state, owner))
     checks = (artifact or {}).get("checks") or {}
     record = owner.get("acceptance_record") or {}
     parent = state.get("parent") or {}

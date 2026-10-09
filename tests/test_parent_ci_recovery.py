@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import json
 from pathlib import Path
 import subprocess
 from typing import Any
 
-from agent_run.review_budget import review_budget_owner
+import pytest
+
 
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
@@ -17,6 +20,7 @@ from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
+from support.inprocess_cli import invoke_cli_inprocess
 from support.delivery_agents import PassAgents
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact, _repair_artifact
 from support.run_agents import ScriptedRunAgents
@@ -257,26 +261,65 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     failed = publication.publish(run_id)
     final_pr = failed["run_publication"]["pr_number"]
     agents = RunCIAgents()
-    agents._reviews = [_passing_artifact(), _passing_artifact()]
+    agents._reviews = [_candidate_finding_artifact(), _passing_artifact(), _candidate_finding_artifact()]
     acceptance = RunAcceptanceEngine(
         git=git, states=states, agents=agents, github=publisher,
     )
 
     first_repair = acceptance.accept(run_id)
     assert first_repair["status"] == "run_publication_pending"
+    assert first_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 2
+    assert first_repair["run_acceptance"]["completed_repair_jobs"]
+    assert "repair_job" not in first_repair["run_acceptance"]
+    assert StateStore(states.root).load_current_run(run_id) == first_repair
     failed_again = publication.publish(run_id)
     assert failed_again["status"] == "run_acceptance_pending"
     assert failed_again["run_publication"]["pr_number"] == final_pr
     assert failed_again["run_acceptance"]["ci_recovery"]["window"] == 1
 
     second_repair = acceptance.accept(run_id)
-    assert second_repair["status"] == "run_publication_pending"
-    assert second_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 2
-    assert second_repair["run_acceptance"]["review_budget"]["development_attempts"] == 0
+    assert second_repair["status"] == "ready_for_human"
+    run = second_repair["run_acceptance"]
+    assert run["ci_recovery"]["developments_used"] == 3
+    assert run["ci_recovery"]["checkpoint_reason"] == "ci_development_budget_exhausted"
+    assert run["review_budget"]["development_attempts"] == 0
+    assert all(key not in run["repair_job"] for key in
+               ("review_budget", "review_budget_history", "ci_recovery", "integration_resync"))
+    assert StateStore(states.root).load_current_run(run_id) == second_repair
+    ordinary = deepcopy(run["review_budget"])
+    ticket_budget = deepcopy(second_repair["ticket_jobs"]["2"]["review_budget"])
+    fixture = git_repo / "github.json"
+    before = states.load_run(run_id)
+    status = invoke_cli_inprocess(git_repo, fixture, "status", run_id,
+                                  "--state-dir", str(states.root), "--json")
+    assert status.returncode == 0, status.stderr
+    visible = json.loads(status.stdout)
+    assert visible["ci_recovery"]["developments_used"] == 3
+    history = invoke_cli_inprocess(git_repo, fixture, "history", run_id,
+                                   "--state-dir", str(states.root), "--json")
+    assert history.returncode == 0, history.stderr
+    assert "run-ci-reviewer" in history.stdout
+    assert states.load_run(run_id) == before
+    controller = Controller(FixtureGitHubReader(fixture), git, StateStore(states.root))
+    resumed, _ = controller.resume(run_id, explicit_resume=True)
+    renewed_ci = deepcopy(resumed["run_acceptance"]["ci_recovery"])
+    assert renewed_ci["window"] == 2
+    assert renewed_ci["developments_used"] == 0
+    assert renewed_ci["history"][-1]["developments_used"] == 3
+    assert resumed["run_acceptance"]["review_budget"] == ordinary
+    assert resumed["ticket_jobs"]["2"]["review_budget"] == ticket_budget
+    with pytest.raises(ValueError, match="no canonical recovery boundary"):
+        controller.resume(run_id, explicit_resume=True)
+    repeated, _ = controller.resume(run_id)
+    assert repeated["run_acceptance"]["ci_recovery"] == renewed_ci
+    agents._reviews = [_passing_artifact()]
+    recovered = acceptance.accept(run_id)
+    assert recovered["status"] == "run_publication_pending"
+    assert recovered["run_acceptance"]["ci_recovery"]["developments_used"] == 1
     published = publication.publish(run_id)
     assert published["status"] == "run_approval_pending"
     assert published["run_publication"]["pr_number"] == final_pr
-    assert len(agents.review_requests) == 2
+    assert len(agents.review_requests) == 4
 
 
 def test_internal_repair_pr_ci_failure_uses_same_run_budget(git_repo: Path) -> None:
@@ -332,7 +375,7 @@ def test_run_ci_reviewer_exhausts_shared_development_allowance(git_repo: Path) -
     assert run["blocked_reason"] == "ci_development_budget_exhausted"
     assert run["ci_recovery"]["window"] == 1
     assert run["ci_recovery"]["developments_used"] == 3
-    assert review_budget_owner(run)["review_budget"]["development_attempts"] == 0
+    assert run["review_budget"]["development_attempts"] == 0
     assert len(agents.review_requests) == 3
     original_ci = agents.development_requests[0]["ci_evidence"]
     assert all(request["work_source"] == "ci" and request["ci_evidence"] == original_ci
@@ -345,10 +388,10 @@ def test_run_ci_reviewer_exhausts_shared_development_allowance(git_repo: Path) -
     assert _run_repair_status(blocked)["code_modification_attempts"] == 0
     job = run["repair_job"]
     job["attempt_kind"] = "ordinary"
-    job["review_budget"]["development_attempts"] = 1
+    run["review_budget"]["development_attempts"] = 1
     assert _run_repair_status(blocked)["code_modification_attempts"] == 1
     job["attempt_kind"] = "ci_repair"
-    job["review_budget"]["development_attempts"] = 0
+    run["review_budget"]["development_attempts"] = 0
 
     resumed, _ = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         run_id, explicit_resume=True,
@@ -483,8 +526,10 @@ def test_run_no_change_ci_investigation_resumes_without_renewal(git_repo: Path) 
     blocked = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(run_id)
     job = blocked["run_acceptance"]["repair_job"]
     assert job["blocked_reason"] == "ci_investigation_paused"
-    assert job["ci_recovery"]["developments_used"] == 1
-    ordinary = job["review_budget"]
+    assert blocked["run_acceptance"]["ci_recovery"]["developments_used"] == 1
+    ordinary = blocked["run_acceptance"]["review_budget"]
+    assert "ci_recovery" not in job
+    assert "review_budget" not in job
     Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         run_id, explicit_resume=True, message="PLATFORM_RESTORED", new_thread=True,
     )
@@ -577,7 +622,7 @@ def test_run_ci_target_append_findings_use_shared_integration_owner(git_repo: Pa
             current = states.load_run(run_id)
             job = current.get("run_acceptance", {}).get("repair_job", {}) if current else {}
             if (base_branch == target_branch and not targets and job.get("phase") == "accepted"
-                and job.get("ci_recovery", {}).get("developments_used") == 1):
+                and current["run_acceptance"]["ci_recovery"]["developments_used"] == 1):
                 checkout = git_repo.parent / "run-ci-target-append"
                 previous = git.resolve(target_branch)
                 subprocess.run(["git", "worktree", "add", "--detach", str(checkout), previous],

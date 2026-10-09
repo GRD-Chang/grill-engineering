@@ -6,6 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.ci_recovery_budget import (
     ci_limit_for_job,
@@ -60,12 +62,12 @@ def _route_repairable_ci_failure(
 ) -> bool:
     limit = ci_limit_for_job(job)
     decision = observe_repairable_ci_failure(
-        job,
+        delivery_budget_owner(state, job),
         head_sha=str(job["publication_sha"]),
         limit=limit,
         is_ticket=stage.contract.label.startswith("ticket-"),
     )
-    budget = job["ci_recovery"]
+    budget = delivery_budget_owner(state, job)["ci_recovery"]
     if (
         stage.contract.label.startswith("ticket-")
         and not budget["review_required"]

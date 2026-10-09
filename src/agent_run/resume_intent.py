@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_run.operator_gate import operator_gate_subjects
-from agent_run.review_budget import budget_checkpoint_subjects, review_budget_owner
+from agent_run.review_budget import budget_checkpoint_subjects
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.task_control import TaskControlError
 
@@ -182,7 +183,7 @@ def bind_resume_intent(
         "run_id": state.get("run_id"),
         "invocation": _invocation_identity(invocation),
         "subjects": [
-            {"location": location, **_subject_identity(subject)}
+            {"location": location, **_subject_identity(subject, state=state)}
             for location, subject in subjects
         ],
         "operator_stop": state.get("operator_stop"),
@@ -202,7 +203,7 @@ def bind_resume_intent(
                 ),
                 "job": _subject_identity(state.get("ticket_jobs", {}).get(
                     str(number), {"ticket_number": int(number)},
-                )),
+                ), state=state),
             }
             for number in state.get("ticket_graph", {}).get("tickets", {})
         }
@@ -228,9 +229,18 @@ def _invocation_identity(invocation: object) -> dict[str, Any]:
     }
 
 
-def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
+def _subject_identity(
+    subject: dict[str, Any], *, state: dict[str, Any],
+) -> dict[str, Any]:
+    owner = delivery_budget_owner(state, subject)
+    resync_owner = subject
+    if owner is not subject:
+        scopes = owner.get("repair_integration_budgets", {})
+        resync_owner = scopes.get(str(subject.get("repair_generation")), {})
     return {
-        "review_budget": review_budget_owner(subject).get("review_budget"),
+        "integration_resync": resync_owner.get("integration_resync"),
+        "review_budget": delivery_budget_owner(state, subject).get("review_budget"),
+        "ci_recovery": delivery_budget_owner(state, subject).get("ci_recovery"),
         **{
             key: subject.get(key)
             for key in (
@@ -239,8 +249,8 @@ def _subject_identity(subject: dict[str, Any]) -> dict[str, Any]:
                 "ticket_branch_generation", "pause_resume_phase",
                 "execution_resume_phase", "human_blocker_phase", "repair_source",
                 "acceptance_record", "publication_sha", "artifact", "last_ticket_resume",
-                "pending_semantic_attempt", "integration_resync", "integration_development_budget",
-                "ci_recovery", "publication_operation_retry",
+                "pending_semantic_attempt", "integration_development_budget",
+                "publication_operation_retry",
             )
         },
     }

@@ -141,7 +141,7 @@ def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
     committed = fixture.git.checkout_head(checkout)
     attempt_id = job["pending_semantic_attempt"]["attempt_id"]
     calls_before = len(fixture.agents.development_requests)
-    used = job["review_budget"]["development_attempts"]
+    used = interrupted["run_acceptance"]["review_budget"]["development_attempts"]
     if tampered_intent:
         job["candidate_commit_intent"]["token"] = "unrelated-intent"
         fixture.states.save_run(run_id, interrupted)

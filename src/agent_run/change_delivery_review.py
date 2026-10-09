@@ -6,6 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.artifacts import (
     AcceptanceArtifact,
     record_human_blocker,
@@ -46,7 +48,8 @@ def review(
     attempt = review_ordinal(job)
     job["phase"] = "reviewing"
     work_subject, generation = stage.adapter.invocation_identity(state, job)
-    budget = job.get("review_budget")
+    owner = delivery_budget_owner(state, job)
+    budget = owner.get("review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Reviewer is missing its Review Budget Window")
     semantic_attempt = begin_review(
@@ -54,8 +57,9 @@ def review(
         work_subject=work_subject,
         generation=generation,
         boundary=stage._invocation_boundary(job),
+        budget_owner=owner,
         budget_window=int(
-            job["ci_recovery"]["window"]
+            delivery_budget_owner(state, job)["ci_recovery"]["window"]
             if job.get("attempt_kind") == "ci_repair"
             else budget["window"]
         ),
@@ -67,7 +71,7 @@ def review(
         stage.publisher.prepare_validation(checkout, job, validation)
         request = stage.adapter.review_request(state, job, validation)
         if job.get("attempt_kind") == "ci_repair":
-            recovery = job.get("ci_recovery")
+            recovery = delivery_budget_owner(state, job).get("ci_recovery")
             records = recovery.get("review_artifacts") if isinstance(recovery, dict) else None
             if isinstance(records, list) and records:
                 previous = records[-1]
@@ -85,13 +89,13 @@ def review(
         elif job.get("attempt_kind") == "ci_repair":
             limit = ci_limit_for_job(job)
             request["review_budget_context"] = ci_reviewer_budget_context(
-                job,
+                owner,
                 limit=limit,
                 is_ticket=stage.contract.label.startswith("ticket-"),
             )
         else:
             request["review_budget_context"] = reviewer_budget_context(
-                job,
+                owner,
                 stage.review_budget_policy(),
                 current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
             )
@@ -126,7 +130,8 @@ def review(
     job.pop("review_resume_thread_id", None)
     job.pop("review_human_blocker_resume", None)
     try:
-        artifact = consume_review_result(job, stage.review_budget_policy(), review.artifact)
+        artifact = consume_review_result(job, stage.review_budget_policy(), review.artifact,
+            budget_owner=owner)
     except ValueError:
         # A malformed Artifact has no resumable result, but its Reviewer
         # identity must remain durable before a fresh output attempt.
@@ -178,9 +183,9 @@ def complete_review(
         job.pop("final_ci_fix_failure_head", None)
     clear_required_checks_observation(job)
     budget = (
-        job.get("ci_recovery")
+        delivery_budget_owner(state, job).get("ci_recovery")
         if job.get("attempt_kind") == "ci_repair"
-        else job.get("review_budget")
+        else delivery_budget_owner(state, job).get("review_budget")
     )
     review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
@@ -242,7 +247,8 @@ def complete_review(
     if artifact.requires_human:
         stage.save(state)
         return
-    decision = after_review(job, stage.review_budget_policy(), artifact)
+    decision = after_review(job, stage.review_budget_policy(), artifact,
+        budget_owner=delivery_budget_owner(state, job))
     if decision == ReviewDecision.ACCEPT:
         job["phase"] = "accepted"
     elif decision == ReviewDecision.REVIEW_EXHAUSTED:

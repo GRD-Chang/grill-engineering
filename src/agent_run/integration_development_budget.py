@@ -130,5 +130,4 @@ def semantic_attempt_budget(owner: dict[str, Any], attempt: dict[str, Any]) -> o
         return budget if charged else None
     if charged:
         return budget
-    from agent_run.review_budget import review_budget_owner
-    return review_budget_owner(owner).get("review_budget")
+    return owner.get("review_budget")

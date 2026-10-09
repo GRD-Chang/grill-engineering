@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import repair_integration_budget_owner
 from agent_run.git import GitError, GitRepository
 from agent_run.integration_resync_budget import ResyncBudgetExhausted
 from agent_run.parent_integration import (
@@ -205,6 +206,7 @@ def prepare_repair_integration(
                 git=stage.git,
                 github=stage.github,
                 subject=job,
+                budget_owner=repair_integration_budget_owner(state, job),
                 checkout=checkout,
                 source_branch=stage.contract.branch,
                 target_branch=stage.contract.base_branch,
@@ -236,6 +238,7 @@ def prepare_repair_integration(
                 result = finish_parent_snapshot_conflict(
                     git=stage.git,
                     subject=job,
+                    budget_owner=repair_integration_budget_owner(state, job),
                     checkout=checkout,
                     record_key=RECORD,
                     save=lambda: stage.save(state),

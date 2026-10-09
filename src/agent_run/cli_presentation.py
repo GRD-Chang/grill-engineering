@@ -6,7 +6,7 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
-from agent_run.review_budget import review_budget_owner
+from agent_run.delivery_budget import delivery_budget_owner
 
 from agent_run.attempt_projection import (
     current_semantic_attempt,
@@ -618,7 +618,7 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         job, state_snapshot=state.get("policy_snapshot")
     )
     candidate_validation_status = _candidate_validation_status(job)
-    ordinary_budget = job.get("review_budget")
+    ordinary_budget = delivery_budget_owner(state, job).get("review_budget")
     ordinary_modifications = (
         ordinary_budget.get("development_attempts", 0)
         if isinstance(ordinary_budget, dict)
@@ -659,7 +659,14 @@ def _public_integration_resync(state: dict[str, object]) -> dict[str, object] | 
     current = current_work_subject(state)
     if current is None:
         return None
-    budget = current[1].get("integration_resync")
+    subject = current[1]
+    owner = delivery_budget_owner(state, subject)
+    if owner is not subject:
+        budgets = owner.get("repair_integration_budgets")
+        scope = budgets.get(str(subject.get("repair_generation"))) if isinstance(budgets, dict) else None
+        budget = scope.get("integration_resync") if isinstance(scope, dict) else None
+    else:
+        budget = subject.get("integration_resync")
     if not isinstance(budget, dict):
         return None
     return {key: budget.get(key) for key in ("generation", "window", "used", "limit", "open")}
@@ -675,7 +682,7 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
         if not isinstance(acceptance, dict):
             return None
         subject = acceptance
-    budget = subject.get("ci_recovery")
+    budget = delivery_budget_owner(state, subject).get("ci_recovery")
     if not isinstance(budget, dict):
         return None
     limit = ci_limit_for_job(subject)
@@ -736,7 +743,7 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
         policy = run_repair_budget_policy_for_job(
             subject, state_snapshot=state.get("policy_snapshot")
         )
-    budget = review_budget_owner(subject).get("review_budget")
+    budget = delivery_budget_owner(state, subject).get("review_budget")
     if not isinstance(budget, dict):
         return None
     return {

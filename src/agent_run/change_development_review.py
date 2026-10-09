@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.ci_recovery_budget import ci_review_required
 from agent_run.development_review import review_is_due
 from agent_run.change_delivery_integration import prepare_delivery_integration
@@ -46,7 +48,7 @@ class ChangeDevelopmentReview:
         if (
             job.get("attempt_kind") == "ci_repair"
             and not ci_review_required(
-                job, is_ticket=self.engine.contract.label.startswith("ticket-")
+                delivery_budget_owner(state, job), is_ticket=self.engine.contract.label.startswith("ticket-")
             )
         ):
             if not self.engine._prepare_ticket_ci_publication_authorization(
@@ -55,7 +57,7 @@ class ChangeDevelopmentReview:
                 raise ValueError("Ticket CI repair has no valid publication authority")
             return True
         policy = self.engine.review_budget_policy()
-        if not review_is_due(job, policy):
+        if not review_is_due(job, policy, budget_owner=delivery_budget_owner(state, job)):
             if self.engine._prepare_ticket_fallback(state, job):
                 return True
             self.engine._checkpoint_budget(

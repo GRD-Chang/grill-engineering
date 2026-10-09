@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.agents import HumanBlockerResult
 from agent_run.artifacts import AcceptanceArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
@@ -67,7 +69,7 @@ def develop(
         and pending > int(job.get("modification_attempts", 0))
     )
     if not pending_resume and attempt_kind != "integration":
-        stage.mark_development_attempt(job, attempt_kind=attempt_kind)
+        stage.mark_development_attempt(state, job, attempt_kind=attempt_kind)
     # Persist the actual Worker attempt before invoking Codex.  This
     # makes a foreground status query truthful even while Codex is still
     # running, and leaves an observable recovery boundary on interruption.
@@ -81,7 +83,8 @@ def develop(
     else:
         job["managed_checkout_head"] = stage.git.checkout_head(checkout)
     work_subject, generation = stage.adapter.invocation_identity(state, job)
-    budget = job.get("integration_development_budget" if attempt_kind == "integration" else "review_budget")
+    owner = delivery_budget_owner(state, job)
+    budget = owner.get("integration_development_budget" if attempt_kind == "integration" else "review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Development is missing its Review Budget Window")
     new_semantic_attempt = pending_semantic_attempt(job, role="development") is None
@@ -92,8 +95,9 @@ def develop(
         generation=generation,
         currentness_boundary=stage._invocation_boundary(job),
         ordinal=attempt,
+        budget_owner=owner,
         budget_window=int(
-            job["ci_recovery"]["window"]
+            delivery_budget_owner(state, job)["ci_recovery"]["window"]
             if attempt_kind == "ci_repair"
             else budget["window"]
         ),
@@ -127,17 +131,17 @@ def develop(
     if request.get("repair_source") is not None and attempt_kind != "integration":
         if attempt_kind == "ci_repair" and (
             not stage.contract.label.startswith("ticket-")
-            or job["ci_recovery"]["review_required"]
+            or delivery_budget_owner(state, job)["ci_recovery"]["review_required"]
         ):
             limit = ci_limit_for_job(job)
             request["review_budget_context"] = ci_repair_budget_context(
-                job,
+                delivery_budget_owner(state, job),
                 limit=limit,
                 is_ticket=stage.contract.label.startswith("ticket-"),
             )
         elif attempt_kind != "ci_repair":
             request["review_budget_context"] = repair_budget_context(
-                job, stage.review_budget_policy()
+                delivery_budget_owner(state, job), stage.review_budget_policy()
             )
     request["_invocation_event"] = stage._invocation_events(
         state,
@@ -287,7 +291,7 @@ def commit_candidate(
             job["modification_attempts"] = attempt
             limit = ci_limit_for_job(job)
             refund_ci_repair_without_candidate(
-                job,
+                delivery_budget_owner(state, job),
                 limit=limit,
                 is_ticket=stage.contract.label.startswith("ticket-"),
             )
@@ -302,7 +306,7 @@ def commit_candidate(
             job["attempt_kind"] = "ci_repair"
             job["next_attempt_kind"] = "ci_repair"
             decision = observe_repairable_ci_failure(
-                job, head_sha=job["ci_recovery"]["failure_head"],
+                delivery_budget_owner(state, job), head_sha=delivery_budget_owner(state, job)["ci_recovery"]["failure_head"],
                 limit=limit, is_ticket=stage.contract.label.startswith("ticket-"),
             )
             if decision != "exhausted":

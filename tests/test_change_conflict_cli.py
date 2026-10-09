@@ -64,10 +64,11 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     seed_idle_control(TaskControlStore(store.root), TaskKey(repo, state["repository"], 1), run_id)
     profiles = AgentProfileStore(store.root)
     profiles.initialize(run_id)
-    budget = deepcopy(job["review_budget"])
+    owner = state["run_acceptance"] if kind == "run_repair" else job
+    budget = deepcopy(owner["review_budget"])
     if kind == "run_repair":
         budget["development_attempts"] += 1
-    ci_budget = deepcopy(job["ci_recovery"])
+    ci_budget = deepcopy(owner["ci_recovery"])
     candidate = job["candidate_sha"]
     preserved = checkout / "conflict-work.txt"
     preserved.write_text("work already completed\n")
@@ -101,6 +102,7 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     resumed = StateStore(store.root).load_current_run(run_id)
     assert resumed is not None
     resumed_job = _job(resumed, kind)
+    resumed_owner = resumed["run_acceptance"] if kind == "run_repair" else resumed_job
     if kind == "ticket":
         resumed["active_ticket_job"] = resumed_job
     assert resumed["active_agent_invocation"]["status"] == "resuming"
@@ -110,8 +112,8 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     assert resumed_job.get("integration_development_budget") == integration_budget
     assert resumed_job["candidate_sha"] == candidate
     assert resumed_job.get("acceptance_record") == acceptance
-    assert resumed_job["review_budget"] == budget
-    assert resumed_job["ci_recovery"] == ci_budget
+    assert resumed_owner["review_budget"] == budget
+    assert resumed_owner["ci_recovery"] == ci_budget
     assert resumed_job["development_thread_id"] == "conflict-thread"
     assert preserved.read_text() == "work already completed\n"
 
@@ -129,8 +131,8 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
     stage.agents = ProfiledAgentBackend(SimpleNamespace(develop=complete), profiles, run_id=run_id)
     assert run_conflict(stage, resumed, resumed_job, checkout)
     assert "pending_semantic_attempt" not in resumed_job
-    assert resumed_job["review_budget"] == budget
-    assert resumed_job["ci_recovery"] == ci_budget
+    assert resumed_owner["review_budget"] == budget
+    assert resumed_owner["ci_recovery"] == ci_budget
     assert resumed_job.get("integration_development_budget") == integration_budget
     assert resumed_job["semantic_attempt_history"][-1]["attempt_id"] == attempt["attempt_id"]
     if kind == "parent_only":

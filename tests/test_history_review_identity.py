@@ -80,9 +80,9 @@ def repair_history() -> tuple[dict[str, Any], dict[str, Any]]:
         "repository": "example/project",
         "parent": {"number": 1, "title": "History regression"},
         "run_acceptance": {
+            "review_budget": {"window": 1, "review_artifacts": artifacts},
             "repair_job": {
                 "semantic_attempt_history": attempts,
-                "review_budget": {"window": 1, "review_artifacts": artifacts},
             }
         },
     }
@@ -155,7 +155,7 @@ def test_repair_history_does_not_borrow_unproven_review_results(
 ) -> None:
     state, audit = repair_history
     latest = audit["agent_invocations"][-1]
-    budget = state["run_acceptance"]["repair_job"]["review_budget"]
+    budget = state["run_acceptance"]["review_budget"]
     if identity_gap == "missing_reviewer":
         latest.pop("reported_thread_id")
     elif identity_gap == "missing_candidate":

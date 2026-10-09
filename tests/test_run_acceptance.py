@@ -306,10 +306,10 @@ def test_run_repair_review_budget_stops_at_r_n_plus_one_without_development_n_pl
     assert run["blocked_reason"] == "review_budget_exhausted"
     assert len(agents.development_requests) == 1
     assert len(agents.review_requests) == 2
-    assert job["review_budget"]["development_attempts"] == 1
-    assert job["review_budget"]["reviewer_invocations"] == 2
-    assert "review_budget" not in run
-    assert "review_budget_history" not in run
+    assert run["review_budget"]["development_attempts"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 2
+    assert "review_budget" not in job
+    assert "review_budget_history" not in job
     assert job["phase"] == "blocked"
 
 
@@ -899,6 +899,8 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
         "reviewer_thread_ids": [],
         "development_thread_id": None,
         "development_thread_history": [],
+        "review_budget": exhausted_budget,
+        "review_budget_history": [],
         "repair_job": {
             "phase": "blocked",
             "human_response_generation": 1,
@@ -915,8 +917,6 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
             "development_thread_history": thread_history,
             "modification_attempts": 0,
             "validation_attempts": 0,
-            "review_budget": exhausted_budget,
-            "review_budget_history": [],
         },
     }
     state["status"] = "ready_for_human"
@@ -937,9 +937,9 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
     assert job["repair_mode"] == "squash"
     assert job["repair_branch"] == f"agent-run-repair/{state['run_id']}/1"
     assert job["base_sha"] == run_head
-    assert job["review_budget"]["reviewer_invocations"] == 0
-    assert job["review_budget"]["development_attempts"] == exhausted_budget["development_attempts"]
-    assert job["review_budget_history"][-1]["review_budget"] == exhausted_budget
+    assert run["review_budget"]["reviewer_invocations"] == 0
+    assert run["review_budget"]["development_attempts"] == exhausted_budget["development_attempts"]
+    assert run["review_budget_history"][-1]["review_budget"] == exhausted_budget
     assert run["repair_generation"] == 1
 
     assert job["human_response_generation"] == 1
@@ -1428,7 +1428,7 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
     old_generation = repair["repair_generation"]
     old_attempt = deepcopy(repair["pending_semantic_attempt"])
-    old_budget = deepcopy(repair["review_budget"])
+    old_budget = deepcopy(blocked["run_acceptance"]["review_budget"])
     old_checkout = Path(str(repair["repair_checkout"]))
     assert old_checkout.exists()
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
@@ -1461,7 +1461,7 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     assert resumed_job["repair_generation"] == old_generation
     assert resumed_job["phase"] == "developing"
     assert resumed_job["pending_semantic_attempt"] == old_attempt
-    assert resumed_job["review_budget"] == old_budget
+    assert resumed_run["review_budget"] == old_budget
     assert resumed_job["development_thread_id"] == "run-repair-development-blocked"
     assert resumed_job["human_response_history"] == [
         {
@@ -1500,7 +1500,7 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert repair["reviewer_thread_ids"][-1] == "run-reviewer-2"
     old_generation = repair["repair_generation"]
     old_attempt = deepcopy(repair["pending_semantic_attempt"])
-    old_budget = deepcopy(repair["review_budget"])
+    old_budget = deepcopy(blocked["run_acceptance"]["review_budget"])
     old_candidate = repair["candidate_sha"]
     old_checkout = Path(str(repair["repair_checkout"]))
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
@@ -1528,7 +1528,7 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert resumed_job["phase"] == "candidate"
     assert resumed_job["candidate_sha"] == old_candidate
     assert resumed_job["pending_semantic_attempt"] == old_attempt
-    assert resumed_job["review_budget"] == old_budget
+    assert resumed_run["review_budget"] == old_budget
     assert resumed_job["reviewer_thread_ids"][-1] == "run-reviewer-2"
     assert resumed_job["review_human_blocker_resume"] is True
     assert resumed_run["repair_cycle"]["status"] == "active"
@@ -1570,7 +1570,7 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     assert "publication_sha" not in repair
     old_generation = repair["repair_generation"]
     old_attempt = deepcopy(repair["pending_semantic_attempt"])
-    old_budget = deepcopy(repair["review_budget"])
+    old_budget = deepcopy(blocked["run_acceptance"]["review_budget"])
     old_candidate = repair["candidate_sha"]
     old_checkout = Path(str(repair["repair_checkout"]))
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
@@ -1602,7 +1602,7 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     assert resumed_job["phase"] == "accepted"
     assert resumed_job["candidate_sha"] == old_candidate
     assert resumed_job["pending_semantic_attempt"] == old_attempt
-    assert resumed_job["review_budget"] == old_budget
+    assert resumed_run["review_budget"] == old_budget
     assert resumed_job["publication_attempts"] == 1
     assert resumed_job["publication_thread_id"] == "run-repair-publication-blocked"
     assert resumed_run["repair_cycle"]["status"] == "active"
@@ -1796,8 +1796,6 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
         "repair_mode": "squash",
         "acceptance_artifact": _repair_artifact(),
     }
-    job["review_budget"] = run.pop("review_budget")
-    job["review_budget_history"] = run.pop("review_budget_history")
     run["repair_job"] = job
 
     RunRepairPublisher(engine, RunRepairPromotion(engine)).invalidate_stale(

@@ -62,8 +62,9 @@ from agent_run.run_currentness import (
 )
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.run_repair_integration import repair_run_branch_is_current
+from agent_run.delivery_budget import delivery_budget_owner, repair_integration_budget_owner
+from agent_run.run_repair_cycle import remove_repair_job
 from agent_run.review_budget import (
-    remove_repair_job,
     budget_checkpoint_subjects,
     reset_budget,
     renew_run_budget,
@@ -1256,7 +1257,7 @@ class Controller:
                 }
             )
             return
-        if candidate_or_acceptance_is_inconsistent(job):
+        if candidate_or_acceptance_is_inconsistent(job, budget_owner=delivery_budget_owner(state, job)):
             job.pop("approval_grant", None)
             state.update(
                 {
@@ -1399,7 +1400,7 @@ class Controller:
             ),
             "prompt_resources": resolve_resources(language),
             "branch_authority_protocol": 2,
-            "review_budget_protocol": 1,
+            "review_budget_protocol": 2,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
             "multi_ticket_protocol": 4,
             "ticket_agent_invocations": {},
@@ -2091,8 +2092,8 @@ def _resume_ci_recovery_window(
     limit = ci_limit_for_job(job)
     repair_job = job.get("repair_job") if kind == "run_acceptance" else None
     if repair_job is not None:
-        if not isinstance(repair_job, dict) or repair_job.get("ci_recovery") != job.get("ci_recovery"):
-            raise ValueError("Run and Run Repair CI recovery state differ")
+        if not isinstance(repair_job, dict):
+            raise ValueError("Run Repair state is invalid")
         evidence = repair_job.get("ci_evidence")
         origin = repair_job.get("required_checks_origin")
         budget = job["ci_recovery"]
@@ -2123,7 +2124,6 @@ def _resume_ci_recovery_window(
     job["phase"] = "repairing"
     if kind == "run_acceptance":
         if isinstance(repair_job, dict):
-            repair_job["ci_recovery"] = job["ci_recovery"]
             repair_job.pop("blocked_reason", None)
             repair_job.pop("escalation_code", None)
             repair_job["phase"] = "repairing"
@@ -2215,7 +2215,7 @@ def _resume_run_repair_integration(state: dict[str, Any]) -> bool:
         return False
     if reason == "integration_resync_exhausted":
         renew_resync_budget(
-            job,
+            repair_integration_budget_owner(state, job),
             policy_snapshot=job.get("policy_snapshot") or state["policy_snapshot"],
         )
     # The integration attempt can start before or after Candidate Acceptance.

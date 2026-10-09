@@ -53,9 +53,6 @@ def _with_canonical_ci_budgets(state: dict[str, Any]) -> None:
     run = state.get("run_acceptance")
     if isinstance(run, dict):
         run.setdefault("ci_recovery", new_ci_recovery_budget())
-        repair = run.get("repair_job")
-        if isinstance(repair, dict):
-            repair.setdefault("ci_recovery", dict(run["ci_recovery"]))
 
 
 def test_human_response_history_keeps_ordered_immutable_entries() -> None:
@@ -271,11 +268,11 @@ def _prepared_resume(
         state["run_acceptance"] = {
             "phase": "repairing",
             "policy_snapshot": dict(state["policy_snapshot"]),
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "repair_job": {
                 "phase": "accepted",
                 "policy_snapshot": dict(state["policy_snapshot"]),
-                "review_budget": _canonical_budget(),
-                "review_budget_history": [],
                 "repair_generation": 2,
                 "repair_mode": "squash",
                 "publication_thread_id": "current-repair-thread",

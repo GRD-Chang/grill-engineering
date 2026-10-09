@@ -14,10 +14,10 @@ from agent_run.delivery_policy import (
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,
-    review_budget_owner,
 )
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
@@ -132,7 +132,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
             for key, expected in (
                 ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
                 ("branch_authority_protocol", 2),
-                ("review_budget_protocol", 1),
+                ("review_budget_protocol", 2),
                 ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
                 ("semantic_attempt_protocol", 1),
                 ("multi_ticket_protocol", 4),
@@ -174,7 +174,7 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible branch authority protocol"
         )
-    if state.get("review_budget_protocol") != 1:
+    if state.get("review_budget_protocol") != 2:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Review Budget protocol"
         )
@@ -486,7 +486,7 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
         if required_checks_origin is not None:
             origin_pr_number = pr_number
             repair_trigger = owner.get("repair_trigger")
-            ci_budget = owner.get("ci_recovery")
+            ci_budget = delivery_budget_owner(state, owner).get("ci_recovery")
             ci_evidence = owner.get("ci_evidence")
             current_ci_failure = (
                 isinstance(ci_budget, dict)
@@ -708,6 +708,25 @@ def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
         job = state.get(key)
         if isinstance(job, dict):
             subjects.append((key, job))
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        scopes = acceptance.get("repair_integration_budgets", {})
+        if not isinstance(scopes, dict):
+            raise IncompatibleRunStateError("Run repair integration budget scopes are invalid")
+        for generation, scope in scopes.items():
+            if (
+                not isinstance(generation, str) or not generation.isdigit()
+                or int(generation) < 1 or str(int(generation)) != generation
+                or not isinstance(scope, dict)
+                or set(scope) - {"policy_snapshot", "integration_resync"}
+            ):
+                raise IncompatibleRunStateError("Run repair integration budget scope is invalid")
+            try:
+                _require_policy_snapshot_binding(scope.get("policy_snapshot"),
+                    acceptance.get("policy_snapshot"), "repair_integration_budgets")
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError("Run repair integration policy is invalid") from error
+            subjects.append((f"run_acceptance.repair_integration_budgets[{generation}]", scope))
     for location, job in subjects:
         development_budget = job.get("integration_development_budget")
         if development_budget is not None:
@@ -747,13 +766,6 @@ def _require_ci_recovery_budgets(state: dict[str, Any]) -> None:
         job = state.get(key)
         if isinstance(job, dict):
             subjects.append((key, job, False))
-    run = state.get("run_acceptance")
-    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
-        if run.get("ci_recovery") != run["repair_job"].get("ci_recovery"):
-            raise IncompatibleRunStateError(
-                "incompatible_run_state: Run Acceptance and Run Repair CI recovery differ"
-            )
-        subjects.append(("run_acceptance.repair_job", run["repair_job"], False))
     for location, job, is_ticket in subjects:
         try:
             limit = ci_limit_for_job(
@@ -851,11 +863,12 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                     "policy_snapshot"
                 )
                 if any(
-                    field in value
-                    for field in ("review_budget", "review_budget_history")
+                    field in repair
+                    for field in ("review_budget", "review_budget_history", "ci_recovery",
+                                  "integration_resync")
                 ):
                     raise IncompatibleRunStateError(
-                        "Run Acceptance and Run Repair must have one Review Budget owner"
+                        "Run Repair must not persist delivery budgets"
                     )
                 if repair.get("publication_authority") == "fallback" or (
                     "fallback_publication_receipt" in repair
@@ -869,14 +882,11 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                         run_snapshot,
                         "run_acceptance.repair_job",
                     )
-                    repair_policy = run_repair_budget_policy_for_job(
-                        repair, state_snapshot=run_snapshot
-                    )
                 except (TypeError, ValueError) as error:
                     raise IncompatibleRunStateError(
                         "legacy state has an invalid run_acceptance.repair_job.policy_snapshot"
                     ) from error
-                subjects.append(("run_acceptance.repair_job", repair, repair_policy))
+
     for location, job, policy in subjects:
         try:
             ensure_budget(job, policy)
@@ -1634,7 +1644,7 @@ def _require_active_invocation_identity(
             raise IncompatibleRunStateError(
                 f"run state has a stale active Ticket Invocation: {subject} owner, generation, phase or conflict context mismatch"
             )
-        _require_pending_invocation_attempt(job, invocation)
+        _require_pending_invocation_attempt(job, invocation, state=state)
         return
     if subject == f"parent-only:{run_id}":
         job = state.get("parent_job")
@@ -1677,7 +1687,7 @@ def _require_active_invocation_identity(
         owner = state.get("run_publication")
     else:
         owner = job
-    _require_pending_invocation_attempt(owner, invocation)
+    _require_pending_invocation_attempt(owner, invocation, state=state)
 
 
 def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
@@ -1805,6 +1815,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
                 )
             _require_owner_attempt(
                 pending,
+                state=state,
                 location=f"{location}.pending_semantic_attempt",
                 status="pending",
                 roles=roles,
@@ -1827,6 +1838,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             item_location = f"{location}.semantic_attempt_history[{index}]"
             _require_owner_attempt(
                 attempt,
+                state=state,
                 location=item_location,
                 status="completed",
                 roles=roles,
@@ -1908,6 +1920,7 @@ def _require_owner_attempt(
     maximum_generation: int,
     owner: dict[str, Any],
     require_current: bool,
+    state: dict[str, Any],
 ) -> None:
     try:
         require_semantic_attempt_record(attempt, expected_status=status)
@@ -1950,7 +1963,7 @@ def _require_owner_attempt(
                 f"run state has an invalid Publication Budget Window at {location}"
             )
         return
-    budget = semantic_attempt_budget(owner, attempt)
+    budget = semantic_attempt_budget(delivery_budget_owner(state, owner), attempt)
     current_window = budget.get("window") if isinstance(budget, dict) else None
     if (
         type(current_window) is not int
@@ -1976,7 +1989,7 @@ def _require_unique_attempt_record(
 
 
 def _require_pending_invocation_attempt(
-    owner: object, invocation: dict[str, Any]
+    owner: object, invocation: dict[str, Any], *, state: dict[str, Any],
 ) -> None:
     if not isinstance(owner, dict):
         raise IncompatibleRunStateError(
@@ -1994,7 +2007,7 @@ def _require_pending_invocation_attempt(
         )
     budget_window = pending.get("budget_window")
     if budget_window is not None:
-        budget = semantic_attempt_budget(owner, pending)
+        budget = semantic_attempt_budget(delivery_budget_owner(state, owner), pending)
         if not isinstance(budget, dict) or budget.get("window") != budget_window:
             raise IncompatibleRunStateError(
                 "run state has a pending Semantic Agent Attempt in the wrong Budget Window"

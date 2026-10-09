@@ -134,7 +134,7 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
     paused_job = paused["run_acceptance"]["repair_job"]
     assert paused_job["blocked_reason"] == "agent_requires_human"
     attempt = deepcopy(paused_job["pending_semantic_attempt"])
-    budget = deepcopy(paused_job["review_budget"])
+    budget = deepcopy(paused["run_acceptance"]["review_budget"])
     assert budget["development_attempts"] == 2
 
     # Exercise rejection of damaged identities on the actual production
@@ -171,7 +171,7 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
     resumed_job = resumed["run_acceptance"]["repair_job"]
     assert resumed_job["candidate_sha"] == paused_job["candidate_sha"]
     assert resumed_job["pending_semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
-    assert resumed_job["review_budget"] == budget
+    assert resumed["run_acceptance"]["review_budget"] == budget
     result = RunAcceptanceEngine(
         git=git, states=states, agents=agents,
         github=FixtureGitHubPublisher(fixture, git),

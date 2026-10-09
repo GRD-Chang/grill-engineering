@@ -111,14 +111,15 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
             "development_thread_history": [],
         }
         if subject_location == "run_repair":
-            del acceptance["review_budget"]
-            del acceptance["review_budget_history"]
             acceptance.update(
                 {
                     "phase": "ready_for_human",
                     "repair_generation": 1,
                     "repair_job": {
-                        **subject,
+                        **{
+                            key: value for key, value in subject.items()
+                            if key not in {"review_budget", "review_budget_history", "ci_recovery"}
+                        },
                         "repair_mode": "squash",
                         "repair_source": "acceptance",
                         "acceptance_artifact": _repair_artifact(),
@@ -214,7 +215,10 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
             "development_thread_history": [],
             "repair_generation": 1,
             "repair_job": {
-                **subject,
+                **{
+                    key: value for key, value in subject.items()
+                    if key not in {"review_budget", "review_budget_history", "ci_recovery"}
+                },
                 "repair_mode": "squash",
                 "repair_source": "acceptance",
                 "acceptance_artifact": _repair_artifact(),
@@ -223,8 +227,6 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
                 "development_thread_history": [],
             },
         }
-        del state["run_acceptance"]["review_budget"]
-        del state["run_acceptance"]["review_budget_history"]
     else:
         state["run_publication"] = {
             "phase": "ready_for_human",

@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent_run.review_budget import remove_repair_job
+from agent_run.run_repair_cycle import remove_repair_job
 
 from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine

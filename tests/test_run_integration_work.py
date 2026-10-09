@@ -17,7 +17,6 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.graph import state_from_graph
 from agent_run.github import GitHubReadError
 from agent_run.history_facts import history_records
-from agent_run.review_budget import review_budget_owner
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.state_errors import MissingRunMaterialsError
 from support.run_agents import ScriptedRunAgents
@@ -265,7 +264,7 @@ def test_git_work_and_parent_findings_share_development_allowance(
     result = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(state["run_id"])
     assert result["status"] == "run_publication_pending"
     assert agents.events == ["development", "development", "review", "development", "review"]
-    budget = review_budget_owner(result["run_acceptance"])["review_budget"]
+    budget = result["run_acceptance"]["review_budget"]
     assert budget["development_attempts"] == 3
     assert budget["reviewer_invocations"] == 2
     assert result["ticket_jobs"] == state["ticket_jobs"]

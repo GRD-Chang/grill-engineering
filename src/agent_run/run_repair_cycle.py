@@ -211,3 +211,8 @@ def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be an object")
     return value
+
+
+def remove_repair_job(run: dict[str, Any]) -> None:
+    """Remove repair work while retaining the Parent's fixed budgets."""
+    run.pop("repair_job", None)

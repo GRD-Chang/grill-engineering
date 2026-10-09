@@ -19,6 +19,7 @@ from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_history import history_records
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.git import GitError
+from agent_run.delivery_budget import repair_integration_budget_owner
 from agent_run.integration_resync_budget import (
     complete_integration_window,
     observe_integration_snapshot,
@@ -65,10 +66,10 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_cycle": {"status": "active"},
         "candidate_acceptance_history": [],
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "candidate_acceptance_history": _malformed_candidate_history(),
         },
     }
@@ -226,7 +227,7 @@ def test_run_repair_unknown_checks_wait_and_real_failures_enter_investigation(
 
     run = result["run_acceptance"]
     job = run["repair_job"]
-    assert job["review_budget"]["development_attempts"] == 1
+    assert run["review_budget"]["development_attempts"] == 1
     assert run["repair_cycle"]["code_modification_attempts"] == (1 if checks == "unknown" else 2)
     assert len(job["candidate_acceptance_history"]) == 1
     assert run.get("completed_repair_jobs", []) == []
@@ -240,7 +241,7 @@ def test_run_repair_unknown_checks_wait_and_real_failures_enter_investigation(
         # charged and paused for an explicit resume, irrespective of category.
         assert result["status"] == "ready_for_human"
         assert job["blocked_reason"] == "ci_investigation_paused"
-        assert job["ci_recovery"]["developments_used"] == 1
+        assert run["ci_recovery"]["developments_used"] == 1
         assert len(agents.development_requests) == 2
         request = agents.development_requests[-1]
         assert request["repair_source"] == "required_checks"
@@ -271,7 +272,7 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     job = run["repair_job"]
     original_pr = job["pr_number"]
     original_candidate = job["candidate_sha"]
-    original_review = deepcopy(job["review_budget"])
+    original_review = deepcopy(run["review_budget"])
     original_run_resync = deepcopy(run["integration_resync"])
     states.save_run(run_id, paused)
     collaborator = git_repo.parent / "repair-collaborator"
@@ -329,14 +330,14 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     if reason == "integration_resync_exhausted":
         for source in (job["published_sha"], first_append):
             observe_integration_snapshot(
-                job, source_sha=source, target_sha=job["base_sha"],
+                repair_integration_budget_owner(paused, job), source_sha=source, target_sha=job["base_sha"],
                 policy_snapshot=job["policy_snapshot"],
             )
-            complete_integration_window(job)
-        original_job_resync = deepcopy(job["integration_resync"])
+            complete_integration_window(repair_integration_budget_owner(paused, job))
+        original_job_resync = deepcopy(repair_integration_budget_owner(paused, job)["integration_resync"])
         states.save_run(run_id, paused)
     else:
-        original_job_resync = job.get("integration_resync")
+        original_job_resync = repair_integration_budget_owner(paused, job).get("integration_resync")
     publisher.data["delivery"]["published_branches"][job["repair_branch"]] = appended
     repair_pr = next(
         pr for pr in publisher.data["delivery"]["pull_requests"]
@@ -362,7 +363,7 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
         monkeypatch.setattr(run_repair_integration, "prepare_parent_snapshot", original_prepare)
     assert blocked["status"] == "ready_for_human"
     assert blocked["run_acceptance"]["repair_job"]["blocked_reason"] == reason
-    blocked_review = deepcopy(blocked["run_acceptance"]["repair_job"]["review_budget"])
+    blocked_review = deepcopy(blocked["run_acceptance"]["review_budget"])
     blocked_run_resync = deepcopy(blocked["run_acceptance"]["integration_resync"])
     if reason == "integration_failed":
         assert blocked_review == original_review
@@ -382,16 +383,16 @@ def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
     assert resumed_job["phase"] == "accepted"
     assert resumed_job["pr_number"] == original_pr
     assert resumed_job["candidate_sha"] == original_candidate
-    assert resumed_job["review_budget"] == blocked_review
-    assert "review_budget" not in resumed_run
-    assert "review_budget_history" not in resumed_run
+    assert resumed_run["review_budget"] == blocked_review
+    assert "review_budget" not in resumed_job
+    assert "review_budget_history" not in resumed_job
     assert resumed_run["integration_resync"] == blocked_run_resync
     if reason == "integration_resync_exhausted":
-        assert resumed_job["integration_resync"]["generation"] == 2
-        assert resumed_job["integration_resync"]["used"] == 0
-        assert resumed_job["integration_resync"]["history"][:-1] == original_job_resync["history"]
+        assert repair_integration_budget_owner(resumed, resumed_job)["integration_resync"]["generation"] == 2
+        assert repair_integration_budget_owner(resumed, resumed_job)["integration_resync"]["used"] == 0
+        assert repair_integration_budget_owner(resumed, resumed_job)["integration_resync"]["history"][:-1] == original_job_resync["history"]
     else:
-        assert resumed_job.get("integration_resync") == original_job_resync
+        assert repair_integration_budget_owner(resumed, resumed_job).get("integration_resync") == original_job_resync
     event = resumed["resume_audit"]["history"][-1]
     assert event["kind"] == (
         "integration_resync" if reason == "integration_resync_exhausted"
@@ -439,6 +440,8 @@ def test_nested_run_repair_history_rewrite_resumes_from_saved_work(git_repo: Pat
     states.save_run(run_id, paused)
 
     original = deepcopy(job)
+    original_budget = deepcopy(paused["run_acceptance"]["review_budget"])
+    original_ci = deepcopy(paused["run_acceptance"]["ci_recovery"])
     delivery_before = deepcopy(publisher.data["delivery"])
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         run_id, explicit_resume=True,
@@ -447,8 +450,10 @@ def test_nested_run_repair_history_rewrite_resumes_from_saved_work(git_repo: Pat
     assert reloaded == resumed
     resumed_job = resumed["run_acceptance"]["repair_job"]
     assert resumed_job["phase"] == "accepted"
-    for key in ("repair_generation", "candidate_sha", "acceptance_record", "review_budget", "ci_recovery"):
+    for key in ("repair_generation", "candidate_sha", "acceptance_record"):
         assert resumed_job[key] == original[key]
+    assert resumed["run_acceptance"]["review_budget"] == original_budget
+    assert resumed["run_acceptance"]["ci_recovery"] == original_ci
     assert resumed_job["pause_history"][-1]["blocked_reason"] == "integration_history_rewritten"
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == delivery_before
 
@@ -471,11 +476,11 @@ def test_rewritten_repair_pr_cannot_consume_nested_resync_resume(
     run = paused["run_acceptance"]
     job = run["repair_job"]
     observe_integration_snapshot(
-        job, source_sha=job["published_sha"], target_sha=job["base_sha"],
+        repair_integration_budget_owner(paused, job), source_sha=job["published_sha"], target_sha=job["base_sha"],
         policy_snapshot=job["policy_snapshot"],
     )
-    complete_integration_window(job)
-    budget_before = deepcopy(job["integration_resync"])
+    complete_integration_window(repair_integration_budget_owner(paused, job))
+    budget_before = deepcopy(repair_integration_budget_owner(paused, job)["integration_resync"])
     job.update({"phase": "blocked", "blocked_reason": "integration_resync_exhausted"})
     run["phase"] = "ready_for_human"
     paused.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
@@ -496,7 +501,7 @@ def test_rewritten_repair_pr_cannot_consume_nested_resync_resume(
         "change_pr_head_changed_externally"
         if rewritten_branch == "source" else "change_pr_base_changed_externally"
     )
-    assert blocked["run_acceptance"]["repair_job"]["integration_resync"] == budget_before
+    assert repair_integration_budget_owner(blocked, blocked["run_acceptance"]["repair_job"])["integration_resync"] == budget_before
     assert blocked["run_acceptance"]["repair_job"]["phase"] == "blocked"
 
 
@@ -515,7 +520,7 @@ def test_nested_integration_resume_reenters_candidate_without_review_record(
     run = paused["run_acceptance"]
     job = run["repair_job"]
     original_pr = job["pr_number"]
-    review_budget = deepcopy(job["review_budget"])
+    review_budget = deepcopy(run["review_budget"])
     job.pop("acceptance_record")
     job.pop("acceptance_artifact")
     job.update({"phase": "blocked", "blocked_reason": "integration_failed"})
@@ -529,7 +534,7 @@ def test_nested_integration_resume_reenters_candidate_without_review_record(
     resumed_job = resumed["run_acceptance"]["repair_job"]
     assert resumed_job["phase"] == "candidate"
     assert resumed_job["pr_number"] == original_pr
-    assert resumed_job["review_budget"] == review_budget
+    assert resumed["run_acceptance"]["review_budget"] == review_budget
     assert resumed["status"] == "run_acceptance_pending"
 
 def test_run_repair_default_branch_drift_revalidates_candidate_in_same_cycle(
@@ -850,11 +855,11 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert run["repair_cycle"]["status"] == "active"
     assert run["repair_cycle"]["code_modification_attempts"] == 1
     assert run["repair_cycle"]["generation"] == generation
-    assert job["review_budget"]["window"] == 1
-    assert "review_budget" not in run
-    assert job["review_budget"]["reviewer_invocations"] == 2
-    assert job["review_budget"]["development_attempts"] == 1
-    assert job["review_budget_history"] == []
+    assert run["review_budget"]["window"] == 1
+    assert "review_budget" not in job
+    assert run["review_budget"]["reviewer_invocations"] == 2
+    assert run["review_budget"]["development_attempts"] == 1
+    assert run["review_budget_history"] == []
     assert repair_checkout.exists()
 
     first_ci_budget = deepcopy(run["ci_recovery"])
@@ -1043,12 +1048,12 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     assert len(agents.development_requests) == 3
     assert run["integration_resync"]["window"] == 2
     assert run["integration_resync"]["used"] == 1
-    assert job["review_budget"]["window"] == 1
-    assert "review_budget" not in run
-    assert "review_budget_history" not in run
-    assert job["review_budget"]["reviewer_invocations"] == 4
-    assert job["review_budget_history"] == []
-    assert job["review_budget"]["development_attempts"] == 3
+    assert run["review_budget"]["window"] == 1
+    assert "review_budget" not in job
+    assert "review_budget_history" not in job
+    assert run["review_budget"]["reviewer_invocations"] == 4
+    assert run["review_budget_history"] == []
+    assert run["review_budget"]["development_attempts"] == 3
     assert job["candidate_sha"]
     assert run["repair_cycle"]["status"] == "active"
     ci_before = deepcopy(run["ci_recovery"])
@@ -1079,7 +1084,7 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     resumed, _ = Controller(LiveReader(fixture), git, states).resume(
         str(state["run_id"]), explicit_resume=True, resume_budget_checkpoint=True,
     )
-    budget = resumed["run_acceptance"]["repair_job"]["review_budget"]
+    budget = resumed["run_acceptance"]["review_budget"]
     if merged_mutation is not None:
         assert resumed["status"] == "blocked"
         assert resumed["diagnostics"][0]["code"] == "change_pr_integrated_authority_changed_externally"

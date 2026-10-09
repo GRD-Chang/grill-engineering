@@ -59,7 +59,6 @@ from agent_run.review_attempt import (
     review_ordinal,
 )
 from agent_run.review_budget import (
-    review_budget_owner,
     ReviewBudgetPolicy,
     ensure_budget,
     new_budget,
@@ -558,7 +557,7 @@ class RunAcceptanceEngine:
             request["run_integration_record"] = dict(run_integration)
         previous = previous_review_context(run)
         if previous is None:
-            history = review_budget_owner(run).get("review_budget_history")
+            history = run.get("review_budget_history")
             if isinstance(history, list) and history and isinstance(history[-1], dict):
                 previous = previous_review_context(history[-1])
         if previous is not None:

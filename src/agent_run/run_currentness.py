@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Protocol
 
-from agent_run.review_budget import remove_repair_job
+from agent_run.run_repair_cycle import remove_repair_job
 
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.semantic_attempt import (

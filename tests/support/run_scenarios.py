@@ -57,8 +57,6 @@ def save_run_with_ci_fixture(
                     run, head_sha=head_sha,
                     limit=3, is_ticket=False,
                 )
-    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
-        run["repair_job"].setdefault("ci_recovery", deepcopy(run["ci_recovery"]))
     states.save_run(run_id, state)
 
 

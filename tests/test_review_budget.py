@@ -29,9 +29,8 @@ from agent_run.review_budget import (
     repair_budget_context,
     reset_budget,
     reviewer_budget_context,
-    remove_repair_job,
-    review_budget_owner,
 )
+from agent_run.run_repair_cycle import remove_repair_job
 from agent_run.change_delivery_required_checks import observe_required_checks
 
 
@@ -385,30 +384,29 @@ def test_ticket_budget_resume_opens_new_window_and_preserves_repair_evidence() -
     ] == 3
 
 
-def test_run_repair_owns_one_persisted_run_window() -> None:
+def test_run_repair_uses_fixed_parent_budget_after_reload_and_completion() -> None:
     import json
 
+    from agent_run.delivery_budget import delivery_budget_owner
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
-    job = _job_with_budget(
-        policy_snapshot=DeliveryPolicy().snapshot(), phase="reviewing",
-    )
-    job["review_budget"]["reviewer_invocations"] = 3
-    run = {
-        "policy_snapshot": DeliveryPolicy().snapshot(),
-        "repair_job": job,
-        "repair_cycle": {"generation": 1},
-    }
-    run = json.loads(json.dumps(run))
+    run = _job_with_budget(policy_snapshot=DeliveryPolicy().snapshot())
+    job = {"phase": "reviewing", "policy_snapshot": DeliveryPolicy().snapshot()}
+    run.update({"repair_job": job, "repair_cycle": {"generation": 1}})
+    run["review_budget"]["reviewer_invocations"] = 3
+    state = json.loads(json.dumps({"run_acceptance": run}))
+    run = state["run_acceptance"]
     job = run["repair_job"]
-    mark_review(job, RUN_POLICY)
+    owner = delivery_budget_owner(state, job)
+    assert owner is run
+    mark_review(owner, RUN_POLICY)
     sync_repair_cycle_counters(run, job)
-    assert ensure_budget(run, RUN_POLICY)["reviewer_invocations"] == 4
+    assert run["review_budget"]["reviewer_invocations"] == 4
     assert not can_start_review(run, RUN_POLICY)
-    assert "review_budget" not in run
-    assert "review_budget_history" not in run
-    budget = job["review_budget"]
-    history = job["review_budget_history"]
+    assert "review_budget" not in job
+    assert "review_budget_history" not in job
+    budget = run["review_budget"]
+    history = run["review_budget_history"]
     remove_repair_job(run)
     assert run["review_budget"] is budget
     assert run["review_budget_history"] is history
@@ -421,8 +419,8 @@ def test_run_repair_budget_uses_frozen_limits_and_retains_one_history() -> None:
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
     policy = DeliveryPolicy(run_repair_rounds=2)
-    job = _job_with_budget(policy_snapshot=policy.snapshot(), phase="blocked")
-    job["review_budget"].update({
+    run = _job_with_budget(policy_snapshot=policy.snapshot())
+    run["review_budget"].update({
         "development_attempts": 2,
         "reviewer_invocations": 3,
         "review_artifacts": [
@@ -431,27 +429,50 @@ def test_run_repair_budget_uses_frozen_limits_and_retains_one_history() -> None:
         ],
         "checkpoint_reason": "review_budget_exhausted",
     })
-    run = {
-        "policy_snapshot": policy.snapshot(),
-        "repair_job": job,
-        "repair_cycle": {"generation": 1},
-        "validation_attempts": 1,
-    }
+    job = {"phase": "blocked", "policy_snapshot": policy.snapshot()}
+    run.update({"repair_job": job, "repair_cycle": {"generation": 1}, "validation_attempts": 1})
     sync_repair_cycle_counters(run, job)
     budget_policy = run_repair_budget_policy(policy)
     assert not can_start_development(run, budget_policy)
     assert not can_start_review(run, budget_policy)
     reset_budget(run, budget_policy)
-    assert review_budget_owner(run) is job
     assert run["validation_attempts"] == 0
-    assert job["review_budget"]["window"] == 2
-    assert len(job["review_budget_history"]) == 1
-    archived = job["review_budget_history"][0]["review_budget"]
+    assert run["review_budget"]["window"] == 2
+    assert len(run["review_budget_history"]) == 1
+    archived = run["review_budget_history"][0]["review_budget"]
     assert archived["development_attempts"] == 2
     assert archived["reviewer_invocations"] == 3
     assert len(archived["review_artifacts"]) == 3
     assert archived["checkpoint_reason"] == "review_budget_exhausted"
-    assert "review_budget_history" not in run
+    assert "review_budget_history" not in job
+
+
+def test_delivery_budgets_keep_ticket_parent_and_repair_identity_separate() -> None:
+    from copy import deepcopy
+
+    from agent_run.delivery_budget import delivery_budget_owner
+
+    ticket = _job_with_budget()
+    other_ticket = _job_with_budget()
+    parent = _job_with_budget()
+    repair = {"phase": "repairing"}
+    run = _job_with_budget(repair_job=repair)
+    state = {"ticket_jobs": {"2": ticket, "3": other_ticket},
+             "parent_job": parent, "run_acceptance": run}
+    before = deepcopy(state)
+    for subject in (ticket, other_ticket, parent, run):
+        assert delivery_budget_owner(state, subject) is subject
+    assert delivery_budget_owner(state, repair) is run
+    # A distinct record with the same content is not the active repair work.
+    unrelated = deepcopy(repair)
+    assert delivery_budget_owner(state, unrelated) is unrelated
+    assert state == before
+    mark_development(delivery_budget_owner(state, repair), RUN_POLICY, attempt_kind="ordinary")
+    assert run["review_budget"]["development_attempts"] == 1
+    assert ticket["review_budget"]["development_attempts"] == 0
+    assert other_ticket["review_budget"]["development_attempts"] == 0
+    assert parent["review_budget"]["development_attempts"] == 0
+    assert "review_budget" not in repair
 
 
 def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -> None:

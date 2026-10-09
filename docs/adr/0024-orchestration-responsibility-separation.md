@@ -14,10 +14,10 @@ status: accepted
 
 审核结论、CI 观测、Publish 文案和人工批准分别绑定其准确对象及成果事实；阶段引用适用记录，同一类证据的适用规则由共同职责维护。历史记录保留原含义，各类证据不强制采用同一字段集合或统一失效条件；相同 tree 不能替代需求、基线和完整交付事实的核验，Candidate 验收提升仍须证明实际集成结果适用。外部写入结果未知时保留原操作意图并先对账。
 
-预算固定归属于交付对象：Ticket 使用自身额度，完整 Parent（包括 Parent-only）使用自身额度；按既有用途、角色和窗口分别计数。Repair Job 使用所属对象的预算，不搬移或复制可变预算。此目标取代现有 Run Review Budget 在 Run Acceptance 与 Repair Job 之间移交、归还的持久归属要求，并消除 CI 预算双位置保存后依赖内存别名重绑的实现责任；额度上限、消费时点、累计范围和续期授权不变。
+预算固定归属于交付对象：Ticket 使用自身额度，完整 Parent（包括 Parent-only）使用自身额度；按既有用途、角色和窗口分别计数。Repair Job 使用所属对象的预算，不搬移或复制可变预算。此合同取代 Run Review Budget 在 Run Acceptance 与 Repair Job 之间移交、归还的持久归属要求，并消除 CI 预算双位置保存后依赖内存别名重绑的实现责任；额度上限、消费时点、累计范围和续期授权不变。固定归属切片已实施：Ticket 与 Parent-only 使用自身 Job，完整 Parent 使用 Run Acceptance 中的 Review Budget、历史与 CI Recovery；Repair Job 不保存这些可变字段。Repair 的集成 resync 额度也保存在 Run 的 `repair_integration_budgets`，按修复代次保持既有窗口隔离；不能与主线 source/target 窗口合并。归属在创建、暂停、重载与修复完成后保持不变，显式 resume 仅续期适用耗尽额度并保留历史。新状态使用 `review_budget_protocol=2`，旧状态拒绝兼容读取，不自动迁移或删除成果。
 
 Review Context 的准备与返回结论绑定由共同职责处理。上下文区分需求范围、完整交付范围和本轮重点变化，提供准确提交、适用前次结论与 Findings、CI 或集成证据；完整 Parent 还保留实际预期合并结果、Ticket Graph 与 Completion。程序固定真实事实，Reviewer 自主决定审查深度及扩大范围，不由程序解析 Findings 并生成具体检查计划。此职责集中复用既有身份与证据，不增加另一套审核状态。实现将调用前的 Review Context 保存于既有 Semantic Attempt，按原身份形成 Acceptance Record，随有界历史保留；完整范围和重点变化独立表达。恢复使用同一快照并附加原始 Human Blocker Artifact 与本次人工回复，既有 currentness 负责否决不适用结论。
 
 本轮集中已有错误处理、Agent 修复、程序等待/对账、暂停与恢复规则，并修正已确认的执行不一致；不扩大 Agent 自动调查范围，不新增普通提交、部分 Parent fetch 或发布操作失败后的 Development 调查流程。相关权限、材料或外部条件问题继续通过现有暂停与人工 resume 处理。这项范围限制使共同机制的深化与新增修复能力分别验收。
 
-这是一项已确认的目标设计，实施尚未完成。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。
+这是一项已确认的目标设计；固定预算归属已实施，其余职责深化尚未完成。不要求新增同名文件、进程或第三方框架；除上述预算持久归属调整外，Ticket、Parent、Parent-only 的入口、审核责任、预算策略、最终批准和恢复合同继续有效。内部 Repair PR 的取消另由 [ADR 0025](0025-parent-repair-without-internal-pr.md) 明确授权；其他合并、删除或改变产品策略的事项，须在需求阶段逐项明确，不能由本职责调整隐式授权。

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner, repair_integration_budget_owner
+
 from agent_run.agents import HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker
 from agent_run.change_delivery_threads import (
@@ -244,11 +246,12 @@ def resolve_parent_conflict(
                 stage.git.fetch_remote_commit(stage.contract.branch, scene["source_sha"])
                 stage.git.fetch_remote_commit(stage.contract.base_branch, scene["target_sha"])
             observe_integration_snapshot(
-                job, source_sha=scene["source_sha"], target_sha=scene["target_sha"],
+                repair_integration_budget_owner(state, job), source_sha=scene["source_sha"], target_sha=scene["target_sha"],
                 policy_snapshot=job["policy_snapshot"],
             )
             result = finish_parent_snapshot_conflict(
                 git=stage.git, subject=job, checkout=checkout,
+                budget_owner=repair_integration_budget_owner(state, job),
                 record_key=record_key,
                 # Persist progress on this same scene. Switching to a new
                 # scene (or finishing it) is atomic with Attempt closeout in
@@ -270,7 +273,7 @@ def resolve_parent_conflict(
         and attempt is None and "development_summary" not in conflict
     )
     if new_run_development:
-        if not can_start_development(job, stage.review_budget_policy()):
+        if not can_start_development(delivery_budget_owner(state, job), stage.review_budget_policy()):
             stage._checkpoint_budget(state, job, "modification_budget_exhausted",
                                      "Parent integration Development allowance is exhausted")
             return False
@@ -287,7 +290,7 @@ def resolve_parent_conflict(
         if new_run_development:
             # A mechanical advance may reach another Git failure after its
             # one admitted Agent call. Denied work must not consume allowance.
-            mark_development(job, stage.review_budget_policy(), attempt_kind="ordinary")
+            mark_development(delivery_budget_owner(state, job), stage.review_budget_policy(), attempt_kind="ordinary")
     conflict["attempts"] = 1
     select_development_thread(state, job, new_attempt=attempt is None)
     conflict_input = {
@@ -317,7 +320,8 @@ def resolve_parent_conflict(
         generation=generation,
         currentness_boundary=stage._invocation_boundary(job),
         ordinal=int(job[f"{record_key}_conflict_ordinal"]),
-        budget_window=int(job["review_budget"]["window"]),
+        budget_owner=delivery_budget_owner(state, job),
+        budget_window=int(delivery_budget_owner(state, job)["review_budget"]["window"]),
     )
     request["_invocation_event"] = stage._invocation_events(
         state, job, request, role="development", phase="integration_conflict",

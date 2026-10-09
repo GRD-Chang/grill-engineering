@@ -274,18 +274,24 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
     repair = {
         "repair_generation": 3,
         "phase": "developing",
-        "review_budget": _canonical_budget(),
-        "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
         "repair_branch": "agent-run-repair/run-1/2-generation-3",
         "ticket_completion_records": [{"ticket_number": 7}],
     }
+    budget = _canonical_budget()
+    budget["development_attempts"] = 1
+    budget_history = [deepcopy(budget)]
+    budget["window"] = 2
+    ci_budget = new_ci_recovery_budget()
+    ci_budget["developments_used"] = 1
+    ci_budget["failure_head"] = "failed-publication-sha"
     repair_state: dict[str, Any] = {
         "run_id": "run-1",
         "status": "requeue_required",
         "run_acceptance": {
             "phase": "repairing",
-            "ci_recovery": new_ci_recovery_budget(),
+            "review_budget": deepcopy(budget),
+            "review_budget_history": deepcopy(budget_history),
+            "ci_recovery": deepcopy(ci_budget),
             "repair_job": repair,
         },
     }
@@ -293,9 +299,9 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
     assert repair_retired["work_subject"] == "run-repair:run-1"
     assert repair_state["run_acceptance"] == {
         "phase": "pending",
-        "review_budget": _canonical_budget(),
-        "review_budget_history": [],
-        "ci_recovery": new_ci_recovery_budget(),
+        "review_budget": budget,
+        "review_budget_history": budget_history,
+        "ci_recovery": ci_budget,
     }
     assert repair_state["active_agent_invocation"] is None
     assert repair_state["status"] == "run_acceptance_pending"

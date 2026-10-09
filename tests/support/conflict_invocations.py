@@ -29,9 +29,14 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     state, _ = Controller(FixtureGitHubReader(fixture), git, store).start(1)
     base = git.resolve("HEAD")
     common = dict(phase=phase, base_sha=base, candidate_sha=base,
-                  review_budget=new_budget(development_attempts=1, reviewer_invocations=0),
-                  review_budget_history=[], ci_recovery=(new_ticket_ci_recovery_budget() if kind == "ticket" else new_ci_recovery_budget()),
                   modification_attempts=1, development_thread_id="conflict-thread")
+    budgets = dict(
+        review_budget=new_budget(development_attempts=1, reviewer_invocations=0),
+        review_budget_history=[],
+        ci_recovery=new_ticket_ci_recovery_budget() if kind == "ticket" else new_ci_recovery_budget(),
+    )
+    if kind != "run_repair":
+        common.update(budgets)
     if phase == "candidate":
         common["attempt_kind"] = "ci_repair"
     if kind == "ticket":
@@ -80,7 +85,9 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         job = common
         job.update(repair_generation=1, repair_mode="squash", policy_snapshot=dict(state["policy_snapshot"]))
         state["run_acceptance"] = dict(phase="repairing", repair_job=job,
-            policy_snapshot=dict(state["policy_snapshot"]), ci_recovery=new_ci_recovery_budget())
+            policy_snapshot=dict(state["policy_snapshot"]),
+            **budgets,
+            repair_integration_budgets={"1": {"policy_snapshot": dict(state["policy_snapshot"])}})
         subject = f"run-repair:{state['run_id']}"
         key = "run_repair_integration_conflict"
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,

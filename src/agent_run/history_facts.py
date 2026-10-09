@@ -669,7 +669,7 @@ def _history_record_details(
     ]
     record["activity"] = _record_activity(state, record, invocation_values)
     owners = owners_for_attempt(state, attempt_view)
-    artifact = review_artifact_for_attempt(owners, attempt_view, invocation_values)
+    artifact = review_artifact_for_attempt(owners, attempt_view, invocation_values, state=state)
     if artifact is None and isinstance(attempt_view.get("acceptance_artifact"), dict):
         artifact = attempt_view["acceptance_artifact"]
     findings = _artifact_findings(artifact) if isinstance(artifact, dict) else []

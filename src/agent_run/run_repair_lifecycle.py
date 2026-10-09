@@ -331,9 +331,6 @@ class RunRepairLifecycle:
     ) -> dict[str, Any]:
         existing = run.get("repair_job")
         if isinstance(existing, dict):
-            if existing.get("ci_recovery") != run.get("ci_recovery"):
-                raise ValueError("Run and Run Repair CI recovery state differ")
-            existing["ci_recovery"] = run["ci_recovery"]
             self._complete_pending_repair_trigger(state, existing)
             return existing
         ensure_run_repair_base(self.owner, state, run)
@@ -381,10 +378,7 @@ class RunRepairLifecycle:
         run_policy = run_repair_budget_policy_for_job(
             run_state, state_snapshot=state.get("policy_snapshot")
         )
-        run_budget = ensure_budget(run_state, run_policy)
-        run_budget_history = run_state.get("review_budget_history")
-        if not isinstance(run_budget_history, list):
-            raise ValueError("run review_budget_history must be an array")
+        ensure_budget(run_state, run_policy)
         repair_source = str(repair_request.get("repair_source", "acceptance"))
         if repair_source not in {
             "acceptance",
@@ -440,9 +434,6 @@ class RunRepairLifecycle:
             "policy_snapshot": deepcopy(
                 run_state.get("policy_snapshot") or state.get("policy_snapshot")
             ),
-            "review_budget": run_budget,
-            "review_budget_history": run_budget_history,
-            "ci_recovery": run["ci_recovery"],
             "repair_checkout": str(self.owner._repair_checkout(state)),
         }
         for key in (
@@ -489,8 +480,8 @@ class RunRepairLifecycle:
                 raise ValueError("merge-conflict repair evidence must be non-empty")
             job["merge_conflict_evidence"] = evidence
         job["repair_trigger_pending"] = True
-        run.pop("review_budget")
-        run.pop("review_budget_history")
+        windows = run.setdefault("repair_integration_budgets", {})
+        windows[str(generation)] = {"policy_snapshot": deepcopy(job["policy_snapshot"])}
         run["repair_job"] = job
         self._sync_repair_cycle_counters(run, job)
         self.owner._save(state)

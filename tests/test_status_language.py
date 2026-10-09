@@ -320,14 +320,14 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
         "parent": {"number": 1}, "status": "ready_for_human", "diagnostics": [],
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 31,
+            "review_budget": {"window": 4, "development_attempts": 2,
+                              "reviewer_invocations": 1, "final_ci_fix_used": False},
             "repair_cycle": {"generation": 72, "status": "active", "code_modification_attempts": 2},
             "repair_job": {
                 "repair_generation": 99, "phase": "blocked", "candidate_sha": "private-candidate-sha",
                 "blocked_reason": "agent_requires_human", "human_blocker_phase": "reviewing",
                 "human_blockers": ["等待人工处理 / 原始 evidence"],
                 "repair_checkout": "/preserved/development",
-                "review_budget": {"window": 4, "development_attempts": 2,
-                                  "reviewer_invocations": 1, "final_ci_fix_used": False},
             },
         },
         "agent_invocation_history": [{

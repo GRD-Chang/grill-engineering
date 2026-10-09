@@ -218,7 +218,9 @@ def unknown_pr_mutation(
     return None
 
 
-def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
+def candidate_or_acceptance_is_inconsistent(
+    job: dict[str, Any], *, budget_owner: dict[str, Any] | None = None,
+) -> bool:
     """Whether a persisted acceptance cannot be bound to its candidate."""
     candidate = job.get("candidate_sha")
     record = job.get("acceptance_record")
@@ -250,7 +252,8 @@ def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
         or reviewed_candidate != job.get("last_review_candidate_sha")
     ):
         return True
-    budget = job.get("review_budget")
+    owner = budget_owner if budget_owner is not None else job
+    budget = owner.get("ci_recovery" if job.get("attempt_kind") == "ci_repair" else "review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     latest = artifacts[-1] if isinstance(artifacts, list) and artifacts else None
     return not (

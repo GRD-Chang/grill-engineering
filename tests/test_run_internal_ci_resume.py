@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 
-from agent_run.review_budget import review_budget_owner
 
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
@@ -86,17 +85,17 @@ def test_internal_repair_ci_exhaustion_resumes_without_final_pr_evidence(
         assert job["ci_evidence"]["head_sha"] == failed_head
         assert job["ci_evidence"]["pr_number"] == failed_pr
     assert run["ci_recovery"]["failure_head"] == failed_head
-    assert run["ci_recovery"] == job["ci_recovery"]
-    assert review_budget_owner(run)["review_budget"]["development_attempts"] == 1
-    ordinary_budget = review_budget_owner(run)["review_budget"].copy()
+    assert "ci_recovery" not in job
+    assert run["review_budget"]["development_attempts"] == 1
+    ordinary_budget = run["review_budget"].copy()
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         run_id, explicit_resume=True,
     )
     resumed_run = resumed["run_acceptance"]
     assert resumed_run["repair_cycle"]["status"] == "active"
-    assert review_budget_owner(resumed_run)["review_budget"] == ordinary_budget
-    assert resumed_run["ci_recovery"] == resumed_run["repair_job"]["ci_recovery"]
+    assert resumed_run["review_budget"] == ordinary_budget
+    assert "ci_recovery" not in resumed_run["repair_job"]
     assert resumed_run["ci_recovery"]["failure_head"] == failed_head
     assert resumed_run["ci_recovery"]["window"] == 2
     assert resumed_run["ci_recovery"]["developments_used"] == 0

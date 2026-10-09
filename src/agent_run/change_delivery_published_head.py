@@ -8,6 +8,8 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.change_delivery_branches import ensure_linked_branch_display
 from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.change_delivery_contracts import (
@@ -89,7 +91,7 @@ class PublishedHeadStage(ChangeDeliveryStage, Protocol):
         message: str | None = None,
     ) -> bool: ...
 
-    def modification_budget_exhausted(self, job: dict[str, Any]) -> bool: ...
+    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
 
 
 def _publication_operation(
@@ -627,6 +629,7 @@ def publish_and_merge(
     if stage._pause_ticket_if_requested(state, job):
         return True
     merge_intent = job.get("merge_intent")
+    budget_owner = delivery_budget_owner(state, job)
     integration_record = {
         "source": "fallback" if fallback else "ci_repair" if ci_repair else "accepted",
         "policy_snapshot": deepcopy(job.get("policy_snapshot")),
@@ -648,14 +651,14 @@ def publish_and_merge(
             "mergeable": live.get("mergeable"),
         },
         "final_ci_fix_used": (
-            job.get("review_budget", {}).get("final_ci_fix_used")
-            if isinstance(job.get("review_budget"), dict)
+            budget_owner.get("review_budget", {}).get("final_ci_fix_used")
+            if isinstance(budget_owner.get("review_budget"), dict)
             else False
         ),
-        "window": job.get("review_budget", {}).get("window")
-        if isinstance(job.get("review_budget"), dict)
+        "window": budget_owner.get("review_budget", {}).get("window")
+        if isinstance(budget_owner.get("review_budget"), dict)
         else None,
-        "review_budget": deepcopy(job.get("review_budget")),
+        "review_budget": deepcopy(budget_owner.get("review_budget")),
     }
     required_checks_origin = job.get("required_checks_origin")
     if isinstance(required_checks_origin, dict):

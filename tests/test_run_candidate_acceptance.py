@@ -196,6 +196,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "repair_generation": 2,
         "modification_attempts": 3,
         "validation_attempts": 3,
+        "review_budget": dict(ordinary_budget),
+        "review_budget_history": [],
         "development_thread_id": "run-repair-developer",
         "development_thread_history": [],
         "reviewer_thread_ids": [],
@@ -211,8 +213,6 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "run_id": state["run_id"],
         "phase": "escalating",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": dict(ordinary_budget),
-        "review_budget_history": [],
         "repair_attempt": 1,
         "repair_generation": 2,
         "repair_branch": f"agent-run-repair/{state['run_id']}/1",
@@ -386,8 +386,6 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     repair_job = {
         "phase": job_phase,
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "repair_mode": "squash",
         "candidate_sha": candidate_sha,
         "acceptance_record": {
@@ -412,6 +410,8 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
         "acceptance_generation": 4,
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_cycle": {
             "generation": 2,
             "status": "active",
@@ -645,8 +645,6 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     candidate_sha = git.resolve(str(state["run_branch"]))
     job = {
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
         "default_base_sha": git.resolve("main"),
         "candidate_sha": candidate_sha,
         "base_sha": candidate_sha,
@@ -665,10 +663,11 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
         "candidate_acceptance_history": [],
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": job,
     }
     state["run_acceptance"]["ci_recovery"] = new_ci_recovery_budget()
-    job["ci_recovery"] = state["run_acceptance"]["ci_recovery"]
     require_current_run_state(state)
 
 @pytest.mark.parametrize(

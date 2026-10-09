@@ -29,9 +29,8 @@ def _with_canonical_ci_budget(state: dict[str, Any]) -> dict[str, Any]:
     run = state.get("run_acceptance")
     if isinstance(run, dict):
         run.setdefault("ci_recovery", new_ci_recovery_budget())
-        repair = run.get("repair_job")
-        if isinstance(repair, dict):
-            repair.setdefault("ci_recovery", deepcopy(run["ci_recovery"]))
+        run.setdefault("review_budget", _canonical_run_budget())
+        run.setdefault("review_budget_history", [])
     return state
 
 
@@ -83,8 +82,6 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     repair_job: dict[str, object] = {
         "phase": phase,
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
     }
     if repair_mode is not None:
         repair_job["repair_mode"] = repair_mode
@@ -133,8 +130,6 @@ def test_canonical_run_repair_modes_pass_state_validation(
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_mode": repair_mode,
         },
     }
@@ -155,8 +150,6 @@ def test_run_repair_snapshot_is_required_for_materialized_projections(
         "repair_job": {
             "phase": "developing",
             "policy_snapshot": repair_snapshot,
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_mode": "squash",
         },
     }
@@ -231,7 +224,7 @@ def test_run_repair_rejects_duplicate_budget_owners(
         },
     }
 
-    with pytest.raises(IncompatibleRunStateError, match="one Review Budget owner"):
+    with pytest.raises(IncompatibleRunStateError, match="must not persist delivery budgets"):
         _require_repair_state(state)
 
 
@@ -246,8 +239,6 @@ def test_run_repair_cannot_use_ticket_fallback_authority(
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "fallback_publication_receipt": {},
         },
     }
@@ -266,8 +257,6 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
         "repair_job": {
             "phase": "candidate",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
         },
     }
 
@@ -286,8 +275,6 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
             "phase": "waiting_checks",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "pr_number": 17,
             "publication_sha": "repair-head",
         },
@@ -308,8 +295,6 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
             "phase": "developing",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "required_checks": "fail",
             "required_checks_mode": "configured",
             "required_checks_evidence": {
@@ -347,8 +332,6 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
             "phase": "waiting_checks",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "pr_number": 17,
             "publication_sha": "repair-head",
             "required_checks_evidence": {
@@ -449,13 +432,12 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
         "repair_job": {
             "phase": phase,
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": marker,
         },
     }
     state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    _with_canonical_ci_budget(state)
     state_path.write_text(json.dumps(state), encoding="utf-8")
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
@@ -481,8 +463,6 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
         "repair_job": {
             "phase": "candidate",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": _integrated_revalidation_merge(),
         },
@@ -501,8 +481,6 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
         "repair_job": {
             "phase": "completed",
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": _integrated_revalidation_merge(),
         },
@@ -510,3 +488,26 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
 
     with pytest.raises(IncompatibleRunStateError, match="phase"):
         _require_repair_state(state)
+
+
+def test_resume_rejects_previous_budget_protocol_without_changing_materials(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    assert state["review_budget_protocol"] == 2
+    state["review_budget_protocol"] = 1
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = state_path.read_bytes()
+    fixture_before = fixture.read_bytes()
+    refs_before = _git_refs(managed_repo(git_repo))
+
+    rejected = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "incompatible_run_state"
+    assert state_path.read_bytes() == before
+    assert fixture.read_bytes() == fixture_before
+    assert _git_refs(managed_repo(git_repo)) == refs_before

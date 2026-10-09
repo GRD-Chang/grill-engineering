@@ -32,24 +32,30 @@ class ReviewDecision(str, Enum):
     CI_EXHAUSTED = "ci_development_budget_exhausted"
 
 
-def review_is_due(job: dict[str, Any], policy: ReviewBudgetPolicy) -> bool:
+def review_is_due(
+    job: dict[str, Any], policy: ReviewBudgetPolicy,
+    *, budget_owner: dict[str, Any] | None = None,
+) -> bool:
     """An interrupted semantic review may finish even at the window ceiling."""
+    owner = budget_owner if budget_owner is not None else job
     return (
         pending_semantic_attempt(job, role="reviewer") is not None
         or job.get("parent_integration_stage") is True
         or job.get("attempt_kind") == "ci_repair"
-        or can_start_review(job, policy)
+        or can_start_review(owner, policy)
     )
 
 
 def after_review(
-    job: dict[str, Any], policy: ReviewBudgetPolicy, artifact: AcceptanceArtifact
+    job: dict[str, Any], policy: ReviewBudgetPolicy, artifact: AcceptanceArtifact,
+    *, budget_owner: dict[str, Any] | None = None,
 ) -> ReviewDecision:
     """Finite outcome rules shared by demand and full Parent acceptance.
 
     A finding never authorizes fallback. Only a later eligible Ticket Candidate
     can obtain that authority at the pre-review gate. CI keeps its own window.
     """
+    owner = budget_owner if budget_owner is not None else job
     if artifact.is_accepted:
         return ReviewDecision.ACCEPT
     if artifact.requires_human:
@@ -59,14 +65,14 @@ def after_review(
     if job.get("attempt_kind") == "ci_repair":
         limit = ci_limit_for_job(job)
         if checkpoint_after_reviewer_failure(
-            job, limit=limit,
+            owner, limit=limit,
             is_ticket=policy.budget_scope == "ticket",
         ):
             return ReviewDecision.CI_EXHAUSTED
         return ReviewDecision.REPAIR
-    if not policy.fallback and not can_start_review(job, policy):
+    if not policy.fallback and not can_start_review(owner, policy):
         return ReviewDecision.REVIEW_EXHAUSTED
-    if not can_start_development(job, policy):
+    if not can_start_development(owner, policy):
         return ReviewDecision.DEVELOPMENT_EXHAUSTED
     return ReviewDecision.REPAIR
 

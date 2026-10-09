@@ -5,6 +5,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.acceptance_facts import (
     current_findings,
     current_artifact,
@@ -1038,7 +1040,7 @@ def _current_conclusion(
             return "验收状态无法确认"
         if activity == "not_running":
             return "验收等待执行"
-        review_kind = "复验" if has_prior_acceptance_failure(subject) else "首次验收"
+        review_kind = "复验" if has_prior_acceptance_failure(subject, budget_owner=delivery_budget_owner(state, subject)) else "首次验收"
         if activity == "capacity_wait":
             return f"模型容量不足，等待自动续接{review_kind}"
         if activity == "recovery_wait":
@@ -1061,7 +1063,7 @@ def _current_conclusion(
         and subject.get("repair_source") == "acceptance"
     ):
         return "修复完成，待复验"
-    artifact = current_artifact(subject)
+    artifact = current_artifact(subject, budget_owner=delivery_budget_owner(state, subject))
     if artifact is not None:
         checks = artifact.get("checks")
         if isinstance(checks, dict):

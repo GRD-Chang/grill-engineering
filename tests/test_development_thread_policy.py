@@ -59,7 +59,7 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
             development_thread_is_allowed=lambda state, thread: True,
         ),
         agents=SimpleNamespace(develop=worker), contract=SimpleNamespace(label="ticket:1"),
-        mark_development_attempt=lambda job, attempt_kind: mark_development(job, TICKET_POLICY, attempt_kind=attempt_kind),
+        mark_development_attempt=lambda state, job, *, attempt_kind: mark_development(job, TICKET_POLICY, attempt_kind=attempt_kind),
         review_budget_policy=lambda: TICKET_POLICY,
         _reject_stale=lambda *args: None, _invocation_boundary=lambda job: {"base_sha": "base"},
         _invocation_events=lambda *args, **kwargs: lambda *args, **kwargs: None,

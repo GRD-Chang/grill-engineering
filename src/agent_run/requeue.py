@@ -12,7 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from agent_run.review_budget import remove_repair_job
+from agent_run.run_repair_cycle import remove_repair_job
 
 
 class RequeueError(ValueError):

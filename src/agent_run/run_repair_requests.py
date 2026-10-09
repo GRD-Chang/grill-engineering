@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
@@ -178,7 +180,7 @@ class RunRepairRequests:
                     "default_base_sha": baseline.get("reviewed_default_base_sha"),
                     "expected_merge_tree": baseline.get("expected_merge_tree"),
                 }
-        previous = previous_review_context(job)
+        previous = previous_review_context(delivery_budget_owner(state, job))
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]

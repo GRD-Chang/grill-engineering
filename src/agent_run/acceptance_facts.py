@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.review_budget import review_budget_owner
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.delivery_facts import current_work_subject
 
 def current_findings(state: dict[str, Any]) -> list[str]:
@@ -11,7 +11,7 @@ def current_findings(state: dict[str, Any]) -> list[str]:
     if current is None:
         return []
     subject = acceptance_subject(state, current)
-    artifact = current_artifact(subject)
+    artifact = current_artifact(subject, budget_owner=delivery_budget_owner(state, subject))
     if artifact is not None:
         return artifact_findings(artifact)
     if subject.get("phase") in {
@@ -75,7 +75,9 @@ def artifact_has_failures(artifact: dict[str, Any]) -> bool:
     )
 
 
-def current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
+def current_artifact(
+    subject: dict[str, Any], *, budget_owner: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return only an artifact proven to belong to the current candidate."""
 
     candidate = subject_candidate_identity(subject)
@@ -91,7 +93,7 @@ def current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
             return artifact
         return None
 
-    budget = review_budget_owner(subject).get("review_budget")
+    budget = (subject if budget_owner is None else budget_owner).get("review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     if isinstance(artifacts, list):
         for review in reversed(artifacts):
@@ -116,7 +118,8 @@ def current_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
     current = current_work_subject(state)
     if current is None:
         return completed_acceptance_artifact(state)
-    return current_artifact(acceptance_subject(state, current))
+    subject = acceptance_subject(state, current)
+    return current_artifact(subject, budget_owner=delivery_budget_owner(state, subject))
 
 
 def completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -130,7 +133,7 @@ def completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | Non
             "merged",
         }:
             continue
-        artifact = current_artifact(subject)
+        artifact = current_artifact(subject, budget_owner=delivery_budget_owner(state, subject))
         if not isinstance(artifact, dict):
             continue
         checks = artifact.get("checks")
@@ -282,7 +285,9 @@ def subject_candidate_identity(subject: dict[str, Any]) -> object:
     return None
 
 
-def has_prior_acceptance_failure(subject: dict[str, Any]) -> bool:
+def has_prior_acceptance_failure(
+    subject: dict[str, Any], *, budget_owner: dict[str, Any] | None = None,
+) -> bool:
     if isinstance(subject.get("unresolved_acceptance_artifact"), dict):
         return True
     record = subject.get("acceptance_record")
@@ -300,7 +305,7 @@ def has_prior_acceptance_failure(subject: dict[str, Any]) -> bool:
             and artifact_has_failures(artifact)
         ):
             return True
-    budget = review_budget_owner(subject).get("review_budget")
+    budget = (subject if budget_owner is None else budget_owner).get("review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     if not isinstance(artifacts, list):
         return False

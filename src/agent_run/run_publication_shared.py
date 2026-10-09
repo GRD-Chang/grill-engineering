@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_run.review_budget import remove_repair_job
+from agent_run.run_repair_cycle import remove_repair_job
 
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact

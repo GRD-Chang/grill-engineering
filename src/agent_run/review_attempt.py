@@ -27,22 +27,27 @@ def review_ordinal(job: dict[str, Any]) -> int:
 def begin_review(
     job: dict[str, Any], *, work_subject: str, generation: int,
     boundary: dict[str, Any], budget_window: int,
+    budget_owner: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ordinal = review_ordinal(job)
-    ci_budget = job.get("ci_recovery")
+    owner = budget_owner if budget_owner is not None else job
+    ci_budget = owner.get("ci_recovery")
     if job.get("attempt_kind") == "ci_repair" and isinstance(ci_budget, dict) and "developments_used" in ci_budget:
         budget_window = int(ci_budget["window"])
     job["validation_attempts"] = ordinal
     return allocate_semantic_attempt(
         job, role="reviewer", work_subject=work_subject, generation=generation,
         currentness_boundary=boundary, ordinal=ordinal, budget_window=budget_window,
+        budget_owner=owner,
     )
 
 
 def consume_review_result(
     job: dict[str, Any], policy: ReviewBudgetPolicy, raw: object,
+    *, budget_owner: dict[str, Any] | None = None,
 ) -> AcceptanceArtifact:
     """Only a valid role result consumes the existing attempt, exactly once."""
+    owner = budget_owner if budget_owner is not None else job
     artifact = AcceptanceArtifact.parse(raw)
     attempt = pending_semantic_attempt(job, role="reviewer")
     if attempt is None:
@@ -51,9 +56,9 @@ def consume_review_result(
         if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
             pass  # Review is bounded by cumulative integration Development.
         elif job.get("attempt_kind") == "ci_repair":
-            mark_ci_review_invocation(job)
+            mark_ci_review_invocation(owner)
         else:
-            mark_review(job, policy)
+            mark_review(owner, policy)
         attempt["budget_consumed"] = True
     return artifact
 

@@ -14,6 +14,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.review_context import review_context_is_current
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import parent_only_budget_policy_for_job
@@ -243,7 +244,7 @@ class ChangeDeliveryEngine:
         self._current_job = job
         self._agent_work_allowed = allow_agent
         try:
-            ensure_budget(job, self.review_budget_policy())
+            ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
             if self._pause_ticket_if_requested(state, job):
                 return self._step_result(state, job)
             self._require_ticket_publication_authorization(job)
@@ -412,7 +413,7 @@ class ChangeDeliveryEngine:
             elif attempt_kind == "ci_repair":
                 limit = ci_limit_for_job(job)
                 if not can_start_ci_repair(
-                    job,
+                    delivery_budget_owner(state, job),
                     limit=limit,
                     is_ticket=self.contract.label.startswith("ticket-"),
                 ):
@@ -422,7 +423,7 @@ class ChangeDeliveryEngine:
                     )
                     return
             elif not can_start_development(
-                job, self.review_budget_policy(), attempt_kind=attempt_kind
+                delivery_budget_owner(state, job), self.review_budget_policy(), attempt_kind=attempt_kind
             ):
                 self._checkpoint_budget(
                     state,
@@ -547,13 +548,13 @@ class ChangeDeliveryEngine:
     ) -> bool:
         return publish_and_merge(self, state, job, checkout)
 
-    def modification_budget_exhausted(self, job: dict[str, Any]) -> bool:
-        return not can_start_development(job, self.review_budget_policy())
+    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        return not can_start_development(delivery_budget_owner(state, job), self.review_budget_policy())
 
     def _refund_unstarted_credential_invocation(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None:
-        budget = ensure_budget(job, self.review_budget_policy())
+        budget = ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
         semantic_attempt = pending_semantic_attempt(job)
         if semantic_attempt is None:
             return
@@ -587,7 +588,7 @@ class ChangeDeliveryEngine:
             if job.get("pending_attempt_kind") == "ci_repair":
                 limit = ci_limit_for_job(job)
                 refund_ci_repair_without_candidate(
-                    job,
+                    delivery_budget_owner(state, job),
                     limit=limit,
                     is_ticket=self.contract.label.startswith("ticket-"),
                 )
@@ -617,30 +618,30 @@ class ChangeDeliveryEngine:
             self.contract.label
         )
 
-    def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool:
+    def review_budget_exhausted_for_review(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         if job.get("attempt_kind") == "ci_repair":
             return False
-        return not can_start_review(job, self.review_budget_policy())
+        return not can_start_review(delivery_budget_owner(state, job), self.review_budget_policy())
 
     def mark_development_attempt(
-        self, job: dict[str, Any], *, attempt_kind: str
+        self, state: dict[str, Any], job: dict[str, Any], *, attempt_kind: str
     ) -> int:
         if attempt_kind == "ci_repair":
             limit = ci_limit_for_job(job)
             return mark_ci_repair(
-                job,
+                delivery_budget_owner(state, job),
                 limit=limit,
                 is_ticket=self.contract.label.startswith("ticket-"),
             )
         return mark_development(
-            job, self.review_budget_policy(), attempt_kind=attempt_kind
+            delivery_budget_owner(state, job), self.review_budget_policy(), attempt_kind=attempt_kind
         )
 
     def _checkpoint_ci_budget(
         self, state: dict[str, Any], job: dict[str, Any], code: str
     ) -> None:
         job.update({"phase": "escalating", "escalation_code": code})
-        job["ci_recovery"]["checkpoint_reason"] = code
+        delivery_budget_owner(state, job)["ci_recovery"]["checkpoint_reason"] = code
         self.save(state)
 
     def _prepare_ticket_ci_publication_authorization(
@@ -660,7 +661,7 @@ class ChangeDeliveryEngine:
         message: str,
     ) -> None:
         job.update({"phase": "escalating", "escalation_code": code})
-        budget = ensure_budget(job, self.review_budget_policy())
+        budget = ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
         budget["checkpoint_reason"] = code
         self.save(state)
 
