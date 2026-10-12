@@ -20,7 +20,13 @@ from agent_run.cli import (
 from agent_run.state import StateStore
 from support.cli_fixtures import run_agents
 from support.seeding import seed_run, write_fixture
-from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli import (
+    load_only_run_state,
+    read_run_state_bytes,
+    run_cli,
+    snapshot_run_states,
+    stdout_json,
+)
 from support.cli_payloads import publication, ticket
 
 
@@ -432,10 +438,9 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = str(stdout_json(seed_run(git_repo, fixture))["run_id"])
     state_root = managed_state(git_repo)
-    state_path = state_root / "runs" / f"{run_id}.json"
     profile_path = state_root / "profiles" / f"{run_id}.json"
     profile_before = json.loads(profile_path.read_bytes())
-    state_before = state_path.read_bytes()
+    state_before = read_run_state_bytes(git_repo, run_id)
     task_control = state_root / "task-control"
     control_before = {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
@@ -452,7 +457,7 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     assert configured.returncode == 0, configured.stdout
     assert "配置状态: 已保存" in configured.stdout
     assert run_id not in configured.stdout
-    assert state_path.read_bytes() == state_before
+    assert read_run_state_bytes(git_repo, run_id) == state_before
     assert {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
     } == control_before
@@ -610,4 +615,4 @@ def test_parent_mutation_selector_reports_missing_repository_and_ambiguity(
     assert str(git_repo) not in human_ambiguous.stdout
     assert "state_dir" not in human_ambiguous.stdout
     assert "repository_root" not in human_ambiguous.stdout
-    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 2
+    assert len(snapshot_run_states(git_repo)) == 2

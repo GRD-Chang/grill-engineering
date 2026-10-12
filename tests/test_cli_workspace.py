@@ -9,8 +9,8 @@ import pytest
 
 from agent_run.managed_workspace import ManagedWorkspace
 from agent_run.task_control import TaskControlStore, TaskKey
+from support.cli import issue, run_cli, snapshot_run_states, stdout_json
 from support.seeding import seed_idle_control, seed_run, write_fixture
-from support.cli import run_cli, issue, stdout_json
 
 
 def _files(root: Path) -> dict[str, bytes]:
@@ -100,8 +100,7 @@ def test_two_clones_and_outside_repo_commands_reuse_one_task(
         output = stdout_json(result)
         assert output.get("run_id") == run_id, f"{command}: {json.dumps(output, ensure_ascii=False)}"
 
-    workspace = ManagedWorkspace.for_repository("example/project")
-    assert [path.stem for path in (workspace.state_root / "runs").glob("*.json")] == [run_id]
+    assert list(snapshot_run_states(git_repo)) == [run_id]
     assert all(_files(repo) == before for repo, before in originals.items())
     assert not list(outside.iterdir())
 
@@ -133,8 +132,7 @@ def test_different_parents_keep_independent_unfinished_tasks(
         run_ids[parent] = output["run_id"]
 
     assert len(set(run_ids.values())) == 2
-    workspace = ManagedWorkspace.for_repository("example/project")
-    assert {path.stem for path in (workspace.state_root / "runs").glob("*.json")} == set(run_ids.values())
+    assert set(snapshot_run_states(git_repo)) == set(run_ids.values())
     for parent, fixture in fixtures.items():
         status = run_cli(
             tmp_path, fixture, "status", "--repo", "example/project", "--parent", str(parent), "--json",
@@ -163,8 +161,7 @@ def test_state_override_cannot_write_into_user_repository(
     assert any("统一状态目录" in item["message"] for item in output["diagnostics"])
     assert not override.exists()
     assert _files(git_repo) == before
-    workspace = ManagedWorkspace.for_repository("example/project")
-    assert not list((workspace.state_root / "runs").glob("*.json"))
+    assert snapshot_run_states(git_repo) == {}
 
 
 @pytest.mark.parametrize("command", ["stop", "abandon"])

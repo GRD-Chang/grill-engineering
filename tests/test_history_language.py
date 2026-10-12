@@ -9,9 +9,8 @@ from typing import Any
 import pytest
 from rich.text import Text
 
-from support.workspace import managed_state
-
 from agent_run.cli import main
+from support.cli import read_run_state_bytes, replace_only_run_state
 from support.seeding import seed_run, write_fixture
 
 
@@ -48,16 +47,17 @@ def publication_events() -> list[dict[str, Any]]:
     ]
 
 
-def save_history(repo: Path, events: list[dict[str, Any]]) -> tuple[str, Path]:
+def save_history(
+    repo: Path, events: list[dict[str, Any]]
+) -> tuple[str, dict[str, Any]]:
     fixture = write_fixture(repo / "github.json", issues={})
     started = seed_run(repo, fixture, idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    path = managed_state(repo) / "runs" / f"{run_id}.json"
-    state = json.loads(path.read_text())
-    state["timeline"] = events
-    path.write_text(json.dumps(state))
-    return run_id, path
+    state = replace_only_run_state(
+        repo, lambda persisted: persisted.update(timeline=events)
+    )
+    return run_id, state
 
 
 def render(run_id: str, *arguments: str) -> str:
@@ -73,10 +73,10 @@ def test_history_groups_final_pr_preparation_without_hiding_checks_or_raw_events
 ) -> None:
     assert main(["settings", "configure", "--language", language, "--json"]) == 0
     events = publication_events()
-    run_id, path = save_history(git_repo, events)
+    run_id, _ = save_history(git_repo, events)
+    before_state_bytes = read_run_state_bytes(git_repo, run_id)
     # Personal changes affect future Runs, not this frozen Run.
     assert main(["settings", "configure", "--language", "en" if language == "zh" else "zh", "--json"]) == 0
-    before = path.read_bytes()
     monkeypatch.chdir(git_repo)
     # Exercise Rich even when the developer's shell requests plain output.
     monkeypatch.delenv("NO_COLOR", raising=False)
@@ -107,7 +107,7 @@ def test_history_groups_final_pr_preparation_without_hiding_checks_or_raw_events
                 assert "".join(description.split()) in visible_content
     audit = json.loads(render(run_id, "--json"))
     assert audit["timeline"] == events
-    assert path.read_bytes() == before
+    assert read_run_state_bytes(git_repo, run_id) == before_state_bytes
 
 
 @pytest.mark.parametrize("boundary", ["failure", "different_attempt", "unfinished"])

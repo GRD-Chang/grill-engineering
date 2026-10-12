@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import agent_run.cli as cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.controller import Controller
@@ -253,11 +253,94 @@ def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
 def load_only_run_state(
     repo: Path, *, extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    run_files = list((managed_state(repo, extra_env=extra_env) / "runs").glob("*.json"))
-    assert len(run_files) == 1
-    loaded: object = json.loads(run_files[0].read_text(encoding="utf-8"))
-    assert isinstance(loaded, dict)
+    """Read the sole persisted Run, including rejected historical records.
+
+    This helper deliberately uses the StateStore's raw record reader.  Several
+    negative CLI tests need to inspect the durable fact after the product has
+    rejected an incompatible lifecycle state; ``load_current_run`` would
+    replace that fact with a materials error before the test can assert it.
+    """
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    run_ids = states.list_run_ids()
+    assert len(run_ids) == 1
+    loaded = states.load_run(run_ids[0])
+    assert loaded is not None
     return loaded
+
+
+def snapshot_run_states(
+    repo: Path, *, extra_env: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read all legal Run records through the shared StateStore boundary."""
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    snapshot: dict[str, dict[str, Any]] = {}
+    for run_id in states.list_run_ids():
+        state = states.load_current_run(run_id)
+        assert state is not None
+        snapshot[run_id] = state
+    return snapshot
+
+
+def modify_only_run_state(
+    repo: Path,
+    mutate: Callable[[dict[str, Any]], None],
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Apply a test-only change to the sole legal Run through StateStore."""
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    state = load_only_run_state(repo, extra_env=extra_env)
+    mutate(state)
+    states.save_run(str(state["run_id"]), state)
+    saved = states.load_current_run(str(state["run_id"]))
+    assert saved is not None
+    return saved
+
+
+def save_run_state(
+    repo: Path, state: dict[str, Any], *, extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Persist one legal Run fixture through the shared StateStore boundary."""
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    run_id = str(state["run_id"])
+    states.save_run(run_id, state)
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    return saved
+
+
+def replace_only_run_state(
+    repo: Path,
+    mutate: Callable[[dict[str, Any]], None],
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Replace the sole Run fixture without save-time timeline normalization.
+
+    History tests use this only to install an exact, already-valid event list.
+    The storage layout remains private to this shared helper while the test
+    keeps the product's durable event projection unchanged.
+    """
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    state = load_only_run_state(repo, extra_env=extra_env)
+    mutate(state)
+    destination = states.runs_directory / f"{state['run_id']}.json"
+    destination.write_text(json.dumps(state), encoding="utf-8")
+    return state
+
+
+def read_run_state_bytes(
+    repo: Path, run_id: str, *, extra_env: dict[str, str] | None = None,
+) -> bytes:
+    """Read one Run's exact durable bytes for a file-level immutability check."""
+
+    states = StateStore(managed_state(repo, extra_env=extra_env))
+    return (states.runs_directory / f"{run_id}.json").read_bytes()
 
 
 def failed_invocation(

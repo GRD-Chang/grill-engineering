@@ -55,7 +55,7 @@ from agent_run.task_control import (
 from support.seeding import seed_idle_control, seed_run, write_fixture
 from support.cli_fixtures import run_agents
 from support.cli_supervision import _parent_only_agents
-from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli import load_only_run_state, run_cli, snapshot_run_states, stdout_json
 from support.cli_payloads import ticket
 from support.cli_crash import DevelopmentBoundary, run_cli_at_development_boundary
 
@@ -1992,10 +1992,7 @@ def test_different_parent_runs_reach_agents_without_shared_state_lock(
         results = [process.communicate(timeout=30) for process in processes]
         for process, (stdout, stderr) in zip(processes, results):
             assert process.returncode == 0, f"{stdout}\n{stderr}"
-        states = [
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in sorted((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
-        ]
+        states = list(snapshot_run_states(git_repo, extra_env=environment).values())
         assert len(states) == 2
         assert {state["parent"]["number"] for state in states} == {1, 2}
     finally:

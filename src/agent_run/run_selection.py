@@ -174,25 +174,20 @@ def _verified_locator_checkout(
 def read_state_directory(
     state_dir: Path, repository_root: Path | None, *, read_only: bool = False
 ) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
-    runs_directory = state_dir / "runs"
-    if not runs_directory.is_dir():
-        return []
-    paths: list[Path] = []
-    for path in runs_directory.glob("*.json"):
-        paths.append(path)
-        if len(paths) > MAX_LOCATOR_ENTRIES:
-            raise RunLocatorError(
-                "run_locator_invalid",
-                error_message('cli.error.too_many_runs' ,value0=MAX_LOCATOR_ENTRIES),
-            )
-    paths.sort(key=lambda path: path.name)
+    try:
+        run_ids = StateStore(state_dir).list_run_ids(limit=MAX_LOCATOR_ENTRIES)
+    except ValueError as error:
+        raise RunLocatorError(
+            "run_locator_invalid",
+            error_message('cli.error.too_many_runs' ,value0=MAX_LOCATOR_ENTRIES),
+        ) from error
     repository_root_value = (
         str(repository_root.resolve()) if repository_root is not None else "unavailable"
     )
     records: list[tuple[dict[str, object], dict[str, Any] | None]] = []
-    for path in paths:
+    for run_id in run_ids:
         entry: LocatorEntry = {
-            "run_id": path.stem,
+            "run_id": run_id,
             "repository_root": repository_root_value,
             "state_dir": str(state_dir.resolve()),
             "updated_at": "",
@@ -216,70 +211,69 @@ def _read_locator_entry(
     if Path(run_id).name != run_id:
         return _candidate(entry, error=error_message("cli.error.unsafe_run_id")), None
     state_dir = Path(entry["state_dir"])
-    state_path = state_dir / "runs" / f"{run_id}.json"
+    states = StateStore(state_dir)
     state: dict[str, Any] | None = None
     state_error: str | None = None
-    if not state_path.is_file():
+    if not states.has_run(run_id):
         state_error = error_message("cli.error.state_missing")
     else:
         try:
             # Identity must be checked before validating the lifecycle payload:
             # a broken payload cannot hide a contradictory routing identity.
-            state = StateStore(state_dir).load_run(run_id)
+            state = states.load_run(run_id)
         except (OSError, ValueError) as error:
             state_error = bounded_error(str(error))
         if state is None:
-            if state_error is None:
-                state_error = error_message("cli.error.run_id_mismatch")
-        elif state.get("run_id") != run_id:
+            state_error = state_error or error_message("cli.error.run_id_mismatch")
+    if state is not None and state.get("run_id") != run_id:
+        return _candidate(
+            entry,
+            error=error_message("cli.error.run_id_mismatch"),
+            identity_conflict=True,
+        ), None
+    if state is not None:
+        repository = state.get("repository")
+        parent = state.get("parent")
+        parent_number = parent.get("number") if isinstance(parent, dict) else None
+        if (
+            (
+                repository is not None
+                and (
+                    not isinstance(repository, str)
+                    or len(repository.split("/")) != 2
+                    or not all(repository.split("/"))
+                    or any(character.isspace() for character in repository)
+                )
+            )
+            or (
+                parent_number is not None
+                and (type(parent_number) is not int or parent_number <= 0)
+            )
+        ):
             return _candidate(
                 entry,
-                error=error_message("cli.error.run_id_mismatch"),
+                error=error_message("cli.error.identity_format"),
                 identity_conflict=True,
             ), None
-        if state is not None:
-            repository = state.get("repository")
-            parent = state.get("parent")
-            parent_number = parent.get("number") if isinstance(parent, dict) else None
-            if (
-                (
-                    repository is not None
-                    and (
-                        not isinstance(repository, str)
-                        or len(repository.split("/")) != 2
-                        or not all(repository.split("/"))
-                        or any(character.isspace() for character in repository)
-                    )
-                )
-                or (
-                    parent_number is not None
-                    and (type(parent_number) is not int or parent_number <= 0)
-                )
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_format"),
-                    identity_conflict=True,
-                ), None
-            if repository is None or parent_number is None:
-                state_error = error_message("cli.error.identity_missing")
-        if state is not None and "repository" in entry:
-            parent = state.get("parent")
-            if (
-                not same_repository(state.get("repository"), entry["repository"])
-                or not isinstance(parent, dict)
-                or parent.get("number") != entry["parent_number"]
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_mismatch"),
-                    identity_conflict=True,
-                ), None
-        if state is not None:
-            try:
-                _require_supported_state(state, read_only=read_only)
-            except IncompatibleRunStateError as error:
-                state_error = bounded_error(str(error))
+        if repository is None or parent_number is None:
+            state_error = error_message("cli.error.identity_missing")
+    if state is not None and "repository" in entry:
+        parent = state.get("parent")
+        if (
+            not same_repository(state.get("repository"), entry["repository"])
+            or not isinstance(parent, dict)
+            or parent.get("number") != entry["parent_number"]
+        ):
+            return _candidate(
+                entry,
+                error=error_message("cli.error.identity_mismatch"),
+                identity_conflict=True,
+            ), None
+    if state is not None:
+        try:
+            _require_supported_state(state, read_only=read_only)
+        except IncompatibleRunStateError as error:
+            state_error = bounded_error(str(error))
     if state is None and state_error is not None:
         if not verify_checkout:
             return _candidate(entry, error=state_error), None
@@ -527,5 +521,3 @@ def selected_local_run_id(
             [selected],
         )
     return selected_run_id
-
-

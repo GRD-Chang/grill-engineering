@@ -100,6 +100,40 @@ def test_run_state_persistence_rejects_oversized_write_and_read(
         store.load_run("run-external")
 
 
+def test_run_discovery_lists_ids_without_loading_or_creating_state(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+
+    assert store.list_run_ids() == []
+    assert not store.has_run("missing")
+    assert not store.root.exists()
+
+    store.runs_directory.mkdir(parents=True)
+    (store.runs_directory / "broken.json").write_text("{", encoding="utf-8")
+    (store.runs_directory / "usable.json").write_text(
+        json.dumps({"run_id": "usable"}), encoding="utf-8"
+    )
+
+    assert store.list_run_ids() == ["broken", "usable"]
+    assert store.has_run("broken")
+    assert store.load_run("usable") == {"run_id": "usable"}
+    with pytest.raises(json.JSONDecodeError):
+        store.load_run("broken")
+
+
+def test_run_discovery_enforces_a_caller_supplied_bound_without_loading_records(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    store.runs_directory.mkdir(parents=True)
+    for run_id in ("run-a", "run-b"):
+        (store.runs_directory / f"{run_id}.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exceeds the requested limit"):
+        store.list_run_ids(limit=1)
+
+
 def test_state_save_preserves_shared_input_while_redacting_its_durable_copy(
     tmp_path: Path,
 ) -> None:

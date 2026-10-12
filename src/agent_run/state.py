@@ -325,6 +325,36 @@ class StateStore:
             raise ValueError(f"Invalid run state: {path}")
         return loaded
 
+    def has_run(self, run_id: str) -> bool:
+        """Return whether a persisted Run record exists without reading it.
+
+        Discovery callers must not reconstruct the ``runs/<id>.json`` layout
+        themselves.  Keeping this check here also preserves the distinction
+        between a missing record and a record whose contents cannot be read.
+        """
+
+        return (self.runs_directory / f"{run_id}.json").is_file()
+
+    def list_run_ids(self, *, limit: int | None = None) -> list[str]:
+        """List persisted Run IDs without loading or changing their records.
+
+        A bounded caller can stop discovery before materializing an unbounded
+        number of filenames.  Record contents are intentionally not parsed;
+        callers that need per-Run diagnostics can load each ID independently
+        so one damaged record does not hide usable records beside it.
+        """
+
+        if limit is not None and limit < 0:
+            raise ValueError("Run ID listing limit must not be negative")
+        if not self.runs_directory.is_dir():
+            return []
+        run_ids: list[str] = []
+        for path in self.runs_directory.glob("*.json"):
+            run_ids.append(path.stem)
+            if limit is not None and len(run_ids) > limit:
+                raise ValueError("Run ID listing exceeds the requested limit")
+        return sorted(run_ids)
+
     def load_current_run(self, run_id: str) -> dict[str, Any] | None:
         """Load only the one supported persisted Run contract."""
 

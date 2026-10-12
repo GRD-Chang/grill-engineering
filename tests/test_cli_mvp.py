@@ -5,6 +5,7 @@ import shlex
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -18,7 +19,11 @@ from support.workspace import managed_repo, managed_state
 from support.cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
+    read_run_state_bytes,
+    replace_only_run_state,
     run_cli,
+    save_run_state,
+    snapshot_run_states,
     stdout_json,
 )
 from support.cli_payloads import passing_acceptance, publication, repair_acceptance, ticket
@@ -154,13 +159,9 @@ def test_displayed_final_approval_selects_the_unique_active_run(
     assert approved.returncode == 0, (approved.stdout, approved.stderr)
     assert stdout_json(approved)["run_id"] == second_run_id
     assert stdout_json(approved)["status"] == "completed"
-    runs_dir = managed_state(git_repo) / "runs"
-    first_state = json.loads(
-        (runs_dir / f"{first_run_id}.json").read_text(encoding="utf-8")
-    )
-    second_state = json.loads(
-        (runs_dir / f"{second_run_id}.json").read_text(encoding="utf-8")
-    )
+    states = snapshot_run_states(git_repo)
+    first_state = states[first_run_id]
+    second_state = states[second_run_id]
     assert first_state["status"] == "completed"
     assert second_state["status"] == "completed"
 
@@ -174,12 +175,9 @@ def test_parent_approval_selector_refuses_two_approval_ready_runs(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
     run_id = str(stdout_json(pending)["run_id"])
-    original_path = managed_state(git_repo) / "runs" / f"{run_id}.json"
     duplicate_id = f"{run_id}-duplicate"
-    duplicate_path = original_path.with_name(f"{duplicate_id}.json")
-    duplicate = json.loads(
-        original_path.read_text(encoding="utf-8").replace(run_id, duplicate_id)
-    )
+    original = snapshot_run_states(git_repo)[run_id]
+    duplicate = json.loads(json.dumps(original).replace(run_id, duplicate_id))
     attempt_ids: dict[str, str] = {}
 
     def rebind_attempts(value: object) -> None:
@@ -231,10 +229,10 @@ def test_parent_approval_selector_refuses_two_approval_ready_runs(
 
     rebind_attempts(duplicate)
     duplicate = replace_attempt_references(duplicate)
-    duplicate_path.write_text(json.dumps(duplicate), encoding="utf-8")
+    save_run_state(git_repo, duplicate)
     before = {
-        original_path: original_path.read_bytes(),
-        duplicate_path: duplicate_path.read_bytes(),
+        run_id: read_run_state_bytes(git_repo, run_id),
+        duplicate_id: read_run_state_bytes(git_repo, duplicate_id),
     }
 
     ambiguous = run_cli(git_repo, fixture, "approve", "1", "--repo", "example/project")
@@ -243,7 +241,10 @@ def test_parent_approval_selector_refuses_two_approval_ready_runs(
     assert stdout_json(ambiguous)["diagnostics"][0]["code"] == (
         "run_selector_ambiguous"
     )
-    assert {path: path.read_bytes() for path in before} == before
+    assert {
+        run_id: read_run_state_bytes(git_repo, run_id),
+        duplicate_id: read_run_state_bytes(git_repo, duplicate_id),
+    } == before
 
 
 def test_current_long_blocker_is_full_in_status_and_bounded_in_history(
@@ -320,8 +321,7 @@ def test_history_continues_after_timeline_capacity_without_new_invocations(
         for _ in range(255)
     ]
     state.pop("timeline_at_capacity", None)
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
 
     approved = run_cli(git_repo, fixture, "approve", run_id)
     assert approved.returncode == 0, approved.stderr
@@ -378,8 +378,7 @@ def test_history_renders_device_timezone_and_keeps_json_events_in_utc(
             "result": "started",
         }
     ]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
 
     local = run_cli(
         git_repo,
@@ -435,8 +434,7 @@ def test_history_keeps_later_invocations_after_an_early_timeline_tail(
     state = load_only_run_state(git_repo)
     early_event = state["timeline"][0]
     state["timeline"] = [early_event]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
 
     history = invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     assert history.returncode == 0, (history.stdout, history.stderr)
@@ -603,13 +601,16 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
 
     assert paused.returncode == 2
     run_id = str(stdout_json(paused)["run_id"])
-    paused_state = load_only_run_state(git_repo)
     # Persisted Runs created before the response-audit protocol remain
     # observable and resumable instead of being rejected as incompatible.
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
-    paused_state.pop("human_response_audit_protocol")
-    paused_state.pop("human_response_audit")
-    run_file.write_text(json.dumps(paused_state), encoding="utf-8")
+    def remove_response_audit_fields(persisted: dict[str, Any]) -> None:
+        persisted.pop("human_response_audit_protocol", None)
+        persisted.pop("human_response_audit", None)
+
+    replace_only_run_state(git_repo, remove_response_audit_fields)
+    paused_state = load_only_run_state(git_repo)
+    assert "human_response_audit_protocol" not in paused_state
+    assert "human_response_audit" not in paused_state
     expected_action = f"agent-run resume {run_id} --ticket 3"
     for command in ("status", "history"):
         output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
@@ -981,15 +982,20 @@ def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
     locator_env = {"XDG_DATA_HOME": str(locator_home)}
     started = seed_run(git_repo, fixture, "1", extra_env=locator_env)
     assert started.returncode == 0, started.stderr
-    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
-    legacy = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy = load_only_run_state(git_repo, extra_env=locator_env)
     if legacy_protocol is None:
         legacy.pop("branch_authority_protocol")
     else:
         legacy["branch_authority_protocol"] = legacy_protocol
     legacy["locator_registration_pending"] = True
-    state_path.write_text(json.dumps(legacy), encoding="utf-8")
-    state_before = state_path.read_text(encoding="utf-8")
+    def install_legacy_state(state: dict[str, Any]) -> None:
+        state.clear()
+        state.update(legacy)
+
+    replace_only_run_state(git_repo, install_legacy_state, extra_env=locator_env)
+    state_before = read_run_state_bytes(
+        git_repo, str(legacy["run_id"]), extra_env=locator_env
+    )
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     delivery_before = fixture_data.get("delivery")
     fixture_data["repository_read_failures"] = [
@@ -1020,7 +1026,9 @@ def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert state_path.read_text(encoding="utf-8") == state_before
+    assert read_run_state_bytes(
+        git_repo, str(legacy["run_id"]), extra_env=locator_env
+    ) == state_before
     assert not locator_path.exists()
     assert subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -1261,11 +1269,9 @@ def test_status_keeps_allowed_actions_without_inventing_host_activity(git_repo: 
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-
     for status in ("waiting_merge", "parent_closeout_pending"):
         state["status"] = status
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
         rendered = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
         assert rendered.returncode == 0, rendered.stderr
         if status == "waiting_merge":
@@ -1339,7 +1345,6 @@ def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
     agents = _run_agents(git_repo / "agents.json")
     started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -1349,7 +1354,7 @@ def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    run_file.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery_graph_read_failures"] = [
         {"code": "github_read_failed", "message": "temporary GitHub lag"}
@@ -1372,11 +1377,10 @@ def test_publish_run_retries_final_pr_after_external_wait(git_repo: Path) -> Non
     agents = _run_agents(git_repo / "agents.json")
     started = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
     run_id = stdout_json(started)["run_id"]
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update({"status": "waiting_external", "terminal_kind": "waiting_external"})
     state["run_publication"]["phase"] = "waiting_checks"
-    run_file.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
 
     retried = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
@@ -1393,7 +1397,6 @@ def test_run_supervises_read_failures_after_supervision_timeout(
     agents = _run_agents(git_repo / "agents.json")
     started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -1403,7 +1406,7 @@ def test_run_supervises_read_failures_after_supervision_timeout(
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    run_file.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery_graph_read_failures"] = [
         {"code": "github_read_failed", "message": "temporary GitHub lag"}
@@ -1424,7 +1427,6 @@ def test_run_repauses_after_a_fresh_external_wait_window(
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -1434,7 +1436,7 @@ def test_run_repauses_after_a_fresh_external_wait_window(
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    run_file.write_text(json.dumps(state), encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery_graph_read_failures"] = [
         {"code": "github_read_failed", "message": "persistent GitHub lag"}
@@ -1533,7 +1535,7 @@ def test_public_run_and_resume_reuse_initial_fetch_failure_run(
     assert stdout_json(resumed)["run_id"] == run_id
     state = load_only_run_state(git_repo)
     assert state["status"] == "progress_exhausted"
-    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 1
+    assert len(snapshot_run_states(git_repo)) == 1
 
 
 def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
@@ -1642,9 +1644,8 @@ def test_incompatible_state_preserves_existing_publisher_ledger_and_worktree(
     preserved = checkout / "legacy-recovery.txt"
     preserved.write_text("do not clean or publish\n", encoding="utf-8")
     state["schema_version"] = 1
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
-    state_before = state_path.read_text(encoding="utf-8")
+    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
+    state_before = read_run_state_bytes(git_repo, str(run_id))
     fixture_before = fixture.read_text(encoding="utf-8")
     delivery_before = json.loads(fixture_before)["delivery"]
     assert len(delivery_before["pull_requests"]) == 1
@@ -1672,7 +1673,7 @@ def test_incompatible_state_preserves_existing_publisher_ledger_and_worktree(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert state_path.read_text(encoding="utf-8") == state_before
+    assert read_run_state_bytes(git_repo, str(run_id)) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert preserved.read_text(encoding="utf-8") == "do not clean or publish\n"
     assert (
@@ -1769,9 +1770,6 @@ def test_completed_run_is_not_reopened_by_run_command(git_repo: Path) -> None:
     assert replayed.returncode == 2
     assert stdout_json(replayed)["run_id"] != run_id
     assert stdout_json(replayed)["status"] == "progress_exhausted"
-    states = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in (managed_state(git_repo) / "runs").glob("*.json")
-    ]
+    states = list(snapshot_run_states(git_repo).values())
     assert any(state["status"] == "completed" for state in states)
     assert any(state["status"] == "progress_exhausted" for state in states)
