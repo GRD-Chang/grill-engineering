@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +16,48 @@ from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_work import TicketWorkAdmission, generation
 from support.ticket_parallel import ticket_run
 
+from support.state import write_run_fixture
+
 
 def _queue(states: StateStore, run_id: str) -> list[dict[str, Any]]:
     # A fresh reader also verifies the persisted contract after every mutation.
     saved = StateStore(states.root).load_current_run(run_id)
     assert saved is not None
     return saved["ticket_work_queue"]
+
+
+def test_seed_preview_skips_noop_but_revalidates_changes(git_repo: Path) -> None:
+    state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
+    admission = TicketWorkAdmission(states, state["run_id"])
+    admission.seed([2])
+    current = states.load_current_run(state["run_id"])
+    before = deepcopy(current)
+
+    def revoked() -> None:
+        raise TaskControlBusyError("executor authorization revoked")
+
+    states._set_write_guard(revoked)
+    admission.seed([2], current=current)
+    assert current == before
+    with pytest.raises(TaskControlBusyError, match="authorization revoked"):
+        admission.seed([2, 3], current=current)
+    assert _queue(states, state["run_id"]) == before["ticket_work_queue"]
+
+
+def test_seed_preview_cannot_overwrite_a_newer_sibling_lease(git_repo: Path) -> None:
+    state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
+    admission = TicketWorkAdmission(states, state["run_id"])
+    admission.seed([3])
+    snapshot = states.load_current_run(state["run_id"])
+    before = deepcopy(snapshot)
+    token = admission.acquire(3, generation(state, 3), "reviewer")
+    assert token is not None
+    admission.seed([2, 3], current=snapshot)
+    assert snapshot == before
+    queue = _queue(states, state["run_id"])
+    assert [item["ticket_number"] for item in queue] == [3, 2]
+    assert queue[0]["lease_id"] == token and queue[0]["role"] == "reviewer"
+    assert queue[1]["lease_id"] is None
 
 
 @pytest.mark.parametrize("workers", [1, 2, 3])
@@ -156,8 +193,8 @@ def test_invalid_persisted_queue_is_rejected(git_repo: Path, corruption: str) ->
         entry["ticket_number"] = 999
     elif corruption == "invalid_capacity":
         state["policy_snapshot"]["ticket_development_workers"] = True
-    path = states.runs_directory / f"{state['run_id']}.json"
-    path.write_text(json.dumps(state), encoding="utf-8")
+    path_ref = (states.root, str(state['run_id']))
+    write_run_fixture(path_ref, state)
     with pytest.raises(IncompatibleRunStateError):
         StateStore(states.root).load_current_run(state["run_id"])
 

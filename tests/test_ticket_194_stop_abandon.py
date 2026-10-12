@@ -60,6 +60,8 @@ from agent_run.task_control import (
     TaskKey,
 )
 
+from support.state import snapshot_run, snapshot_runs
+
 
 def test_control_action_atomically_fences_the_previous_executor(tmp_path: Path) -> None:
     control, task, previous = _running_executor(tmp_path)
@@ -183,8 +185,8 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
         current=current,
         host=host,
     )
-    state_path = states.runs_directory / f"{run_id}.json"
-    before_state = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before_state = snapshot_run(state_ref)
     before_control = control.path_for(task).read_bytes()
     entered = threading.Barrier(2, timeout=5)
     release = threading.Event()
@@ -214,7 +216,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     contender.start()
     try:
         entered.wait()
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
         assert control.path_for(task).read_bytes() == before_control
     except BaseException:
         entered.abort()
@@ -226,7 +228,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     assert not contender.is_alive()
     assert len(failures) == 1
     assert isinstance(failures[0], ActionBusyError)
-    assert state_path.read_bytes() == before_state
+    assert snapshot_run(state_ref) == before_state
     assert control.path_for(task).read_bytes() == before_control
     assert host.start_count == 0
     record = control.load(task)
@@ -300,15 +302,15 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     assert durable is not None
     assert durable["status"] == "operator_stopped"
     assert durable["action_application_receipt"]["kind"] == "stop"
-    state_path = states.runs_directory / f"{run_id}.json"
-    before_state = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before_state = snapshot_run(state_ref)
     before_control = control.path_for(task).read_bytes()
 
     repeated = _run_cli(git_repo, fixture, "stop", run_id)
 
     assert repeated.returncode == 0, repeated.stderr
     assert json.loads(repeated.stdout)["status"] == "operator_stopped"
-    assert state_path.read_bytes() == before_state
+    assert snapshot_run(state_ref) == before_state
     assert control.path_for(task).read_bytes() == before_control
 
     assert cli_surface._resume_is_ready(durable)
@@ -326,7 +328,7 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     assert resumed["status"] != "operator_stopped"
     assert "operator_stop" not in resumed
     assert resumed["resume_audit"]["history"][-1]["kind"] == "operator_stopped"
-    resumed_state = state_path.read_bytes()
+    resumed_state = snapshot_run(state_ref)
     resumed_control = control.path_for(task).read_bytes()
 
     no_active_executor = _run_cli(git_repo, fixture, "stop", run_id)
@@ -335,7 +337,7 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     no_active_payload = json.loads(no_active_executor.stdout)
     assert no_active_payload["status"] == "operator_stopped"
     assert no_active_payload["action"]["operation"] == "stop"
-    assert state_path.read_bytes() != resumed_state
+    assert snapshot_run(state_ref) != resumed_state
     assert control.path_for(task).read_bytes() != resumed_control
 
 
@@ -467,8 +469,8 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
             assert state_after_run.get(field) == state_before_run.get(field)
         assert control.path_for(task).read_bytes() == control_before_run
 
-        state_path = states.runs_directory / f"{run_id}.json"
-        state_bytes = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        state_bytes = snapshot_run(state_ref)
         fixture_bytes = fixture.read_bytes()
         for run_arguments in (
             (),
@@ -556,7 +558,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
                     "host": 0,
                     "readiness": 0,
                 }
-                assert state_path.read_bytes() == state_bytes
+                assert snapshot_run(state_ref) == state_bytes
                 assert control.path_for(task).read_bytes() == control_before_run
                 assert fixture.read_bytes() == fixture_bytes
 
@@ -659,6 +661,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
         before = {
             path: path.read_bytes() for path in states.root.rglob("*.json")
         }
+        runs_before = snapshot_runs(states.root)
         for command in ("status", "history"):
             assert cli_module.main([command, run_id, "--json"]) == 0
             view = json.loads(capsys.readouterr().out)
@@ -666,6 +669,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
             assert {
                 path: path.read_bytes() for path in states.root.rglob("*.json")
             } == before
+            assert snapshot_runs(states.root) == runs_before
 
     def target_identity(target: Mapping[str, Any]) -> tuple[int, str]:
         target_worker = target.get("worker")
@@ -1685,25 +1689,25 @@ def test_public_stop_rejects_unknown_ownership_without_mutating_run(
     states = StateStore(managed_state(git_repo))
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
-    state_path = states.runs_directory / f"{run_id}.json"
-    before = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before = snapshot_run(state_ref)
 
     rejected = _run_cli(git_repo, fixture, "stop", run_id)
 
     assert rejected.returncode == 2
     output = json.loads(rejected.stdout)
     assert output["diagnostics"][0]["code"] == "task_control"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
 
     run.update({"status": "completed", "terminal_kind": "completed"})
     states.save_run(run_id, run)
-    terminal_before = state_path.read_bytes()
+    terminal_before = snapshot_run(state_ref)
 
     terminal = _run_cli(git_repo, fixture, "stop", run_id)
 
     assert terminal.returncode == 0, terminal.stderr
     assert json.loads(terminal.stdout)["status"] == "completed"
-    assert state_path.read_bytes() == terminal_before
+    assert snapshot_run(state_ref) == terminal_before
 
 
 @pytest.mark.parametrize("mode", ["recorded_absent", "pid_gone", "token_mismatch"])
@@ -1779,9 +1783,9 @@ def test_stop_proven_no_active_observations_admit_pause_action(
     elif process is not None:
         process.kill()
         process.wait(timeout=3)
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
-    before_state = state_path.read_bytes()
+    before_state = snapshot_run(state_ref)
     before_control = control_path.read_bytes()
 
     final, _resumed, receipt = _control_lifecycle(
@@ -1800,7 +1804,7 @@ def test_stop_proven_no_active_observations_admit_pause_action(
 
     assert final["status"] == current["status"]
     assert receipt is not None and receipt.kind == "stop"
-    assert state_path.read_bytes() != before_state
+    assert snapshot_run(state_ref) != before_state
     assert states.load_run(run_id)["action_application_receipt"]["kind"] == "stop"
     assert control_path.read_bytes() != before_control
 
@@ -1865,9 +1869,9 @@ def test_stop_unknown_host_observation_rejects_without_partial_mutation(
         generation=reservation.generation,
         result_status=str(current["status"]),
     )
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
-    before_state = state_path.read_bytes()
+    before_state = snapshot_run(state_ref)
     before_control = control_path.read_bytes()
 
     with pytest.raises(ExecutorStartUnknownError, match="permission denied"):
@@ -1885,7 +1889,7 @@ def test_stop_unknown_host_observation_rejects_without_partial_mutation(
             )
         )
 
-    assert state_path.read_bytes() == before_state
+    assert snapshot_run(state_ref) == before_state
     assert control_path.read_bytes() == before_control
 
 
@@ -1941,7 +1945,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
         except BaseException as error:
             failure.append(error)
 
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
     worker.kill()
     worker.wait(timeout=3)
@@ -1958,7 +1962,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
             action_id=str(executor["action_id"]),
             generation=int(executor["generation"]),
         )
-        after_exit_state = state_path.read_bytes()
+        after_exit_state = snapshot_run(state_ref)
         after_exit_control = control_path.read_bytes()
         after_exit_record = control.load(task)
         assert after_exit_record is not None
@@ -1973,7 +1977,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
         assert receipt is None
         assert final["status"] == "completed"
         assert cli_module.cli_presentation._next_action(final) == "无"
-        assert state_path.read_bytes() == after_exit_state
+        assert snapshot_run(state_ref) == after_exit_state
         assert control_path.read_bytes() == after_exit_control
         final_record = control.load(task)
         assert final_record is not None
@@ -2042,7 +2046,7 @@ def test_public_stop_reloads_state_after_executor_exit(
     assert record is not None
     executor = record["executor"]
     assert isinstance(executor, dict)
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: True)
@@ -2068,7 +2072,7 @@ def test_public_stop_reloads_state_after_executor_exit(
                 action_id=str(executor["action_id"]),
                 generation=int(executor["generation"]),
             )
-        after_exit_state = state_path.read_bytes()
+        after_exit_state = snapshot_run(state_ref)
         after_exit_control = control_path.read_bytes()
         release.set()
         submitter.join(timeout=3)
@@ -2096,7 +2100,7 @@ def test_public_stop_reloads_state_after_executor_exit(
             assert "操作: stop" in captured.out
             assert "agent-run resume 1 --repo example/project" in captured.out
         if becomes_terminal:
-            assert state_path.read_bytes() == after_exit_state
+            assert snapshot_run(state_ref) == after_exit_state
             assert control_path.read_bytes() == after_exit_control
         else:
             assert states.load_run(run_id)["status"] == "operator_stopped"
@@ -2267,8 +2271,8 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
         checker.join(timeout=3)
         assert not checker.is_alive()
         assert result == [None]
-        state_path = states.runs_directory / f"{run_id}.json"
-        before_state = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        before_state = snapshot_run(state_ref)
         before_control = control.path_for(task).read_bytes()
 
         with pytest.raises(ActionBusyError, match="不会等待或排队"):
@@ -2286,7 +2290,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
                 )
             )
 
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
         assert control.path_for(task).read_bytes() == before_control
         reservation = control.begin_executor(
             task, action_id=resume.action_id, run_id=run_id
@@ -2380,9 +2384,9 @@ def test_production_read_only_stop_skips_execution_dependencies(
         monkeypatch.setattr(
             cli_module, "SystemdUserExecutorHost", AvailableSystemdHost
         )
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
-    before_state = state_path.read_bytes()
+    before_state = snapshot_run(state_ref)
     before_control = control_path.read_bytes()
 
     try:
@@ -2399,7 +2403,7 @@ def test_production_read_only_stop_skips_execution_dependencies(
             assert return_code == 2
             assert output["diagnostics"][-1]["code"] == "execution_readiness"
         assert "action" not in output
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
         assert control_path.read_bytes() == before_control
     finally:
         if worker_still_running:
@@ -2420,9 +2424,9 @@ def test_production_stop_with_active_executor_still_requires_readiness(
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
-    before_state = state_path.read_bytes()
+    before_state = snapshot_run(state_ref)
     before_control = control_path.read_bytes()
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: False)
@@ -2434,7 +2438,7 @@ def test_production_stop_with_active_executor_still_requires_readiness(
         assert return_code == 2
         output = json.loads(capsys.readouterr().out)
         assert output["result"] == "error"
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
         assert control_path.read_bytes() == before_control
     finally:
         worker.kill()
@@ -2458,9 +2462,9 @@ def test_production_stop_rejects_pending_action_before_execution_readiness(
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control = TaskControlStore(managed_state(git_repo))
     control.claim_action(task, kind=pending_kind, payload={"parent": 1})
-    state_path = states.runs_directory / f"{run_id}.json"
+    state_ref = (states.root, str(run_id))
     control_path = control.path_for(task)
-    before_state = state_path.read_bytes()
+    before_state = snapshot_run(state_ref)
     before_control = control_path.read_bytes()
     readiness_checks: list[bool] = []
     monkeypatch.chdir(git_repo)
@@ -2478,7 +2482,7 @@ def test_production_stop_rejects_pending_action_before_execution_readiness(
     output = json.loads(capsys.readouterr().out)
     assert output["diagnostics"][-1]["code"] == "action_busy"
     assert readiness_checks == []
-    assert state_path.read_bytes() == before_state
+    assert snapshot_run(state_ref) == before_state
     assert control_path.read_bytes() == before_control
 
 
@@ -2502,13 +2506,13 @@ def test_terminal_abandon_replay_completes_its_applying_control_action(
     )
     run.update({"status": "abandoned", "terminal_kind": "abandoned"})
     states.save_run(run_id, run)
-    before_state = (states.runs_directory / f"{run_id}.json").read_bytes()
+    before_state = snapshot_run((states.root, str(run_id)))
 
     replayed = _run_cli(git_repo, fixture, "abandon", run_id)
 
     assert replayed.returncode == 0, replayed.stderr
     assert json.loads(replayed.stdout)["status"] == "abandoned"
-    assert (states.runs_directory / f"{run_id}.json").read_bytes() == before_state
+    assert snapshot_run((states.root, str(run_id))) == before_state
     record = control.load(task)
     assert record is not None
     assert record["action"]["action_id"] == claim.action_id
@@ -2613,8 +2617,8 @@ def test_control_action_reconciles_durable_outcome_after_executor_exit(
         action_id=claim.action_id,
         generation=reservation.generation,
     )
-    state_path = states.runs_directory / f"{run_id}.json"
-    before = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before = snapshot_run(state_ref)
 
     final, _resumed, receipt = _control_lifecycle(
         states=states,
@@ -2625,7 +2629,7 @@ def test_control_action_reconciles_durable_outcome_after_executor_exit(
     ).submit_control(LifecycleRequest(task=task, kind=kind, payload=payload))
 
     assert final["status"] == durable_status
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert receipt is not None
     assert receipt.status == "completed"
     record = control.load(task)

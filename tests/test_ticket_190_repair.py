@@ -22,6 +22,8 @@ from support.seeding import write_fixture
 from support.workspace import managed_workspace
 from support.cli_payloads import ticket
 
+from support.state import only_run_ref, read_run, run_refs, snapshot_run
+
 
 def _isolated_environment(root: Path) -> dict[str, str]:
     return {
@@ -86,6 +88,23 @@ if role == "replacement":
                 yield
 
     TaskControlStore._locked = parked_transaction
+
+    def establish_replacement_barrier():
+        deadline = time.monotonic() + 10
+        while not started.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Agent did not reach replacement barrier")
+            time.sleep(0.001)
+        workspace = ManagedWorkspace.for_repository("example/project")
+        store = TaskControlStore(workspace.state_root)
+        task = TaskKey(workspace.repository_root, "example/project", 1)
+        # Request the barrier explicitly: an idle scheduler has no reason to
+        # enter Task Control after a no-op queue seed. This read-only lock
+        # request drains preceding transactions without writing Run facts.
+        with store._locked(task, wait=True):
+            pass
+
+    threading.Thread(target=establish_replacement_barrier, daemon=False).start()
 
 elif role == "first":
     import fcntl
@@ -234,14 +253,14 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         # The Agent barrier alone leaves the continuous scheduler running.
         # Replace ownership only after all old Task Control work is parked.
         _wait_for_marker(process, parked)
-        state_path = next((workspace.state_root / "runs").glob("*.json"))
+        state_ref = only_run_ref(workspace.state_root)
         control = TaskControlStore(workspace.state_root)
         task = TaskKey(workspace.repository_root, "example/project", 1)
         control_path = next((workspace.state_root / "task-control").glob("*.json"))
         record = json.loads(control_path.read_text(encoding="utf-8"))
         action_id = record["action"]["action_id"]
         generation = record["executor"]["generation"]
-        state_before_release = state_path.read_bytes()
+        state_before_release = snapshot_run(state_ref)
         fixture_before_release = fixture.read_bytes()
         agents_before_release = agents.read_bytes()
         git_status_before_release = {
@@ -275,7 +294,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         release.touch()
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode == 2, f"{stdout}\n{stderr}"
-        assert state_path.read_bytes() == state_before_release
+        assert snapshot_run(state_ref) == state_before_release
         assert fixture.read_bytes() == fixture_before_release
         assert agents.read_bytes() == agents_before_release
         assert {
@@ -414,13 +433,13 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
         assert second.returncode == 0, f"{second_stdout}\n{second_stderr}"
         assert not holder_error.exists()
 
-        run_files = list((workspace.state_root / "runs").glob("*.json"))
+        run_records = run_refs(workspace.state_root)
         control_files = list(
             (workspace.state_root / "task-control").glob("*.json")
         )
-        assert len(run_files) == 1
+        assert len(run_records) == 1
         assert len(control_files) == 1
-        state = json.loads(run_files[0].read_text(encoding="utf-8"))
+        state = read_run(run_records[0])
         record = json.loads(control_files[0].read_text(encoding="utf-8"))
         assert state["status"] not in {"completed", "abandoned"}
         assert state["status"] != "execution_failed"

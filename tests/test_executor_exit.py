@@ -20,6 +20,8 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlError, TaskControlStore
 from support.executor_exit import create_exit_run
 
+from support.state import snapshot_runs
+
 
 @pytest.fixture(autouse=True)
 def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,10 +32,13 @@ def _observe(spec: ExecutorSpec) -> None:
     observe_exit(spec, service_result="signal", exit_code="killed", exit_status="KILL")
 
 
-def _business_files(states: StateStore) -> dict[Path, bytes]:
-    return {path.relative_to(states.root): path.read_bytes()
-            for directory in ("runs", "task-control")
-            for path in (states.root / directory).rglob("*") if path.is_file()}
+def _business_files(states: StateStore) -> dict[str, bytes]:
+    snapshot = {
+        str(path.relative_to(states.root)): path.read_bytes()
+        for path in (states.root / "task-control").rglob("*") if path.is_file()
+    }
+    snapshot.update({f"run:{run_id}": state for run_id, state in snapshot_runs(states.root).items()})
+    return snapshot
 
 
 def _resume(states: StateStore, control: TaskControlStore, spec: ExecutorSpec) -> ExecutorSpec:

@@ -12,12 +12,14 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli import issue, run_cli, snapshot_run_states, stdout_json
 from support.seeding import seed_idle_control, seed_run, write_fixture
 
+from support.state import include_in_state_snapshot
+
 
 def _files(root: Path) -> dict[str, bytes]:
     return {
         str(path.relative_to(root)): path.read_bytes()
         for path in root.rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
 
 

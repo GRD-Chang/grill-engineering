@@ -27,6 +27,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import seed_idle_control, write_fixture
 from support.workspace import prepare_workspace
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("interruption", ["worker", "commit", "cli-commit", "wrong-message", "wrong-parents", "bad-delta"])
 def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
@@ -173,11 +175,11 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
             command(checkout, "add", "invalid.csv")
             command(checkout, "commit", "--amend", "--no-edit")
         if interruption in {"wrong-message", "wrong-parents", "bad-delta"}:
-            before = (states.runs_directory / f"{run_id}.json").read_bytes()
+            before = snapshot_run((states.root, str(run_id)))
             wrong_head = git.checkout_head(checkout)
             with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):
                 Controller(FixtureGitHubReader(fixture), git, states).resume(run_id, explicit_resume=True)
-            assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+            assert snapshot_run((states.root, str(run_id))) == before
             assert git.checkout_head(checkout) == wrong_head
             assert (checkout / "preserved.txt").read_text() == "partial conflict work\n"
             assert agents.integration_calls == 1
@@ -207,8 +209,8 @@ def test_public_resume_closes_parent_conflict_and_dispatches_integration_review(
         assert git.is_ancestor(committed, loaded["parent_job"]["candidate_sha"])
     assert any(item["phase"] == "integration_conflict" and item["status"] == "completed"
                for item in loaded["agent_invocation_history"])
-    before = (states.runs_directory / f"{run_id}.json").read_bytes()
+    before = snapshot_run((states.root, str(run_id)))
     for query in ("status", "history"):
         result = invoke_cli_inprocess(repo, None, query, run_id, "--state-dir", str(states.root), "--json")
         assert result.returncode == 0, result.stdout + result.stderr
-    assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+    assert snapshot_run((states.root, str(run_id))) == before

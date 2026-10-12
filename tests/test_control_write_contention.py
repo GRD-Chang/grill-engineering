@@ -102,8 +102,7 @@ def test_state_commit_does_not_replay_observer_after_persisting(tmp_path: Path) 
         raise TaskControlBusyError("observer failed after commit")
 
     states.run_saved_observer = observer
-    with pytest.raises(TaskControlBusyError, match="observer failed"):
-        states.save_run("run-1", {"run_id": "run-1", "status": "active"})
+    states.save_run("run-1", {"run_id": "run-1", "status": "active"})
     assert observations == ["active"]
     assert states.load_run("run-1")["status"] == "active"
 

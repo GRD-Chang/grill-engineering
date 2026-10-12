@@ -24,14 +24,13 @@ def run_cli_at_development_boundary(
     # 限定到本次子进程，退出时删除注入模块；后续 run/resume 使用原入口。
     with TemporaryDirectory(prefix="cli-crash-", dir=repo.parent) as directory:
         Path(directory, "sitecustomize.py").write_text(
-            "import json\n"
             "from agent_run.state import FaultInjectingStateStore, SimulatedProcessCrash\n"
             f"boundary = {boundary!r}\n"
             "def after_saved(self):\n"
             "    if self.injected:\n"
             "        return\n"
-            "    for path in self.runs_directory.glob('*.json'):\n"
-            "        state = json.loads(path.read_text(encoding='utf-8'))\n"
+            "    for run_id in self.list_run_ids():\n"
+            "        state = self.load_run(run_id)\n"
             "        invocation = state.get('active_agent_invocation') or {}\n"
             "        if boundary == 'before_invocation':\n"
             "            reached = (isinstance(state.get('action_application_receipt'), dict)\n"

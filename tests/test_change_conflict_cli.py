@@ -20,6 +20,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import seed_idle_control
 from support.workspace import prepare_workspace
 
+from support.state import include_in_state_snapshot
+
 
 def _job(state: dict[str, Any], kind: str) -> dict[str, Any]:
     if kind == "ticket":
@@ -30,14 +32,14 @@ def _job(state: dict[str, Any], kind: str) -> dict[str, Any]:
 
 
 def _query(repo: Path, store: StateStore, run_id: str, status: str) -> None:
-    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()}
+    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file() and include_in_state_snapshot(path)}
     for command in ("status", "history"):
         result = invoke_cli_inprocess(repo, None, command, run_id, "--state-dir", str(store.root), "--json")
         assert result.returncode == 0, result.stdout + result.stderr
         if command == "history" or status != "completed":
             assert "integration_conflict" in result.stdout
             assert status in result.stdout
-    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()} == before
+    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file() and include_in_state_snapshot(path)} == before
 
 
 @pytest.mark.parametrize("kind", ["ticket", "parent_only", "run_repair"])

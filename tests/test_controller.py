@@ -16,6 +16,8 @@ from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.state import StateStore
 from support.seeding import write_fixture
 
+from support.state import run_refs, snapshot_run
+
 
 def _issue(number: int) -> dict[str, Any]:
     return {
@@ -59,7 +61,7 @@ def test_initial_state_failure_happens_before_branch_creation(
         check=True,
     ).stdout.splitlines()
     assert branches == []
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not run_refs(git_repo / '.agent-run')
 
 
 def test_locator_registration_retries_only_for_new_pending_run(git_repo: Path) -> None:
@@ -319,7 +321,7 @@ def test_execution_failure_producer_persists_one_bounded_safe_diagnostic(
         f"command failed; token={credential}; " + ("raw tool output " * 20_000),
     )
 
-    persisted_bytes = (store.runs_directory / f"{run_id}.json").read_bytes()
+    persisted_bytes = snapshot_run((store.root, str(run_id)))
     recorded = store.load_run(run_id)
     assert recorded is not None
     assert len(recorded["diagnostics"]) == 1

@@ -2901,13 +2901,14 @@ def _reconcile_resume_exit(
     if is_final_approval_action(action, current):
         return current
     if not has_run_operator_gate(current):
-        control.fail_session_from_application_receipt(
-            task, action_id=spec.action_id, generation=spec.generation,
-            application_receipt=current["action_application_receipt"],
-            persist_run_failure=lambda: record_session_interruption(
-                current, save=lambda value: states.save_run(str(current["run_id"]), value)
-            ),
-        )
+        with states.commit_admission():
+            control.fail_session_from_application_receipt(
+                task, action_id=spec.action_id, generation=spec.generation,
+                application_receipt=current["action_application_receipt"],
+                persist_run_failure=lambda: record_session_interruption(
+                    current, save=lambda value: states.save_run(str(current["run_id"]), value)
+                ),
+            )
     return current
 
 

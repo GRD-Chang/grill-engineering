@@ -8,6 +8,8 @@ from pathlib import Path
 from agent_run.task_control import TaskKey
 from support.environment import _user_environment
 
+from support.state import include_in_state_snapshot
+
 
 def _task(tmp_path: Path) -> TaskKey:
     return TaskKey(tmp_path / "checkout", "example/project", 156)
@@ -23,7 +25,7 @@ def _file_snapshot(root: Path) -> dict[str, bytes]:
     return {
         str(path.relative_to(root)): path.read_bytes()
         for path in root.rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
 
 

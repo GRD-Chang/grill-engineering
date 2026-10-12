@@ -16,6 +16,8 @@ from support.cli import run_cli, stdout_json
 from support.cli_payloads import ticket
 from support.lifecycle import _file_snapshot, _isolated_environment
 
+from support.state import only_run_ref, read_run, write_run_fixture
+
 
 def _workspace_snapshot(
     repo: Path, *, extra_env: dict[str, str] | None = None,
@@ -40,8 +42,8 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     )
     assert first.returncode == 0, first.stderr
     run_id = stdout_json(first)['run_id']
-    state_path = next((managed_state(git_repo, extra_env=environment) / 'runs').glob('*.json'))
-    state = json.loads(state_path.read_text())
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
+    state = read_run(state_ref)
     invocation = dict(state['agent_invocation_history'][-1])
     invocation.update(
         status='running', started_at='2026-09-07T01:39:19+00:00', ended_at=None,
@@ -76,7 +78,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
                 'running', spec.generation, 123, True
             ),
         )
-    state_path.write_text(json.dumps(state))
+    write_run_fixture(state_ref, state)
     monkeypatch.chdir(git_repo)
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
@@ -160,12 +162,12 @@ def test_completed_invocation_keeps_bounded_recovery_summary(
     )
     assert first.returncode == 0, first.stderr
     run_id = stdout_json(first)["run_id"]
-    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
-    state = json.loads(state_path.read_text())
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
+    state = read_run(state_ref)
     invocation = state["agent_invocation_history"][-1]
     assert invocation["status"] == "completed"
     invocation.update(ordinary_recovery_used=True, capacity_recovery_count=3)
-    state_path.write_text(json.dumps(state))
+    write_run_fixture(state_ref, state)
     before = _workspace_snapshot(git_repo, extra_env=environment)
     for command in ("history", "status"):
         result = run_cli(

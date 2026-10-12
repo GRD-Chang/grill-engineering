@@ -76,21 +76,37 @@ class TicketWorkAdmission:
         self.states = states
         self.run_id = run_id
 
-    def seed(self, numbers: list[int]) -> None:
+    def seed(self, numbers: list[int], *, current: dict[str, Any] | None = None) -> bool:
+        """Seed the queue; report whether a commit boundary was entered."""
+        # Dispatch already read this snapshot. A queue that needs no change
+        # has no commit to authorize; avoid occupying the writer's FIFO seat.
+        # Any possible change still rereads and revalidates inside the boundary.
+        if current is not None:
+            preview = {**current, "ticket_work_queue": deepcopy(current["ticket_work_queue"])}
+            self._seed_queue(preview, numbers)
+            if preview["ticket_work_queue"] == current["ticket_work_queue"]:
+                return False
+
         def commit() -> None:
             state = self._load()
             before = deepcopy(state["ticket_work_queue"])
-            reconcile(state)
-            for number in numbers:
-                if (
-                    number in state["frontier"]
-                    and str(number) not in state["ticket_pause_requests"]
-                    and not ticket_program_ready(state["ticket_jobs"].get(str(number), {}))
-                ):
-                    enqueue(state, number, "development")
+            self._seed_queue(state, numbers)
             if state["ticket_work_queue"] != before:
                 self.states._save_run_and_notify_unlocked(self.run_id, state)
         self.states._commit_run(commit)
+        return True
+
+    @staticmethod
+    def _seed_queue(state: dict[str, Any], numbers: list[int]) -> None:
+        """Change only the queue; other snapshot facts are read-only."""
+        reconcile(state)
+        for number in numbers:
+            if (
+                number in state["frontier"]
+                and str(number) not in state["ticket_pause_requests"]
+                and not ticket_program_ready(state["ticket_jobs"].get(str(number), {}))
+            ):
+                enqueue(state, number, "development")
 
     def acquire(
         self, number: int, expected_generation: int, role: str, *, allow_start: bool = True,

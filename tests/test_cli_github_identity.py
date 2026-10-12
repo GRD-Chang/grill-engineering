@@ -15,6 +15,8 @@ from support.seeding import write_fixture
 from support.user_defaults import settings
 from support.workspace import managed_state
 
+from support.state import only_run_ref, read_run, run_refs, run_state_text, snapshot_run, write_run_fixture
+
 
 @pytest.mark.parametrize("reference", ["env", "file", "app"])
 def test_public_native_identity_failure_and_same_reference_resume(
@@ -106,11 +108,11 @@ raise SystemExit(cli.main(sys.argv[1:]))
     if reference == "app":
         token_file.unlink()
         failed_start = call("run", "1", "--worker-github-source", "app", *ref_args)
-        assert not list((managed_state(git_repo) / "runs").glob("*.json"))
+        assert not run_refs(managed_state(git_repo))
         assert "app" in failed_start.stdout
         token_file.write_text("pat-first\n")
     started = call("run", "1", "--worker-github-source", "app" if reference == "app" else "pat", *ref_args)
-    assert list((managed_state(git_repo) / "runs").glob("*.json")), started.stdout + started.stderr
+    assert run_refs(managed_state(git_repo)), started.stdout + started.stderr
     first = load_only_run_state(git_repo)
     assert first["status"] == "ready_for_human"
     expected = {"source": "pat", "pat": {reference: "TASK_WORKER_PAT" if reference == "env" else str(token_file)}}
@@ -149,17 +151,19 @@ raise SystemExit(cli.main(sys.argv[1:]))
     assert repaired["parent_job"]["development_thread_id"] == "identity-thread"
     assert repaired["parent_job"]["review_budget"] == first["parent_job"]["review_budget"]
     assert [json.loads(line)["token"] for line in capture.read_text().splitlines()] == ["pat-first", "pat-repaired"]
-    for path in managed_state(git_repo).rglob("*.json"):
-        assert all(secret not in path.read_text() for secret in ("pat-first", "pat-repaired", "independent-runner-secret"))
+    texts = [path.read_text() for path in managed_state(git_repo).rglob("*.json")]
+    texts.extend(run_state_text(reference) for reference in run_refs(managed_state(git_repo)))
+    assert all(secret not in text for text in texts
+               for secret in ("pat-first", "pat-repaired", "independent-runner-secret"))
     if reference == "app":
-        state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-        legacy_state = json.loads(state_path.read_text())
+        state_ref = only_run_ref(managed_state(git_repo))
+        legacy_state = read_run(state_ref)
         legacy_state["github_identity"].pop("app_read_only")
-        state_path.write_text(json.dumps(legacy_state))
-        before = state_path.read_bytes()
+        write_run_fixture(state_ref, legacy_state)
+        before = snapshot_run(state_ref)
         incompatible = call("resume", first["run_id"], "--message", "旧授权不能猜测")
         assert "incompatible_run_state" in incompatible.stdout
-        assert state_path.read_bytes() == before
+        assert snapshot_run(state_ref) == before
 
 
 def test_new_run_rejects_missing_pat_before_creating_state(
@@ -172,5 +176,5 @@ def test_new_run_rejects_missing_pat_before_creating_state(
     result = run_cli(git_repo, fixture, "run", "1", "--worker-github-source", "pat",
                      "--github-pat-file", str(tmp_path / "missing"))
     assert result.returncode == 2
-    assert not list((managed_state(git_repo) / "runs").glob("*.json"))
+    assert not run_refs(managed_state(git_repo))
     assert "PAT" in result.stdout

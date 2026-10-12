@@ -43,6 +43,8 @@ from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_round_agents, passing_acceptance
 
+from support.state import only_run_ref, snapshot_run, write_run_fixture
+
 
 def _ticket(
     number: int, *, blocked_by: list[dict[str, Any]] | None = None
@@ -78,9 +80,10 @@ def test_legacy_branch_authority_state_is_rejected_before_reuse(
 
     archive = states.root / "archived-runs"
     archive.mkdir()
-    (states.runs_directory / f"{state['run_id']}.json").rename(
-        archive / f"{state['run_id']}.json"
-    )
+    for name in ("state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"):
+        path = states.root / name
+        if path.exists():
+            path.rename(archive / name)
     replacement, resumed = controller.start_or_resume_unfinished(1)
 
     assert not resumed
@@ -421,8 +424,8 @@ def test_unbound_execution_failure_and_ticket_human_gate_fail_closed(
 
     run_id = str(state["run_id"])
     states.save_run(run_id, state)
-    state_path = states.runs_directory / f"{run_id}.json"
-    state_before = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     commands = (
         ("status", run_id, "--json"),
@@ -442,7 +445,7 @@ def test_unbound_execution_failure_and_ticket_human_gate_fail_closed(
             rejected.stdout,
             rejected.stderr,
         )
-        assert state_path.read_bytes() == state_before
+        assert snapshot_run(state_ref) == state_before
         assert fixture.read_bytes() == fixture_before
 
 
@@ -1836,8 +1839,8 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
         for event in history_json["events"]
     )
     state["timeline"] = [state["timeline"][0]]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     stale_timeline_history = stdout_json(
         invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
@@ -2081,7 +2084,11 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(
     assert completed["ticket_jobs"]["3"]["ticket_integration"]["target_sha"] == completed["ticket_jobs"]["2"]["integrated_sha"]
 
 
-def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> None:
+def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_run.external_supervision as supervision
+
+    clock = [1000.25]
+    monkeypatch.setattr(supervision, "monotonic", lambda: clock[0])
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2), "3": _ticket(3)},
@@ -2124,6 +2131,8 @@ def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> 
     checks["delivery"]["required_checks"] = ["pass"]
     fixture.write_text(json.dumps(checks))
     publisher.data = checks
+    window = waiting["supervision_window"]
+    clock[0] = float(window.get("next_retry_at") or clock[0])
     progressed = engine.deliver(state["run_id"])
     assert progressed["ticket_jobs"]["2"]["phase"] == "completed"
     assert progressed["ticket_jobs"]["3"]["phase"] == "blocked"
@@ -2221,7 +2230,11 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
     assert progressed["ticket_integration_queue"] == []
 
 
-def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
+def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_run.external_supervision as supervision
+
+    clock = [1000.25]
+    monkeypatch.setattr(supervision, "monotonic", lambda: clock[0])
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket(2), "3": _ticket(3)},
         delivery={"required_checks": ["pending"]},
@@ -2263,6 +2276,8 @@ def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
     checks["delivery"]["check_position"] = 0
     fixture.write_text(json.dumps(checks))
     publisher.data = checks
+    window = waiting["supervision_window"]
+    clock[0] = float(window.get("next_retry_at") or clock[0])
     delivered = engine.deliver(state["run_id"])
     assert delivered["ticket_jobs"]["3"]["phase"] == "completed"
     assert delivered["ticket_jobs"]["2"]["phase"] == "completed"

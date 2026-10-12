@@ -17,6 +17,8 @@ from agent_run.executor_host import FakeExecutorHost
 from support.seeding import write_fixture
 from support.cli import load_only_run_state, run_cli, stdout_json
 
+from support.state import only_run_ref, read_run, write_run_fixture
+
 
 def test_budget_resume_receipt_records_explicit_window_authority(git_repo: Path) -> None:
     fixture, agents, state = _checkpoint(git_repo)
@@ -39,7 +41,7 @@ def test_resume_rejects_changed_pause_target_before_applying_authority(
     drift_at: str,
 ) -> None:
     fixture, agents, initial = _checkpoint(git_repo)
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo))
     original_refresh = Controller._refresh
 
     class DriftingHost(FakeExecutorHost):
@@ -48,10 +50,10 @@ def test_resume_rejects_changed_pause_target_before_applying_authority(
 
         def ensure(self, *args, **kwargs):
             if drift_at == "executor_start":
-                state = json.loads(state_path.read_text())
+                state = read_run(state_ref)
                 state["parent_job"]["blocked_reason"] = "modification_budget_exhausted"
                 state["parent_job"]["review_budget"]["checkpoint_reason"] = "modification_budget_exhausted"
-                state_path.write_text(json.dumps(state))
+                write_run_fixture(state_ref, state)
             return super().ensure(*args, **kwargs)
 
     def refresh(self, state, parent_number):
@@ -93,11 +95,11 @@ def test_repeated_pending_resume_keeps_original_intent_and_generation(
     capsys.readouterr()
     control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     first = json.loads(control_path.read_text())
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state = json.loads(state_path.read_text())
+    state_ref = only_run_ref(managed_state(git_repo))
+    state = read_run(state_ref)
     state["parent_job"]["blocked_reason"] = "modification_budget_exhausted"
     state["parent_job"]["review_budget"]["checkpoint_reason"] = "modification_budget_exhausted"
-    state_path.write_text(json.dumps(state))
+    write_run_fixture(state_ref, state)
     assert cli.main(arguments) == 2
     capsys.readouterr()
     repeated = json.loads(control_path.read_text())

@@ -17,6 +17,8 @@ from support.cli_fixtures import run_agents
 from support.cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from support.cli_payloads import passing_acceptance, ticket
 
+from support.state import include_in_state_snapshot
+
 
 def _fail_parent_run(git_repo: Path, fixture: Path) -> None:
     failed_agents = git_repo / "failed-agents.json"
@@ -269,7 +271,7 @@ def _establish_ordinary_run_boundary(
 def _tree_snapshot(root: Path) -> dict[Path, bytes | None]:
     return {
         path.relative_to(root): None if path.is_dir() else path.read_bytes()
-        for path in root.rglob("*")
+        for path in root.rglob("*") if include_in_state_snapshot(path)
     }
 
 

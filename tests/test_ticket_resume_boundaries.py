@@ -20,6 +20,8 @@ from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
 
+from support.state import snapshot_run
+
 
 @pytest.fixture
 def paused_ticket(git_repo: Path):
@@ -299,7 +301,7 @@ def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: boo
             task, action_id=executor['action_id'], generation=executor['generation'],
             run_id=payload['run_id'], can_exit=lambda: True, failure='scheduler stopped',
         )
-    state_before = (controller.states.runs_directory / f"{payload['run_id']}.json").read_bytes()
+    state_before = snapshot_run((controller.states.root, str(payload['run_id'])))
     control_before = control.path_for(task).read_bytes()
     if closed:
         with pytest.raises(ActionBusyError, match='收口'):
@@ -307,7 +309,7 @@ def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: boo
     else:
         duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
         assert repeated and duplicate == admitted
-    assert (controller.states.runs_directory / f"{payload['run_id']}.json").read_bytes() == state_before
+    assert snapshot_run((controller.states.root, str(payload['run_id']))) == state_before
     assert control.path_for(task).read_bytes() == control_before
 
 

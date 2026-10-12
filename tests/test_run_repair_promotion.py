@@ -254,7 +254,11 @@ def test_parent_integration_resume_requires_review_when_record_is_missing(git_re
         def _save_run_unlocked(self, run_id: str, current: dict[str, Any]) -> None:
             super()._save_run_unlocked(run_id, current)
             job = current.get("run_acceptance", {}).get("repair_job", {})
-            if job.get("phase") == "accepted":
+            self._pause_after_save = job.get("phase") == "accepted"
+
+        def _after_run_saved(self) -> None:
+            if self._pause_after_save:
+                self._pause_after_save = False
                 raise SimulatedProcessCrash("accepted before Run write")
 
     with pytest.raises(SimulatedProcessCrash):

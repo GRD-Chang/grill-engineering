@@ -14,6 +14,8 @@ from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
 from support.seeding import write_fixture
 
+from support.state import snapshot_run
+
 
 def _accepted(git_repo: Path, tmp_path: Path, kind: str, *, target: str | None = None, payload_damage: str | None = None):
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -111,8 +113,8 @@ def test_existing_action_reentry_rejects_wrong_target_before_business(
     if damage == "binding":
         control.bind_run(task, claim.action_id, "other-run", generation=reservation.generation)
     if damage == "unreadable":
-        (states.runs_directory / f"{run_id}.json").write_text("{broken")
-    before = (states.runs_directory / f"{run_id}.json").read_bytes()
+        (states.root / "state.sqlite3").write_bytes(b"broken SQLite database")
+    before = (states.root / "state.sqlite3").read_bytes()
     lifecycle = _executor(
         states, task, control, claim, reservation,
         lambda _: pytest.fail("must not apply intent"),
@@ -123,7 +125,7 @@ def test_existing_action_reentry_rejects_wrong_target_before_business(
             action_id="stale-action" if damage == "action" else claim.action_id,
             generation=reservation.generation + (damage == "generation"),
         )
-    assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+    assert (states.root / "state.sqlite3").read_bytes() == before
 
 
 @pytest.mark.parametrize("kind", ["resume", "approve", "revise", "requeue"])
@@ -132,7 +134,7 @@ def test_binding_does_not_bypass_command_business_rejection(
 ) -> None:
     states, initial, task, control, claim, reservation = _accepted(git_repo, tmp_path, kind)
     run_id = initial["run_id"]
-    before = (states.runs_directory / f"{run_id}.json").read_bytes()
+    before = snapshot_run((states.root, str(run_id)))
 
     def reject(_action):
         raise ValueError("current command boundary no longer permits intent")
@@ -143,7 +145,7 @@ def test_binding_does_not_bypass_command_business_rejection(
     )
     with pytest.raises(ValueError, match="current command boundary"):
         lifecycle.execute_claimed(action_id=claim.action_id, generation=reservation.generation)
-    assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+    assert snapshot_run((states.root, str(run_id))) == before
     record = control.load(task)
     assert record["action"]["run_id"] == run_id
     assert record["action"]["application_observed"] is False

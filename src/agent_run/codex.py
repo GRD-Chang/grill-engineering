@@ -1119,9 +1119,15 @@ def _worker_hidden_paths(
         if configured_root:
             state_roots.add(Path(configured_root).expanduser())
         for root in state_roots:
+            # Cover the database and sidecars created after Worker startup.
+            # bubblewrap reopens only this Invocation's checkout/Git paths.
+            paths.append(root)
             paths.extend(
                 root / child
-                for child in ("runs", "task-control", "profiles", ".lock")
+                for child in (
+                    "runs", "task-control", "profiles", ".lock",
+                    "state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm",
+                )
             )
     return tuple(paths)
 

@@ -1596,16 +1596,17 @@ class RunLifecycle:
             # write.  Materialize that deterministic Action-bound profile so
             # the advertised explicit Resume remains usable after closeout.
             self.initialize_profile(current, True)
-        closed = self.control.fail_session_from_application_receipt(
-            self.task,
-            action_id=action_id,
-            generation=generation,
-            application_receipt=application_receipt,
-            persist_run_failure=lambda: record_session_interruption(
-                current,
-                save=lambda value: state_store.save_run(run_id, value),
-            ),
-        )
+        with state_store.commit_admission():
+            closed = self.control.fail_session_from_application_receipt(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                application_receipt=application_receipt,
+                persist_run_failure=lambda: record_session_interruption(
+                    current,
+                    save=lambda value: state_store.save_run(run_id, value),
+                ),
+            )
         return (
             current,
             resumed,

@@ -20,6 +20,8 @@ from support.seeding import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
 
+from support.state import include_in_state_snapshot, read_run, run_refs, snapshot_run, write_run_fixture
+
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -445,7 +447,7 @@ def _file_tree(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in sorted(root.rglob("*"))
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
 
 
@@ -1858,7 +1860,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     managed_root = _data_root(home) / "repositories" / "example" / "project"
     target_state_before_uninstall = _file_tree(managed_root)
     assert target_state_before_uninstall
-    assert list((managed_root / "state" / "runs").glob("*.json"))
+    assert run_refs(managed_root / 'state')
 
     count_before_repeat = int(count.read_text(encoding="utf-8"))
     # The public setup above already built and installed the real wheel.
@@ -2769,7 +2771,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     started_output = json.loads(started.stdout)
     run_id = started_output["run_id"]
     state_root = _data_root(home) / "repositories" / "example" / "project" / "state"
-    state_path = state_root / "runs" / f"{run_id}.json"
+    state_ref = (state_root, str(run_id))
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'second'\n", encoding="utf-8"
@@ -2802,20 +2804,20 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     rollback_output = json.loads(continued_after_rollback.stdout)
     assert rollback_output["run_id"] == run_id
 
-    incompatible = json.loads(state_path.read_text(encoding="utf-8"))
+    incompatible = read_run(state_ref)
     incompatible["schema_version"] = 1
-    state_path.write_text(json.dumps(incompatible), encoding="utf-8")
-    before = state_path.read_bytes()
+    write_run_fixture(state_ref, incompatible)
+    before = snapshot_run(state_ref)
     locator_path = _data_root(home) / "run-locator.json"
     locator_before = locator_path.read_bytes()
     target_files_before = {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
     target_paths_before = sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     )
     rejected = subprocess.run(
         [
@@ -2834,16 +2836,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected.returncode == 2
     assert json.loads(rejected.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
@@ -2861,16 +2863,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_install.returncode == 2
     assert json.loads(rejected_after_install.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
     rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
@@ -2885,16 +2887,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_rollback.returncode == 2
     assert json.loads(rejected_after_rollback.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
 

@@ -11,6 +11,8 @@ from support.workspace import managed_state
 from agent_run.delivery_history import history_records
 from support.cli import replace_only_run_state
 
+from support.state import include_in_state_snapshot
+
 
 def check_event(minute: int, result: str = "pending", **changes: Any) -> dict[str, Any]:
     event = {
@@ -213,7 +215,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
     replace_only_run_state(git_repo, lambda state: state.update(timeline=events))
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "120")
-    before = {path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*") if path.is_file()}
+    before = {path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*") if path.is_file() and include_in_state_snapshot(path)}
     for arguments in (["--plain"], ["--plain", "--details"], [], ["--details"]):
         output = Terminal()
         with redirect_stdout(output):

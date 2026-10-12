@@ -28,6 +28,8 @@ from agent_run.task_control import (
     TaskControlStore,
 )
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("revocation", ["none", "stop", "generation"])
 def test_cli_stop_preflight_contention_revalidates_before_commit(
@@ -75,7 +77,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         )
         head = GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo))
         (managed_repo(git_repo) / "README.md").write_text("candidate\n")
-        before_state = (states.runs_directory / f"{run_id}.json").read_bytes()
+        before_state = snapshot_run((states.root, str(run_id)))
         before_control = control.path_for(task).read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, "running")
         monkeypatch.setattr(
@@ -154,7 +156,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
                     )
                 release_preflight.set()
                 assert stop.result(timeout=5) == 0
-                assert (states.runs_directory / f"{run_id}.json").read_bytes() == before_state
+                assert snapshot_run((states.root, str(run_id))) == before_state
                 assert control.path_for(task).read_bytes() == before_control
                 if revocation == "stop":
                     control.claim_control_action(
@@ -186,9 +188,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
             assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) == head
             with pytest.raises(ActionReconciliationError):
                 states.save_run(run_id, {**state, "status": "completed"})
-            assert (
-                states.runs_directory / f"{run_id}.json"
-            ).read_bytes() == before_state
+            assert snapshot_run((states.root, str(run_id))) == before_state
     finally:
         if worker.poll() is None:
             worker.kill()

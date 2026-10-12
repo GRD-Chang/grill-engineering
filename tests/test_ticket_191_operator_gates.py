@@ -29,6 +29,8 @@ from support.resume import (
     _tree_snapshot,
 )
 
+from support.state import only_run_ref, snapshot_run
+
 
 @pytest.mark.parametrize(
     "subject_location",
@@ -386,9 +388,9 @@ def _assert_run_preserves_boundary(
     run_arguments: tuple[str, ...],
 ) -> None:
     state_root = managed_state(git_repo)
-    state_path = next((state_root / "runs").glob("*.json"))
+    state_ref = only_run_ref(state_root)
     control_path = next((state_root / "task-control").glob("*.json"))
-    state_before = state_path.read_bytes()
+    state_before = snapshot_run(state_ref)
     control_before = control_path.read_bytes()
     control_document_before = json.loads(control_before)
     tree_before = _tree_snapshot(state_root)
@@ -412,7 +414,7 @@ def _assert_run_preserves_boundary(
 
     assert rejected.returncode == 2, rejected.stderr
     assert stdout_json(rejected)["status"] == expected_status
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert control_path.read_bytes() == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert fixture.read_bytes() == fixture_before
@@ -492,9 +494,9 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     state_root = managed_state(git_repo)
-    state_path = next((state_root / "runs").glob("*.json"))
+    state_ref = only_run_ref(state_root)
     control_path = next((state_root / "task-control").glob("*.json"))
-    state_before = state_path.read_bytes()
+    state_before = snapshot_run(state_ref)
     control_before = control_path.read_bytes()
     tree_before = _tree_snapshot(state_root)
     unused_agents = _parent_only_agents(git_repo / "unused-agents.json")
@@ -510,7 +512,7 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
 
     assert waiting.returncode == 0, waiting.stderr
     assert stdout_json(waiting)["status"] == "waiting_external"
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert control_path.read_bytes() == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert json.loads(fixture.read_text(encoding="utf-8"))[

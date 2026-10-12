@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.state_errors import IncompatibleRunStateError
+
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
 from agent_run.state import (
     ConcurrentRunStateError,
@@ -20,23 +23,29 @@ from agent_run.state import (
 )
 
 
-def test_run_state_reads_pretty_json_and_saves_the_same_data_compactly(
-    tmp_path: Path,
-) -> None:
+def test_run_state_saves_only_sqlite_and_reopens_the_same_data(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     state = {"nested": [{"message": "中文状态", "values": [1, True, None]}]}
-    original = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
-    store.runs_directory.mkdir(parents=True)
+    store.save_run("run-1", state)
+    assert StateStore(store.root).load_run("run-1") == state
+    assert (store.root / "state.sqlite3").is_file()
+    assert not list(store.runs_directory.glob("*.json"))
+
+
+def test_legacy_json_is_rejected_without_reading_or_migrating(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    store.runs_directory.mkdir()
     path = store.runs_directory / "run-1.json"
-    path.write_text(original, encoding="utf-8")
-
-    loaded = store.load_run("run-1")
-    assert loaded == state
-    store.save_run("run-1", loaded)
-
-    assert store.load_run("run-1") == state
-    assert loaded == state
-    assert len(path.read_bytes()) < len(original.encode("utf-8"))
+    path.write_bytes(b"{broken legacy state")
+    before = path.read_bytes()
+    for operation in (lambda: store.load_run("run-1"),
+                      lambda: store.save_run("run-1", {"version": 1}),
+                      lambda: store.find_run("example/project", 1)):
+        with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
+            operation()
+    assert path.read_bytes() == before
+    assert store.has_run("run-1")
+    assert store.list_run_ids() == ["run-1"]
 
 
 @pytest.mark.parametrize("body", [
@@ -96,7 +105,7 @@ def test_run_state_persistence_rejects_oversized_write_and_read(
     store.runs_directory.mkdir(parents=True, exist_ok=True)
     oversized = store.runs_directory / "run-external.json"
     oversized.write_bytes(b" " * (MAX_RUN_STATE_BYTES + 1))
-    with pytest.raises(ValueError, match="persistence limit"):
+    with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
         store.load_run("run-external")
 
 
@@ -111,14 +120,12 @@ def test_run_discovery_lists_ids_without_loading_or_creating_state(
 
     store.runs_directory.mkdir(parents=True)
     (store.runs_directory / "broken.json").write_text("{", encoding="utf-8")
-    (store.runs_directory / "usable.json").write_text(
-        json.dumps({"run_id": "usable"}), encoding="utf-8"
-    )
+    store.save_run("usable", {"run_id": "usable"})
 
     assert store.list_run_ids() == ["broken", "usable"]
     assert store.has_run("broken")
-    assert store.load_run("usable") == {"run_id": "usable"}
-    with pytest.raises(json.JSONDecodeError):
+    assert store.load_run("usable")["run_id"] == "usable"
+    with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
         store.load_run("broken")
 
 
@@ -323,8 +330,7 @@ def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
 
     store.save_run("run-1", state)
 
-    path = store.runs_directory / "run-1.json"
-    persisted_bytes = path.read_bytes()
+    persisted_bytes = (store.root / "state.sqlite3").read_bytes()
     persisted = store.load_run("run-1")
     assert persisted is not None
     diagnostic = persisted["diagnostics"][0]
@@ -420,29 +426,16 @@ def test_run_locator_atomic_replace_preserves_previous_index(
     assert not list(tmp_path.glob(".run-locator.*.tmp"))
 
 
-def test_interrupted_replace_preserves_previous_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_interrupted_transaction_preserves_previous_state(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
     store.save_run("run-1", {"attempt": 1})
-    original_replace = os.replace
-
-    def fail_run_replace(source: str | Path, destination: str | Path) -> None:
-        if Path(destination).name == "run-1.json":
-            raise OSError("simulated interruption")
-        original_replace(source, destination)
-
-    monkeypatch.setattr(os, "replace", fail_run_replace)
-
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
     with pytest.raises(OSError, match="simulated interruption"):
-        store.save_run("run-1", {"attempt": 2})
-
-    persisted = json.loads(
-        (tmp_path / "runs" / "run-1.json").read_text(encoding="utf-8")
-    )
-    assert persisted == {"attempt": 1}
-    assert not list((tmp_path / "runs").glob("*.tmp"))
+        with repository.atomic():
+            repository.save("run-1", {"attempt": 2})
+            raise OSError("simulated interruption")
+    assert StateStore(tmp_path).load_run("run-1") == {"attempt": 1}
+    assert not list(tmp_path.glob("*journal"))
 
 
 def test_fresh_reviewer_human_blocker_history_uses_reviewer_thread(

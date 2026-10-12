@@ -214,17 +214,17 @@ def _read_locator_entry(
     states = StateStore(state_dir)
     state: dict[str, Any] | None = None
     state_error: str | None = None
-    if not states.has_run(run_id):
-        state_error = error_message("cli.error.state_missing")
-    else:
-        try:
+    try:
+        if not states.has_run(run_id):
+            state_error = error_message("cli.error.state_missing")
+        else:
             # Identity must be checked before validating the lifecycle payload:
             # a broken payload cannot hide a contradictory routing identity.
             state = states.load_run(run_id)
-        except (OSError, ValueError) as error:
-            state_error = bounded_error(str(error))
         if state is None:
             state_error = state_error or error_message("cli.error.run_id_mismatch")
+    except (OSError, ValueError) as error:
+        state_error = bounded_error(str(error))
     if state is not None and state.get("run_id") != run_id:
         return _candidate(
             entry,

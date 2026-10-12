@@ -32,6 +32,8 @@ from support.cli_supervision import (
 from agent_run.executor_host import _process_start_token
 from agent_run.notification_events import events
 
+from support.state import snapshot_runs
+
 
 def _write_executor_record(repo: Path, pid: int, start_token: str) -> None:
     directory = managed_state(repo) / "task-control"
@@ -198,6 +200,7 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
         state_files = {
             path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*.json")
         }
+        runs_before = snapshot_runs(managed_state(git_repo))
         # 活动 Executor 的真实 CLI 查询已在上方验证；退出后的展示组合复用进程内入口。
         for host_exit, activity in ((4, "not_running"), (1, "unknown")):
             # systemctl exit 4 confirms an absent unit; exit 1 cannot establish
@@ -232,6 +235,7 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
         assert {
             path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*.json")
         } == state_files
+        assert snapshot_runs(managed_state(git_repo)) == runs_before
     finally:
         _interrupt_run(process, git_repo)
 

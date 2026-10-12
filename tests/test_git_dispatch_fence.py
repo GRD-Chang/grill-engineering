@@ -16,6 +16,8 @@ from agent_run.run_driver import DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
 
+from support.state import snapshot_run
+
 
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(
@@ -207,8 +209,8 @@ def test_git_successor_write_rechecks_executor_ownership(
     states = StateStore(tmp_path / "state")
     state = {"run_id": "run-156", "status": "running"}
     states.save_run("run-156", state)
-    state_path = states.runs_directory / "run-156.json"
-    before_state = state_path.read_bytes()
+    state_ref = (states.root, 'run-156')
+    before_state = snapshot_run(state_ref)
     control = TaskControlStore(states.root)
     claim = control.claim_action(task, kind="run", payload={"parent": 156})
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id="run-156")
@@ -285,7 +287,7 @@ def test_git_successor_write_rechecks_executor_ownership(
         assert _git(root, "rev-parse", "HEAD") == head
         with pytest.raises(ActionReconciliationError):
             states.save_run("run-156", {**state, "status": "completed"})
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
     else:
         states.save_run("run-156", {**state, "status": "completed"})
         assert states.load_run("run-156")["status"] == "completed"

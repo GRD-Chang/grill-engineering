@@ -18,6 +18,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import write_fixture
 from support.workspace import managed_state
 
+from support.state import snapshot_runs
+
 
 @pytest.mark.parametrize("state_read_error", [False, True], ids=["lost-receipts", "read-recovery"])
 def test_public_run_finishes_important_retry_and_exposes_attempts_without_sending(
@@ -120,10 +122,12 @@ raise SystemExit(main(sys.argv[1:]))
     assert all(not Path(f"/proc/{pid}").exists()
                for item in requests for pid in item["processes"])
     before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*.json")}
+    runs_before = snapshot_runs(root)
     sent_before = messages.read_bytes()
     for command in ("status", "history"):
         queried = invoke_cli_inprocess(git_repo, fixture, command, state["run_id"], "--json")
         assert queried.returncode == 0, queried.stdout + queried.stderr
         assert stdout_json(queried)["notifications"] == journal
     assert {path.relative_to(root): path.read_bytes() for path in root.rglob("*.json")} == before
+    assert snapshot_runs(root) == runs_before
     assert messages.read_bytes() == sent_before

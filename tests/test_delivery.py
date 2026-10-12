@@ -56,6 +56,8 @@ from agent_run.review_budget import TICKET_POLICY
 
 from support.seeding import write_fixture
 
+from support.state import read_run
+
 
 def test_change_delivery_seams_keep_facts_and_semantics_separate() -> None:
     contract = ChangeJobContract(
@@ -1549,11 +1551,7 @@ def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
     ).stdout.strip()
     assert message == "feat(delivery): complete one ticket autonomously"
     assert not checkout.exists()
-    persisted = json.loads(
-        (git_repo / ".agent-run" / "runs" / f"{state['run_id']}.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    persisted = read_run((git_repo / '.agent-run', str(state['run_id'])))
     assert persisted["status"] == "ticket_completed"
     completed_job = persisted["ticket_jobs"]["3"]
     assert completed_job["human_blocker_history"] == [
@@ -1766,7 +1764,11 @@ def test_first_ci_repair_candidate_save_clears_receipt_observation_before_resume
                 and job.get("attempt_kind") == "ci_repair"
             )
             super()._save_run_unlocked(run_id, state)
-            if is_ci_repair_candidate:
+            self._crash_after_save = is_ci_repair_candidate
+
+        def _after_run_saved(self) -> None:
+            if self._crash_after_save:
+                self._crash_after_save = False
                 self.crashed = True
                 raise SimulatedProcessCrash(
                     "simulated crash after CI repair Candidate save"
@@ -1872,7 +1874,11 @@ def test_fallback_observation_commit_resumes_without_duplicate_work(
                     "simulated crash before atomic Observation commit"
                 )
             super()._save_run_unlocked(run_id, state)
-            if is_observation_commit:
+            self._crash_after_save = is_observation_commit
+
+        def _after_run_saved(self) -> None:
+            if self._crash_after_save:
+                self._crash_after_save = False
                 self.crashed = True
                 raise SimulatedProcessCrash(
                     "simulated crash after atomic Observation commit"
@@ -2678,6 +2684,7 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
         crashed = False
 
         def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+            self._crash_after_save = False
             super()._save_run_unlocked(run_id, state)
             job = state.get("active_ticket_job")
             if not isinstance(job, dict) or job.get("attempt_kind") != "ci_repair":
@@ -2705,7 +2712,11 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
                 "review_result": job["phase"] == "reviewing"
                 and isinstance(job.get("pending_review_result"), dict),
             }[checkpoint]
-            if reached:
+            self._crash_after_save = reached
+
+        def _after_run_saved(self) -> None:
+            if self._crash_after_save:
+                self._crash_after_save = False
                 self.crashed = True
                 raise SimulatedProcessCrash(f"after {checkpoint} save")
 

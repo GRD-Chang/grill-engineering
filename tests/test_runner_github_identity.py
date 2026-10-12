@@ -20,6 +20,8 @@ from support.seeding import write_fixture
 from support.user_defaults import settings
 from support.workspace import managed_state
 
+from support.state import run_refs, run_state_text
+
 
 @pytest.mark.parametrize("reference", ["env", "file"])
 def test_public_runner_pat_reference_failure_and_resume(
@@ -112,9 +114,10 @@ raise SystemExit(0 if token in ("runner-first", "runner-repaired") else 1)
     assert delivery["pull_requests"][0]["state"] == "MERGED"
     tokens = [json.loads(line)["token"] for line in capture.read_text().splitlines()]
     assert set(tokens) == {"runner-first", "runner-repaired"}
-    for path in managed_state(git_repo).rglob("*.json"):
-        assert all(secret not in path.read_text() for secret in
-                   ("runner-first", "runner-repaired", "unavailable-host"))
+    texts = [path.read_text() for path in managed_state(git_repo).rglob("*.json")]
+    texts.extend(run_state_text(reference) for reference in run_refs(managed_state(git_repo)))
+    assert all(secret not in text for text in texts
+               for secret in ("runner-first", "runner-repaired", "unavailable-host"))
 
 
 def test_public_runner_missing_pat_has_no_recoverable_run(
@@ -125,7 +128,7 @@ def test_public_runner_missing_pat_has_no_recoverable_run(
                      "--github-pat-file", str(tmp_path / "missing-pat"))
     assert result.returncode == 2
     assert "PAT" in result.stdout
-    assert not list((managed_state(git_repo) / "runs").glob("*.json"))
+    assert not run_refs(managed_state(git_repo))
 
 
 @pytest.mark.parametrize("worker_source", ["host", "pat"])
@@ -206,7 +209,7 @@ raise SystemExit(cli.main(sys.argv[1:]))
         "--github-pat-env", "TASK_RUNNER_PAT", "--json",
     ], cwd=git_repo, env=environment, capture_output=True, text=True, timeout=30)
     assert result.returncode == 2, result.stdout + result.stderr
-    assert not list((managed_state(git_repo) / "runs").glob("*.json"))
+    assert not run_refs(managed_state(git_repo))
     assert f"HTTP {status}" in result.stdout + result.stderr
     assert "valid-but-unscoped" not in result.stdout + result.stderr
 
@@ -237,7 +240,7 @@ def test_runner_initial_fetch_failure_does_not_create_run(
     with pytest.raises(GitError, match="HTTP 403"):
         controller.start_or_resume_unfinished(1)
     assert received == [identity]
-    assert not list((states.root / "runs").glob("*.json"))
+    assert not run_refs(states.root)
 
 
 @pytest.mark.parametrize("failure_mode", ["initial", "renewal"])

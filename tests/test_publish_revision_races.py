@@ -607,25 +607,34 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
 
     save_run = StateStore._save_run_unlocked
     crashed = False
+    crash_after_save = False
 
-    def crash_after_revision_mismatch_save(
+    def record_revision_mismatch_save(
         store: StateStore, saved_run_id: str, state: dict[str, Any]
     ) -> None:
-        nonlocal crashed
+        nonlocal crash_after_save
         save_run(store, saved_run_id, state)
         job = state.get("ticket_jobs", {}).get("2", {})
-        if (
+        crash_after_save = (
             not crashed
             and saved_run_id == run_id
             and job.get("phase") == "blocked"
             and job.get("blocked_reason") == "effective_revision_mismatch"
-        ):
+        )
+
+    def crash_after_revision_mismatch_save(store: StateStore) -> None:
+        nonlocal crashed, crash_after_save
+        if crash_after_save:
+            crash_after_save = False
             crashed = True
             raise SimulatedProcessCrash("after durable revision mismatch")
 
     with monkeypatch.context() as crash_patch:
         crash_patch.setattr(
-            StateStore, "_save_run_unlocked", crash_after_revision_mismatch_save
+            StateStore, "_save_run_unlocked", record_revision_mismatch_save
+        )
+        crash_patch.setattr(
+            StateStore, "_after_run_saved", crash_after_revision_mismatch_save
         )
         interrupted = run_internal_stage(
             git_repo,

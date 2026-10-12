@@ -22,6 +22,8 @@ from support.environment import _apply_test_environment
 from support.seeding import seed_run, write_fixture
 from support.cli import issue, load_only_run_state, run_cli, stdout_json
 
+from support.state import only_run_ref, read_run, snapshot_run, write_run_fixture
+
 
 def _with_canonical_ci_budget(state: dict[str, Any]) -> dict[str, Any]:
     """Keep these repair-mode fixtures valid under the independent CI contract."""
@@ -90,9 +92,9 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_job": repair_job,
     }
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo))
     _with_canonical_ci_budget(state)
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(state_ref, state)
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
     head_before = subprocess.run(
@@ -108,7 +110,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
     assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == state_before
+    assert read_run(state_ref) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -423,9 +425,9 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
             "integrated_revalidation_merge": marker,
         },
     }
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo))
     _with_canonical_ci_budget(state)
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(state_ref, state)
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
     refs_before = _git_refs(managed_repo(git_repo))
@@ -435,7 +437,7 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
     assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == state_before
+    assert read_run(state_ref) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert _git_refs(managed_repo(git_repo)) == refs_before
 
@@ -487,9 +489,9 @@ def test_resume_rejects_previous_budget_protocol_without_changing_materials(
     state = load_only_run_state(git_repo)
     assert state["review_budget_protocol"] == 2
     state["review_budget_protocol"] = 1
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
-    before = state_path.read_bytes()
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
+    before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     refs_before = _git_refs(managed_repo(git_repo))
 
@@ -497,7 +499,7 @@ def test_resume_rejects_previous_budget_protocol_without_changing_materials(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert fixture.read_bytes() == fixture_before
     assert _git_refs(managed_repo(git_repo)) == refs_before
 

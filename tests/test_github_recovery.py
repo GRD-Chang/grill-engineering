@@ -17,6 +17,8 @@ from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 from agent_run.models import Repository
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
 
+from support.state import run_refs
+
 
 def test_github_reader_retries_transient_timeout(
     git_repo: Path, monkeypatch
@@ -246,7 +248,7 @@ def test_foreground_run_selection_reuses_one_unfinished_run(git_repo: Path) -> N
     assert not created_resumed
     assert reused_resumed
     assert reused["run_id"] == created["run_id"]
-    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+    assert len(run_refs(git_repo / '.agent-run')) == 1
 
 
 def test_foreground_run_reports_all_conflicting_run_ids(git_repo: Path) -> None:

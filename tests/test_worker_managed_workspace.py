@@ -38,7 +38,7 @@ def test_worker_can_use_managed_checkout_without_exposing_runner_data(
         clone / "base-checkout-secret",
         runner_root / "snapshots" / "installed" / "runner-secret",
         runner_root / "run-locator.json",
-        state_root / "runs" / "run.json",
+        state_root / "state.sqlite3",
         state_root / "task-control" / "authority.json",
         state_root / "worktrees" / "other-run" / "private-source.py",
         checkout / ".agent-run" / "runs" / "nested-secret.json",

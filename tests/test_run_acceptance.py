@@ -40,6 +40,8 @@ from support.cli_payloads import final_run_publication
 
 from support.run_agents import FreshCycleRunAgents, ScriptedRunAgents
 
+from support.state import snapshot_run
+
 
 def _integration_record(
     *,
@@ -1628,8 +1630,8 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     assert blocked["status"] == "ready_for_human"
     assert all(not checkout.exists() for checkout in agents.checkouts)
     from support.inprocess_cli import invoke_cli_inprocess
-    state_file = states.runs_directory / f"{state['run_id']}.json"
-    saved = state_file.read_bytes()
+    state_ref = (states.root, str(state['run_id']))
+    saved = snapshot_run(state_ref)
     views = {}
     for command in ("status", "history"):
         query = invoke_cli_inprocess(
@@ -1643,7 +1645,7 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     assert worker["attempt"] == marker["attempt"] == 1
     assert worker["thread_id"] == marker["thread_id"] == "blocked-run-reviewer"
     assert worker["phase"] == marker["phase"] == blocked["run_acceptance"]["human_blocker_phase"]
-    assert state_file.read_bytes() == saved
+    assert snapshot_run(state_ref) == saved
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states

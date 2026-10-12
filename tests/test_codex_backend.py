@@ -3496,7 +3496,9 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
         directory.mkdir(parents=True)
         (directory / "authority.json").write_text("authority", encoding="utf-8")
     (custom_state_root / ".lock").write_text("authority", encoding="utf-8")
-    custom_run = custom_state_root / "runs" / "authority.json"
+    (control_root / "state.sqlite3").write_text("secret", encoding="utf-8")
+    custom_run = custom_state_root / "state.sqlite3"
+    custom_run.write_text("authority", encoding="utf-8")
     custom_control = custom_state_root / "task-control" / "authority.json"
     custom_profile = custom_state_root / "profiles" / "authority.json"
     custom_lock = custom_state_root / ".lock"
@@ -3524,6 +3526,9 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
     monkeypatch.setenv("AGENT_RUN_INTERNAL_STATE_ROOT", str(custom_state_root))
     environment = worker_environment(tmp_path / "gh", "read-token")
     hidden = codex_module._worker_hidden_paths(None, checkout=checkout)
+    # WAL/SHM can appear after the launch boundary collected existing paths.
+    for suffix in ("-wal", "-shm"):
+        Path(str(custom_run) + suffix).write_text("authority", encoding="utf-8")
     probe = checkout / "probe.py"
     probe.write_text(
         "import json, os, subprocess, sys\n"
@@ -3560,7 +3565,7 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
     )
     environment.update(
         {
-            "CONTROL_SECRET": str(control_root / "runs" / "authority.json"),
+            "CONTROL_SECRET": str(control_root / "state.sqlite3"),
             "CUSTOM_STATE": str(custom_run),
             "CUSTOM_CONTROL": str(custom_control),
             "CUSTOM_PROFILE": str(custom_profile),
@@ -3572,6 +3577,15 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
             "SYSTEMD_PRIVATE": str(systemd_private),
         }
     )
+    sidecar_probe = (
+        "import os; from pathlib import Path\n"
+        "for suffix in ('-wal', '-shm'):\n"
+        "    path = Path(os.environ['CUSTOM_STATE'] + suffix)\n"
+        "    assert not path.exists(), 'SQLite authority sidecar exposed'\n"
+        "    path.write_text('mutated')\n"
+    )
+    with probe.open("a", encoding="utf-8") as stream:
+        stream.write(f"subprocess.run([sys.executable, '-c', {sidecar_probe!r}], check=True)\n")
     command = bubblewrap_command(
         [sys.executable, str(probe)],
         checkout=checkout,
@@ -3592,6 +3606,8 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
 
     assert result.returncode == 0, result.stderr
     assert custom_run.read_text(encoding="utf-8") == "authority"
+    for suffix in ("-wal", "-shm"):
+        assert Path(str(custom_run) + suffix).read_text(encoding="utf-8") == "authority"
     assert custom_control.read_text(encoding="utf-8") == "authority"
     assert custom_profile.read_text(encoding="utf-8") == "authority"
     assert custom_lock.read_text(encoding="utf-8") == "authority"

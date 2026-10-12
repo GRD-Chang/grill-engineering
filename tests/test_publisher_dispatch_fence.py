@@ -17,6 +17,8 @@ from agent_run.run_driver import _FencedExternal, _fenced_publisher
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
 
+from support.state import snapshot_run
+
 
 def _publisher(tmp_path: Path):
     task = TaskKey(tmp_path, "example/project", 156)
@@ -51,7 +53,7 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revocation: str
 ) -> None:
     publisher, control, task, identity, states, state = _publisher(tmp_path)
-    before = (states.runs_directory / "run-156.json").read_bytes()
+    before = snapshot_run((states.root, 'run-156'))
     entered, release = Event(), Event()
     mutations: list[str] = []
     remote = {"state": "OPEN", "comments": []}
@@ -110,7 +112,7 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
         assert remote["state"] == "OPEN"
         with pytest.raises(ActionReconciliationError):
             states.save_run("run-156", {**state, "status": "completed"})
-        assert (states.runs_directory / "run-156.json").read_bytes() == before
+        assert snapshot_run((states.root, 'run-156')) == before
 
 
 @pytest.mark.parametrize("revoke_after_write", [False, True])

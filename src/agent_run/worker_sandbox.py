@@ -323,13 +323,13 @@ def _mask_worker_paths(
     )
     mounted_directories: list[Path] = []
     for directory in directories:
-        if any(parent in mounted_directories for parent in directory.parents):
-            continue
+        # Keep explicitly masked subdirectories available as empty private
+        # mountpoints even when their parent state root is already hidden.
         arguments.extend(["--tmpfs", str(directory)])
         mounted_directories.append(directory)
 
     for path in sorted(paths - set(directories), key=str):
-        if any(directory in path.parents for directory in mounted_directories):
+        if path.name != ".lock" and any(directory in path.parents for directory in mounted_directories):
             continue
         arguments.extend(["--ro-bind", "/dev/null", str(path)])
     return paths

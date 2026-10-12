@@ -21,6 +21,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_publication, passing_acceptance, ticket
 
+from support.state import run_refs
+
 
 def test_preset_resolution_respects_publication_defaults_and_overrides() -> None:
     economy = resolve_profiles(preset="economy")
@@ -545,9 +547,9 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         while not started_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert started_file.exists()
-        run_files = list((managed_state(git_repo) / "runs").glob("*.json"))
-        assert len(run_files) == 1
-        run_id = run_files[0].stem
+        run_records = run_refs(managed_state(git_repo))
+        assert len(run_records) == 1
+        run_id = run_records[0][1]
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         assert active_before["agent_invocation"]["model"] == "old-development"
@@ -764,9 +766,9 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
             time.sleep(0.02)
         assert started_file.exists()
 
-        run_files = list((managed_state(git_repo) / "runs").glob("*.json"))
-        assert len(run_files) == 1
-        run_id = run_files[0].stem
+        run_records = run_refs(managed_state(git_repo))
+        assert len(run_records) == 1
+        run_id = run_records[0][1]
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         invocation_before = active_before["agent_invocation"]

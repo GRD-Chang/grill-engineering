@@ -24,6 +24,8 @@ from support.seeding import seed_run, write_fixture
 from support.cli import load_only_run_state
 from support.run_artifacts import _canonical_run_budget
 
+from support.state import snapshot_run
+
 
 @pytest.fixture(autouse=True)
 def isolated_environment(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,8 +105,8 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
     arguments = [command, run_id, "--repo", "example/project", "--json"]
     if command == "revise":
         arguments.extend(["--message", "apply this exact revision"])
-    state_path = state_root / "runs" / f"{run_id}.json"
-    state_before = state_path.read_bytes()
+    state_ref = (state_root, str(run_id))
+    state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     control_before = control_path.read_bytes() if control_path.exists() else None
 
@@ -113,7 +115,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         cli_module.main(["run", "1", "--repo", "example/project", "--json"])
         capsys.readouterr()
         assert host.start_count == 0
-        assert state_path.read_bytes() == state_before
+        assert snapshot_run(state_ref) == state_before
         # A read-only refusal may leave the missing/corrupt evidence intact.
         assert (
             control_path.read_bytes() if control_path.exists() else None
@@ -126,7 +128,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         spec.action_id == receipt["action_id"] and spec.generation == old_generation
         for spec in host.observed
     )
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert fixture.read_bytes() == fixture_before
     repaired = control.load(task)
     assert repaired is not None
@@ -141,7 +143,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         assert host.start_count == 0
         assert len(host.observed) == 2
         assert control_path.read_bytes() == before_retry
-        assert state_path.read_bytes() == state_before
+        assert snapshot_run(state_ref) == state_before
         assert fixture.read_bytes() == fixture_before
         return
 
@@ -173,7 +175,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
     capsys.readouterr()
     assert host.start_count == (1 if intent == "successor" else 0)
     assert control_path.read_bytes() == before_retry
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert fixture.read_bytes() == fixture_before
 
 

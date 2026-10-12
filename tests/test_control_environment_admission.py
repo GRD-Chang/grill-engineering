@@ -33,6 +33,8 @@ from agent_run.task_control import (
     TaskKey,
 )
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize(
     "kind,active",
@@ -101,8 +103,8 @@ def test_control_environment_rejected_before_ownership_changes(
             executor["pid"],
             executor["process_start_token"],
         )
-    state_path = states.runs_directory / f"{run_id}.json"
-    before_state = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before_state = snapshot_run(state_ref)
     before_control = control.path_for(task).read_bytes()
     before_fixture = fixture.read_bytes()
     for _ in range(2):
@@ -111,7 +113,7 @@ def test_control_environment_rejected_before_ownership_changes(
         assert code == 2, output
         assert "发起终端环境过大" in json.dumps(output, ensure_ascii=False), output
         assert control.path_for(task).read_bytes() == before_control
-        assert state_path.read_bytes() == before_state
+        assert snapshot_run(state_ref) == before_state
         assert fixture.read_bytes() == before_fixture
         assert transport.start_count == 0
         assert not list((tmp_path / "runtime").glob("environment-*.json"))
@@ -286,8 +288,8 @@ def test_running_control_attaches_with_oversize_observer_environment(
         payload_digest=first.action["payload_digest"],
     )
     before_control = control.path_for(task).read_bytes()
-    state_path = states.runs_directory / f"{run_id}.json"
-    before_run = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    before_run = snapshot_run(state_ref)
 
     def detach_observer(_seconds: float) -> None:
         observation = host.observe(spec, control)
@@ -303,7 +305,7 @@ def test_running_control_attaches_with_oversize_observer_environment(
                 LifecycleRequest(task=task, kind=kind, payload=payload)
             )
         assert control.path_for(task).read_bytes() == before_control
-        assert state_path.read_bytes() == before_run
+        assert snapshot_run(state_ref) == before_run
         assert transport.start_count == 0
         assert worker.poll() is None
         assert not list((tmp_path / "runtime").glob("environment-*.json"))

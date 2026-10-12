@@ -18,6 +18,8 @@ from support.delivery_agents import PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
 from support.seeding import write_fixture
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("merge", [False, True])
 @pytest.mark.parametrize(
@@ -137,10 +139,10 @@ def test_public_resume_validates_recovered_integration_commit(
     agents.continued = True
     calls_before = agents.integration_calls
     if recovery == "invalid_manual_commit":
-        before = (states.runs_directory / f"{run_id}.json").read_bytes()
+        before = snapshot_run((states.root, str(run_id)))
         with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):
             controller.resume(run_id, explicit_resume=True, ticket_number=3, new_thread=True)
-        assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+        assert snapshot_run((states.root, str(run_id))) == before
         assert agents.integration_calls == calls_before
         assert not agents.publication_requests
         assert publisher.merged_head is None

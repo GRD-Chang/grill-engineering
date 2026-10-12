@@ -26,6 +26,8 @@ from support.seeding import write_fixture
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_publication, passing_acceptance, repair_acceptance, ticket
 
+from support.state import snapshot_runs
+
 
 @pytest.mark.parametrize("language,drain,scope,mode", [
     ("zh", True, "ticket", "detailed"),
@@ -286,6 +288,7 @@ raise SystemExit(main(sys.argv[1:]))
         path.relative_to(state_root): path.read_bytes()
         for path in state_root.rglob("*.json")
     }
+    runs_before = snapshot_runs(state_root)
     for command in ("status", "history"):
         queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
         assert queried.returncode == 0, queried.stderr
@@ -344,6 +347,7 @@ raise SystemExit(main(sys.argv[1:]))
         path.relative_to(state_root): path.read_bytes()
         for path in state_root.rglob("*.json")
     } == durable_before
+    assert snapshot_runs(state_root) == runs_before
     assert (messages.read_bytes() if messages.exists() else b"") == before
     assert read_notifications(managed_state(git_repo), output["run_id"]) == journal
     # Approval reuses the immutable Run configuration even after defaults change.

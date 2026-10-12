@@ -39,6 +39,8 @@ from support.cli import (
     stdout_json,
 )
 
+from support.state import only_run_ref, write_run_fixture
+
 
 def assert_invalid_policy_cli_result(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 2, result.stderr
@@ -4849,7 +4851,7 @@ def test_resume_targets_failed_run_repair_development_not_completed_ticket(
     assert failed.returncode == 2, failed.stderr
     assert stdout_json(failed)["status"] == "execution_failed"
 
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo))
     failed_state = load_only_run_state(git_repo)
     completed_ticket = failed_state["ticket_jobs"]["3"]
     assert completed_ticket["phase"] == "completed"
@@ -4860,7 +4862,7 @@ def test_resume_targets_failed_run_repair_development_not_completed_ticket(
     assert original_invocation["work_subject"] == f"run-repair:{run_id}"
     assert original_invocation["role"] == "development"
     assert original_invocation["reported_thread_id"] == "run-repair-developer"
-    state_path.write_text(json.dumps(failed_state), encoding="utf-8")
+    write_run_fixture(state_ref, failed_state)
 
     resume_agents = git_repo / "resume-run-repair-agents.json"
     resume_agents.write_text(json.dumps({

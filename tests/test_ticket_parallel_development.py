@@ -46,6 +46,8 @@ from support.ticket_parallel import (
     ticket_engine as _engine,
 )
 
+from support.state import snapshot_run
+
 
 def test_fixture_revision_read_does_not_erase_parallel_ticket_branch(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
@@ -268,7 +270,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
     run_id = stdout_json(seeded)["run_id"]
     states = StateStore(managed_state(git_repo))
     control_path = next((states.root / "task-control").glob("*.json"))
-    run_path = states.runs_directory / f"{run_id}.json"
+    run_ref = (states.root, str(run_id))
     evidence_path = git_repo / "branch-preparation-observed.json"
     observed: list[str] = []
 
@@ -278,7 +280,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
         assert preparing["ticket_jobs"]["2"]["phase"] == "developing"
         assert "2" not in preparing["ticket_agent_invocations"]
         original_control = control_path.read_bytes()
-        original_run = run_path.read_bytes()
+        original_run = snapshot_run(run_ref)
         try:
             for activity in ("not_running", "running", "unknown"):
                 if activity == "unknown":
@@ -324,7 +326,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
                                 "running": "not_running",
                                 "unknown": "unknown",
                             }[activity]
-                    assert run_path.read_bytes() == original_run
+                    assert snapshot_run(run_ref) == original_run
                     assert (control_path.read_bytes() if control_path.exists() else None) == before_control
                     observed.append(activity)
         finally:

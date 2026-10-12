@@ -157,6 +157,17 @@ def _invocation_timing(invocation: dict[str, Any], *, allow_open: bool = False) 
                     "recorded_execution_seconds": 0}
         return facts
     segments = invocation.get("execution_segments")
+    summary = invocation.get("execution_timing_summary")
+    if segments == [] and invocation.get("status") in {"completed", "failed"} and isinstance(summary, dict):
+        if (set(summary) == set(facts)
+                and type(summary.get("execution_timing_complete")) is bool
+                and all(value is None or type(value) is int and value >= 0
+                        for value in (summary.get("execution_seconds"), summary.get("recorded_execution_seconds")))
+                and (summary["execution_timing_complete"] is True
+                     and summary["execution_seconds"] == summary["recorded_execution_seconds"]
+                     or summary["execution_timing_complete"] is False and summary["execution_seconds"] is None)):
+            return dict(summary)
+        return facts
     if not isinstance(segments, list) or not segments:
         # Invocation timestamps include Controller checks and setup. Legacy
         # records cannot prove Worker duration, even when both timestamps exist.

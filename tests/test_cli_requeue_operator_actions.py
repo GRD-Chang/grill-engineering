@@ -18,6 +18,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import seed_run, write_fixture
 from support.workspace import managed_state
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("parent_only", [True, False], ids=["parent-only", "ticket"])
 def test_changed_requirements_replace_the_old_human_action_with_requeue(git_repo: Path, parent_only: bool) -> None:
@@ -59,8 +61,8 @@ def test_changed_requirements_replace_the_old_human_action_with_requeue(git_repo
     assert stale["agent_invocation_history"] == blocked["agent_invocation_history"]
     reason = "parent_requirements_changed" if parent_only else "ticket_requirements_changed"
     assert stale["requeue_required"]["reason"] == reason
-    run_path = managed_state(git_repo) / "runs" / f"{run_id}.json"
-    before_queries = run_path.read_bytes()
+    run_ref = (managed_state(git_repo), str(run_id))
+    before_queries = snapshot_run(run_ref)
     for command in ("status", "history"):
         result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
         assert result.returncode == 0, result.stdout + result.stderr
@@ -78,7 +80,7 @@ def test_changed_requirements_replace_the_old_human_action_with_requeue(git_repo
         assert action["next_action"] == view["next_action"] == f"agent-run requeue {run_id}"
         human = invoke_cli_inprocess(git_repo, fixture, command, run_id).stdout
         assert "agent-run requeue 1 --repo example/project" in human
-    assert run_path.read_bytes() == before_queries
+    assert snapshot_run(run_ref) == before_queries
     requeue_event = boundary(stale)
     assert requeue_event["id"] != old_boundary["id"]
     for key in ("work_subject", "generation", "scope", "reason", "evidence", "action"):
@@ -154,8 +156,8 @@ def test_requeue_preserves_an_independent_reviewer_blocker(
     assert stale is not None
     assert stale["ticket_jobs"]["2"] == sibling
     assert stale["agent_invocation_history"] == invocations_before
-    run_path = managed_state(git_repo) / "runs" / f"{run_id}.json"
-    before_queries = run_path.read_bytes()
+    run_ref = (managed_state(git_repo), str(run_id))
+    before_queries = snapshot_run(run_ref)
     for command in ("status", "history"):
         result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
         assert result.returncode == 0, result.stdout + result.stderr
@@ -174,7 +176,7 @@ def test_requeue_preserves_an_independent_reviewer_blocker(
         assert human.returncode == 0, human.stdout + human.stderr
         assert "agent-run requeue 1 --repo example/project" in human.stdout
         assert HUMAN_BLOCKER in human.stdout
-    assert run_path.read_bytes() == before_queries
+    assert snapshot_run(run_ref) == before_queries
 
     boundaries = {event["work_subject"]: event for event in events(stale) if event.get("current")}
     assert set(boundaries) == {"ticket:2", "ticket:3"}
@@ -196,7 +198,7 @@ def test_requeue_preserves_an_independent_reviewer_blocker(
     for event in boundaries.values():
         assert sent.count(card(event)) == 1
     assert read_notifications(managed_state(git_repo), run_id)["pending"] == []
-    assert run_path.read_bytes() == before_queries
+    assert snapshot_run(run_ref) == before_queries
 
     replacement = git_repo / "replacement-agents.json"
     replacement.write_text(json.dumps({"developments": [human_blocker_step("developer-3-new")]}), encoding="utf-8")

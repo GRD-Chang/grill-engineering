@@ -31,6 +31,8 @@ from support.seeding import write_fixture
 from support.cli import PROJECT_ROOT, issue, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_round_agents, passing_acceptance, ticket
 
+from support.state import only_run_ref, snapshot_run
+
 
 def _start_gated_resume(
     git_repo: Path,
@@ -578,8 +580,8 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         str(_resumed_parent_agents(git_repo)),
         "--json",
     ]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_bytes = state_path.read_bytes()
+    state_ref = only_run_ref(managed_state(git_repo))
+    state_bytes = snapshot_run(state_ref)
     fixture_bytes = fixture.read_bytes()
     return_code = cli_module.main(command)
     output = json.loads(capsys.readouterr().out)
@@ -588,7 +590,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         assert return_code == 2, output
         assert output["diagnostics"][0]["code"] == "executor_start_unknown"
         assert host.start_count == 0
-        assert state_path.read_bytes() == state_bytes
+        assert snapshot_run(state_ref) == state_bytes
         assert fixture.read_bytes() == fixture_bytes
         repaired_bytes = control_path.read_bytes()
         repaired = control_store.load(task)
@@ -601,7 +603,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         assert repeated_return_code == 2, repeated_output
         assert repeated_output["diagnostics"][0]["code"] == "executor_start_unknown"
         assert control_path.read_bytes() == repaired_bytes
-        assert state_path.read_bytes() == state_bytes
+        assert snapshot_run(state_ref) == state_bytes
         assert fixture.read_bytes() == fixture_bytes
         assert host.observe_count == 2
         assert host.start_count == 0
@@ -695,12 +697,12 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
         ]
         fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     state_root = managed_state(git_repo)
-    state_path = next((state_root / "runs").glob("*.json"))
+    state_ref = only_run_ref(state_root)
     control_path = next((state_root / "task-control").glob("*.json"))
     current_state = load_only_run_state(git_repo)
     receipt_before = current_state["action_application_receipt"]
     assert isinstance(receipt_before, dict)
-    state_before = state_path.read_bytes()
+    state_before = snapshot_run(state_ref)
     control_before = control_path.read_bytes()
     control_document_before = json.loads(control_before)
     state_tree_before = _tree_snapshot(state_root)
@@ -744,7 +746,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
                 assert output["status"] == expected_status, output
                 if expected_status == "publication_pending":
                     assert output["result"] == "rejected"
-                assert state_path.read_bytes() == state_before
+                assert snapshot_run(state_ref) == state_before
                 assert control_path.read_bytes() == control_before
                 assert _tree_snapshot(state_root) == state_tree_before
                 assert (
@@ -781,7 +783,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
                         run_arguments,
                         expected_return_code=expected_return_code,
                     )
-                assert state_path.read_bytes() == state_before
+                assert snapshot_run(state_ref) == state_before
                 assert control_path.read_bytes() == control_before
                 capsys.readouterr()
         except AssertionError as error:

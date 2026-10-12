@@ -5,9 +5,10 @@ from agent_run.work_facts import work_attempt, work_phase, work_role
 
 import fcntl
 import json
+import logging
 import os
-import tempfile
 import threading
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -15,11 +16,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-from agent_run.models import same_repository
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
+from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.state_commits import coordinator_for
+from agent_run.state_errors import IncompatibleRunStateError
 
 
 MAX_TIMELINE_EVENTS = 256
@@ -32,16 +35,6 @@ _T = TypeVar("_T")
 
 class ConcurrentRunStateError(RuntimeError):
     """A Run changed after a Controller read its refresh baseline."""
-
-
-def _load_bounded_json(path: Path) -> object:
-    with path.open("rb") as source:
-        encoded = source.read(MAX_RUN_STATE_BYTES + 1)
-    if len(encoded) > MAX_RUN_STATE_BYTES:
-        raise ValueError(
-            f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit: {path}"
-        )
-    return json.loads(encoded.decode("utf-8"))
 
 
 class SimulatedProcessCrash(OSError):
@@ -58,6 +51,10 @@ class StateStore:
         self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
         self._expected_run_state = threading.local()
+        self._repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+        self._coordinator = coordinator_for(root)
+        self._commit_context = threading.local()
+        self._validated_read: tuple[object, weakref.ReferenceType[object]] | None = None
 
     @contextmanager
     def require_unchanged_run(
@@ -119,8 +116,33 @@ class StateStore:
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
         self._commit_run(
-            lambda: self._save_run_and_notify_unlocked(run_id, state)
+            lambda: self._save_run_and_notify_unlocked(run_id, state),
         )
+
+    def update_run(
+        self, run_id: str, update: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """Commit a logical object transition against the latest consistent Run.
+
+        The callback verifies the relevant Job/Attempt/Invocation identities
+        and changes only its owned objects. It runs once inside the authorized
+        transaction; Agent, Git, network and observer work belong outside it.
+        StateStore validates associated facts and returns only a durable view.
+        """
+        def commit() -> dict[str, Any]:
+            state = self.load_current_run(run_id)
+            if state is None:
+                raise ValueError("Delivery Run disappeared during object commit")
+            update(state)
+            from agent_run.state_contract import require_current_run_state
+
+            require_current_run_state(state)
+            self._save_run_and_notify_unlocked(run_id, state)
+            saved = self.load_current_run(run_id)
+            assert saved is not None
+            return saved
+
+        return self._commit_run(commit)
 
     @contextmanager
     def _write_boundary(self) -> Iterator[None]:
@@ -133,11 +155,48 @@ class StateStore:
             yield
 
     def _commit_run(self, operation: Callable[[], _T]) -> _T:
-        # Task Control owns bounded acquisition, before the Run state lock.
-        # Do not retry the body: observers or future operations may have effects.
-        with self._write_boundary():
-            with self.locked():
-                return operation()
+        # Queue before acquiring Control/Run locks. Never replay a transaction.
+        with self.commit_admission():
+            notifications = self._commit_context.notifications
+            checkpoint = len(notifications)
+            expected = dict(getattr(self._expected_run_state, "by_run", {}))
+            try:
+                with self._write_boundary(), self.locked(), self._repository.atomic():
+                    return operation()
+            except BaseException:
+                del notifications[checkpoint:]
+                self._expected_run_state.by_run = expected
+                raise
+
+    @contextmanager
+    def commit_admission(self) -> Iterator[None]:
+        """Acquire a FIFO seat before callers enter a compound Control boundary.
+
+        Nested saves on this StateStore reuse the seat. Notifications wait until its outer scope
+        has released all Control and database locks, and never fail the save.
+        """
+        nested = getattr(self._commit_context, "notifications", None) is not None
+        notifications: list[dict[str, Any] | None] = []
+        try:
+            with self._coordinator.admitted():
+                if not nested:
+                    self._commit_context.notifications = notifications
+                try:
+                    yield
+                finally:
+                    if not nested:
+                        self._commit_context.notifications = None
+        finally:
+            if not nested:
+                for saved in notifications:
+                    self._after_run_saved()
+                    if saved is not None and self.run_saved_observer is not None:
+                        try:
+                            self.run_saved_observer(saved)
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Run observer failed after durable commit", exc_info=True,
+                            )
 
     def create_run_if_absent(
         self, run_id: str, state: dict[str, Any]
@@ -145,19 +204,14 @@ class StateStore:
         """Atomically create one Run or return the existing Run."""
 
         custom_save = self._custom_save_run()
-        if custom_save is not None:
-            with self.locked():
-                existing = self.load_run(run_id)
-                if existing is not None:
-                    return existing, False
-                custom_save(run_id, state)
-                return deepcopy(state), True
-
         def create() -> tuple[dict[str, Any], bool]:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            self._save_run_and_notify_unlocked(run_id, state)
+            if custom_save is not None:
+                custom_save(run_id, state)
+            else:
+                self._save_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
@@ -172,19 +226,6 @@ class StateStore:
         """Atomically reuse an unfinished Parent Run or create one."""
 
         custom_save = self._custom_save_run()
-        if custom_save is not None:
-            with self.locked():
-                unfinished = self.find_unfinished_runs(repository, parent_number)
-                if len(unfinished) > 1:
-                    run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
-                    raise ValueError(
-                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
-                        f"{run_ids}"
-                    )
-                if unfinished:
-                    return unfinished[0], False
-                return self.create_run_if_absent(run_id, state)
-
         def create() -> tuple[dict[str, Any], bool]:
             unfinished = self.find_unfinished_runs(repository, parent_number)
             if len(unfinished) > 1:
@@ -198,7 +239,10 @@ class StateStore:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            self._save_run_and_notify_unlocked(run_id, state)
+            if custom_save is not None:
+                custom_save(run_id, state)
+            else:
+                self._save_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
@@ -215,17 +259,27 @@ class StateStore:
     def _save_run_and_notify_unlocked(
         self, run_id: str, state: dict[str, Any]
     ) -> None:
-        self._save_run_unlocked(run_id, state)
-        self._after_run_saved()
-        if self.run_saved_observer is not None:
-            self.run_saved_observer(state)
+        durable = self._save_run_unlocked(run_id, state)
+        notifications = getattr(self._commit_context, "notifications", None)
+        if notifications is None:
+            raise RuntimeError("Run save requires commit admission")
+        if self.run_saved_observer is None:
+            notifications.append(None)
+        elif durable is None:
+            # Custom save hooks may retain the former None return contract.
+            notifications.append(deepcopy(state))
+        else:
+            # Sanitization already made an isolated durable view. Only timeline
+            # fields are shared back with the caller by the save bridge.
+            for field in ("timeline", "timeline_continuation"):
+                if field in durable:
+                    durable[field] = deepcopy(durable[field])
+            notifications.append(durable)
 
     def _after_run_saved(self) -> None:
         """Hook for durable-write fault injection."""
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
-        self.runs_directory.mkdir(parents=True, exist_ok=True)
-        destination = self.runs_directory / f"{run_id}.json"
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
         previous = self.load_run(run_id)
         expected_by_run: dict[str, dict[str, Any]] = getattr(
             self._expected_run_state, "by_run", {}
@@ -275,6 +329,11 @@ class StateStore:
 
             reconcile(state)
         durable_state = _sanitize_durable_errors(state)
+        from agent_run.state_retention import compact_invocation_details
+
+        compact_invocation_details(durable_state)
+        if "agent_invocation_history" in durable_state:
+            state["agent_invocation_history"] = deepcopy(durable_state["agent_invocation_history"])
         if "run_id" in durable_state:
             _append_timeline_event(durable_state, previous)
             state["timeline"] = durable_state["timeline"]
@@ -283,74 +342,34 @@ class StateStore:
             continuation = durable_state.get("timeline_continuation")
             if isinstance(continuation, list):
                 state["timeline_continuation"] = continuation
-        serialized = (
-            json.dumps(
-                durable_state,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
+        self._repository.save(run_id, durable_state)
+        if expected is not None:
+            expected_by_run[run_id] = deepcopy(durable_state)
+        return durable_state
+
+    def _reject_legacy_run(self, run_id: str | None = None) -> None:
+        legacy = (self.runs_directory / f"{run_id}.json" if run_id is not None
+                  else next(self.runs_directory.glob("*.json"), None))
+        if legacy is not None and legacy.is_file():
+            raise IncompatibleRunStateError(
+                f"incompatible legacy JSON Run: {legacy}; no migration is performed"
             )
-            + "\n"
-        )
-        if len(serialized.encode("utf-8")) > MAX_RUN_STATE_BYTES:
-            raise ValueError(
-                f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit"
-            )
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.runs_directory,
-            prefix=f".{run_id}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                temporary_file.write(serialized)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, destination)
-            self._sync_directory(self.runs_directory)
-            if expected is not None:
-                expected_by_run[run_id] = json.loads(serialized)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
-        path = self.runs_directory / f"{run_id}.json"
-        if not path.exists():
-            return None
-        loaded = _load_bounded_json(path)
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Invalid run state: {path}")
-        return loaded
+        self._reject_legacy_run(run_id)
+        return self._repository.load(run_id)
 
     def has_run(self, run_id: str) -> bool:
-        """Return whether a persisted Run record exists without reading it.
-
-        Discovery callers must not reconstruct the ``runs/<id>.json`` layout
-        themselves.  Keeping this check here also preserves the distinction
-        between a missing record and a record whose contents cannot be read.
-        """
-
-        return (self.runs_directory / f"{run_id}.json").is_file()
+        """Locate persisted records, including unsupported legacy identities."""
+        return (self.runs_directory / f"{run_id}.json").is_file() or self._repository.has(run_id)
 
     def list_run_ids(self, *, limit: int | None = None) -> list[str]:
-        """List persisted Run IDs without loading or changing their records.
-
-        A bounded caller can stop discovery before materializing an unbounded
-        number of filenames.  Record contents are intentionally not parsed;
-        callers that need per-Run diagnostics can load each ID independently
-        so one damaged record does not hide usable records beside it.
-        """
-
+        """Discover SQLite and legacy identities without reading old records."""
         if limit is not None and limit < 0:
             raise ValueError("Run ID listing limit must not be negative")
-        if not self.runs_directory.is_dir():
-            return []
-        run_ids: list[str] = []
+        run_ids = set(self._repository.list_ids(limit=limit))
         for path in self.runs_directory.glob("*.json"):
-            run_ids.append(path.stem)
+            run_ids.add(path.stem)
             if limit is not None and len(run_ids) > limit:
                 raise ValueError("Run ID listing exceeds the requested limit")
         return sorted(run_ids)
@@ -359,64 +378,102 @@ class StateStore:
         """Load only the one supported persisted Run contract."""
 
         state = self.load_run(run_id)
-        if state is not None:
-            from agent_run.state_contract import require_current_run_state
-            from agent_run.state_errors import MissingRunMaterialsError
+        if state is None:
+            self._validated_read = None
+            return None
+        from agent_run.state_contract import require_current_run_state
 
-            try:
-                require_current_run_state(state)
-            except MissingRunMaterialsError as error:
-                raise MissingRunMaterialsError(
-                    f"{self.runs_directory / (run_id + '.json')}: {error}"
-                ) from error
+        token = self._repository.read_token()
+        ordinary = (
+            getattr(self.load_run, "__func__", None) is _DEFAULT_LOAD_RUN
+            and getattr(self._validate_current_run, "__func__", None) is _DEFAULT_VALIDATE_CURRENT_RUN
+        )
+        cached = self._validated_read
+        if not (ordinary and token is not None and cached is not None
+                and cached[0] is require_current_run_state and cached[1]() is token):
+            self._validate_current_run(run_id, state)
+        # Only SQLite's immutable, content-proven baseline identifies this
+        # pure validation. Never retain/recognize the caller's mutable dict.
+        self._validated_read = ((require_current_run_state, weakref.ref(token))
+                                if ordinary and token is not None else None)
         return state
 
+    @contextmanager
+    def current_run_reader(self, run_id: str) -> Iterator[Callable[[], dict[str, Any] | None]]:
+        """Retain one read-only scheduling view while SQLite reports no commit.
+
+        The caller must not mutate this polling projection. Ordinary loads
+        and all commit paths still read independent mutable views. The watcher
+        holds no transaction between polls and closes on every scope exit.
+        """
+        from agent_run.sqlite_watcher import SQLiteWatcher
+
+        previous: dict[str, Any] | None = None
+        previous_version: tuple[int, int] | None = None
+        retained = False
+        previous_limit = self._repository.max_bytes
+        with SQLiteWatcher(self._repository.path) as watcher:
+            def read() -> dict[str, Any] | None:
+                nonlocal previous, previous_version, retained, previous_limit
+                watcher.require_active()
+                self._reject_legacy_run(run_id)
+                if self._repository.in_transaction:
+                    return self.load_current_run(run_id)
+                version = watcher.version()
+                if (retained and version == previous_version
+                        and previous_limit == self._repository.max_bytes):
+                    return previous
+                with self._repository.use_reader(watcher.connection):
+                    current = self.load_current_run(run_id)
+                # Sampled before reading: a concurrent commit during the read
+                # can only cause an extra refresh, never label old facts new.
+                previous_version = version
+                previous_limit = self._repository.max_bytes
+                retained = current is None or self._repository._check_size(current) <= 512 * 1024
+                previous = current if retained else None
+                return current
+
+            yield read
+
+    def _validate_current_run(self, run_id: str, state: dict[str, Any]) -> None:
+        from agent_run.state_contract import require_current_run_state
+        from agent_run.state_errors import MissingRunMaterialsError
+
+        try:
+            require_current_run_state(state)
+        except MissingRunMaterialsError as error:
+            raise MissingRunMaterialsError(
+                f"{self._repository.path} Run {run_id}: {error}"
+            ) from error
+
     def find_run(self, repository: str, parent_number: int) -> dict[str, Any] | None:
-        if not self.runs_directory.exists():
-            return None
-        matches: list[dict[str, Any]] = []
-        for path in self.runs_directory.glob("*.json"):
-            loaded = _load_bounded_json(path)
-            if not isinstance(loaded, dict):
-                continue
-            parent = loaded.get("parent")
-            if (
-                same_repository(loaded.get("repository"), repository)
-                and isinstance(parent, dict)
-                and parent.get("number") == parent_number
-            ):
-                matches.append(loaded)
-        if not matches:
-            return None
-        return max(matches, key=lambda state: str(state.get("created_at", "")))
+        matches = self._find_runs(repository, parent_number, unfinished_only=False)
+        return max(matches, key=lambda state: str(state.get("created_at", ""))) if matches else None
 
     def find_unfinished_runs(
-        self, repository: str, parent_number: int
+        self, repository: str, parent_number: int,
     ) -> list[dict[str, Any]]:
-        if not self.runs_directory.exists():
-            return []
-        runs: list[dict[str, Any]] = []
-        for path in self.runs_directory.glob("*.json"):
-            loaded = _load_bounded_json(path)
-            if not isinstance(loaded, dict):
-                continue
-            parent = loaded.get("parent")
-            if (
-                same_repository(loaded.get("repository"), repository)
-                and isinstance(parent, dict)
-                and parent.get("number") == parent_number
-                and loaded.get("status") not in {"completed", "abandoned"}
-            ):
-                runs.append(loaded)
-        return sorted(runs, key=lambda state: str(state.get("created_at", "")))
+        return self._find_runs(repository, parent_number, unfinished_only=True)
 
-    @staticmethod
-    def _sync_directory(directory: Path) -> None:
-        descriptor = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    def _find_runs(
+        self, repository: str, parent_number: int, *, unfinished_only: bool,
+    ) -> list[dict[str, Any]]:
+        # Unknown old JSON may belong to this Parent. Refuse before new work,
+        # without reading, migrating or overwriting any legacy record.
+        self._reject_legacy_run()
+        result = []
+        for run_id in self._repository.find_ids(
+            repository, parent_number, unfinished_only=unfinished_only,
+        ):
+            state = self.load_run(run_id)
+            if state is not None:
+                result.append(state)
+        return sorted(result, key=lambda state: str(state.get("created_at", "")))
+
+
+# Preserve custom read/validation hooks, including class-level replacements.
+_DEFAULT_LOAD_RUN = StateStore.load_run
+_DEFAULT_VALIDATE_CURRENT_RUN = StateStore._validate_current_run
 
 
 def _append_timeline_event(
@@ -897,14 +954,19 @@ def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+_IDENTITY_SNAPSHOT_PATHS = frozenset({
+    ("github_identity",), ("runner_github_identity",),
+    ("creation_configuration", "github_identity"),
+    ("creation_configuration", "runner_github_identity"),
+})
+
+
 def _sanitize_error_value(
     value: object, *, redacted: dict[str, str],
     key_kinds: dict[str, tuple[bool, bool, bool]],
     diagnostic: bool = False, path: tuple[str, ...] = ()
 ) -> object:
-    if path in {(name,) for name in ("github_identity", "runner_github_identity")} | {
-        ("creation_configuration", name) for name in ("github_identity", "runner_github_identity")
-    }:
+    if path in _IDENTITY_SNAPSHOT_PATHS:
         # Only validated source and references belong here, never credential values.
         from agent_run.github_identity import validate_identity_snapshot
 

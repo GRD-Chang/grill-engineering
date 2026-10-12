@@ -28,6 +28,8 @@ from support.receipt_host import _install_host
 from support.lifecycle import _isolated_environment
 from support.control import _bind_running_executor
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize(
     "command", ["run", "resume", "approve", "revise", "requeue", "stop", "abandon"]
@@ -127,8 +129,8 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
         else:
             path.write_text("not json", encoding="utf-8")
         control_before = path.read_bytes() if path.exists() else None
-        state_path = states.runs_directory / f"{run_id}.json"
-        state_before = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        state_before = snapshot_run(state_ref)
         fixture_before = fixture.read_bytes()
         agents_before = agents.read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, host_status or "unknown")
@@ -180,7 +182,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                     reconciled_state["diagnostics"][-1]["code"] == "session_interrupted"
                 )
             else:
-                assert state_path.read_bytes() == state_before
+                assert snapshot_run(state_ref) == state_before
             assert fixture.read_bytes() == fixture_before
             assert agents.read_bytes() == agents_before
             if not proven_exited:
@@ -227,10 +229,10 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             after = path.read_bytes() if path.exists() else None
             if attempt == 0:
                 after_first = after
-                state_after_first = state_path.read_bytes()
+                state_after_first = snapshot_run(state_ref)
             else:
                 assert after == after_first
-                assert state_path.read_bytes() == state_after_first
+                assert snapshot_run(state_ref) == state_after_first
     finally:
         if worker.poll() is None:
             worker.kill()
@@ -285,8 +287,8 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
         else:
             path.write_text("not json", encoding="utf-8")
         before_control = path.read_bytes() if path.exists() else None
-        state_path = states.runs_directory / f"{run_id}.json"
-        before_state = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        before_state = snapshot_run(state_ref)
         before_fixture = fixture.read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, "exited")
         monkeypatch.setattr(
@@ -323,7 +325,7 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
             assert prepared == []
             assert published == []
             assert worker.poll() is None
-            assert state_path.read_bytes() == before_state
+            assert snapshot_run(state_ref) == before_state
             assert fixture.read_bytes() == before_fixture
             assert (path.read_bytes() if path.exists() else None) == before_control
     finally:

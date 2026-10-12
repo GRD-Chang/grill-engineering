@@ -113,6 +113,17 @@ def test_unknown_duration_does_not_become_zero() -> None:
     assert aggregate_invocation_timing([invocation(end="00:00:00")])["execution_seconds"] == 0
 
 
+@pytest.mark.parametrize("end", ["00:01:00", None, "00:00:00"])
+def test_history_detail_compaction_preserves_proven_and_unknown_duration(end: str | None) -> None:
+    from agent_run.state_retention import MAX_DETAILED_INVOCATIONS, compact_invocation_details
+
+    history = [invocation(end=end) for _ in range(MAX_DETAILED_INVOCATIONS + 1)]
+    before = aggregate_invocation_timing(history)
+    compact_invocation_details({"agent_invocation_history": history})
+    assert history[0]["execution_segments"] == []
+    assert aggregate_invocation_timing(history) == before
+
+
 @pytest.mark.parametrize("segments", [None, [], "invalid"])
 def test_invocation_timestamps_and_waits_cannot_replace_worker_boundaries(segments: Any) -> None:
     legacy = invocation(execution_segments=segments, recovery_wait_intervals=[{

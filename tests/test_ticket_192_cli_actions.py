@@ -29,6 +29,8 @@ from support.cli import (
 )
 from support.cli_payloads import publication, ticket
 
+from support.state import include_in_state_snapshot, run_refs
+
 
 def test_public_parser_exposes_only_run_as_the_ordinary_entrypoint() -> None:
     parser = build_parser()
@@ -447,7 +449,7 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     }
     tree_before = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
-        for path in state_root.rglob("*")
+        for path in state_root.rglob("*") if include_in_state_snapshot(path)
     }
 
     configured = _human_cli(
@@ -463,7 +465,7 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     } == control_before
     tree_after = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
-        for path in state_root.rglob("*")
+        for path in state_root.rglob("*") if include_in_state_snapshot(path)
     }
     profile_relative = profile_path.relative_to(state_root)
     assert tree_after.keys() == tree_before.keys()
@@ -568,7 +570,7 @@ def test_parent_mutation_selector_never_guesses_a_missing_run(
 
     assert result.returncode == 2
     assert stdout_json(result)["diagnostics"][0]["code"] == "run_selector_not_found"
-    assert not (managed_state(git_repo) / "runs").exists()
+    assert not run_refs(managed_state(git_repo))
 
 
 def test_parent_mutation_selector_reports_missing_repository_and_ambiguity(

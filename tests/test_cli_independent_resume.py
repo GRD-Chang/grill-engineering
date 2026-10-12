@@ -13,6 +13,8 @@ from support.cli import load_only_run_state, run_cli
 from support.seeding import write_fixture
 from support.workspace import managed_repo, managed_state
 
+from support.state import snapshot_run, write_run_fixture
+
 
 # 只替换外部进程 Host。子解释器执行生产 Executor 和完整 CLI，既不 fork
 # 当前 Run 闭包，也不预填正式绑定；fixture Agent/GitHub 仍为产品既有边界。
@@ -99,8 +101,8 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     if missing_material is not None:
         # 缺损只来自本例故障注入；修复必须使用准确备份和真实 Git 身份，
         # 不能由 Controller 猜测历史或通过重置状态伪造后继启动。
-        state_file = managed_state(git_repo) / 'runs' / f'{run_id}.json'
-        trusted_state = state_file.read_bytes()
+        state_ref = (managed_state(git_repo), str(run_id))
+        trusted_state = snapshot_run(state_ref)
         progress = (checkout / 'progress.txt').read_bytes()
         branch = subprocess.run(
             ['git', 'branch', '--show-current'], cwd=checkout,
@@ -113,12 +115,12 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
         if missing_material == 'timeline':
             damaged = json.loads(trusted_state)
             del damaged['timeline']
-            state_file.write_text(json.dumps(damaged), encoding='utf-8')
+            write_run_fixture(state_ref, damaged)
         else:
             subprocess.run(['git', 'worktree', 'remove', '--force', str(checkout)],
                            cwd=managed_repo(git_repo), check=True, capture_output=True)
             assert not checkout.exists()
-        state_bytes = state_file.read_bytes()
+        state_bytes = snapshot_run(state_ref)
         control_bytes = {path.name: path.read_bytes()
                          for path in control_file.parent.glob('*.json')}
         rejected = run_cli(git_repo, fixture, 'resume', run_id,
@@ -135,12 +137,12 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
             assert branch in diagnostic
             assert head in diagnostic
             assert not checkout.exists()
-        assert state_file.read_bytes() == state_bytes
+        assert snapshot_run(state_ref) == state_bytes
         assert {path.name: path.read_bytes()
                 for path in control_file.parent.glob('*.json')} == control_bytes
         assert json.loads(agents.read_text()) == script
         if missing_material == 'timeline':
-            state_file.write_bytes(trusted_state)
+            write_run_fixture(state_ref, json.loads(trusted_state))
         else:
             subprocess.run(['git', 'worktree', 'add', str(checkout), branch],
                            cwd=managed_repo(git_repo), check=True, capture_output=True)
@@ -159,7 +161,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
             assert wrong.returncode == 2, wrong.stdout + wrong.stderr
             assert 'recovery_materials_missing' in wrong.stdout
             assert head in wrong.stdout
-            assert state_file.read_bytes() == state_bytes
+            assert snapshot_run(state_ref) == state_bytes
             assert {path.name: path.read_bytes()
                     for path in control_file.parent.glob('*.json')} == control_bytes
             assert json.loads(agents.read_text()) == script

@@ -22,6 +22,8 @@ from support.seeding import write_fixture
 from support.ticket_parallel import TicketAgents
 from support.workspace import managed_state
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("execution_failure", [False, True], ids=["human-blocker", "execution-failure"])
 def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_target(
@@ -108,15 +110,15 @@ def test_noncurrent_ticket_notifies_while_sibling_continues_and_resumes_only_tar
         assert current["status"] not in {"ready_for_human", "operator_stopped", "execution_failed"}
         before = records("cards")
         journal = read_notifications(managed_state(git_repo), current["run_id"])
-        run_path = managed_state(git_repo) / "runs" / f"{current['run_id']}.json"
-        run_before = run_path.read_bytes()
+        run_ref = (managed_state(git_repo), str(current['run_id']))
+        run_before = snapshot_run(run_ref)
         for _ in range(3):
             sender.observe(current)
         for command in ("status", "history"):
             result = run_cli(git_repo, fixture, command, current["run_id"], "--json")
             assert result.returncode == 0, result.stdout + result.stderr
             record("queries", stdout_json(result))
-        assert run_path.read_bytes() == run_before
+        assert snapshot_run(run_ref) == run_before
         assert read_notifications(managed_state(git_repo), current["run_id"]) == journal
         assert records("cards") == before
 

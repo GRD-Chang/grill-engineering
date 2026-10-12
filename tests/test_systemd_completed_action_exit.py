@@ -32,6 +32,8 @@ from agent_run.task_control import ActionReconciliationError, TaskControlStore, 
 from support.seeding import seed_run, write_fixture
 from support.lifecycle import _file_snapshot, _isolated_environment
 
+from support.state import snapshot_runs
+
 
 @pytest.fixture
 def completed_action(
@@ -165,12 +167,12 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
     assert record["executor"]["generation"] == spec.generation
     assert record["executor"]["runner_binding"] == initial["executor"]["runner_binding"]
     control_before = control.path_for(spec.task).read_bytes()
-    states_before = _file_snapshot(states.root / "runs")
+    states_before = snapshot_runs(states.root)
     host.inspect(spec, control)
     again, _, _ = lifecycle.submit(request)
     assert again == result
     assert control.path_for(spec.task).read_bytes() == control_before
-    assert _file_snapshot(states.root / "runs") == states_before
+    assert snapshot_runs(states.root) == states_before
     assert _file_snapshot(states.root / "worktrees") == worktrees
     assert fixture.read_bytes() == fixture_before
     assert transport.start_count == 1
@@ -186,7 +188,7 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     final["status"] = final_status
     final["terminal_kind"] = "completed" if final_status == "completed" else "waiting_human"
     states.save_run(spec.run_id, final)
-    state_before = _file_snapshot(states.root / "runs")
+    state_before = snapshot_runs(states.root)
     action_before = control.load(spec.task)["action"]
     transport.unit = replace(transport.unit, status="exited", pid=None)
     assert host.inspect(spec, control).status == "exited"
@@ -196,7 +198,7 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     )
     assert result["status"] == final_status and receipt.status == "completed"
     assert control.load(spec.task)["action"] == action_before
-    assert _file_snapshot(states.root / "runs") == state_before
+    assert snapshot_runs(states.root) == state_before
     assert transport.start_count == 1
 
 
@@ -210,7 +212,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
     elif native_status == "conflict":
         transport.unit = replace(transport.unit, description="another Executor")
     control_before = control.path_for(spec.task).read_bytes()
-    state_before = _file_snapshot(states.root / "runs")
+    state_before = snapshot_runs(states.root)
     lifecycle = _lifecycle(states, control, spec, host)
     request = LifecycleRequest(task=spec.task, kind="run", payload={"parent": 1})
     if native_status == "running":
@@ -220,7 +222,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
         with pytest.raises(ExecutorStartUnknownError):
             lifecycle.submit(request)
     assert control.path_for(spec.task).read_bytes() == control_before
-    assert _file_snapshot(states.root / "runs") == state_before
+    assert snapshot_runs(states.root) == state_before
     assert transport.start_count == 1
 
 

@@ -22,6 +22,8 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.seeding import seed_idle_control, write_fixture
 from support.workspace import prepare_workspace
 
+from support.state import snapshot_run
+
 
 @pytest.mark.parametrize("failure_step", ["integration", "fetch"])
 def test_git_and_findings_share_parent_allowance_through_public_resume(
@@ -107,11 +109,11 @@ def test_git_and_findings_share_parent_allowance_through_public_resume(
     assert job["review_budget"]["development_attempts"] == 1
     assert job["review_budget"]["reviewer_invocations"] == 1
     retained = deepcopy({key: job[key] for key in ("review_budget", "ci_recovery", "integration_resync")})
-    before = (states.runs_directory / f"{run_id}.json").read_bytes()
+    before = snapshot_run((states.root, str(run_id)))
     for query in ("status", "history"):
         result = invoke_cli_inprocess(repo, None, query, run_id, "--state-dir", str(states.root), "--json")
         assert result.returncode == 0, result.stdout + result.stderr
-    assert (states.runs_directory / f"{run_id}.json").read_bytes() == before
+    assert snapshot_run((states.root, str(run_id))) == before
     seed_idle_control(TaskControlStore(states.root), TaskKey(repo, state["repository"], 1), run_id)
     import agent_run.cli as cli
     monkeypatch.setattr(cli, "FakeExecutorHost", lambda **kwargs: FakeExecutorHost())

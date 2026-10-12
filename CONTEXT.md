@@ -1,5 +1,8 @@
 # Agent 交付自动化
 
+新 Run 的 SQLite 权威、对象提交与一致读取、提交后 observer 和历史保留合同见
+[状态存储](docs/agents/state-storage.md)。旧 JSON Run 只发现身份并明确拒绝，不迁移或双写。
+
 本上下文描述以结构化 Agent 工作结果驱动、由确定性程序控制外部写入的自动交付流程。
 
 Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。

@@ -20,6 +20,8 @@ from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 from support.workspace import managed_state, prepare_workspace
 
+from support.state import snapshot_run, write_run_fixture
+
 
 PROJECT_ROOT = Path(__file__).parents[2]
 
@@ -329,18 +331,18 @@ def replace_only_run_state(
     states = StateStore(managed_state(repo, extra_env=extra_env))
     state = load_only_run_state(repo, extra_env=extra_env)
     mutate(state)
-    destination = states.runs_directory / f"{state['run_id']}.json"
-    destination.write_text(json.dumps(state), encoding="utf-8")
+    destination_ref = (states.root, str(state['run_id']))
+    write_run_fixture(destination_ref, state)
     return state
 
 
 def read_run_state_bytes(
     repo: Path, run_id: str, *, extra_env: dict[str, str] | None = None,
 ) -> bytes:
-    """Read one Run's exact durable bytes for a file-level immutability check."""
+    """Snapshot every durable Run field for query immutability assertions."""
 
     states = StateStore(managed_state(repo, extra_env=extra_env))
-    return (states.runs_directory / f"{run_id}.json").read_bytes()
+    return snapshot_run((states.root, str(run_id)))
 
 
 def failed_invocation(

@@ -22,6 +22,8 @@ from agent_run.state_contract import IncompatibleRunStateError, require_current_
 from support.seeding import seed_run, write_fixture
 from support.cli import issue, load_only_run_state, run_cli, stdout_json
 
+from support.state import only_run_ref, read_run, snapshot_run, write_run_fixture
+
 
 @pytest.mark.parametrize(
     "value",
@@ -244,14 +246,14 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
     started = seed_run(git_repo, fixture, "1")
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_ref = only_run_ref(managed_state(git_repo))
+    state = read_run(state_ref)
     state["active_ticket_job"]["publication_operation_retry"] = {
         "attempts": 1,
         "limit": 999,
     }
-    state_path.write_text(json.dumps(state), encoding="utf-8")
-    state_before = state_path.read_bytes()
+    write_run_fixture(state_ref, state)
+    state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     head_before = (git_repo / ".git" / "HEAD").read_bytes()
 
@@ -259,6 +261,6 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert fixture.read_bytes() == fixture_before
     assert (git_repo / ".git" / "HEAD").read_bytes() == head_before

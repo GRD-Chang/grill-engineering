@@ -111,6 +111,7 @@ def develop_frontier(
     # one reserved supervision thread. Program futures are not Agent permits.
     pipeline_limit = 2 * limit
     with (
+        engine.states.current_run_reader(run_id) as read_current,
         ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
         close_admission_on_failure(),
     ):
@@ -120,7 +121,7 @@ def develop_frontier(
         notify_completion = False
         final_observation = False
         while True:
-            current = engine.states.load_current_run(run_id)
+            current = read_current()
             if current is None:
                 raise ValueError("Delivery Run disappeared during dispatch")
             if current["status"] in RUN_STOP_STATUSES:
@@ -130,12 +131,13 @@ def develop_frontier(
             with observer_lock:
                 owned = active | ({observer_ticket} if observer_ticket is not None else set())
             ready, pending_wait = candidates(current, frozenset(owned))
-            admission.seed([
+            seeded = admission.seed([
                 number for number in ready if number not in active
                 and not ticket_program_ready(current["ticket_jobs"].get(str(number), {}))
-            ])
-            current = engine.states.load_current_run(run_id)
-            assert current is not None
+            ], current=current)
+            if seeded:
+                current = read_current()
+                assert current is not None
             if notify_completion and after_lane is not None and (
                 (not futures and not ready) or any(item["lease_id"] is not None for item in current["ticket_work_queue"])
             ):
