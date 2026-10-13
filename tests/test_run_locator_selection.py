@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 
 from agent_run.cli import main
 from agent_run.run_locator import RunLocatorIndex
+from agent_run.run_selection import read_state_directory
 from agent_run.state import StateStore
 from agent_run.state_errors import IncompatibleRunStateError
 from support.seeding import seed_run, write_fixture
@@ -16,6 +18,18 @@ from support.cli import run_cli, stdout_json
 from support.workspace import managed_repo, managed_state
 
 from support.state import include_in_state_snapshot, read_run, snapshot_run, write_run_fixture
+
+
+def test_discovery_reports_incompatible_sqlite_protocol_without_writes(tmp_path: Path) -> None:
+    states = StateStore(tmp_path)
+    states.save_run("run-1", {"version": 1})
+    database = tmp_path / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE schema_meta SET value = 'sqlite-run-objects-v1'")
+    before = database.read_bytes()
+    with pytest.raises(IncompatibleRunStateError, match="protocol"):
+        read_state_directory(tmp_path, None)
+    assert database.read_bytes() == before
 
 
 def test_empty_checkout_without_origin_does_not_list_another_repository(

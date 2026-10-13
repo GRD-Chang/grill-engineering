@@ -53,23 +53,25 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
     completed_number = 3 if target_completed else 2
     failed_number = 5 - completed_number
     agents.backends[failed_number].data["developments"][0]["error_after_writes"] = "Worker failed"
-    original_save = states._save_run_unlocked
+    original_save = states._save_work_and_notify_unlocked
     interrupted = False
 
-    def fail_result_save_once(saved_run: str, saved: dict[str, Any]) -> None:
+    def fail_result_save_once(
+        saved_run: str, saved: dict[str, Any], baseline: dict[str, Any], **kwargs: Any,
+    ) -> None:
         nonlocal interrupted
         job = saved["ticket_jobs"].get(str(completed_number), {})
         if not interrupted and job.get("phase") == "committing_candidate":
             interrupted = True
             raise OSError("temporary result persistence failure")
-        original_save(saved_run, saved)
+        original_save(saved_run, saved, baseline, **kwargs)
 
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     engine = DeliveryRunEngine(
         controller=controller, tickets=ticket_engine(git, states, fixture, agents),
     )
     with monkeypatch.context() as fault:
-        fault.setattr(states, "_save_run_unlocked", fail_result_save_once)
+        fault.setattr(states, "_save_work_and_notify_unlocked", fail_result_save_once)
         paused = engine.deliver_from_state(run_id, state)
 
     assert interrupted

@@ -9,10 +9,44 @@ creating a second orchestration path.
 """
 
 from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Mapping, TypedDict, cast
 
 from agent_run.required_checks_observation import clear_required_checks_observation
+
+_ARCHIVED_WINDOWS: ContextVar[Mapping[int, int]] = ContextVar("archived_budget_windows", default={})
+
+
+@contextmanager
+def scoped_budget_validation(owners: Mapping[int, int]) -> Iterator[None]:
+    """Limit archive metadata to the exact owners in one work validator call."""
+    token = _ARCHIVED_WINDOWS.set(owners)
+    try:
+        yield
+    finally:
+        _ARCHIVED_WINDOWS.reset(token)
+
+
+def archived_budget_windows(owner: dict[str, Any]) -> int | None:
+    """Return an exemption only inside the current explicit work validator."""
+    return _ARCHIVED_WINDOWS.get().get(id(owner))
+
+
+@contextmanager
+def scoped_budget_alias(source: dict[str, Any], target: dict[str, Any]) -> Iterator[None]:
+    """Keep a CI receipt's temporary mirror bound to the same current budget."""
+    windows = archived_budget_windows(source)
+    if windows is None:
+        yield
+        return
+    if ("review_budget_history" in target or target.get("review_budget") != source.get("review_budget")
+            or target.get("policy_snapshot") != source.get("policy_snapshot")):
+        raise ValueError("scoped budget alias differs from its proved owner")
+    with scoped_budget_validation({**_ARCHIVED_WINDOWS.get(), id(target): windows}):
+        yield
 
 
 TICKET_DEVELOPMENT_LIMIT = 4
@@ -109,6 +143,9 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     to infer a new budget from legacy counters.
     """
 
+    archived = _ARCHIVED_WINDOWS.get().get(id(job))
+    if archived is not None:
+        return require_current_budget(job, policy, archived_windows=archived)
     if "review_budget" not in job:
         raise ValueError("missing canonical review_budget")
     raw = job["review_budget"]
@@ -122,6 +159,26 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     ):
         raise ValueError("missing canonical review_budget_history")
     _validate_budget_history(history, budget["window"], policy)
+    return budget
+
+
+def require_current_budget(
+    job: dict[str, Any], policy: ReviewBudgetPolicy, *, archived_windows: int,
+) -> ReviewBudget:
+    """Validate current facts when SQLite proved an unloaded sibling archive.
+
+    The archive's full contents remain subject to ensure_budget at complete
+    query/write boundaries. A scoped work view never synthesizes old windows.
+    """
+    if "review_budget_history" in job:
+        raise ValueError("scoped budget validation requires an unloaded archive")
+    raw = job.get("review_budget")
+    if not isinstance(raw, dict):
+        raise ValueError("review_budget must be an object")
+    budget = cast(ReviewBudget, raw)
+    _validate_budget_projection(budget, "review_budget", policy)
+    if type(archived_windows) is not int or archived_windows != budget["window"] - 1:
+        raise ValueError("review_budget_history must contain exactly one snapshot per prior window")
     return budget
 
 

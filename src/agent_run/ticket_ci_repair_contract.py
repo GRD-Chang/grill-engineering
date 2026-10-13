@@ -15,6 +15,7 @@ from agent_run.ticket_acceptance_contract import (
 from agent_run.ticket_fallback_contract import (
     _require_previous_publication_authorization,
 )
+from agent_run.review_budget import archived_budget_windows, scoped_budget_alias
 
 
 def require_ci_repair_publication_authorization(
@@ -96,27 +97,29 @@ def require_ci_repair_publication_authorization(
     if previous_budget != job.get("review_budget"):
         invalid("previous Reviewer budget differs from the active Ticket")
     history = job.get("review_budget_history")
-    if not isinstance(history, list):
+    if not isinstance(history, list) and archived_budget_windows(job) is None:
         invalid("previous Reviewer budget history is missing")
     if authority == "acceptance":
         if not isinstance(previous_budget, dict):
             invalid("previous Reviewer budget is missing")
         prior_job = {
             "review_budget": previous_budget,
-            "review_budget_history": history,
             "policy_snapshot": job.get("policy_snapshot"),
         }
-        require_active_accepted_publication_authorization(
-            previous["acceptance_record"],
-            prior_job,
-            {
-                "base_sha": previous["base_sha"],
-                "candidate_sha": previous["candidate_sha"],
-                "candidate_tree": previous["candidate_tree"],
-                "effective_revision": previous["effective_revision"],
-            },
-            location,
-        )
+        if isinstance(history, list):
+            prior_job["review_budget_history"] = history
+        with scoped_budget_alias(job, prior_job):
+            require_active_accepted_publication_authorization(
+                previous["acceptance_record"],
+                prior_job,
+                {
+                    "base_sha": previous["base_sha"],
+                    "candidate_sha": previous["candidate_sha"],
+                    "candidate_tree": previous["candidate_tree"],
+                    "effective_revision": previous["effective_revision"],
+                },
+                location,
+            )
     elif authority == "fallback" and previous_budget != previous["fallback_receipt"].get("review_budget"):
         invalid("previous fallback budget is not bound")
     if previous.get("candidate_sha") == job["candidate_sha"] or previous.get("candidate_tree") == tree:

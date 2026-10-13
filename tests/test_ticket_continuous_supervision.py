@@ -15,6 +15,7 @@ from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_state import TicketState
+from support.cli_payloads import human_blocker_step
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -48,6 +49,18 @@ def test_ci_green_closes_and_cleans_ticket_before_occupied_lanes_return(
 
     monkeypatch.setattr(FixtureAgentBackend, '_wait_for_invocation_gate', invocation_gate)
     agents = TicketAgents(git_repo, numbers, lambda _: None, before_publication=publications.append)
+    # 本例验证占满 Agent 名额时 Ticket 2 的独立 CI 与交付收口。
+    # 兄弟在屏障释放后按真实人工阻塞结果结束调用，验证返回与租约收口，
+    # 避免在退出保护窗口追加无关发布。三票完整交付由
+    # test_ticket_work_scheduling 的 ready/dependency/program_closeout 场景覆盖。
+    for number in numbers[1:]:
+        backend = agents.backends[number]
+        if role == 'development':
+            backend.data['developments'] = [human_blocker_step(f'developer-{number}')]
+        else:
+            backend.data['reviews'][0]['checks']['e2e'].update(
+                status='blocked', evidence=f'Ticket {number} needs a maintainer decision',
+            )
     monkeypatch.setattr(FixtureGitHubPublisher, '_next_required_checks_result',
                         lambda _self, _pr: 'pass' if green.is_set() else 'pending')
     engine = ticket_engine(git, states, fixture, agents)
@@ -107,6 +120,22 @@ def test_ci_green_closes_and_cleans_ticket_before_occupied_lanes_return(
     final = states.load_current_run(run_id)
     assert final is not None and final['ticket_jobs']['2']['phase'] == 'completed'
     assert publications.count(2) == 1
+    assert final['ticket_work_queue'] == []
+    for number in numbers[1:]:
+        sibling = final['ticket_jobs'][str(number)]
+        assert sibling['phase'] == 'blocked'
+        assert sibling['blocked_reason'] == (
+            'agent_requires_human' if role == 'development' else 'reviewer_requires_human'
+        )
+        invocation = final['ticket_agent_invocations'][str(number)]
+        assert invocation['work_subject'] == f'ticket:{number}'
+        assert invocation['role'] == ('development' if role == 'development' else 'fresh_acceptance')
+        assert invocation['status'] == 'completed'
+        assert invocation['ended_at'] is not None
+        assert invocation['reported_thread_id'] == (
+            f'developer-{number}' if role == 'development' else f'reviewer-{number}'
+        )
+    require_current_run_state(final)
 
 
 def test_blocked_external_read_does_not_hold_state_lock_or_delay_other_lane_result(

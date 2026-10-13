@@ -333,11 +333,14 @@ def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(
     resumed, repeated = admit_ticket_resume(controller, control, task, executor, payload)
     assert not repeated
     assert resumed['ticket_jobs']['2']['phase'] == 'developing'
+    from agent_run.state_contract import require_current_run_state
+    require_current_run_state(resumed)
     assert resumed['ticket_jobs']['3'] == before['ticket_jobs']['3']
     assert resumed['ticket_jobs']['2']['pending_semantic_attempt'] == before['ticket_jobs']['2']['pending_semantic_attempt']
     assert resumed['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
     duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
     assert repeated and duplicate == resumed
+    require_current_run_state(duplicate)
     calls = []
 
     def failed_again(number):

@@ -54,7 +54,9 @@ CI 的 `Run tests` 与本地 `make test-report TEST_WORKERS=2` 共用完整测�
 本地六 worker 的对应诊断入口是 `make test-report`。已安装 CLI 的 `agent-run --help` 和
 `make typecheck` 仍需单独检查。快速回归与全量的验证范围不同，不能用 `make test` 通过推断 CI 必须通过。
 
-报告包含环境版本与系统能力、JUnit、最慢用例各阶段耗时、测试输出和 GNU time 资源记录。
+报告包含 Python、SQLite 等环境版本与系统能力、JUnit、最慢用例各阶段耗时、测试输出和 GNU time 资源记录。
+CI 使用 `PYTEST_ARGS='-v'`，逐例记录 nodeid 与结果；即使 job 到时取消、JUnit 和
+资源汇总尚未生成，已有失败也能在上传的测试日志中定位。
 默认写入 `.test-results/`，下一次覆盖；需要比较时用独立的 `TEST_RESULTS`。CI 无论成功或失败均上传报告，
 保留七天。JUnit 的用例时间包含 setup/call/teardown；并行用例时间求和不等于墙钟，GNU time 最大 RSS
 也不等于并行进程树内存之和。诊断后清理本次本地报告。

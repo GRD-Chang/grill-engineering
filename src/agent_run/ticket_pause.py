@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.final_approval_operation import has_final_approval
+from agent_run.sqlite_encoding import copy_json_tree
 from agent_run.state import StateStore
 from agent_run.ticket_queue import reconcile
 
@@ -54,9 +55,10 @@ def request_ticket_pause(
         raise ValueError("Ticket number must be positive")
 
     def commit() -> dict[str, Any]:
-        state = states.load_current_run(run_id)
+        state = states.load_work_run(run_id, ticket_number)
         if state is None:
             raise ValueError("Delivery Run does not exist")
+        baseline = copy_json_tree(state)
         if has_final_approval(state):
             raise ValueError("Final approval is in progress; Ticket pause is unavailable")
         if state.get("status") in {
@@ -87,7 +89,14 @@ def request_ticket_pause(
                 and state.get("ticket_integration_holder") != ticket_number
             ):
                 pause_ticket(state, job)
-            states._save_run_and_notify_unlocked(run_id, state)
+            states._save_work_and_notify_unlocked(
+                run_id, state, baseline, ticket_number=ticket_number,
+            )
         return state
 
-    return states._commit_run(commit)
+    states._commit_run(commit)
+    # The public operation returns the complete query view after releasing
+    # submission locks; its business commit only used the target's objects.
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    return saved

@@ -71,7 +71,7 @@ def develop_frontier(
             TicketDeliveryEngine(
                 git=engine.git, states=engine.states,
                 github=engine.github, agents=engine.agents, development_only=True,
-            ).deliver_ticket(run_id, number)
+            ).deliver_ticket(run_id, number, complete=False)
 
     observer_ticket: int | None = None
     observer_lock = Lock()
@@ -111,7 +111,7 @@ def develop_frontier(
     # one reserved supervision thread. Program futures are not Agent permits.
     pipeline_limit = 2 * limit
     with (
-        engine.states.current_run_reader(run_id) as read_current,
+        engine.states.current_run_reader(run_id, work_only=True) as read_current,
         ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
         close_admission_on_failure(),
     ):
@@ -204,7 +204,7 @@ def develop_frontier(
                 if not consume_result(future):
                     continue
                 number = futures.pop(future)
-                latest = engine.states.load_current_run(run_id)
+                latest = read_current()
                 queued = latest is not None and any(
                     item["ticket_number"] == number for item in latest["ticket_work_queue"]
                 )

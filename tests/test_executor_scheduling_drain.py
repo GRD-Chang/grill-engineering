@@ -52,7 +52,9 @@ def test_failed_scheduler_rejects_resume_before_siblings_finish(
             draining.set()
         return closed
 
-    def advance(_engine: TicketDeliveryEngine, _run_id: str, number: int) -> dict[str, Any]:
+    def advance(
+        _engine: TicketDeliveryEngine, _run_id: str, number: int, *, complete: bool = True,
+    ) -> dict[str, Any]:
         if number == 2:
             entered.set()
             assert release.wait(5), "sibling was not released"

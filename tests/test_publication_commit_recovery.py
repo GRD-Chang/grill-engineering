@@ -28,7 +28,7 @@ class CrashBeforePublicationSave(StateStore):
         self.publication_sha: str | None = None
         self.crash = crash
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+    def _check_interruption(self, state: dict[str, Any]) -> None:
         job = state.get(self.subject)
         if (
             self.crash and self.publication_sha is None
@@ -38,7 +38,19 @@ class CrashBeforePublicationSave(StateStore):
         ):
             self.publication_sha = job["publication_sha"]
             raise SimulatedProcessCrash("publication commit installed before result save")
-        super()._save_run_unlocked(run_id, state)
+
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
+        self._check_interruption(state)
+        return super()._save_run_unlocked(run_id, state)
+
+    def _save_work_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
+        *, ticket_number: int | None = None,
+    ) -> None:
+        self._check_interruption(state)
+        super()._save_work_and_notify_unlocked(
+            run_id, state, baseline, ticket_number=ticket_number,
+        )
 
 
 @pytest.mark.parametrize(

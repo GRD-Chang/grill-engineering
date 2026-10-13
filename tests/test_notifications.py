@@ -362,3 +362,54 @@ def test_resume_result_identity_survives_absent_transient_projection(
     sender = Notifications(tmp_path, current)
     sender.close()
     assert len(calls) == 2  # Run start and the same actual Resume result once.
+
+
+@pytest.mark.parametrize("outcome,status,title", [
+    ("human_action", "ready_for_human", "人工恢复后需要你处理"),
+    ("failed", "execution_failed", "人工恢复失败"),
+])
+@pytest.mark.parametrize("delivery_outcome", ["success", "unknown"])
+def test_same_resume_result_is_not_resent_when_boundary_reenters_during_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    outcome: str, status: str, title: str, delivery_outcome: str,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def sent(_config: Any, rendered: Any, _identity: Any, _cancel: Any, **_kwargs: Any) -> dict[str, Any]:
+        observed_title = rendered["header"]["title"]["content"]
+        calls.append(observed_title)
+        if observed_title == title:
+            entered.set()
+            assert release.wait(5), "Resume transport barrier was not released"
+            if calls.count(title) == 1:
+                return {"outcome": delivery_outcome, "reason": "response lost" if delivery_outcome == "unknown" else None}
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state(status)
+    current["_manual_resume_result"] = {
+        "id": "same-action", "outcome": outcome, "evidence": "controller_boundary",
+    }
+    sender = Notifications(tmp_path, current)
+    try:
+        assert entered.wait(3), calls
+        # 发送中的同一恢复结果可以跨越暂时没有门禁的观察；重新出现的
+        # current 槽位不能为同一个 Resume outcome 创建新的发送预算。
+        sender.observe(state("running"))
+        sender.observe(current)
+    finally:
+        release.set()
+        sender.close()
+    assert calls.count(title) == 1, calls
+    document = read_notifications(tmp_path, "run-test")
+    assert document["resume_results"] == [f"same-action:{outcome}"]
+    assert document["pending"] == []
+    delivered = [record for record in document["records"] if record["kind"] == "boundary"]
+    assert len(delivered) == 1 and delivered[0]["outcome"] == delivery_outcome
+    assert delivered[0]["attempts"] == 1
+    assert delivered[0]["attempt_history"][0]["outcome"] == delivery_outcome
+    current["_manual_resume_result"]["id"] = "next-action"
+    restarted = Notifications(tmp_path, current)
+    restarted.close()
+    assert calls.count(title) == 2, "A new explicit Resume owns a new result"

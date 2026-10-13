@@ -108,7 +108,6 @@ from agent_run.ticket_publication_contract import (
 from agent_run.required_checks_observation import (
     sync_fallback_receipt_observation,
 )
-from agent_run.state_contract import require_current_run_state
 from agent_run.ticket_integration import (
     integration_record_is_valid,
 )
@@ -180,10 +179,9 @@ class ChangeDeliveryEngine:
     def _ticket_stop_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         if not self.contract.label.startswith("ticket-"):
             return False
-        latest = self.state_store.states.load_current_run(str(state["run_id"]))
-        if latest is None:
-            raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-        return str(job["ticket_number"]) in latest["ticket_pause_requests"]
+        return self.state_store.states.ticket_pause_requested(
+            str(state["run_id"]), int(job["ticket_number"]),
+        )
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         if self.contract.label.startswith("ticket-") and self._current_job is not None:
@@ -206,7 +204,7 @@ class ChangeDeliveryEngine:
         """Validate and atomically persist one complete Observation commit."""
 
         sync_fallback_receipt_observation(job, pr_number)
-        require_current_run_state(state)
+        self.state_store.states.validate_work_projection(state)
         return self.save(state)
 
     def run(

@@ -68,18 +68,18 @@ def test_resume_reconciles_write_before_sibling_integration(
         raise RuntimeError("response lost; remote result must be observed")
 
     monkeypatch.setattr(engine.github, operation, lose_response)
-    original_save = states._save_run_unlocked
+    original_save = states._save_work_and_notify_unlocked
     injected = False
 
-    def save_after_write(identifier: str, current: dict[str, Any]) -> None:
+    def save_after_write(identifier: str, current: dict[str, Any], baseline: dict[str, Any], **kwargs: Any) -> None:
         nonlocal injected
         job = current["ticket_jobs"][str(first_ready)]
         if fault == "save" and wrote and not injected and "ticket_write_intent" not in job:
             injected = True
             raise OSError("remote write applied before StateStore result save")
-        original_save(identifier, current)
+        original_save(identifier, current, baseline, **kwargs)
 
-    monkeypatch.setattr(states, "_save_run_unlocked", save_after_write)
+    monkeypatch.setattr(states, "_save_work_and_notify_unlocked", save_after_write)
     engine.deliver_ticket(run_id, first_ready)
     assert injected == (fault == "save")
     interrupted = states.load_current_run(run_id)

@@ -35,7 +35,7 @@ class CrashBeforeResultConsumption(StateStore):
         self.ticket_number = ticket_number
         self.crashed = False
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+    def _check_interruption(self, state: dict[str, Any]) -> None:
         job = (state["ticket_jobs"].get(str(self.ticket_number))
                if self.ticket_number is not None else state.get(self.subject))
         if isinstance(job, dict):
@@ -54,7 +54,19 @@ class CrashBeforeResultConsumption(StateStore):
             ):
                 self.crashed = True
                 raise SimulatedProcessCrash("Agent returned before phase result save")
-        super()._save_run_unlocked(run_id, state)
+
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
+        self._check_interruption(state)
+        return super()._save_run_unlocked(run_id, state)
+
+    def _save_work_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
+        *, ticket_number: int | None = None,
+    ) -> None:
+        self._check_interruption(state)
+        super()._save_work_and_notify_unlocked(
+            run_id, state, baseline, ticket_number=ticket_number,
+        )
 
 
 @pytest.mark.parametrize(

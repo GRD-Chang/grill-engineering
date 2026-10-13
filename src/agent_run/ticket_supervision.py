@@ -72,7 +72,14 @@ def _retry_due(scoped: TicketState, state: dict[str, Any], *, already_ready: boo
 
 
 def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset[int]) -> bool:
-    state = engine.states.load_current_run(run_id)
+    with engine.states.work_session():
+        if not engine.states.has_ticket_supervision_work(run_id):
+            return False
+        return _supervise_loaded(engine, run_id, lanes)
+
+
+def _supervise_loaded(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset[int]) -> bool:
+    state = engine.states.load_work_run(run_id)
     if state is None or state.get("status") in RUN_STOP_STATUSES:
         return False
     number = state["ticket_integration_holder"]
@@ -88,7 +95,7 @@ def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset
         return False
     if is_supervised_wait(projected) and not _retry_due(scoped, projected):
         return False
-    result = engine.deliver_ticket(run_id, number)
+    result = engine.deliver_ticket(run_id, number, complete=False)
     return bool(result["active_ticket_job"].get("phase") == "completed")
 
 

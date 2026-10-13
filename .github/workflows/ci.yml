@@ -78,7 +78,7 @@ jobs:
 
       - name: Run tests
         if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
-        run: make test-report TEST_WORKERS=2
+        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v'
 
       - name: Run type checks
         if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'

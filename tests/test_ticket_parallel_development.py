@@ -1124,7 +1124,7 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
     assert current["status"] == "operator_stopped"
 
 
-def test_pause_during_exhausted_ci_review_keeps_budget_gate(
+def test_pause_during_last_ci_review_keeps_charged_budget_and_attempt(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import agent_run.change_delivery as development
@@ -1255,16 +1255,22 @@ def test_pause_during_exhausted_ci_review_keeps_budget_gate(
     assert saved is not None
     job = saved["ticket_jobs"]["2"]
     assert job["phase"] == "blocked"
-    assert job["blocked_reason"] == "ci_development_budget_exhausted"
-    assert job["ci_recovery"]["checkpoint_reason"] == "ci_development_budget_exhausted"
+    # Stop was accepted before the Reviewer returned. Preserve the already
+    # charged CI work, but do not consume its late verdict to open a new gate.
+    assert job["blocked_reason"] == "ticket_paused"
+    assert job["ci_recovery"]["checkpoint_reason"] is None
+    assert job["ci_recovery"]["developments_used"] == 1
+    assert job["ci_recovery"]["reviewer_invocations"] == 0
+    assert job["pending_semantic_attempt"]["role"] == "reviewer"
+    assert "returned_result" not in job["pending_semantic_attempt"]
     assert "2" not in saved["ticket_pause_requests"]
     assert repairs == [2]
     assert saved["ticket_work_queue"] == []
-    assert bind_resume_intent(saved, ticket_number=2)["authorization"] == "renew_ci_recovery"
+    assert bind_resume_intent(saved, ticket_number=2)["authorization"] == "continue_ticket"
     observed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"])
     )
-    assert observed["ticket_jobs"]["2"]["blocked_reason"] == "ci_development_budget_exhausted"
+    assert observed["ticket_jobs"]["2"]["blocked_reason"] == "ticket_paused"
     assert observed["ticket_jobs"]["2"]["ci_recovery"]["developments_used"] == 1
 
 

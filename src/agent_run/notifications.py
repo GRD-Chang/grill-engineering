@@ -115,15 +115,19 @@ class Notifications:
             identity = event["id"]
             resume_identity = (f"{event['resume_id']}:{event.get('resume_outcome')}"
                                if event.get("resume_id") else None)
+            # A Resume outcome keeps its identity across transient boundary
+            # removal or reselection; a new slot cannot renew its send budget.
+            if resume_identity and resume_identity in document["resume_results"]:
+                continue
             if event.get("current"):
-                if identity in active and (resume_identity is None or resume_identity in document["resume_results"]):
+                if identity in active and resume_identity is None:
                     continue
                 for item in list(pending):
                     if item["event"].get("slot_id") == identity:
                         outbox.cancel_item(document, item, "superseded")
                 document["sequence"] += 1
                 event = {**event, "slot_id": identity, "id": f"{identity}:{document['sequence']}"}
-            elif identity in seen or (resume_identity and resume_identity in document["resume_results"]):
+            elif identity in seen:
                 continue
             outbox.enqueue(document, event, now)
             if resume_identity and resume_identity not in document["resume_results"]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +19,7 @@ from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,
+    scoped_budget_validation,
 )
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
@@ -45,6 +47,7 @@ from agent_run.ticket_publication_contract import (
 from agent_run.publication_operation_retry import (
     publication_operation_attempt,
     require_publication_operation_retry,
+    scoped_publication_attempts,
 )
 from agent_run.resume_audit_contract import (
     RESUME_AUDIT_EVENT_KEYS,
@@ -59,6 +62,58 @@ from agent_run.semantic_attempt import (
     require_semantic_attempt_record,
 )
 from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.sqlite_encoding import encode_json, object_path
+from agent_run.sqlite_job_history import FIELDS as JOB_ARCHIVES
+from agent_run.sqlite_timeline import TimelineScope, FIELDS as TIMELINE_FIELDS, limit as timeline_limit
+
+def require_current_work_state(
+    state: dict[str, Any], archived_histories: Mapping[str, tuple[int, int]],
+    related_attempts: Mapping[str, dict[str, Any]] | None = None,
+    timelines: Mapping[str, TimelineScope] | None = None,
+) -> None:
+    """Validate loaded facts; account for unloaded Job archives and Timeline.
+
+    StateStore supplies metadata from this consistent SQLite read, never a
+    prior authorization or an invented empty list. Complete Run checks retain
+    the original validator and inspect every archived material.
+    """
+    timelines = timelines or {}
+    for key, scope in timelines.items():
+        if (key not in TIMELINE_FIELDS or key in state or not isinstance(scope, TimelineScope)
+                or not 0 <= scope.count <= timeline_limit(key)):
+            raise IncompatibleRunStateError("invalid scoped Timeline field")
+    budget_owners = {}
+    for encoded, (size, count) in archived_histories.items():
+        path = object_path(encoded)
+        if not (len(path) == 2 and path[0] == "active_ticket_job" and path[1] in JOB_ARCHIVES
+                or len(path) == 3 and path[0] == "ticket_jobs" and isinstance(path[1], str) and path[2] in JOB_ARCHIVES):
+            raise IncompatibleRunStateError("invalid scoped Job archive identity")
+        owner: Any = state
+        for part in path[:-1]:
+            owner = owner.get(part) if isinstance(owner, dict) else None
+        if (not isinstance(owner, dict) or path[-1] in owner or type(size) is not int or size < 2
+                or type(count) is not int or count < 0):
+            raise IncompatibleRunStateError("scoped Job archive was loaded, modified or lost its owner")
+        if path[-1] == "review_budget_history":
+            budget_owners[id(owner)] = count
+    attempt_owners = {}
+    for encoded, attempt in (related_attempts or {}).items():
+        path = object_path(encoded)
+        related_owner: Any = state
+        for part in path:
+            related_owner = related_owner.get(part) if isinstance(related_owner, dict) else None
+        archive = encode_json((*path, "semantic_attempt_history"))
+        if (archive not in archived_histories or not isinstance(related_owner, dict)
+                or related_owner.get("publication_operation_retry") is None
+                or attempt.get("role") != "publication" or attempt.get("status") != "completed"
+                or attempt.get("ordinal") != related_owner.get("publication_attempts")):
+            raise IncompatibleRunStateError("invalid scoped Publication Attempt association")
+        attempt_owners[id(related_owner)] = attempt
+    with scoped_budget_validation(budget_owners), scoped_publication_attempts(attempt_owners):
+        if timelines:
+            _validate_current_run_state(state, timelines)
+        else:
+            require_current_run_state(state)
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
@@ -89,8 +144,12 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
 def require_current_run_state(state: dict[str, Any]) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
+    _validate_current_run_state(state, {})
+
+
+def _validate_current_run_state(state: dict[str, Any], timelines: Mapping[str, TimelineScope]) -> None:
     try:
-        _require_current_run_state(state)
+        _require_current_run_state(state, timelines)
     except (ValueError, KeyError, TypeError) as error:
         # Protocol identity must be explicit. This is diagnosis of damaged new
         # Runs, never a legacy migration or permission to fill defaults.
@@ -116,7 +175,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         ) from error
 
 
-def _require_current_run_state(state: dict[str, Any]) -> None:
+def _require_current_run_state(state: dict[str, Any], timelines: Mapping[str, TimelineScope]) -> None:
 
     try:
         validate_resources(state.get("prompt_resources"))
@@ -184,6 +243,8 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
         ("diagnostics", list),
         ("status", str),
     ):
+        if key in timelines:
+            continue
         if not isinstance(state.get(key), expected):
             raise IncompatibleRunStateError(
                 f"legacy state is missing canonical {key}"
@@ -246,7 +307,7 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
         )
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
-    if not all(isinstance(event, dict) for event in state["timeline"]):
+    if "timeline" not in timelines and not all(isinstance(event, dict) for event in state["timeline"]):
         raise IncompatibleRunStateError("legacy state has an invalid timeline")
     from agent_run.state import (
         MAX_DIAGNOSTIC_ENTRIES,
@@ -254,18 +315,18 @@ def _require_current_run_state(state: dict[str, Any]) -> None:
         MAX_TIMELINE_EVENTS,
     )
 
-    if len(state["timeline"]) > MAX_TIMELINE_EVENTS:
+    if "timeline" not in timelines and len(state["timeline"]) > MAX_TIMELINE_EVENTS:
         raise IncompatibleRunStateError("legacy state has an oversized timeline")
     if len(state["diagnostics"]) > MAX_DIAGNOSTIC_ENTRIES:
         raise IncompatibleRunStateError("legacy state has oversized diagnostics")
     timeline_continuation = state.get("timeline_continuation", [])
-    if not isinstance(timeline_continuation, list) or not all(
+    if "timeline_continuation" not in timelines and (not isinstance(timeline_continuation, list) or not all(
         isinstance(event, dict) for event in timeline_continuation
-    ):
+    )):
         raise IncompatibleRunStateError(
             "legacy state has an invalid timeline_continuation"
         )
-    if len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
+    if "timeline_continuation" not in timelines and len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
         raise IncompatibleRunStateError(
             "legacy state has an oversized timeline_continuation"
         )
@@ -1810,6 +1871,15 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
                 require_current=False,
             )
             _require_unique_attempt_record(records_by_id, attempt, item_location)
+        if "semantic_attempt_history" not in owner:
+            related = publication_operation_attempt(owner)
+            if isinstance(related, dict) and related.get("status") == "completed":
+                _require_owner_attempt(
+                    related, state=state, location=f"{location}.related_publication_attempt",
+                    status="completed", roles=roles, work_subject=work_subject,
+                    maximum_generation=generation, owner=owner, require_current=False,
+                )
+                _require_unique_attempt_record(records_by_id, related, location)
 
 
 def _require_owner_publication_operation_retry(

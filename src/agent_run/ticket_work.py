@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
+from agent_run.sqlite_encoding import copy_json_tree
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlBusyError
 from agent_run.work_facts import ticket_program_ready
@@ -89,10 +90,11 @@ class TicketWorkAdmission:
 
         def commit() -> None:
             state = self._load()
+            baseline = copy_json_tree(state)
             before = deepcopy(state["ticket_work_queue"])
             self._seed_queue(state, numbers)
             if state["ticket_work_queue"] != before:
-                self.states._save_run_and_notify_unlocked(self.run_id, state)
+                self.states._save_work_and_notify_unlocked(self.run_id, state, baseline)
         self.states._commit_run(commit)
         return True
 
@@ -118,6 +120,7 @@ class TicketWorkAdmission:
             from agent_run.ticket_state import RUN_STOP_STATUSES
 
             state = self._load()
+            baseline = copy_json_tree(state)
             previous = deepcopy(state["ticket_work_queue"])
             job = state["ticket_jobs"].get(str(number), {})
             if (
@@ -129,7 +132,7 @@ class TicketWorkAdmission:
             reconcile(state)
             if str(number) in state["ticket_pause_requests"]:
                 if state["ticket_work_queue"] != previous:
-                    self.states._save_run_and_notify_unlocked(self.run_id, state)
+                    self.states._save_work_and_notify_unlocked(self.run_id, state, baseline)
                 return
             item = enqueue(state, number, role)
             if item["lease_id"] is not None:
@@ -144,7 +147,7 @@ class TicketWorkAdmission:
                 token = uuid4().hex
                 item["lease_id"] = token
             if state["ticket_work_queue"] != previous:
-                self.states._save_run_and_notify_unlocked(self.run_id, state)
+                self.states._save_work_and_notify_unlocked(self.run_id, state, baseline)
 
         self.states._commit_run(commit)
         return token
@@ -164,27 +167,29 @@ class TicketWorkAdmission:
     def release(self, token: str) -> None:
         def commit() -> None:
             state = self._load()
+            baseline = copy_json_tree(state)
             queue = state["ticket_work_queue"]
             state["ticket_work_queue"] = [item for item in queue if item["lease_id"] != token]
             if state["ticket_work_queue"] != queue:
-                self.states._save_run_and_notify_unlocked(self.run_id, state)
+                self.states._save_work_and_notify_unlocked(self.run_id, state, baseline)
         self.states._commit_run(commit)
 
     def cancel_waiter(self, number: int, expected_generation: int) -> None:
         """A new external wait is no longer ready to compete for Agent work."""
         def commit() -> None:
             state = self._load()
+            baseline = copy_json_tree(state)
             queue = state["ticket_work_queue"]
             state["ticket_work_queue"] = [item for item in queue if not (
                 item["ticket_number"] == number and item["generation"] == expected_generation
                 and item["lease_id"] is None
             )]
             if state["ticket_work_queue"] != queue:
-                self.states._save_run_and_notify_unlocked(self.run_id, state)
+                self.states._save_work_and_notify_unlocked(self.run_id, state, baseline)
         self.states._commit_run(commit)
 
     def _load(self) -> dict[str, Any]:
-        state = self.states.load_current_run(self.run_id)
+        state = self.states.load_work_run(self.run_id)
         if state is None:
             raise ValueError("Delivery Run disappeared during work admission")
         return state

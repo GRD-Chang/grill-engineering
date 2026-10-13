@@ -119,6 +119,61 @@ class StateStore:
             lambda: self._save_run_and_notify_unlocked(run_id, state),
         )
 
+    def load_work_run(
+        self, run_id: str, ticket_number: int | None = None, *, thin_timeline: bool = False,
+    ) -> dict[str, Any] | None:
+        """Read current work and only the Invocation history it references."""
+        self._reject_legacy_run(run_id)
+        state = self._repository.load_work(run_id, ticket_number, thin_timeline=thin_timeline)
+        if state is not None:
+            from agent_run.state_contract import require_current_work_state
+            from agent_run.state_errors import MissingRunMaterialsError
+
+            try:
+                require_current_work_state(state, self._repository.work_archives(), self._repository.work_attempts(),
+                                           self._repository.work_timelines())
+            except MissingRunMaterialsError as error:
+                raise MissingRunMaterialsError(f"{self._repository.path} Run {run_id}: {error}") from error
+        return state
+
+    def validate_work_projection(self, state: dict[str, Any]) -> None:
+        """Complete-StateStore consumers retain the complete Run contract."""
+        from agent_run.state_contract import require_current_run_state
+
+        require_current_run_state(state)
+
+    def ticket_pause_requested(self, run_id: str, ticket_number: int) -> bool:
+        """Read a Ticket Stop observation; commits independently recheck it."""
+        self._reject_legacy_run(run_id)
+        return self._repository.ticket_pause_requested(run_id, ticket_number)
+
+    @contextmanager
+    def work_session(self) -> Iterator[None]:
+        """Share scoped connections while every read retains its own snapshot."""
+        with self._repository.work_session():
+            yield
+
+    def has_ticket_supervision_work(self, run_id: str) -> bool:
+        """Precheck whether supervision needs a complete work observation."""
+        self._reject_legacy_run(run_id)
+        return self._repository.has_ticket_supervision_work(run_id)
+
+    def _save_work_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
+        *, ticket_number: int | None = None,
+    ) -> None:
+        from agent_run.state_work import save_work
+
+        save_work(self._repository, run_id, state, baseline, ticket_number)
+        notifications = self._commit_context.notifications
+        # Existing observers consume a complete Run. Resolve their query only
+        # after admission, Control and database locks have all been released;
+        # it is never reused as the work commit's authorization or baseline.
+        notifications.append(
+            (lambda: self.load_current_run(run_id))
+            if self.run_saved_observer is not None else None
+        )
+
     def update_run(
         self, run_id: str, update: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
@@ -176,7 +231,7 @@ class StateStore:
         has released all Control and database locks, and never fail the save.
         """
         nested = getattr(self._commit_context, "notifications", None) is not None
-        notifications: list[dict[str, Any] | None] = []
+        notifications: list[dict[str, Any] | Callable[[], dict[str, Any] | None] | None] = []
         try:
             with self._coordinator.admitted():
                 if not nested:
@@ -192,7 +247,9 @@ class StateStore:
                     self._after_run_saved()
                     if saved is not None and self.run_saved_observer is not None:
                         try:
-                            self.run_saved_observer(saved)
+                            observed = saved() if callable(saved) else saved
+                            if observed is not None:
+                                self.run_saved_observer(observed)
                         except Exception:
                             logging.getLogger(__name__).warning(
                                 "Run observer failed after durable commit", exc_info=True,
@@ -399,7 +456,9 @@ class StateStore:
         return state
 
     @contextmanager
-    def current_run_reader(self, run_id: str) -> Iterator[Callable[[], dict[str, Any] | None]]:
+    def current_run_reader(
+        self, run_id: str, *, work_only: bool = False,
+    ) -> Iterator[Callable[[], dict[str, Any] | None]]:
         """Retain one read-only scheduling view while SQLite reports no commit.
 
         The caller must not mutate this polling projection. Ordinary loads
@@ -418,13 +477,13 @@ class StateStore:
                 watcher.require_active()
                 self._reject_legacy_run(run_id)
                 if self._repository.in_transaction:
-                    return self.load_current_run(run_id)
+                    return self.load_work_run(run_id) if work_only else self.load_current_run(run_id)
                 version = watcher.version()
                 if (retained and version == previous_version
                         and previous_limit == self._repository.max_bytes):
                     return previous
                 with self._repository.use_reader(watcher.connection):
-                    current = self.load_current_run(run_id)
+                    current = self.load_work_run(run_id) if work_only else self.load_current_run(run_id)
                 # Sampled before reading: a concurrent commit during the read
                 # can only cause an extra refresh, never label old facts new.
                 previous_version = version
@@ -476,9 +535,9 @@ _DEFAULT_LOAD_RUN = StateStore.load_run
 _DEFAULT_VALIDATE_CURRENT_RUN = StateStore._validate_current_run
 
 
-def _append_timeline_event(
-    state: dict[str, Any], previous: dict[str, Any] | None
-) -> None:
+def _timeline_change(
+    state: dict[str, Any], previous: dict[str, Any] | None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
     marker = _timeline_marker(state)
     marker.update(checks_timeline_facts(state, marker))
     marker.update(_execution_timeline_projection(state, marker))
@@ -490,7 +549,23 @@ def _append_timeline_event(
         previous_marker.update(_execution_timeline_projection(previous, previous_marker))
         previous_marker["result"] = _timeline_result(previous)
         if marker == previous_marker:
-            return
+            return None, previous_marker
+    return marker, previous_marker
+
+
+def _timeline_capacity_event(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "at": datetime.now(UTC).isoformat(), "kind": "timeline_capacity",
+        "status": str(state.get("status", "unknown")), "result": "capacity_reached",
+    }
+
+
+def _append_timeline_event(
+    state: dict[str, Any], previous: dict[str, Any] | None
+) -> None:
+    marker, previous_marker = _timeline_change(state, previous)
+    if marker is None:
+        return
     timeline = state.setdefault("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
@@ -498,14 +573,7 @@ def _append_timeline_event(
         _append_timeline_continuation(state, marker, previous_marker)
         return
     if len(timeline) >= MAX_TIMELINE_EVENTS - 1:
-        timeline.append(
-            {
-                "at": datetime.now(UTC).isoformat(),
-                "kind": "timeline_capacity",
-                "status": str(state.get("status", "unknown")),
-                "result": "capacity_reached",
-            }
-        )
+        timeline.append(_timeline_capacity_event(state))
         state["timeline_at_capacity"] = True
         _append_timeline_continuation(state, marker, previous_marker)
         return

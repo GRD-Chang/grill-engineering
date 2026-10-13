@@ -86,7 +86,7 @@ class TicketDeliveryEngine:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         active = state.get("active_ticket_job")
         if isinstance(active, dict):
-            projected = TicketState(self.states, run_id, int(active["ticket_number"])).load_current_run(run_id)
+            projected = TicketState(self.states, run_id, int(active["ticket_number"])).load_current_run(run_id, complete=True)
             if projected is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
             return projected
@@ -124,13 +124,22 @@ class TicketDeliveryEngine:
             raise ValueError("Delivery Run has no selected Ticket")
         return self.deliver_ticket(run_id, int(active["ticket_number"]))
 
-    def deliver_ticket(self, run_id: str, number: int) -> dict[str, Any]:
+    def deliver_ticket(
+        self, run_id: str, number: int, *, complete: bool = True,
+    ) -> dict[str, Any]:
         scoped = TicketState(self.states, run_id, number)
-        return TicketDeliveryEngine(
-            git=self.git, states=scoped,  # type: ignore[arg-type]
-            github=self.github, agents=self.agents,
-            development_only=self.development_only,
-        ).deliver(run_id)
+        with scoped.work_session():
+            result = TicketDeliveryEngine(
+                git=self.git, states=scoped,  # type: ignore[arg-type]
+                github=self.github, agents=self.agents,
+                development_only=self.development_only,
+            ).deliver(run_id)
+            if complete:
+                queried = scoped.load_current_run(run_id, complete=True)
+                if queried is None:
+                    raise ValueError(f"unknown Delivery Run: {run_id}")
+                return queried
+            return result
 
     def _deliver_loaded(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         job = self._job(state)
@@ -219,7 +228,8 @@ class TicketDeliveryEngine:
                 and job.get("human_blocker_phase")
                 in {"developing", "repairing"}
             )
-            latest = self.states.load_current_run(run_id)
+            latest = (self.states.load_work_run(run_id) if isinstance(self.states, StateStore)
+                      else self.states.load_current_run(run_id))
             if latest is not None and any(
                 item["ticket_number"] == ticket_number for item in latest["ticket_work_queue"]
             ):

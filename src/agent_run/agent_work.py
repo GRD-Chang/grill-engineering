@@ -10,7 +10,7 @@ from typing import Any
 from agent_run.agent_return import has_returned_agent_result
 from agent_run.delivery_step import AgentWorkRequired
 from agent_run.ticket_work import TicketWorkAdmission
-from agent_run.worker_control import worker_control
+from agent_run.worker_control import worker_control, worker_lease
 
 
 class AgentWorkScope:
@@ -28,6 +28,7 @@ class AgentWorkScope:
         self._allowed = False
         self._lease: str | None = None
         self._control: Token[Callable[[], None] | None] | None = None
+        self._lease_context: Token[str | None] | None = None
 
     @contextmanager
     def step(self, job: dict[str, Any], *, allow_agent: bool) -> Iterator[None]:
@@ -62,9 +63,13 @@ class AgentWorkScope:
                 raise AgentWorkRequired(role)
             admission, lease = self.admission, self._lease
             self._control = worker_control.set(lambda: admission.check_control(lease))
+            self._lease_context = worker_lease.set(lease)
         self._allowed = False
 
     def release(self) -> None:
+        if self._lease_context is not None:
+            worker_lease.reset(self._lease_context)
+            self._lease_context = None
         if self._control is not None:
             worker_control.reset(self._control)
             self._control = None

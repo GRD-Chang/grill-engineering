@@ -176,6 +176,8 @@ def read_state_directory(
 ) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
     try:
         run_ids = StateStore(state_dir).list_run_ids(limit=MAX_LOCATOR_ENTRIES)
+    except IncompatibleRunStateError:
+        raise
     except ValueError as error:
         raise RunLocatorError(
             "run_locator_invalid",

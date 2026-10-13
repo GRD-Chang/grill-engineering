@@ -57,17 +57,18 @@ def test_target_append_preserves_unknown_pr_until_public_resume_can_settle(
         return number
 
     monkeypatch.setattr(publisher, operation, interrupt)
-    original_save = states._save_run_unlocked
+    save_method = "_save_run_unlocked" if parent_only else "_save_work_and_notify_unlocked"
+    original_save = getattr(states, save_method)
     injected = False
 
-    def save(identifier: str, current: dict[str, Any]) -> None:
+    def save(identifier: str, current: dict[str, Any], *args: Any, **kwargs: Any) -> None:
         nonlocal injected
         if applied and fault == "result_save" and not injected and "ticket_write_intent" not in current[subject]:
             injected = True
             raise OSError("Change PR result save lost")
-        original_save(identifier, current)
+        original_save(identifier, current, *args, **kwargs)
 
-    monkeypatch.setattr(states, "_save_run_unlocked", save)
+    monkeypatch.setattr(states, save_method, save)
     engine = engine_type(git=git, states=states, github=publisher, agents=agents)
     if parent_only:
         with pytest.raises((RuntimeError, OSError), match="(response|save) lost"):

@@ -605,15 +605,16 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
-    save_run = StateStore._save_run_unlocked
+    save_work = StateStore._save_work_and_notify_unlocked
     crashed = False
     crash_after_save = False
 
     def record_revision_mismatch_save(
-        store: StateStore, saved_run_id: str, state: dict[str, Any]
+        store: StateStore, saved_run_id: str, state: dict[str, Any],
+        baseline: dict[str, Any], *, ticket_number: int | None = None,
     ) -> None:
         nonlocal crash_after_save
-        save_run(store, saved_run_id, state)
+        save_work(store, saved_run_id, state, baseline, ticket_number=ticket_number)
         job = state.get("ticket_jobs", {}).get("2", {})
         crash_after_save = (
             not crashed
@@ -631,7 +632,7 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
 
     with monkeypatch.context() as crash_patch:
         crash_patch.setattr(
-            StateStore, "_save_run_unlocked", record_revision_mismatch_save
+            StateStore, "_save_work_and_notify_unlocked", record_revision_mismatch_save
         )
         crash_patch.setattr(
             StateStore, "_after_run_saved", crash_after_revision_mismatch_save

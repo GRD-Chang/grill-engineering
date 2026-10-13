@@ -11,6 +11,7 @@ from agent_run.delivery_policy import parse_policy_snapshot
 from agent_run.final_approval_operation import has_final_approval
 from agent_run.resume_audit import append_explicit_resume_audit
 from agent_run.resume_intent import ResumeIntentError, validate_resume_intent
+from agent_run.sqlite_encoding import copy_json_tree
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.ticket_queue import DEVELOPMENT_WORKER_PHASES
@@ -53,24 +54,34 @@ def admit_ticket_resume(
         task, action_id=str(executor['action_id']), generation=int(executor['generation']),
         run_id=run_id,
     ))
-    initial = states.load_current_run(run_id)
+
+    def complete_result(repeated: bool) -> tuple[dict[str, Any], bool]:
+        current = states.load_current_run(run_id)
+        if current is None:
+            raise ResumeIntentError('Delivery Run 已不存在')
+        return current, repeated
+
+    initial = states.load_work_run(run_id, number)
     if initial is None:
         raise ResumeIntentError('Delivery Run 已不存在')
     _require_admission(initial, number)
     if _replay(initial, number, payload):
         # A live process may already be draining; duplicate receipts must use
         # the same admission fence as new work and recheck the latest Ticket.
+        repeated = False
         with control.ticket_resume_transaction(
             task, action_id=str(executor['action_id']),
             generation=int(executor['generation']), run_id=run_id,
         ), states.locked():
-            latest = states.load_current_run(run_id)
+            latest = states.load_work_run(run_id, number)
             if latest is None:
                 raise ResumeIntentError('Delivery Run 已不存在')
             _require_admission(latest, number)
             if _replay(latest, number, payload):
-                return latest, True
+                repeated = True
             initial = latest
+        if repeated:
+            return complete_result(True)
     policy = parse_policy_snapshot(payload['policy']).snapshot()
     frozen = initial['ticket_jobs'][str(number)]['policy_snapshot']
     if any(policy[key] != frozen[key] for key in policy if key not in {
@@ -99,9 +110,10 @@ def admit_ticket_resume(
         raise ResumeIntentError('Ticket 需求已变化；请检查状态后重新提交')
 
     def commit() -> tuple[dict[str, Any], bool]:
-        latest = states.load_current_run(run_id)
+        latest = states.load_work_run(run_id, number)
         if latest is None:
             raise ResumeIntentError('Delivery Run 已不存在')
+        baseline = copy_json_tree(latest)
         _require_admission(latest, number)
         if _replay(latest, number, payload):
             return latest, True
@@ -158,10 +170,13 @@ def admit_ticket_resume(
                     latest.pop(key, None)
                 else:
                     latest[key] = value
-        states._save_run_and_notify_unlocked(run_id, latest)
+        states._save_work_and_notify_unlocked(run_id, latest, baseline, ticket_number=number)
         return latest, False
 
-    return states._commit_run(commit)
+    _, repeated = states._commit_run(commit)
+    # Public receipts contain the complete persisted query after the object
+    # commit releases its admission and database locks.
+    return complete_result(repeated)
 
 
 def active_ticket_resume(

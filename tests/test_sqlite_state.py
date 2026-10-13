@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -319,3 +320,505 @@ def test_invocation_detail_retention_protects_recovery_and_review_facts() -> Non
     before = deepcopy(state)
     compact_invocation_details(state)
     assert state == before
+
+
+def _work_fixture(unrelated: int = 0) -> dict:
+    current = {"work_subject": "ticket:2", "started_at": "current", "ticket_number": 2,
+               "status": "running", "review_context": {"body": "本票准确材料" * 200}}
+    history = [{"work_subject": "ticket:2" if number % 2 else "ticket:3", "started_at": str(number),
+                "status": "completed", "review_context": {"body": f"历史-{number}" + "历史材料" * 200}}
+               for number in range(unrelated)] + [deepcopy(current)]
+    return {"ticket_jobs": {"2": {"phase": "developing"}, "3": {"phase": "blocked"}},
+            "ticket_agent_invocations": {"2": current, "3": {
+                "work_subject": "ticket:3", "started_at": "sibling", "status": "completed",
+                "review_context": {"body": "兄弟材料" * 400}}},
+            "agent_invocation_history": history, "phase": "delivery"}
+
+
+def test_work_patch_preserves_unloaded_history_and_sibling_after_reopen(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(20)
+    repository.save("run-1", original)
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        assert len(baseline["agent_invocation_history"]) == 1
+        assert set(baseline["ticket_agent_invocations"]) == {"2"}
+        updated = deepcopy(baseline)
+        updated["ticket_jobs"]["2"]["phase"] = "candidate"
+        updated["agent_invocation_history"][0]["status"] = "completed"
+        updated["ticket_agent_invocations"]["2"]["status"] = "completed"
+        updated["agent_invocation_history"].append({"work_subject": "ticket:2", "started_at": "next", "status": "running"})
+        repository.save_work("run-1", updated, baseline)
+    expected = deepcopy(original)
+    expected["ticket_jobs"]["2"]["phase"] = "candidate"
+    expected["agent_invocation_history"][-1]["status"] = "completed"
+    expected["ticket_agent_invocations"]["2"]["status"] = "completed"
+    expected["agent_invocation_history"].append(updated["agent_invocation_history"][-1])
+    reopened = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    assert reopened.load("run-1") == expected
+    with reopened._reading() as connection:
+        assert connection is not None
+        assert connection.execute("SELECT logical_bytes FROM run_sizes WHERE run_id='run-1'").fetchone()[0] == reopened._check_size(expected)
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+@pytest.mark.parametrize("empty_core", [True, False])
+def test_work_replacing_thin_active_job_accounts_for_unloaded_archive(
+    tmp_path: Path, aggregate: bool, empty_core: bool,
+) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(4)
+    original["ticket_jobs"]["2"]["semantic_attempt_history"] = [{"evidence": "target"}]
+    original["ticket_jobs"]["3"] = {**({} if empty_core else {"ticket_number": 3}), "semantic_attempt_history": [
+        {"review_context": {"body": "old sibling evidence" * 1000}}], "human_blocker_history": [{"question": "old question"}]}
+    original["active_ticket_job"] = deepcopy(original["ticket_jobs"]["3"])
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        assert "semantic_attempt_history" not in baseline["active_ticket_job"]
+        updated = deepcopy(baseline)
+        updated["active_ticket_job"] = {"ticket_number": 2, **updated["ticket_jobs"]["2"]}
+        repository.save_work("run-1", updated, baseline)
+    expected = deepcopy(original)
+    expected["active_ticket_job"] = deepcopy(updated["active_ticket_job"])
+    assert SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES).load("run-1") == expected
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_work_rejects_replacing_unloaded_sibling_archive(tmp_path: Path, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(4)
+    original["ticket_jobs"]["3"]["semantic_attempt_history"] = [{"evidence": "retained"}]
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    with pytest.raises(ValueError, match="cannot replace unloaded Job history"):
+        with repository.atomic():
+            baseline = repository.load_work("run-1", 2)
+            assert baseline is not None
+            updated = deepcopy(baseline)
+            updated["ticket_jobs"]["3"]["semantic_attempt_history"] = []
+            repository.save_work("run-1", updated, baseline)
+    assert repository.load("run-1") == original
+
+
+@pytest.mark.parametrize("damage", ["logical_bytes", "item_count", "missing"])
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_full_and_selected_work_reject_damaged_job_archive_metadata(tmp_path: Path, damage: str, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(4)
+    original["ticket_jobs"]["2"]["semantic_attempt_history"] = [{"evidence": "retained"}]
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    assert repository.load("run-1") == original
+    with repository.atomic():
+        connection = repository._local.connection
+        if damage == "missing":
+            connection.execute("DELETE FROM run_job_history WHERE run_id='run-1'")
+        else:
+            connection.execute(f"UPDATE run_job_history SET {damage}={damage}+1 WHERE run_id='run-1'")
+    with pytest.raises(ValueError, match="Job history size"):
+        repository.load("run-1")
+    with pytest.raises(ValueError, match="Job history size|list item"):
+        repository.load_work("run-1", 2)
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_existing_attempt_update_keeps_archive_metadata_exact_after_reopen(tmp_path: Path, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(4)
+    original["ticket_jobs"]["2"]["semantic_attempt_history"] = [{"role": "publication", "status": "completed", "ordinal": 1}]
+    original["active_ticket_job"] = {"ticket_number": 2, **deepcopy(original["ticket_jobs"]["2"])}
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        for owner in (updated["ticket_jobs"]["2"], updated["active_ticket_job"]):
+            owner["semantic_attempt_history"][0]["publication_operation_retry"] = {"attempts": 5, "limit": 5}
+        repository.save_work("run-1", updated, baseline)
+    expected = deepcopy(original)
+    for owner in (expected["ticket_jobs"]["2"], expected["active_ticket_job"]):
+        owner["semantic_attempt_history"][0]["publication_operation_retry"] = {"attempts": 5, "limit": 5}
+    assert SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES).load("run-1") == expected
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_current_index_keeps_ordinary_paths_with_archive_text(tmp_path: Path, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(4)
+    original["ordinary"] = {"semantic_attempt_history": {"current": "retained"}}
+    quoted = 'literal ,"semantic_attempt_history", key'
+    original[quoted] = {"current": "also retained"}
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    projected = repository.load_work("run-1", 2)
+    assert projected is not None
+    assert projected["ordinary"] == original["ordinary"]
+    assert projected[quoted] == original[quoted]
+
+
+@pytest.mark.parametrize("ticket", [None, 2])
+def test_work_projection_retains_resume_successor_evidence(tmp_path: Path, ticket: int | None) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(10)
+    original["agent_invocation_history"][0]["resume_id"] = "resume-3"
+    original["resume_audit"] = {"history": [{"resume_id": "resume-3", "successor_invocation_started_at": "0"}]}
+    repository.save("run-1", original)
+    projected = repository.load_work("run-1", ticket)
+    assert projected is not None
+    assert any(entry.get("resume_id") == "resume-3" for entry in projected["agent_invocation_history"])
+    assert len(projected["agent_invocation_history"]) == (1 if ticket is None else 2)
+
+
+@pytest.mark.parametrize("failure", ["size", "exception"])
+def test_work_patch_failure_rolls_back_materials_and_history(tmp_path: Path, failure: str) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=16384)
+    original = _work_fixture(1)
+    repository.save("run-1", original)
+    with pytest.raises((ValueError, OSError), match="limit|injected"):
+        with repository.atomic():
+            baseline = repository.load_work("run-1", 2)
+            assert baseline is not None
+            updated = deepcopy(baseline)
+            updated["agent_invocation_history"].append({"work_subject": "ticket:2", "started_at": "next", "status": "running", "body": "x" * (16384 if failure == "size" else 1200)})
+            repository.save_work("run-1", updated, baseline)
+            raise OSError("injected failure")
+    assert SQLiteStateRepository(tmp_path, max_bytes=16384).load("run-1") == original
+
+
+def test_work_global_retention_preserves_sibling_current_and_pending_attempt(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(256)
+    for entry in original["agent_invocation_history"][:3]:
+        entry["execution_segments"] = [{"started_at": "2026-10-13T00:00:00+00:00", "ended_at": "2026-10-13T00:00:01+00:00"}]
+    original["ticket_agent_invocations"]["3"] = deepcopy(original["agent_invocation_history"][0])
+    original["ticket_jobs"]["2"]["pending_semantic_attempt"] = {"attempt_id": "pending"}
+    original["agent_invocation_history"][1]["semantic_attempt"] = {"attempt_id": "pending"}
+    repository.save("run-1", original)
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        updated["agent_invocation_history"].extend([
+            {"work_subject": "ticket:2", "started_at": "new-1", "status": "completed"},
+            {"work_subject": "ticket:2", "started_at": "new-2", "status": "completed"}])
+        repository.save_work("run-1", updated, baseline)
+    saved = repository.load("run-1")
+    assert saved is not None
+    history = saved["agent_invocation_history"]
+    assert history[0]["execution_segments"] and history[1]["execution_segments"]
+    assert history[2]["execution_segments"] == []
+    assert history[2]["execution_segments_summary"]["count"] == 1
+    with repository._reading() as connection:
+        assert connection is not None
+        assert connection.execute("SELECT logical_bytes FROM run_sizes WHERE run_id='run-1'").fetchone()[0] == repository._check_size(saved)
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+@pytest.mark.parametrize("history_run", ["run-1", "unrelated-run"])
+def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
+    tmp_path: Path, monkeypatch, aggregate: bool, history_run: str,
+) -> None:
+    from agent_run import sqlite_objects, sqlite_mutations
+    observed = []
+    real_decode = sqlite_objects._decode
+    def decode(repository, connection, run_id, rows, **kwargs):
+        observed.append(sum(len(path.encode()) + len(encoded.encode()) for path, _, encoded in rows))
+        return real_decode(repository, connection, run_id, rows, **kwargs)
+    monkeypatch.setattr(sqlite_objects, "_decode", decode)
+    json_bytes = []
+    real_encode = sqlite_mutations.encode_json
+    def encode(value):
+        result = real_encode(value)
+        json_bytes.append(len(result.encode("utf-8")))
+        return result
+    monkeypatch.setattr(sqlite_objects, "encode_json", encode)
+    monkeypatch.setattr(sqlite_mutations, "encode_json", encode)
+    serializer_bytes = []
+    real_dumps = json.dumps
+    def dumps(*args, **kwargs):
+        result = real_dumps(*args, **kwargs)
+        serializer_bytes.append(len(result.encode("utf-8")))
+        return result
+    monkeypatch.setattr(json, "dumps", dumps)
+    sql_steps = [0]
+    measuring = [False]
+    connect = sqlite3.connect
+    def progress():
+        sql_steps[0] += 1
+        return 0
+    def measured_connection(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        if measuring[0]:
+            connection.set_progress_handler(progress, 1)
+        return connection
+    monkeypatch.setattr(sqlite3, "connect", measured_connection)
+    costs = []
+    for number in (10, 500):
+        repository = SQLiteStateRepository(tmp_path / str(number), max_bytes=MAX_RUN_STATE_BYTES)
+        repository._aggregate_rows = aggregate
+        original = _work_fixture(number if history_run == "run-1" else 0)
+        repository.save("run-1", original)
+        unrelated = _work_fixture(number)
+        if history_run != "run-1":
+            repository.save(history_run, unrelated)
+        observed.clear()
+        json_bytes.clear()
+        serializer_bytes.clear()
+        encoded = []
+        real_objects = repository._objects
+        def objects(state, **kwargs):
+            encoded.append(len(json.dumps(state, ensure_ascii=False).encode()))
+            return real_objects(state, **kwargs)
+        monkeypatch.setattr(repository, "_objects", objects)
+        sql_steps[0] = 0
+        measuring[0] = True
+        tracemalloc.start()
+        try:
+            with repository.atomic():
+                baseline = repository.load_work("run-1", 2)
+                assert baseline is not None
+                updated = deepcopy(baseline)
+                updated["ticket_jobs"]["2"]["phase"] = "candidate"
+                repository.save_work("run-1", updated, baseline)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            measuring[0] = False
+        costs.append((sum(observed), sum(encoded), sum(json_bytes), sum(serializer_bytes), peak, sql_steps[0]))
+        assert repository.load("run-1")["agent_invocation_history"] == original["agent_invocation_history"]
+        if history_run != "run-1":
+            assert repository.load(history_run) == unrelated
+    assert costs[0][:2] == costs[1][:2]
+    assert costs[1][2] <= costs[0][2] + 4
+    assert costs[1][3] <= costs[0][3] + 4
+    assert costs[1][4] < costs[0][4] + 128 * 1024
+    assert costs[1][5] <= costs[0][5] + 256, costs
+    print(f"work node bytes/object encoding bytes/helper encoding bytes/all serializer bytes/peak bytes/SQL VM steps (10, 500): {costs}")
+
+
+@pytest.mark.parametrize("damage", ["size", "history", "refs"])
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_complete_queries_reject_damaged_sparse_metadata_even_with_cached_projection(tmp_path: Path, damage: str, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    repository.save("run-1", _work_fixture(3))
+    repository._aggregate_rows = aggregate
+    assert repository.load("run-1") is not None
+    with repository.atomic():
+        connection = repository._local.connection
+        if damage == "size":
+            connection.execute("UPDATE run_sizes SET logical_bytes = logical_bytes - 1 WHERE run_id='run-1'")
+        elif damage == "history":
+            connection.execute("DELETE FROM run_history WHERE run_id='run-1' AND position=0")
+        else:
+            connection.execute("DELETE FROM run_object_material_refs WHERE run_id='run-1'")
+    with pytest.raises(ValueError, match="metadata|index|references"):
+        repository.load("run-1")
+
+
+def test_work_gc_keeps_materials_needed_by_unloaded_history_and_other_run(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(2)
+    original["ticket_agent_invocations"]["2"]["review_context"] = deepcopy(original["agent_invocation_history"][0]["review_context"])
+    original["agent_invocation_history"][-1]["review_context"] = deepcopy(original["agent_invocation_history"][0]["review_context"])
+    repository.save("run-1", original)
+    other = {"review_context": deepcopy(original["agent_invocation_history"][0]["review_context"])}
+    repository.save("run-2", other)
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        updated["ticket_agent_invocations"]["2"]["review_context"] = {"body": "replacement" * 200}
+        updated["agent_invocation_history"][-1]["review_context"] = {"body": "replacement" * 200}
+        repository.save_work("run-1", updated, baseline)
+    expected = deepcopy(original)
+    expected["ticket_agent_invocations"]["2"]["review_context"] = updated["ticket_agent_invocations"]["2"]["review_context"]
+    expected["agent_invocation_history"][-1]["review_context"] = updated["agent_invocation_history"][-1]["review_context"]
+    assert repository.load("run-1") == expected
+    assert repository.load("run-2") == other
+    # Complete removal exercises released object refs and actual SQL GC.
+    repository.save("run-1", {"phase": "removed"})
+    assert repository.load("run-2") == other
+
+
+def test_work_material_damage_is_bounded_and_old_protocol_is_rejected(tmp_path: Path) -> None:
+    from agent_run.state_errors import IncompatibleRunStateError
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    repository.save("run-1", _work_fixture())
+    with repository.atomic():
+        repository._local.connection.execute("UPDATE run_materials SET byte_length=byte_length+1")
+    with pytest.raises(ValueError, match="byte length"):
+        repository.load_work("run-1", 2)
+    with repository.atomic():
+        repository._local.connection.execute("UPDATE schema_meta SET value='sqlite-run-objects-v1'")
+    with pytest.raises(IncompatibleRunStateError, match="protocol"):
+        repository.load_work("run-1", 2)
+
+
+def test_work_shared_material_decode_keeps_returned_objects_independent(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture()
+    repository.save("run-1", original)
+    with repository.atomic():
+        projected = repository.load_work("run-1", 2)
+        assert projected is not None
+        projected["agent_invocation_history"][0]["review_context"]["body"] = "changed history"
+        assert projected["ticket_agent_invocations"]["2"]["review_context"] == original["ticket_agent_invocations"]["2"]["review_context"]
+    assert repository.load("run-1") == original
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_work_transaction_view_is_independent_and_invalidated_by_save(tmp_path: Path, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture()
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    with repository.atomic():
+        sql_steps = [0]
+        def progress():
+            sql_steps[0] += 1
+            return 0
+        repository._local.connection.set_progress_handler(progress, 1)
+        projected = repository.load_work("run-1", 2)
+        assert projected is not None
+        first_read_steps = sql_steps[0]
+        projected["ticket_jobs"]["2"]["phase"] = "local mutation"
+        sql_steps[0] = 0
+        repeated = repository.load_work("run-1", 2)
+        assert repeated is not None
+        assert sql_steps[0] < first_read_steps / 2
+        repository._local.connection.set_progress_handler(None, 0)
+        assert repeated["ticket_jobs"]["2"]["phase"] == original["ticket_jobs"]["2"]["phase"]
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        repeated["ticket_jobs"]["2"]["phase"] = "candidate"
+        repository.save_work("run-1", repeated, baseline)
+        fresh = repository.load_work("run-1", 2)
+        assert fresh is not None and fresh["ticket_jobs"]["2"]["phase"] == "candidate"
+        sibling = repository.load_work("run-1", 3)
+        assert sibling is not None
+        assert sibling["ticket_agent_invocations"]["3"] == original["ticket_agent_invocations"]["3"]
+    other = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    saved = other.load("run-1")
+    assert saved is not None
+    saved["ticket_jobs"]["2"]["phase"] = "external"
+    other.save("run-1", saved)
+    refreshed = repository.load_work("run-1", 2)
+    assert refreshed is not None and refreshed["ticket_jobs"]["2"]["phase"] == "external"
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+@pytest.mark.parametrize("damage", ["material", "protocol", "schema"])
+def test_work_transaction_view_rechecks_storage_after_direct_sql(tmp_path: Path, aggregate: bool, damage: str) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    repository.save("run-1", _work_fixture())
+    repository._aggregate_rows = aggregate
+    with repository.atomic():
+        assert repository.load_work("run-1", 2) is not None
+        connection = repository._local.connection
+        if damage == "material":
+            connection.execute("UPDATE run_materials SET byte_length=byte_length+1")
+        elif damage == "protocol":
+            connection.execute("UPDATE schema_meta SET value='unsupported'")
+        else:
+            # DDL leaves total_changes unchanged, so the separate schema check
+            # must still reject it before returning the transaction's view.
+            connection.execute("CREATE VIEW unexpected AS SELECT 1")
+        with pytest.raises(ValueError, match="byte length|protocol|schema"):
+            repository.load_work("run-1", 2)
+
+
+def test_work_sparse_canonical_add_remove_and_scalar_types_keep_exact_size(tmp_path: Path) -> None:
+    import math
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(2)
+    original["value"] = 0.0
+    repository.save("run-1", original)
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        del updated["ticket_agent_invocations"]["2"]
+        updated["value"] = -0.0
+        repository.save_work("run-1", updated, baseline)
+    expected = deepcopy(original)
+    del expected["ticket_agent_invocations"]["2"]
+    expected["value"] = -0.0
+    assert repository.load("run-1") == expected
+    assert math.copysign(1, repository.load("run-1")["value"]) == -1
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 4)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        updated["ticket_agent_invocations"]["4"] = {"work_subject": "ticket:4", "started_at": "new", "status": "running"}
+        updated["value"] = False
+        repository.save_work("run-1", updated, baseline)
+    expected["ticket_agent_invocations"]["4"] = updated["ticket_agent_invocations"]["4"]
+    expected["value"] = False
+    saved = repository.load("run-1")
+    assert saved == expected and type(saved["value"]) is bool
+
+
+@pytest.mark.parametrize("index", ["history_identity", "current_work_objects", "job_attempt_role", "material_run_refs"])
+def test_work_required_history_index_cannot_be_removed(tmp_path: Path, index: str) -> None:
+    from agent_run.state_errors import IncompatibleRunStateError
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    repository.save("run-1", _work_fixture())
+    with repository.atomic():
+        repository._local.connection.execute(f"DROP INDEX {index}")
+    with pytest.raises(IncompatibleRunStateError, match="indexes"):
+        repository.load("run-1")
+    with pytest.raises(IncompatibleRunStateError, match="indexes"):
+        repository.load_work("run-1", 2)
+
+
+def test_work_patch_can_initialize_history_and_canonical_collection(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
+    repository.save("run-1", {"phase": "delivery"})
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None
+        updated = deepcopy(baseline)
+        invocation = {"work_subject": "ticket:2", "started_at": "first", "status": "running"}
+        updated["ticket_agent_invocations"] = {"2": invocation}
+        updated["agent_invocation_history"] = [deepcopy(invocation)]
+        repository.save_work("run-1", updated, baseline)
+    assert repository.load("run-1") == updated
+
+
+def test_work_core_transaction_reuse_returns_independent_views_and_invalidates_writes(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(2)
+    repository.save("run-1", original)
+    with repository.atomic():
+        admission = repository.load_work("run-1", None)
+        baseline = repository.load_work("run-1", 2)
+        assert baseline is not None and admission is not None
+        updated = deepcopy(baseline)
+        updated["ticket_jobs"]["2"]["phase"] = "candidate"
+        assert admission["ticket_jobs"]["2"]["phase"] == "developing"
+        repository.save_work("run-1", updated, baseline)
+        assert repository.load_work("run-1", None)["ticket_jobs"]["2"]["phase"] == "candidate"
+        replacement = deepcopy(original)
+        replacement["ticket_jobs"]["2"]["phase"] = "accepted"
+        repository.save("run-1", replacement)
+        assert repository.load_work("run-1", 2)["ticket_jobs"]["2"]["phase"] == "accepted"
+    assert repository.load("run-1") == replacement
+
+
+@pytest.mark.parametrize("aggregate", [True, False])
+def test_work_material_batch_preserves_unicode_and_nul_in_both_read_paths(tmp_path: Path, aggregate: bool) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    original = _work_fixture(2)
+    original["ticket_agent_invocations"]["2"]["review_context"] = {"body": "原始证据\x00继续" * 300}
+    original["agent_invocation_history"][-1]["review_context"] = deepcopy(original["ticket_agent_invocations"]["2"]["review_context"])
+    repository.save("run-1", original)
+    repository._aggregate_rows = aggregate
+    projected = repository.load_work("run-1", 2)
+    assert projected is not None
+    assert projected["ticket_agent_invocations"]["2"]["review_context"] == original["ticket_agent_invocations"]["2"]["review_context"]
+    assert projected["agent_invocation_history"][-1] == original["agent_invocation_history"][-1]
