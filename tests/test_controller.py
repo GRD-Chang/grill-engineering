@@ -295,9 +295,9 @@ def test_credential_renewal_failure_uses_a_recoverable_diagnostic(
             "code": "worker_credential_renewal_failed",
             "message": "Worker GitHub read credential error: worker_credential_renewal_failed: retries exhausted; token=[REDACTED]",
             "operator_gate": {
-                "work_subject": "ticket:2",
+                "work_subject": f"run:{run_id}",
                 "action_kind": "execution_failure",
-                "phase": "active",
+                "phase": "execution_failed",
                 "reason": "worker_credential_renewal_failed",
             },
         }

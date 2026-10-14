@@ -220,3 +220,38 @@ def test_global_resume_can_select_ticket_before_its_first_invocation(
     assert resumed["active_ticket_job"]["ticket_number"] == 3
     assert resumed["ticket_agent_invocations"] == {}
     assert [item["ticket_number"] for item in resumed["ticket_work_queue"]] == [3, 2]
+
+
+@pytest.mark.parametrize("invocation_status", ["running", "completed"])
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_executor_recovery_preserves_selected_thread_choice_after_reload(
+    invocation_status: str, new_thread: bool,
+) -> None:
+    attempt = {"attempt_id": "pending-attempt", "status": "pending"}
+    job = {"ticket_number": 2, "ticket_branch_generation": 1, "phase": "developing",
+           "pending_semantic_attempt": attempt}
+    invocation = {"work_subject": "ticket:2", "role": "development", "generation": 1,
+                  "started_at": "2026-10-14T00:00:00+00:00", "status": invocation_status,
+                  "semantic_attempt": deepcopy(attempt), "reported_thread_id": "prior-developer"}
+    state = {"run_id": "run", "status": "execution_failed",
+             "ticket_graph": {"tickets": {"2": {}}},
+             "ticket_jobs": {"2": job}, "active_ticket_job": job,
+             "ticket_agent_invocations": {"2": invocation},
+             # 持久化重开后，观察投影与实际对象不共享 Python 字典身份。
+             "active_agent_invocation": deepcopy(invocation)}
+    apply_resume_to_state(
+        state, explicit_resume=True, resume_human_blocker=False, new_thread=new_thread,
+        human_response=None, resume_budget_checkpoint=False, budget_policy=DeliveryPolicy(),
+        ticket_number=None, source_status="execution_failed",
+    )
+    if new_thread:
+        assert job.get("development_thread_id") is None
+        assert job["development_new_thread"] is True
+        assert job["development_thread_history"] == ["prior-developer"]
+    else:
+        assert job["development_thread_id"] == "prior-developer"
+        assert not job.get("development_new_thread")
+    assert job["pending_semantic_attempt"] == attempt
+    assert state["ticket_agent_invocations"]["2"]["status"] == (
+        "resuming" if invocation_status == "running" else "completed"
+    )

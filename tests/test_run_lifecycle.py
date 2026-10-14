@@ -2315,10 +2315,10 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     )
     operator_gate = recovered_diagnostics[0].get("operator_gate")
     assert isinstance(operator_gate, dict)
-    assert operator_gate["work_subject"] == "ticket:3"
+    recovered_state = load_only_run_state(git_repo, extra_env=environment)
+    assert operator_gate["work_subject"] == f"run:{recovered_state['run_id']}"
     assert operator_gate["action_kind"] == "execution_failure"
     assert operator_gate["reason"] == "session_interrupted"
-    recovered_state = load_only_run_state(git_repo, extra_env=environment)
     require_current_run_state(recovered_state)
     assert recovered_state["status"] == "execution_failed"
     assert recovered_state["terminal_kind"] == "execution_failed"
@@ -2468,7 +2468,8 @@ def test_session_closeout_retries_only_the_control_commit(
     assert after_run_save is not None
     require_current_run_state(after_run_save)
     gate = after_run_save["diagnostics"][0]["operator_gate"]
-    assert gate["phase"] != "execution_failed"
+    assert gate["work_subject"] == f"run:{run_id}"
+    assert gate["phase"] == "execution_failed"
     assert session_interruption_is_persisted(after_run_save)
     successor_state = dict(after_run_save)
     successor_state["action_application_receipt"] = {

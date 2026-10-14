@@ -5,6 +5,25 @@ Invocation 和关联历史使用同一数据库；完整 Run 字典是按需读�
 不再另存或双写 `runs/<id>.json`。Task Control 继续保存原有 Action、Executor
 及其对账事实；它不是第二份业务进度，也不凭数据库提交推定宿主已经退出。
 
+## 故障归属
+
+Ticket 的调用或保存失败由该 Ticket 的 `TicketState` 核对准确 Job、Invocation、
+Semantic Attempt 和需求身份后保存，沿用提交协调并保留兄弟进度。局部暂停只限制
+实际对象及其依赖；定向 resume 仍由该对象已有恢复合同处理。
+
+Executor 级执行失败、共享凭据失效及共享 GitHub 权威刷新中的确定性错误使用
+`run:<run_id>` 门禁；已确认 Session 退出后的中断记录也使用此身份。
+Run 门禁阶段对应顶层失败状态，status/history 从相同
+记录解释故障。当前选择不会改变故障归属，已完成对象不会获得新的故障门禁。
+共享故障保留独立对象原有的人工、预算和暂停门禁；真实执行取消、退出确认与退出
+后全部未完成调用的核对仍由执行生命周期负责，故障记录本身不证明 Worker 已退出。
+
+公开生命周期排除旧 Executor/Worker 后，显式 Run 恢复在还原 Thread 前收口
+Ticket 记录中仍为 `running/resuming` 的实际 Invocation，并同步对应调用历史与
+准确匹配的观察投影，不重写 Run 原始故障解释。恢复从各 Invocation 的准确 pending
+Attempt 取回原 Thread，包括未被选中的兄弟调用；`completed` 调用保持完成记录，
+已保存返回优先由正常阶段消费。完成 Ticket 及兄弟的人工、预算、暂停门禁不被解除。
+
 ## 读取与协议边界
 
 `load_run` 返回原始持久事实；`load_current_run` 另校验当前业务合同。

@@ -12,7 +12,7 @@ from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.operator_action_facts import operator_action_facts
 from agent_run.operator_gate import operator_gate_identity_is_consistent
 from agent_run.state_contract import require_current_run_state
-from support.cli import load_only_run_state
+from support.cli import load_only_run_state, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
 from support.parent_approval_update import append_remote, git_command
 from support.published_run import prepare_published_run
@@ -66,11 +66,34 @@ def test_run_approval_update_preserves_hard_gates(
         assert after["status"] == expected_status
         require_current_run_state(after)
         fact, = operator_action_facts(after)
-        assert fact["work_subject"] == f"run-publication:{before['run_id']}"
+        # 共享权威与凭据故障归 Run；保留的 Publication 不是故障拥有者。
+        assert fact["work_subject"] == f"run:{before['run_id']}"
+        assert fact["scope"] == "global"
+        assert fact["phase"] == expected_status
         assert fact["status_code"] == expected_status
         assert fact["action_kind"] == (
             "deterministic_contradiction" if gate == "foreign_pr" else "execution_failure"
         )
+        expected_code = "foreign_run_pr" if gate == "foreign_pr" else "runner_credential_failed"
+        assert fact["reason"] == expected_code
+        assert after["diagnostics"][0]["operator_gate"] == {
+            "work_subject": f"run:{before['run_id']}",
+            "phase": expected_status,
+            "action_kind": fact["action_kind"],
+            "reason": expected_code,
+        }
+        assert after["run_publication"]["phase"] == before["run_publication"]["phase"]
+        assert after["run_publication"]["record"] == before["run_publication"]["record"]
+        for command in ("status", "history"):
+            queried = invoke_cli_inprocess(git_repo, fixture, command, before["run_id"], "--json")
+            assert queried.returncode == 0, queried.stdout + queried.stderr
+            action, = stdout_json(queried)["operator_actions"]
+            assert action["work_subject"] == fact["work_subject"]
+            assert action["scope"] == "global"
+            assert action["status_code"] == expected_status
+            assert action["action_kind"] == fact["action_kind"]
+            assert action["reasons"] == [after["diagnostics"][0]["message"]]
+        assert load_only_run_state(git_repo) == after
     external = json.loads(fixture.read_text())["delivery"]
     for field in ("pull_requests", "published_branches", "closed_issues", "mutations"):
         assert external.get(field) == data["delivery"].get(field)

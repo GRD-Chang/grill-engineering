@@ -144,6 +144,7 @@ def test_shared_credential_failure_is_durable_before_sibling_can_write(
     old = sibling.load_current_run(run_id)
     assert old is not None
     original_job = deepcopy(old['ticket_jobs']['2'])
+    selected = states.load_current_run(run_id)['active_ticket_job']['ticket_number']
 
     def fail(**_kwargs: Any) -> None:
         raise RunnerCredentialError('confirmed shared credential revoked')
@@ -154,7 +155,8 @@ def test_shared_credential_failure_is_durable_before_sibling_can_write(
     saved = states.load_current_run(run_id)
     assert saved is not None
     assert saved['diagnostics'][0]['code'] == 'runner_credential_failed'
-    assert saved['active_ticket_job']['ticket_number'] == 3
+    assert saved['active_ticket_job']['ticket_number'] == selected
+    assert saved['diagnostics'][0]['operator_gate']['work_subject'] == f'run:{run_id}'
     assert saved['ticket_jobs']['2'] == original_job
     with pytest.raises(TaskControlBusyError):
         sibling.save_run(run_id, old)

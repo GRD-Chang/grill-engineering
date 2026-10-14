@@ -11,7 +11,9 @@ from agent_run.resume_work import continuation_phase
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
-from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
+from agent_run.agent_invocation import (
+    fail_interrupted_invocation, interrupt_exited_ticket_invocations, restore_operator_stop,
+)
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
@@ -53,6 +55,7 @@ from agent_run.operator_gate import (
     has_run_operator_gate,
     has_unresolved_subject_gate,
     operator_gate_subjects,
+    run_failure_diagnostic,
 )
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.run_currentness import (
@@ -810,6 +813,7 @@ class Controller:
     def record_execution_failure(
         self, run_id: str, message: str, *, runner_credential_failure: bool = False,
     ) -> bool:
+        """Record an Executor-wide failure; Ticket lanes retain local failures."""
         # Resolve external identity before the short state-write transaction.
         hint_reader = getattr(self.github, "repository_hint", None)
         repository_hint = hint_reader() if callable(hint_reader) else None
@@ -863,17 +867,10 @@ class Controller:
                 return False
             failure_message = message
             active = state.get("active_agent_invocation")
-            invocation_owns_failure = (
-                isinstance(active, dict)
-                and (
-                    active.get("status") in {"running", "failed"}
-                    or (
-                        active.get("status") == "completed"
-                        and invocation_attempt_is_pending(state, active)
-                    )
-                )
-            )
-            if isinstance(active, dict) and isinstance(active.get("role"), str):
+            # Ticket lanes record their own failures. The selected Ticket is
+            # only an observation pointer, never the owner of a shared error.
+            if (isinstance(active, dict) and isinstance(active.get("role"), str)
+                    and not str(active.get("work_subject", "")).startswith("ticket:")):
                 fail_interrupted_invocation(
                     state,
                     role=str(active["role"]),
@@ -890,14 +887,8 @@ class Controller:
                     if "worker_credential_renewal_failed:" in failure_message
                     else "command_failed"
                 )
-            diagnostic = _operator_gate_diagnostic(
-                state,
-                code=code,
-                message=failure_message,
-                action_kind="execution_failure",
-                reason=code,
-                fallback_phase=str(state.get("status") or "execution_failed"),
-                bind_to_current_change_job=runner_credential_failure or not invocation_owns_failure,
+            diagnostic = run_failure_diagnostic(
+                state, code=code, message=failure_message,
             )
             state.update(
                 {
@@ -944,15 +935,11 @@ class Controller:
                 return False
             state.pop("supervision_window", None)
             state.pop("supervision_wait", None)
-            diagnostic = _operator_gate_diagnostic(
+            diagnostic = run_failure_diagnostic(
                 state,
                 code=code,
                 message=message,
                 action_kind="deterministic_contradiction",
-                reason=code,
-                fallback_phase=str(
-                    state.get("status") or "deterministic_contradiction"
-                ),
             )
             state.update(
                 {
@@ -1157,15 +1144,11 @@ class Controller:
             else:
                 failed.pop("supervision_window", None)
                 failed.pop("supervision_wait", None)
-                diagnostic = _operator_gate_diagnostic(
+                diagnostic = run_failure_diagnostic(
                     failed,
                     code=error.code,
                     message=error.message,
                     action_kind="deterministic_contradiction",
-                    reason=error.code,
-                    fallback_phase=str(
-                        failed.get("status") or "deterministic_contradiction"
-                    ),
                 )
                 failed.update(
                     {
@@ -2670,7 +2653,7 @@ def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
                 and not _ticket_invocation_is_gated(state, ticket_invocation)
                 and ticket_invocation.get("status") == "failed"
                 and ticket_invocation.get("error") in {
-                    "operator_stopped", "session_interrupted"
+                    "operator_stopped", "session_interrupted", "controller_interrupted"
                 }
             ):
                 ticket_invocation["status"] = "resuming"
@@ -2685,14 +2668,20 @@ def _restore_parallel_ticket_invocations(state: dict[str, Any]) -> None:
         if (
             isinstance(invocation, dict)
             and not _ticket_invocation_is_gated(state, invocation)
-            and invocation.get("status") == "failed"
-            and invocation.get("error") in {
-                "operator_stopped", "session_interrupted"
-            }
-            and invocation is not selected
+            and (
+                invocation.get("status") == "completed"
+                or (invocation.get("status") == "failed" and invocation.get("error") in {
+                    "operator_stopped", "session_interrupted", "controller_interrupted"
+                })
+            )
+            and not (
+                isinstance(selected, dict)
+                and invocation.get("work_subject") == selected.get("work_subject")
+                and invocation.get("started_at") == selected.get("started_at")
+            )
         ):
             state["active_agent_invocation"] = invocation
-            _restore_current_invocation_thread(state)
+            _restore_current_invocation_thread(state, allow_completed=True)
     state["active_agent_invocation"] = selected
 
 
@@ -3116,45 +3105,6 @@ def _operator_gate_binding(
     }
 
 
-def _operator_gate_diagnostic(
-    state: dict[str, Any],
-    *,
-    code: str,
-    message: str,
-    action_kind: str,
-    reason: str,
-    fallback_phase: str,
-    bind_to_current_change_job: bool = True,
-) -> dict[str, Any]:
-    diagnostic: dict[str, Any] = {
-        "code": code,
-        "message": bounded_error(message),
-    }
-    if not bind_to_current_change_job:
-        return diagnostic
-    try:
-        work_subject, subject, _container = current_change_job(state)
-    except RequeueError:
-        return diagnostic
-    if subject is None:
-        publication = state.get("run_publication")
-        acceptance = state.get("run_acceptance")
-        if isinstance(publication, dict) and (
-            state.get("status") in {"run_approval_pending", "publication_pending"}
-            or isinstance(acceptance, dict) and acceptance.get("phase") == "accepted"
-        ) and publication.get("phase") not in {"completed", "abandoned"}:
-            work_subject, subject = f"run-publication:{state['run_id']}", publication
-    if subject is not None:
-        diagnostic["operator_gate"] = _operator_gate_binding(
-            work_subject,
-            subject,
-            action_kind=action_kind,
-            reason=reason,
-            fallback_phase=fallback_phase,
-        )
-    return diagnostic
-
-
 def apply_resume_to_state(
     state: dict[str, Any], *, explicit_resume: bool,
     resume_human_blocker: bool, new_thread: bool,
@@ -3167,6 +3117,9 @@ def apply_resume_to_state(
         explicit_resume and ticket_number is None
         and is_ticket_execution_recovery(state, source_status)
     ):
+        # 公开生命周期已排除旧 Executor/Worker；在恢复 Thread 前收口
+        # 仍未结束的准确 Ticket 调用，不在共享故障报告时推定退出。
+        interrupt_exited_ticket_invocations(state, "controller_interrupted")
         # Executor recovery does not authorize consuming independent local gates.
         active = state.get("active_ticket_job")
         if not isinstance(active, dict) or active.get("phase") not in {

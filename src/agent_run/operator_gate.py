@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import supervision_window_matches
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 from agent_run.scope_changes import unsupported_scope_change_identity_is_consistent
@@ -52,6 +53,23 @@ _REQUEUE_GENERATION_KEY_BY_LOCATION = {
     "parent": "parent_generation",
     "run_repair": "repair_generation",
 }
+
+
+def run_failure_diagnostic(
+    state: dict[str, Any], *, code: str, message: str,
+    action_kind: str = "execution_failure",
+) -> dict[str, Any]:
+    """Bind shared failure evidence to the Run, independently of selection."""
+    return {
+        "code": code,
+        "message": bounded_error(message),
+        "operator_gate": {
+            "work_subject": f"run:{state['run_id']}",
+            "action_kind": action_kind,
+            "phase": "deterministic_contradiction" if action_kind == "deterministic_contradiction" else "execution_failed",
+            "reason": code,
+        },
+    }
 
 
 def operator_gate_subjects(
@@ -285,6 +303,8 @@ def operator_gate_identity_is_consistent(state: dict[str, Any]) -> bool:
     resolved = _work_subject(state, binding["work_subject"])
     if resolved is None:
         return False
+    if resolved[0] == "run":
+        return binding["phase"] == state.get("status")
     phase = resolved[1].get("phase")
     if phase is None:
         # A graph-selected Ticket has no Change Job phase until its first
@@ -302,6 +322,15 @@ def _local_gate_matches_top_status(
     status = state.get("status")
     location, subject = local
     phase = subject.get("phase")
+    binding = operator_gate_evidence(state)
+    if (
+        status in {"execution_failed", "deterministic_contradiction"}
+        and binding is not None
+        and binding["work_subject"] == f"run:{state.get('run_id')}"
+    ):
+        # A shared failure preserves every retained object gate, including
+        # Parent approval and human decisions; it adds a separate Run gate.
+        return True
     active = state.get("active_ticket_job")
     if (
         location.startswith("ticket:")
@@ -460,6 +489,13 @@ def has_mechanical_revision_restart(state: dict[str, Any]) -> bool:
 
 def _status_requires_operator_gate(state: dict[str, Any]) -> bool:
     status = state.get("status")
+    binding = operator_gate_evidence(state)
+    if (
+        status in {"execution_failed", "deterministic_contradiction"}
+        and binding is not None
+        and binding["work_subject"] == f"run:{state.get('run_id')}"
+    ):
+        return True
     if status != "requeue_required" and has_mechanical_revision_restart(state):
         return False
     if status in _OPERATOR_GATE_STATUSES:
@@ -694,6 +730,8 @@ def _work_subject(
         job = jobs.get(key) if isinstance(jobs, dict) else None
         return (f"ticket:{key}", job) if isinstance(job, dict) else None
     run_id = state.get("run_id")
+    if work_subject == f"run:{run_id}":
+        return "run", state
     if work_subject == f"parent-only:{run_id}":
         parent = state.get("parent_job")
         return ("parent", parent) if isinstance(parent, dict) else None

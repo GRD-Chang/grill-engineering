@@ -937,8 +937,9 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
             run_cli(git_repo, fixture, command, run_id, "--json")
         )
         assert json_view["operator_action"]["type"] == "Execution Failure"
-        assert json_view["operator_action"]["object"] == "Ticket #2"
-        assert json_view["operator_action"]["phase"] == "active"
+        assert json_view["operator_action"]["object"] == "Delivery Run（Parent Issue #1）"
+        assert json_view["operator_action"]["work_subject"] == f"run:{run_id}"
+        assert json_view["operator_action"]["phase"] == "execution_failed"
         assert json_view["operator_action"]["next_action"] == (
             "agent-run resume 1 --repo example/project"
         )

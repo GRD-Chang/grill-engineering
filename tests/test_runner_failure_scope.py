@@ -13,7 +13,8 @@ from agent_run import runner_credentials
 from agent_run.credential_lifecycle import ReadCredential
 from agent_run.github import GitHubReadError
 from agent_run.github_auth import GitHubCredentialError
-from agent_run.operator_gate import has_run_operator_gate, operator_gate_identity_is_consistent
+from agent_run.operator_gate import has_run_operator_gate, operator_gate_identity_is_consistent, run_failure_diagnostic
+from agent_run.operator_action_facts import operator_action_facts
 from agent_run.run_driver import DirectRunOperations, RunDriver
 from agent_run.runner_credentials import RunnerCredentialError, runner_credential_scope
 from agent_run.runner_transport import runner_environment
@@ -133,6 +134,31 @@ def test_only_confirmed_runner_gate_can_coexist_with_ticket_human_gate(reason: s
     }
     assert has_run_operator_gate(state)
     assert operator_gate_identity_is_consistent(state) is (reason == "runner_credential_failed")
+
+
+@pytest.mark.parametrize("reason", ["command_failed", "runner_credential_failed"])
+@pytest.mark.parametrize("local_reason", ["ticket_paused", "review_budget_exhausted", "agent_requires_human", "effective_revision_mismatch"])
+def test_explicit_run_failure_preserves_independent_local_gates(
+    reason: str, local_reason: str,
+) -> None:
+    paused = {"ticket_number": 3, "phase": "blocked", "blocked_reason": local_reason}
+    completed = {"ticket_number": 2, "phase": "completed"}
+    state = {
+        "run_id": "r1", "status": "execution_failed", "terminal_kind": "execution_failed",
+        "ticket_jobs": {"2": completed, "3": paused}, "active_ticket_job": completed,
+        "frontier": [], "ticket_integration_holder": None, "ticket_integration_queue": [],
+    }
+    state["diagnostics"] = [run_failure_diagnostic(state, code=reason, message="Shared failure")]
+    assert has_run_operator_gate(state)
+    assert operator_gate_identity_is_consistent(state)
+    expected = {("run:r1", "global")}
+    if local_reason != "effective_revision_mismatch":
+        expected.add(("ticket:3", "local"))
+    assert {(item["work_subject"], item["scope"]) for item in operator_action_facts(state)} == expected
+    state["active_ticket_job"] = paused
+    assert operator_gate_identity_is_consistent(state)
+    assert has_run_operator_gate(state)
+    assert {(item["work_subject"], item["scope"]) for item in operator_action_facts(state)} == expected
 
 
 def test_driver_records_runner_failure_with_explicit_shared_identity() -> None:

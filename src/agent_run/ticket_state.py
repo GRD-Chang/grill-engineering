@@ -437,8 +437,7 @@ class TicketState:
 
     def block_shared_failure(self, error: Exception) -> None:
         """Fence the Run before other lanes can commit after proven auth loss."""
-        from agent_run.agent_invocation import fail_interrupted_invocation
-        from agent_run.controller import _operator_gate_diagnostic
+        from agent_run.operator_gate import run_failure_diagnostic
 
         def commit() -> None:
             latest = self._load_owned_run(self.run_id)
@@ -446,23 +445,10 @@ class TicketState:
                 raise ValueError("Delivery Run disappeared during credential failure")
             if latest.get("status") in RUN_STOP_STATUSES or latest.get("terminal_kind") == "permanent_blocked":
                 return
-            number = str(self.ticket_number)
-            job = latest["ticket_jobs"].get(number)
-            if _execution_job(job) != _execution_job(self._last_job):
-                raise TaskControlBusyError("Ticket changed before credential failure")
-            latest["active_ticket_job"] = job
-            latest["active_agent_invocation"] = latest["ticket_agent_invocations"].get(number)
-            invocation = latest["active_agent_invocation"]
-            if isinstance(invocation, dict):
-                fail_interrupted_invocation(
-                    latest, role=str(invocation["role"]), save=lambda _: None,
-                )
             latest.update({
                 "status": "execution_failed", "terminal_kind": "execution_failed",
-                "diagnostics": [_operator_gate_diagnostic(
+                "diagnostics": [run_failure_diagnostic(
                     latest, code="runner_credential_failed", message=str(error),
-                    action_kind="execution_failure", reason="runner_credential_failed",
-                    fallback_phase="active",
                 )],
             })
             self.states._save_run_and_notify_unlocked(self.run_id, latest)

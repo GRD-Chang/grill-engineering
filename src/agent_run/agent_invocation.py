@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 from typing import Any, Callable
 
-from agent_run.requeue import RequeueError, current_change_job
+from agent_run.operator_gate import run_failure_diagnostic
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
 from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.resume_audit import bind_resume_to_successor
@@ -361,11 +361,11 @@ def record_session_interruption(
         )
         state["active_agent_invocation"] = failed
         _sync_invocation_history(state, failed)
-    _interrupt_ticket_invocations(state, "session_interrupted")
-    diagnostic: dict[str, Any] = {
-        "code": "session_interrupted",
-        "message": "Executor Session 已退出；保留现场并等待显式 Resume",
-    }
+    interrupt_exited_ticket_invocations(state, "session_interrupted")
+    diagnostic = run_failure_diagnostic(
+        state, code="session_interrupted",
+        message="Executor Session 已退出；保留现场并等待显式 Resume",
+    )
     receipt = state.get("action_application_receipt")
     if (
         isinstance(receipt, dict)
@@ -375,30 +375,6 @@ def record_session_interruption(
         diagnostic["action_identity"] = {
             "action_id": receipt["action_id"],
             "executor_generation": receipt["executor_generation"],
-        }
-    try:
-        work_subject, subject, _container = current_change_job(state)
-    except RequeueError:
-        subject = None
-    if subject is not None and subject.get("phase") in {"completed", "abandoned"}:
-        # The selected Ticket may have finished while a sibling was working.
-        # Never bind a new failure gate to that immutable completion.
-        subject = None
-        for number, job in state.get("ticket_jobs", {}).items():
-            if job.get("phase") not in {"completed", "abandoned"}:
-                work_subject, subject = f"ticket:{number}", job
-                break
-    if subject is not None:
-        phase = subject.get("phase")
-        diagnostic["operator_gate"] = {
-            "work_subject": work_subject,
-            "action_kind": "execution_failure",
-            "phase": (
-                phase
-                if isinstance(phase, str) and phase
-                else "active"
-            ),
-            "reason": "session_interrupted",
         }
     state.update(
         {
@@ -436,7 +412,7 @@ def record_operator_stop(
         )
         state["active_agent_invocation"] = failed
         _sync_invocation_history(state, failed)
-    _interrupt_ticket_invocations(state, "operator_stopped")
+    interrupt_exited_ticket_invocations(state, "operator_stopped")
     state.update(
         {
             "status": "operator_stopped",
@@ -452,8 +428,8 @@ def record_operator_stop(
     save(state)
 
 
-def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
-    # Called only after the Executor's exit/stop has been established.
+def interrupt_exited_ticket_invocations(state: dict[str, Any], reason: str) -> None:
+    """在已确认旧执行退出后收口实际调用，保留 Run 故障及对象成果。"""
     from agent_run.ticket_work import release_exited_executor_leases
 
     release_exited_executor_leases(state)
@@ -463,6 +439,8 @@ def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
     for number, active in list(invocations.items()):
         if not isinstance(active, dict) or active.get("status") not in {"running", "resuming"}:
             continue
+        if state.get("ticket_jobs", {}).get(number, {}).get("phase") == "completed":
+            continue
         failed = dict(active)
         failed.update({
             "status": "failed",
@@ -471,6 +449,14 @@ def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
         })
         invocations[number] = failed
         _sync_invocation_history(state, failed)
+        selected = state.get("active_agent_invocation")
+        if (
+            isinstance(selected, dict)
+            and selected.get("status") in {"running", "resuming", "failed"}
+            and selected.get("work_subject") == active.get("work_subject")
+            and selected.get("started_at") == active.get("started_at")
+        ):
+            state["active_agent_invocation"] = failed
 
 
 def restore_operator_stop(state: dict[str, Any]) -> None:
