@@ -8,6 +8,7 @@ import pytest
 
 from agent_run.github import GitHubReadError
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
+from support.state_commits import observe_run_commits
 
 
 @pytest.mark.parametrize("observation", [
@@ -165,7 +166,6 @@ def test_final_create_restart_uses_public_resume_and_never_repeats_completed_wri
         return number
 
     monkeypatch.setattr(publisher, "ensure_run_pr", create)
-    original_save = states._save_run_unlocked
     failed = False
 
     def save(identifier: str, current: dict[str, Any]) -> None:
@@ -173,9 +173,8 @@ def test_final_create_restart_uses_public_resume_and_never_repeats_completed_wri
         if fault == "result_save" and created and not failed and "write_intent" not in current["run_publication"]:
             failed = True
             raise OSError("Final create result checkpoint lost")
-        original_save(identifier, current)
 
-    monkeypatch.setattr(states, "_save_run_unlocked", save)
+    observe_run_commits(monkeypatch, states, before=save)
     waiting = RunPublicationEngine(
         git=git, states=states, agents=agents, github=publisher,
         default_branch="main", default_head_sha=git.resolve("main"),

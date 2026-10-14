@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_run.agents import AgentBackend
 from agent_run.approval_grant import create_grant, grant_matches
@@ -28,6 +28,7 @@ from agent_run.delivery_policy import (
 )
 from agent_run.resume_materials import require_change_checkout
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.review_budget import new_budget, reset_budget
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
@@ -49,11 +50,21 @@ class ParentDeliveryEngine:
         agents: AgentBackend,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.github = github
         self.agents = agents
 
     def deliver(self, run_id: str) -> dict[str, Any]:
+        self._deliver(run_id)
+        return self._control_result(run_id)
+
+    def _control_result(self, run_id: str) -> dict[str, Any]:
+        state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        return state
+
+    def _deliver(self, run_id: str) -> dict[str, Any]:
         state = self._load(run_id)
         if state.get("status") in {
             "abandoned",
@@ -126,7 +137,7 @@ class ParentDeliveryEngine:
         state = self._load(run_id)
         job = _mapping(state, "parent_job")
         if job.get("phase") == "completed":
-            return state
+            return self._control_result(run_id)
         if job.get("phase") not in {"ready_for_approval", "merging"}:
             raise ValueError("Parent-only delivery is not awaiting approval")
         if state.get("status") == "unsupported_scope_change":
@@ -161,7 +172,7 @@ class ParentDeliveryEngine:
         state = self._load(run_id)
         job = _mapping(state, "parent_job")
         if job.get("phase") != "merging":
-            return state
+            return self._control_result(run_id)
         if prepare_state is not None:
             prepare_state(state)
             self._save(state)
@@ -171,9 +182,9 @@ class ParentDeliveryEngine:
         state = self._load(run_id)
         job = _mapping(state, "parent_job")
         if job.get("phase") == "completed":
-            return state
+            return self._control_result(run_id)
         if job.get("phase") == "abandoned":
-            return state
+            return self._control_result(run_id)
         if not discard_worktree:
             require_clean_run_worktrees(self.git, self.states, run_id)
         abandonment = state.get("run_abandonment")
@@ -220,10 +231,14 @@ class ParentDeliveryEngine:
                 "diagnostics": [],
             }
         )
-        return self._save(state)
+        self._save(state)
+        return self._control_result(run_id)
 
     def retire_for_child_flow(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_current_run(run_id)
+        # Retirement owns the archive in addition to the current Parent Job;
+        # ordinary Parent stage commits deliberately exclude archived owners.
+        retirement_states = object_store(self.states)
+        state = retirement_states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         job = state.get("parent_job")
@@ -235,7 +250,7 @@ class ParentDeliveryEngine:
         job["phase"] = "abandoned_for_structure_change"
         state["retired_parent_job"] = dict(job)
         state.pop("parent_job", None)
-        self._save(state)
+        retirement_states.save_run(run_id, state)
         return state
 
     def _load(self, run_id: str) -> dict[str, Any]:

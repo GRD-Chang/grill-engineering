@@ -103,8 +103,10 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
     assert job["ticket_closed_by_run"] is True
     assert job["development_thread_id"] == successor_thread
     assert job["review_budget"]["development_attempts"] == 1
+    history = states.load_current_run(run_id)
+    assert history is not None
     successor = [
-        item for item in result["agent_invocation_history"]
+        item for item in history["agent_invocation_history"]
         if item["work_subject"] == "ticket:3" and item["role"] == "development"
     ]
     assert ("returned_result" in pending) is target_completed

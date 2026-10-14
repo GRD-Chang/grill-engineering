@@ -29,6 +29,7 @@ from agent_run.git import GitError, GitRepository
 from agent_run.github import MergeOutcomeUnknownError
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.review_budget import ensure_budget
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
 from agent_run.parent_integration import parent_integration_record_is_valid
@@ -437,7 +438,7 @@ class ParentDeliveryLoop:
         agents: AgentBackend,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.github = github
         self.agents = agents
         self.adapter = ParentDeliveryAdapter(git, github)
@@ -451,6 +452,7 @@ class ParentDeliveryLoop:
     def _engine(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> ChangeDeliveryEngine:
+        self.states.load_current_run(str(state["run_id"]))
         return ChangeDeliveryEngine(
             git=self.git,
             github=self.github,

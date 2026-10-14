@@ -21,6 +21,7 @@ from agent_run.external_supervision import (
 )
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.object_state import object_store
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_publication_update import reconcile_publication_update, wait_for_merge_readback
 
@@ -300,6 +301,9 @@ class RunPublicationApproval(RunPublicationShared):
         return self._save(state)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
+        # Run-level abandonment owns every current Ticket obligation, unlike
+        # the ready Parent's development/review/publication stage commits.
+        self.states = object_store(self.states)
         state = self._load(run_id)
         if state.get("status") in {"completed", "abandoned"}:
             return state

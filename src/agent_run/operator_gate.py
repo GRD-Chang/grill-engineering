@@ -180,6 +180,9 @@ def _iter_operator_gate_subjects(
 def _iter_local_operator_gate_subjects(
     state: dict[str, Any],
 ) -> Iterator[tuple[str, dict[str, Any]]]:
+    if state.get("status") == "abandoned":
+        # Retained owner records describe discarded work, not current actions.
+        return
     seen: set[str] = set()
     active = state.get("active_ticket_job")
     if isinstance(active, dict) and _subject_requires_operator(active):
@@ -334,6 +337,13 @@ def _local_gate_matches_top_status(
         resolved = _work_subject(state, evidence["work_subject"]) if evidence else None
         return bool(evidence and evidence["reason"] == "runner_credential_failed"
                     and resolved is not None and resolved[0] == location)
+    if status == "deterministic_contradiction" and phase == "ready_for_approval":
+        # A proven authority contradiction pauses the retained approval object.
+        # It cannot become an approval action merely because its phase is kept.
+        evidence = operator_gate_evidence(state)
+        resolved = _work_subject(state, evidence["work_subject"]) if evidence else None
+        return bool(evidence and evidence["action_kind"] == "deterministic_contradiction"
+                    and resolved is not None and resolved[0] == location)
     if status == "ready_for_human":
         return phase in {"blocked", "ready_for_human"}
     if status == "blocked":
@@ -345,10 +355,9 @@ def _local_gate_matches_top_status(
     if status == "run_approval_pending":
         return location == "run_publication" and phase == "ready_for_approval"
     if status == "unsupported_scope_change":
-        # A newly observed graph contradiction invalidates an approval that was
-        # current under the accepted graph.  The retained owner is still the
-        # accurate Work Subject and preserves its accepted Candidate/PR.
-        return phase == "ready_for_approval"
+        # The independently validated global scope gate stops all work without
+        # consuming retained local blockers, publication failures or approvals.
+        return phase in _OPERATOR_GATE_PHASES
     return False
 
 

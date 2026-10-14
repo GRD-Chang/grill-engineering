@@ -370,6 +370,10 @@ _SUPPORTING_IDENTITY_GROUPS = {
         "merge_commit_sha",
     },
 }
+_SUPPORTING_KEY_GROUPS = {
+    key: tuple(group for group, keys in _SUPPORTING_IDENTITY_GROUPS.items() if key in keys)
+    for keys in _SUPPORTING_IDENTITY_GROUPS.values() for key in keys
+}
 
 _SUPPORTING_SCOPE_KEYS = {
     "base_sha",
@@ -429,9 +433,8 @@ def _supporting_identity_bundle(
     for key, item in value.items():
         if key in {"attempt_id", "semantic_attempt_id"}:
             bundle["attempt"].update(_supporting_scalar_values(item))
-        for group, keys in _SUPPORTING_IDENTITY_GROUPS.items():
-            if key in keys:
-                bundle[group].update(_supporting_scalar_values(item))
+        for group in _SUPPORTING_KEY_GROUPS.get(key, ()):
+            bundle[group].update(_supporting_scalar_values(item))
         if key == "head_sha":
             bundle[default_head_group].update(_supporting_scalar_values(item))
         elif key in _SUPPORTING_SCOPE_KEYS:

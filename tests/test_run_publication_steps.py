@@ -69,19 +69,20 @@ def test_final_publication_artifact_and_attempt_survive_same_persistence_boundar
         default_branch="main", default_head_sha=git.resolve("main"),
     )
     run_id = str(state["run_id"])
-    save = states.save_run
+    after_saved = states._after_run_saved
 
-    def interrupt_after_artifact(at_run_id: str, value: dict[str, Any]) -> None:
-        save(at_run_id, value)
+    def interrupt_after_artifact() -> None:
+        value = states.load_current_run(run_id)
+        assert value is not None
         publication = value.get("run_publication", {})
         history = publication.get("semantic_attempt_history", [])
         if history and history[-1].get("outcome") == "publication_artifact":
             raise KeyboardInterrupt("controller disappeared after attempt completion")
 
-    monkeypatch.setattr(states, "save_run", interrupt_after_artifact)
+    monkeypatch.setattr(states, "_after_run_saved", interrupt_after_artifact)
     with pytest.raises(KeyboardInterrupt):
         engine.advance(run_id, allow_agent=True)
-    monkeypatch.setattr(states, "save_run", save)
+    monkeypatch.setattr(states, "_after_run_saved", after_saved)
     persisted = states.load_current_run(run_id)
     assert persisted is not None
     assert persisted["run_publication"]["artifact"]

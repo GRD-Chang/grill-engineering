@@ -9,13 +9,13 @@ from agent_run.sqlite_encoding import encode_json, object_path, scalar_value
 from agent_run.sqlite_job_history import FIELD, attempt_row
 
 if TYPE_CHECKING:
-    from agent_run.sqlite_objects import DecodeContext
+    from agent_run.sqlite_work_objects import DecodeContext
     from agent_run.sqlite_state import SQLiteStateRepository
 
 
 def archive_rows(repository: SQLiteStateRepository, connection: sqlite3.Connection, run_id: str,
                  paths: list[str]) -> list[tuple[str, str, str]]:
-    from agent_run.sqlite_objects import _sql_rows
+    from agent_run.sqlite_work_objects import _sql_rows
 
     rows = []
     for path in paths:
@@ -34,7 +34,7 @@ def archive_rows(repository: SQLiteStateRepository, connection: sqlite3.Connecti
 def read_related(repository: SQLiteStateRepository, connection: sqlite3.Connection, run_id: str,
                  state: Mapping[str, Any], archives: Mapping[str, tuple[int, int]], context: DecodeContext,
                  ) -> dict[str, dict[str, Any]]:
-    from agent_run.sqlite_objects import _object_rows, _prefetch_materials
+    from agent_run.sqlite_work_objects import _object_rows, _prefetch_materials
 
     owners = [(('active_ticket_job',), state.get("active_ticket_job"))] + [
         (("ticket_jobs", key), value) for key, value in state.get("ticket_jobs", {}).items()]
@@ -63,10 +63,12 @@ def decode_related(repository: SQLiteStateRepository, connection: sqlite3.Connec
                    rows: list[tuple[str, str, str]], metadata: list[tuple[Any, ...]],
                    archives: Mapping[str, tuple[int, int]], context: DecodeContext,
                    ) -> dict[str, dict[str, Any]]:
-    from agent_run.sqlite_objects import _decode, _HISTORY, _HROOT
+    from agent_run.sqlite_work_objects import _decode, _HISTORY, _HROOT
 
     if len(rows) != len(metadata) or {row[0] for row in rows} != {row[0] for row in metadata}:
         raise ValueError("Missing SQLite Run related Job Attempt")
+    if not metadata:
+        return {}
     by_path = {row[0]: row for row in rows}
     ordered = [by_path[row[0]] for row in metadata]
     local = [(encode_json((_HISTORY, position)), kind, encoded)

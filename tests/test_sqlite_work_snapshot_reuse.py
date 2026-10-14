@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from agent_run import sqlite_objects
+from agent_run import sqlite_work_objects as sqlite_objects
 from agent_run.sqlite_state import SQLiteStateRepository
 
 

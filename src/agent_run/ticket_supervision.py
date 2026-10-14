@@ -79,7 +79,7 @@ def supervise_ticket(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset
 
 
 def _supervise_loaded(engine: TicketDeliveryEngine, run_id: str, lanes: frozenset[int]) -> bool:
-    state = engine.states.load_work_run(run_id)
+    state = engine.states.load_work_run(run_id, thin_timeline=True)
     if state is None or state.get("status") in RUN_STOP_STATUSES:
         return False
     number = state["ticket_integration_holder"]

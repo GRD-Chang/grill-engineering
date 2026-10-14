@@ -63,11 +63,24 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
         assert result["status"] == "run_approval_pending"
         assert len(agents.requests) == 1
         reviewer = Reviewer()
-        reused = RunAcceptanceEngine(
-            git=git, states=reloaded_states, agents=reviewer, github=publisher,
-        ).accept(run_id)
-        assert reused["run_acceptance"]["acceptance_record"] == original
-        assert reviewer.requests == []
+        publication = deepcopy(result["run_publication"])
+        budget = deepcopy(result["run_acceptance"]["review_budget"])
+        attempts = deepcopy(result["run_acceptance"]["semantic_attempt_history"])
+        invocations = deepcopy(result["agent_invocation_history"])
+        for _ in range(2):
+            reopened = StateStore(states.root)
+            reused = RunAcceptanceEngine(
+                git=git, states=reopened, agents=reviewer, github=publisher,
+            ).accept(run_id)
+            assert reused["status"] == "run_approval_pending"
+            assert reused["run_publication"] == publication
+            assert reused["run_acceptance"]["acceptance_record"] == original
+            assert reused["run_acceptance"]["review_budget"] == budget
+            assert reused["run_acceptance"]["semantic_attempt_history"] == attempts
+            assert reused["agent_invocation_history"] == invocations
+            assert reviewer.requests == []
+            assert len(agents.requests) == 1
+            assert reopened.load_current_run(run_id)["status"] == "run_approval_pending"
     else:
         assert result["status"] == "run_acceptance_pending"
         assert agents.requests == []
@@ -128,3 +141,24 @@ def test_candidate_promotion_proves_actual_result_and_preserves_original_review(
     assert evidence.promotion_record(state, job, candidate) is None
     assert job["acceptance_record"] == original
     assert job["candidate_acceptance_history"][0]["outcome"] == "accepted"
+
+
+def test_completed_acceptance_resumes_pending_publication_handoff(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    run_id = str(state["run_id"])
+    accepted = deepcopy(state["run_acceptance"])
+    # The accepted review is durable before its outer Run handoff is saved.
+    state.update(status="run_acceptance_pending", terminal_kind="run_acceptance_pending")
+    states.save_run(run_id, state)
+    reviewer = Reviewer()
+    reopened = StateStore(states.root)
+    result = RunAcceptanceEngine(
+        git=git, states=reopened, agents=reviewer, github=publisher,
+    ).accept(run_id)
+    assert result["status"] == "run_publication_pending"
+    assert result["terminal_kind"] == "run_acceptance_passed"
+    assert result["run_acceptance"]["acceptance_record"] == accepted["acceptance_record"]
+    assert result["run_acceptance"]["review_budget"] == accepted["review_budget"]
+    assert result["run_acceptance"]["semantic_attempt_history"] == accepted["semantic_attempt_history"]
+    assert reviewer.requests == []
+    assert reopened.load_current_run(run_id)["status"] == "run_publication_pending"

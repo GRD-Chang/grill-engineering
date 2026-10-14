@@ -9,6 +9,8 @@ import pytest
 
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
 
+pytest_plugins = ("support.sharding",)
+
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     # Work stealing initially gives each worker a contiguous part of the

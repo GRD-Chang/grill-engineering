@@ -104,7 +104,8 @@ def test_parent_repair_successful_push_survives_local_save_failure(
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     agents = ScriptedRunAgents()
-    original_save = states.save_run
+    engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    original_save = engine.states.save_run
     interrupted = False
 
     def failing_save(run_id: str, current: dict[str, Any]) -> Any:
@@ -115,8 +116,7 @@ def test_parent_repair_successful_push_survives_local_save_failure(
             raise OSError("local StateStore save failed after push")
         return original_save(run_id, current)
 
-    monkeypatch.setattr(states, "save_run", failing_save)
-    engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    monkeypatch.setattr(engine.states, "save_run", failing_save)
     with pytest.raises(OSError, match="local StateStore save failed"):
         engine.accept(str(state["run_id"]))
     loaded = states.load_current_run(str(state["run_id"]))

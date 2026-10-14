@@ -84,6 +84,7 @@ from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
+from agent_run.object_state import object_store
 from agent_run.state import ConcurrentRunStateError, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -119,7 +120,7 @@ class Controller:
         delivery_policy_provider: Callable[[], DeliveryPolicy] | None = None,
     ) -> None:
         self.github = github
-        self.states = states
+        self.states = object_store(states)
         self.checkout = git.root
         self.publisher = Publisher(git)
         self.locator = locator
@@ -1007,7 +1008,8 @@ class Controller:
         return waiting
 
     def _load_run(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_run(run_id)
+        loader = getattr(self.states, "load_scheduler_run", self.states.load_run)
+        state = loader(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         require_current_run_state(state)
@@ -1250,6 +1252,7 @@ class Controller:
         ):
             external = None
         if external is not None:
+            _pause_currentness_job(job, external)
             job.pop("approval_grant", None)
             state.update(
                 {
@@ -1271,6 +1274,7 @@ class Controller:
             )
             return
         if candidate_or_acceptance_is_inconsistent(job, budget_owner=delivery_budget_owner(state, job)):
+            _pause_currentness_job(job, "candidate_or_acceptance_inconsistent")
             job.pop("approval_grant", None)
             state.update(
                 {
@@ -1297,6 +1301,21 @@ class Controller:
         ) in {"effective_revision_mismatch", "merged_revision_mismatch"}:
             reason = "ticket_requirements_changed"
         if reason is None:
+            if job.get("blocked_reason") in {
+                "change_pr_head_changed_externally", "change_pr_base_changed_externally",
+                "change_pr_closed_or_merged_externally", "change_pr_base_unknown",
+                "candidate_or_acceptance_inconsistent",
+            }:
+                # Explicit continuation still owns the permission decision.
+                # Restored external facts no longer need the currentness gate.
+                job["phase"] = continuation_phase("change", job)
+                job.pop("blocked_reason", None)
+                job.pop("pause_resume_phase", None)
+                if subject.startswith("parent-only:"):
+                    from agent_run.run_orchestration import parent_stage_state
+                    state.update(parent_stage_state(state, parent_only=True))
+                elif subject.startswith("ticket:"):
+                    sync_active_ticket_job(state)
             return
         if subject.startswith("run-repair:"):
             job.pop("approval_grant", None)
@@ -1538,7 +1557,7 @@ class Controller:
                 return state, True
             self._initialize_direct_profile(state)
         else:
-            state = existing
+            state = self._load_run(str(existing["run_id"]))
             require_current_run_state(state)
             self._require_current_checkout(state)
             run_id = str(state["run_id"])
@@ -1650,6 +1669,13 @@ def _run_id(
     identity = f"{repository}\0{parent_number}\0{base_sha}\0{checkout.resolve()}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:16]
     return f"run-{parent_number}-{suffix}"
+
+
+def _pause_currentness_job(job: dict[str, Any], reason: str) -> None:
+    if job.get("phase") != "blocked":
+        job["pause_resume_phase"] = job["phase"]
+    job["phase"] = "blocked"
+    job["blocked_reason"] = reason
 
 
 def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:
@@ -3110,6 +3136,14 @@ def _operator_gate_diagnostic(
         work_subject, subject, _container = current_change_job(state)
     except RequeueError:
         return diagnostic
+    if subject is None:
+        publication = state.get("run_publication")
+        acceptance = state.get("run_acceptance")
+        if isinstance(publication, dict) and (
+            state.get("status") in {"run_approval_pending", "publication_pending"}
+            or isinstance(acceptance, dict) and acceptance.get("phase") == "accepted"
+        ) and publication.get("phase") not in {"completed", "abandoned"}:
+            work_subject, subject = f"run-publication:{state['run_id']}", publication
     if subject is not None:
         diagnostic["operator_gate"] = _operator_gate_binding(
             work_subject,

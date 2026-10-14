@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent_run.sqlite_encoding import copy_json_tree
+from agent_run.sqlite_mutations import _same
 from agent_run import sqlite_timeline
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state import _append_timeline_event, _sanitize_durable_errors
@@ -27,18 +28,39 @@ def save_work(
 
     reconcile(state)
     durable = dict(state)
+    redacted: dict[str, str] = {}
+    key_kinds: dict[str, tuple[bool, bool, bool]] = {}
+
+    def sanitize(value: dict[str, Any]) -> dict[str, Any]:
+        # Current-object and canonical projections can contain the same text
+        # and protocol keys. Share only this save's bounded pure scan results;
+        # every container, diagnostic and path-specific identity is checked.
+        return _sanitize_durable_errors(value, redacted=redacted, key_kinds=key_kinds)
+
+    def sanitize_object(value: Any, previous: Any) -> Any:
+        if not isinstance(value, dict) or not isinstance(previous, dict):
+            return sanitize({"value": value})["value"]
+        # The transaction already read and validated the durable baseline.
+        # Preserve exactly unchanged fields, just as unchanged root objects
+        # above are preserved. New/changed fields still traverse the original
+        # sanitizer at the same path, including credential-key exceptions.
+        changed = {key: item for key, item in value.items()
+                   if key not in previous or not _same(item, previous[key])}
+        return {**{key: item for key, item in value.items() if key not in changed},
+                **sanitize({"value": changed})["value"]}
+
     for key, value in state.items():
         if value == baseline.get(key) and key in baseline:
             continue
         if key in {"ticket_jobs", "ticket_agent_invocations"}:
             previous = baseline.get(key, {})
             durable[key] = {
-                identity: (_sanitize_durable_errors({"value": item})["value"]
+                identity: (sanitize_object(item, previous.get(identity))
                            if item != previous.get(identity) else item)
                 for identity, item in value.items()
             }
         else:
-            durable[key] = _sanitize_durable_errors({key: value})[key]
+            durable[key] = sanitize({key: value})[key]
     # Timeline uses the actual committing Ticket, irrespective of selection.
     # Appending/trimming changes the list, never an existing event. Detach the
     # list without copying every old event before adding the new marker.

@@ -95,15 +95,15 @@ def test_run_repair_hook_failure_reloads_and_resumes_same_work(
             return DevelopmentResult("run-repair-developer", "Fixed integration hook")
 
     agents = HookAgents()
-    save_run = states.save_run
 
-    def interrupt_after_acceptance(run_id: str, value: dict[str, Any]) -> None:
-        save_run(run_id, value)
+    def interrupt_after_acceptance() -> None:
+        value = states.load_current_run(run_id)
+        assert value is not None
         if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
             raise OSError("interrupt before Run Branch update")
 
     with monkeypatch.context() as interruption:
-        interruption.setattr(states, "save_run", interrupt_after_acceptance)
+        interruption.setattr(states, "_after_run_saved", interrupt_after_acceptance)
         with pytest.raises(OSError, match="interrupt before Run Branch update"):
             RunAcceptanceEngine(
                 git=git, states=states, agents=agents,

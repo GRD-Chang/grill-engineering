@@ -320,7 +320,8 @@ def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(
     ticket_engine(controller.publisher.git, controller.states, fixture,
                   TicketAgents(fixture.parent, (2, 3), fail_sibling),
                   development_only=True).deliver_ticket(payload['run_id'], 3)
-    state = controller.states.load_current_run(payload['run_id'])
+    # 两个当前 Job 的准备属于显式调度查询，日常目标投影不读取无关暂停票。
+    state = controller.states.load_scheduler_current_run(payload['run_id'])
     job = state['ticket_jobs']['2']
     job['blocked_reason'] = 'unclassified_worker_failure'
     state['active_ticket_job'] = job
@@ -336,6 +337,8 @@ def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(
     from agent_run.state_contract import require_current_run_state
     require_current_run_state(resumed)
     assert resumed['ticket_jobs']['3'] == before['ticket_jobs']['3']
+    persisted = StateStore(controller.states.root).load_current_run(payload['run_id'])
+    assert persisted['ticket_jobs']['3'] == before['ticket_jobs']['3']
     assert resumed['ticket_jobs']['2']['pending_semantic_attempt'] == before['ticket_jobs']['2']['pending_semantic_attempt']
     assert resumed['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
     duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
@@ -353,4 +356,5 @@ def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(
     assert calls == [2]
     assert result['ticket_jobs']['2']['pending_semantic_attempt']['attempt_id'] == before['ticket_jobs']['2']['pending_semantic_attempt']['attempt_id']
     assert result['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
-    assert result['ticket_jobs']['3'] == before['ticket_jobs']['3']
+    persisted = StateStore(controller.states.root).load_current_run(payload['run_id'])
+    assert persisted['ticket_jobs']['3'] == before['ticket_jobs']['3']

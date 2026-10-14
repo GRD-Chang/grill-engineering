@@ -32,9 +32,22 @@ def histories(state: Mapping[str, Any]) -> dict[str, Any]:
     return values
 
 
-def sizes(state: Mapping[str, Any]) -> dict[str, tuple[int, int]]:
-    return {path: (len(encode_json(value).encode("utf-8")), len(value) if isinstance(value, list) else -1)
-            for path, value in histories(state).items()}
+def sizes(state: Mapping[str, Any], *,
+          snapshot_encodings: Mapping[tuple[str | int, ...], str] | None = None) -> dict[str, tuple[int, int]]:
+    """Size restored archives, reusing only proved unmodified encodings."""
+    encodings = snapshot_encodings or {}
+    result = {}
+    for encoded, value in histories(state).items():
+        path = object_path(encoded)
+        if path in encodings:
+            size = len(encodings[path].encode("utf-8"))
+        elif isinstance(value, list) and all((*path, index) in encodings for index in range(len(value))):
+            size = 2 + max(len(value) - 1, 0) + sum(
+                len(encodings[(*path, index)].encode("utf-8")) for index in range(len(value)))
+        else:
+            size = len(encode_json(value).encode("utf-8"))
+        result[encoded] = size, len(value) if isinstance(value, list) else -1
+    return result
 
 
 def decode_sizes(rows: Iterable[tuple[Any, ...]], limit: int) -> dict[str, tuple[int, int]]:
@@ -64,8 +77,9 @@ def read_sizes(connection: sqlite3.Connection, run_id: str, limit: int) -> dict[
     return decode_sizes(rows, limit)
 
 
-def check_selected(state: Mapping[str, Any], indexed: Mapping[str, tuple[int, int]]) -> None:
-    if any(indexed.get(path) != size for path, size in sizes(state).items()):
+def check_selected(state: Mapping[str, Any], indexed: Mapping[str, tuple[int, int]], *,
+                   snapshot_encodings: Mapping[tuple[str | int, ...], str] | None = None) -> None:
+    if any(indexed.get(path) != size for path, size in sizes(state, snapshot_encodings=snapshot_encodings).items()):
         raise ValueError("Invalid SQLite Run Job history size")
 
 

@@ -2,12 +2,27 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
+
+_DATETIME = datetime
+
+
+@lru_cache(maxsize=2048)
+def _cached_timestamp(value: str) -> datetime:
+    return _DATETIME.fromisoformat(value)
+
+
+def _timestamp(value: str) -> datetime:
+    # Datetimes are immutable; only exact bounded text is retained. Test or
+    # host-supplied datetime implementations keep their ordinary parse path.
+    return (_cached_timestamp(value) if datetime is _DATETIME and type(value) is str and len(value) <= 128
+            else datetime.fromisoformat(value))
 
 
 def _time(value: object) -> datetime | None:
     try:
-        parsed = datetime.fromisoformat(str(value))
+        parsed = _timestamp(str(value))
         return parsed if parsed.tzinfo else None
     except ValueError:
         return None
@@ -232,7 +247,7 @@ def invocation_activity(
 
 
 def parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
+    parsed = _timestamp(value)
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
 

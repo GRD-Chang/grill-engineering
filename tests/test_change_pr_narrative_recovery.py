@@ -11,6 +11,7 @@ from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
+from support.state_commits import observe_run_commits
 
 
 def _mock_pr_readback(publisher: GhGitHubPublisher, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,8 +188,6 @@ def test_public_resume_preserves_change_pr_intent_until_narrative_is_known(
         return number
 
     monkeypatch.setattr(publisher, "ensure_change_pr" if parent_only else "ensure_ticket_pr", interrupt)
-    save_method = "_save_run_unlocked" if parent_only else "_save_work_and_notify_unlocked"
-    original_save = getattr(states, save_method)
     injected = False
 
     def save(identifier: str, current: dict[str, Any], *args: Any, **kwargs: Any) -> None:
@@ -197,9 +196,8 @@ def test_public_resume_preserves_change_pr_intent_until_narrative_is_known(
         if applied and fault == "result_save" and not injected and "ticket_write_intent" not in job:
             injected = True
             raise OSError("Change PR result save lost")
-        original_save(identifier, current, *args, **kwargs)
 
-    monkeypatch.setattr(states, save_method, save)
+    observe_run_commits(monkeypatch, states, before=save)
     if parent_only:
         with pytest.raises((RuntimeError, OSError), match="(response|save) lost"):
             engine_type(git=git, states=states, github=publisher, agents=agents).deliver(run_id)

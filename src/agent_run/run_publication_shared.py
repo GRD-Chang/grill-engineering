@@ -30,6 +30,7 @@ from agent_run.run_currentness import (
     ticket_completion_records,
 )
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.publication_operation_retry import (
     record_publication_operation_failure,
 )
@@ -62,7 +63,7 @@ class RunPublicationShared:
         currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.agents = agents
         self.github = github
         self.default_branch = default_branch
@@ -612,6 +613,7 @@ class RunPublicationShared:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        state.update(self.states.load_delivery_evidence(run_id))  # type: ignore[attr-defined]
         return state
 
     @staticmethod

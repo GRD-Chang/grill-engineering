@@ -191,6 +191,7 @@ def test_driver_applies_stop_control_before_automatic_progress() -> None:
 def test_driver_persists_backoff_before_sleep_and_a_restart_uses_it(tmp_path) -> None:
     state: dict[str, object] = {"run_id": "run-1", "status": "waiting_external"}
     states = StateStore(tmp_path)
+    states.save_run("run-1", state)
     now = [0.0]
     sleeps: list[float] = []
 
@@ -299,6 +300,7 @@ def test_driver_records_failure_when_progress_identity_does_not_change(tmp_path)
 def test_driver_does_not_apply_no_progress_guard_to_external_waits(tmp_path) -> None:
     state: dict[str, object] = {"run_id": "run-1", "status": "waiting_external"}
     states = StateStore(tmp_path)
+    states.save_run("run-1", state)
     retries = 0
 
     class Controller:

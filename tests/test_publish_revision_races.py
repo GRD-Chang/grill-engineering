@@ -10,6 +10,8 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.operator_action_facts import operator_action_facts
+from agent_run.state_contract import require_current_run_state
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
@@ -562,11 +564,23 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     fixture.write_text(json.dumps(drifted), encoding="utf-8")
     assert run_internal_stage(git_repo, fixture, "deliver", run_id).returncode == 2
 
+    scoped_out = load_only_run_state(git_repo)
+    require_current_run_state(scoped_out)
+    assert scoped_out["status"] == "unsupported_scope_change"
+    assert {fact["work_subject"] for fact in operator_action_facts(scoped_out)} == {
+        f"run:{run_id}", "ticket:2",
+    }
+
     before_abandonment = json.loads(fixture.read_text(encoding="utf-8"))
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
-    assert abandoned.returncode == 2, abandoned.stderr
-    assert stdout_json(abandoned)["status"] == "incompatible_run_state"
+    assert abandoned.returncode == 0, abandoned.stdout + abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    retired = load_only_run_state(git_repo)
+    require_current_run_state(retired)
+    assert operator_action_facts(retired) == []
+    assert retired["ticket_jobs"]["2"] == scoped_out["ticket_jobs"]["2"]
+    assert "ticket_closed_by_run" not in retired["ticket_jobs"]["2"]
     after = json.loads(fixture.read_text(encoding="utf-8"))
     assert after == before_abandonment
     assert after["issues"]["2"]["state"] == "CLOSED"
@@ -605,35 +619,19 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
-    save_work = StateStore._save_work_and_notify_unlocked
     crashed = False
-    crash_after_save = False
-
-    def record_revision_mismatch_save(
-        store: StateStore, saved_run_id: str, state: dict[str, Any],
-        baseline: dict[str, Any], *, ticket_number: int | None = None,
-    ) -> None:
-        nonlocal crash_after_save
-        save_work(store, saved_run_id, state, baseline, ticket_number=ticket_number)
-        job = state.get("ticket_jobs", {}).get("2", {})
-        crash_after_save = (
-            not crashed
-            and saved_run_id == run_id
-            and job.get("phase") == "blocked"
-            and job.get("blocked_reason") == "effective_revision_mismatch"
-        )
 
     def crash_after_revision_mismatch_save(store: StateStore) -> None:
-        nonlocal crashed, crash_after_save
-        if crash_after_save:
-            crash_after_save = False
+        nonlocal crashed
+        # 统一提交后 hook 覆盖对象保存；只在真实已持久化的故障边界中断。
+        current = store.load_current_run(run_id)
+        job = current.get("ticket_jobs", {}).get("2", {}) if current is not None else {}
+        if (not crashed and job.get("phase") == "blocked"
+                and job.get("blocked_reason") == "effective_revision_mismatch"):
             crashed = True
             raise SimulatedProcessCrash("after durable revision mismatch")
 
     with monkeypatch.context() as crash_patch:
-        crash_patch.setattr(
-            StateStore, "_save_work_and_notify_unlocked", record_revision_mismatch_save
-        )
         crash_patch.setattr(
             StateStore, "_after_run_saved", crash_after_revision_mismatch_save
         )

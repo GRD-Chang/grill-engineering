@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 
 from agent_run.messages import error_message
 from typing import Any, cast
@@ -35,6 +36,16 @@ _POLICY_KEYS = frozenset(
     }
 )
 _DEADLINE_KEYS = frozenset({"development", "review", "publication"})
+_LEGACY_POLICY_KEYS = _POLICY_KEYS - {"development_thread_policy"}
+_POLICY_SCALAR_FIELDS = (
+    "parent_only_paired_rounds", "run_repair_rounds", "ticket_review_rounds",
+    "ticket_development_workers", "integration_resync_limit",
+    "ticket_integration_development_limit", "ticket_ci_development_limit",
+    "ticket_ci_review", "parent_ci_development_limit", "development_thread_policy",
+)
+_DEADLINE_FIELDS = ("development", "review", "publication")
+_PolicyScalar = bool | int | float | str
+_PolicyCacheKey = tuple[tuple[type[object], _PolicyScalar], ...]
 _DURATION_PATTERN = re.compile(
     r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([smhd]?)\s*$", re.IGNORECASE
 )
@@ -250,27 +261,59 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
     """Parse the complete canonical state snapshot without applying defaults."""
 
     if not isinstance(value, Mapping) or set(value) not in (
-        _POLICY_KEYS, _POLICY_KEYS - {"development_thread_policy"}
+        _POLICY_KEYS, _LEGACY_POLICY_KEYS
     ):
         raise DeliveryPolicyError("Policy Snapshot has an invalid field set")
     deadlines = value.get("invocation_deadlines")
     if not isinstance(deadlines, Mapping) or set(deadlines) != _DEADLINE_KEYS:
         raise DeliveryPolicyError("Policy Snapshot deadlines have an invalid field set")
-    return _policy_from_values(
-        {
-            "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
-            "run_repair_rounds": value.get("run_repair_rounds"),
-            "ticket_review_rounds": value.get("ticket_review_rounds"),
-            "ticket_development_workers": value.get("ticket_development_workers"),
-            "integration_resync_limit": value.get("integration_resync_limit"),
-            "ticket_integration_development_limit": value.get("ticket_integration_development_limit"),
-            "ticket_ci_development_limit": value.get("ticket_ci_development_limit"),
-            "ticket_ci_review": value.get("ticket_ci_review"),
-            "parent_ci_development_limit": value.get("parent_ci_development_limit"),
-            "development_thread_policy": value.get("development_thread_policy", "reuse"),
-            "invocation_deadlines": dict(deadlines),
-        }
+    key = _policy_cache_key(value, deadlines)
+    if key is not None:
+        return _cached_policy(key)
+    return _policy_with_deadlines(value, deadlines)
+
+
+def _policy_cache_key(
+    values: Mapping[str, Any], deadlines: Mapping[str, Any],
+) -> _PolicyCacheKey | None:
+    # Custom mappings/values retain their original access and validation path.
+    # Bound retained scalar sizes as well as the number of successful entries.
+    if type(values) is not dict or type(deadlines) is not dict:
+        return None
+    if any(type(field) is not str for field in values) or any(
+        type(field) is not str for field in deadlines
+    ):
+        return None
+    scalars = tuple(values.get(field, "reuse") for field in _POLICY_SCALAR_FIELDS) + tuple(
+        deadlines[field] for field in _DEADLINE_FIELDS
     )
+    key: list[tuple[type[object], _PolicyScalar]] = []
+    for scalar in scalars:
+        scalar_type = type(scalar)
+        if scalar_type is str:
+            if len(scalar) > 128:
+                return None
+        elif scalar_type is int:
+            if scalar.bit_length() > 64:
+                return None
+        elif scalar_type is float:
+            if not math.isfinite(scalar):
+                return None
+        elif scalar_type is not bool:
+            return None
+        key.append((scalar_type, scalar))
+    # Python compares bool/int/float values equal; retain each exact type.
+    return tuple(key)
+
+
+@lru_cache(maxsize=128)
+def _cached_policy(key: _PolicyCacheKey) -> DeliveryPolicy:
+    scalar_count = len(_POLICY_SCALAR_FIELDS)
+    values = dict(zip(_POLICY_SCALAR_FIELDS, (scalar for _, scalar in key[:scalar_count])))
+    deadlines = dict(zip(_DEADLINE_FIELDS, (scalar for _, scalar in key[scalar_count:])))
+    # lru_cache retains only successful immutable results, never exceptions or
+    # the caller's mutable snapshot. Shape checks still run before every hit.
+    return _policy_with_deadlines(values, deadlines)
 
 
 def policy_snapshot_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -419,42 +462,29 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
         raise DeliveryPolicyError(
             "invocation_deadlines is missing: " + ", ".join(sorted(required))
         )
+    return _policy_with_deadlines(values, deadlines)
+
+
+def _policy_with_deadlines(
+    values: Mapping[str, Any], deadlines: Mapping[str, Any],
+) -> DeliveryPolicy:
+    """Construct after the caller has checked its required deadline fields."""
     return DeliveryPolicy(
         development_thread_policy=values.get("development_thread_policy", "reuse"),
-        parent_only_paired_rounds=_positive_integer(
-            values.get("parent_only_paired_rounds"), "parent_only_paired_rounds"
-        ),
-        run_repair_rounds=_positive_integer(
-            values.get("run_repair_rounds"), "run_repair_rounds"
-        ),
-        ticket_review_rounds=_positive_integer(
-            values.get("ticket_review_rounds"), "ticket_review_rounds"
-        ),
-        ticket_development_workers=_positive_integer(
-            values.get("ticket_development_workers"), "ticket_development_workers"
-        ),
-        ticket_integration_development_limit=_positive_integer(
-            values.get("ticket_integration_development_limit"), "ticket_integration_development_limit"
-        ),
-        integration_resync_limit=_nonnegative_integer(
-            values.get("integration_resync_limit"), "integration_resync_limit"
-        ),
-        ticket_ci_development_limit=_positive_integer(
-            values.get("ticket_ci_development_limit"), "ticket_ci_development_limit"
-        ),
+        # The immutable policy's constructor validates and normalizes these
+        # exact values. Do not repeat every check before __post_init__.
+        parent_only_paired_rounds=cast(int, values.get("parent_only_paired_rounds")),
+        run_repair_rounds=cast(int, values.get("run_repair_rounds")),
+        ticket_review_rounds=cast(int, values.get("ticket_review_rounds")),
+        ticket_development_workers=cast(int, values.get("ticket_development_workers")),
+        ticket_integration_development_limit=cast(int, values.get("ticket_integration_development_limit")),
+        integration_resync_limit=cast(int, values.get("integration_resync_limit")),
+        ticket_ci_development_limit=cast(int, values.get("ticket_ci_development_limit")),
         ticket_ci_review=cast(bool, values.get("ticket_ci_review")),
-        parent_ci_development_limit=_positive_integer(
-            values.get("parent_ci_development_limit"), "parent_ci_development_limit"
-        ),
-        development_deadline_seconds=_positive_duration(
-            deadlines["development"], "development deadline"
-        ),
-        review_deadline_seconds=_positive_duration(
-            deadlines["review"], "review deadline"
-        ),
-        publication_deadline_seconds=_positive_duration(
-            deadlines["publication"], "publication deadline"
-        ),
+        parent_ci_development_limit=cast(int, values.get("parent_ci_development_limit")),
+        development_deadline_seconds=deadlines["development"],
+        review_deadline_seconds=deadlines["review"],
+        publication_deadline_seconds=deadlines["publication"],
     )
 
 

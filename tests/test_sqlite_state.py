@@ -523,7 +523,7 @@ def test_work_global_retention_preserves_sibling_current_and_pending_attempt(tmp
 def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
     tmp_path: Path, monkeypatch, aggregate: bool, history_run: str,
 ) -> None:
-    from agent_run import sqlite_objects, sqlite_mutations
+    from agent_run import sqlite_work_objects as sqlite_objects, sqlite_mutations
     observed = []
     real_decode = sqlite_objects._decode
     def decode(repository, connection, run_id, rows, **kwargs):

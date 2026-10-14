@@ -123,7 +123,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     result = []
     if (state.get("parent") or {}).get("number"):
         result.append(event_envelope(state, "run_start", state.get("run_id"), event_copy(state, "run_start"), started_at=state.get("created_at")))
-    records = history_records(state, audit)
+    records = history_records(state, audit, presentation_details=False)
     actions = operator_action_facts(state)
     for record in records:
         if not record.get("event_record"):

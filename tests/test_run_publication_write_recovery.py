@@ -93,7 +93,7 @@ def test_final_write_success_before_state_save_failure_keeps_durable_intent(
 ) -> None:
     run_id, states, agents, publisher, engine = _prepare(git_repo, action, True)
     publisher.interrupt = False
-    original_save = states.save_run
+    original_save = engine.states.save_run
     failed = False
 
     def interrupted_save(identifier: str, state: dict[str, Any]) -> None:
@@ -109,7 +109,7 @@ def test_final_write_success_before_state_save_failure_keeps_durable_intent(
             raise OSError("StateStore unavailable after successful remote write")
         original_save(identifier, state)
 
-    monkeypatch.setattr(states, "save_run", interrupted_save)
+    monkeypatch.setattr(engine.states, "save_run", interrupted_save)
     waiting = engine.publish(run_id)
     assert failed
     assert isinstance(waiting["run_publication"].get("write_intent"), dict)

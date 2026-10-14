@@ -347,6 +347,10 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
         raise MergeConflictError("merge preview conflicts")
 
     monkeypatch.setattr(git, "prepare_expected_merge_checkout", conflict)
+    state = engine.states.load_current_run(str(state["run_id"]))
+    assert state is not None
+    state.update(engine.states.load_delivery_evidence(str(state["run_id"])))
+    run = state["run_acceptance"]
     assert engine._review(state, run)
 
     assert run["phase"] == "repairing"
@@ -370,6 +374,10 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
     )
     save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
+    state = engine.states.load_current_run(str(state["run_id"]))
+    assert state is not None
+    state.update(engine.states.load_delivery_evidence(str(state["run_id"])))
+    run = state["run_acceptance"]
     assert engine._review(state, run)
     assert run["validation_attempts"] == 3
     assert run["review_budget"]["reviewer_invocations"] == 1

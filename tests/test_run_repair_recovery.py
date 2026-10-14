@@ -4,6 +4,7 @@ from support.repairing_run import prepare_run_repair
 
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
 from support.run_scenarios import _completed_run
+from support.final_publication import final_publication_context
 
 import subprocess
 import json
@@ -163,22 +164,10 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
 def test_run_repair_currentness_supervises_recoverable_live_pr_reads(
     git_repo: Path, error_type: str
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    states, git, state = final_publication_context(git_repo, approved=False)
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
-    publisher.ensure_final_run_ref(
-        branch=str(state["run_branch"]),
-        expected_head_sha=git.resolve(str(state["run_branch"])),
-    )
-    final_pr = publisher.ensure_run_pr(
-        branch=str(state["run_branch"]),
-        base_branch="main",
-        expected_head_sha=git.resolve(str(state["run_branch"])),
-        expected_base_sha=git.resolve("main"),
-        title="Final Run",
-        body="Original final Run narrative.",
-    )
-    state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
+    final_pr = state["run_publication"]["pr_number"]
     currentness = RunAcceptanceEngine(
         git=git,
         states=states,
@@ -213,6 +202,8 @@ def test_run_repair_currentness_supervises_recoverable_live_pr_reads(
         github=FailingCurrentnessPublisher(fixture, git),
     ).repair_currentness
     assert failing is not None
+    state = failing.states.load_current_run(str(state["run_id"]))
+    assert state is not None
     with pytest.raises(RunRepairObservationPending):
         failing.trigger_is_current(state, job, default_head_sha=git.resolve("main"))
 

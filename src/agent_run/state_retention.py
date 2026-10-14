@@ -44,14 +44,24 @@ def compact_invocation_details(state: dict[str, Any]) -> None:
         if ((invocation.get("work_subject"), invocation.get("started_at")) in identities
                 or isinstance(attempt, dict) and attempt.get("attempt_id") in pending):
             continue
-        for field in _DETAIL_FIELDS:
-            details = invocation.get(field)
-            if not isinstance(details, list) or not details:
-                continue
-            if field == "execution_segments":
-                invocation["execution_timing_summary"] = aggregate_invocation_timing([invocation])
-            encoded = json.dumps(details, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            invocation[f"{field}_summary"] = {
-                "count": len(details), "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
-            }
-            invocation[field] = []
+        compact_invocation_detail(invocation)
+
+
+def compact_invocation_detail(invocation: dict[str, Any]) -> bool:
+    """Compact one proven unprotected terminal record, retaining its facts."""
+    if invocation.get("status") not in {"completed", "failed"}:
+        return False
+    changed = False
+    for field in _DETAIL_FIELDS:
+        details = invocation.get(field)
+        if not isinstance(details, list) or not details:
+            continue
+        if field == "execution_segments":
+            invocation["execution_timing_summary"] = aggregate_invocation_timing([invocation])
+        encoded = json.dumps(details, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        invocation[f"{field}_summary"] = {
+            "count": len(details), "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+        }
+        invocation[field] = []
+        changed = True
+    return changed

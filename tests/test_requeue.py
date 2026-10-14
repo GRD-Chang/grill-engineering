@@ -1034,7 +1034,7 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
     assert persisted["diagnostics"][0]["operator_gate"] == {
         "work_subject": "ticket:7",
         "action_kind": "deterministic_contradiction",
-        "phase": "developing",
+        "phase": "blocked",
         "reason": "change_pr_base_changed_externally",
     }
     for command in ("status", "history"):

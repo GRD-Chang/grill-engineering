@@ -10,6 +10,7 @@ import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,7 +18,9 @@ from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.sqlite_encoding import copy_json_tree, copy_projection_fields, encode_json, object_path, scalar_value, snapshot_fields
 from agent_run.sqlite_mutations import patch_run, save_work
 from agent_run import sqlite_timeline
-from agent_run.sqlite_objects import check_indexes, load_work, index_run, _object_rows, _decode
+from agent_run.sqlite_work_objects import check_indexes, load_work, index_run, _object_rows, _decode
+from agent_run.sqlite_work_indexes import IndexFacts
+from agent_run.sqlite_work_fields import field_node_counts
 from agent_run.sqlite_rows import ReadConnection, RowSource, read_document, read_run_rows, read_schema
 from agent_run.sqlite_job_history import FIELDS as JOB_HISTORIES, CURRENT_WORK_PREDICATE
 
@@ -33,10 +36,12 @@ _VALID_SCHEMAS: set[tuple[tuple[str, str, str, str | None], ...]] = set()
 _SCHEMA_CACHE_LOCK = threading.Lock()
 _COLUMNS = {
     "schema_meta": ("key", "value"),
-    "runs": ("run_id", "repository", "parent_number", "status", "phase", "created_at", "updated_at"),
+    "runs": ("run_id", "repository", "parent_number", "status", "phase", "created_at", "updated_at", "root_keys_json"),
     "run_objects": ("run_id", "object_path", "kind", "value_json"),
     "run_materials": ("material_id", "value", "byte_length"),
-    "run_material_refs": ("run_id", "material_id"),
+    "run_material_refs": ("run_id", "material_id", "object_refcount"),
+    "run_object_index": ("run_id", "object_path", "invocation_id", "resume_id", "logical_bytes", "content_digest", "size_proof", "child_count", "attempt_id"),
+    "run_object_materials": ("run_id", "object_path", "material_id"),
     "run_sizes": ("run_id", "logical_bytes", "canonical_count"),
     "run_history": ("run_id", "position", "ticket_number", "work_subject", "started_at", "resume_id", "logical_bytes", "detailed"),
     "run_object_material_refs": ("run_id", "object_path", "material_id"),
@@ -49,6 +54,8 @@ _KEYS = {
     "run_objects": ("run_id", "object_path"),
     "run_materials": ("material_id",),
     "run_material_refs": ("run_id", "material_id"),
+    "run_object_index": ("run_id", "object_path"),
+    "run_object_materials": ("run_id", "object_path", "material_id"),
     "run_sizes": ("run_id",),
     "run_history": ("run_id", "position"),
     "run_object_material_refs": ("run_id", "object_path", "material_id"),
@@ -57,6 +64,8 @@ _KEYS = {
 }
 _FOREIGN_KEYS = {
     "run_objects": {("runs", "run_id", "run_id", "CASCADE")},
+    "run_object_index": {("runs", "run_id", "run_id", "CASCADE")},
+    "run_object_materials": {("runs", "run_id", "run_id", "CASCADE")},
     "run_material_refs": {
         ("runs", "run_id", "run_id", "CASCADE"),
         ("run_materials", "material_id", "material_id", "NO ACTION"),
@@ -80,17 +89,23 @@ _FOREIGN_KEYS = {
 _SCHEMA = (
     "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE runs (run_id TEXT PRIMARY KEY, repository TEXT, "
-    "parent_number INTEGER, status TEXT, phase TEXT, created_at TEXT, updated_at TEXT)",
+    "parent_number INTEGER, status TEXT, phase TEXT, created_at TEXT, updated_at TEXT, root_keys_json TEXT NOT NULL)",
     "CREATE TABLE run_objects (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
     "kind TEXT NOT NULL CHECK (kind IN ('map', 'list', 'scalar', 'material', 'snapshot')), "
     "value_json TEXT NOT NULL, PRIMARY KEY (run_id, object_path), "
     "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
     "CREATE TABLE run_materials (material_id TEXT PRIMARY KEY, value TEXT NOT NULL, "
     "byte_length INTEGER NOT NULL)",
-    "CREATE TABLE run_material_refs (run_id TEXT NOT NULL, material_id TEXT NOT NULL, "
+    "CREATE TABLE run_material_refs (run_id TEXT NOT NULL, material_id TEXT NOT NULL, object_refcount INTEGER NOT NULL DEFAULT 0, "
     "PRIMARY KEY (run_id, material_id), "
     "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE, "
     "FOREIGN KEY (material_id) REFERENCES run_materials(material_id))",
+    "CREATE TABLE run_object_index (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
+    "invocation_id TEXT, resume_id TEXT, logical_bytes INTEGER NOT NULL, content_digest TEXT, size_proof TEXT, child_count INTEGER, attempt_id TEXT, "
+    "PRIMARY KEY (run_id, object_path), FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
+    "CREATE TABLE run_object_materials (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
+    "material_id TEXT NOT NULL, PRIMARY KEY (run_id, object_path, material_id), "
+    "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
     "CREATE TABLE run_sizes (run_id TEXT PRIMARY KEY, logical_bytes INTEGER NOT NULL, canonical_count INTEGER NOT NULL, "
     "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
     "CREATE TABLE run_history (run_id TEXT NOT NULL, position INTEGER NOT NULL, "
@@ -108,6 +123,11 @@ _SCHEMA = (
     "parent_path TEXT NOT NULL, position INTEGER NOT NULL, role TEXT, status TEXT, ordinal INTEGER, "
     "PRIMARY KEY (run_id, object_path), FOREIGN KEY (run_id, object_path) "
     "REFERENCES run_objects(run_id, object_path) ON DELETE CASCADE)",
+    "CREATE INDEX current_field_sizes ON run_object_index(run_id, logical_bytes) WHERE logical_bytes > 0",
+    "CREATE INDEX run_invocation_identity ON run_object_index(run_id, invocation_id)",
+    "CREATE INDEX run_attempt_identity ON run_object_index(run_id, attempt_id)",
+    "CREATE INDEX run_resume_identity ON run_object_index(run_id, resume_id)",
+    "CREATE INDEX object_material_identity ON run_object_materials(run_id, material_id)",
     "CREATE INDEX runs_parent ON runs(repository COLLATE NOCASE, parent_number, created_at)",
     "CREATE INDEX history_ticket ON run_history(run_id, ticket_number, position)",
     "CREATE INDEX history_resume ON run_history(run_id, resume_id, position)",
@@ -120,6 +140,13 @@ _SCHEMA = (
 )
 _CANONICAL_TABLES = dict(zip(_COLUMNS, _SCHEMA[:len(_COLUMNS)], strict=True))
 _CANONICAL_INDEXES = {statement.split()[2]: statement for statement in _SCHEMA[len(_COLUMNS):]}
+_WORK_SCHEMA_PARAMETERS = {
+    "schema_definitions": encode_json(sorted(
+        [("table", name, ddl) for name, ddl in _CANONICAL_TABLES.items()]
+        + [("index", name, ddl) for name, ddl in _CANONICAL_INDEXES.items()],
+    )),
+    "schema_protocol": _PROTOCOL,
+}
 
 
 _json = encode_json
@@ -135,6 +162,16 @@ class _RunView:
     fields: dict[str, str] | None
     snapshots: dict[str, str]
     snapshot_refs: dict[str, frozenset[str]]
+    index_facts: IndexFacts | None = None
+    physical_bytes: int | None = None
+
+    @cached_property
+    def field_node_counts(self) -> dict[str, int]:
+        return field_node_counts(self.objects)
+
+    @cached_property
+    def timeline_sources(self) -> Mapping[str, sqlite_timeline.ScopeSource]:
+        return sqlite_timeline.scopes_from_view(self)
 
 
 @dataclass(frozen=True)
@@ -273,11 +310,12 @@ class SQLiteStateRepository:
                     or foreign_keys != _FOREIGN_KEYS.get(name, set())):
                 raise IncompatibleRunStateError("Incompatible SQLite Run state schema")
             for row in info:
-                expected_type = "INTEGER" if row[1] in {"parent_number", "byte_length", "position", "ticket_number", "logical_bytes", "detailed", "canonical_count", "item_count", "ordinal"} else "TEXT"
-                nullable = (name == "runs" or row[1] == "key"
+                expected_type = "INTEGER" if row[1] in {"parent_number", "byte_length", "logical_bytes", "object_refcount", "child_count", "position", "ticket_number", "detailed", "canonical_count", "item_count", "ordinal"} else "TEXT"
+                nullable = ((name == "runs" and row[1] != "root_keys_json") or row[1] == "key"
                             or name in {"run_materials", "run_sizes"} and row[1] in {"material_id", "run_id"}
-                            or name == "run_history" and row[1] in {"ticket_number", "work_subject", "started_at", "resume_id"})
-                nullable = nullable or name == "run_job_attempts" and row[1] in {"role", "status", "ordinal"}
+                            or name == "run_object_index" and row[1] in {"invocation_id", "resume_id", "content_digest", "size_proof", "child_count", "attempt_id"}
+                            or name == "run_history" and row[1] in {"ticket_number", "work_subject", "started_at", "resume_id"}
+                            or name == "run_job_attempts" and row[1] in {"role", "status", "ordinal"})
                 if row[2] != expected_type or bool(row[3]) == nullable:
                     raise IncompatibleRunStateError("Incompatible SQLite Run state schema")
         if sum(len(text or "") for _, _, _, text in definitions) <= 16 * 1024:
@@ -378,7 +416,7 @@ class SQLiteStateRepository:
             self._local.reader = previous
 
     @contextmanager
-    def _reading(self, run_id: str | None = None) -> Iterator[sqlite3.Connection | None]:
+    def _reading(self, run_id: str | None = None, *, check_schema: bool = True) -> Iterator[sqlite3.Connection | None]:
         active = getattr(self._local, "connection", None)
         if active is not None:
             yield active
@@ -412,7 +450,9 @@ class SQLiteStateRepository:
             if run_id is not None and self._aggregate_rows:
                 read_document(cast(ReadConnection, connection), run_id, max_bytes=self.max_bytes,
                               aggregate_bytes=_READ_VIEW_BYTES, tables=_CANONICAL_TABLES)
-            if self._check_schema(connection, allow_empty=True):
+            # Work reads prove the current canonical DDL and protocol in their
+            # bounded query; every other reader validates before querying.
+            if not check_schema or self._check_schema(connection, allow_empty=True):
                 yield connection
             else:
                 # A failed first business transaction may leave an empty
@@ -453,7 +493,8 @@ class SQLiteStateRepository:
             if encoded is None:
                 encoded = encoded_fields.get(key) if encoded_fields is not None else None
             if encoded is None:
-                encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                encoded = (json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                           if isinstance(value, dict | list | tuple) else _json(value))
             size += len(encoded.encode("utf-8"))
             if fields is not None:
                 if size > _READ_VIEW_BYTES:
@@ -505,23 +546,56 @@ class SQLiteStateRepository:
                 assert cached.view.fields is not None
                 state = self._copy_view(cached.view)
                 check_indexes(self, connection, run_id, state, cached.view.logical_bytes,
-                              cached.view.objects, cached.view.materials, snapshot_refs=cached.view.snapshot_refs)
+                              cached.view.objects, cached.view.materials, snapshot_refs=cached.view.snapshot_refs,
+                              expected=cached.view.index_facts)
                 return state
             materials: dict[str, str] = {}
             for identity, material_value, byte_length in source.material_rows():
+                if not isinstance(material_value, str) or type(byte_length) is not int:
+                    raise ValueError("Invalid SQLite Run material identity")
                 material_encoded = material_value.encode("utf-8")
                 if len(material_encoded) != byte_length or hashlib.sha256(material_encoded).hexdigest() != identity:
                     raise ValueError("Invalid SQLite Run material identity")
                 materials[identity] = material_value
+            objects = {path: (kind, encoded) for path, kind, encoded in source.object_rows()}
+            prior = cached.view if cached is not None and cached.view.run_id == run_id else None
+            unchanged = set(prior.fields) if prior is not None and prior.fields is not None else set()
+            if unchanged and prior is not None:
+                for raw_path in objects.keys() | prior.objects.keys():
+                    if objects.get(raw_path) != prior.objects.get(raw_path):
+                        parsed = object_path(raw_path)
+                        if parsed and isinstance(parsed[0], str):
+                            unchanged.discard(parsed[0])
+                        else:
+                            unchanged.clear()
+                            break
+                # Source nodes alone do not prove a snapshot's material closure.
+                # The current query has verified every material's actual SHA and
+                # length; all dependencies must still be present before reuse.
+                for raw_path, (kind, _) in objects.items():
+                    parsed = object_path(raw_path)
+                    if kind == "snapshot" and parsed and parsed[0] in unchanged:
+                        refs = prior.snapshot_refs.get(raw_path)
+                        if isinstance(parsed[0], str) and (refs is None or not refs <= materials.keys()):
+                            unchanged.discard(parsed[0])
             nodes: dict[tuple[str | int, ...], Any] = {}
-            objects: dict[str, tuple[str, str]] = {}
             snapshots: dict[str, str] = {}
             snapshot_refs: dict[str, frozenset[str]] = {}
             snapshot_bytes = 0
             list_lengths: dict[tuple[str | int, ...], int] = {}
-            for encoded_path, kind, encoded in source.object_rows():
-                objects[encoded_path] = (kind, encoded)
+            if prior is not None and prior.fields is not None:
+                for field_key in unchanged:
+                    nodes[(field_key,)] = json.loads(prior.fields[field_key])
+                for raw_path, plain in prior.snapshots.items():
+                    parsed = object_path(raw_path)
+                    if parsed and parsed[0] in unchanged:
+                        snapshots[raw_path] = plain
+                        snapshot_refs[raw_path] = prior.snapshot_refs[raw_path]
+                        snapshot_bytes += len(plain.encode("utf-8"))
+            for encoded_path, (kind, encoded) in objects.items():
                 path = object_path(encoded_path)
+                if path and path[0] in unchanged:
+                    continue
                 value = scalar_value(encoded)
                 if kind == "map" and value is None:
                     value = {}
@@ -586,11 +660,16 @@ class SQLiteStateRepository:
             # A snapshot with separately stored descendants can be overridden
             # during assembly. Only complete, unmodified subtree encodings may
             # stand in for the assembled value in size/copy calculations.
-            overridden = {path[:length] for path in nodes for length in range(1, len(path))}
+            overridden = {path[:length] for raw_path in objects for path in (object_path(raw_path),)
+                          for length in range(1, len(path))}
             encodings = {object_path(path): plain for path, plain in snapshots.items()
                          if object_path(path) not in overridden}
-            logical_bytes = self._check_size(root, fields=fields, encoded_fields=snapshot_fields(root, encodings))
-            check_indexes(self, connection, run_id, root, logical_bytes, objects, materials, snapshot_refs=snapshot_refs)
+            proven_fields = snapshot_fields(root, encodings)
+            if prior is not None and prior.fields is not None:
+                proven_fields.update((key, prior.fields[key]) for key in unchanged)
+            logical_bytes = self._check_size(root, fields=fields, encoded_fields=proven_fields)
+            index_facts = check_indexes(self, connection, run_id, root, logical_bytes, objects, materials,
+                                        snapshot_refs=snapshot_refs, snapshot_encodings=encodings)
             reusable = (logical_bytes <= _READ_VIEW_BYTES
                         and material_bytes + object_bytes <= _READ_VIEW_BYTES)
             active = getattr(self._local, "connection", None) is not None
@@ -601,7 +680,8 @@ class SQLiteStateRepository:
                         if reusable else copy_json_tree(root)) if reusable or active else {}
             view = (_RunView(run_id, baseline,
                              objects, materials, logical_bytes, fields if reusable else None,
-                             snapshots, snapshot_refs)
+                             snapshots, snapshot_refs, index_facts if reusable else None,
+                             material_bytes + object_bytes)
                     if reusable or active else None)
             with self._read_view_lock:
                 self._read_view = (_ReadView(view, source)
@@ -616,13 +696,50 @@ class SQLiteStateRepository:
         """Read work facts and indexed related history in one SQL snapshot."""
         return load_work(self, run_id, ticket_number, thin_timeline=thin_timeline)
 
+    def work_baseline(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        """Borrow the proved transaction baseline for internal read-only use.
+
+        The caller mutates its separate loaded projection. A matching baseline
+        is already isolated from it; a custom or changed view keeps the copy
+        path. Neither result grants authority outside the current transaction.
+        """
+        from agent_run.sqlite_work_objects import WorkView
+        from agent_run.sqlite_mutations import _same
+
+        view = getattr(self._local, "work_view", None)
+        connection = getattr(self._local, "connection", None)
+        if (connection is not None and isinstance(view, WorkView) and view.run_id == run_id
+                and view.total_changes == connection.total_changes and _same(view.baseline, state)):
+            return view.baseline
+        return cast(dict[str, Any], copy_json_tree(state))
+
+    def current_work_baseline(self, run_id: str) -> dict[str, Any]:
+        """Borrow only the isolated source of this unchanged write snapshot."""
+        from agent_run.sqlite_work_objects import WorkView
+
+        view = getattr(self._local, "work_view", None)
+        connection = getattr(self._local, "connection", None)
+        if (connection is None or not isinstance(view, WorkView) or view.run_id != run_id
+                or view.total_changes != connection.total_changes):
+            raise ValueError("Work baseline requires a current transaction read")
+        return view.baseline
+
     def has_ticket_supervision_work(self, run_id: str) -> bool:
         """Skip only a proved empty normal supervision observation."""
-        with self._reading() as connection:
+        with self._reading(check_schema=False) as connection:
             if connection is None:
                 return False
             if self.in_transaction:
                 self._check_schema(connection)
+            if self._aggregate_rows:
+                from agent_run.sqlite_supervision_read import read_supervision_work
+
+                observed = read_supervision_work(connection, run_id, max_bytes=self.max_bytes,
+                                                 schema_parameters=_WORK_SCHEMA_PARAMETERS)
+                if observed is not None:
+                    return observed
+            if not self.in_transaction and not self._check_schema(connection, allow_empty=True):
+                return False
             size = connection.execute(
                 "SELECT s.logical_bytes FROM runs r LEFT JOIN run_sizes s "
                 "ON s.run_id=r.run_id WHERE r.run_id=?", (run_id,),
@@ -672,13 +789,22 @@ class SQLiteStateRepository:
         """Observe one Stop intent without loading execution or history bodies."""
         if type(ticket_number) is not int or ticket_number < 1:
             raise ValueError("Ticket number must be positive")
-        with self._reading() as connection:
+        with self._reading(check_schema=False) as connection:
             if connection is None:
                 raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-            # _reading checks every read transaction; its write-transaction
-            # reentry also needs to reject direct schema/protocol changes.
+            # Writers retain their fresh structural validation. Ordinary
+            # readers first prove current canonical DDL in the scalar query.
             if self.in_transaction:
                 self._check_schema(connection)
+            if self._aggregate_rows:
+                from agent_run.sqlite_ticket_pause_read import read_ticket_pause
+
+                observed = read_ticket_pause(connection, run_id, ticket_number, max_bytes=self.max_bytes,
+                                             schema_parameters=_WORK_SCHEMA_PARAMETERS)
+                if observed is not None:
+                    return observed
+            if not self.in_transaction and not self._check_schema(connection, allow_empty=True):
+                raise ValueError("Delivery Run disappeared at Ticket pause boundary")
             size = connection.execute(
                 "SELECT s.logical_bytes FROM runs r LEFT JOIN run_sizes s "
                 "ON s.run_id=r.run_id WHERE r.run_id=?", (run_id,),
@@ -881,10 +1007,11 @@ class SQLiteStateRepository:
         raise ValueError("Missing or invalid SQLite Run snapshot material")
 
     def save(self, run_id: str, state: Mapping[str, Any]) -> None:
-        self._check_size(state)
         previous = cast(_RunView | None, getattr(self._local, "view", None))
         if previous is not None and previous.run_id != run_id:
             previous = None
+        if previous is None:
+            self._check_size(state)
         objects, materials = self._objects(state, previous=previous)
         representation_bytes = sum(len(path.encode()) + len(value.encode())
                                    for path, (_, value) in objects.items())
@@ -906,28 +1033,91 @@ class SQLiteStateRepository:
             self._local.view = None
             self._local.work_source = None
             connection = self._local.connection
+            from agent_run.sqlite_integrity import require_field_sizes
+            if connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None:
+                # Retain unchanged field proofs only after checking the old
+                # manifest and source headers, before changing either one.
+                require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
             connection.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET repository=excluded.repository, "
                 "parent_number=excluded.parent_number, status=excluded.status, phase=excluded.phase, "
-                "created_at=excluded.created_at, updated_at=excluded.updated_at "
-                "WHERE (repository, parent_number, status, phase, created_at, updated_at) "
+                "created_at=excluded.created_at, updated_at=excluded.updated_at, root_keys_json=excluded.root_keys_json "
+                "WHERE (repository, parent_number, status, phase, created_at, updated_at, root_keys_json) "
                 "IS NOT (excluded.repository, excluded.parent_number, excluded.status, "
-                "excluded.phase, excluded.created_at, excluded.updated_at)",
-                (run_id, metadata[0], parent_number, *metadata[1:]),
+                "excluded.phase, excluded.created_at, excluded.updated_at, excluded.root_keys_json)",
+                (run_id, metadata[0], parent_number, *metadata[1:], _json(sorted(state))),
             )
             prior_objects = previous.objects if previous is not None else {
                 path: (kind, value) for path, kind, value in connection.execute(
                     "SELECT object_path, kind, value_json FROM run_objects WHERE run_id = ?", (run_id,)
                 )
             }
+            from agent_run.sqlite_objects import index_objects
+
+            history = previous.state.get("agent_invocation_history") if previous is not None else None
+            index_objects(connection, run_id, state, objects, materials, prior_objects,
+                          previous_history=history if isinstance(history, list) else None)
             connection.execute("DELETE FROM run_object_material_refs WHERE run_id = ?", (run_id,))
             self._aggregate_rows = patch_run(
                 connection, run_id, objects=objects, previous=prior_objects, materials=materials,
                 known_materials=previous.materials if previous is not None else {}, native=self._aggregate_rows,
             )
+            from agent_run.sqlite_integrity import sync_material_counts
+            sync_material_counts(connection, run_id)
+            if previous is not None:
+                # The current transaction's proven old field sizes and newly
+                # generated changed-field proofs cover the complete logical
+                # value. Check after patching, with rollback on overflow,
+                # instead of encoding the entire unchanged history again.
+                require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
             index_run(self, connection, run_id, state, objects, materials)
             self._local.work_view = None
+
+    def load_objects(
+        self, run_id: str, *, excluded_fields: set[str] | None = None,
+        related_tickets: bool = False, ticket_numbers: set[int] | None = None, scheduler_tickets: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, int]] | None:
+        """Read current facts and only history linked to current identities."""
+        from agent_run.sqlite_objects import load_projection
+        with self._reading() as connection:
+            return None if connection is None else load_projection(connection, run_id, excluded_fields=excluded_fields, max_bytes=self.max_bytes,
+                                                                       related_tickets=related_tickets, ticket_numbers=ticket_numbers,
+                                                                       scheduler_tickets=scheduler_tickets)
+
+    def load_fields(self, run_id: str, fields: set[str]) -> dict[str, Any] | None:
+        from agent_run.sqlite_objects import load_fields
+        with self._reading() as connection:
+            return None if connection is None else load_fields(connection, run_id, fields, max_bytes=self.max_bytes)
+
+    def save_objects(
+        self, run_id: str, state: Mapping[str, Any], *, fields: set[str],
+        history_positions: Mapping[str, int] | None = None,
+        keyed_changes: Mapping[str, set[str]] | None = None,
+    ) -> None:
+        from agent_run.sqlite_objects import save_projection
+        with self.atomic():
+            save_projection(self, self._local.connection, run_id, state, fields,
+                            history_positions or {}, keyed_changes=keyed_changes)
+            self._local.view = None
+
+    def load_paths(self, run_id: str, paths: set[tuple[str | int, ...]]) -> dict[str, Any] | None:
+        from agent_run.sqlite_collections import load_paths
+        from agent_run.sqlite_integrity import require_field_sizes
+        with self._reading() as connection:
+            if connection is None or connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is None:
+                return None
+            require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
+            return load_paths(connection, run_id, paths)
+
+    def append_array(self, run_id: str, field: str, items: list[Any]) -> None:
+        from agent_run.sqlite_objects import save_projection
+        with self.atomic():
+            if field == "agent_invocation_history":
+                save_projection(self, self._local.connection, run_id, {field: items}, {field}, {})
+            else:
+                save_projection(self, self._local.connection, run_id, {}, {field}, {}, append_changes={field: items})
+            self._local.view = None
 
     def has(self, run_id: str) -> bool:
         with self._reading() as connection:

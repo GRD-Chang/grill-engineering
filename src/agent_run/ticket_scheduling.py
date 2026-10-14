@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from threading import Lock
@@ -110,8 +112,10 @@ def develop_frontier(
     # returned Agents' program closeout (e.g. a slow currentness read), plus
     # one reserved supervision thread. Program futures are not Agent permits.
     pipeline_limit = 2 * limit
+    session = getattr(engine.states, "work_session", None)
     with (
-        engine.states.current_run_reader(run_id, work_only=True) as read_current,
+        session() if callable(session) else nullcontext(),
+        engine.states.current_run_reader(run_id, work_only=True, thin_timeline=True) as read_current,
         ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
         close_admission_on_failure(),
     ):

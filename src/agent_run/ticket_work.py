@@ -6,7 +6,6 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
-from agent_run.sqlite_encoding import copy_json_tree
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlBusyError
 from agent_run.work_facts import ticket_program_ready
@@ -89,8 +88,10 @@ class TicketWorkAdmission:
                 return False
 
         def commit() -> None:
-            state = self._load()
-            baseline = copy_json_tree(state)
+            loaded = self.states._load_work_for_update(self.run_id, thin_timeline=True)
+            if loaded is None:
+                raise ValueError("Delivery Run disappeared during work admission")
+            state, baseline = loaded
             before = deepcopy(state["ticket_work_queue"])
             self._seed_queue(state, numbers)
             if state["ticket_work_queue"] != before:
@@ -119,8 +120,10 @@ class TicketWorkAdmission:
             nonlocal token
             from agent_run.ticket_state import RUN_STOP_STATUSES
 
-            state = self._load()
-            baseline = copy_json_tree(state)
+            loaded = self.states._load_work_for_update(self.run_id, thin_timeline=True)
+            if loaded is None:
+                raise ValueError("Delivery Run disappeared during work admission")
+            state, baseline = loaded
             previous = deepcopy(state["ticket_work_queue"])
             job = state["ticket_jobs"].get(str(number), {})
             if (
@@ -166,8 +169,10 @@ class TicketWorkAdmission:
 
     def release(self, token: str) -> None:
         def commit() -> None:
-            state = self._load()
-            baseline = copy_json_tree(state)
+            loaded = self.states._load_work_for_update(self.run_id, thin_timeline=True)
+            if loaded is None:
+                raise ValueError("Delivery Run disappeared during work admission")
+            state, baseline = loaded
             queue = state["ticket_work_queue"]
             state["ticket_work_queue"] = [item for item in queue if item["lease_id"] != token]
             if state["ticket_work_queue"] != queue:
@@ -177,8 +182,10 @@ class TicketWorkAdmission:
     def cancel_waiter(self, number: int, expected_generation: int) -> None:
         """A new external wait is no longer ready to compete for Agent work."""
         def commit() -> None:
-            state = self._load()
-            baseline = copy_json_tree(state)
+            loaded = self.states._load_work_for_update(self.run_id, thin_timeline=True)
+            if loaded is None:
+                raise ValueError("Delivery Run disappeared during work admission")
+            state, baseline = loaded
             queue = state["ticket_work_queue"]
             state["ticket_work_queue"] = [item for item in queue if not (
                 item["ticket_number"] == number and item["generation"] == expected_generation
@@ -189,7 +196,7 @@ class TicketWorkAdmission:
         self.states._commit_run(commit)
 
     def _load(self) -> dict[str, Any]:
-        state = self.states.load_work_run(self.run_id)
+        state = self.states.load_work_run(self.run_id, thin_timeline=True)
         if state is None:
             raise ValueError("Delivery Run disappeared during work admission")
         return state

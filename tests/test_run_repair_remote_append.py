@@ -23,6 +23,7 @@ from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _completed_run
+from support.state_commits import observe_run_commits
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -99,15 +100,12 @@ def test_run_repair_preserves_remote_run_append_and_resumes_same_work(
                 continue
         raise AssertionError("Repair did not finish within the existing work budget")
 
-    save = states.save_run
-
     def stop_after_review(identifier: str, value: dict[str, Any]) -> None:
-        save(identifier, value)
         if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
             raise OSError("interrupt before Run Branch update")
 
     with monkeypatch.context() as pause:
-        pause.setattr(states, "save_run", stop_after_review)
+        observe_run_commits(pause, states, after=stop_after_review)
         with pytest.raises(OSError, match="interrupt before Run Branch update"):
             accept()
     saved = states.load_current_run(run_id)
@@ -136,12 +134,11 @@ def test_run_repair_preserves_remote_run_append_and_resumes_same_work(
     agents._reviews = [_candidate_finding_artifact(), _passing_artifact()] if interrupted else [_passing_artifact()]
     if interrupted:
         def stop_after_candidate(identifier: str, value: dict[str, Any]) -> None:
-            save(identifier, value)
             repair = value.get("run_acceptance", {}).get("repair_job", {})
             if repair.get("phase") == "candidate" and len(agents.development_requests) == 2:
                 raise OSError("interrupt after repair Candidate")
         with monkeypatch.context() as pause:
-            pause.setattr(states, "save_run", stop_after_candidate)
+            observe_run_commits(pause, states, after=stop_after_candidate)
             with pytest.raises(OSError, match="interrupt after repair Candidate"):
                 accept()
         saved = states.load_current_run(run_id)
@@ -208,7 +205,9 @@ def test_run_repair_preserves_remote_run_append_and_resumes_same_work(
     assert len(agents.development_requests) == (3 if git_check else 2 if conflict or interrupted else 1)
     if git_check:
         assert result["run_acceptance"]["review_budget"]["development_attempts"] == 3
-        attempts = [item["semantic_attempt"] for item in result["agent_invocation_history"]
+        history = states.load_current_run(run_id)
+        assert history is not None
+        attempts = [item["semantic_attempt"] for item in history["agent_invocation_history"]
                     if item["phase"] == "integration_conflict" and item["status"] == "completed"]
         assert [item["budget_snapshot"]["development_attempts"] for item in attempts] == [2, 3]
         assert len({item["attempt_id"] for item in attempts}) == 2
@@ -238,15 +237,12 @@ def test_merge_resolution_repair_preserves_default_ancestor_and_remote_run_appen
     from support.merge_resolution import MergeResolutionFixture
 
     scene = MergeResolutionFixture(git_repo, "happy_path")
-    save = scene.states.save_run
-
     def stop_after_review(run_id: str, value: dict[str, Any]) -> None:
-        save(run_id, value)
         if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
             raise OSError("interrupt before Run Branch update")
 
     with monkeypatch.context() as pause:
-        pause.setattr(scene.states, "save_run", stop_after_review)
+        observe_run_commits(pause, scene.states, after=stop_after_review)
         with pytest.raises(OSError, match="interrupt before Run Branch update"):
             scene.accept()
     saved = scene.states.load_current_run(str(scene.state["run_id"]))

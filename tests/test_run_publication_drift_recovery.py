@@ -15,6 +15,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
 from support.run_publication import RunPublicationAgents
+from support.state_commits import observe_run_commits
 from support.run_scenarios import PassingRunReviewer, _accepted_run
 
 
@@ -69,7 +70,6 @@ def test_default_append_preserves_unknown_final_update_until_read_only_settlemen
     initial_publisher._save()
     states.save_run(run_id, initial)
     publisher = InterruptedUpdatePublisher(fixture, git, fault=fault)
-    original_save = states.save_run
     injected = False
 
     def save(identifier: str, current: dict[str, Any]) -> None:
@@ -82,9 +82,8 @@ def test_default_append_preserves_unknown_final_update_until_read_only_settlemen
         ):
             injected = True
             raise OSError("Final Run update result save lost")
-        original_save(identifier, current)
 
-    monkeypatch.setattr(states, "save_run", save)
+    observe_run_commits(monkeypatch, states, before=save)
     waiting = RunPublicationEngine(
         git=git, states=states, agents=agents, github=publisher,
         default_branch="main", default_head_sha=git.resolve("main"),

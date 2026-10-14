@@ -168,6 +168,15 @@ def test_run_update_stop_resume_preserves_attempts_and_invalidates_old_grant(
     if boundary in {"conflict", "review"}:
         attempt_id = saved["pending_semantic_attempt"]["attempt_id"]
         assert sum(item["attempt_id"] == attempt_id for item in run["semantic_attempt_history"]) == 1
+        predecessor = paused["active_agent_invocation"]
+        invocations = [item for item in final["agent_invocation_history"]
+                       if item["semantic_attempt"]["attempt_id"] == attempt_id]
+        successor = next(item for item in invocations
+                         if item["predecessor_invocation_started_at"] == predecessor["started_at"])
+        assert successor["requested_thread_id"] == predecessor["reported_thread_id"]
+        assert successor["reported_thread_id"] == predecessor["reported_thread_id"]
+        assert successor["mode"] == "resume"
+        assert successor["status"] == "completed"
     delivery = json.loads(fixture.read_text())["delivery"]
     assert len(delivery["pull_requests"]) == 2
     assert delivery["pull_requests"][-1]["state"] == "OPEN"

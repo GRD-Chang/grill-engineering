@@ -30,6 +30,7 @@ from agent_run.final_approval_operation import (
     is_final_approval_action,
 )
 from agent_run.operator_gate import has_run_operator_gate
+from agent_run.object_state import ObjectStateStore, object_store
 from agent_run.state import StateStore
 from agent_run.resume_intent import action_resume_intent
 from agent_run.task_control import (
@@ -196,7 +197,7 @@ class RunLifecycle:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.states = states
+        self.states = object_store(states)
         self.control = control
         self.host = host
         self.task = task
@@ -243,6 +244,34 @@ class RunLifecycle:
         )
 
     def submit(
+        self, request: LifecycleRequest
+    ) -> tuple[dict[str, Any], bool, ActionReceipt]:
+        state, resumed, receipt = self._submit(request)
+        return self._public_state(state, receipt), resumed, receipt
+
+    def _public_state(
+        self, state: dict[str, Any], receipt: ActionReceipt | None,
+    ) -> dict[str, Any]:
+        """Read the full response after execution, outside commit boundaries."""
+        if not isinstance(self.states, ObjectStateStore):
+            return state
+        run_id = state.get("run_id")
+        if not isinstance(run_id, str):
+            return state
+        # A successor may already own the Task. Its store cannot determine
+        # this Action's response; snapshot also resolves retained Actions.
+        action_id = receipt.action_id if receipt is not None else None
+        record = self.control.snapshot(self.task, action_id)
+        if action_id is None and isinstance(record, Mapping) and record.get("run_id") != run_id:
+            record = None
+        store = self._state_store_for_record(record)
+        if isinstance(store, ObjectStateStore):
+            complete = store.load_full_run(run_id)
+            if complete is not None:
+                return complete
+        return state
+
+    def _submit(
         self, request: LifecycleRequest
     ) -> tuple[dict[str, Any], bool, ActionReceipt]:
         if request.task != self.task:
@@ -580,6 +609,14 @@ class RunLifecycle:
         self,
         request: LifecycleRequest,
     ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
+        """Fence the previous Executor and return the durable Stop/Abandon result."""
+        state, resumed, receipt = self._submit_control(request)
+        return self._public_state(state, receipt), resumed, receipt
+
+    def _submit_control(
+        self,
+        request: LifecycleRequest,
+    ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
         """Fence an old Executor and run Stop/Abandon under a new Executor.
 
         Admission is deliberately separate from ordinary lifecycle submission:
@@ -781,6 +818,13 @@ class RunLifecycle:
         return current
 
     def execute_claimed(
+        self, *, action_id: str, generation: int
+    ) -> tuple[dict[str, Any], bool, ActionReceipt]:
+        """Execute an externally reserved Action and return its durable result."""
+        state, resumed, receipt = self._execute_claimed(action_id=action_id, generation=generation)
+        return self._public_state(state, receipt), resumed, receipt
+
+    def _execute_claimed(
         self, *, action_id: str, generation: int
     ) -> tuple[dict[str, Any], bool, ActionReceipt]:
         """Execute one Action already reserved by an external Host."""
@@ -2006,7 +2050,7 @@ class RunLifecycle:
                         and Path(current_root).resolve() == state_root.resolve()
                     ):
                         return self.states
-                    return StateStore(state_root.resolve())
+                    return object_store(StateStore(state_root.resolve()))
         return self.states
 
     def _load_action_run(

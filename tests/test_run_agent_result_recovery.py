@@ -44,19 +44,19 @@ def test_public_run_consumes_durable_run_agent_return_after_save_interruption(
             return ReviewResult("run-review-return-thread", _passing_artifact())
 
     agents = Agents()
-    original_save = states.save_run
     interrupted = False
     subject_key = "run_acceptance" if role == "reviewer" else "run_publication"
 
-    def interrupt_after_save(identifier: str, current: dict[str, Any]) -> None:
+    def interrupt_after_save() -> None:
         nonlocal interrupted
-        original_save(identifier, current)
+        current = StateStore(states.root).load_current_run(run_id)
+        assert current is not None
         attempt = current.get(subject_key, {}).get("pending_semantic_attempt", {})
         if not interrupted and "returned_result" in attempt:
             interrupted = True
             raise RuntimeError("interrupted after durable Agent return")
 
-    monkeypatch.setattr(states, "save_run", interrupt_after_save)
+    monkeypatch.setattr(states, "_after_run_saved", interrupt_after_save)
     engine = (
         RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
         if role == "reviewer" else RunPublicationEngine(
@@ -170,3 +170,40 @@ def test_public_resume_reuses_publication_return_after_remote_currentness_timeou
     assert len(agents.requests) == 1
     live = json.loads((repo / "github.json").read_text())["delivery"]["pull_requests"]
     assert len(live) == 1
+
+
+def test_run_reviewer_recovery_wait_commits_owner_and_invocation_together(
+    git_repo: Path,
+) -> None:
+    workspace = prepare_workspace(git_repo)
+    state, states, git = _completed_run(workspace.repository_root, state_root=workspace.state_root)
+    publisher = FixtureGitHubPublisher(workspace.repository_root / "github.json", git)
+    run_id = state["run_id"]
+    attempt_ids: list[str] = []
+
+    class Agents(RunPublicationAgents):
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            event = request["_invocation_event"]
+            event("started", requested_thread_id=None, attempt_count=0)
+            event("thread_started", reported_thread_id="run-review-recovery", attempt_count=1)
+            event("recovery_waiting", recovery_kind="ordinary", ordinary_recovery_used=True)
+            waiting = StateStore(states.root).load_current_run(run_id)
+            assert waiting is not None
+            assert waiting["run_acceptance"]["phase"] == "pending"
+            assert waiting["active_agent_invocation"]["status"] == "resuming"
+            attempt_ids.append(waiting["run_acceptance"]["pending_semantic_attempt"]["attempt_id"])
+            event("recovery_started")
+            running = StateStore(states.root).load_current_run(run_id)
+            assert running is not None
+            assert running["run_acceptance"]["phase"] == "reviewing"
+            assert running["active_agent_invocation"]["status"] == "running"
+            assert running["run_acceptance"]["pending_semantic_attempt"]["attempt_id"] == attempt_ids[0]
+            event("completed", reported_thread_id="run-review-recovery", attempt_count=2)
+            return ReviewResult("run-review-recovery", _passing_artifact())
+
+    RunAcceptanceEngine(git=git, states=states, agents=Agents(), github=publisher).accept(run_id)
+    saved = StateStore(states.root).load_current_run(run_id)
+    assert saved is not None
+    assert saved["status"] == "run_publication_pending"
+    assert saved["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
+    assert [attempt["attempt_id"] for attempt in saved["run_acceptance"]["semantic_attempt_history"]] == attempt_ids

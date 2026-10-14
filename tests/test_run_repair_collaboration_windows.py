@@ -37,12 +37,12 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     agents = ScriptedRunAgents()
 
-    save = states.save_run
     interrupt = True
     interrupted_candidates: set[str] = set()
 
-    def stop_after_acceptance(run_id: str, value: dict) -> None:
-        save(run_id, value)
+    def stop_after_acceptance() -> None:
+        value = states.load_current_run(str(state["run_id"]))
+        assert value is not None
         repair = value.get("run_acceptance", {}).get("repair_job", {})
         candidate = str(repair.get("candidate_sha"))
         if interrupt and repair.get("phase") == "accepted" and candidate not in interrupted_candidates:
@@ -51,7 +51,7 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
 
     def accept() -> dict:
         with monkeypatch.context() as pause:
-            pause.setattr(states, "save_run", stop_after_acceptance)
+            pause.setattr(states, "_after_run_saved", stop_after_acceptance)
             try:
                 return RunAcceptanceEngine(
                     git=git, states=states, agents=agents,
@@ -172,15 +172,15 @@ def test_temporary_repair_fetch_failure_resumes_without_duplicate_review(
             github=FixtureGitHubPublisher(fixture, git),
         ).accept(str(state["run_id"]))
 
-    save = states.save_run
 
-    def stop_after_acceptance(run_id: str, value: dict) -> None:
-        save(run_id, value)
+    def stop_after_acceptance() -> None:
+        value = states.load_current_run(str(state["run_id"]))
+        assert value is not None
         if value.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
             raise OSError("interrupt before Run Branch update")
 
     with monkeypatch.context() as pause:
-        pause.setattr(states, "save_run", stop_after_acceptance)
+        pause.setattr(states, "_after_run_saved", stop_after_acceptance)
         with pytest.raises(OSError, match="interrupt before Run Branch update"):
             accept()
     waiting = states.load_current_run(str(state["run_id"]))

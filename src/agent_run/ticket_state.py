@@ -6,7 +6,7 @@ from copy import deepcopy
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from agent_run.agent_invocation import _sync_invocation_history
 from agent_run.sqlite_timeline import TimelineScope
@@ -84,6 +84,12 @@ class TicketState:
         self._loaded = False
         self._last_holder: int | None = None
 
+    def _load_owned_run(self, run_id: str) -> dict[str, Any] | None:
+        loader = getattr(self.states, "load_current_run_for_ticket", None)
+        if callable(loader):
+            return cast(dict[str, Any] | None, loader(run_id, self.ticket_number))
+        return self.states.load_current_run(run_id)
+
     @contextmanager
     def work_session(self) -> Iterator[None]:
         with self.states._repository.work_session():
@@ -114,8 +120,11 @@ class TicketState:
     ) -> dict[str, Any] | None:
         if run_id != self.run_id:
             raise ValueError("Ticket state belongs to another Run")
-        state = (self.states.load_current_run(run_id) if complete
-                 else self.states.load_work_run(run_id, self.ticket_number, thin_timeline=True))
+        if complete:
+            loader = getattr(self.states, "load_full_run", self.states.load_current_run)
+            state = cast(dict[str, Any] | None, loader(run_id))
+        else:
+            state = self.states.load_work_run(run_id, self.ticket_number, thin_timeline=True)
         if state is None:
             return None
         if not complete:
@@ -165,9 +174,10 @@ class TicketState:
         lease = worker_lease.get()
 
         def commit() -> None:
-            latest = self.states.load_work_run(run_id, self.ticket_number, thin_timeline=True)
-            if latest is None:
+            loaded = self.states._load_work_for_update(run_id, self.ticket_number, thin_timeline=True)
+            if loaded is None:
                 raise ValueError("Delivery Run disappeared during Ticket execution")
+            latest, baseline = loaded
             if latest.get("status") in RUN_STOP_STATUSES:
                 raise TaskControlBusyError("Ticket lost Run authorization")
             if lease is not None and not any(
@@ -195,7 +205,6 @@ class TicketState:
                     and not (isinstance(proposed_invocation, dict)
                              and proposed_invocation.get("status") == "failed")):
                 raise TicketStopRequested("Ticket stop requested before commit")
-            baseline = copy_json_tree(latest)
             if _execution_job(current) != _execution_job(self._last_job):
                 raise TaskControlBusyError("Ticket Job changed while its lane ran")
             if latest["ticket_agent_invocations"].get(number) != self._last_invocation:
@@ -284,7 +293,7 @@ class TicketState:
                 for key in ("status", "terminal_kind", "diagnostics", "requeue_required"):
                     latest[key] = copy_json_tree(state.get(key))
             _merge_ticket_cleanup(latest, state, job)
-            self.states._save_work_and_notify_unlocked(
+            durable = self.states._save_work_and_notify_unlocked(
                 run_id, latest, baseline, ticket_number=self.ticket_number,
             )
             state["ticket_work_queue"] = copy_json_tree(latest["ticket_work_queue"])
@@ -314,10 +323,17 @@ class TicketState:
             # Persistence normalizes diagnostic payloads (including Git control
             # characters). Compare subsequent writes with the durable baseline,
             # rather than the unsanitized in-memory payload we just saved.
-            from agent_run.state import _sanitize_durable_errors
-            baseline = _sanitize_durable_errors({
-                "job": latest["ticket_jobs"][number], "invocation": invocation,
-            })
+            if durable is not None:
+                baseline = copy_json_tree({
+                    "job": durable["ticket_jobs"][number],
+                    "invocation": durable["ticket_agent_invocations"].get(number),
+                })
+            else:
+                # Custom save hooks may retain the older void-return seam.
+                from agent_run.state import _sanitize_durable_errors
+                baseline = _sanitize_durable_errors({
+                    "job": latest["ticket_jobs"][number], "invocation": invocation,
+                })
             self._last_job = baseline["job"]
             self._last_invocation = baseline["invocation"] if isinstance(invocation, dict) else None
 
@@ -362,12 +378,12 @@ class TicketState:
             return
 
         def commit() -> None:
-            latest = self.states.load_work_run(self.run_id, self.ticket_number, thin_timeline=True)
-            if latest is None:
+            loaded = self.states._load_work_for_update(self.run_id, self.ticket_number, thin_timeline=True)
+            if loaded is None:
                 raise ValueError("Delivery Run disappeared during Ticket failure")
+            latest, baseline = loaded
             if latest.get("status") in RUN_STOP_STATUSES:
                 raise TaskControlBusyError("Ticket lost Run authorization")
-            baseline = copy_json_tree(latest)
             number = str(self.ticket_number)
             job = latest["ticket_jobs"].get(number)
             if not isinstance(job, dict) or _execution_job(job) != _execution_job(self._last_job):
@@ -425,7 +441,7 @@ class TicketState:
         from agent_run.controller import _operator_gate_diagnostic
 
         def commit() -> None:
-            latest = self.states.load_current_run(self.run_id)
+            latest = self._load_owned_run(self.run_id)
             if latest is None:
                 raise ValueError("Delivery Run disappeared during credential failure")
             if latest.get("status") in RUN_STOP_STATUSES or latest.get("terminal_kind") == "permanent_blocked":

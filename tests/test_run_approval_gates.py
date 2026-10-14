@@ -9,6 +9,9 @@ import pytest
 
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.runner_credentials import RunnerCredentialError
+from agent_run.operator_action_facts import operator_action_facts
+from agent_run.operator_gate import operator_gate_identity_is_consistent
+from agent_run.state_contract import require_current_run_state
 from support.cli import load_only_run_state
 from support.inprocess_cli import invoke_cli_inprocess
 from support.parent_approval_update import append_remote, git_command
@@ -58,6 +61,33 @@ def test_run_approval_update_preserves_hard_gates(
     assert after["run_acceptance"]["review_budget"] == before["run_acceptance"]["review_budget"]
     assert after["run_acceptance"]["ci_recovery"] == before["run_acceptance"]["ci_recovery"]
     assert "approval_update" not in after["run_publication"]
+    if gate in {"foreign_pr", "permission"}:
+        expected_status = "deterministic_contradiction" if gate == "foreign_pr" else "execution_failed"
+        assert after["status"] == expected_status
+        require_current_run_state(after)
+        fact, = operator_action_facts(after)
+        assert fact["work_subject"] == f"run-publication:{before['run_id']}"
+        assert fact["status_code"] == expected_status
+        assert fact["action_kind"] == (
+            "deterministic_contradiction" if gate == "foreign_pr" else "execution_failure"
+        )
     external = json.loads(fixture.read_text())["delivery"]
     for field in ("pull_requests", "published_branches", "closed_issues", "mutations"):
         assert external.get(field) == data["delivery"].get(field)
+
+
+@pytest.mark.parametrize("binding", ["missing", "wrong_subject", "wrong_phase", "wrong_action"])
+def test_retained_approval_rejects_inaccurate_fault_binding(binding: str) -> None:
+    evidence = {
+        "work_subject": "run-publication:r1", "phase": "ready_for_approval",
+        "action_kind": "deterministic_contradiction", "reason": "foreign_pr",
+    }
+    if binding != "missing":
+        field = {"wrong_subject": "work_subject", "wrong_phase": "phase", "wrong_action": "action_kind"}[binding]
+        evidence[field] = "different"
+    state = {
+        "run_id": "r1", "status": "deterministic_contradiction",
+        "run_publication": {"phase": "ready_for_approval"},
+        "diagnostics": [] if binding == "missing" else [{"operator_gate": evidence}],
+    }
+    assert not operator_gate_identity_is_consistent(state)

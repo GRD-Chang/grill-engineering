@@ -47,6 +47,7 @@ from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
@@ -92,7 +93,7 @@ class RunAcceptanceEngine:
         currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.agents = agents
         self.default_head_sha = default_head_sha
         self.github = github
@@ -104,7 +105,7 @@ class RunAcceptanceEngine:
             RunRepairRequests(git, github) if github is not None else None
         )
         self.repair_currentness = (
-            RunRepairCurrentness(git, github, states)
+            RunRepairCurrentness(git, github, self.states)
             if github is not None
             else None
         )
@@ -112,9 +113,17 @@ class RunAcceptanceEngine:
         self._repair_lifecycle = RunRepairLifecycle(self, self._repair_promotion)
 
     def accept(self, run_id: str) -> dict[str, Any]:
+        self._accept(run_id)
+        state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        return state
+
+    def _accept(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        state.update(self.states.load_delivery_evidence(run_id))  # type: ignore[attr-defined]
         run = state.get("run_acceptance")
         repair = run.get("repair_job") if isinstance(run, dict) else None
         if isinstance(run, dict) and isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
@@ -148,8 +157,14 @@ class RunAcceptanceEngine:
             if not prepare_run_parent_integration(self, state, run):
                 return self._save(state)
             self._invalidate_stale_acceptance(state, run)
+        acceptance_already_complete = run["phase"] == "accepted"
         advance_development_review(RunDevelopmentReview(self, state, run))
-        if run["phase"] == "accepted":
+        if run["phase"] == "accepted" and (
+            not acceptance_already_complete or state.get("status") == "run_acceptance_pending"
+        ):
+            # Reusing an applicable completed review must retain the current
+            # Publication/approval gate; only Acceptance's own handoff advances
+            # the Run to publication work.
             state.update({"status": "run_publication_pending",
                           "terminal_kind": "run_acceptance_passed", "diagnostics": []})
         elif run["phase"] == "ready_for_human":
@@ -219,7 +234,25 @@ class RunAcceptanceEngine:
             )
             context = prepare_review_context(request, semantic_attempt, run, self.git, state)
             run["phase"] = "reviewing"
-            self._save(state)
+
+            def save_review(current: dict[str, Any]) -> dict[str, Any]:
+                # Public Resume leaves the predecessor Invocation resuming
+                # with a pending owner until the backend records its successor;
+                # backend recovery waits have the same pending relationship.
+                # Persist their phase transition together, without inventing
+                # a started Invocation or changing the paid Attempt.
+                active = current.get("active_agent_invocation")
+                bound = active.get("semantic_attempt") if isinstance(active, dict) else None
+                if (
+                    run.get("phase") in {"pending", "reviewing"}
+                    and isinstance(active, dict)
+                    and isinstance(bound, dict)
+                    and bound.get("attempt_id") == semantic_attempt["attempt_id"]
+                ):
+                    run["phase"] = "pending" if active["status"] == "resuming" else "reviewing"
+                return self._save(current)
+
+            save_review(state)
             is_current = lambda: (
                 self._refresh_run_currentness(state)
                 and
@@ -237,7 +270,7 @@ class RunAcceptanceEngine:
             try:
                 review = cast(ReviewResult, execute_agent_work(
                     state, run, request, semantic_attempt,
-                    agents=self.agents, save=self._save, phase="run_acceptance",
+                    agents=self.agents, save=save_review, phase="run_acceptance",
                     boundary=boundary, is_current=is_current,
                 ))
             except InitialCredentialUnavailable as error:

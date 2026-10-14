@@ -22,6 +22,7 @@ from agent_run.state_errors import MissingRunMaterialsError
 from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _passing_artifact, _repair_artifact
 from support.run_scenarios import _completed_run
+from support.state_commits import observe_run_commits
 
 
 def _git(checkout: Path, *args: str) -> str:
@@ -483,18 +484,16 @@ def test_run_integration_return_is_reused_before_git_closeout(
 
     state, states, git, publisher = _two_ticket_run(git_repo, tmp_path)
     agents = CsvIntegrationAgents(0)
-    original_save = states.save_run
     interrupted = False
 
     def crash_after_return(run_id: str, current: dict[str, Any]) -> None:
         nonlocal interrupted
-        original_save(run_id, current)
         attempt = current.get("run_acceptance", {}).get("pending_semantic_attempt", {})
         if not interrupted and attempt.get("role") == "development" and "returned_result" in attempt:
             interrupted = True
             raise SimulatedProcessCrash("interrupt before integration result consumption")
 
-    monkeypatch.setattr(states, "save_run", crash_after_return)
+    observe_run_commits(monkeypatch, states, after=crash_after_return)
     with pytest.raises(SimulatedProcessCrash, match="before integration"):
         RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(state["run_id"])
     reloaded = StateStore(states.root)
@@ -559,19 +558,17 @@ def test_saved_run_review_settles_before_default_branch_reintegration(
             )
 
     agents = Agents()
-    original_save = states.save_run
     interrupted = False
 
     def interrupt_after_return(identifier: str, saved: dict[str, Any]) -> None:
         nonlocal interrupted
-        original_save(identifier, saved)
         pending = saved.get("run_acceptance", {}).get("pending_semantic_attempt", {})
         if not interrupted and pending.get("role") == "reviewer" and "returned_result" in pending:
             interrupted = True
             raise RuntimeError("interrupted after saved review")
 
     with monkeypatch.context() as fault:
-        fault.setattr(states, "save_run", interrupt_after_return)
+        observe_run_commits(fault, states, after=interrupt_after_return)
         with pytest.raises(RuntimeError, match="after saved review"):
             RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(run_id)
     old_attempt = StateStore(states.root).load_current_run(run_id)["run_acceptance"]["pending_semantic_attempt"]
@@ -640,16 +637,14 @@ def test_saved_local_review_is_invalidated_before_conflicting_merge_tree_check(
             return DevelopmentResult("local-integration-developer", "Resolved default integration.")
 
     agents = Agents()
-    original_save = states.save_run
 
     def interrupt_saved_return(identifier: str, saved: dict[str, Any]) -> None:
-        original_save(identifier, saved)
         pending = saved.get("run_acceptance", {}).get("pending_semantic_attempt", {})
         if "returned_result" in pending:
             raise RuntimeError("saved local review interrupted")
 
     with monkeypatch.context() as fault:
-        fault.setattr(states, "save_run", interrupt_saved_return)
+        observe_run_commits(fault, states, after=interrupt_saved_return)
         with pytest.raises(RuntimeError, match="local review interrupted"):
             RunAcceptanceEngine(git=git, states=states, agents=agents).accept(run_id)
     attempt = StateStore(states.root).load_current_run(run_id)["run_acceptance"]["pending_semantic_attempt"]

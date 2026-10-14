@@ -12,6 +12,7 @@ from agent_run.executor_admission import executor_failure_scope, report_executor
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notifications import Notifications
+from agent_run.object_state import ObjectStateStore
 from agent_run.messages import error_detail, selected_language
 from agent_run.runner_lease import retain_lease_for_systemd_exit, runner_usage_lease
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
@@ -86,20 +87,29 @@ class DeliveryExecutor:
         state = states.load_current_run(run_id)
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
+        def observation_state() -> dict[str, Any] | None:
+            # Presentation reads happen outside business transactions. Its
+            # complete facts retain sibling gates and completed Ticket events.
+            if isinstance(states, ObjectStateStore):
+                return states.load_full_run(run_id)
+            return states.load_current_run(run_id)
+
         feedback = self.resume_feedback
         if feedback is not None:
             if action_id is not None:
                 feedback.identity = action_id
-            feedback.observe(state)
+            feedback.observe(observation_state() or state)
         def notification_state() -> dict[str, Any] | None:
-            current = states.load_current_run(run_id)
+            current = observation_state()
             return feedback.project(current) if feedback and current is not None else current
 
         notifications = Notifications(states.root, feedback.project(state) if feedback else state,
                                       load_state=notification_state)
         if feedback is not None:
             feedback.attach(notifications, action_id)
-        states.run_saved_observer = feedback.observe if feedback else notifications.observe
+        states.run_saved_observer = (
+            lambda saved: feedback.observe(observation_state() or saved)
+        ) if feedback else notifications.observe
         driver: _RunDriver | None = None
 
         def record_failure(error: BaseException) -> bool:
@@ -126,7 +136,7 @@ class DeliveryExecutor:
                 if control_operation is None:
                     result = driver.advance(state)
                     if feedback is not None:
-                        feedback.observe(dict(result))
+                        feedback.observe(observation_state() or dict(result))
                     return result
                 return driver.advance(state, control_operation=control_operation)
             except KeyboardInterrupt as error:
@@ -139,7 +149,7 @@ class DeliveryExecutor:
             except Exception as error:
                 report_executor_failure(error)
                 if feedback is not None:
-                    feedback.observe(states.load_current_run(run_id) or state)
+                    feedback.observe(observation_state() or state)
                 raise
             finally:
                 states.run_saved_observer = None

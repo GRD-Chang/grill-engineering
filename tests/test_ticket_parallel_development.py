@@ -1101,7 +1101,8 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
     saved_by_controller = Event()
     stopped = Event()
     states.run_saved_observer = lambda _state: saved_by_controller.set()
-    original_load = states.load_run
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    original_load = controller.states.load_scheduler_run
 
     def load_with_stop(run_id: str) -> dict[str, Any] | None:
         if saved_by_controller.is_set() and not stopped.is_set():
@@ -1114,8 +1115,7 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
             )
         return original_load(run_id)
 
-    monkeypatch.setattr(states, "load_run", load_with_stop)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    monkeypatch.setattr(controller.states, "load_scheduler_run", load_with_stop)
     observed, _ = controller.resume(str(state["run_id"]))
     assert saved_by_controller.is_set() and stopped.is_set()
     assert observed["status"] == "operator_stopped"

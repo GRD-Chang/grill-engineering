@@ -58,6 +58,7 @@ from agent_run.review_budget import (
 )
 
 from agent_run.agent_work import AgentWorkScope
+from agent_run.state_contract import require_current_run_state
 
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 
@@ -204,7 +205,10 @@ class ChangeDeliveryEngine:
         """Validate and atomically persist one complete Observation commit."""
 
         sync_fallback_receipt_observation(job, pr_number)
-        self.state_store.states.validate_work_projection(state)
+        if self.contract.label.startswith("ticket-"):
+            self.state_store.states.validate_work_projection(state)
+        else:
+            require_current_run_state(state, parent_scope=True)
         return self.save(state)
 
     def run(

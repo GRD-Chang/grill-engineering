@@ -709,3 +709,28 @@ def test_completion_omits_total_when_resume_proves_missing_execution(role: str) 
     state["agent_invocation_history"].insert(0, earlier)
     completed = next(event for event in events(state) if event["kind"] == "ticket_completed")
     assert completed["total_seconds"] == 14
+
+@pytest.mark.parametrize(("role", "outcome"), [
+    ("development", "candidate"), ("review", "acceptance_artifact"),
+    ("publication", "publication_artifact"),
+])
+@pytest.mark.parametrize("status", ["active", "ready_for_human", "execution_failed", "completed"])
+def test_notification_facts_match_complete_history_details(
+    role: str, outcome: str, status: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run import notification_events
+
+    state = state_with_round(role, outcome)
+    state.update(status=status, human_blockers=["original blocker"] if status == "ready_for_human" else [])
+    if role == "review":
+        state["semantic_agent_attempts"][0]["acceptance_artifact"] = {
+            "checks": {"spec": {"status": "fail", "findings": ["original finding"]}}}
+    projected = events(state)
+    records = notification_events.history_records
+
+    def complete(*args: Any, **kwargs: Any) -> Any:
+        kwargs["presentation_details"] = True
+        return records(*args, **kwargs)
+
+    monkeypatch.setattr(notification_events, "history_records", complete)
+    assert events(state) == projected

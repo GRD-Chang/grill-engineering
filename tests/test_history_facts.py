@@ -70,3 +70,25 @@ def test_ticket_ci_history_retains_its_cumulative_allowance_snapshot() -> None:
     for language, expected in (("zh", "累计开发 2/3"), ("en", "cumulative development at round start 2/3")):
         with presentation_language(language):
             assert expected in _budget_line({"role": "development", "budget_facts": facts})
+
+
+def test_notification_history_retains_semantics_without_unused_presentation_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_run import history_facts
+    from support.notification import state_with_round
+
+    state = state_with_round("review", "acceptance_artifact")
+    state["semantic_agent_attempts"][0]["acceptance_artifact"] = {
+        "checks": {"spec": {"status": "fail", "findings": ["original finding"]}}}
+    audit = {"semantic_agent_attempts": state["semantic_agent_attempts"],
+             "agent_invocations": state["agent_invocation_history"]}
+    complete = history_records(state, audit)
+
+    def unused(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("notification calculated unused History presentation details")
+
+    monkeypatch.setattr(history_facts, "_budget_facts_for_attempt", unused)
+    monkeypatch.setattr(history_facts, "_supporting_records", unused)
+    concise = history_records(state, audit, presentation_details=False)
+    expected = [{key: value for key, value in record.items() if key not in {"budget_facts", "supporting_records"}}
+                for record in complete]
+    assert concise == expected

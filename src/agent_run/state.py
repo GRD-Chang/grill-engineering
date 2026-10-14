@@ -142,6 +142,29 @@ class StateStore:
 
         require_current_run_state(state)
 
+    def _load_work_for_update(
+        self, run_id: str, ticket_number: int | None = None, *, thin_timeline: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read and validate before returning an isolated transaction baseline.
+
+        No caller can mutate the loaded projection between its default read
+        and this source loan. Custom readers/validators keep exact comparison.
+        Neither baseline bypasses the later ownership or authorization checks.
+        """
+        from agent_run import state_contract
+
+        state = self.load_work_run(run_id, ticket_number, thin_timeline=thin_timeline)
+        if state is None:
+            return None
+        ordinary = (
+            getattr(self.load_work_run, "__func__", None) is _DEFAULT_LOAD_WORK_RUN
+            and getattr(self._repository.load_work, "__func__", None) is _DEFAULT_REPOSITORY_LOAD_WORK
+            and state_contract.require_current_work_state is state_contract._DEFAULT_WORK_VALIDATION
+        )
+        baseline = (self._repository.current_work_baseline(run_id) if ordinary
+                    else self._repository.work_baseline(run_id, state))
+        return state, baseline
+
     def ticket_pause_requested(self, run_id: str, ticket_number: int) -> bool:
         """Read a Ticket Stop observation; commits independently recheck it."""
         self._reject_legacy_run(run_id)
@@ -161,10 +184,10 @@ class StateStore:
     def _save_work_and_notify_unlocked(
         self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
         *, ticket_number: int | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         from agent_run.state_work import save_work
 
-        save_work(self._repository, run_id, state, baseline, ticket_number)
+        durable = save_work(self._repository, run_id, state, baseline, ticket_number)
         notifications = self._commit_context.notifications
         # Existing observers consume a complete Run. Resolve their query only
         # after admission, Control and database locks have all been released;
@@ -173,6 +196,7 @@ class StateStore:
             (lambda: self.load_current_run(run_id))
             if self.run_saved_observer is not None else None
         )
+        return durable
 
     def update_run(
         self, run_id: str, update: Callable[[dict[str, Any]], None],
@@ -221,6 +245,12 @@ class StateStore:
             except BaseException:
                 del notifications[checkpoint:]
                 self._expected_run_state.by_run = expected
+                # Object projections may have advanced inside a nested save.
+                # An outer rollback invalidates those provisional baselines.
+                for attribute in ("_object_store_adapter", "_parent_object_store_adapter"):
+                    adapter = getattr(self, attribute, None)
+                    if adapter is not None:
+                        adapter.invalidate_baseline()
                 raise
 
     @contextmanager
@@ -457,7 +487,7 @@ class StateStore:
 
     @contextmanager
     def current_run_reader(
-        self, run_id: str, *, work_only: bool = False,
+        self, run_id: str, *, work_only: bool = False, thin_timeline: bool = False,
     ) -> Iterator[Callable[[], dict[str, Any] | None]]:
         """Retain one read-only scheduling view while SQLite reports no commit.
 
@@ -477,18 +507,29 @@ class StateStore:
                 watcher.require_active()
                 self._reject_legacy_run(run_id)
                 if self._repository.in_transaction:
-                    return self.load_work_run(run_id) if work_only else self.load_current_run(run_id)
+                    return self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
+                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
                 version = watcher.version()
                 if (retained and version == previous_version
                         and previous_limit == self._repository.max_bytes):
                     return previous
                 with self._repository.use_reader(watcher.connection):
-                    current = self.load_work_run(run_id) if work_only else self.load_current_run(run_id)
+                    current = self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
+                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
                 # Sampled before reading: a concurrent commit during the read
                 # can only cause an extra refresh, never label old facts new.
                 previous_version = version
                 previous_limit = self._repository.max_bytes
-                retained = current is None or self._repository._check_size(current) <= 512 * 1024
+                size = None
+                if (work_only and getattr(self.load_work_run, "__func__", None) is _DEFAULT_LOAD_WORK_RUN
+                        and getattr(self._repository.load_work, "__func__", None) is _DEFAULT_REPOSITORY_LOAD_WORK):
+                    # The default work read already computed this exact view's
+                    # logical size, with current source/material proofs. Reuse
+                    # only its scalar result, not a prior budget or Run size.
+                    size = getattr(self._repository._local, "work_projection_bytes", None)
+                retained = current is None or (
+                    size if size is not None else self._repository._check_size(current)
+                ) <= 512 * 1024
                 previous = current if retained else None
                 return current
 
@@ -531,6 +572,8 @@ class StateStore:
 
 
 # Preserve custom read/validation hooks, including class-level replacements.
+_DEFAULT_LOAD_WORK_RUN = StateStore.load_work_run
+_DEFAULT_REPOSITORY_LOAD_WORK = SQLiteStateRepository.load_work
 _DEFAULT_LOAD_RUN = StateStore.load_run
 _DEFAULT_VALIDATE_CURRENT_RUN = StateStore._validate_current_run
 
@@ -999,14 +1042,18 @@ def _timeline_result(state: dict[str, Any]) -> object:
     )
 
 
-def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_durable_errors(
+    value: dict[str, Any], *, redacted: dict[str, str] | None = None,
+    key_kinds: dict[str, tuple[bool, bool, bool]] | None = None,
+) -> dict[str, Any]:
     """Build an isolated durable copy while bounding and redacting payloads."""
 
     # Static instructions are intentional user content, not diagnostic payloads.
     # Preserve them verbatim across restart; dynamic output remains sanitized.
     sanitized = _sanitize_error_value(
         {key: item for key, item in value.items() if key != "prompt_resources"},
-        redacted={}, key_kinds={},
+        redacted={} if redacted is None else redacted,
+        key_kinds={} if key_kinds is None else key_kinds,
     )
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")

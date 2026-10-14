@@ -3377,6 +3377,7 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
     assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == (
         "requeue_required"
     )
+    before = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
     fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -3384,15 +3385,43 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
     blocked = run_cli(git_repo, fixture, "requeue", run_id)
 
     assert blocked.returncode == 2
-    assert stdout_json(blocked)["status"] == "blocked"
-    diagnostic = stdout_json(blocked)["diagnostics"][0]
-    assert diagnostic["code"] == "task_control"
-    assert diagnostic["operation"] == "requeue"
-    assert diagnostic["application_status"] == "unknown"
-    # The CLI observation failure and the durable delivery failure are distinct.
-    assert load_only_run_state(git_repo)["diagnostics"][0]["code"] == (
+    output = stdout_json(blocked)
+    assert output["status"] == "blocked"
+    assert output["diagnostics"][0]["code"] == (
         "change_pr_closed_or_merged_externally"
     )
+    # The blocked decision is durable and its Action is observed and closed.
+    # An external close does not authorize replacement or another close.
+    assert output["action"]["status"] == "applied"
+    audit = output["action_audit"]
+    assert audit["kind"] == "requeue"
+    assert audit["status"] == "completed"
+    assert audit["result_status"] == "blocked"
+    assert audit["failure"] is None
+    after = load_only_run_state(git_repo)
+    assert after["diagnostics"][0]["code"] == output["diagnostics"][0]["code"]
+    for field in (
+        "parent_generation", "candidate_sha", "pr_number", "parent_branch",
+        "modification_attempts", "validation_attempts", "publication_attempts",
+        "review_budget", "ci_recovery",
+    ):
+        assert after["parent_job"][field] == before["parent_job"][field]
+    assert after.get("retired_job_generations", []) == before.get("retired_job_generations", [])
+    assert "requeue_transition" not in after
+    assert after["action_application_receipt"]["action_id"] == audit["action_id"]
+    control = TaskControlStore(managed_state(git_repo)).load(
+        TaskKey(managed_repo(git_repo), "example/project", 1)
+    )
+    assert control is not None
+    assert control["action"]["action_id"] == audit["action_id"]
+    assert control["action"]["application_observed"] is True
+    assert control["action"]["status"] == "completed"
+    assert control["action"]["result_status"] == "blocked"
+    assert control["executor"]["action_id"] == audit["action_id"]
+    assert control["executor"]["status"] == "exited"
+    external = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    for field in ("pull_requests", "published_branches", "mutations", "closed_issues"):
+        assert external.get(field) == data["delivery"].get(field)
 
 
 def test_child_addition_cannot_continue_parent_only_delivery(

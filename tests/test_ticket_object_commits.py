@@ -50,6 +50,58 @@ class _Agents(TicketAgents):
         return super().publication(request)
 
 
+def test_work_update_returns_isolated_current_baseline_and_rejects_intervening_sql(git_repo: Path) -> None:
+    state, states, _, _ = ticket_run(git_repo, (2, 3))
+    run_id = state["run_id"]
+
+    def observe() -> None:
+        loaded, baseline = states._load_work_for_update(run_id, 2, thin_timeline=True)
+        assert baseline is states._repository.current_work_baseline(run_id)
+        loaded["updated_at"] = "caller mutation"
+        assert baseline["updated_at"] != loaded["updated_at"]
+        states._repository._local.connection.execute("UPDATE runs SET status=status WHERE run_id=?", (run_id,))
+        with pytest.raises(ValueError, match="current transaction read"):
+            states._repository.current_work_baseline(run_id)
+
+    states._commit_run(observe)
+    assert states.load_current_run(run_id)["updated_at"] == state["updated_at"]
+
+
+@pytest.mark.parametrize("custom", ["reader", "validator"])
+def test_work_update_custom_hooks_cannot_substitute_a_changed_baseline(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, custom: str,
+) -> None:
+    from agent_run import state_contract
+
+    state, states, _, _ = ticket_run(git_repo, (2, 3))
+    run_id = state["run_id"]
+    if custom == "reader":
+        read = states.load_work_run
+
+        def altered_read(*args, **kwargs):
+            loaded = read(*args, **kwargs)
+            loaded["updated_at"] = "custom hook mutation"
+            return loaded
+
+        monkeypatch.setattr(states, "load_work_run", altered_read)
+    else:
+        validate = state_contract.require_current_work_state
+
+        def altered_validate(loaded, *args, **kwargs):
+            validate(loaded, *args, **kwargs)
+            loaded["updated_at"] = "custom hook mutation"
+
+        monkeypatch.setattr(state_contract, "require_current_work_state", altered_validate)
+
+    def commit() -> None:
+        loaded, baseline = states._load_work_for_update(run_id, 2, thin_timeline=True)
+        states._repository.save_work(run_id, loaded, baseline)
+
+    with pytest.raises(ValueError, match="current transaction baseline"):
+        states._commit_run(commit)
+    assert StateStore(states.root).load_current_run(run_id)["updated_at"] == state["updated_at"]
+
+
 @pytest.mark.parametrize("blocked_ticket", [2, 3])
 def test_human_blocker_history_retains_actual_ticket_and_review_evidence(
     git_repo: Path, blocked_ticket: int,

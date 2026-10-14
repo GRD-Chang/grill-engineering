@@ -25,6 +25,7 @@ from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import SimulatedProcessCrash, StateStore
 from support.delivery_agents import PassAgents, issue
 from support.seeding import write_fixture
+from support.state_commits import observe_run_commits
 
 
 class CrashBeforeResultConsumption(StateStore):
@@ -35,7 +36,7 @@ class CrashBeforeResultConsumption(StateStore):
         self.ticket_number = ticket_number
         self.crashed = False
 
-    def _check_interruption(self, state: dict[str, Any]) -> None:
+    def before_save(self, run_id: str, state: dict[str, Any]) -> None:
         job = (state["ticket_jobs"].get(str(self.ticket_number))
                if self.ticket_number is not None else state.get(self.subject))
         if isinstance(job, dict):
@@ -55,19 +56,6 @@ class CrashBeforeResultConsumption(StateStore):
                 self.crashed = True
                 raise SimulatedProcessCrash("Agent returned before phase result save")
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
-        self._check_interruption(state)
-        return super()._save_run_unlocked(run_id, state)
-
-    def _save_work_and_notify_unlocked(
-        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
-        *, ticket_number: int | None = None,
-    ) -> None:
-        self._check_interruption(state)
-        super()._save_work_and_notify_unlocked(
-            run_id, state, baseline, ticket_number=ticket_number,
-        )
-
 
 @pytest.mark.parametrize(
     ("parent_only", "role"),
@@ -84,6 +72,7 @@ def test_change_resume_reuses_saved_agent_result(
         git_repo / "github.json", issues={} if parent_only else {"3": issue(3)},
     )
     states = CrashBeforeResultConsumption(workspace.state_root, subject, role)
+    observe_run_commits(monkeypatch, states, before=states.before_save)
     git = GitRepository(git_repo)
     state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
     run_id = str(state["run_id"])
@@ -214,7 +203,7 @@ def test_saved_human_blocker_resume_starts_new_thread_on_same_work(git_repo: Pat
 
 @pytest.mark.parametrize("role", ["development", "reviewer", "publication"])
 def test_returned_ticket_result_closes_without_agent_capacity(
-    git_repo: Path, role: str,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, role: str,
 ) -> None:
     """Reloaded returns finish through the existing stage seam with a full FIFO."""
     from agent_run.delivery_loop import TicketDeliveryLoop
@@ -226,6 +215,7 @@ def test_returned_ticket_result_closes_without_agent_capacity(
     initial, original, git, fixture = ticket_run(git_repo, (2, 3), workers=1)
     run_id = initial["run_id"]
     crashing = CrashBeforeResultConsumption(original.root, "active_ticket_job", role, ticket_number=3)
+    observe_run_commits(monkeypatch, crashing, before=crashing.before_save)
     checkout = original.root / "worktrees" / run_id / "ticket-3"
     agents = PassAgents(checkout)
     publisher = FixtureGitHubPublisher(fixture, git)
@@ -282,6 +272,7 @@ def test_dispatch_consumes_reloaded_return_while_sibling_owns_last_slot(
     crashing = CrashBeforeResultConsumption(
         original.root, "active_ticket_job", "development", ticket_number=3,
     )
+    observe_run_commits(monkeypatch, crashing, before=crashing.before_save)
     calls: list[int] = []
     sibling_started = Event()
 

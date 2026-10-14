@@ -24,6 +24,35 @@ from agent_run.notification_events import events
 from agent_run.status_actions import status_timing
 
 
+def test_timestamp_reuse_keeps_timezone_and_immutable_results() -> None:
+    from agent_run.execution_timing import parse_optional_timestamp, parse_timestamp
+
+    value = "2026-10-14T10:20:30.123456+08:00"
+    expected = datetime.fromisoformat(value)
+    parsed = parse_timestamp(value)
+    assert parsed == expected
+    assert parsed.replace(year=2030) != parse_timestamp(value)
+    assert parse_optional_timestamp(value) == expected.astimezone(UTC)
+    assert parse_timestamp("2026-10-14T10:20:30").tzinfo is UTC
+    assert parse_optional_timestamp("not a timestamp") is None
+
+
+def test_timestamp_reuse_preserves_replaced_datetime_parser(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_run.execution_timing as timing
+
+    value = "2026-10-14T10:20:30+00:00"
+    assert timing.parse_timestamp(value) == datetime.fromisoformat(value)
+
+    class Replacement(datetime):
+        @classmethod
+        def fromisoformat(cls, text: str) -> datetime:
+            assert text == value
+            return datetime(2030, 1, 1, tzinfo=UTC)
+
+    monkeypatch.setattr(timing, "datetime", Replacement)
+    assert timing.parse_timestamp(value) == datetime(2030, 1, 1, tzinfo=UTC)
+
+
 def invocation(start: str = "00:00:00", end: str | None = "00:01:00", **facts: Any) -> dict[str, Any]:
     return {
         "started_at": f"2026-09-21T{start}+00:00",

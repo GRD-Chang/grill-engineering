@@ -16,6 +16,7 @@ from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import StateStore
 from support.delivery_agents import PassAgents, issue
 from support.seeding import write_fixture
+from support.state_commits import observe_run_commits
 
 
 def _git(root: Path, *args: str) -> str:
@@ -57,8 +58,6 @@ def test_target_append_preserves_unknown_pr_until_public_resume_can_settle(
         return number
 
     monkeypatch.setattr(publisher, operation, interrupt)
-    save_method = "_save_run_unlocked" if parent_only else "_save_work_and_notify_unlocked"
-    original_save = getattr(states, save_method)
     injected = False
 
     def save(identifier: str, current: dict[str, Any], *args: Any, **kwargs: Any) -> None:
@@ -66,9 +65,8 @@ def test_target_append_preserves_unknown_pr_until_public_resume_can_settle(
         if applied and fault == "result_save" and not injected and "ticket_write_intent" not in current[subject]:
             injected = True
             raise OSError("Change PR result save lost")
-        original_save(identifier, current, *args, **kwargs)
 
-    monkeypatch.setattr(states, save_method, save)
+    observe_run_commits(monkeypatch, states, before=save)
     engine = engine_type(git=git, states=states, github=publisher, agents=agents)
     if parent_only:
         with pytest.raises((RuntimeError, OSError), match="(response|save) lost"):

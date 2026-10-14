@@ -35,7 +35,8 @@ CLI、安装器等未单列的模块直接选择其测试文件。公共接口�
 本地最终验收使用 `make test-full`：先检查 pip，并真实创建、关闭 Linux memfd/pidfd，再执行完整套件，默认固定六个 pytest worker；缺少接口或内核拒绝调用时拒绝全量入口，不以跳过进程边界测试代替验收。`make typecheck` 执行完整类型检查。
 
 提交前优先使用 CI 相同的 CPython 3.11.16 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Python 版本号本身不能证明构建支持 memfd/pidfd，部分便携构建缺少这些接口。先激活所选 venv，并确认 `python` 与 `python3` 都来自该环境；仅指定 Make 的 `PYTHON` 不会改变所有外部工具的解释器选择。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
-六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`；CI 显式使用这个双 worker 命令，runner 规格和 job 数量不变。
+六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`。
+CI 使用两个独立的产品测试分片，每台 runner 仍固定两个 worker；不提高单机并发或测试超时。每个 worker 完整收集用例后，按排序后的 nodeid 轮流分配至分片，两个分片互斥且并集为完整套件。参数错误、重复 nodeid 或空分片明确失败。默认本地入口不分片。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
 `make test-full` 未收到显式 `TMPDIR` 时，在标准且可写的 `/run/user/<uid>` tmpfs 中放置测试临时文件；其他环境沿用 `/tmp`。
 该路径对受控 Worker 子进程可见，避免 `/dev/shm` 在 bubblewrap 的 `/dev` 挂载下不可见；需要对照磁盘临时目录时可显式设置 `TMPDIR=/tmp`。
@@ -50,13 +51,16 @@ Git 初始模板每个 worker 只创建一次，每个用例复制独立文件�
 
 ## CI 对齐与诊断
 
-CI 的 `Run tests` 与本地 `make test-report TEST_WORKERS=2` 共用完整测试入口，不过滤集成测试；
+CI 每个分片的 `Run tests` 使用 `make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=0'`（另一分片为 index 1）。
+两个分片全部成功后，必需的 `quality` 检查才允许继续后续检查；任何失败、取消或意外跳过都会使汇总失败。分片各自上传独立诊断，仍保留全部集成测试；单个分片的通过不代表全量通过。
 本地六 worker 的对应诊断入口是 `make test-report`。已安装 CLI 的 `agent-run --help` 和
 `make typecheck` 仍需单独检查。快速回归与全量的验证范围不同，不能用 `make test` 通过推断 CI 必须通过。
 
 报告包含 Python、SQLite 等环境版本与系统能力、JUnit、最慢用例各阶段耗时、测试输出和 GNU time 资源记录。
 CI 使用 `PYTEST_ARGS='-v'`，逐例记录 nodeid 与结果；即使 job 到时取消、JUnit 和
 资源汇总尚未生成，已有失败也能在上传的测试日志中定位。
+`quality` 的 `Run tests` 是分片状态汇总；排查实际 pytest 失败或取消时，读取同一 run 的
+`product-tests` 作业日志和 `test-diagnostics-shard-0` / `test-diagnostics-shard-1` 附件。
 默认写入 `.test-results/`，下一次覆盖；需要比较时用独立的 `TEST_RESULTS`。CI 无论成功或失败均上传报告，
 保留七天。JUnit 的用例时间包含 setup/call/teardown；并行用例时间求和不等于墙钟，GNU time 最大 RSS
 也不等于并行进程树内存之和。诊断后清理本次本地报告。

@@ -1720,14 +1720,23 @@ def test_fallback_pending_observation_is_one_contract_valid_commit(
             *, ticket_number: int | None = None,
         ) -> None:
             job = state.get("active_ticket_job")
-            if isinstance(job, dict) and isinstance(
+            observed = isinstance(job, dict) and isinstance(
                 job.get("required_checks_evidence"), dict
-            ):
-                require_current_run_state(state)
-                self.observation_commits.append(deepcopy(state))
+            )
+            if observed:
+                from agent_run.state_contract import require_current_work_state
+
+                require_current_work_state(
+                    state, self._repository.work_archives(state),
+                    self._repository.work_attempts(state), self._repository.work_timelines(),
+                )
             super()._save_work_and_notify_unlocked(
                 run_id, state, baseline, ticket_number=ticket_number,
             )
+            if observed:
+                committed = self.load_current_run(run_id)
+                assert committed is not None
+                self.observation_commits.append(committed)
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = ObservationRecordingStateStore(git_repo / ".agent-run")

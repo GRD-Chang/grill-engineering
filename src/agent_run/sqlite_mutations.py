@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from agent_run.sqlite_state import SQLiteStateRepository
 
 from agent_run.sqlite_rows import read_material_ids
+from agent_run.sqlite_work_patch import patch_work_objects
 from agent_run import sqlite_job_history, sqlite_timeline
 
 Row = tuple[str | int, ...]
@@ -88,8 +89,8 @@ def patch_run(
     )
     native = _batch(
         connection, ((run_id, identity) for identity in materials.keys() - references),
-        sql="INSERT INTO run_material_refs VALUES (?, ?)",
-        native_sql="INSERT INTO run_material_refs SELECT json_extract(value, '$[0]'), "
+        sql="INSERT INTO run_material_refs(run_id, material_id) VALUES (?, ?)",
+        native_sql="INSERT INTO run_material_refs(run_id, material_id) SELECT json_extract(value, '$[0]'), "
                    "json_extract(value, '$[1]') FROM json_each(?)",
         native=native,
     )
@@ -102,43 +103,6 @@ def patch_run(
                    "(SELECT 1 FROM run_material_refs r WHERE r.material_id = run_materials.material_id)",
         native=native,
     )
-
-
-def patch_work_objects(
-    connection: sqlite3.Connection, run_id: str, *, replacements: Mapping[str, tuple[str, str]],
-    deleted: set[str], materials: Mapping[str, str], references: Mapping[str, set[str]], native: bool,
-) -> bool:
-    """Replace only selected objects and reclaim only their released materials."""
-    removed: set[str] = set()
-    for path in replacements.keys() | deleted:
-        removed.update(row[0] for row in connection.execute(
-            "SELECT material_id FROM run_object_material_refs WHERE run_id = ? AND object_path = ?", (run_id, path)))
-        connection.execute("DELETE FROM run_object_material_refs WHERE run_id = ? AND object_path = ?", (run_id, path))
-    native = _batch(connection, ((identity, value, len(value.encode("utf-8"))) for identity, value in materials.items()),
-        sql="INSERT OR IGNORE INTO run_materials VALUES (?, ?, ?)",
-        native_sql="INSERT OR IGNORE INTO run_materials SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?)", native=native)
-    # An existing content identity must prove its actual current bytes; OR IGNORE
-    # cannot silently retain a damaged material behind newly generated references.
-    for identity, value in materials.items():
-        row = connection.execute("SELECT value, byte_length FROM run_materials WHERE material_id = ?", (identity,)).fetchone()
-        if row != (value, len(value.encode("utf-8"))):
-            raise ValueError("Invalid SQLite Run material identity")
-    native = _batch(connection, ((run_id, path) for path in deleted),
-        sql="DELETE FROM run_objects WHERE run_id = ? AND object_path = ?",
-        native_sql="DELETE FROM run_objects WHERE (run_id, object_path) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))", native=native)
-    update = "ON CONFLICT(run_id, object_path) DO UPDATE SET kind=excluded.kind, value_json=excluded.value_json"
-    native = _batch(connection, ((run_id, path, *item) for path, item in replacements.items()),
-        sql="INSERT INTO run_objects VALUES (?, ?, ?, ?) " + update,
-        native_sql="INSERT INTO run_objects SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?) WHERE true " + update, native=native)
-    for path, identities in references.items():
-        connection.executemany("INSERT INTO run_object_material_refs VALUES (?, ?, ?)", ((run_id, path, identity) for identity in identities))
-        connection.executemany("INSERT OR IGNORE INTO run_material_refs VALUES (?, ?)", ((run_id, identity) for identity in identities))
-    for identity in removed:
-        connection.execute("DELETE FROM run_material_refs WHERE run_id = ? AND material_id = ? AND NOT EXISTS "
-                           "(SELECT 1 FROM run_object_material_refs WHERE run_id = ? AND material_id = ?)", (run_id, identity, run_id, identity))
-        connection.execute("DELETE FROM run_materials WHERE material_id = ? AND NOT EXISTS "
-                           "(SELECT 1 FROM run_object_material_refs WHERE material_id = ?)", (identity, identity))
-    return native
 
 
 def _same(left: Any, right: Any) -> bool:
@@ -163,7 +127,7 @@ def _identity(entry: Any) -> tuple[Any, ...]:
 
 def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str, Any], baseline: Mapping[str, Any],
               *, timeline_updates: Mapping[str, dict[str, Any]] | None = None) -> None:
-    from agent_run.sqlite_objects import (
+    from agent_run.sqlite_work_objects import (
         WorkView, _HISTORY, _HROOT, _CANONICAL, _history_row, _references, _decode, _entry_rows, _object_row,
     )
 
@@ -176,6 +140,10 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
             or any(key in state or key in baseline for key in view.timelines)):
         raise ValueError("SQLite work patch cannot replace unloaded Timeline fields")
     connection = repository._local.connection
+    from agent_run.sqlite_integrity import require_field_sizes
+    from agent_run.sqlite_work_proofs import previous_objects, check_materials, sync_proofs
+
+    require_field_sizes(connection, run_id, max_bytes=repository.max_bytes)
     old_history = baseline.get(_HISTORY, [])
     new_history = state.get(_HISTORY, [])
     if not isinstance(old_history, list) or not isinstance(new_history, list):
@@ -233,6 +201,12 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
     deleted: set[str] = set()
     materials: dict[str, str] = {}
     byte_delta = 0
+    field_deltas: dict[str, int] = {}
+
+    def add_bytes(field: str, amount: int) -> None:
+        nonlocal byte_delta
+        byte_delta += amount
+        field_deltas[field] = field_deltas.get(field, 0) + amount
     moved_references: dict[str, set[str]] = {}
     canonical_count = view.canonical_count
     prior_archives = sqlite_job_history.histories(baseline)
@@ -260,13 +234,14 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
             # The original complete logical size includes this omitted field.
             # A pointer replacement/removal must subtract it without reading
             # its old Review Context bodies; ordinary thin Job updates keep it.
-            byte_delta -= len(encode_json(archive_path[-1]).encode()) + 1 + size + bool(owner)
+            add_bytes(str(archive_path[0]), -(len(encode_json(archive_path[-1]).encode()) + 1 + size + bool(owner)))
             if not owner:
                 prefix = archive_path[:-1]
                 removed_empty_archives[prefix] = removed_empty_archives.get(prefix, 0) + 1
             if encoded not in new_archives:
                 deleted.add(encoded)
-    byte_delta -= sum(max(count - 1, 0) for count in removed_empty_archives.values())
+    for prefix, removed_count in removed_empty_archives.items():
+        add_bytes(str(prefix[0]), -max(removed_count - 1, 0))
 
     def field_paths(key: str, child: str | None = None, *, complete: bool = False) -> set[str]:
         target = (key,) if child is None else (key, child)
@@ -368,9 +343,9 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
         shift = key == "timeline_continuation" and timeline_count == sqlite_timeline.limit(key)
         if timeline_count >= sqlite_timeline.limit(key) and not shift:
             raise ValueError("Invalid SQLite Run Timeline capacity")
-        byte_delta += len(encode_json(event).encode())
+        add_bytes(key, len(encode_json(event).encode()))
         if shift:
-            byte_delta -= len(scope.entries[0].encode())
+            add_bytes(key, -len(scope.entries[0].encode()))
             # Move the exact already-proved objects and closures, never
             # re-encode old events or fetch them through another snapshot.
             for position in range(timeline_count - 1):
@@ -383,7 +358,7 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
             position = timeline_count - 1
         else:
             position = timeline_count
-            byte_delta += bool(timeline_count)
+            add_bytes(key, int(bool(timeline_count)))
             replacements[encode_json((key,))] = ("list", str(timeline_count + 1))
         objects, content = repository._objects({key: [event]})
         materials.update(content)
@@ -396,7 +371,7 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
             continue
         if (key in {"timeline", "timeline_continuation"}
                 and isinstance(baseline.get(key), list) and isinstance(state.get(key), list)):
-            byte_delta += patch_timeline(key, baseline[key], state[key])
+            add_bytes(key, patch_timeline(key, baseline[key], state[key]))
             continue
         if key in {"ticket_jobs", "ticket_agent_invocations"} and isinstance(baseline.get(key), dict) and isinstance(state.get(key), dict):
             old, new = baseline[key], state[key]
@@ -404,26 +379,26 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
                 if child in old and child in new and _same(old[child], new[child]):
                     continue
                 if child in old:
-                    byte_delta -= len(encode_json(child).encode()) + 1 + field_bytes(key, old[child], child, view.history_sizes)
+                    add_bytes(key, -(len(encode_json(child).encode()) + 1 + field_bytes(key, old[child], child, view.history_sizes)))
                 if child in new:
-                    byte_delta += len(encode_json(child).encode()) + 1 + field_bytes(key, new[child], child, new_archives)
+                    add_bytes(key, len(encode_json(child).encode()) + 1 + field_bytes(key, new[child], child, new_archives))
                     encode_field(key, new[child], child)
                 else:
                     deleted.update(field_paths(key, child, complete=True))
             if key == _CANONICAL:
                 canonical_count = view.canonical_count + len(new) - len(old)
-                byte_delta += max(canonical_count - 1, 0) - max(view.canonical_count - 1, 0)
+                add_bytes(key, max(canonical_count - 1, 0) - max(view.canonical_count - 1, 0))
             else:
-                byte_delta += max(len(new) - 1, 0) - max(len(old) - 1, 0)
+                add_bytes(key, max(len(new) - 1, 0) - max(len(old) - 1, 0))
             continue
         if key == _CANONICAL:
             if isinstance(baseline.get(key), dict):
                 raise ValueError("SQLite work patches cannot replace the sparse Invocation collection")
             canonical_count = len(state[key]) if isinstance(state.get(key), dict) else 0
         if key in old_keys:
-            byte_delta -= len(encode_json(key).encode()) + 1 + field_bytes(key, baseline[key], None, view.history_sizes)
+            add_bytes(key, -(len(encode_json(key).encode()) + 1 + field_bytes(key, baseline[key], None, view.history_sizes)))
         if key in new_keys:
-            byte_delta += len(encode_json(key).encode()) + 1 + field_bytes(key, state[key], None, new_archives)
+            add_bytes(key, len(encode_json(key).encode()) + 1 + field_bytes(key, state[key], None, new_archives))
             encode_field(key, state[key])
         else:
             deleted.update(field_paths(key, complete=key == "active_ticket_job" and active_replaced))
@@ -431,14 +406,14 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
     if _HISTORY in baseline and _HISTORY not in state:
         raise ValueError("SQLite work patches cannot delete Invocation history")
     if _HISTORY not in baseline and _HISTORY in state:
-        byte_delta += len(encode_json(_HISTORY).encode()) + 1 + 2
+        add_bytes(_HISTORY, len(encode_json(_HISTORY).encode()) + 1 + 2)
     for position, entry in entries.items():
         if position in prior_entries and _same(prior_entries[position], entry):
             continue
         row = connection.execute("SELECT logical_bytes FROM run_history WHERE run_id = ? AND position = ?",
                                  (run_id, position)).fetchone()
         entry_bytes = len(encode_json(entry).encode())
-        byte_delta += entry_bytes - (row[0] if row is not None else 0)
+        add_bytes(_HISTORY, entry_bytes - (row[0] if row is not None else 0))
         objects, content = repository._objects({_HISTORY: [entry]})
         materials.update(content)
         for path, item in objects.items():
@@ -448,7 +423,7 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
                 if view.objects.get(location) != item:
                     replacements[location] = item
         connection.execute("INSERT OR REPLACE INTO run_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)", _history_row(run_id, position, entry))
-    byte_delta += max(count - 1, 0) - max(view.count - 1, 0)
+    add_bytes(_HISTORY, max(count - 1, 0) - max(view.count - 1, 0))
     logical_bytes = view.logical_bytes + byte_delta
     if not 3 <= logical_bytes <= repository.max_bytes:
         raise ValueError(f"Run state exceeds {repository.max_bytes} byte persistence limit")
@@ -462,6 +437,8 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
     # the current read already verified materials for untouched objects.
     needed_materials = set().union(*references.values()) if references else set()
     materials = {identity: value for identity, value in materials.items() if identity in needed_materials}
+    previous = previous_objects(connection, run_id, view, replacements, deleted)
+    identities = check_materials(connection, run_id, previous, references)
     repository._aggregate_rows = patch_work_objects(connection, run_id, replacements=replacements, deleted=deleted,
         materials=materials, references=references, native=repository._aggregate_rows)
     for path in deleted:
@@ -478,12 +455,23 @@ def save_work(repository: SQLiteStateRepository, run_id: str, state: Mapping[str
             attempt = current_archives[archive_parent][parsed[-1]]
             connection.execute("INSERT OR REPLACE INTO run_job_attempts VALUES (?, ?, ?, ?, ?, ?, ?)",
                                (run_id, *sqlite_job_history.attempt_row(archive_parent, parsed[-1], attempt)))
-    connection.execute("UPDATE run_sizes SET logical_bytes = ?, canonical_count = ? WHERE run_id = ?", (logical_bytes, canonical_count, run_id))
+    connection.execute("UPDATE run_sizes SET logical_bytes = ?, canonical_count = ? WHERE run_id = ? "
+                       "AND (logical_bytes IS NOT ? OR canonical_count IS NOT ?)",
+                       (logical_bytes, canonical_count, run_id, logical_bytes, canonical_count))
+    repository._aggregate_rows = sync_proofs(connection, run_id, view, state, baseline, replacements=replacements, deleted=deleted,
+        previous=previous, references=references, identities=identities, field_deltas=field_deltas,
+        prior_entries=prior_entries, entries=entries, count=count, canonical_count=canonical_count,
+        timeline_updates=timeline_updates, max_bytes=repository.max_bytes, native=repository._aggregate_rows)
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else None
     metadata = [value if isinstance(value, str) else None for value in
                 (state.get("repository"), state.get("status"), state.get("phase"), state.get("created_at"), state.get("updated_at"))]
-    connection.execute("UPDATE runs SET repository=?, parent_number=?, status=?, phase=?, created_at=?, updated_at=? WHERE run_id=?",
-                       (metadata[0], parent_number if type(parent_number) is int else None, *metadata[1:], run_id))
+    values = (metadata[0], parent_number if type(parent_number) is int else None, *metadata[1:])
+    # A no-op work observation must not manufacture a database revision and
+    # force other scheduling readers to rebuild an unchanged projection.
+    # Compare the actual SQL metadata, so drift is still corrected atomically.
+    connection.execute("UPDATE runs SET repository=?, parent_number=?, status=?, phase=?, created_at=?, updated_at=? WHERE run_id=? "
+                       "AND NOT (repository IS ? AND parent_number IS ? AND status IS ? AND phase IS ? AND created_at IS ? AND updated_at IS ?)",
+                       (*values, run_id, *values))
     repository._local.view = None
     repository._local.work_view = None

@@ -129,7 +129,7 @@ def test_approval_change_preserves_existing_scope_identity_and_permission_gates(
     elif gate == "permission":
         assert state["status"] == "execution_failed"
     else:
-        assert state["status"] == "blocked"
+        assert state["status"] == "blocked", result.stdout + result.stderr
 
 
 def test_exhausted_update_resync_pauses_and_resume_renews_only_its_allowance(git_repo: Path) -> None:

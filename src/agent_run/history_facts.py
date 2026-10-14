@@ -30,6 +30,13 @@ from agent_run.attempt_evidence import (
     _supporting_records,
 )
 
+_TIMELINE_RECORD_FIELDS = frozenset({
+    "pr_number", "commit_sha", "thread_id", "approval_granted_at",
+    "required_checks_result", "required_checks_observed_at", "required_checks_evidence",
+    "next_action", "result", "explicit_resume_sequence", "explicit_resume_kind",
+    "explicit_resume_thread_id", "explicit_resume_attempt_id", *CHECKS_HISTORY_FIELDS,
+})
+
 def _history_turning_points(
     state: dict[str, Any], audit: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -43,6 +50,22 @@ def _history_turning_points(
 
     points: list[dict[str, Any]] = []
     timeline_events: list[dict[str, Any]] = []
+    labels: dict[tuple[Any, ...], str] = {}
+
+    def object_label(raw: dict[str, Any]) -> str:
+        subject, ticket = raw.get("history_work_subject"), raw.get("ticket")
+        key: tuple[Any, ...]
+        if isinstance(subject, str):
+            key = ("subject", subject)
+        elif isinstance(ticket, int):
+            key = ("ticket", type(ticket), ticket)
+        else:
+            kind = str(raw.get("kind") or "")
+            key = ("scope", kind if kind in {"parent_phase", "run_acceptance", "run_publication"} else "")
+        if key not in labels:
+            labels[key] = subject_label(state, subject) if isinstance(subject, str) else timeline_object(state, raw)
+        return labels[key]
+
     order = 0
     for timeline in (audit.get("timeline"), audit.get("timeline_continuation")):
         if not isinstance(timeline, list):
@@ -66,43 +89,29 @@ def _history_turning_points(
                 and raw.get("pr_number") is None
             ):
                 continue
-            scope_details = scope_change_details(raw)
-            details.extend(scope_details)
             event = {
                 "at": timestamp,
                 "kind": kind,
-                "object": (
-                    subject_label(state, raw["history_work_subject"])
-                    if isinstance(raw.get("history_work_subject"), str)
-                    else timeline_object(state, raw)
-                ),
-                "phase": raw.get("phase"),
+                "object": object_label(raw),
                 "status": raw.get("status"),
                 "role": raw.get("worker"),
                 "round": raw.get("attempt"),
                 "details": details,
                 "semantic_attempt_id": raw.get("semantic_attempt_id"),
-                "scope_ticket_changes": scope_ticket_changes(raw),
                 "_order": order,
             }
-            for key in (
-                "pr_number",
-                "commit_sha",
-                "thread_id",
-                "approval_granted_at",
-                "required_checks_result",
-                "required_checks_observed_at",
-                "required_checks_evidence",
-                "next_action",
-                "result",
-                "explicit_resume_sequence",
-                "explicit_resume_kind",
-                "explicit_resume_thread_id",
-                "explicit_resume_attempt_id",
-                *CHECKS_HISTORY_FIELDS,
-            ):
-                if raw.get(key) is not None:
-                    event[key] = raw[key]
+            # Ordinary snapshots still close the same Human Blocker scope,
+            # but never become history records. Retain their ordered marker
+            # without copying every presentation field before discarding it.
+            if not _is_history_turning_point(event):
+                timeline_events.append(event)
+                order += 1
+                continue
+            details.extend(scope_change_details(raw))
+            event["phase"] = raw.get("phase")
+            event["scope_ticket_changes"] = scope_ticket_changes(raw)
+            event.update((key, value) for key, value in raw.items()
+                         if key in _TIMELINE_RECORD_FIELDS and value is not None)
             timeline_events.append(event)
             order += 1
 
@@ -316,12 +325,14 @@ def _history_turning_point_identity(point: dict[str, Any]) -> str:
 def history_records(
     state: dict[str, Any],
     audit: dict[str, Any],
-    events: list[dict[str, Any]] | None = None,
+    events: list[dict[str, Any]] | None = None, *, presentation_details: bool = True,
 ) -> list[dict[str, Any]]:
     """Aggregate raw snapshots and invocations into one record per Attempt.
 
     This is a read-only projection.  Raw timeline events remain in the JSON
     audit output; History and notifications consume the same semantic records.
+    Consumers may omit unused presentation details without changing Attempt
+    association, status, evidence, turning points or execution timing.
     """
 
     attempts = audit.get("semantic_agent_attempts")
@@ -375,7 +386,7 @@ def history_records(
             record["turning_points"] = event_by_attempt.get(attempt_id, [])
         else:
             record["turning_points"] = []
-        _finalize_history_record(state, record)
+        _finalize_history_record(state, record, presentation_details=presentation_details)
 
     for index, raw in enumerate(standalone):
         record = _ensure_history_record(
@@ -392,7 +403,7 @@ def history_records(
             },
         )
         record.setdefault("turning_points", []).append(raw)
-        _finalize_history_record(state, record)
+        _finalize_history_record(state, record, presentation_details=presentation_details)
 
     result = list(records_by_key.values())
     result.sort(key=lambda item: (_record_start(item), _record_order(item)))
@@ -467,7 +478,8 @@ def _attempt_key(
     }
     return "identity:" + json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)
 
-def _finalize_history_record(state: dict[str, Any], record: dict[str, Any]) -> None:
+def _finalize_history_record(state: dict[str, Any], record: dict[str, Any], *,
+                             presentation_details: bool = True) -> None:
     if record.get("event_record") is True:
         _finalize_event_record(state, record)
         return
@@ -511,7 +523,7 @@ def _finalize_history_record(state: dict[str, Any], record: dict[str, Any]) -> N
         if type(invocation.get("attempt_count")) is int
     ]
     record["configurations"] = _record_configurations(invocations)
-    details = _history_record_details(state, record)
+    details = _history_record_details(state, record, presentation_details=presentation_details)
     record.update(details)
     record["status_code"] = history_record_status_code(record)
 
@@ -648,7 +660,7 @@ def history_record_status_code(record: dict[str, Any]) -> str:
     } else "completed"
 
 def _history_record_details(
-    state: dict[str, Any], record: dict[str, Any]
+    state: dict[str, Any], record: dict[str, Any], *, presentation_details: bool = True,
 ) -> dict[str, Any]:
     attempt = record.get("attempt")
     attempt_view = dict(attempt) if isinstance(attempt, dict) else {}
@@ -676,14 +688,13 @@ def _history_record_details(
     return {
         "findings": findings,
         "acceptance_artifact": artifact,
-        "budget_facts": _budget_facts_for_attempt(state, attempt_view),
+        **({"budget_facts": _budget_facts_for_attempt(state, attempt_view)} if presentation_details else {}),
         "development_summary": _development_summary_for_attempt(
             attempt_view, owners
         ),
         "publication": _publication_for_attempt(attempt_view, owners),
-        "supporting_records": _supporting_records(
-            owners, attempt_view, invocation_values
-        ),
+        **({"supporting_records": _supporting_records(owners, attempt_view, invocation_values)}
+           if presentation_details else {}),
     }
 
 def _record_activity(

@@ -116,6 +116,9 @@ def require_current_work_state(
             require_current_run_state(state)
 
 
+_DEFAULT_WORK_VALIDATION = require_current_work_state
+
+
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
 _ACTIVE_RUN_REPAIR_PHASES = frozenset(
     {
@@ -141,15 +144,22 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
         "outcome",
     }
 )
-def require_current_run_state(state: dict[str, Any]) -> None:
+def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = False) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
-    _validate_current_run_state(state, {})
+    if parent_scope:
+        # This is a validation scope, never a replacement authority record.
+        # Delivery evidence attached by a caller remains outside Parent writes.
+        from agent_run.object_state import _PARENT_EXCLUDED_FIELDS
+        state = {key: value for key, value in state.items() if key not in _PARENT_EXCLUDED_FIELDS}
+    _validate_current_run_state(state, {}, parent_scope=parent_scope)
 
 
-def _validate_current_run_state(state: dict[str, Any], timelines: Mapping[str, TimelineScope]) -> None:
+def _validate_current_run_state(
+    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+) -> None:
     try:
-        _require_current_run_state(state, timelines)
+        _require_current_run_state(state, timelines, parent_scope=parent_scope)
     except (ValueError, KeyError, TypeError) as error:
         # Protocol identity must be explicit. This is diagnosis of damaged new
         # Runs, never a legacy migration or permission to fill defaults.
@@ -175,7 +185,9 @@ def _validate_current_run_state(state: dict[str, Any], timelines: Mapping[str, T
         ) from error
 
 
-def _require_current_run_state(state: dict[str, Any], timelines: Mapping[str, TimelineScope]) -> None:
+def _require_current_run_state(
+    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+) -> None:
 
     try:
         validate_resources(state.get("prompt_resources"))
@@ -243,7 +255,10 @@ def _require_current_run_state(state: dict[str, Any], timelines: Mapping[str, Ti
         ("diagnostics", list),
         ("status", str),
     ):
-        if key in timelines:
+        if key in timelines or parent_scope and key in {
+            "ticket_jobs", "ticket_agent_invocations", "ticket_pause_requests",
+            "retired_ticket_generations", "pending_ticket_retirements",
+        }:
             continue
         if not isinstance(state.get(key), expected):
             raise IncompatibleRunStateError(
@@ -257,14 +272,17 @@ def _require_current_run_state(state: dict[str, Any], timelines: Mapping[str, Ti
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
-    _require_ticket_integration_queue(state)
-    from agent_run.ticket_work import require_queue
+    if not parent_scope:
+        _require_ticket_integration_queue(state)
+        from agent_run.ticket_work import require_queue
 
-    require_queue(state)
-    from agent_run.resume_intent import require_ticket_resume_receipts
+        require_queue(state)
+        from agent_run.resume_intent import require_ticket_resume_receipts
 
-    require_ticket_resume_receipts(state)
-    _require_ticket_agent_invocations(state)
+        require_ticket_resume_receipts(state)
+        _require_ticket_agent_invocations(state)
+    elif state.get("active_ticket_job") is not None:
+        raise IncompatibleRunStateError("Parent commit cannot own an active Ticket")
     _require_run_branch_write_intent(state)
     _require_run_gate_exclusivity(state)
     if (
@@ -279,7 +297,8 @@ def _require_current_run_state(state: dict[str, Any], timelines: Mapping[str, Ti
         raise IncompatibleRunStateError(
             "legacy state has an inconsistent active Ticket gate mirror"
         )
-    require_completed_ticket_integration_records(state)
+    if not parent_scope:
+        require_completed_ticket_integration_records(state)
     _require_required_checks_observations(state)
     _require_branch_publication_observations(state)
     _require_review_budget_windows(state)
@@ -926,9 +945,11 @@ def _require_policy_snapshot_binding(
 
     if nested is None:
         raise ValueError(f"{location}.policy_snapshot is missing")
-    nested_snapshot = parse_policy_snapshot(nested).snapshot()
-    parent_snapshot = parse_policy_snapshot(parent).snapshot()
-    if nested_snapshot != parent_snapshot:
+    # Parsing normalizes all scalar fields; compare frozen values without
+    # allocating two new mutable snapshot dictionaries for each association.
+    nested_policy = parse_policy_snapshot(nested)
+    parent_policy = parse_policy_snapshot(parent)
+    if nested_policy != parent_policy:
         raise ValueError(f"{location}.policy_snapshot differs from its Run Snapshot")
 
 
@@ -972,7 +993,7 @@ def _require_human_blocker_containers(state: dict[str, Any]) -> None:
 def _human_blocker_subjects(state: dict[str, Any]) -> list[dict[str, Any]]:
     subjects: list[dict[str, Any]] = []
     subjects.extend(
-        job for job in state["ticket_jobs"].values() if isinstance(job, dict)
+        job for job in state.get("ticket_jobs", {}).values() if isinstance(job, dict)
     )
     for key in ("parent_job", "run_acceptance", "run_publication"):
         value = state.get(key)

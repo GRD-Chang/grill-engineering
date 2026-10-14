@@ -37,6 +37,7 @@ from agent_run.agent_profiles import (
 )
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller, _validated_human_response
+from agent_run.object_state import ObjectStateStore, object_store
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import require_clean_run_worktrees
 from agent_run.delivery_policy import (
@@ -1507,6 +1508,11 @@ def _preflight_run(
             f"{run_ids}"
         )
     current = unfinished[0] if unfinished else None
+    if current is not None and isinstance(states, ObjectStateStore):
+        # Public admission refreshes the whole current frontier. A sparse
+        # ordinary-control view omits completed siblings and cannot determine
+        # that the same settled Run Action is still at its approval boundary.
+        current = states.load_scheduler_current_run(str(current["run_id"]))
     if current is not None:
         require_current_run_state(current)
     return current
@@ -1703,6 +1709,7 @@ def _run_control_action(
 ) -> tuple[dict[str, Any], ActionReceipt | None]:
     """Submit Stop/Abandon and observe its independently hosted Executor."""
 
+    states = object_store(states)
     kind = parsed.command
     if kind not in {"stop", "abandon"}:
         raise TaskControlError("unsupported control action")
@@ -1947,6 +1954,7 @@ def _run_lifecycle(
     prepare_executor_session: Callable[[], None] | None = None,
     resume_feedback: ResumeFeedback | None = None,
 ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
+    states = object_store(states)
     if host is None:
         raise ExecutionReadinessError(
             error_message('cli.error.execution_readiness')
@@ -1960,6 +1968,8 @@ def _run_lifecycle(
     current = (
         _preflight_run(task, states)
         if action_kind == "run"
+        else states.load_scheduler_current_run(parsed.run_id)
+        if isinstance(states, ObjectStateStore)
         else states.load_current_run(parsed.run_id)
     )
     if action_kind != "run" and current is None:

@@ -75,6 +75,7 @@ def test_completed_ticket_cleanup_preserves_tracked_modifications(
     )
     (checkout / "README.md").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    states.save_run(run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -115,6 +116,7 @@ def test_completed_ticket_cleanup_preserves_untracked_files(
     )
     (checkout / "unsaved.txt").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    states.save_run(run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -144,6 +146,7 @@ def test_completed_ticket_cleanup_removes_clean_checkout(git_repo: Path) -> None
         checkout=checkout,
     )
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    states.save_run(run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -285,6 +288,7 @@ def test_cleanup_never_deletes_a_maintainer_branch(git_repo: Path) -> None:
     branch = "maintainer/keep-me"
     git.ensure_run_branch(branch, git.resolve("main"))
     state = {"run_id": "run-1", "status": "completed", "ticket_jobs": {}}
+    states.save_run("run-1", state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,

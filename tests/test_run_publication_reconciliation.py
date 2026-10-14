@@ -56,8 +56,10 @@ def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
 
     if observation != "merged":
         if observation == "merged_during_revalidation":
+            current = engine.states.load_current_run(run_id)
+            assert current is not None
             assert not engine._approval()._revalidate_final_run_pr_before_merge(
-                pending, pending["run_publication"], original["pr_number"],
+                current, current["run_publication"], original["pr_number"],
                 original["record"]["run_head_sha"],
             )
             lagging = states.load_current_run(run_id)

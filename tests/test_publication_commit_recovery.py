@@ -17,6 +17,7 @@ from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import SimulatedProcessCrash, StateStore
 from support.delivery_agents import PassAgents, issue
 from support.seeding import write_fixture
+from support.state_commits import observe_run_commits
 
 
 class CrashBeforePublicationSave(StateStore):
@@ -28,7 +29,7 @@ class CrashBeforePublicationSave(StateStore):
         self.publication_sha: str | None = None
         self.crash = crash
 
-    def _check_interruption(self, state: dict[str, Any]) -> None:
+    def before_save(self, run_id: str, state: dict[str, Any]) -> None:
         job = state.get(self.subject)
         if (
             self.crash and self.publication_sha is None
@@ -38,19 +39,6 @@ class CrashBeforePublicationSave(StateStore):
         ):
             self.publication_sha = job["publication_sha"]
             raise SimulatedProcessCrash("publication commit installed before result save")
-
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
-        self._check_interruption(state)
-        return super()._save_run_unlocked(run_id, state)
-
-    def _save_work_and_notify_unlocked(
-        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
-        *, ticket_number: int | None = None,
-    ) -> None:
-        self._check_interruption(state)
-        super()._save_work_and_notify_unlocked(
-            run_id, state, baseline, ticket_number=ticket_number,
-        )
 
 
 @pytest.mark.parametrize(
@@ -69,6 +57,7 @@ def test_installed_publication_commit_resume_preserves_accepted_work(
     states = CrashBeforePublicationSave(
         git_repo / ".agent-run", subject, crash=window == "result_save",
     )
+    observe_run_commits(monkeypatch, states, before=states.before_save)
     state, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states,
     ).start(1)

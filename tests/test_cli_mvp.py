@@ -67,7 +67,7 @@ def test_run_reaches_explicit_approval_with_status_and_history(
     assert str(latest_invocation["reasoning_effort"]) in status.stdout
     assert "下一步: agent-run approve" in status.stdout
     assert run_id not in status.stdout
-    status_json = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+    status_json = stdout_json(invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json"))
     assert status_json["active_ticket"] is None
     assert status_json["phase"] == "ready_for_approval"
 
@@ -108,7 +108,7 @@ def test_run_reaches_explicit_approval_with_status_and_history(
     assert stdout_json(replayed)["result"] == "resumed"
     assert stdout_json(replayed)["run_id"] == run_id
     replay_timeline = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )["timeline"]
     assert len(replay_timeline) == history_count
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -146,7 +146,7 @@ def test_displayed_final_approval_selects_the_unique_active_run(
     assert stdout_json(second)["run_id"] == second_run_id
     assert stdout_json(second)["status"] == "run_approval_pending"
 
-    status = run_cli(git_repo, fixture, "status", second_run_id)
+    status = invoke_cli_inprocess(git_repo, fixture, "status", second_run_id)
     action_line = next(
         line for line in status.stdout.splitlines() if line.startswith("下一步: ")
     )

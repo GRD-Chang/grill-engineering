@@ -194,8 +194,12 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
             lane.validate_work_projection(invalid_scope)
         # A plain JSON/container copy has no scope metadata and must satisfy
         # the complete contract instead of inheriting a later read's scope.
+        plain = dict(snapshot)
+        with pytest.raises(ValueError, match="canonical timeline"):
+            lane.validate_work_projection(plain)
+        plain.update((field, json.loads(scope.encoded)) for field, scope in snapshot.timelines.items())
         with pytest.raises(ValueError, match="review_budget_history"):
-            lane.validate_work_projection(dict(snapshot))
+            lane.validate_work_projection(plain)
     # The small current window number grows by one digit; unrelated retained
     # bodies must never contribute to processing or transient memory cost.
     assert costs[1][0] <= costs[0][0] + 256, costs

@@ -23,6 +23,28 @@ from agent_run.state import (
 )
 
 
+def test_shared_save_sanitizer_keeps_path_and_diagnostic_rules() -> None:
+    from agent_run.state import _sanitize_durable_errors
+
+    redacted: dict[str, str] = {}
+    kinds: dict[str, tuple[bool, bool, bool]] = {}
+    text = "plain evidence " * 900
+    first = _sanitize_durable_errors(
+        {"candidate_commit_intent": {"token": "same-nonce"}, "note": text},
+        redacted=redacted, key_kinds=kinds,
+    )
+    second = _sanitize_durable_errors(
+        {"untrusted": {"token": "same-nonce", "environment": {"value": "secret"}},
+         "note": text, "diagnostics": [{"code": "failed", "message": text}]},
+        redacted=redacted, key_kinds=kinds,
+    )
+    assert first["candidate_commit_intent"]["token"] == "same-nonce"
+    assert second["untrusted"] == {"token": "[REDACTED]"}
+    assert second["note"] == text
+    assert len(second["diagnostics"][0]["message"].encode()) <= 8 * 1024
+    assert first["note"] == text
+
+
 def test_run_state_saves_only_sqlite_and_reopens_the_same_data(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     state = {"nested": [{"message": "中文状态", "values": [1, True, None]}]}

@@ -2140,31 +2140,25 @@ def test_stop_noop_reload_fails_closed_after_successor_admission(
     assert record is not None
     executor = record["executor"]
     assert isinstance(executor, dict)
-    original_load = states.load_current_run
-    load_count = 0
+    lifecycle = _control_lifecycle(
+        states=states, control=control, task=task, current=current,
+        host=RunningBarrierHost(),
+    )
+    original_load = lifecycle.states.load_current_run
 
     def load_with_reload_barrier(bound_run_id: str) -> dict[str, object] | None:
-        nonlocal load_count
-        load_count += 1
-        if load_count == 2:
-            reload_started.set()
-            assert release_reload.wait(3)
+        reload_started.set()
+        assert release_reload.wait(3)
         return original_load(bound_run_id)
 
-    monkeypatch.setattr(states, "load_current_run", load_with_reload_barrier)
+    monkeypatch.setattr(lifecycle.states, "load_current_run", load_with_reload_barrier)
     result: list[tuple[dict[str, object], bool, object]] = []
     failure: list[BaseException] = []
 
     def submit_stop() -> None:
         try:
             result.append(
-                _control_lifecycle(
-                    states=states,
-                    control=control,
-                    task=task,
-                    current=current,
-                    host=RunningBarrierHost(),
-                ).submit_control(
+                lifecycle.submit_control(
                     LifecycleRequest(
                         task=task,
                         kind="stop",

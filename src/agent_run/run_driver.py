@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Literal, Protocol
@@ -39,6 +40,7 @@ from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.run_publication_approval import prepare_run_approval
+from agent_run.object_state import ObjectStateStore, object_store, save_owned
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError
 
@@ -183,7 +185,7 @@ class DirectRunOperations:
         executor_host: ExecutorHost | None = None,
     ) -> None:
         self.controller: Any = controller
-        self.states = states
+        self.states = object_store(states)
         self.before_external_step = before_external_step
         self.resume_pending_refresh = resume_pending_refresh
         self.use_current_state_once = use_current_state_once
@@ -630,7 +632,7 @@ class RunDriver:
         supervisor: ExternalSupervisor,
     ) -> None:
         self.operations = operations
-        self.states = states
+        self.states = object_store(states)
         self.supervisor = supervisor
         self.on_outcome: Callable[[dict[str, Any], str], None] | None = None
 
@@ -707,9 +709,10 @@ class RunDriver:
                     return failed
                 if self.on_outcome is not None:
                     self.on_outcome(state, outcome.kind.value)
+                expected_wait = self._wait_facts(state)
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
                     if clear_supervision_window(state):
-                        self.states.save_run(run_id, state)
+                        self._save_wait(run_id, state, expected_wait)
                     if outcome.kind in {
                         RunOutcomeKind.HUMAN_GATE,
                         RunOutcomeKind.EXECUTION_FAILURE,
@@ -720,29 +723,29 @@ class RunDriver:
                     }:
                         return state
                     continue
-                previous_window = state.get("supervision_window")
+                previous_window = deepcopy(state.get("supervision_window"))
                 self._before_external_step()
                 self.supervisor.observe(state)
                 if state.get("supervision_window") != previous_window:
-                    self.states.save_run(run_id, state)
+                    self._save_wait(run_id, state, expected_wait)
                 marker = _external_wait_marker(state)
                 credential_wait = isinstance(state.get("credential_availability"), dict)
                 if credential_wait or marker == previous_marker:
                     self._before_external_step()
                     if not self.supervisor.before_retry(
                         state,
-                        persist_before_sleep=lambda: self.states.save_run(run_id, state),
+                        persist_before_sleep=lambda: self._save_wait(run_id, state, expected_wait),
                     ):
                         if self._pause_ticket_supervision(run_id, state):
                             state, _ = self.operations.controller.resume(run_id)
                             outcome = self.operations.classify(state)
                             previous_marker = None
                             continue
-                        self.states.save_run(run_id, state)
+                        self._save_wait(run_id, state, expected_wait)
                         return state
                     # Persist each throttled retry so concurrent status/history
                     # reads observe the same durable wait contract.
-                    self.states.save_run(run_id, state)
+                    self._save_wait(run_id, state, expected_wait)
                 previous_marker = marker
                 self._before_external_step()
                 wait = public_supervision_snapshot(state, now=self.supervisor.now())
@@ -814,6 +817,29 @@ class RunDriver:
         current["diagnostics"] = state["diagnostics"]
         pause_ticket_supervision(scoped, current)
         return True
+
+    @staticmethod
+    def _wait_facts(state: dict[str, Any]) -> dict[str, Any]:
+        return deepcopy({key: state.get(key) for key in (
+            "status", "terminal_kind", "diagnostics", "supervision_window",
+            "supervision_wait", "credential_availability", "action_application_receipt",
+            "operator_stop", "requeue_required", "accepted_parent_spec_revision",
+            "accepted_ticket_graph_revision",
+            "active_ticket_job", "active_agent_invocation",
+        )})
+
+    def _save_wait(
+        self, run_id: str, state: dict[str, Any], expected: dict[str, Any],
+    ) -> None:
+        if isinstance(self.states, ObjectStateStore):
+            save_owned(self.states, run_id, state,
+                       fields={"status", "terminal_kind", "diagnostics", "supervision_window",
+                               "supervision_wait", "credential_availability"}, expected=expected,
+                       ticket_wait=True)
+        else:
+            self.states.save_run(run_id, state)
+        expected.clear()
+        expected.update(self._wait_facts(state))
 
     def _before_external_step(self) -> None:
         fence = getattr(self.operations, "before_external_step", None)

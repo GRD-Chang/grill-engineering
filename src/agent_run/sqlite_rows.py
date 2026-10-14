@@ -20,29 +20,67 @@ _SIZES = (
     "(SELECT COALESCE(SUM(LENGTH(CAST(object_path AS BLOB)) + LENGTH(CAST(value_json AS BLOB))), 0) "
     "FROM run_objects WHERE run_id = :run_id) AS objects"
 )
+_MATERIAL_DATA = (
+    "(SELECT COALESCE(CAST(group_concat(value, '') AS BLOB), X'') FROM (" + _MATERIAL_ROWS + "))"
+)
+_MATERIAL_METADATA = (
+    "(SELECT json_group_array(json_array("
+    "CASE WHEN typeof(material_id)='text' THEN material_id END, "
+    "CASE WHEN typeof(byte_length)='integer' THEN byte_length END, "
+    "LENGTH(CAST(value AS BLOB)), typeof(material_id), typeof(value), typeof(byte_length))) "
+    "FROM (" + _MATERIAL_ROWS + "))"
+)
+_BOUNDED_ROWS = (
+    "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN " + _MATERIAL_DATA + " END, "
+    "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN " + _MATERIAL_METADATA + " END, "
+    "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN "
+    "(SELECT json_group_array(json_array(object_path, kind, value_json)) FROM ("
+    + _OBJECT_ROWS + ")) END"
+)
 
 _DOCUMENT = (
     "WITH sizes AS (" + _SIZES + ") SELECT found, materials, objects, "
     "(SELECT json_group_array(json_array(type, name, tbl_name, sql)) FROM "
     "(SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name)), "
     "(SELECT json_group_array(json_array(key, value)) FROM schema_meta), "
-    "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN "
-    "(SELECT json_group_array(json_array(material_id, value, byte_length)) FROM ("
-    + _MATERIAL_ROWS + ")) END, "
-    "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN "
-    "(SELECT json_group_array(json_array(object_path, kind, value_json)) FROM ("
-    + _OBJECT_ROWS + ")) END FROM sizes"
+    + _BOUNDED_ROWS + " FROM sizes"
 )
 
 
 @dataclass(frozen=True)
+class MaterialRows:
+    """Exact ordered SQL bytes and typed metadata, including empty values."""
+    data: bytes
+    metadata: str
+
+    def rows(self) -> tuple[tuple[str, str, int], ...]:
+        offset = 0
+        rows = []
+        for identity, length, actual, identity_type, value_type, length_type in json.loads(self.metadata):
+            if ((identity_type, value_type, length_type) != ("text", "text", "integer")
+                    or not isinstance(identity, str) or type(length) is not int
+                    or type(actual) is not int or length != actual or actual < 0
+                    or offset + actual > len(self.data)):
+                raise ValueError("Invalid SQLite Run material identity: type or byte length")
+            try:
+                value = self.data[offset:offset + actual].decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("Invalid SQLite Run material UTF-8 encoding") from error
+            offset += actual
+            rows.append((identity, value, length))
+        if offset != len(self.data):
+            raise ValueError("Invalid SQLite Run material bundle length")
+        return tuple(rows)
+
+
+@dataclass(frozen=True)
 class RowSource:
-    materials: str | tuple[tuple[str, str, int], ...]
+    materials: MaterialRows | tuple[tuple[str, str, int], ...]
     objects: str | tuple[tuple[str, str, str], ...]
 
     def material_rows(self) -> tuple[tuple[str, str, int], ...]:
-        if isinstance(self.materials, str):
-            return tuple(tuple(row) for row in json.loads(self.materials))
+        if isinstance(self.materials, MaterialRows):
+            return self.materials.rows()
         return self.materials
 
     def object_rows(self) -> tuple[tuple[str, str, str], ...]:
@@ -66,7 +104,7 @@ def read_document(
     existing explicit read transaction and structural PRAGMA validation.
     """
     try:
-        found, materials, objects, ddl, metadata, material_json, object_json = connection.execute(
+        found, materials, objects, ddl, metadata, material_data, material_metadata, object_json = connection.execute(
             _DOCUMENT, {"run_id": run_id, "aggregate_bytes": min(aggregate_bytes, 8 * max_bytes)},
         ).fetchone()
     except sqlite3.OperationalError as error:
@@ -75,10 +113,11 @@ def read_document(
         raise
     definitions = tuple(tuple(row) for row in json.loads(ddl))
     actual = {name: sql for kind, name, _, sql in definitions if kind == "table" and not name.startswith("sqlite_")}
-    if actual != tables or found and material_json is None:
+    if actual != tables or found and material_data is None:
         return False
     connection.schema_facts = definitions, dict(json.loads(metadata))
-    connection.run_rows = (RowSource(material_json, object_json) if found else None, materials, objects, True)
+    connection.run_rows = (RowSource(MaterialRows(material_data, material_metadata), object_json)
+                           if found else None, materials, objects, True)
     return True
 
 
@@ -125,15 +164,14 @@ def read_row_source(connection: sqlite3.Connection, run_id: str, *, aggregate: b
     params = {"run_id": run_id}
     if aggregate:
         try:
-            material_json = connection.execute(
-                "SELECT json_group_array(json_array(material_id, value, byte_length)) FROM ("
-                + _MATERIAL_ROWS + ")", params,
-            ).fetchone()[0]
+            material_data, material_metadata = connection.execute(
+                "SELECT " + _MATERIAL_DATA + ", " + _MATERIAL_METADATA, params,
+            ).fetchone()
             object_json = connection.execute(
                 "SELECT json_group_array(json_array(object_path, kind, value_json)) FROM ("
                 + _OBJECT_ROWS + ")", params,
             ).fetchone()[0]
-            return RowSource(material_json, object_json)
+            return RowSource(MaterialRows(material_data, material_metadata), object_json)
         except sqlite3.OperationalError as error:
             if "no such function" not in str(error):
                 raise
@@ -157,17 +195,12 @@ def read_run_rows(
     source = None
     if aggregate:
         try:
-            found, materials, objects, material_json, object_json = connection.execute(
+            found, materials, objects, material_data, material_metadata, object_json = connection.execute(
                 "WITH sizes AS (" + _SIZES + ") SELECT found, materials, objects, "
-                "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN "
-                "(SELECT json_group_array(json_array(material_id, value, byte_length)) FROM ("
-                + _MATERIAL_ROWS + ")) END, "
-                "CASE WHEN found AND materials + objects <= :aggregate_bytes THEN "
-                "(SELECT json_group_array(json_array(object_path, kind, value_json)) FROM ("
-                + _OBJECT_ROWS + ")) END FROM sizes", params,
+                + _BOUNDED_ROWS + " FROM sizes", params,
             ).fetchone()
-            if material_json is not None:
-                source = RowSource(material_json, object_json)
+            if material_data is not None:
+                source = RowSource(MaterialRows(material_data, material_metadata), object_json)
         except sqlite3.OperationalError as error:
             if "no such function" not in str(error):
                 raise

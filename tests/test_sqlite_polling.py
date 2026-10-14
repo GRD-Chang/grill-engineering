@@ -145,3 +145,43 @@ def test_polling_never_substitutes_old_facts_inside_a_write_transaction(git_repo
                 assert read()["status"] == "operator_stopped"
                 raise OSError("before commit")
         assert read()["status"] == state["status"]
+
+
+def test_work_polling_reuses_its_current_read_size_without_encoding_twice(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, states, _, _ = ticket_run(git_repo, (2,))
+    sizes = []
+    check = states._repository._check_size
+
+    def measure(*args, **kwargs):
+        result = check(*args, **kwargs)
+        sizes.append(result)
+        return result
+
+    monkeypatch.setattr(states._repository, "_check_size", measure)
+    with states.current_run_reader(state["run_id"], work_only=True) as read:
+        assert read() is not None
+        assert len(sizes) == 1
+        assert read() is not None
+        assert len(sizes) == 1
+
+
+def test_custom_work_polling_keeps_actual_returned_size_limit(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, states, _, _ = ticket_run(git_repo, (2,))
+    original = states.load_work_run
+    reads = []
+
+    def custom(*args, **kwargs):
+        current = original(*args, **kwargs)
+        current["custom"] = "x" * (513 * 1024)
+        reads.append(True)
+        return current
+
+    monkeypatch.setattr(states, "load_work_run", custom)
+    with states.current_run_reader(state["run_id"], work_only=True) as read:
+        assert len(read()["custom"]) == 513 * 1024
+        assert len(read()["custom"]) == 513 * 1024
+        assert len(reads) == 2

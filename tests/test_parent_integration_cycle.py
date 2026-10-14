@@ -207,25 +207,25 @@ def test_second_conflict_checkpoint_closes_source_attempt_before_public_resume(
     profiles.initialize(run_id)
     agents = Agents(checkout)
     backend = ProfiledAgentBackend(agents, profiles, run_id=run_id)
-    save = states.save_run
+    after_saved = states._after_run_saved
     interrupted = False
 
-    def interrupt_checkpoint(current_run: str, current: dict[str, Any]) -> Any:
+    def interrupt_checkpoint() -> None:
         nonlocal interrupted
+        current = states.load_current_run(run_id)
+        assert current is not None
         job = current.get("parent_job", {})
         scene = job.get("parent_integration_conflict", {})
         if not interrupted and scene.get("stage") == "target" and scene.get("attempts") == 0:
             # Before the fix this save contained the previous source Attempt.
             assert job.get("pending_semantic_attempt") is None
             interrupted = True
-            save(current_run, current)
             raise OSError("interrupted after second conflict checkpoint")
-        return save(current_run, current)
 
-    monkeypatch.setattr(states, "save_run", interrupt_checkpoint)
+    monkeypatch.setattr(states, "_after_run_saved", interrupt_checkpoint)
     with pytest.raises(OSError, match="second conflict checkpoint"):
         ParentDeliveryEngine(git=git, states=states, github=publisher, agents=backend).deliver(run_id)
-    monkeypatch.setattr(states, "save_run", save)
+    monkeypatch.setattr(states, "_after_run_saved", after_saved)
     loaded = StateStore(states.root).load_current_run(run_id)
     assert loaded is not None
     job = loaded["parent_job"]

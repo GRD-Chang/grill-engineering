@@ -94,7 +94,7 @@ def test_work_session_writer_reestablishes_and_enforces_foreign_keys(
             with repository.atomic():
                 assert repository._local.connection is writer
                 assert writer.execute("PRAGMA foreign_keys").fetchone() == (1,)
-                writer.execute("INSERT INTO run_material_refs VALUES('missing','missing')")
+                writer.execute("INSERT INTO run_material_refs(run_id,material_id) VALUES('missing','missing')")
     _assert_closed(created)
     assert repository.load("run-1") == {"value": 1}
 
