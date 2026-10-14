@@ -11,7 +11,10 @@ from time import monotonic
 from typing import Any, Callable, TYPE_CHECKING
 
 from agent_run.work_facts import ticket_program_ready
-from agent_run.executor_admission import close_admission_on_failure, close_executor_admission
+from agent_run.executor_admission import (
+    check_executor_cancelled, close_admission_on_failure, close_executor_admission,
+    executor_cancellation_scope,
+)
 from agent_run.external_supervision import ExternalSupervisor
 from agent_run.runner_credentials import runner_credential_scope
 from agent_run.state import ConcurrentRunStateError
@@ -114,6 +117,7 @@ def develop_frontier(
     pipeline_limit = 2 * limit
     session = getattr(engine.states, "work_session", None)
     with (
+        executor_cancellation_scope(),
         session() if callable(session) else nullcontext(),
         engine.states.current_run_reader(run_id, work_only=True, thin_timeline=True) as read_current,
         ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
@@ -125,6 +129,7 @@ def develop_frontier(
         notify_completion = False
         final_observation = False
         while True:
+            check_executor_cancelled()
             current = read_current()
             if current is None:
                 raise ValueError("Delivery Run disappeared during dispatch")
@@ -156,6 +161,7 @@ def develop_frontier(
                 for item in current["ticket_work_queue"]
             )
             for number in ready:
+                check_executor_cancelled()
                 if len(futures) >= pipeline_limit:
                     break
                 job = current["ticket_jobs"].get(str(number), {})
@@ -167,6 +173,7 @@ def develop_frontier(
                     futures[pool.submit(copy_context().run, advance, number)] = number
             # Queue order, not role or a new thread's startup order, owns priority.
             for number in waiting:
+                check_executor_cancelled()
                 if occupied >= limit or len(futures) >= pipeline_limit:
                     break
                 if number in futures.values():

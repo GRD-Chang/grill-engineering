@@ -15,6 +15,17 @@ import pytest
 import agent_run.worker_sandbox as worker_sandbox
 
 
+def wait_until(predicate: Callable[[], Any], *, timeout: float = 10) -> Any:
+    """Wait for ready/exit evidence; the timeout only bounds a failed test."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.01)
+    raise AssertionError("Worker did not reach the expected boundary")
+
+
 class AdvancingClock:
     """Advance a deadline without changing subprocess/thread library clocks."""
 

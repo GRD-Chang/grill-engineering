@@ -11,6 +11,7 @@ neither layer gets a shortcut from development to a Run Branch write.
 
 from copy import deepcopy
 from pathlib import Path
+import sys
 from typing import Any
 
 from agent_run.delivery_budget import delivery_budget_owner
@@ -324,7 +325,7 @@ class ChangeDeliveryEngine:
         return reconcile_pending_pr_write(self, state, job)
 
     def release_agent_work(self) -> None:
-        self.agent_work.release()
+        self.agent_work.release(error=sys.exception())
 
     def require_agent_work(self, role: str) -> None:
         self.agent_work.require(role)

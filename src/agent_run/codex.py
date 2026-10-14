@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -53,6 +54,7 @@ from agent_run.executor_environment import ensure_executor_runtime_directory
 from agent_run.paths import app_data_root
 from agent_run.worker_sandbox import (
     WorkerDeadlineExceeded,
+    WorkerExitUnknownError,
     WorkerSandboxError,
     bubblewrap_command,
     run_worker_process,
@@ -492,7 +494,17 @@ class CodexCliBackend:
                 if process_started:
                     failure_facts["execution_interrupted"] = not getattr(error, "completed_output", False)
                     failure_facts["machine_error"] = getattr(error, "machine_error", None)
-                notify("failed", **failure_facts)
+                try:
+                    notify("failed", **failure_facts)
+                except BaseException as diagnostic_error:
+                    if not isinstance(error, WorkerExitUnknownError):
+                        raise
+                    gap = bounded_error(
+                        f"Worker failure diagnostic recording failed; durable failure unknown: {diagnostic_error}"
+                    )
+                    error.add_note(gap)
+                    logging.getLogger(__name__).error("%s", gap)
+                    raise error from diagnostic_error
                 raise error
             invocation_attempted = True
             if current_thread is not None and reported_thread != current_thread:
@@ -731,6 +743,7 @@ class CodexCliBackend:
                             expected=thread_id, callback=report_thread
                         )
                     worker_pid: int | None = None
+                    worker_exit_unknown = False
 
                     def worker_started(pid: int) -> None:
                         nonlocal worker_pid
@@ -753,10 +766,13 @@ class CodexCliBackend:
                     try:
                         try:
                             result = run_worker_process(arguments, **worker_options)
+                        except WorkerExitUnknownError:
+                            worker_exit_unknown = True
+                            raise
                         finally:
-                            # The Worker runner returns/raises only after its
-                            # process is reaped. Exclude auth/result checks below.
-                            if on_execution is not None:
+                            # Ordinary returns/failures follow process reap;
+                            # unknown exit retains ownership for host checks.
+                            if on_execution is not None and not worker_exit_unknown:
                                 on_execution("execution_finished")
                         if not app_access and self.worker_identity is not None:
                             # Validate the credential consumed by this invocation, not a
@@ -767,7 +783,7 @@ class CodexCliBackend:
                             )
                             validate_worker_auth(consumed_identity, environment=environment)
                     finally:
-                        if worker_pid is not None and self.on_worker_finished is not None:
+                        if worker_pid is not None and self.on_worker_finished is not None and not worker_exit_unknown:
                             self.on_worker_finished(worker_pid)
                 if credential_exhausted.is_set():
                     raise WorkerSandboxError(credential_failure[0])
@@ -784,6 +800,8 @@ class CodexCliBackend:
                 raise _CodexInvocationDeadlineError(
                     str(error), process_started=True
                 ) from error
+            except WorkerExitUnknownError:
+                raise
             except WorkerSandboxError as error:
                 raise CodexProcessError(
                     str(error), recoverable=False,

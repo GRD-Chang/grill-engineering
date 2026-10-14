@@ -34,6 +34,7 @@ from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
 from agent_run.ticket_state import RUN_STOP_STATUSES, TicketState
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.worker_sandbox import WorkerExitUnknownError
 
 
 _ticket_checkout_preparation = Lock()
@@ -110,7 +111,7 @@ class TicketDeliveryEngine:
                 assert failed is not None
                 return failed
             except (TicketGraphDriftError, IncompatibleRunStateError,
-                    SimulatedProcessCrash, GitHubIdentityError):
+                    SimulatedProcessCrash, GitHubIdentityError, WorkerExitUnknownError):
                 raise
             except Exception as error:
                 # Foreground delivery, development and supervision use the

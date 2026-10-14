@@ -11,6 +11,9 @@ worker_lease: ContextVar[str | None] = ContextVar("worker_lease", default=None)
 
 
 def check_worker_control() -> None:
+    from agent_run.executor_admission import check_executor_cancelled
+
+    check_executor_cancelled()
     check = worker_control.get()
     if check is not None:
         check()

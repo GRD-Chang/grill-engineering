@@ -5,12 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import Token
+import sys
 from typing import Any
 
 from agent_run.agent_return import has_returned_agent_result
 from agent_run.delivery_step import AgentWorkRequired
+from agent_run.executor_admission import check_executor_cancelled
 from agent_run.ticket_work import TicketWorkAdmission
 from agent_run.worker_control import worker_control, worker_lease
+from agent_run.worker_sandbox import WorkerExitUnknownError
 
 
 class AgentWorkScope:
@@ -38,10 +41,11 @@ class AgentWorkScope:
         try:
             yield
         finally:
-            self.release()
+            self.release(error=sys.exception())
             self._job = None
 
     def require(self, role: str) -> None:
+        check_executor_cancelled()
         job = self._job
         if job is None:
             raise ValueError("Agent admission requires an active delivery step")
@@ -66,7 +70,11 @@ class AgentWorkScope:
             self._lease_context = worker_lease.set(lease)
         self._allowed = False
 
-    def release(self) -> None:
+    def release(self, *, error: BaseException | None = None) -> None:
+        if isinstance(error, WorkerExitUnknownError):
+            # Stages may release in an inner finally before step() unwinds.
+            # Only proven host exit may revoke this still-owned durable lease.
+            self._lease = None
         if self._lease_context is not None:
             worker_lease.reset(self._lease_context)
             self._lease_context = None

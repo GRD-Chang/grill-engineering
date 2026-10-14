@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import codecs
 import json
+import logging
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -22,6 +24,10 @@ class WorkerSandboxError(RuntimeError):
 
 class WorkerDeadlineExceeded(WorkerSandboxError):
     pass
+
+
+class WorkerExitUnknownError(WorkerSandboxError):
+    """Keep Worker ownership unresolved until an independent exit check."""
 
 
 _STREAM_CHUNK_BYTES = 64 * 1024
@@ -472,6 +478,7 @@ def run_worker_process(
     on_process_started: Callable[[int], None] | None = None,
     on_process_released: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    from agent_run.executor_host import _process_start_token
     from agent_run.worker_control import check_worker_control
 
     check_worker_control()
@@ -514,6 +521,16 @@ def run_worker_process(
             )
         finally:
             os.close(gate_read)
+    start_token = _process_start_token(process.pid)
+
+    def terminate() -> None:
+        try:
+            _terminate_process_group(process, start_token=start_token)
+        except OSError as error:
+            message = f"Worker pid={process.pid} exit unknown; process control failed: {error}"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message) from error
+
     try:
         if on_process_started is not None:
             on_process_started(process.pid)
@@ -538,7 +555,7 @@ def run_worker_process(
         if gate_write is not None:
             os.close(gate_write)
         try:
-            _terminate_process_group(process)
+            terminate()
             process.wait()
         finally:
             for pipe in (process.stdin, process.stdout, process.stderr):
@@ -560,6 +577,7 @@ def run_worker_process(
     stderr_reader: threading.Thread | None = None
     stdin_writer: threading.Thread | None = None
     wait_error: BaseException | None = None
+    stream_stop = threading.Event()
 
     def join_started(thread: threading.Thread | None) -> None:
         # A signal or a start failure may leave a later thread unstarted.
@@ -583,14 +601,19 @@ def run_worker_process(
                     on_stdout_line(line)
                 except BaseException as error:
                     callback_errors.append(error)
-                    _terminate_process_group(process)
+                    terminate()
 
         stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
         stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
 
         def read_stdout() -> None:
             try:
-                while chunk := os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                while not stream_stop.is_set():
+                    if not select.select([stdout_pipe], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
                     stdout_capture.feed(chunk)
                 stdout_capture.finish()
             except BaseException as error:
@@ -598,19 +621,33 @@ def run_worker_process(
 
         def read_stderr() -> None:
             try:
-                while chunk := os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                while not stream_stop.is_set():
+                    if not select.select([stderr_pipe], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
                     stderr_capture.append(chunk)
             except BaseException as error:
                 reader_errors.append(error)
 
         def write_stdin() -> None:
             try:
-                stdin.write(prompt.encode("utf-8"))
-                stdin.close()
+                os.set_blocking(stdin.fileno(), False)
+                pending = memoryview(prompt.encode("utf-8"))
+                while pending and not stream_stop.is_set():
+                    if not select.select([], [stdin], [], 0.1)[1]:
+                        continue
+                    try:
+                        pending = pending[os.write(stdin.fileno(), pending[:_STREAM_CHUNK_BYTES]):]
+                    except BlockingIOError:
+                        continue
             except BrokenPipeError:
                 return
             except BaseException as error:
                 writer_errors.append(error)
+            finally:
+                stdin.close()
 
         stdout_reader = threading.Thread(
             target=read_stdout,
@@ -639,6 +676,9 @@ def run_worker_process(
             else time.monotonic() + timeout
         )
         while process.poll() is None:
+            if callback_errors or reader_errors or writer_errors:
+                wait_error = (callback_errors or reader_errors or writer_errors)[0]
+                break
             check_worker_control()
             if abort_event is not None and abort_event.is_set():
                 wait_error = WorkerSandboxError(
@@ -656,7 +696,13 @@ def run_worker_process(
     except BaseException as error:
         wait_error = error
     finally:
-        _terminate_process_group(process)
+        try:
+            terminate()
+        except WorkerExitUnknownError as error:
+            # Unknown process ownership is not permission to kill it. Stop our
+            # pipe threads independently, retain the unresolved process fact.
+            stream_stop.set()
+            wait_error = error
         join_started(stdin_writer)
         join_started(stdout_reader)
         join_started(stderr_reader)
@@ -680,6 +726,12 @@ def run_worker_process(
         for pipe in (stdin, stdout_pipe, stderr_pipe):
             if pipe is not None:
                 pipe.close()
+    if isinstance(wait_error, WorkerExitUnknownError):
+        # Persistence callback errors explain the stop trigger, but cannot
+        # erase the independent fact that this process has not proven exit.
+        if callback_errors:
+            raise wait_error from callback_errors[0]
+        raise wait_error
     if callback_errors:
         raise callback_errors[0]
     if wait_error is not None:
@@ -698,7 +750,28 @@ def run_worker_process(
     )
 
 
-def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+def _terminate_process_group(process: subprocess.Popen[Any], *, start_token: str | None) -> None:
+    from agent_run.executor_host import _process_start_token
+
+    def require_identity() -> None:
+        current = _process_start_token(process.pid)
+        if (start_token is None or (current is not None and current != start_token)
+                or (current is None and process.poll() is None)):
+            message = f"Worker pid={process.pid} ownership/exit unknown; no process group signal sent"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message)
+
+    def reap() -> None:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired as error:
+            message = f"Worker pid={process.pid} exit unknown after process group termination"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message) from error
+
+    # Popen owns the child and its session. Check the captured start identity
+    # before each group signal, including cleanup after the child was reaped.
+    require_identity()
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -706,7 +779,7 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
         # Reap it before the caller can release its Ticket work lease.
         if process.poll() is None:
             process.kill()
-        process.wait()
+        reap()
         return
     deadline = time.monotonic() + 0.2
     while time.monotonic() < deadline:
@@ -716,9 +789,10 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
             break
         time.sleep(0.01)
     else:
+        require_identity()
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
     if process.poll() is None:
-        process.wait()
+        reap()
