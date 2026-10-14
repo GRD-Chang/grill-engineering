@@ -13,6 +13,7 @@ from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import passing_acceptance
+from support.cli_crash import run_cli_at_resume_boundary
 
 
 def _ticket(
@@ -313,15 +314,14 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
         reviewer="reviewer-recovery",
         expected_thread_id="developer-2",
     )
-    interrupted_authorization = run_cli(
+    interrupted_authorization = run_cli_at_resume_boundary(
         git_repo,
         fixture,
         "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
-        "--crash-after-save",
-        "1",
+        boundary="resume_authorized",
     )
     assert interrupted_authorization.returncode == 2
     after_first = load_only_run_state(git_repo)
@@ -329,6 +329,9 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     assert after_first["resume_audit"]["history"][0][
         "semantic_attempt_id"
     ] == attempt_id
+    assert after_first["resume_audit"]["history"][0].get("successor_invocation_started_at") is None
+    assert after_first["active_agent_invocation"]["started_at"] == failed_invocation["started_at"]
+    assert len(after_first["agent_invocation_history"]) == len(failed_state["agent_invocation_history"])
     # This is the durable shape left by an abrupt exit after Controller
     # authorization and before the successor Invocation reports ``started``.
     after_first["status"] = "active"
@@ -340,15 +343,14 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
             invocation["status"] = "resuming"
     StateStore(managed_state(git_repo)).save_run(run_id, after_first)
 
-    interrupted_again = run_cli(
+    interrupted_again = run_cli_at_resume_boundary(
         git_repo,
         fixture,
         "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
-        "--crash-after-save",
-        "1",
+        boundary="session_interrupted",
     )
     assert interrupted_again.returncode == 2
     after_second = load_only_run_state(git_repo)

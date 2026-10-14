@@ -15,9 +15,10 @@ from support.cli import run_cli, stdout_json
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
+@pytest.mark.parametrize("first_role", ["development", "fresh_acceptance"])
 @pytest.mark.parametrize("sibling_boundary", ["running", "completed", "returned"])
 def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch, sibling_boundary: str,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, sibling_boundary: str, first_role: str,
 ) -> None:
     initial, states, git, fixture = ticket_run(git_repo, (2, 3, 4, 5), workers=2)
     run_id = initial["run_id"]
@@ -42,6 +43,8 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
             return
         saved = states.load_current_run(run_id)
         invocation = saved["ticket_agent_invocations"].get(number, {})
+        if invocation.get("role") != (first_role if number == "3" else "development"):
+            return
         boundary = "running" if number == "3" else sibling_boundary
         returned = saved["ticket_jobs"][number].get("pending_semantic_attempt", {}).get("returned_result")
         reached = (
@@ -65,8 +68,9 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
     for number in ("3", "4"):
         expected_status = "running" if number == "3" or sibling_boundary == "running" else "completed"
         assert interrupted["ticket_agent_invocations"][number]["status"] == expected_status
-        assert interrupted["ticket_agent_invocations"][number]["reported_thread_id"] == f"developer-{number}"
-        assert interrupted["ticket_jobs"][number].get("development_thread_id") is None
+        reviewing = number == "3" and first_role == "fresh_acceptance"
+        assert interrupted["ticket_agent_invocations"][number]["reported_thread_id"] == f"{'reviewer' if reviewing else 'developer'}-{number}"
+        assert interrupted["ticket_jobs"][number].get("development_thread_id") == ("developer-3" if reviewing else None)
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     assert controller.record_execution_failure(run_id, "shared execution interrupted")
     failed = StateStore(states.root).load_current_run(run_id)
@@ -109,6 +113,8 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
         assert job["pending_semantic_attempt"] == failed["ticket_jobs"][number]["pending_semantic_attempt"]
         assert job["review_budget"] == failed["ticket_jobs"][number]["review_budget"]
         assert job["development_thread_id"] == f"developer-{number}"
+        if number == "3" and first_role == "fresh_acceptance":
+            assert job["review_resume_thread_id"] == "reviewer-3"
         closed = next(item for item in reopened["agent_invocation_history"]
                       if item["work_subject"] == f"ticket:{number}"
                       and item["started_at"] == original["started_at"])
@@ -119,10 +125,12 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
 
     def recover(number: int) -> None:
         assert sibling_boundary != "returned" or number != 4, "persisted result was replayed"
+        assert first_role != "fresh_acceptance" or number != 3, "saved Candidate was redeveloped"
 
     recovered_agents = TicketAgents(git_repo, (3, 4), recover)
     for number in (3, 4):
-        recovered_agents.backends[number].data["developments"][0]["expected_thread_id"] = f"developer-{number}"
+        reviewing = number == 3 and first_role == "fresh_acceptance"
+        recovered_agents.backends[number].data["reviews" if reviewing else "developments"][0]["expected_thread_id"] = f"{'reviewer' if reviewing else 'developer'}-{number}"
     DeliveryRunEngine(
         controller=controller, tickets=ticket_engine(git, states, fixture, recovered_agents),
     ).deliver_from_state(run_id, resumed)
@@ -131,11 +139,11 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
         assert result["ticket_jobs"][number]["phase"] == "completed"
         assert result["ticket_jobs"][number]["review_budget"]["development_attempts"] == 1
         calls = [item for item in result["agent_invocation_history"]
-                 if item["work_subject"] == f"ticket:{number}" and item["role"] == "development"]
+                 if item["work_subject"] == f"ticket:{number}" and item["role"] == (first_role if number == "3" else "development")]
         cached = number == "4" and sibling_boundary == "returned"
         assert len(calls) == (1 if cached else 2)
         if not cached:
-            assert calls[-1]["requested_thread_id"] == f"developer-{number}"
+            assert calls[-1]["requested_thread_id"] == f"{'reviewer' if number == '3' and first_role == 'fresh_acceptance' else 'developer'}-{number}"
         assert calls[-1]["semantic_attempt"]["attempt_id"] == failed["ticket_jobs"][number]["pending_semantic_attempt"]["attempt_id"]
     assert result["ticket_jobs"]["2"] == before["ticket_jobs"]["2"]
     assert result["ticket_jobs"]["5"] == before["ticket_jobs"]["5"]

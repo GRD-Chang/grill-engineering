@@ -56,6 +56,13 @@ def recovery_cli(
         'agent_run.codex.time', SimpleNamespace(monotonic=time.monotonic, sleep=waits.append),
     )
     monkeypatch.setattr(cli, 'FakeExecutorHost', lambda **kwargs: FakeExecutorHost())
+    # 此 fixture 同步执行在 pytest 进程内，未启动实际 Executor 或 Worker。
+    # 只替换虚拟 Host 的退出证据边界；真实 PID/Worker 验证由生命周期用例覆盖。
+    def virtual_exit(executor: Any) -> None:
+        assert executor["status"] == "exited"
+        assert not executor.get("workers") and not executor.get("worker")
+
+    monkeypatch.setattr(cli, "validate_executor_exit", virtual_exit)
     monkeypatch.setattr(cli, 'CodexCliBackend', lambda **kwargs: CodexCliBackend(
         credential_provider=lambda: 'fixture-reader', **kwargs,
     ))

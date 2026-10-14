@@ -41,6 +41,7 @@ def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
 
 @pytest.mark.parametrize("case", [
     "exited", "orphan", "recorded_exit_orphan", "multiple_orphans", "unknown", "save_interrupted",
+    "recorded_exit_unknown", "recorded_exit_alive",
 ])
 def test_resume_reconciles_externally_exited_executor(
     git_repo: Path, case: str, monkeypatch: pytest.MonkeyPatch,
@@ -54,9 +55,11 @@ def test_resume_reconciles_externally_exited_executor(
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id)
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait(timeout=3)
-    token = None if case == "unknown" else "old"
+    child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()" if case == "recorded_exit_alive" else "pass"])
+    if case != "recorded_exit_alive":
+        child.wait(timeout=3)
+    token = (_process_start_token(child.pid) if case == "recorded_exit_alive"
+             else None if case in {"unknown", "recorded_exit_unknown"} else "old")
     control.mark_process_started(task, action_id=claim.action_id,
         generation=reservation.generation, pid=child.pid, process_start_token=token)
     control.mark_handshake(task, action_id=claim.action_id,
@@ -71,6 +74,13 @@ def test_resume_reconciles_externally_exited_executor(
         generation=reservation.generation, result_status=current["status"])
 
     workers: list[subprocess.Popen[bytes]] = []
+    live_executor = child if case == "recorded_exit_alive" else None
+    if case in {"recorded_exit_unknown", "recorded_exit_alive"}:
+        from agent_run.controller import Controller
+        from agent_run.git import GitRepository
+        from agent_run.github_fixture import FixtureGitHubReader
+        assert Controller(FixtureGitHubReader(fixture), GitRepository(managed_repo(git_repo)), states).record_execution_failure(run_id, "shared failure")
+        control.finish_executor(task, action_id=claim.action_id, generation=reservation.generation)
     try:
         if case in {"orphan", "recorded_exit_orphan", "multiple_orphans"}:
             for _ in range(2 if case == "multiple_orphans" else 1):
@@ -87,10 +97,11 @@ def test_resume_reconciles_externally_exited_executor(
         before = states.load_run(run_id)
         control_before = control.path_for(task).read_bytes()
         if case == "save_interrupted":
-            original_save = StateStore.save_run
+            from agent_run.object_state import ObjectStateStore
+            original_save = ObjectStateStore.save_run
 
             def fail_interruption_save(
-                self: StateStore, selected_run_id: str, value: dict[str, Any],
+                self: ObjectStateStore, selected_run_id: str, value: dict[str, Any],
             ) -> None:
                 if any(item.get("code") == "session_interrupted"
                        for item in value.get("diagnostics", [])):
@@ -99,7 +110,7 @@ def test_resume_reconciles_externally_exited_executor(
 
             with monkeypatch.context() as patch:
                 patch.chdir(git_repo)
-                patch.setattr(StateStore, "save_run", fail_interruption_save)
+                patch.setattr(ObjectStateStore, "save_run", fail_interruption_save)
                 assert main([
                     "resume", run_id, "--json", "--github-fixture",
                     str(fixture), "--agent-fixture",
@@ -109,9 +120,9 @@ def test_resume_reconciles_externally_exited_executor(
             assert states.load_run(run_id) == before
         result = _run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture",
             str(_parent_only_agents(git_repo / "agents.json")))
-        if case == "unknown":
+        if case in {"unknown", "recorded_exit_unknown", "recorded_exit_alive"}:
             assert result.returncode == 2, result.stdout + result.stderr
-            assert "退出证据不足" in result.stdout
+            assert ("仍在运行" if case == "recorded_exit_alive" else "退出证据不足") in result.stdout
             assert states.load_run(run_id) == before
             assert control.path_for(task).read_bytes() == control_before
         elif workers:
@@ -130,6 +141,10 @@ def test_resume_reconciles_externally_exited_executor(
             assert states.load_run(run_id)["status"] == "parent_approval_pending"
             assert control.load(task)["action"]["kind"] == "resume"
     finally:
+        if live_executor is not None:
+            assert live_executor.poll() is None
+            live_executor.kill()
+            live_executor.wait(timeout=3)
         for worker in workers:
             if worker.poll() is None:
                 worker.kill()

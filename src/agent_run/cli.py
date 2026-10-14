@@ -28,7 +28,7 @@ from agent_run.github_identity import (
 )
 from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
-from agent_run.agent_invocation import record_session_interruption
+from agent_run.agent_invocation import interrupt_exited_invocations, record_session_interruption
 from agent_run.agent_profiles import (
     AgentProfileStore,
     ProfileOverrides,
@@ -2832,6 +2832,9 @@ def _reconcile_resume_exit(
     """Explicit Resume may close an exactly identified externally stopped session."""
     if host is None or current.get("status") == "abandoned":
         return current
+    # Reject incompatible frozen authorization before Host/Run reconciliation
+    # can persist anything. The lifecycle repeats this check before execution.
+    frozen_worker_identity(current)
     task = _task_for_parent(parsed, github, git)
     control = TaskControlStore(workspace_state_root(git.root))
     try:
@@ -2847,18 +2850,9 @@ def _reconcile_resume_exit(
         isinstance(executor, Mapping)
         and isinstance(action, Mapping)
         and (
-            executor.get("status") in {"running", "starting"}
+            executor.get("status") in {"running", "starting", "exited", "absent"}
             or isinstance(executor.get("worker"), Mapping)
             or isinstance(executor.get("workers"), list)
-            or (
-                # A previous reconciliation can commit the Host exit before
-                # the Run interruption save fails. Recheck its concrete process
-                # identity and finish that boundary on the next explicit Resume.
-                executor.get("status") in {"exited", "absent"}
-                and (not has_run_operator_gate(current) or is_final_approval_action(action, current))
-                and type(executor.get("pid")) is int
-                and isinstance(executor.get("process_start_token"), str)
-            )
         )
         and (
             action.get("status") in {"completed", "failed"}
@@ -2886,12 +2880,14 @@ def _reconcile_resume_exit(
     ):
         raise ExecutorStartUnknownError(observation.reason or error_message('cli.error.executor_exit_unknown'))
     validate_executor_exit(executor)
-    latest = states.load_current_run(str(current["run_id"]))
+    states = object_store(states)
+    latest = getattr(states, "load_scheduler_current_run", states.load_current_run)(str(current["run_id"]))
     if latest is None or not (
         action_receipt_matches(latest, action) or _unbound_action_matches_run_receipt(latest, action)
     ):
         raise ExecutorStartUnknownError(error_message('cli.error.executor_changed'))
     current = latest
+    frozen_worker_identity(current)
     if current.get("status") in {"completed", "abandoned"} and not is_final_approval_action(action, current):
         return current
     if _unbound_action_matches_run_receipt(current, action) and is_final_approval_action(action, current):
@@ -2910,7 +2906,17 @@ def _reconcile_resume_exit(
     )
     if is_final_approval_action(action, current):
         return current
-    if not has_run_operator_gate(current):
+    if has_run_operator_gate(current):
+        # The failure gate is not exit proof. Close this generation's work
+        # before a successor can refresh stages or admit another invocation.
+        with states.commit_admission(), control.exited_executor_transaction(
+            task, action_id=spec.action_id, generation=spec.generation,
+            application_receipt=current["action_application_receipt"],
+        ):
+            with states.require_unchanged_run(str(current["run_id"]), current):
+                interrupt_exited_invocations(current, "controller_interrupted")
+                states.save_run(str(current["run_id"]), current)
+    else:
         with states.commit_admission():
             control.fail_session_from_application_receipt(
                 task, action_id=spec.action_id, generation=spec.generation,

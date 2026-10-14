@@ -349,19 +349,7 @@ def record_session_interruption(
         # from the now-terminal Run would change its durable identity.
         return
 
-    active = state.get("active_agent_invocation")
-    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
-        failed = dict(active)
-        failed.update(
-            {
-                "status": "failed",
-                "interruption_observed_at": datetime.now(UTC).isoformat(),
-                "error": "session_interrupted",
-            }
-        )
-        state["active_agent_invocation"] = failed
-        _sync_invocation_history(state, failed)
-    interrupt_exited_ticket_invocations(state, "session_interrupted")
+    interrupt_exited_invocations(state, "session_interrupted")
     diagnostic = run_failure_diagnostic(
         state, code="session_interrupted",
         message="Executor Session 已退出；保留现场并等待显式 Resume",
@@ -400,19 +388,7 @@ def record_operator_stop(
         "resume_diagnostics": deepcopy(state.get("diagnostics", [])),
         "stopped_at": datetime.now(UTC).isoformat(),
     }
-    active = state.get("active_agent_invocation")
-    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
-        failed = dict(active)
-        failed.update(
-            {
-                "status": "failed",
-                "interruption_observed_at": datetime.now(UTC).isoformat(),
-                "error": "operator_stopped",
-            }
-        )
-        state["active_agent_invocation"] = failed
-        _sync_invocation_history(state, failed)
-    interrupt_exited_ticket_invocations(state, "operator_stopped")
+    interrupt_exited_invocations(state, "operator_stopped")
     state.update(
         {
             "status": "operator_stopped",
@@ -426,6 +402,17 @@ def record_operator_stop(
         }
     )
     save(state)
+
+
+def interrupt_exited_invocations(state: dict[str, Any], reason: str) -> None:
+    """Close current work only after the lifecycle proves its Executor exited."""
+    interrupt_exited_ticket_invocations(state, reason)
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
+        failed = {**active, "status": "failed", "error": reason,
+                  "interruption_observed_at": datetime.now(UTC).isoformat()}
+        state["active_agent_invocation"] = failed
+        _sync_invocation_history(state, failed)
 
 
 def interrupt_exited_ticket_invocations(state: dict[str, Any], reason: str) -> None:

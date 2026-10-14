@@ -1,6 +1,7 @@
 """Native identity delivery across public CLI restarts with external-tool doubles."""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import subprocess
@@ -157,13 +158,24 @@ raise SystemExit(cli.main(sys.argv[1:]))
                for secret in ("pat-first", "pat-repaired", "independent-runner-secret"))
     if reference == "app":
         state_ref = only_run_ref(managed_state(git_repo))
-        legacy_state = read_run(state_ref)
-        legacy_state["github_identity"].pop("app_read_only")
-        write_run_fixture(state_ref, legacy_state)
-        before = snapshot_run(state_ref)
-        incompatible = call("resume", first["run_id"], "--message", "旧授权不能猜测")
-        assert "incompatible_run_state" in incompatible.stdout
-        assert snapshot_run(state_ref) == before
+        compatible_state = read_run(state_ref)
+        control_root = managed_state(git_repo) / "task-control"
+        for missing in ("app_read_only", "app_current_repository_only", "github_identity"):
+            legacy_state = deepcopy(compatible_state)
+            if missing == "github_identity":
+                legacy_state.pop(missing)
+            else:
+                legacy_state["github_identity"].pop(missing)
+            write_run_fixture(state_ref, legacy_state)
+            before = snapshot_run(state_ref)
+            controls_before = {path.name: path.read_bytes() for path in control_root.glob("*.json")}
+            capture_before, fixture_before = capture.read_bytes(), fixture.read_bytes()
+            incompatible = call("resume", first["run_id"], "--message", "旧授权不能猜测")
+            assert json.loads(incompatible.stdout)["diagnostics"][0]["code"] == "incompatible_run_state"
+            assert snapshot_run(state_ref) == before
+            assert {path.name: path.read_bytes() for path in control_root.glob("*.json")} == controls_before
+            assert capture.read_bytes() == capture_before
+            assert fixture.read_bytes() == fixture_before
 
 
 def test_new_run_rejects_missing_pat_before_creating_state(

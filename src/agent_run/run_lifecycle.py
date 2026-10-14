@@ -1580,9 +1580,9 @@ class RunLifecycle:
                 "不会改写状态或启动第二个 Executor"
             )
         guarded_store = self._state_store_for_record(record)
-        state_store = StateStore(guarded_store.root)
+        state_store = object_store(StateStore(guarded_store.root))
         run_id = _string_field(state, "run_id")
-        current = state_store.load_current_run(run_id)
+        current = getattr(state_store, "load_scheduler_current_run", state_store.load_current_run)(run_id)
         current_receipt = (
             current.get("action_application_receipt")
             if isinstance(current, Mapping)

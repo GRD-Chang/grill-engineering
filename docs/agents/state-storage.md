@@ -18,9 +18,13 @@ Run 门禁阶段对应顶层失败状态，status/history 从相同
 共享故障保留独立对象原有的人工、预算和暂停门禁；真实执行取消、退出确认与退出
 后全部未完成调用的核对仍由执行生命周期负责，故障记录本身不证明 Worker 已退出。
 
-公开生命周期排除旧 Executor/Worker 后，显式 Run 恢复在还原 Thread 前收口
-Ticket 记录中仍为 `running/resuming` 的实际 Invocation，并同步对应调用历史与
-准确匹配的观察投影，不重写 Run 原始故障解释。恢复从各 Invocation 的准确 pending
+公开 resume 在准入新 Executor 前重新核验旧 Executor 和全部已登记 Worker 的
+PID 与启动身份；即使控制记录已标记 `exited`，存活、未知或缺失身份也不能作为
+退出证明，resume 不终止残留进程。确认退出后，在原 Action、执行代次和 Run Receipt
+栅栏内收口仍为 `running/resuming` 的实际 Invocation、工作租约、对应调用历史与
+准确匹配的观察投影，不重写 Run 原始故障解释。共享故障记录保存失败时，存储恢复
+后的第一次显式 resume 完成同一核对；已持久化的返回仍保留为完成事实。
+退出收口使用现有对象投影和差量提交，不加载或重写无关归档调用历史。恢复从各 Invocation 的准确 pending
 Attempt 取回原 Thread，包括未被选中的兄弟调用；`completed` 调用保持完成记录，
 已保存返回优先由正常阶段消费。完成 Ticket 及兄弟的人工、预算、暂停门禁不被解除。
 

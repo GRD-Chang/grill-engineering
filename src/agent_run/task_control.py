@@ -1391,16 +1391,16 @@ class TaskControlStore:
             self._write_unlocked(task, record)
             return deepcopy(record)
 
-    def fail_session_from_application_receipt(
+    @contextmanager
+    def exited_executor_transaction(
         self,
         task: TaskKey,
         *,
         action_id: str,
         generation: int,
         application_receipt: Mapping[str, Any],
-        persist_run_failure: Callable[[], None],
-    ) -> dict[str, Any]:
-        """Atomically fence a proven dead Executor around its Run failure save."""
+    ) -> Iterator[dict[str, Any]]:
+        """Fence exit reconciliation against a successor Action and generation."""
 
         with self._locked(task, wait=True):
             record = self._require_unlocked(task)
@@ -1447,6 +1447,26 @@ class TaskControlStore:
                     "Delivery Run Receipt 与中断 Session ownership 不一致"
                 )
 
+            yield record
+
+    def fail_session_from_application_receipt(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        application_receipt: Mapping[str, Any],
+        persist_run_failure: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Atomically fence a proven dead Executor around its Run failure save."""
+
+        with self.exited_executor_transaction(
+            task, action_id=action_id, generation=generation,
+            application_receipt=application_receipt,
+        ) as record:
+            action = record["action"]
+            executor = record["executor"]
+            receipt_run_id = application_receipt["run_id"]
             # Hold the Task Control transaction across the one local Run-state
             # commit so no successor Action can pass admission in between.
             persist_run_failure()
