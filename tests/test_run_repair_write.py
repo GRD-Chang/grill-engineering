@@ -15,6 +15,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.work_facts import work_phase
 from support.run_agents import ScriptedRunAgents
 from support.run_scenarios import _completed_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("failure", ["permission", "lost_response", "read_before", "read_after"])
@@ -23,7 +24,7 @@ def test_parent_repair_write_reloads_and_reconciles_without_repeating_agents(
 ) -> None:
     state, states, git = _completed_run(git_repo)
     state["policy_snapshot"] = DeliveryPolicy(integration_resync_limit=0).snapshot()
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture = git_repo / "github.json"
     run_branch = str(state["run_branch"])
     old_head = git.resolve(run_branch)
@@ -100,7 +101,7 @@ def test_parent_repair_successful_push_survives_local_save_failure(
 ) -> None:
     state, states, git = _completed_run(git_repo)
     state["policy_snapshot"] = DeliveryPolicy(integration_resync_limit=0).snapshot()
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     agents = ScriptedRunAgents()

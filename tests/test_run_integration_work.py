@@ -23,6 +23,7 @@ from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _passing_artifact, _repair_artifact
 from support.run_scenarios import _completed_run
 from support.state_commits import observe_run_commits
+from support.state import persist_run_fixture
 
 
 def _git(checkout: Path, *args: str) -> str:
@@ -100,7 +101,7 @@ def _two_ticket_run(git_repo: Path, tmp_path: Path, *, conflict: bool = True, st
         _git(git_repo, "commit", "-m", "advance default target")
         publisher.data["default_head_sha"] = git.resolve("main")
         publisher._save()
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     return state, states, git, publisher
 
 
@@ -276,7 +277,7 @@ def test_closed_ticket_without_completion_cannot_start_parent_integration(
 ) -> None:
     state, states, git, publisher = _two_ticket_run(git_repo, tmp_path)
     state["ticket_jobs"].pop("3")
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     before = git.resolve(state["run_branch"])
     agents = CsvIntegrationAgents(0)
     with pytest.raises(ValueError, match="every Ticket to be completed"):
@@ -305,7 +306,7 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
         "validation_attempts": 4,
     })
     accepted.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
-    states.save_run(state["run_id"], accepted)
+    persist_run_fixture(states, state["run_id"], accepted)
     before = states.load_current_run(state["run_id"])["run_acceptance"]
     resumed, _ = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         state["run_id"], explicit_resume=True, resume_budget_checkpoint=True,

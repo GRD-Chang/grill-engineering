@@ -15,6 +15,7 @@ from support.parent_approval_update import append_remote
 from support.published_run import prepare_published_run
 from support.run_approval_update import update_agents
 from support.workspace import managed_state
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("exhausted", [False, True], ids=["repair", "budget-checkpoint"])
@@ -32,7 +33,7 @@ def test_public_run_approval_update_routes_ci_and_preserves_other_budgets(
                 run, head_sha=f"previous-ci-head-{index}", limit=3, is_ticket=False,
             )
             mark_ci_repair(run, limit=3, is_ticket=False)
-        StateStore(managed_state(git_repo)).save_run(before["run_id"], before)
+        persist_run_fixture(StateStore(managed_state(git_repo)), before["run_id"], before)
         agents = update_agents(git_repo)
     else:
         agents = _resume_repair_agents(git_repo / "ci-update-agents.json", expected_thread_id=None)

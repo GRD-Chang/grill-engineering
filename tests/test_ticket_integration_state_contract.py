@@ -16,6 +16,7 @@ from agent_run.state_contract import IncompatibleRunStateError, require_current_
 from agent_run.ticket_queue import next_ticket
 from agent_run.review_budget import new_budget
 from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 def _state(repo: Path) -> dict[str, Any]:
@@ -96,7 +97,7 @@ def test_old_protocol_is_rejected_on_resume_before_delivery(git_repo: Path) -> N
     state = _state(git_repo)
     state.pop("multi_ticket_protocol")
     states = StateStore(git_repo / ".agent-run")
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture = git_repo / "github.json"
     controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
 

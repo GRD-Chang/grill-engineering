@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
 from support.run_scenarios import _completed_run, _sync_completed_ticket_integrated_sha
+from support.state import persist_run_fixture
 
 import json
 import subprocess
@@ -343,7 +344,7 @@ class MergeResolutionFixture:
         )
         default_head = self.git.resolve("main")
         _sync_completed_ticket_integrated_sha(self.state, self.git, run_head)
-        self.states.save_run(str(self.state["run_id"]), self.state)
+        persist_run_fixture(self.states, str(self.state["run_id"]), self.state)
         fixture_data = json.loads(self.fixture.read_text(encoding="utf-8"))
         fixture_data["default_head_sha"] = default_head
         fixture_data.setdefault("delivery", {}).setdefault(

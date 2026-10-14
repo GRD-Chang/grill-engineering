@@ -21,6 +21,7 @@ from agent_run.ticket_queue import reconcile
 from agent_run.ticket_work import TicketWorkAdmission
 from agent_run.worker_control import worker_lease
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 def _prepare_cost_run(git_repo: Path, monkeypatch: pytest.MonkeyPatch, *, retry_pending: bool) -> tuple[str, StateStore, dict]:
@@ -112,7 +113,7 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
                 reset_budget(job, ticket_budget_policy_for_job(job))
         current["active_ticket_job"] = deepcopy(job)
         require_current_run_state(current)
-        states.save_run(run_id, current)
+        persist_run_fixture(states, run_id, current)
         # All measurements start with a fresh repository, excluding setup and
         # the deliberately complete query. Both SQL paths exercise real disk.
         work_states = StateStore(states.root)
@@ -215,7 +216,7 @@ def test_related_attempt_damage_is_rejected_by_complete_and_work_queries(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool, damage: str,
 ) -> None:
     run_id, states, original = _prepare_cost_run(git_repo, monkeypatch, retry_pending=True)
-    states.save_run(run_id, original)
+    persist_run_fixture(states, run_id, original)
     parent = '["ticket_jobs","3","semantic_attempt_history"]'
     with states._repository.atomic():
         connection = states._repository._local.connection

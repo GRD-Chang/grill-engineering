@@ -27,6 +27,7 @@ from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 def _canonical_budget() -> dict[str, Any]:
@@ -346,7 +347,7 @@ def _prepared_resume(
     state["status"] = "execution_failed"
     state["terminal_kind"] = "execution_failed"
     _with_canonical_ci_budgets(state)
-    store.save_run(run_id, state)
+    persist_run_fixture(store, run_id, state)
     return controller, store, run_id
 
 
@@ -472,7 +473,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
         }
     )
     _with_canonical_ci_budgets(state)
-    store.save_run(run_id, state)
+    persist_run_fixture(store, run_id, state)
 
     resumed, reused = controller.resume(run_id, explicit_resume=True, message="凭据已恢复，继续原开发。")
 
@@ -575,7 +576,7 @@ def test_parent_repair_rejects_internal_publication_attempt(git_repo: Path) -> N
         generation=2, currentness_boundary={}, ordinal=1,
     )
     state["active_agent_invocation"] = None
-    store.save_run(run_id, state)
+    persist_run_fixture(store, run_id, state)
     before = store.load_run(run_id)
     with pytest.raises(IncompatibleRunStateError, match="owner mismatch"):
         controller.resume(run_id)

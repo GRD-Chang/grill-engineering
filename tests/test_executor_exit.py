@@ -21,6 +21,7 @@ from agent_run.task_control import TaskControlError, TaskControlStore
 from support.executor_exit import create_exit_run
 
 from support.state import snapshot_runs
+from support.state import persist_run_fixture
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +60,7 @@ def _resume(states: StateStore, control: TaskControlStore, spec: ExecutorSpec) -
     state = states.load_current_run(spec.run_id)
     assert state is not None
     prepare_action_application_receipt(state, claim.action)
-    states.save_run(spec.run_id, state)
+    persist_run_fixture(states, spec.run_id, state)
     control.record_application(spec.task, action_id=successor.action_id, run_id=spec.run_id,
                                generation=successor.generation,
                                payload_digest=claim.action["payload_digest"])
@@ -117,11 +118,11 @@ def test_exit_observer_suppresses_non_crashes_and_obsolete_sessions(
     assert state is not None
     if case in {"completed", "abandoned", "operator_stopped"}:
         state["status"] = case
-        states.save_run(str(spec.run_id), state)
+        persist_run_fixture(states, str(spec.run_id), state)
     elif case in {"waiting_approval", "waiting_human", "handled_failure", "handled_exception"}:
         state["status"] = {"waiting_approval": "ready_for_approval", "waiting_human": "ready_for_human",
                            "handled_failure": "execution_failed", "handled_exception": "execution_failed"}[case]
-        states.save_run(str(spec.run_id), state)
+        persist_run_fixture(states, str(spec.run_id), state)
         control.finish_executor(spec.task, action_id=spec.action_id, generation=spec.generation,
                                 result_status=state["status"],
                                 failure="handled invocation failure" if case == "handled_exception" else None)

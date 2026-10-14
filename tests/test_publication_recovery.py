@@ -15,6 +15,7 @@ from agent_run.state import StateStore
 from support.seeding import write_fixture
 from support.delivery_agents import PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("remote", ["previous", "target", "rewrite", "wrong_base"])
@@ -53,7 +54,7 @@ def test_resume_reconciles_known_publication_heads_and_rejects_external_changes(
         ).stdout.strip()
     elif remote == "wrong_base":
         publisher.base_branch = "main"
-    states.save_run(run_id, waiting)
+    persist_run_fixture(states, run_id, waiting)
 
     resumed, _ = controller.resume(run_id)
 
@@ -118,7 +119,7 @@ def test_publication_reconciles_completed_push_only_with_matching_write_intent(
         job.pop("ticket_write_intent")
     elif intent == "foreign":
         job["ticket_write_intent"]["branch"] = "foreign-branch"
-    states.save_run(run_id, waiting)
+    persist_run_fixture(states, run_id, waiting)
 
     if intent == "foreign":
         paused = engine.deliver(run_id)
@@ -164,7 +165,7 @@ def test_published_source_rewind_is_not_reused_as_an_unpublished_base(
     job = waiting["active_ticket_job"]
     assert job["published_sha"] == job["publication_sha"]
     publisher.live_head = job["ticket_integration"]["source_sha"]
-    states.save_run(run_id, waiting)
+    persist_run_fixture(states, run_id, waiting)
 
     blocked = engine.deliver(run_id)
 

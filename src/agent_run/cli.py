@@ -2881,6 +2881,8 @@ def _reconcile_resume_exit(
         raise ExecutorStartUnknownError(observation.reason or error_message('cli.error.executor_exit_unknown'))
     validate_executor_exit(executor)
     states = object_store(states)
+    assert isinstance(states, ObjectStateStore)
+    object_states = states
     latest = getattr(states, "load_scheduler_current_run", states.load_current_run)(str(current["run_id"]))
     if latest is None or not (
         action_receipt_matches(latest, action) or _unbound_action_matches_run_receipt(latest, action)
@@ -2913,7 +2915,7 @@ def _reconcile_resume_exit(
             task, action_id=spec.action_id, generation=spec.generation,
             application_receipt=current["action_application_receipt"],
         ):
-            with states.require_unchanged_run(str(current["run_id"]), current):
+            with object_states.require_unchanged_run(str(current["run_id"]), current):
                 interrupt_exited_invocations(current, "controller_interrupted")
                 states.save_run(str(current["run_id"]), current)
     else:

@@ -10,6 +10,7 @@ from agent_run.run_publication_approval import prepare_run_approval
 from agent_run.state import StateStore
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run
+from support.state import persist_run_fixture
 
 
 def final_publication_context(
@@ -29,6 +30,6 @@ def final_publication_context(
     else:
         state["run_publication"]["phase"] = "waiting_checks"
         state.update(status="waiting_checks", terminal_kind="waiting_checks")
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     assert states.load_current_run(str(state["run_id"])) is not None
     return states, git, state

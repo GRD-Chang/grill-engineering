@@ -13,6 +13,7 @@ from agent_run.state_errors import IncompatibleRunStateError
 from support.run_agents import ScriptedRunAgents
 from support.run_scenarios import _completed_run
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 def test_parent_commit_rejects_changed_demand_even_without_changing_owner(
@@ -27,7 +28,7 @@ def test_parent_commit_rejects_changed_demand_even_without_changing_owner(
     assert changed is not None
     changed["parent"]["revision"] = "new-parent-revision"
     changed["accepted_parent_spec_revision"] = "new-parent-revision"
-    states.save_run(run_id, changed)
+    persist_run_fixture(states, run_id, changed)
     staged["updated_at"] = "2026-10-13T00:00:00+00:00"
     with pytest.raises(ConcurrentRunStateError, match="Parent demand changed"):
         parent.save_run(run_id, staged)
@@ -42,7 +43,7 @@ def test_outer_rollback_drops_provisional_baseline_and_notification(git_repo: Pa
     observations: list[dict[str, object]] = []
     states.run_saved_observer = observations.append
 
-    def interrupted(_current):
+    def interrupted():
         staged = adapter.load_current_run(run_id)
         assert staged is not None
         staged["updated_at"] = "2026-10-13T00:00:00+00:00"
@@ -50,7 +51,7 @@ def test_outer_rollback_drops_provisional_baseline_and_notification(git_repo: Pa
         raise OSError("outer transaction interrupted")
 
     with pytest.raises(OSError, match="outer transaction interrupted"):
-        states.update_run(run_id, interrupted)
+        states._commit_run(interrupted)
     assert StateStore(states.root).load_current_run(run_id) == before
     assert observations == []
     staged = adapter.load_current_run(run_id)
@@ -68,7 +69,7 @@ def test_parent_acceptance_validates_completed_ticket_authority_at_evidence_boun
     run_id = state["run_id"]
     damaged = deepcopy(state)
     damaged["ticket_jobs"]["2"]["deterministic_integration_record"]["publication_sha"] = "different-publication"
-    states.save_run(run_id, damaged)
+    persist_run_fixture(states, run_id, damaged)
     agents = ScriptedRunAgents()
     with pytest.raises(IncompatibleRunStateError, match="integrated_publication_sha"):
         RunAcceptanceEngine(git=git, states=states, agents=agents).accept(run_id)
@@ -98,7 +99,7 @@ def test_controller_readback_reselects_retired_invocation_without_losing_concurr
         if concurrent_change:
             changed = states.load_current_run(run_id)
             changed["updated_at"] = "2026-10-13T02:00:00+00:00"
-            states.save_run(run_id, changed)
+            persist_run_fixture(states, run_id, changed)
             with pytest.raises(ConcurrentRunStateError, match="before Controller returned"):
                 adapter.load_unchanged_run(run_id)
         else:

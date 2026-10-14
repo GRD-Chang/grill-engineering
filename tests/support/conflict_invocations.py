@@ -15,10 +15,12 @@ from agent_run.parent_only_integration import resolve_parent_conflict
 from agent_run.review_budget import new_budget, policy_for_subject
 from agent_run.revisions import effective_revision
 from support.run_artifacts import _passing_artifact
+from agent_run.object_state import object_store
 from agent_run.state import StateStore
 from agent_run.ticket_integration import _resolve_conflict
 from support.delivery_agents import issue
 from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, state_root: Path | None = None) -> tuple[dict[str, Any], StateStore, dict[str, Any], Any]:
@@ -63,7 +65,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
                     "reviewed_base_sha", "reviewed_candidate_sha", "reviewed_candidate_tree")}, artifact=artifact,
             )]
         state["active_ticket_job"] = job
-        state["ticket_integration_holder"] = 3
+        state["ticket_integration_holder"] = 3 if phase == "accepted" else None
         subject = "ticket:3"
         key = "integration_conflict"
     elif kind == "parent_only":
@@ -93,6 +95,9 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,
                     stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0,
                     resolved_stages=[], conflict_paths=["README.md"])
+    persist_run_fixture(store, str(state["run_id"]), state)
+    scoped = object_store(store, parent_scope=kind != "ticket")
+    assert scoped.load_current_run(str(state["run_id"])) is not None
     stage = SimpleNamespace(
         require_agent_work=lambda _role: None,
         release_agent_work=lambda: None,
@@ -105,7 +110,7 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         review_budget_policy=lambda: policy_for_subject({
             "ticket": "ticket-3", "parent_only": "parent-only", "run_repair": "run-repair",
         }[kind]),
-        save=lambda current: store.save_run(str(current["run_id"]), current),
+        save=lambda current: scoped.save_run(str(current["run_id"]), current),
         _invocation_boundary=invocation_boundary,
         _agent_is_current=lambda state, job: True,
         _reject_stale=lambda *args: None,

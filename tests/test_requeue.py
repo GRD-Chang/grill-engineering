@@ -24,10 +24,12 @@ from agent_run.requeue import RequeueError, requeue_change_job
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
+from agent_run.ticket_state import TicketState
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_idle_control, seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import issue, run_cli, stdout_json
+from support.state import persist_run_fixture
 
 
 def _canonical_budget() -> dict[str, Any]:
@@ -138,11 +140,12 @@ def test_ticket_ref_recovery_preserves_a_publish_intent_before_its_push(
     ).start(1)
     git = GitRepository(git_repo)
     publisher = FixtureGitHubPublisher(fixture, git)
-    with states.locked():
-        current = states.load_current_run(str(state["run_id"]))
+    lane = TicketState(states, state["run_id"], 7)
+    with lane.work_session():
+        current = lane.load_current_run(state["run_id"])
         assert current is not None
         engine = TicketDeliveryEngine(
-            git=git, states=states, github=publisher, agents=object()  # type: ignore[arg-type]
+            git=git, states=lane, github=publisher, agents=object()  # type: ignore[arg-type]
         )
         job = engine._job(current)
         base_sha = str(job["base_sha"])
@@ -160,10 +163,18 @@ def test_ticket_ref_recovery_preserves_a_publish_intent_before_its_push(
             "expected_remote_sha": base_sha,
             "head_sha": "pending-publication-sha",
         }
+        # 未对账的发布意图必须保留准确的集成席位。
+        current["ticket_integration_holder"] = 7
+        lane.save_run(state["run_id"], current)
         engine._ensure_ticket_branch(current, job)
 
     assert job["ticket_write_intent"]["expected_remote_sha"] == base_sha
     assert job["ticket_write_intent"]["head_sha"] == "pending-publication-sha"
+
+    reopened = states.load_current_run(state["run_id"])
+    assert reopened is not None
+    assert reopened["ticket_jobs"]["7"]["ticket_write_intent"] == job["ticket_write_intent"]
+    assert reopened["ticket_integration_holder"] == 7
 
 
 def _ticket_state() -> dict[str, Any]:
@@ -399,7 +410,7 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
         }
     )
     state["ticket_jobs"] = {"7": active}
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["issues"]["7"]["body"] = "new requirements"
@@ -454,7 +465,7 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
         }
     )
     state["ticket_jobs"] = {"7": active}
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["issues"]["7"]["body"] = "new requirements"
@@ -533,7 +544,7 @@ def test_requeue_transition_restores_its_exact_gate_after_graph_read_recovers(
         }
     )
     state["ticket_jobs"] = {"7": active}
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["issues"]["7"]["body"] = "new requirements"
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
@@ -613,7 +624,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
         }
     )
     state["ticket_jobs"] = {"7": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
     stale = run_cli(git_repo, fixture, "run", "1")
     assert stdout_json(stale)["status"] == "requeue_required"
@@ -694,7 +705,7 @@ def test_requeue_blocks_an_external_close_during_retirement(
         }
     )
     state["ticket_jobs"] = {"7": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
     assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == (
         "requeue_required"
@@ -738,7 +749,7 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7, expected_head_sha=base_sha, expected_base_sha=base_sha)
     job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "review_budget": _canonical_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(), "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
     state["ticket_jobs"] = {"7": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == "requeue_required"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["external_reopen_after_supersession_receipt_once"] = True
@@ -793,7 +804,7 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
             "message": "Ticket requirements changed; run requeue",
         }
     ]
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
     waiting = run_cli(git_repo, fixture, "requeue", run_id)
 
@@ -846,7 +857,7 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
             "message": "Ticket requirements changed; run requeue",
         }
     ]
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["supervision_clock_multiplier"] = 1
     data["repository_read_failures"] = [
@@ -892,7 +903,7 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
         }
     )
     state["ticket_jobs"] = {"7": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
     blocked = run_cli(git_repo, fixture, "run", "1")
 
@@ -937,7 +948,7 @@ def test_stale_human_blocker_cannot_resume_the_old_generation(git_repo: Path) ->
             "terminal_kind": "waiting_human",
         }
     )
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = controller.resume(str(state["run_id"]), resume_human_blocker=True)
 
@@ -1020,7 +1031,7 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
         }
     )
     state["ticket_jobs"] = {"7": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery"]["pull_requests"][0]["base_branch"] = "foreign"
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")

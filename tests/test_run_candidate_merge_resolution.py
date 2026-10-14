@@ -22,6 +22,7 @@ from support.workspace import prepare_workspace
 from support.seeding import seed_idle_control
 from support.cli import run_cli
 from support.merge_resolution import _LateMergeRepairEngine
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -69,7 +70,7 @@ def test_written_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     )
     initial_default = git.resolve("main")
     _sync_completed_ticket_integrated_sha(state, git, run_head)
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["default_head_sha"] = initial_default
     fixture_data.setdefault("delivery", {}).setdefault("published_branches", {})[
@@ -226,7 +227,7 @@ def test_written_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         active_run["repair_cycle"]["code_modification_attempts"] = 9
         active_run["modification_attempts"] = 9
         active_run["code_modification_attempts"] = 9
-        states.save_run(str(state["run_id"]), first)
+        persist_run_fixture(states, str(state["run_id"]), first)
 
     if latest_combination_has_finding:
         exhausted = RunAcceptanceEngine(

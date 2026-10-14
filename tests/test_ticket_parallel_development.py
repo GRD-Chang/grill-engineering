@@ -28,6 +28,7 @@ from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.ticket_state import TicketState
 from agent_run.ticket_pause import request_ticket_pause
 from agent_run.user_defaults import UserDefaultsStore
+from agent_run.object_state import save_owned
 from support.cli_payloads import (
     human_blocker_step,
     passing_acceptance,
@@ -47,6 +48,7 @@ from support.ticket_parallel import (
 )
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def test_fixture_revision_read_does_not_erase_parallel_ticket_branch(
@@ -376,7 +378,7 @@ def test_lane_rejects_real_concurrent_changes(
         latest["ticket_graph"]["tickets"]["2"]["content_revision"] = "changed"
     else:
         latest["status"] = "operator_stopped"
-    states.save_run(run_id, latest)
+    persist_run_fixture(states, run_id, latest)
     with pytest.raises(TaskControlBusyError):
         if failure:
             lane.block_execution_failure(RuntimeError("Worker exited"))
@@ -610,7 +612,7 @@ def test_ticket_pause_receipts_use_frozen_run_language(
     assert paused["ticket_jobs"][str(queued_number)]["blocked_reason"] == "ticket_paused"
     # A later, independently established gate is not reported as a new Stop.
     paused["ticket_jobs"][str(queued_number)]["blocked_reason"] = "modification_budget_exhausted"
-    states.save_run(str(state["run_id"]), paused)
+    persist_run_fixture(states, str(state["run_id"]), paused)
     unchanged = invoke_cli_inprocess(
         git_repo, fixture, "stop", "1", "--ticket", str(queued_number),
     )
@@ -677,7 +679,7 @@ def test_pausing_integration_holder_requeues_original_phase(
     state["active_ticket_job"] = job
     state["ticket_integration_holder"] = 2
     state["ticket_integration_queue"] = []
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     if held_phase == "waiting_checks":
         fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
         fixture_data.setdefault("delivery", {})["required_checks"] = ["pending"]
@@ -1023,7 +1025,7 @@ def test_controller_refresh_does_not_reopen_concurrent_operator_stop(
         assert current is not None
         record_operator_stop(
             current,
-            save=lambda stopped: independent_store.save_run(str(state["run_id"]), stopped),
+            save=lambda stopped: save_owned(independent_store, str(state["run_id"]), stopped, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}),
         )
     finally:
         release.set()
@@ -1111,7 +1113,7 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
             current = independent_store.load_current_run(run_id)
             assert current is not None
             record_operator_stop(
-                current, save=lambda value: independent_store.save_run(run_id, value),
+                current, save=lambda value: save_owned(independent_store, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}),
             )
         return original_load(run_id)
 
@@ -1434,7 +1436,7 @@ def test_integration_holder_does_not_block_other_ticket_development(
     state["ticket_integration_holder"] = 2
     state["ticket_integration_queue"] = []
     require_current_run_state(state)
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     barrier = Barrier(2)
     agents = _TicketAgents(

@@ -29,6 +29,7 @@ from support.lifecycle import _isolated_environment
 from support.control import _bind_running_executor
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -122,7 +123,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             if receipt_case == "invalid":
                 # Syntactically valid evidence referring to a different Run.
                 receipt["run_id"] = "run-unrelated"
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         path = control.path_for(task)
         if control_case == "missing":
             path.unlink()
@@ -280,7 +281,7 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
         state["status"] = status
         state["terminal_kind"] = "operator_stopped" if command == "stop" else None
         state.pop("action_application_receipt", None)
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         path = control.path_for(task)
         if control_case == "missing":
             path.unlink()

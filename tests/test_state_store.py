@@ -21,6 +21,7 @@ from agent_run.state import (
     MAX_TIMELINE_EVENTS,
     StateStore,
 )
+from agent_run.object_state import save_owned
 
 
 def test_shared_save_sanitizer_keeps_path_and_diagnostic_rules() -> None:
@@ -100,20 +101,24 @@ def test_requirement_body_keeps_credential_redaction(tmp_path: Path, body: str) 
     assert "- [ ] 验收" in saved
 
 
-def test_controller_refresh_rejects_a_concurrent_run_write(tmp_path: Path) -> None:
+def test_initial_save_refuses_to_replace_existing_work(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
     store.save_run("run-1", {"version": 1})
-    baseline = store.load_run("run-1")
-    assert baseline is not None
-
-    with store.require_unchanged_run("run-1", baseline):
+    with pytest.raises(ValueError, match="already exists"):
         store.save_run("run-1", {"version": 2})
-        store.save_run("run-1", {"version": 3})
-        StateStore(store.root).save_run("run-1", {"version": 4})
-        with pytest.raises(ConcurrentRunStateError, match="changed"):
-            store.save_run("run-1", {"version": 5})
+    assert StateStore(store.root).load_run("run-1") == {"version": 1}
+    existing, created = store.create_run_if_absent("run-1", {"version": 3})
+    assert not created and existing == {"version": 1}
 
-    assert store.load_run("run-1") == {"version": 4}
+
+def test_owned_commit_rejects_a_concurrent_object_write(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save_run("run-1", {"version": 1})
+    save_owned(store, "run-1", {"version": 2}, fields={"version"}, expected={"version": 1})
+    save_owned(StateStore(store.root), "run-1", {"version": 3}, fields={"version"})
+    with pytest.raises(ConcurrentRunStateError, match="changed"):
+        save_owned(store, "run-1", {"version": 4}, fields={"version"}, expected={"version": 2})
+    assert store.load_run("run-1") == {"version": 3}
 
 
 def test_run_state_persistence_rejects_oversized_write_and_read(
@@ -230,7 +235,7 @@ def test_repeated_text_keeps_contextual_redaction_and_resource_isolation(
     assert saved["untrusted"]["token"] == "[REDACTED]"
     resource["method"] = "updated instruction"
     state["repeated"][0] = "token=changed-private-value"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"prompt_resources", "repeated"})
     assert saved["prompt_resources"]["method"] == "token=personal-instruction"
     updated = store.load_run("run-1")
     assert updated is not None
@@ -290,7 +295,7 @@ def test_unserializable_extension_keeps_the_previous_durable_state(
     unsupported = {"version": 2, "extension": {"not-json"}}
 
     with pytest.raises(TypeError, match="not JSON serializable"):
-        store.save_run("run-1", unsupported)
+        save_owned(store, "run-1", unsupported, fields={"version", "extension"})
 
     assert unsupported == {"version": 2, "extension": {"not-json"}}
     assert store.load_run("run-1") == {"version": 1}
@@ -454,7 +459,7 @@ def test_interrupted_transaction_preserves_previous_state(tmp_path: Path) -> Non
     repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
     with pytest.raises(OSError, match="simulated interruption"):
         with repository.atomic():
-            repository.save("run-1", {"attempt": 2})
+            repository.save_objects("run-1", {"attempt": 2}, fields={"attempt"})
             raise OSError("simulated interruption")
     assert StateStore(tmp_path).load_run("run-1") == {"attempt": 1}
     assert not list(tmp_path.glob("*journal"))
@@ -611,7 +616,7 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
     }
 
     store.save_run("run-1", state)
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change"})
 
     assert state["timeline"] == [
         {
@@ -637,18 +642,18 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
         for number in range(1, MAX_TIMELINE_EVENTS - 2)
     ]
     change["observed_graph_revision"] = "history-253"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     assert len(store.load_run("run-1")["timeline"]) == 254
 
     change["observed_graph_revision"] = "last-ordinary-event"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     persisted = store.load_run("run-1")
     assert len(persisted["timeline"]) == 255
     assert persisted["timeline"][-1]["observed_graph_revision"] == "last-ordinary-event"
     assert persisted.get("timeline_at_capacity", False) is False
 
     change["observed_graph_revision"] = "first-continuation-event"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     persisted = store.load_run("run-1")
     assert len(persisted["timeline"]) == 256
     assert persisted["timeline"][0] == first_event
@@ -663,11 +668,11 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
         for number in range(1, MAX_TIMELINE_CONTINUATION_EVENTS - 1)
     ]
     change["observed_graph_revision"] = "continuation-254"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     assert len(store.load_run("run-1")["timeline_continuation"]) == 255
 
     change["observed_graph_revision"] = "last-continuation-slot"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     persisted = store.load_run("run-1")
     assert len(persisted["timeline_continuation"]) == 256
     assert persisted["timeline_continuation"][0] == first_continuation
@@ -676,7 +681,7 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
     )
 
     change["observed_graph_revision"] = "continuation-after-rollover"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     persisted = store.load_run("run-1")
     assert persisted["timeline"] == frozen_timeline
     assert persisted["timeline_at_capacity"] is True
@@ -688,7 +693,7 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
         "continuation-after-rollover"
     )
 
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"unsupported_scope_change", "timeline", "timeline_continuation"})
     assert store.load_run("run-1") == persisted
 
 

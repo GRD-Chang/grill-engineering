@@ -44,6 +44,7 @@ from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout
 from support.cli_payloads import parent_round_agents, passing_acceptance
 
 from support.state import only_run_ref, snapshot_run, write_run_fixture
+from support.state import persist_run_fixture
 
 
 def _ticket(
@@ -73,7 +74,7 @@ def test_legacy_branch_authority_state_is_rejected_before_reuse(
         state.pop("branch_authority_protocol")
     else:
         state["branch_authority_protocol"] = legacy_protocol
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="branch authority"):
         controller.resume(str(state["run_id"]))
@@ -105,7 +106,7 @@ def test_legacy_semantic_attempt_state_is_rejected_before_reuse(
         state.pop("semantic_attempt_protocol")
     else:
         state["semantic_attempt_protocol"] = legacy_protocol
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="Semantic Agent Attempt"):
         controller.resume(str(state["run_id"]))
@@ -423,7 +424,7 @@ def test_unbound_execution_failure_and_ticket_human_gate_fail_closed(
         require_current_run_state(state)
 
     run_id = str(state["run_id"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     state_ref = (states.root, str(run_id))
     state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
@@ -1221,7 +1222,7 @@ def test_pending_semantic_attempt_owner_mismatch_is_rejected_without_invocation(
         budget_window=job["review_budget"]["window"],
     )
     state["active_ticket_job"] = dict(job)
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="owner mismatch"):
         controller.resume(str(state["run_id"]))
@@ -1239,7 +1240,7 @@ def test_controller_reprepare_authority_is_rejected_outside_run_repair(
     state["ticket_jobs"]["2"]["controller_candidate_reprepare"] = {
         "kind": "controller_currentness_reprepare"
     }
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="outside Run Repair"):
         controller.resume(str(state["run_id"]))
@@ -1592,7 +1593,7 @@ def test_legacy_run_fails_closed_before_reading_graph_drift(
     )
     state, _ = controller.start(1)
     state.pop("accepted_ticket_graph_revision")
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["sub_issues"].append(3)
     data["issues"]["3"] = _ticket(3)
@@ -1990,7 +1991,7 @@ def test_deterministic_ticket_conflict_allows_independent_frontier(
             ],
         }
     )
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = controller.resume(str(state["run_id"]))
 

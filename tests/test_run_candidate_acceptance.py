@@ -35,6 +35,7 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_cli, stdout_json
 
 from support.run_agents import ScriptedRunAgents
+from support.state import persist_run_fixture
 
 def test_run_acceptance_repairs_then_rechecks_the_whole_run(git_repo: Path) -> None:
     state, states, git = _completed_run(git_repo)
@@ -566,7 +567,7 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
     assert require_candidate_acceptance_history(
         history, "run_acceptance.candidate_acceptance"
     ) == history
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     reloaded = states.load_current_run(str(state["run_id"]))
     assert reloaded is not None
     assert reloaded["run_acceptance"]["candidate_acceptance_history"][0] == history[0]

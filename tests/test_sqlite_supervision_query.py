@@ -25,12 +25,12 @@ def test_supervision_precheck_reopens_and_reads_latest_shared_facts(tmp_path: Pa
     with states.work_session():
         assert states.has_ticket_supervision_work("run-1") is not empty
         updated = dict(facts, ticket_integration_holder=2)
-        StateStore(tmp_path)._repository.save("run-1", updated)
+        StateStore(tmp_path)._repository.save_objects("run-1", updated, fields={"ticket_integration_holder", "ticket_integration_queue"})
         assert states.has_ticket_supervision_work("run-1")
         updated.update(ticket_integration_holder=None, ticket_integration_queue=[{"ticket_number": 2}])
-        StateStore(tmp_path)._repository.save("run-1", updated)
+        StateStore(tmp_path)._repository.save_objects("run-1", updated, fields={"ticket_integration_holder", "ticket_integration_queue"})
         assert states.has_ticket_supervision_work("run-1")
-        StateStore(tmp_path)._repository.save("run-1", facts)
+        StateStore(tmp_path)._repository.save_objects("run-1", facts, fields={"ticket_integration_holder", "ticket_integration_queue"})
         assert states.has_ticket_supervision_work("run-1") is not empty
     assert not states._repository.in_transaction
 
@@ -53,9 +53,10 @@ def test_empty_supervision_does_not_read_unrelated_material_or_repair_missing_ru
 
 def test_empty_supervision_query_cost_does_not_scan_unrelated_object_paths(tmp_path: Path) -> None:
     states = StateStore(tmp_path)
+    states._repository.save("run-1", _facts())
     costs = []
     for count in (1, 1000):
-        states._repository.save("run-1", _facts() | {"unrelated_history": [{"fact": n} for n in range(count)]})
+        states._repository.save_objects("run-1", {"unrelated_history": [{"fact": n} for n in range(count)]}, fields={"unrelated_history"})
         steps = [0]
 
         def progress() -> int:

@@ -15,6 +15,7 @@ from agent_run.git import GitRepository
 from agent_run.run_driver import DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
 
 from support.state import snapshot_run
 
@@ -286,10 +287,10 @@ def test_git_successor_write_rechecks_executor_ownership(
     if revocation != "none":
         assert _git(root, "rev-parse", "HEAD") == head
         with pytest.raises(ActionReconciliationError):
-            states.save_run("run-156", {**state, "status": "completed"})
+            save_owned(states, "run-156", {**state, "status": "completed"}, fields={'status'})
         assert snapshot_run(state_ref) == before_state
     else:
-        states.save_run("run-156", {**state, "status": "completed"})
+        save_owned(states, "run-156", {**state, "status": "completed"}, fields={'status'})
         assert states.load_run("run-156")["status"] == "completed"
     if operation == "restore":
         assert untracked.exists() == (revocation != "none")

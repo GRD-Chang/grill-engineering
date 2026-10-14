@@ -32,6 +32,7 @@ from support.cli import run_internal_stage, run_cli, stdout_json
 
 from support.run_publication import CountingNarrativeRefreshPublisher, DelayedChecksRunPublisher, HumanThenRunPublicationAgents, InterruptedFinalRefPublisher, RunPublicationAgents, UnknownNarrativeWritePublisher, WaitingThenInterruptedChecksPublisher
 from support.run_publication import InvocationRunPublicationAgents
+from support.state import persist_run_fixture
 
 
 def _assert_program_continuation(state: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
@@ -310,7 +311,7 @@ def test_first_unknown_required_checks_observation_does_not_create_operation_ret
     publication_attempts[-1]["publication_operation_retry"] = dict(
         waiting["run_publication"]["publication_operation_retry"]
     )
-    states.save_run(str(state["run_id"]), waiting)
+    persist_run_fixture(states, str(state["run_id"]), waiting)
     publisher.data["delivery"]["required_checks"] = ["none"]
     resumed = engine.publish(str(state["run_id"]))
 
@@ -412,7 +413,7 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
         title="Previous title", body="Previous body",
     )
     publisher._save()
-    states.save_run(str(state["run_id"]), initial)
+    persist_run_fixture(states, str(state["run_id"]), initial)
     uncertain_publisher = UnknownNarrativeWritePublisher(
         git_repo / "github.json", git
     )
@@ -542,7 +543,7 @@ def test_final_publication_human_resume_clears_current_blocker(
 def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     state["ticket_jobs"]["2"]["pr_number"] = 42
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     engine = RunPublicationEngine(
         git=git,
         states=states,

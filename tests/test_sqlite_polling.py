@@ -11,6 +11,7 @@ import pytest
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.sqlite_watcher import SQLiteWatcher
 from agent_run.state import StateStore
+from agent_run.object_state import save_owned
 from support.ticket_parallel import ticket_run
 
 
@@ -25,7 +26,7 @@ def test_watcher_observes_other_process_commit_and_not_rollback(tmp_path: Path) 
             connection.execute("DELETE FROM runs")
         with pytest.raises(OSError):
             with repository.atomic():
-                repository.save("run-1", {"version": 2})
+                repository.save_objects("run-1", {"version": 2}, fields={"version"})
                 raise OSError("before commit")
         assert watcher.version() == first
         script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE run_objects SET value_json='2' WHERE object_path='[\\\"version\\\"]'\"); c.commit(); c.close()"
@@ -73,7 +74,7 @@ def test_polling_sees_stop_and_preserves_independent_public_views(git_repo: Path
         other = StateStore(states.root)
         stopped = other.load_current_run(run_id)
         stopped["status"] = "operator_stopped"
-        other.save_run(run_id, stopped)
+        save_owned(other, run_id, stopped, fields={"status"})
         assert read()["status"] == "operator_stopped"
         assert read() == other.load_current_run(run_id)
 
@@ -114,7 +115,7 @@ def test_polling_refresh_does_not_mark_concurrent_commit_as_observed(
         result = original(connection, allow_empty=allow_empty)
         if not advanced and connection.execute("PRAGMA query_only").fetchone()[0]:
             advanced = True
-            other.save_run(run_id, changed)
+            save_owned(other, run_id, changed, fields={"status"})
         return result
 
     monkeypatch.setattr(SQLiteStateRepository, "_check_schema", staticmethod(check))
@@ -141,7 +142,7 @@ def test_polling_never_substitutes_old_facts_inside_a_write_transaction(git_repo
             with states._repository.atomic():
                 changed = states.load_current_run(run_id)
                 changed["status"] = "operator_stopped"
-                states._repository.save(run_id, changed)
+                states._repository.save_objects(run_id, changed, fields={"status"})
                 assert read()["status"] == "operator_stopped"
                 raise OSError("before commit")
         assert read()["status"] == state["status"]

@@ -102,7 +102,6 @@ def index_objects(
     connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any],
     objects: Mapping[str, tuple[str, str]], materials: Mapping[str, str],
     previous: Mapping[str, tuple[str, str]],
-    *, previous_history: list[Any] | None = None,
 ) -> None:
     changed = {path for path in previous.keys() | objects.keys() if previous.get(path) != objects.get(path)}
     changed_fields = {object_path(path)[0] for path in changed if object_path(path)}
@@ -132,30 +131,9 @@ def index_objects(
         if field not in changed_fields:
             continue
         path = encode_json((field,))
-        if field == _HISTORY and previous_history is not None and isinstance(value, list):
-            # The complete-save caller supplies only its current transaction's
-            # immutable SQL view. Its field proof was checked before mutation.
-            size, prior_digest = connection.execute(
-                "SELECT logical_bytes,content_digest FROM run_object_index WHERE run_id=? AND object_path=?",
-                (run_id, path),
-            ).fetchone()
-            size += max(0, len(value) - 1) - max(0, len(previous_history) - 1)
-            total_digest = int(prior_digest, 16)
-            positions = {parts[1] for changed_path in changed if len(parts := object_path(changed_path)) > 1
-                         and parts[0] == field and type(parts[1]) is int}
-            for position in positions:
-                if position < len(previous_history):
-                    old_item = previous_history[position]
-                    size -= len(encode_json(old_item).encode())
-                    total_digest -= history_item_digest(position, old_item)
-                if position < len(value):
-                    size += len(encode_json(value[position]).encode())
-                    total_digest += history_item_digest(position, value[position])
-            digest = f"{total_digest % (1 << 256):064x}"
-        else:
-            encoded_value = encode_json(value).encode()
-            size = len(encode_json(field).encode()) + len(encoded_value) + 2
-            digest = field_content_digest(field, value) if isinstance(value, list) or field in KEYED_FIELDS else hashlib.sha256(encoded_value).hexdigest()
+        encoded_value = encode_json(value).encode()
+        size = len(encode_json(field).encode()) + len(encoded_value) + 2
+        digest = field_content_digest(field, value) if isinstance(value, list) or field in KEYED_FIELDS else hashlib.sha256(encoded_value).hexdigest()
         if field in SOURCE_DIGEST_FIELDS:
             digest = source_objects_digest({location: source for location, source in objects.items()
                                             if object_path(location)[:1] == (field,)})

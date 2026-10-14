@@ -20,6 +20,7 @@ from agent_run.ticket_state import TicketState
 from support.cli_payloads import human_blocker_step
 from support.inprocess_cli import invoke_cli_inprocess
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 class _Agents(TicketAgents):
@@ -316,7 +317,7 @@ def test_waiting_ticket_return_revalidates_authority_without_recalling_agent(
             elif revocation == "job":
                 pending["ticket_jobs"]["2"]["base_sha"] = "replacement-head"
                 pending["active_ticket_job"] = pending["ticket_jobs"]["2"]
-                states.save_run(run_id, pending)
+                persist_run_fixture(states, run_id, pending)
             else:
                 control.finish_executor(task, **identity)
                 successor = control.claim_action(task, kind="resume", payload={})

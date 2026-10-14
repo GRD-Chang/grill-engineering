@@ -19,7 +19,7 @@ def _history(count: int) -> list[dict[str, object]]:
                  review_context={"body": "证据\x00\n" * 300}) for index in range(count)]
 
 
-def test_complete_save_updates_only_changed_field_indexes(tmp_path: Path) -> None:
+def test_object_commit_updates_only_changed_field_indexes(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
     state = {"phase": "pending", "fixed": {"body": "fixed evidence " * 300},
              "agent_invocation_history": _history(12)}
@@ -30,14 +30,14 @@ def test_complete_save_updates_only_changed_field_indexes(tmp_path: Path) -> Non
         assert changed is not None
         changed["phase"] = "completed"
         repository._local.connection.set_trace_callback(writes.append)
-        repository.save("run-1", changed)
+        repository.save_objects("run-1", changed, fields={"phase"})
     indexes = [sql for sql in writes if sql.startswith("INSERT INTO run_object_index ")]
     assert len(indexes) == 1 and '["phase"]' in indexes[0]
     assert repository.load("run-1") == {**state, "phase": "completed"}
 
 
 @pytest.mark.parametrize("damage", ["proof", "missing"])
-def test_complete_save_rejects_damaged_unchanged_field_index(tmp_path: Path, damage: str) -> None:
+def test_object_commit_rejects_damaged_unchanged_field_index(tmp_path: Path, damage: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
     state = {"phase": "pending", "fixed": {"body": "evidence"}}
     repository.save("run-1", state)
@@ -48,51 +48,58 @@ def test_complete_save_rejects_damaged_unchanged_field_index(tmp_path: Path, dam
         else:
             connection.execute("DELETE FROM run_object_index WHERE object_path=?", (encode_json(("fixed",)),))
     with pytest.raises(ValueError, match="field size proof"):
-        repository.save("run-1", {**state, "phase": "completed"})
+        repository.save_objects("run-1", {"phase": "completed"}, fields={"phase"})
     assert repository.load("run-1") == state
 
 
-def test_complete_save_repairs_unchanged_history_identity_claim(tmp_path: Path) -> None:
+def test_unrelated_commit_preserves_damaged_history_for_explicit_validation(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    state = {"phase": "pending", "agent_invocation_history": _history(2)}
+    state = {"phase": "pending", "agent_invocation_history": _history(2),
+             "active_agent_invocation": _history(2)[0]}
     repository.save("run-1", state)
     path = encode_json(("agent_invocation_history", 0))
     with sqlite3.connect(repository.path) as connection:
         connection.execute("UPDATE run_object_index SET invocation_id='wrong',size_proof='broken' WHERE object_path=?", (path,))
-    repository.save("run-1", {**state, "phase": "completed"})
+    repository.save_objects("run-1", {"phase": "completed"}, fields={"phase"})
     with sqlite3.connect(repository.path) as connection:
         row = connection.execute("SELECT invocation_id,size_proof FROM run_object_index WHERE object_path=?", (path,)).fetchone()
-    assert row == (encode_json(("ticket:2", "invocation-0")), None)
+    assert row == ("wrong", "broken")
     assert repository.load("run-1") == {**state, "phase": "completed"}
+    with pytest.raises(ValueError, match="history index claim"):
+        repository.save_objects("run-1", {"agent_invocation_history": [state["agent_invocation_history"][0]]},
+                                fields={"agent_invocation_history"}, history_positions={
+                                    encode_json(("ticket:2", "invocation-0")): 0,
+                                })
 
 
-@pytest.mark.parametrize("change", ["append", "remove", "move", "edit", "empty", "from_empty"])
-def test_complete_history_delta_matches_full_content_and_size(tmp_path: Path, change: str) -> None:
+@pytest.mark.parametrize("change", ["append", "edit", "from_empty", "sparse"])
+def test_selected_history_delta_preserves_full_content_and_size(tmp_path: Path, change: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
     state = {"phase": "pending", "agent_invocation_history": [] if change == "from_empty" else _history(4)}
     repository.save("run-1", state)
+    history = deepcopy(state["agent_invocation_history"])
+    if change in {"append", "from_empty"}:
+        selected = _history(6)[4:]
+        history.extend(selected)
+    elif change == "edit":
+        history[2]["review_context"]["body"] += "new evidence"
+        selected = [history[2]]
+    else:
+        # An omitted history record is preserved, including its exact position.
+        selected = [history[2]]
     with repository.atomic():
-        changed = repository.load("run-1")
-        assert changed is not None
-        history = changed["agent_invocation_history"]
-        if change in {"append", "from_empty"}:
-            history.extend(_history(6)[4:])
-        elif change == "remove":
-            history.pop(0)
-        elif change == "move":
-            history.reverse()
-        elif change == "edit":
-            history[2]["review_context"]["body"] += "new evidence"
-        else:
-            history.clear()
-        repository.save("run-1", changed)
+        repository.save_objects("run-1", {"agent_invocation_history": selected},
+                                fields={"agent_invocation_history"}, history_positions={
+                                    encode_json((item["work_subject"], item["started_at"])): position
+                                    for position, item in enumerate(state["agent_invocation_history"])
+                                })
         summary = repository._local.connection.execute(
             "SELECT logical_bytes,content_digest,child_count FROM run_object_index WHERE run_id=? AND object_path=?",
             ("run-1", encode_json(("agent_invocation_history",))),
         ).fetchone()
         assert summary == (len(encode_json("agent_invocation_history").encode()) + len(encode_json(history).encode()) + 2,
                            field_content_digest("agent_invocation_history", history), len(history))
-    assert repository.load("run-1") == changed
+    assert repository.load("run-1") == {**state, "agent_invocation_history": history}
     assert repository.load_objects("run-1")[0]["phase"] == "pending"
 
 
@@ -100,12 +107,13 @@ def test_batched_subtree_reads_do_not_scan_unrelated_history(tmp_path: Path) -> 
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
     state = {f"field-{index}": {"value": index} for index in range(30)}
     paths = [encode_json((key,)) for key in state]
+    repository.save("run-1", {**state, "agent_invocation_history": []})
     costs = []
     for count in (0, 256):
         history = _history(count)
         for item in history:
             item["review_context"] = {"body": "small archived evidence"}
-        repository.save("run-1", {**state, "agent_invocation_history": history})
+        repository.save_objects("run-1", {"agent_invocation_history": history}, fields={"agent_invocation_history"})
         with sqlite3.connect(repository.path) as connection:
             steps = []
             connection.set_progress_handler(lambda: steps.append(1) or 0, 10)
@@ -144,7 +152,7 @@ def test_shared_material_read_is_independent_and_revalidated(tmp_path: Path, rea
         read()
 
 
-def test_transaction_complete_save_checks_new_logical_size_and_rolls_back(tmp_path: Path) -> None:
+def test_transaction_object_commit_checks_new_logical_size_and_rolls_back(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=2048)
     state = {"phase": "pending", "fixed": "original"}
     repository.save("run-1", state)
@@ -152,6 +160,6 @@ def test_transaction_complete_save_checks_new_logical_size_and_rolls_back(tmp_pa
         with repository.atomic():
             changed = repository.load("run-1")
             changed["many_references"] = ["deduplicated evidence " * 50] * 8
-            repository.save("run-1", changed)
+            repository.save_objects("run-1", changed, fields={"many_references"})
     assert repository.load("run-1") == state
     assert repository.load_objects("run-1")[0] == {**state, "agent_invocation_history": []}

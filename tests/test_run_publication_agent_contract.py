@@ -29,6 +29,7 @@ from support.cli import run_internal_stage, run_cli, stdout_json
 from support.prompt_capture import _capture_public_prompt
 
 from support.run_publication import InterruptedRunPublisher, InvocationRunPublicationAgents, RunPublicationAgents
+from support.state import persist_run_fixture
 
 
 def _exhaust_publication_operations(
@@ -608,7 +609,7 @@ def test_final_run_publication_receives_only_role_required_facts(
         state["ticket_jobs"]["2"]["deterministic_integration_record"],
     )
     state["prompt_resources"]["methods/publishing"] = "Run 创建时固定的发布方法"
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     agents = RunPublicationAgents()
 
     RunPublicationEngine(
@@ -703,7 +704,7 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         state["ticket_jobs"]["2"],
         integration_records[0]["integration_record"],
     )
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     repair_requests = RunRepairRequests(
         git=SimpleNamespace(
@@ -877,7 +878,7 @@ def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) ->
     }
     publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
     published["run_publication"]["phase"] = "publishing"
-    states.save_run(str(state["run_id"]), published)
+    persist_run_fixture(states, str(state["run_id"]), published)
 
     stale = engine.publish(str(state["run_id"]))
 

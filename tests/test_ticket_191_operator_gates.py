@@ -30,6 +30,7 @@ from support.resume import (
 )
 
 from support.state import only_run_ref, snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -133,7 +134,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
             )
         state["run_acceptance"] = acceptance
     state.update({"status": "blocked", "terminal_kind": "waiting_human"})
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
     fixture = managed_repo(git_repo) / "github.json"
@@ -239,7 +240,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
     state.update(
         {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
     )
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
     fixture = managed_repo(git_repo) / "github.json"
@@ -306,7 +307,7 @@ def test_production_run_locates_configured_data_root_gate_before_readiness(
     state.update(
         {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
     )
-    StateStore(state_root).save_run(str(state["run_id"]), state)
+    persist_run_fixture(StateStore(state_root), str(state["run_id"]), state)
 
     _assert_production_run_rejects_before_readiness(
         git_repo,
@@ -458,7 +459,7 @@ def test_ordinary_run_preserves_parent_budget_checkpoint(
     if blocked_reason == "modification_budget_exhausted":
         state["parent_job"]["blocked_reason"] = blocked_reason
         state["parent_job"]["review_budget"]["checkpoint_reason"] = blocked_reason
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
 
     # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
     for run_arguments in (
@@ -593,7 +594,7 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
         state.update(
             {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
         )
-        states.save_run(str(state["run_id"]), state)
+        persist_run_fixture(states, str(state["run_id"]), state)
         fixture = managed_repo(git_repo) / "github.json"
 
     state_root = managed_state(git_repo)
@@ -691,7 +692,7 @@ def test_ordinary_run_preserves_requeue_required_boundary(
         }
     )
     state["ticket_jobs"] = {"3": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     stale = run_cli(git_repo, fixture, "run", "1")
     assert stale.returncode == 2, stale.stderr
     assert stdout_json(stale)["status"] == "requeue_required"

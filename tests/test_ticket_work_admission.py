@@ -17,6 +17,7 @@ from agent_run.ticket_work import TicketWorkAdmission, generation
 from support.ticket_parallel import ticket_run
 
 from support.state import write_run_fixture
+from support.state import persist_run_fixture
 
 
 def _queue(states: StateStore, run_id: str) -> list[dict[str, Any]]:
@@ -127,7 +128,7 @@ def test_pause_cancels_waiter_without_releasing_running_work(git_repo: Path) -> 
     paused = states.load_current_run(run_id)
     assert paused is not None
     paused["ticket_pause_requests"]["2"] = "2026-09-30T00:00:00+00:00"
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     assert [item["ticket_number"] for item in _queue(states, run_id)] == [3, 4]
     admission.seed([2, 4])
     assert admission.acquire(2, generation(state, 2), "development") is None
@@ -149,7 +150,7 @@ def test_run_gate_blocks_admission_and_preserves_only_resumable_waiters(
     stopped = states.load_current_run(run_id)
     assert stopped is not None
     stopped["status"] = status
-    states.save_run(run_id, stopped)
+    persist_run_fixture(states, run_id, stopped)
     remaining = [None] if status == "operator_stopped" else []
     assert [item["lease_id"] for item in _queue(states, run_id)] == [token, *remaining]
     with pytest.raises(TaskControlBusyError):

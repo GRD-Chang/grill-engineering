@@ -13,6 +13,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.object_state import object_store
 from agent_run.state import SimulatedProcessCrash, StateStore
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("prior_cleanup_completed", [False, True])
@@ -23,7 +24,7 @@ def test_reopened_cleanup_registers_completed_ticket_outside_current_projection(
     run_id = state["run_id"]
     if prior_cleanup_completed:
         state["delivery_cleanup"] = {"status": "completed", "items": {}}
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
 
     def crash_before_registration(_engine, current, job):
         durable = StateStore(states.root).load_current_run(run_id)
@@ -53,7 +54,7 @@ def test_reopened_cleanup_registers_completed_ticket_outside_current_projection(
     def reject_whole_save(*_args, **_kwargs):
         raise AssertionError("cleanup rewrote the complete Run")
 
-    monkeypatch.setattr(reopened, "_save_run_unlocked", reject_whole_save)
+    monkeypatch.setattr(reopened, "_create_run_unlocked", reject_whole_save)
     publisher = FixtureGitHubPublisher(fixture, git)
     DeliveryCleanupEngine(git=git, states=reopened, github=publisher).resume(run_id)
 

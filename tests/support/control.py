@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from support.workspace import managed_repo, managed_state
+from support.state import persist_run_fixture
 from agent_run.executor_host import ExecutorSpec, FakeExecutorHost, HostObservation
 from agent_run.run_lifecycle import RunLifecycle, prepare_action_application_receipt
 from agent_run.state import StateStore
@@ -150,7 +151,7 @@ def _bind_running_executor(
     record = control.load(task)
     assert record is not None and isinstance(record.get("action"), dict)
     prepare_action_application_receipt(run, record["action"])
-    states.save_run(run_id, run)
+    persist_run_fixture(states, run_id, run)
     control.complete_action(
         task,
         action_id=claim.action_id,

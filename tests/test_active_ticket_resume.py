@@ -22,6 +22,7 @@ from support.control import _bind_running_executor
 from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("pause_reason", ["ticket_execution_failed", "ticket_paused"])
@@ -74,7 +75,7 @@ def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
     # The existing Executor owns the sender; the public targeted Resume only
     # persists admission and must not announce success while still queued.
     paused["notifications"] = {"enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test"}
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     cards: list[dict[str, Any]] = []
 
     def send(_config: Any, card: dict[str, Any], _identity: Any, _cancel: Any, **_kwargs: Any) -> dict[str, Any]:

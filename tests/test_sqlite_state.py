@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import shutil
+import time
 import subprocess
 import sys
 import threading
@@ -14,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.state import MAX_RUN_STATE_BYTES, StateStore
+from agent_run.ticket_state import TicketState
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state_commits import StateCommitBusyError
 from agent_run.state_retention import MAX_DETAILED_INVOCATIONS, compact_invocation_details
@@ -23,6 +26,7 @@ from support.workspace import managed_repo, managed_state
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.state import include_in_state_snapshot
 from agent_run.git import GitRepository
+from agent_run.object_state import save_owned
 
 
 def test_new_run_advances_and_public_queries_reopen_read_only(git_repo: Path) -> None:
@@ -48,7 +52,12 @@ def test_new_run_advances_and_public_queries_reopen_read_only(git_repo: Path) ->
         current["ticket_jobs"]["2"]["development_summary"] = "object commit"
         if (current.get("active_ticket_job") or {}).get("ticket_number") == 2:
             current["active_ticket_job"] = current["ticket_jobs"]["2"]
-    saved = states.update_run(run_id, update)
+    lane = TicketState(states, run_id, 2)
+    current = lane.load_current_run(run_id)
+    assert current is not None
+    update(current)
+    lane.save_run(run_id, current)
+    saved = states.load_current_run(run_id)
     assert calls == [saved["ticket_jobs"]["2"]["candidate_sha"]]
     assert saved["ticket_jobs"]["2"]["development_summary"] == "object commit"
     assert not list((root / "runs").glob("*.json"))
@@ -76,7 +85,7 @@ def test_process_exit_exposes_only_complete_old_or_new_commit(tmp_path: Path, co
         "import os,sys,json; sys.path.insert(0,sys.argv[3]); from pathlib import Path; "
         "from agent_run.sqlite_state import SQLiteStateRepository; "
         f"repo=SQLiteStateRepository(Path(sys.argv[1]),max_bytes={MAX_RUN_STATE_BYTES}); "
-        "context=repo.atomic(); context.__enter__(); repo.save('run-1',json.loads(sys.argv[2])); "
+        "context=repo.atomic(); context.__enter__(); repo.save_objects('run-1',json.loads(sys.argv[2]),fields={'jobs','budget','history'}); "
         + ("context.__exit__(None,None,None); " if commit else "")
         + "os._exit(23)"
     )
@@ -99,9 +108,9 @@ def test_transition_failure_rolls_back_all_facts_and_never_notifies(tmp_path: Pa
     store.run_saved_observer = observed.append
 
     def transition() -> None:
-        store._save_run_and_notify_unlocked("run-1", {
+        save_owned(store, "run-1", {
             "budget": 2, "job": {"phase": "candidate"}, "invocation": "completed",
-        })
+        }, fields={"budget", "job", "invocation"})
         raise OSError("storage failed before commit")
 
     with pytest.raises(OSError, match="before commit"):
@@ -120,7 +129,7 @@ def test_fixed_materials_are_referenced_once_and_survive_reopen(tmp_path: Path) 
     assert StateStore(tmp_path).load_run("run-1") == state
     assert (tmp_path / "state.sqlite3").stat().st_size < len(json.dumps(state).encode())
     state["ticket_jobs"]["2"]["phase"] = "accepted"
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"ticket_jobs"})
     saved = StateStore(tmp_path).load_run("run-1")
     assert saved == state
     assert saved["ticket_jobs"]["3"]["review_context"] == context
@@ -173,7 +182,7 @@ def test_consistent_query_keeps_one_commit_while_writer_advances(tmp_path: Path,
     reader.start()
     try:
         assert entered.wait(5)
-        StateStore(tmp_path).save_run("run-1", new)
+        save_owned(StateStore(tmp_path), "run-1", new, fields=set(new))
     finally:
         release.set()
         reader.join(5)
@@ -212,7 +221,7 @@ def test_queued_commit_revalidates_real_executor_authority(tmp_path: Path, monke
     monkeypatch.setattr(store._coordinator._condition, "wait", wait)
     with ThreadPoolExecutor(max_workers=1) as pool:
         with store.commit_admission():
-            request = pool.submit(store.save_run, "run-1", {"version": 2})
+            request = pool.submit(save_owned, store, "run-1", {"version": 2}, fields={"version"})
             assert waiting.wait(5)
             if revocation == "generation":
                 control.finish_executor(task, action_id=claim.action_id, generation=generation)
@@ -243,7 +252,7 @@ def test_observer_waits_outside_commit_locks_and_cannot_fail_saved_result(tmp_pa
         first = pool.submit(store.save_run, "run-1", {"version": 1})
         try:
             assert observing.wait(5)
-            second = pool.submit(store.save_run, "run-1", {"version": 2})
+            second = pool.submit(save_owned, store, "run-1", {"version": 2}, fields={"version"})
             second.result(timeout=5)
             assert StateStore(tmp_path).load_run("run-1") == {"version": 2}
         finally:
@@ -257,6 +266,7 @@ def test_commit_queue_is_fifo_bounded_and_releases_failed_waiters(tmp_path: Path
 
     monkeypatch.setattr(state_commits, "MAX_PENDING_COMMITS", 3)
     store = StateStore(tmp_path)
+    store.save_run("run-1", {"version": 1})
     waiting = {name: threading.Event() for name in ("second", "third")}
     real_wait = store._coordinator._condition.wait
 
@@ -268,8 +278,8 @@ def test_commit_queue_is_fifo_bounded_and_releases_failed_waiters(tmp_path: Path
     order = []
 
     def commit(version):
-        store._commit_run(lambda: (order.append(version), store._save_run_and_notify_unlocked(
-            "run-1", {"version": version})))
+        store._commit_run(lambda: (order.append(version), save_owned(
+            store, "run-1", {"version": version}, fields={"version"})))
 
     second = threading.Thread(target=commit, args=(2,), name="second")
     third = threading.Thread(target=commit, args=(3,), name="third")
@@ -297,7 +307,7 @@ def test_commit_queue_is_fifo_bounded_and_releases_failed_waiters(tmp_path: Path
     assert not second.is_alive() and not third.is_alive()
     assert order == [2, 3]
     assert store.load_run("run-1") == {"version": 3}
-    store.save_run("run-1", {"version": 5})
+    save_owned(store, "run-1", {"version": 5}, fields={"version"})
 
 
 def test_invocation_detail_retention_protects_recovery_and_review_facts() -> None:
@@ -558,7 +568,13 @@ def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
         return connection
     monkeypatch.setattr(sqlite3, "connect", measured_connection)
     costs = []
+    resources = []
+
+    def storage_bytes(root):
+        return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
     for number in (10, 500):
+        prepared_at = time.perf_counter()
         repository = SQLiteStateRepository(tmp_path / str(number), max_bytes=MAX_RUN_STATE_BYTES)
         repository._aggregate_rows = aggregate
         original = _work_fixture(number if history_run == "run-1" else 0)
@@ -566,6 +582,9 @@ def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
         unrelated = _work_fixture(number)
         if history_run != "run-1":
             repository.save(history_run, unrelated)
+        preparation_seconds = time.perf_counter() - prepared_at
+        storage_before = storage_bytes(repository.root)
+        storage_samples = [storage_before]
         observed.clear()
         json_bytes.clear()
         serializer_bytes.clear()
@@ -578,6 +597,7 @@ def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
         sql_steps[0] = 0
         measuring[0] = True
         tracemalloc.start()
+        executed_at = time.perf_counter()
         try:
             with repository.atomic():
                 baseline = repository.load_work("run-1", 2)
@@ -585,20 +605,35 @@ def test_work_cost_does_not_grow_with_unrelated_or_older_same_ticket_history(
                 updated = deepcopy(baseline)
                 updated["ticket_jobs"]["2"]["phase"] = "candidate"
                 repository.save_work("run-1", updated, baseline)
+                storage_samples.append(storage_bytes(repository.root))
             _, peak = tracemalloc.get_traced_memory()
+            execution_seconds = time.perf_counter() - executed_at
         finally:
             tracemalloc.stop()
             measuring[0] = False
+        storage_samples.append(storage_bytes(repository.root))
         costs.append((sum(observed), sum(encoded), sum(json_bytes), sum(serializer_bytes), peak, sql_steps[0]))
         assert repository.load("run-1")["agent_invocation_history"] == original["agent_invocation_history"]
         if history_run != "run-1":
             assert repository.load(history_run) == unrelated
+        cleaned_at = time.perf_counter()
+        # Ordinary repository reads/writes have closed their connections here.
+        # Remove only this test's exact preparation root, never a user Run.
+        shutil.rmtree(repository.root)
+        cleanup_seconds = time.perf_counter() - cleaned_at
+        assert not repository.root.exists()
+        resources.append({"history": number, "prepare_seconds": preparation_seconds,
+                          "commit_seconds": execution_seconds, "cleanup_seconds": cleanup_seconds,
+                          "stored_before_bytes": storage_before,
+                          "sampled_storage_increase_bytes": max(storage_samples) - storage_before,
+                          "remaining_bytes": storage_bytes(repository.root)})
     assert costs[0][:2] == costs[1][:2]
     assert costs[1][2] <= costs[0][2] + 4
     assert costs[1][3] <= costs[0][3] + 4
     assert costs[1][4] < costs[0][4] + 128 * 1024
     assert costs[1][5] <= costs[0][5] + 256, costs
     print(f"work node bytes/object encoding bytes/helper encoding bytes/all serializer bytes/peak bytes/SQL VM steps (10, 500): {costs}")
+    print(f"work preparation/commit/cleanup/storage ({aggregate=}, {history_run=}): {resources}")
 
 
 @pytest.mark.parametrize("damage", ["size", "history", "refs"])
@@ -641,7 +676,7 @@ def test_work_gc_keeps_materials_needed_by_unloaded_history_and_other_run(tmp_pa
     assert repository.load("run-1") == expected
     assert repository.load("run-2") == other
     # Complete removal exercises released object refs and actual SQL GC.
-    repository.save("run-1", {"phase": "removed"})
+    repository.save_objects("run-1", {"phase": "removed"}, fields={"phase", "ticket_jobs", "ticket_agent_invocations", "active_ticket_job", "active_agent_invocation"})
     assert repository.load("run-2") == other
 
 
@@ -706,7 +741,7 @@ def test_work_transaction_view_is_independent_and_invalidated_by_save(tmp_path: 
     saved = other.load("run-1")
     assert saved is not None
     saved["ticket_jobs"]["2"]["phase"] = "external"
-    other.save("run-1", saved)
+    other.save_objects("run-1", saved, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
     refreshed = repository.load_work("run-1", 2)
     assert refreshed is not None and refreshed["ticket_jobs"]["2"]["phase"] == "external"
 
@@ -805,7 +840,7 @@ def test_work_core_transaction_reuse_returns_independent_views_and_invalidates_w
         assert repository.load_work("run-1", None)["ticket_jobs"]["2"]["phase"] == "candidate"
         replacement = deepcopy(original)
         replacement["ticket_jobs"]["2"]["phase"] = "accepted"
-        repository.save("run-1", replacement)
+        repository.save_objects("run-1", replacement, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
         assert repository.load_work("run-1", 2)["ticket_jobs"]["2"]["phase"] == "accepted"
     assert repository.load("run-1") == replacement
 

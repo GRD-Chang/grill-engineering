@@ -10,6 +10,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.run_publication import RunPublicationEngine
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run
+from support.state import persist_run_fixture
 
 
 class InterruptedPublisher(FixtureGitHubPublisher):
@@ -57,7 +58,7 @@ def _prepare(git_repo: Path, action: str, applied: bool) -> tuple[Any, ...]:
         initial["terminal_kind"] = "waiting_external"
         publisher.data["delivery"]["pull_requests"][0]["title"] = "Previous publication title"
         publisher._save()
-        states.save_run(run_id, initial)
+        persist_run_fixture(states, run_id, initial)
     interrupted = InterruptedPublisher(git_repo / "github.json", git, action=action, applied=applied)
     engine = RunPublicationEngine(
         git=git, states=states, agents=agents, github=interrupted,
@@ -181,7 +182,7 @@ def test_explicit_final_publication_resume_keeps_intent_and_artifact(git_repo: P
     assert subject["write_intent"] == original["write_intent"]
     assert subject["artifact"] == original["artifact"]
     assert subject["publication_operation_retry_history"] == [original["publication_operation_retry"]]
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     # Visibility converges to the intended title without another Runner edit.
     publisher.data["delivery"]["pull_requests"][0]["title"] = subject["artifact"]["pr_title"]
     publisher._save()
@@ -315,7 +316,7 @@ def test_parent_only_published_retry_resume_continues_without_new_agents(git_rep
         ChangeDeliveryEngine._record_publication_operation_failure_in_memory(
             stage, paused, paused["parent_job"], OSError("publication read unavailable"),
         )
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     assert paused["status"] == "publication_pending"
     original = deepcopy(paused["parent_job"])
     calls = (len(agents.development_requests), len(agents.review_requests), len(agents.publication_requests))
@@ -325,7 +326,7 @@ def test_parent_only_published_retry_resume_continues_without_new_agents(git_rep
         human_response=None, resume_budget_checkpoint=False,
         budget_policy=DeliveryPolicy(), ticket_number=None, source_status="publication_pending",
     )
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     resumed = engine.deliver(run_id)
     assert resumed["status"] == "parent_approval_pending"
     assert resumed["parent_job"]["publication"] == original["publication"]

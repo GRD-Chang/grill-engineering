@@ -14,6 +14,7 @@ from agent_run.state import StateStore
 from support.run_artifacts import _passing_artifact
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run, _sync_completed_ticket_integrated_sha
+from support.state import persist_run_fixture
 
 
 class Reviewer:
@@ -51,7 +52,7 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
         assert git.resolve(f"{default}^{{tree}}") == git.resolve("main^{tree}")
     elif drift == "merge_result":
         state["run_acceptance"]["acceptance_record"]["expected_merge_tree"] = "different-result"
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     reloaded_states = StateStore(states.root)
     agents = RunPublicationAgents()
     result = RunPublicationEngine(
@@ -149,7 +150,7 @@ def test_completed_acceptance_resumes_pending_publication_handoff(git_repo: Path
     accepted = deepcopy(state["run_acceptance"])
     # The accepted review is durable before its outer Run handoff is saved.
     state.update(status="run_acceptance_pending", terminal_kind="run_acceptance_pending")
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     reviewer = Reviewer()
     reopened = StateStore(states.root)
     result = RunAcceptanceEngine(

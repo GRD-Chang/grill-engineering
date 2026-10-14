@@ -17,6 +17,7 @@ from agent_run.state import StateStore
 from support.run_publication import RunPublicationAgents
 from support.state_commits import observe_run_commits
 from support.run_scenarios import PassingRunReviewer, _accepted_run
+from support.state import persist_run_fixture
 
 
 class CountingReviewer(PassingRunReviewer):
@@ -68,7 +69,7 @@ def test_default_append_preserves_unknown_final_update_until_read_only_settlemen
     prior = {"title": "Previous title", "body": "Previous body"}
     initial_publisher.data["delivery"]["pull_requests"][0].update(prior)
     initial_publisher._save()
-    states.save_run(run_id, initial)
+    persist_run_fixture(states, run_id, initial)
     publisher = InterruptedUpdatePublisher(fixture, git, fault=fault)
     injected = False
 

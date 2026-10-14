@@ -50,13 +50,15 @@ from agent_run.parent_delivery_loop import ParentDeliveryAdapter, ParentDelivery
 from agent_run.revisions import effective_revision
 from agent_run.requeue import requeue_change_job
 from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.ticket_state import TicketState
 from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
 from agent_run.run_repair_delivery import RunRepairAdapter
 from agent_run.review_budget import TICKET_POLICY
 
 from support.seeding import write_fixture
 
-from support.state import read_run
+from support.state import read_run, write_run_fixture
+from support.state import persist_run_fixture
 
 
 def test_change_delivery_seams_keep_facts_and_semantics_separate() -> None:
@@ -1590,7 +1592,7 @@ def test_fresh_validation_human_resume_rejects_an_older_reviewer_thread(
     assert job["reviewer_thread_ids"] == ["blocked-latest-reviewer"]
     job["reviewer_thread_ids"].insert(0, "older-reviewer")
     blocked["ticket_jobs"]["3"] = dict(job)
-    states.save_run(str(state["run_id"]), blocked)
+    persist_run_fixture(states, str(state["run_id"]), blocked)
 
     Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states).resume(
         str(state["run_id"]), resume_human_blocker=True
@@ -1632,7 +1634,7 @@ def test_fresh_validation_human_resume_with_new_thread_replaces_blocker_artifact
     resumed_job = resumed["ticket_jobs"]["3"]
     resumed_job["review_new_thread"] = True
     resumed["active_ticket_job"] = resumed_job
-    states.save_run(str(state["run_id"]), resumed)
+    persist_run_fixture(states, str(state["run_id"]), resumed)
     engine.deliver(str(state["run_id"]))
 
     persisted = states.load_run(str(state["run_id"]))
@@ -2659,7 +2661,7 @@ def test_ticket_ci_conflict_human_resume_returns_to_integration(
     assert states.load_current_run(state["run_id"]) is not None
     if legacy_resume_phase:
         paused_job["human_blocker_phase"] = "accepted"
-        states.save_run(state["run_id"], paused)
+        persist_run_fixture(states, state["run_id"], paused)
 
     resumed, _ = controller.resume(
         state["run_id"], resume_human_blocker=True,
@@ -3691,7 +3693,7 @@ def test_persisted_closed_unmerged_pr_blocks_without_creating_another(
     refreshed["ticket_graph"]["tickets"]["3"][
         "content_revision"
     ] = "sha256:closed-pr-new-content"
-    states.save_run(state["run_id"], refreshed)
+    persist_run_fixture(states, state["run_id"], refreshed)
 
     blocked = engine.deliver(state["run_id"])
 
@@ -3778,7 +3780,7 @@ def test_integrated_branch_waits_for_pr_merged_state_without_remerging(
     waiting = engine.deliver(state["run_id"])
     assert waiting["status"] == "waiting_merge"
     waiting["active_ticket_job"]["phase"] = "waiting_merge"
-    states.save_run(state["run_id"], waiting)
+    persist_run_fixture(states, state["run_id"], waiting)
     still_waiting = engine.deliver(state["run_id"])
     assert still_waiting["status"] == "waiting_merge"
     completed = engine.deliver(state["run_id"])
@@ -3998,7 +4000,7 @@ def test_post_merge_revision_drift_requires_explicit_requeue(
     current = states.load_run(state["run_id"])
     assert current is not None
     retired = requeue_change_job(current)
-    states.save_run(state["run_id"], current)
+    persist_run_fixture(states, state["run_id"], current)
     assert current["status"] == "active"
     assert current["active_ticket_job"] is None
     assert retired["pr_number"] == 11
@@ -4046,7 +4048,7 @@ def test_revision_drift_after_merged_save_waits_for_explicit_requeue(
     interrupted["ticket_graph"]["tickets"]["3"][
         "content_revision"
     ] = new_ticket_revision
-    states.save_run(state["run_id"], interrupted)
+    persist_run_fixture(states, state["run_id"], interrupted)
     publisher.pr_number = 12
     publisher.merged_sha = None
     publisher.merged_head = None
@@ -4075,7 +4077,7 @@ def test_revision_drift_after_merged_save_waits_for_explicit_requeue(
     current = states.load_run(state["run_id"])
     assert current is not None
     retired = requeue_change_job(current)
-    states.save_run(state["run_id"], current)
+    persist_run_fixture(states, state["run_id"], current)
 
     assert retired["pr_number"] == old_pr_number
     assert current["status"] == "active"
@@ -4432,7 +4434,7 @@ def test_active_ticket_authorization_is_checked_before_resume_mutation(
     ]
     job["acceptance_record"]["artifact"] = fail_artifact
     job["acceptance_artifact"] = fail_artifact
-    states.save_run(state["run_id"], waiting)
+    persist_run_fixture(states, state["run_id"], waiting)
 
     with pytest.raises(IncompatibleRunStateError, match="artifact must be pass"):
         engine.deliver(state["run_id"])
@@ -4717,14 +4719,21 @@ def test_unknown_persisted_phase_fails_instead_of_spinning(
     state, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).start(1)
+    lane = TicketState(states, state["run_id"], 3)
+    current = lane.load_current_run(state["run_id"])
+    assert current is not None
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
-        states=states,
+        states=lane,  # type: ignore[arg-type]
         github=ScriptedPublisher(git_repo),
         agents=PassAgents(git_repo),
     )
-    engine._job(state)["phase"] = "corrupt"
-    states.save_run(state["run_id"], state)
+    engine._job(current)
+    corrupt = states.load_current_run(state["run_id"])
+    assert corrupt is not None
+    corrupt["ticket_jobs"]["3"]["phase"] = "corrupt"
+    corrupt["active_ticket_job"]["phase"] = "corrupt"
+    write_run_fixture((states.root, state["run_id"]), corrupt)
 
     with pytest.raises(ValueError, match="unknown Ticket phase"):
         engine.deliver(state["run_id"])
@@ -5421,7 +5430,7 @@ def test_resume_preserves_local_gate_while_selecting_independent_frontier(
         "checkpoint_reason": None,
     }
     completed_record["review_budget"] = deepcopy(completed_ticket["review_budget"])
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["issues"]["3"]["labels"].append("ready-for-human")
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")

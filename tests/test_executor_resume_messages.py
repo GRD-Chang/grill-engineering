@@ -12,6 +12,7 @@ from agent_run.human_responses import append_human_response
 from agent_run.resume_audit import append_explicit_resume_audit
 from agent_run.state import StateStore
 from agent_run.ticket_pause import request_ticket_pause
+from agent_run.object_state import save_owned
 from support.cli import run_cli, stdout_json
 from support.cli_payloads import ticket
 from support.seeding import seed_run, write_fixture
@@ -77,7 +78,7 @@ def test_public_executor_resume_message_reaches_runnable_publication(
         assert paused["active_agent_invocation"]["status"] == "completed"
     else:
         paused["active_agent_invocation"] = None
-    record_session_interruption(paused, save=lambda value: states.save_run(run_id, value))
+    record_session_interruption(paused, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     before = states.load_current_run(run_id)
     assert before is not None
     siblings = {str(number): deepcopy(before["ticket_jobs"][str(number)]) for number in paused_numbers}

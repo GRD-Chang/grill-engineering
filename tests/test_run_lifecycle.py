@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from support.lifecycle import (
     _InMemoryRunState,
     _file_snapshot,
@@ -60,6 +61,7 @@ from support.cli_payloads import ticket
 from support.cli_crash import DevelopmentBoundary, run_cli_at_development_boundary
 
 from support.state import only_run_ref, read_run, run_refs, snapshot_run, write_run_fixture
+from support.state import persist_run_fixture
 
 
 def _assert_public_action_receipt(
@@ -1575,7 +1577,7 @@ def test_receipt_only_control_closes_once_after_exact_host_exit_proof(
     if action_kind != "run":
         original_action["kind"] = action_kind
         state["action_application_receipt"]["kind"] = action_kind
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
     payload = dict(original_action["payload"])
     if control_case == "missing":
         control_path.unlink()

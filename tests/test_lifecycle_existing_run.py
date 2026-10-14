@@ -12,9 +12,11 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_lifecycle import RunLifecycle, prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
 from support.seeding import write_fixture
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def _accepted(git_repo: Path, tmp_path: Path, kind: str, *, target: str | None = None, payload_damage: str | None = None):
@@ -64,7 +66,7 @@ def test_existing_action_reentry_applies_intent_exactly_once(
     if window == "applied":
         initial["test_applied_intents"] = [kind]
         prepare_action_application_receipt(initial, claim.action)
-        states.save_run(run_id, initial)
+        persist_run_fixture(states, run_id, initial)
     selected = []
     executed = []
 
@@ -75,7 +77,7 @@ def test_existing_action_reentry_applies_intent_exactly_once(
         state = StateStore(states.root).load_current_run(run_id)
         state.setdefault("test_applied_intents", []).append(kind)
         prepare_action_application_receipt(state, action)
-        StateStore(states.root).save_run(run_id, state)
+        save_owned(StateStore(states.root), run_id, state, fields={'action_application_receipt', 'test_applied_intents'})
         return state, True
 
     def execute(actual_run):
@@ -109,7 +111,7 @@ def test_existing_action_reentry_rejects_wrong_target_before_business(
     if damage == "parent":
         initial["parent"]["number"] = 999
     if damage in {"repository", "parent"}:
-        states.save_run(run_id, initial)
+        persist_run_fixture(states, run_id, initial)
     if damage == "binding":
         control.bind_run(task, claim.action_id, "other-run", generation=reservation.generation)
     if damage == "unreadable":

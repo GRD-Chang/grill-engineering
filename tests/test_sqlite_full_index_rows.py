@@ -177,7 +177,7 @@ def test_complete_query_reuses_only_unchanged_source_fields(
     assert repository.load("run-1") == original
     writer = _repository(tmp_path)
     changed = {**original, "status": "paused"}
-    writer.save("run-1", changed)
+    writer.save_objects("run-1", changed, fields={"status"})
     decode_scalar = sqlite_state.scalar_value
 
     def decode(encoded):
@@ -193,7 +193,7 @@ def test_complete_query_reuses_only_unchanged_source_fields(
     # such as updated_at did not change, and the returned tree stays isolated.
     monkeypatch.setattr(sqlite_state, "scalar_value", decode_scalar)
     changed["ticket_graph"] = {"tickets": {"2": {"number": 123457, "title": "new title"}}}
-    writer.save("run-1", changed)
+    writer.save_objects("run-1", changed, fields={"ticket_graph"})
     assert repository.load("run-1") == changed
 
 

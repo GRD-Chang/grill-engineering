@@ -18,6 +18,7 @@ from support.cli import load_only_run_state, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
 from support.parent_approval_update import append_remote, ready_parent, update_agents
 from support.workspace import managed_state
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("mode", ["concise", "detailed"])
@@ -33,7 +34,7 @@ def test_update_notification_precedes_git_and_failed_delivery_does_not_block(
         "enabled": True, "mode": mode, "profile": "isolated-test",
         "open_id": "ou_test", "app_id": "cli_test",
     }
-    states.save_run(before["run_id"], before)
+    persist_run_fixture(states, before["run_id"], before)
     append_remote(git_repo, fixture, "main", "remote.txt", "remote contribution\n")
     agents = update_agents(git_repo)
     sent: list[str] = []

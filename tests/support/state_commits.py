@@ -1,4 +1,4 @@
-"""在真实整 Run / 对象提交边界注入故障，保留事务和提交后语义。"""
+"""在真实首次创建 / 对象提交边界注入故障，保留事务和提交后语义。"""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -20,7 +20,7 @@ def observe_run_commits(
     after: RunSaveHook | None = None,
 ) -> None:
     """故障前置于实际写入；提交后故障由持久化成功 hook 触发。"""
-    raw_save = states._save_run_unlocked
+    raw_save = states._create_run_unlocked
     object_save = states._repository.save_objects
     work_save = states._repository.save_work
     after_save = states._after_run_saved
@@ -57,7 +57,7 @@ def observe_run_commits(
             assert current is not None
             after(saved_run_id, current)
 
-    monkeypatch.setattr(states, "_save_run_unlocked", save_run)
+    monkeypatch.setattr(states, "_create_run_unlocked", save_run)
     monkeypatch.setattr(states._repository, "save_objects", save_objects)
     monkeypatch.setattr(states._repository, "save_work", save_work)
     monkeypatch.setattr(states, "_after_run_saved", saved)

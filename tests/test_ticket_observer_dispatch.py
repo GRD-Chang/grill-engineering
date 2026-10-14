@@ -1,6 +1,7 @@
 """Resume and global controls remain live after development lanes drain."""
 from __future__ import annotations
 
+
 from copy import deepcopy
 from pathlib import Path
 from threading import Event, Thread
@@ -15,6 +16,7 @@ from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.ticket_resume import admit_ticket_resume
+from agent_run.object_state import save_owned
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -169,7 +171,7 @@ def test_observer_only_interval_handles_completion_failure_and_stop(git_repo: Pa
             assert current is not None
             current['status'] = 'operator_stopped'
             current['terminal_kind'] = 'operator_stopped'
-            states.save_run(run_id, current)
+            save_owned(states, run_id, current, fields={"status", "terminal_kind"})
         continue_dispatch.set()
         if outcome == 'stop':
             assert closed.wait(5), errors

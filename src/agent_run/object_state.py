@@ -1,4 +1,4 @@
-"""StateStore bridge for current-object commits and indexed related history."""
+"""StateStore adapter for current-object commits and indexed related history."""
 from __future__ import annotations
 
 import threading
@@ -202,14 +202,14 @@ class ObjectStateStore:
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
         try:
-            self._store._commit_run(lambda: self._save_run_and_notify_unlocked(run_id, state))
+            self._store._commit_run(lambda: self._save_objects_and_notify_unlocked(run_id, state))
         except BaseException:
             self.invalidate_baseline()
             if isinstance(state, ObjectProjection):
                 state.invalidate_baseline(self._projection_key(run_id))
             raise
 
-    def _save_run_and_notify_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
+    def _save_objects_and_notify_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
         key = self._projection_key(run_id)
         if isinstance(state, ObjectProjection) and state.baseline_is_invalid(key):
             raise ValueError("Object save requires a fresh read after failed commit")
@@ -242,7 +242,7 @@ class ObjectStateStore:
         )
         if loaded is None:
             # New Run creation remains a complete creation transaction.
-            self._store._save_run_and_notify_unlocked(run_id, state)
+            self._store._create_run_and_notify_unlocked(run_id, state)
             created = self._store._repository.load_objects(run_id, excluded_fields=self._excluded_fields)
             if created is not None:
                 self._record_baseline(run_id, created[0], created[1], projection=state)
@@ -303,7 +303,7 @@ class ObjectStateStore:
                     raise ConcurrentRunStateError(f"Object changed before commit: {field}")
                 merged.pop(field, None)
         # Current selection is a view of the exact Ticket Invocation, as in
-        # the original StateStore bridge; association commits stay atomic.
+        # the initial Run association; association commits stay atomic.
         active = merged.get("active_agent_invocation")
         job = merged.get("active_ticket_job")
         if isinstance(active, dict) and isinstance(job, dict) and active.get("work_subject") == f"ticket:{job.get('ticket_number')}":
@@ -494,8 +494,10 @@ def save_owned(
                     durable[field] = deepcopy(projection[field])
                     write_fields.add(field)
         base._repository.save_objects(run_id, durable, fields=write_fields, keyed_changes=keyed_changes)
-        for field in write_fields - fields:
-            if field == "ticket_jobs":
+        for field in (write_fields - fields) | (write_fields & {"timeline", "timeline_continuation", "timeline_at_capacity"}):
+            if field not in durable:
+                state.pop(field, None)
+            elif field == "ticket_jobs":
                 state.setdefault(field, {}).update(deepcopy(durable[field]))
             else:
                 state[field] = deepcopy(durable[field])

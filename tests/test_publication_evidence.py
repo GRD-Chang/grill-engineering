@@ -13,6 +13,7 @@ from agent_run.semantic_attempt import canonical_fingerprint, allocate_semantic_
 from agent_run.run_publication import RunPublicationEngine
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -66,7 +67,7 @@ def test_reloaded_final_publication_rejects_result_outside_its_attempt(git_repo:
     saved = states.load_current_run(run_id)
     assert saved is not None
     saved["run_publication"]["artifact"]["pr_title"] = "Different delivery narrative"
-    states.save_run(run_id, saved)
+    persist_run_fixture(states, run_id, saved)
     restored = RunPublicationEngine(
         git=git, states=states, agents=agents, github=publisher,
         default_branch="main", default_head_sha=git.resolve("main"),
@@ -180,7 +181,7 @@ def test_new_final_narrative_updates_existing_pr_without_repeating_review(git_re
     original_review = deepcopy(ready["run_acceptance"]["acceptance_record"])
     number = ready["run_publication"]["pr_number"]
     ready["run_publication"]["artifact"]["pr_title"] = "Unbound result"
-    states.save_run(run_id, ready)
+    persist_run_fixture(states, run_id, ready)
 
     class UpdatedNarrative(RunPublicationAgents):
         def run_publication(self, request: dict) -> dict:

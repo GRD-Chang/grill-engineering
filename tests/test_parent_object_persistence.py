@@ -18,11 +18,13 @@ from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
+from agent_run.object_state import save_owned
 from support.delivery_agents import PassAgents
 from support.run_agents import ScriptedRunAgents
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run, _completed_run
 from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 def report_thread_from_reader(request: dict[str, Any], thread: str) -> None:
@@ -124,12 +126,12 @@ def test_parent_only_reopens_saved_return_without_repeating_work(
 
     with monkeypatch.context() as interruption:
         interruption.setattr(states, "_after_run_saved", interrupt_return)
-        interruption.setattr(states, "_save_run_unlocked", reject_bridge)
+        interruption.setattr(states, "_create_run_unlocked", reject_bridge)
         with pytest.raises(RuntimeError, match="durable Parent return"):
             ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents).deliver(run_id)
     before = (len(agents.development_requests), agents.review_count, len(agents.publication_requests))
     reopened = StateStore(states.root)
-    monkeypatch.setattr(reopened, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(reopened, "_create_run_unlocked", reject_bridge)
     engine = ParentDeliveryEngine(git=git, states=reopened, github=publisher, agents=agents)
     result = engine.deliver(run_id)
     assert result["parent_job"]["phase"] == "ready_for_approval"
@@ -160,13 +162,13 @@ def test_full_parent_acceptance_and_publication_use_object_commits_after_reload(
     def reject_bridge(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("ordinary Parent save entered whole-Run bridge")
 
-    monkeypatch.setattr(states, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(states, "_create_run_unlocked", reject_bridge)
     accepted = RunAcceptanceEngine(
         git=git, states=states, github=publisher, agents=RecordedRunAgents(),
     ).accept(run_id)
     assert accepted["run_acceptance"]["phase"] == "accepted"
     reopened = StateStore(states.root)
-    monkeypatch.setattr(reopened, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(reopened, "_create_run_unlocked", reject_bridge)
     agents = RecordedRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git, states=reopened, agents=agents, github=publisher,
@@ -189,7 +191,7 @@ def test_full_parent_acceptance_and_publication_use_object_commits_after_reload(
         prior["ended_at"] = prior["started_at"]
         archive.append(prior)
     expanded["agent_invocation_history"] = archive + expanded["agent_invocation_history"]
-    fixture_store.save_run(run_id, expanded)
+    persist_run_fixture(fixture_store, run_id, expanded)
     # Reopen after historical growth: the public stage consumes only current
     # invocation facts while the full query retains every archived result.
     engine = RunPublicationEngine(
@@ -226,7 +228,7 @@ def test_reader_callback_keeps_its_loaded_owner_after_other_thread_refresh(
     from agent_run.run_currentness import invalidate_run_acceptance
     invalidate_run_acceptance(latest)
     latest.update(status="run_acceptance_pending", terminal_kind="run_acceptance_stale")
-    latest_store.save_run(run_id, latest)
+    save_owned(latest_store, run_id, latest, fields={'run_acceptance', 'status', 'terminal_kind'})
     stage_store.load_current_run(run_id)
     old["run_acceptance"]["phase"] = "reviewing"
     failures: list[BaseException] = []
@@ -261,7 +263,7 @@ def test_parent_retirement_keeps_archive_and_closed_pr_after_reopen(
     def reject_bridge(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("Parent retirement entered the whole-Run save bridge")
 
-    monkeypatch.setattr(states, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(states, "_create_run_unlocked", reject_bridge)
     engine = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
     before = engine.deliver(run_id)
     original_job = deepcopy(before["parent_job"])

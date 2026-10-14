@@ -14,7 +14,6 @@ from agent_run.state_retention import MAX_DETAILED_INVOCATIONS, compact_invocati
 if TYPE_CHECKING:
     from agent_run.sqlite_state import SQLiteStateRepository
 
-from agent_run.sqlite_rows import read_material_ids
 from agent_run.sqlite_work_patch import patch_work_objects
 from agent_run import sqlite_job_history, sqlite_timeline
 
@@ -50,57 +49,30 @@ def _batch(
     return native
 
 
-def patch_run(
+def create_run_objects(
     connection: sqlite3.Connection, run_id: str, *, objects: Mapping[str, tuple[str, str]],
-    previous: Mapping[str, tuple[str, str]], materials: Mapping[str, str],
-    known_materials: Mapping[str, str], native: bool,
+    materials: Mapping[str, str], native: bool,
 ) -> bool:
+    """Insert a new Run's objects and references in its creation transaction."""
     native = _batch(
-        connection, ((run_id, path) for path in previous.keys() - objects.keys()),
-        sql="DELETE FROM run_objects WHERE run_id = ? AND object_path = ?",
-        native_sql="DELETE FROM run_objects WHERE (run_id, object_path) IN "
-                   "(SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))",
-        native=native,
-    )
-    update = "ON CONFLICT(run_id, object_path) DO UPDATE SET kind=excluded.kind, value_json=excluded.value_json"
-    native = _batch(
-        connection, ((run_id, path, *value) for path, value in objects.items() if previous.get(path) != value),
-        sql="INSERT INTO run_objects VALUES (?, ?, ?, ?) " + update,
+        connection, ((run_id, path, *value) for path, value in objects.items()),
+        sql="INSERT INTO run_objects VALUES (?, ?, ?, ?)",
         native_sql="INSERT INTO run_objects SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), "
-                   "json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?) WHERE true " + update,
+                   "json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?)",
         native=native,
     )
     native = _batch(
-        connection, ((identity, value, len(value.encode("utf-8"))) for identity, value in materials.items()
-                     if identity not in known_materials),
+        connection, ((identity, value, len(value.encode("utf-8"))) for identity, value in materials.items()),
         sql="INSERT OR IGNORE INTO run_materials VALUES (?, ?, ?)",
         native_sql="INSERT OR IGNORE INTO run_materials SELECT json_extract(value, '$[0]'), "
                    "json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?)",
         native=native,
     )
-    references = read_material_ids(connection, run_id, aggregate=native)
-    removed = references - materials.keys()
-    native = _batch(
-        connection, ((run_id, identity) for identity in removed),
-        sql="DELETE FROM run_material_refs WHERE run_id = ? AND material_id = ?",
-        native_sql="DELETE FROM run_material_refs WHERE (run_id, material_id) IN "
-                   "(SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))",
-        native=native,
-    )
-    native = _batch(
-        connection, ((run_id, identity) for identity in materials.keys() - references),
+    return _batch(
+        connection, ((run_id, identity) for identity in materials),
         sql="INSERT INTO run_material_refs(run_id, material_id) VALUES (?, ?)",
         native_sql="INSERT INTO run_material_refs(run_id, material_id) SELECT json_extract(value, '$[0]'), "
                    "json_extract(value, '$[1]') FROM json_each(?)",
-        native=native,
-    )
-    return _batch(
-        connection, ((identity, identity) for identity in removed),
-        sql="DELETE FROM run_materials WHERE material_id = ? AND NOT EXISTS "
-            "(SELECT 1 FROM run_material_refs WHERE material_id = ?)",
-        native_sql="DELETE FROM run_materials WHERE material_id IN "
-                   "(SELECT json_extract(value, '$[0]') FROM json_each(?)) AND NOT EXISTS "
-                   "(SELECT 1 FROM run_material_refs r WHERE r.material_id = run_materials.material_id)",
         native=native,
     )
 

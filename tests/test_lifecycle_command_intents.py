@@ -16,10 +16,12 @@ from agent_run.run_driver import DirectRunOperations
 from agent_run.run_lifecycle import LifecycleRequest, RunLifecycle, prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
 from support.cli_actions import _parent_agents
 from support.published_run import prepare_published_run
 from support.seeding import write_fixture
 from support.workspace import managed_repo, managed_state, prepare_workspace
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("kind", ["approve", "revise", "requeue"])
@@ -139,7 +141,7 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
     initial, _ = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), actual).start(1)
     run_id = str(initial["run_id"])
     initial["response_store_marker"] = "actual"
-    actual.save_run(run_id, initial)
+    persist_run_fixture(actual, run_id, initial)
     unrelated = StateStore(tmp_path / "unrelated-state")
     other = deepcopy(initial)
     other["response_store_marker"] = "unrelated"
@@ -165,7 +167,7 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
         current = actual.load_current_run(run_id)
         assert current is not None
         prepare_action_application_receipt(current, action)
-        actual.save_run(run_id, current)
+        save_owned(actual, run_id, current, fields={'action_application_receipt'})
         return current, True
 
     lifecycle = RunLifecycle(

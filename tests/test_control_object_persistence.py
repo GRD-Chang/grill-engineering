@@ -12,7 +12,9 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_driver import ControlRunOperation, DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
+from agent_run.object_state import save_owned
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("history_size", [0, 300])
@@ -29,14 +31,14 @@ def test_refresh_and_run_stop_preserve_history_without_run_save_bridge(
         archived = deepcopy(retained["agent_invocation_history"][0])
         archived["started_at"] = f"2025-01-01T00:00:{index:06d}+00:00"
         retained["agent_invocation_history"].append(archived)
-    states.save_run(run_id, retained)
+    persist_run_fixture(states, run_id, retained)
     before = StateStore(states.root).load_current_run(run_id)
     assert before is not None
 
     def reject_bridge(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("ordinary control used the whole Run save bridge")
 
-    monkeypatch.setattr(states, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(states, "_create_run_unlocked", reject_bridge)
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     refreshed, _ = controller.resume(run_id)
     assert refreshed["ticket_jobs"]["2"]["candidate_sha"] == before["ticket_jobs"]["2"]["candidate_sha"]
@@ -76,7 +78,7 @@ def test_external_wait_cannot_overwrite_a_stop_saved_during_observation(
     state, states, _git, _fixture = ticket_run(git_repo, (2,))
     run_id = state["run_id"]
     wait_for_github_convergence(state, code="read_unknown", message="unknown response", waiting_for="GitHub")
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     stopped: list[dict[str, object]] = []
 
     class StopDuringObservation(ExternalSupervisor):
@@ -84,7 +86,7 @@ def test_external_wait_cannot_overwrite_a_stop_saved_during_observation(
             window = super().observe(current)
             latest = states.load_current_run(run_id)
             assert latest is not None
-            record_operator_stop(latest, save=lambda value: states.save_run(run_id, value))
+            record_operator_stop(latest, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
             stopped.append(deepcopy(latest))
             return window
 
@@ -124,17 +126,17 @@ def test_driver_wait_survives_reload_of_the_selected_ticket_lane(
     clock = [0.0]
     supervisor = ExternalSupervisor(now=lambda: clock[0], sleeper=lambda _: None)
     supervisor.observe(state)
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     # Scheduling retains the lane's wait while projecting an active Run.
     selected = states.load_current_run(run_id)
     assert selected is not None
     selected["status"] = "active"
-    states.save_run(run_id, selected)
+    persist_run_fixture(states, run_id, selected)
 
     def reject_bridge(*_args, **_kwargs):
         raise AssertionError("Ticket wait entered the whole-Run save bridge")
 
-    monkeypatch.setattr(states, "_save_run_unlocked", reject_bridge)
+    monkeypatch.setattr(states, "_create_run_unlocked", reject_bridge)
     scoped = object_store(states)
     driver = RunDriver(operations=SimpleNamespace(), states=scoped, supervisor=supervisor)
     for retries in (1, 2):
@@ -172,7 +174,7 @@ def test_ordinary_control_projection_omits_completed_sibling_and_retirement_arch
          "reason": "requeue", "evidence": "archived evidence " * 64}
         for number in range(history_size)
     ]
-    states.save_run(run_id, full)
+    persist_run_fixture(states, run_id, full)
     scoped = object_store(states).load_current_run(run_id)
     assert scoped is not None
     assert set(scoped["ticket_jobs"]) == {"2"}
@@ -200,7 +202,7 @@ def test_executor_notification_reads_complete_facts_after_scoped_commit(
     complete = states.load_current_run(run_id)
     assert complete is not None
     complete["notifications"] = {"enabled": True, "mode": "concise"}
-    states.save_run(run_id, complete)
+    persist_run_fixture(states, run_id, complete)
     observations = []
 
     def observe(_sender, current, **_kwargs):

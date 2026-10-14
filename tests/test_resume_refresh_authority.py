@@ -18,7 +18,9 @@ from agent_run.resume_intent import (
     validate_resume_intent,
 )
 from agent_run.state import StateStore
+from agent_run.object_state import save_owned
 from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("pause", ["operator_stopped", "supervision_timeout"])
@@ -41,7 +43,7 @@ def test_resume_preserves_authority_across_persisted_refresh_wait(
     state, _ = controller.start(1)
     run_id = state["run_id"]
     if pause == "operator_stopped":
-        record_operator_stop(state, save=lambda value: states.save_run(run_id, value))
+        record_operator_stop(state, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
         pause_key = "operator_stop"
     else:
         state.update(
@@ -52,7 +54,7 @@ def test_resume_preserves_authority_across_persisted_refresh_wait(
                 "waiting_for": "GitHub graph",
             },
         )
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         pause_key = "supervision_wait"
     original_pause = deepcopy(state[pause_key])
     intent = bind_resume_intent(state)
@@ -113,7 +115,7 @@ def test_resume_preserves_authority_across_persisted_refresh_wait(
         assert intent["pause_reason"] == pause
     if drift == "persisted_pause":
         persisted[pause_key]["waiting_for"] = "a different pause"
-        states.save_run(run_id, persisted)
+        persist_run_fixture(states, run_id, persisted)
     if drift in {"persisted_pause", "refreshed_invocation"}:
         with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
             resume()
@@ -138,7 +140,7 @@ def test_resume_preserves_unchanged_markdown_requirements(git_repo: Path) -> Non
     controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
     state, _ = controller.start(1)
     run_id = state["run_id"]
-    record_operator_stop(state, save=lambda current: states.save_run(run_id, current))
+    record_operator_stop(state, save=lambda current: save_owned(states, run_id, current, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     paused = states.load_current_run(run_id)
     assert paused is not None
     intent = bind_resume_intent(paused)
@@ -216,7 +218,7 @@ def test_ticket_executor_resume_keeps_authority_through_refresh_wait(
         assert changed is not None
         changed["ticket_jobs"]["2"]["ticket_branch_generation"] = 2
         changed["active_ticket_job"] = deepcopy(changed["ticket_jobs"]["2"])
-        states.save_run(run_id, changed)
+        persist_run_fixture(states, run_id, changed)
         with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):
             resume()
         assert calls == 2
@@ -260,11 +262,11 @@ def test_global_refresh_recovery_preserves_independent_ticket_gate(
         local["ticket_jobs"]["2"]["blocked_reason"] = gate
         local["ticket_jobs"]["2"]["review_budget"]["checkpoint_reason"] = gate
         local["active_ticket_job"] = deepcopy(local["ticket_jobs"]["2"])
-        states.save_run(run_id, local)
+        persist_run_fixture(states, run_id, local)
     TicketWorkAdmission(states, run_id).seed([3])
     paused = states.load_current_run(run_id)
     assert paused is not None
-    record_session_interruption(paused, save=lambda current: states.save_run(run_id, current))
+    record_session_interruption(paused, save=lambda current: save_owned(states, run_id, current, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     intent = bind_resume_intent(paused)
     sibling = deepcopy(paused["ticket_jobs"]["2"])
     assert sibling["blocked_reason"] == gate
@@ -321,7 +323,7 @@ def test_refresh_failure_source_is_narrow_and_cleared_by_new_boundaries(git_repo
     wait_for_github_refresh(
         failed, code="github_read_failed", message="temporary", waiting_for="GitHub graph",
     )
-    states.save_run(state["run_id"], failed)
+    persist_run_fixture(states, state["run_id"], failed)
     waiting = states.load_current_run(state["run_id"])
     assert waiting is not None
     assert resume_pause_state(waiting)["status"] == "execution_failed"

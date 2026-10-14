@@ -29,6 +29,7 @@ from support.seeding import seed_idle_control
 from support.cli import run_cli
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def test_merge_resolution_creates_exact_two_parent_candidate(git_repo: Path) -> None:
@@ -146,7 +147,7 @@ def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
     used = interrupted["run_acceptance"]["review_budget"]["development_attempts"]
     if tampered_intent:
         job["candidate_commit_intent"]["token"] = "unrelated-intent"
-        fixture.states.save_run(run_id, interrupted)
+        persist_run_fixture(fixture.states, run_id, interrupted)
         state_ref = (fixture.states.root, str(run_id))
         before = snapshot_run(state_ref)
         with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):

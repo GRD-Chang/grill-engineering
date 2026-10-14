@@ -22,7 +22,7 @@ def test_small_nul_materials_preserve_content_references_and_rollback(
     if mode == "raw":
         repository._aggregate_rows = False
     elif mode == "legacy_nul":
-        patch = sqlite_state.patch_run
+        patch = sqlite_state.create_run_objects
 
         def legacy_extract(encoded, path):
             value = json.loads(encoded)[int(path[2:-1])]
@@ -34,7 +34,7 @@ def test_small_nul_materials_preserve_content_references_and_rollback(
             connection.create_function("json_extract", 2, legacy_extract)
             return patch(connection, *args, **kwargs)
 
-        monkeypatch.setattr(sqlite_state, "patch_run", legacy_patch)
+        monkeypatch.setattr(sqlite_state, "create_run_objects", legacy_patch)
     state = {"body": body, "review_context": {"body": body}, "version": 1}
     repository.save(run_id, state)
     repository.save("shared", {"body": body})
@@ -46,19 +46,19 @@ def test_small_nul_materials_preserve_content_references_and_rollback(
     assert reopened.load(run_id) == state
     with pytest.raises(OSError, match="before commit"):
         with repository.atomic():
-            repository.save(run_id, {"version": 2})
+            repository.save_objects(run_id, {"version": 2}, fields={"body", "review_context", "version"})
             raise OSError("before commit")
     assert reopened.load(run_id) == state
-    repository.save(run_id, {"version": 2})
+    repository.save_objects(run_id, {"version": 2}, fields={"body", "review_context", "version"})
     assert reopened.load(run_id) == {"version": 2}
     assert reopened.load("shared") == {"body": body}
-    repository.save("shared", {"version": 3})
+    repository.save_objects("shared", {"version": 3}, fields={"body", "version"})
     with sqlite3.connect(repository.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM run_materials").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("mode", ["native", "raw", "missing_json_table", "missing_json_scalar"])
-def test_chunked_patches_preserve_special_text_and_exact_types(
+def test_chunked_creation_preserves_special_text_and_exact_types(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
@@ -69,7 +69,7 @@ def test_chunked_patches_preserve_special_text_and_exact_types(
     elif mode.startswith("missing_json"):
         missing = ("no such table: json_each" if mode == "missing_json_table"
                    else "no such function: json_extract")
-        patch = sqlite_state.patch_run
+        patch = sqlite_state.create_run_objects
 
         class WithoutJson:
             def __init__(self, connection):
@@ -83,7 +83,7 @@ def test_chunked_patches_preserve_special_text_and_exact_types(
             def executemany(self, sql, rows):
                 return self.connection.executemany(sql, rows)
 
-        monkeypatch.setattr(sqlite_state, "patch_run", lambda connection, *args, **kwargs:
+        monkeypatch.setattr(sqlite_state, "create_run_objects", lambda connection, *args, **kwargs:
                             patch(WithoutJson(connection), *args, **kwargs))
     changed = {
         "values": {f'key-{number}\x00中文\\\"': [True, 1, 1.0, -0.0, '中文\t\x00\\"\n']
@@ -92,14 +92,15 @@ def test_chunked_patches_preserve_special_text_and_exact_types(
     }
     with repository.atomic():
         assert repository.load("run-1") == original
-        repository.save("run-1", changed)
-    saved = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024).load("run-1")
+        repository.save("run-2", changed)
+    saved = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024).load("run-2")
     assert json.dumps(saved, sort_keys=True) == json.dumps(changed, sort_keys=True)
-    assert repository.load("run-1") == changed
+    assert repository.load("run-2") == changed
+    assert repository.load("run-1") == original
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_later_chunk_constraint_failure_rolls_back_earlier_chunks_and_materials(
+def test_creation_later_chunk_failure_rolls_back_earlier_chunks_and_materials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
@@ -120,7 +121,9 @@ def test_later_chunk_constraint_failure_rolls_back_earlier_chunks_and_materials(
     with pytest.raises(OSError, match="CHECK constraint failed"):
         with repository.atomic():
             assert repository.load("run-1") == original
-            repository.save("run-1", {"values": {f"key-{n}": n for n in range(400)},
+            repository.save("run-2", {"values": {f"key-{n}": n for n in range(400)},
                                        "evidence": "replacement " * 300})
     assert repository.load("run-1") == original
     assert SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1") == original
+
+    assert repository.load("run-2") is None

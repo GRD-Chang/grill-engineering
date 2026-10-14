@@ -18,6 +18,7 @@ from support.cli import load_only_run_state, run_cli, run_internal_stage, stdout
 from support.cli_payloads import passing_acceptance, ticket
 
 from support.state import include_in_state_snapshot
+from support.state import persist_run_fixture
 
 
 def _fail_parent_run(git_repo: Path, fixture: Path) -> None:
@@ -105,7 +106,7 @@ def _establish_ordinary_run_boundary(
         _block_parent_for_human(git_repo, fixture)
         state = load_only_run_state(git_repo)
         state.update({"status": "blocked", "terminal_kind": "waiting_human"})
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
     elif boundary == "permanent_blocked":
         blocked = run_cli(git_repo, fixture, "run", "1")
         assert blocked.returncode == 2, blocked.stderr
@@ -130,7 +131,7 @@ def _establish_ordinary_run_boundary(
         state.update(
             {"status": "publication_pending", "terminal_kind": "publication_pending"}
         )
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
     elif boundary == "unsupported_scope_change":
         started = run_cli(
             git_repo,
@@ -175,7 +176,7 @@ def _establish_ordinary_run_boundary(
             {"status": "waiting_external", "terminal_kind": "waiting_external"}
         )
         state["run_publication"]["phase"] = "waiting_external"
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
         blocked = run_cli(
             git_repo,
             fixture,
@@ -199,13 +200,13 @@ def _establish_ordinary_run_boundary(
         state.update(
             {"status": "abandonment_pending", "terminal_kind": "abandonment_pending"}
         )
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
     elif boundary == "progress_exhausted":
         blocked = run_cli(git_repo, fixture, "run", "1")
         assert blocked.returncode == 2, blocked.stderr
         state = load_only_run_state(git_repo)
         state["terminal_kind"] = "waiting_human"
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
     else:
         agents = (
             run_agents(git_repo / "initial-agents.json")
@@ -256,9 +257,7 @@ def _establish_ordinary_run_boundary(
             state = load_only_run_state(git_repo)
             record_operator_stop(
                 state,
-                save=lambda stopped: StateStore(managed_state(git_repo)).save_run(
-                    str(stopped["run_id"]), stopped
-                ),
+                save=lambda stopped: persist_run_fixture(StateStore(managed_state(git_repo)), str(stopped["run_id"]), stopped),
             )
     expected_status = (
         "blocked"

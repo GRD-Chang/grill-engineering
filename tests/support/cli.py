@@ -21,6 +21,7 @@ from agent_run.worker_sandbox import WorkerSandboxError
 from support.workspace import managed_state, prepare_workspace
 
 from support.state import snapshot_run, write_run_fixture
+from support.state import persist_run_fixture
 
 
 PROJECT_ROOT = Path(__file__).parents[2]
@@ -296,7 +297,7 @@ def modify_only_run_state(
     states = StateStore(managed_state(repo, extra_env=extra_env))
     state = load_only_run_state(repo, extra_env=extra_env)
     mutate(state)
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     saved = states.load_current_run(str(state["run_id"]))
     assert saved is not None
     return saved
@@ -309,7 +310,7 @@ def save_run_state(
 
     states = StateStore(managed_state(repo, extra_env=extra_env))
     run_id = str(state["run_id"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     saved = states.load_current_run(run_id)
     assert saved is not None
     return saved

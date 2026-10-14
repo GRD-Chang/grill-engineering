@@ -17,6 +17,7 @@ from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
 from support.seeding import write_fixture
 from support.delivery_agents import ScriptedAgents, issue
+from support.state import persist_run_fixture
 
 
 COMMIT_MESSAGE = "fix: 恢复完整交付\n\n问题：合并完成后继续收尾。\n\n证据：保留多段正文与中文引号‘验收’。"
@@ -107,7 +108,7 @@ def test_ticket_recovery_reconciles_successful_merge_before_old_base_ref_check(
         {"head_repository": "foreign/project"}, {"head_ref": "foreign-branch"},
         {"base_repository": "foreign/project"}, {"commit_body": "正文被替换"}, {},
     ):
-        states.save_run(run_id, deepcopy(interrupted))
+        persist_run_fixture(states, run_id, deepcopy(interrupted))
         subprocess.run(
             ["git", "update-ref", f"refs/heads/{state['run_branch']}", original_integrated],
             cwd=git_repo, check=True, capture_output=True,

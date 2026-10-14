@@ -19,6 +19,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.state import StateStore
 from support.seeding import write_fixture
 from support.run_artifacts import _passing_artifact
+from support.state import persist_run_fixture
 
 
 def save_run_with_ci_fixture(
@@ -57,7 +58,7 @@ def save_run_with_ci_fixture(
                     run, head_sha=head_sha,
                     limit=3, is_ticket=False,
                 )
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
 
 def _completed_run(
@@ -212,7 +213,7 @@ def _completed_run(
         "acceptance_record": acceptance_record,
         "ticket_integration": deepcopy(ticket_integration),
     }
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     return state, states, git
 
 

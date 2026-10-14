@@ -31,6 +31,7 @@ from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.worker_process_timing import wait_until
 from support.workspace import managed_repo, managed_state
+from support.state import persist_run_fixture
 
 
 def interrupt_shared_storage(repo: Path, *, storage_loss: bool) -> None:
@@ -67,7 +68,7 @@ def interrupt_shared_storage(repo: Path, *, storage_loss: bool) -> None:
     bound = control.load(task)
     assert bound is not None
     prepare_action_application_receipt(state, bound["action"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control.record_application(task, action_id=action_id, generation=generation, run_id=run_id, payload_digest=claim.action["payload_digest"])
     control.complete_action(task, action_id=action_id, generation=generation, result_status="active")
 

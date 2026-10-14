@@ -9,6 +9,7 @@ import pytest
 from support.workspace import managed_state
 
 from agent_run.delivery_history import history_records
+from agent_run.object_state import save_owned
 from support.cli import replace_only_run_state
 
 from support.state import include_in_state_snapshot
@@ -96,7 +97,7 @@ def test_state_store_retains_future_check_identity_without_repeating_details(tmp
     }
     store.save_run("run-example", state)
     state["run_publication"]["required_checks_observed_at"] = "2026-09-12T04:04:00+00:00"
-    store.save_run("run-example", state)
+    save_owned(store, "run-example", state, fields={"run_publication"})
     persisted = store.load_run("run-example")
     first, second = persisted["timeline"]
     assert first["required_checks_head_sha"] == "accepted-head"
@@ -105,7 +106,7 @@ def test_state_store_retains_future_check_identity_without_repeating_details(tmp
     assert first["required_checks_evidence"]["checks"][0]["name"] == "unit"
     assert "required_checks_evidence" not in second
     state["run_publication"]["required_checks_evidence"]["checks"][0]["link"] = "https://github.com/o/r/actions/runs/1/job/3"
-    store.save_run("run-example", state)
+    save_owned(store, "run-example", state, fields={"run_publication"})
     timeline = store.load_run("run-example")["timeline"]
     assert timeline[-1]["required_checks_run_identity"] != first["required_checks_run_identity"]
     records = history_records(state, {"timeline": timeline})

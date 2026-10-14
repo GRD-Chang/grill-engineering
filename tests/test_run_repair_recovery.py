@@ -23,6 +23,7 @@ from agent_run.state_errors import MissingRunMaterialsError
 
 
 from support.run_agents import ScriptedRunAgents
+from support.state import persist_run_fixture
 
 def test_run_repair_promotion_rejects_final_pr_trigger_drift(
     git_repo: Path,
@@ -499,7 +500,7 @@ def test_run_repair_recovery_rejects_foreign_write_identity_without_new_effects(
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(str(state["run_id"]), explicit_resume=True)
     job = resumed["run_acceptance"]["repair_job"]
     job["run_branch_write_intent"][field] = "foreign"
-    states.save_run(str(state["run_id"]), resumed)
+    persist_run_fixture(states, str(state["run_id"]), resumed)
     fixture_before = fixture.read_bytes()
     requests_before = (len(agents.development_requests), len(agents.review_requests))
     with pytest.raises(MissingRunMaterialsError, match="write intent differs from its reviewed candidate"):

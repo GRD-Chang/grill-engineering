@@ -10,6 +10,7 @@ from agent_run.prompt_resources import builtin_resources
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlStore, TaskKey
+from support.state import persist_run_fixture
 
 
 def create_exit_run(
@@ -60,7 +61,7 @@ def create_exit_run(
         control.mark_handshake(task, action_id=spec.action_id, generation=generation,
                                pid=os.getpid(), process_start_token=_process_start_token(os.getpid()))
         prepare_action_application_receipt(state, claim.action)
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         control.record_application(task, action_id=spec.action_id, run_id=run_id,
                                    generation=generation, payload_digest=claim.action["payload_digest"])
         control.complete_action(task, action_id=spec.action_id, generation=generation,

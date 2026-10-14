@@ -17,6 +17,7 @@ from agent_run.state import StateStore
 from support.seeding import seed_run, write_fixture
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path) -> None:
@@ -69,7 +70,7 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
     current = states.find_unfinished_runs('example/project', 1)[0]
     current['status'] = 'execution_failed'
     current['diagnostics'] = [{'code': 'old_failure', 'message': 'old usage limit'}]
-    states.save_run(current['run_id'], current)
+    persist_run_fixture(states, current['run_id'], current)
     state_ref = (states.root, str(current['run_id']))
     before = snapshot_run(state_ref)
     monkeypatch.chdir(git_repo)

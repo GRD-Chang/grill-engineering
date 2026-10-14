@@ -17,6 +17,7 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
+from agent_run.object_state import save_owned
 from support.cli_supervision import _parent_only_agents
 from support.seeding import write_fixture
 from support.workspace import managed_workspace
@@ -533,7 +534,7 @@ def test_state_commit_retries_task_control_busy_without_failing_run(
 
     def write_state() -> None:
         try:
-            states.save_run("run-1", {"run_id": "run-1", "status": "continued"})
+            save_owned(states, "run-1", {"run_id": "run-1", "status": "continued"}, fields={'status'})
         except BaseException as error:  # pragma: no cover - diagnostic propagation
             writer_errors.append(error)
 

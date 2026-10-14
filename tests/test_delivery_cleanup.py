@@ -17,6 +17,7 @@ from agent_run.state import StateStore
 from support.seeding import write_fixture
 from support.delivery_agents import E2E_PASS_EVIDENCE, SPEC_PASS_EVIDENCE, STANDARDS_PASS_EVIDENCE, PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
+from support.state import persist_run_fixture
 
 
 class PartialCheckoutGit(GitRepository):
@@ -75,7 +76,7 @@ def test_completed_ticket_cleanup_preserves_tracked_modifications(
     )
     (checkout / "README.md").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -116,7 +117,7 @@ def test_completed_ticket_cleanup_preserves_untracked_files(
     )
     (checkout / "unsaved.txt").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -146,7 +147,7 @@ def test_completed_ticket_cleanup_removes_clean_checkout(git_repo: Path) -> None
         checkout=checkout,
     )
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -260,7 +261,7 @@ def test_completed_ticket_cleanup_retries_without_reopening_delivery(
         "integrated_sha": git.resolve(branch),
         "publication_sha": git.resolve(branch),
     }
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
 
     failed = DeliveryCleanupEngine(
         git=FailingBranchCleanupGit(git_repo), states=states
@@ -442,7 +443,7 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
             }
         },
     }
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     github = RecordingBranchPublisher()
 
     resumed = DeliveryCleanupEngine(

@@ -21,6 +21,7 @@ from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run, _completed_run
 from support.seeding import seed_idle_control
 from support.workspace import prepare_workspace
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("role", ["reviewer", "publication"])
@@ -154,7 +155,7 @@ def test_public_resume_reuses_publication_return_after_remote_currentness_timeou
     clock[0] = float(window["deadline"]) + 1
     assert not supervisor.before_retry(paused)
     assert paused["status"] == "supervision_timeout"
-    states.save_run(run_id, paused)
+    persist_run_fixture(states, run_id, paused)
     seed_idle_control(TaskControlStore(states.root), TaskKey(repo, state["repository"], 1), run_id)
     monkeypatch.setattr(cli, "FakeExecutorHost", lambda **kwargs: FakeExecutorHost())
     monkeypatch.setattr(cli, "_agent_backend", lambda *args, **kwargs: agents)

@@ -12,6 +12,7 @@ from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run import sqlite_state
 from agent_run.state import StateStore
 from agent_run.sqlite_rows import read_row_source, read_run_rows, read_schema
+from agent_run.object_state import save_owned
 
 
 def test_transaction_reads_are_isolated_and_follow_writes_and_rollback(tmp_path: Path) -> None:
@@ -27,14 +28,14 @@ def test_transaction_reads_are_isolated_and_follow_writes_and_rollback(tmp_path:
             view["job"]["phase"] = "caller mutation"
             view["history"].append("not saved")
             assert repository.load("run-1") == original
-            repository.save("run-1", replacement)
+            repository.save_objects("run-1", replacement, fields={"job", "history"})
             assert repository.load("run-1") == replacement
             raise OSError("before commit")
 
     with repository.atomic():
         assert repository.load("run-1") == original
     other = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    other.save("run-1", replacement)
+    other.save_objects("run-1", replacement, fields={"job", "history"})
     with repository.atomic():
         assert repository.load("run-1") == replacement
 
@@ -47,7 +48,7 @@ def test_caught_nested_failure_rolls_back_the_entire_transaction(tmp_path: Path)
             assert repository.load("run-1") == {"version": 1}
             try:
                 with repository.atomic():
-                    repository.save("run-1", {"version": 2})
+                    repository.save_objects("run-1", {"version": 2}, fields={"version"})
                     assert repository.load("run-1") == {"version": 2}
                     raise OSError("inner failure")
             except OSError:
@@ -73,7 +74,7 @@ def test_size_limit_counts_exact_utf8_json_including_expanded_materials(
     with pytest.raises(ValueError, match="persistence limit"):
         limited.load("run-1")
     with pytest.raises(ValueError, match="persistence limit"):
-        limited.save("run-1", state)
+        limited.save("oversized-new-run", state)
     assert repository.load("run-1") == json.loads(encoded)
 
 
@@ -82,9 +83,9 @@ def test_material_reclamation_preserves_other_run_references(tmp_path: Path) -> 
     material = "same exact evidence " * 100
     for run_id in ("run-1", "run-2"):
         repository.save(run_id, {"evidence": material})
-    repository.save("run-1", {"evidence": "replaced"})
+    repository.save_objects("run-1", {"evidence": "replaced"}, fields={"evidence"})
     assert repository.load("run-2") == {"evidence": material}
-    repository.save("run-2", {"evidence": "also replaced"})
+    repository.save_objects("run-2", {"evidence": "also replaced"}, fields={"evidence"})
     assert SQLiteStateRepository(tmp_path, max_bytes=8192).load("run-1") == {"evidence": "replaced"}
     assert repository.load("run-2") == {"evidence": "also replaced"}
 
@@ -105,7 +106,7 @@ def test_existing_node_projection_can_be_read_and_updated_as_keyed_objects(
     reopened = SQLiteStateRepository(tmp_path, max_bytes=8192)
     assert reopened.load("run-1") == state
     state["ticket_jobs"]["2"]["phase"] = "candidate"
-    reopened.save("run-1", state)
+    reopened.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
     assert repository.load("run-1") == state
 
 
@@ -146,7 +147,7 @@ def test_retained_object_keeps_transitive_materials_when_sibling_changes(tmp_pat
         updated = repository.load("run-1")
         assert updated is not None
         updated["ticket_jobs"]["3"]["review_context"] = {"body": "replacement " * 200}
-        repository.save("run-1", updated)
+        repository.save_objects("run-1", updated, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"3"}})
         assert repository.load("run-1") == updated
     saved = SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1")
     assert saved == updated
@@ -200,7 +201,7 @@ def test_object_reuse_preserves_exact_json_types_and_values(tmp_path: Path, old,
     with repository.atomic():
         state = repository.load("run-1")
         state["ticket_jobs"]["2"]["nested"]["value"] = new
-        repository.save("run-1", state)
+        repository.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
         assert json.dumps(repository.load("run-1")) == json.dumps(state)
     saved = SQLiteStateRepository(tmp_path, max_bytes=8192).load("run-1")
     value = saved["ticket_jobs"]["2"]["nested"]["value"]
@@ -215,7 +216,7 @@ def test_observer_and_reopened_store_agree_on_changed_object_type(tmp_path: Path
     observed = []
     store.run_saved_observer = observed.append
     state["ticket_jobs"]["2"]["extension"]["value"] = True
-    store.save_run("run-1", state)
+    save_owned(store, "run-1", state, fields={"ticket_jobs"})
     saved = StateStore(tmp_path).load_run("run-1")
     assert saved["ticket_jobs"]["2"]["extension"]["value"] is True
     assert observed[0]["ticket_jobs"]["2"]["extension"]["value"] is True
@@ -262,7 +263,7 @@ def test_sibling_change_preserves_independent_snapshot_values(tmp_path: Path) ->
     assert repository.load("run-1") == state
     other = SQLiteStateRepository(tmp_path, max_bytes=65536)
     state["ticket_jobs"]["3"]["value"] = -0.0
-    other.save("run-1", state)
+    other.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"3"}})
     changed = repository.load("run-1")
     assert json.dumps(changed, sort_keys=True) == json.dumps(state, sort_keys=True)
     changed["ticket_jobs"]["2"]["literal"]["tags"].clear()
@@ -270,7 +271,7 @@ def test_sibling_change_preserves_independent_snapshot_values(tmp_path: Path) ->
     with repository.atomic():
         changed = repository.load("run-1")
         changed["ticket_jobs"]["2"]["value"] = True
-        repository.save("run-1", changed)
+        repository.save_objects("run-1", changed, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
     assert other.load("run-1")["ticket_jobs"]["2"]["value"] is True
 
 
@@ -311,3 +312,51 @@ def test_row_read_checks_bounds_before_aggregation(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="persistence limit"):
             read_run_rows(connection, "run-1", max_bytes=1, aggregate_bytes=65536, aggregate=True)
         assert read_run_rows(connection, "missing", max_bytes=1, aggregate_bytes=65536, aggregate=True)[0] is None
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_complete_save_rejects_existing_run_before_processing_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loaded: bool,
+) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
+    original = {"phase": "created", "evidence": "original evidence " * 100}
+    repository.save("run-1", original)
+
+    def unexpected_encode(*args, **kwargs):
+        raise AssertionError("existing Run entered complete encoding")
+
+    with pytest.raises(ValueError, match="already exists"):
+        with repository.atomic():
+            if loaded:
+                assert repository.load("run-1") == original
+            monkeypatch.setattr(repository, "_objects", unexpected_encode)
+            repository.save("run-1", {"phase": "replacement"})
+    assert not repository.in_transaction
+    assert SQLiteStateRepository(tmp_path, max_bytes=4096).load("run-1") == original
+
+
+def test_competing_complete_creations_preserve_one_durable_run(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(2, timeout=5)
+    candidates = [{"winner": number} for number in (1, 2)]
+
+    def create(state):
+        repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
+        barrier.wait()
+        try:
+            repository.save("run-1", state)
+            return state
+        except ValueError as error:
+            assert "already exists" in str(error)
+            return None
+        finally:
+            assert not repository.in_transaction
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(create, candidate) for candidate in candidates]
+        results = [future.result(timeout=10) for future in futures]
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert SQLiteStateRepository(tmp_path, max_bytes=4096).load("run-1") == winners[0]

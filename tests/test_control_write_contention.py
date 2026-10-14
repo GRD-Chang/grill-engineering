@@ -9,6 +9,7 @@ import pytest
 
 from agent_run import task_control as control_module
 from agent_run.task_control import ActionReconciliationError, TaskControlBusyError, TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
 
 
 @pytest.mark.parametrize("operation", ["start", "finish"])
@@ -132,7 +133,7 @@ def test_state_commit_uses_one_control_deadline(
     monkeypatch.setattr(control_module, "sleep", intervals.append)
     with control._locked(task):
         with pytest.raises(TaskControlBusyError):
-            states.save_run("run-1", {"run_id": "run-1", "status": "continued"})
+            save_owned(states, "run-1", {"run_id": "run-1", "status": "continued"}, fields={'status'})
     assert intervals == [0.01]
     assert control.path_for(task).read_bytes() == before_control
     assert states.load_run("run-1") == before_run

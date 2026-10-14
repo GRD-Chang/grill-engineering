@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from agent_run.executor_host import _process_start_token
+from agent_run.object_state import object_store
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.worker_process_timing import wait_until
@@ -70,7 +71,13 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
             state["active_agent_invocation"] = state["ticket_agent_invocations"]["2"]
 
         # 观察选择置于 A，不改变仍在工作的 B/C 的真实归属。
-        states.update_run(run_id, select_completed)
+        def save_selection() -> None:
+            selected = object_store(states).load_current_run_for_ticket(run_id, 2)
+            assert selected is not None
+            select_completed(selected)
+            object_store(states).save_run(run_id, selected)
+
+        states._commit_run(save_selection)
         before = StateStore(states.root).load_current_run(run_id)
         assert before is not None
         assert before["ticket_jobs"]["2"]["phase"] == "completed"

@@ -19,6 +19,7 @@ from agent_run.review_budget import new_budget
 from agent_run.ticket_eligibility import TicketEligibilityError
 from support.seeding import write_fixture
 from support.delivery_agents import PassAgents, issue
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -64,7 +65,7 @@ def test_running_ticket_keeps_its_place_when_labels_change(git_repo: Path) -> No
     state["active_ticket_job"].update({
         "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(),
     })
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     data = json.loads(fixture.read_text())
     data["issues"]["3"]["labels"] = ["ready-for-human"]
     fixture.write_text(json.dumps(data))
@@ -97,7 +98,7 @@ def test_explicit_entry_rejects_labels_without_consuming_work(
             "effective_revision": "stale",
             "base_sha": git.resolve(state["run_branch"]),
         })
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     if command == "resume":
         controller.record_execution_failure(state["run_id"], "controller_interrupted")
     else:
@@ -155,7 +156,7 @@ def test_resume_retry_reuses_only_successful_action_label_qualification(
     state["active_ticket_job"].update({
         "phase": "developing", "review_budget": new_budget(), "review_budget_history": [], "ci_recovery": new_ticket_ci_recovery_budget(),
     })
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     controller.record_execution_failure(run_id, "interrupted")
     action = {
         "action_id": "resume-1", "kind": "resume",

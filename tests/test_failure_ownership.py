@@ -20,9 +20,11 @@ from agent_run.external_supervision import ExternalSupervisor
 from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
+from agent_run.object_state import save_owned
 from support.cli import run_cli, stdout_json
 from support.state_commits import observe_run_commits
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 def _select_completed(states: StateStore, run_id: str) -> None:
@@ -34,7 +36,7 @@ def _select_completed(states: StateStore, run_id: str) -> None:
     state["status"] = "ticket_completed"
     state["terminal_kind"] = None
     state["diagnostics"] = []
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
 
 
 @pytest.mark.parametrize("failure", ["worker", "save"])
@@ -178,7 +180,7 @@ def test_shared_failure_belongs_to_run_with_completed_selection(
     before = states.load_current_run(run_id)
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     if failure == "session":
-        record_session_interruption(before, save=lambda value: states.save_run(run_id, value))
+        record_session_interruption(before, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     elif failure == "contradiction":
         assert controller.record_deterministic_contradiction(run_id, "github_invalid_response", "Shared repository response invalid")
     elif failure == "lane_credential":

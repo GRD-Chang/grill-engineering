@@ -11,6 +11,7 @@ from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
+from agent_run.object_state import save_owned
 from support.state_commits import observe_run_commits
 
 
@@ -91,7 +92,7 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
     def ensure(current: dict[str, Any]) -> int:
         return publisher().ensure_change_pr(
             **authority, write_intent=current["ticket_write_intent"],
-            save_intent=lambda: states.save_run("test", current),
+            save_intent=lambda: save_owned(states, "test", current, fields={'ticket_write_intent'}),
         )
 
     if fault == "response":
@@ -102,11 +103,11 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
         # The write outcome is not installed in the durable Job: a restart
         # reads the real StateStore checkpoint made before the Gh write.
         state.pop("ticket_write_intent")
-        original = states._save_run_unlocked
-        monkeypatch.setattr(states, "_save_run_unlocked", lambda *_args: (_ for _ in ()).throw(OSError("result save lost")))
+        original = states._repository.save_objects
+        monkeypatch.setattr(states._repository, "save_objects", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("result save lost")))
         with pytest.raises(OSError, match="result save lost"):
-            states.save_run("test", state)
-        monkeypatch.setattr(states, "_save_run_unlocked", original)
+            save_owned(states, "test", state, fields={'ticket_write_intent'})
+        monkeypatch.setattr(states._repository, "save_objects", original)
         fail = False
     current = StateStore(states.root).load_run("test")
     assert current is not None

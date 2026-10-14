@@ -13,6 +13,7 @@ from rich.text import Text
 from agent_run import cli
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
+from support.state import persist_run_fixture
 from support.workspace import prepare_workspace
 from support.lifecycle import _file_snapshot
 
@@ -24,7 +25,7 @@ class TerminalOutput(StringIO):
 
 def _save_run(repo: Path, state: dict[str, Any]) -> Path:
     workspace = prepare_workspace(repo)
-    StateStore(workspace.state_root).save_run(state["run_id"], state)
+    persist_run_fixture(StateStore(workspace.state_root), state["run_id"], state)
     RunLocatorIndex.default().register(
         run_id=state["run_id"],
         repository_root=workspace.repository_root,

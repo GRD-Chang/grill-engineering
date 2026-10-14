@@ -16,6 +16,7 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_supervision import _parent_only_agents
 from support.seeding import seed_idle_control, seed_run, write_fixture
 from support.control import _run_cli
+from support.state import persist_run_fixture
 
 
 def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
@@ -67,7 +68,7 @@ def test_resume_reconciles_externally_exited_executor(
     control.bind_run(task, claim.action_id, run_id, generation=reservation.generation,
         state_dir=states.root)
     prepare_action_application_receipt(current, claim.action)
-    states.save_run(run_id, current)
+    persist_run_fixture(states, run_id, current)
     control.record_application(task, action_id=claim.action_id, run_id=run_id,
         generation=reservation.generation, payload_digest=claim.action["payload_digest"])
     control.complete_action(task, action_id=claim.action_id,

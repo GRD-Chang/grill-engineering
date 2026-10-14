@@ -25,6 +25,7 @@ from support.cli import load_only_run_state
 from support.run_artifacts import _canonical_run_budget
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +94,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
                 }
             ]
     require_current_run_state(state)
-    StateStore(state_root).save_run(run_id, state)
+    persist_run_fixture(StateStore(state_root), run_id, state)
     old_generation = receipt["executor_generation"]
     control_path = control.path_for(task)
     if control_case == "missing":
@@ -296,7 +297,7 @@ def test_original_retry_unknown_then_different_successor_reconciles_again(
     original = control.claim_action(task, kind=original_command, payload=payload)
     prepare_action_application_receipt(state, original.action)
     state.update({"status": "run_approval_pending", "terminal_kind": None})
-    StateStore(managed_state(git_repo)).save_run(run_id, state)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, state)
     control.path_for(task).unlink()
     first_host = _install_host(git_repo, fixture, monkeypatch, "unknown")
     arguments = [original_command, run_id, "--repo", "example/project", "--json"]

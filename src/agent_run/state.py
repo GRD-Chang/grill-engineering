@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.error_safety import bounded_error, redact_credentials
@@ -50,35 +50,10 @@ class StateStore:
         self._write_guard: Callable[[], None] | None = None
         self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
-        self._expected_run_state = threading.local()
         self._repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
         self._coordinator = coordinator_for(root)
         self._commit_context = threading.local()
         self._validated_read: tuple[object, weakref.ReferenceType[object]] | None = None
-
-    @contextmanager
-    def require_unchanged_run(
-        self, run_id: str, expected: dict[str, Any]
-    ) -> Iterator[None]:
-        """Reject stale Controller saves while leaving GitHub reads unlocked."""
-        previous: dict[str, dict[str, Any]] = getattr(
-            self._expected_run_state, "by_run", {}
-        )
-        current = dict(previous)
-        current[run_id] = deepcopy(expected)
-        self._expected_run_state.by_run = current
-        try:
-            yield
-        finally:
-            self._expected_run_state.by_run = previous
-
-    def load_unchanged_run(self, run_id: str) -> dict[str, Any] | None:
-        """Read the result of this Controller refresh only if no writer superseded it."""
-        expected = getattr(self._expected_run_state, "by_run", {}).get(run_id)
-        latest = self.load_run(run_id)
-        if expected is None or latest != expected:
-            raise ConcurrentRunStateError("Run changed before Controller returned its refresh")
-        return latest
 
     def _set_write_guard(
         self,
@@ -115,8 +90,9 @@ class StateStore:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        """Create a new Run; existing work must use an object commit."""
         self._commit_run(
-            lambda: self._save_run_and_notify_unlocked(run_id, state),
+            lambda: self._create_run_and_notify_unlocked(run_id, state),
         )
 
     def load_work_run(
@@ -198,31 +174,6 @@ class StateStore:
         )
         return durable
 
-    def update_run(
-        self, run_id: str, update: Callable[[dict[str, Any]], None],
-    ) -> dict[str, Any]:
-        """Commit a logical object transition against the latest consistent Run.
-
-        The callback verifies the relevant Job/Attempt/Invocation identities
-        and changes only its owned objects. It runs once inside the authorized
-        transaction; Agent, Git, network and observer work belong outside it.
-        StateStore validates associated facts and returns only a durable view.
-        """
-        def commit() -> dict[str, Any]:
-            state = self.load_current_run(run_id)
-            if state is None:
-                raise ValueError("Delivery Run disappeared during object commit")
-            update(state)
-            from agent_run.state_contract import require_current_run_state
-
-            require_current_run_state(state)
-            self._save_run_and_notify_unlocked(run_id, state)
-            saved = self.load_current_run(run_id)
-            assert saved is not None
-            return saved
-
-        return self._commit_run(commit)
-
     @contextmanager
     def _write_boundary(self) -> Iterator[None]:
         if self._write_transaction is not None:
@@ -238,13 +189,11 @@ class StateStore:
         with self.commit_admission():
             notifications = self._commit_context.notifications
             checkpoint = len(notifications)
-            expected = dict(getattr(self._expected_run_state, "by_run", {}))
             try:
                 with self._write_boundary(), self.locked(), self._repository.atomic():
                     return operation()
             except BaseException:
                 del notifications[checkpoint:]
-                self._expected_run_state.by_run = expected
                 # Object projections may have advanced inside a nested save.
                 # An outer rollback invalidates those provisional baselines.
                 for attribute in ("_object_store_adapter", "_parent_object_store_adapter"):
@@ -290,15 +239,11 @@ class StateStore:
     ) -> tuple[dict[str, Any], bool]:
         """Atomically create one Run or return the existing Run."""
 
-        custom_save = self._custom_save_run()
         def create() -> tuple[dict[str, Any], bool]:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            if custom_save is not None:
-                custom_save(run_id, state)
-            else:
-                self._save_run_and_notify_unlocked(run_id, state)
+            self._create_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
@@ -312,7 +257,6 @@ class StateStore:
     ) -> tuple[dict[str, Any], bool]:
         """Atomically reuse an unfinished Parent Run or create one."""
 
-        custom_save = self._custom_save_run()
         def create() -> tuple[dict[str, Any], bool]:
             unfinished = self.find_unfinished_runs(repository, parent_number)
             if len(unfinished) > 1:
@@ -326,38 +270,22 @@ class StateStore:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            if custom_save is not None:
-                custom_save(run_id, state)
-            else:
-                self._save_run_and_notify_unlocked(run_id, state)
+            self._create_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
 
-    def _custom_save_run(self) -> Callable[[str, dict[str, Any]], None] | None:
-        instance_method = self.__dict__.get("save_run")
-        if callable(instance_method):
-            return cast(Callable[[str, dict[str, Any]], None], instance_method)
-        class_method = getattr(type(self), "save_run", None)
-        if class_method is not StateStore.save_run:
-            return self.save_run
-        return None
-
-    def _save_run_and_notify_unlocked(
+    def _create_run_and_notify_unlocked(
         self, run_id: str, state: dict[str, Any]
     ) -> None:
-        durable = self._save_run_unlocked(run_id, state)
+        durable = self._create_run_unlocked(run_id, state)
         notifications = getattr(self._commit_context, "notifications", None)
         if notifications is None:
             raise RuntimeError("Run save requires commit admission")
         if self.run_saved_observer is None:
             notifications.append(None)
-        elif durable is None:
-            # Custom save hooks may retain the former None return contract.
-            notifications.append(deepcopy(state))
         else:
-            # Sanitization already made an isolated durable view. Only timeline
-            # fields are shared back with the caller by the save bridge.
+            # The caller receives timeline fields; observers own a separate view.
             for field in ("timeline", "timeline_continuation"):
                 if field in durable:
                     durable[field] = deepcopy(durable[field])
@@ -366,36 +294,10 @@ class StateStore:
     def _after_run_saved(self) -> None:
         """Hook for durable-write fault injection."""
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
-        previous = self.load_run(run_id)
-        expected_by_run: dict[str, dict[str, Any]] = getattr(
-            self._expected_run_state, "by_run", {}
-        )
-        expected = expected_by_run.get(run_id)
-        if expected is not None and previous != expected:
-            raise ConcurrentRunStateError("Run changed during Controller refresh")
-        if (expected is None and isinstance(previous, dict)
-                and state.get("resume_audit", {}).get("total", 0)
-                <= previous.get("resume_audit", {}).get("total", 0)):
-            # Foreground external supervision may hold an older whole-Run
-            # projection while a targeted Resume commits. Do not erase its
-            # accepted work, audit or queue; the driver reloads and continues.
-            for number, job in previous.get("ticket_jobs", {}).items():
-                proposed = state.get("ticket_jobs", {}).get(number, {})
-                if (isinstance(job, dict) and job.get("last_ticket_resume")
-                        and job.get("ticket_branch_generation") == proposed.get("ticket_branch_generation")
-                        and job["last_ticket_resume"] != proposed.get("last_ticket_resume")):
-                    raise ConcurrentRunStateError("Ticket Resume superseded the Run projection")
-        if isinstance(previous, dict) and isinstance(previous.get("ticket_pause_requests"), dict):
-            requests = state.get("ticket_pause_requests")
-            jobs = state.get("ticket_jobs")
-            if isinstance(requests, dict):
-                for number, requested_at in previous["ticket_pause_requests"].items():
-                    job = jobs.get(number) if isinstance(jobs, dict) else None
-                    if isinstance(job, dict) and job.get("phase") in {"blocked", "completed", "publication_pending"}:
-                        requests.pop(number, None)
-                    else:
-                        requests.setdefault(number, requested_at)
+    def _create_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        self._reject_legacy_run(run_id)
+        if self._repository.has(run_id):
+            raise ValueError("Run already exists; use an object commit")
         invocations = state.get("ticket_agent_invocations")
         active_job = state.get("active_ticket_job")
         active_invocation = state.get("active_agent_invocation")
@@ -422,7 +324,7 @@ class StateStore:
         if "agent_invocation_history" in durable_state:
             state["agent_invocation_history"] = deepcopy(durable_state["agent_invocation_history"])
         if "run_id" in durable_state:
-            _append_timeline_event(durable_state, previous)
+            _append_timeline_event(durable_state, None)
             state["timeline"] = durable_state["timeline"]
             if durable_state.get("timeline_at_capacity") is True:
                 state["timeline_at_capacity"] = True
@@ -430,8 +332,6 @@ class StateStore:
             if isinstance(continuation, list):
                 state["timeline_continuation"] = continuation
         self._repository.save(run_id, durable_state)
-        if expected is not None:
-            expected_by_run[run_id] = deepcopy(durable_state)
         return durable_state
 
     def _reject_legacy_run(self, run_id: str | None = None) -> None:

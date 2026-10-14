@@ -16,7 +16,7 @@ from typing import Any, cast
 
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.sqlite_encoding import copy_json_tree, copy_projection_fields, encode_json, object_path, scalar_value, snapshot_fields
-from agent_run.sqlite_mutations import patch_run, save_work
+from agent_run.sqlite_mutations import create_run_objects, save_work
 from agent_run import sqlite_timeline
 from agent_run.sqlite_work_objects import check_indexes, load_work, index_run, _object_rows, _decode
 from agent_run.sqlite_work_indexes import IndexFacts
@@ -863,7 +863,7 @@ class SQLiteStateRepository:
             save_work(self, run_id, state, baseline, timeline_updates=timeline_updates)
 
     def _objects(
-        self, state: Mapping[str, Any], *, previous: _RunView | None = None,
+        self, state: Mapping[str, Any],
     ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
         objects: dict[str, tuple[str, str]] = {}
         materials: dict[str, str] = {}
@@ -872,31 +872,6 @@ class SQLiteStateRepository:
             identity = hashlib.sha256(value.encode("utf-8")).hexdigest()
             materials.setdefault(identity, value)
             return identity
-
-        def reuse_material(identity: str) -> None:
-            assert previous is not None
-            if identity in materials:
-                return
-            text = previous.materials[identity]
-            materials[identity] = text
-            # Literal map subtrees contain no references. Tagged branches
-            # contain the exact transitive dependencies of this object.
-            if text.startswith("["):
-                def references(value: Any) -> None:
-                    if not isinstance(value, list):
-                        return
-                    kind, content = value
-                    if kind == "map":
-                        for item in content.values():
-                            references(item)
-                    elif kind == "list":
-                        for item in content:
-                            references(item)
-                    elif kind == "snapshot":
-                        reuse_material(content)
-                    elif kind == "material":
-                        materials[content] = previous.materials[content]
-                references(json.loads(text))
 
         def snapshot(value: Any) -> str:
             def encode(item: Any, key: str = "", parent_key: str = "") -> tuple[Any, bool]:
@@ -945,27 +920,6 @@ class SQLiteStateRepository:
                     else:
                         objects[_json((*path, key))] = ("snapshot", _json(snapshot(value[key])))
             elif isinstance(value, Mapping) and (fixed_snapshot or keyed_object):
-                old = previous.objects.get(location) if previous is not None else None
-                if previous is not None and old is not None and old[0] == "snapshot":
-                    # Python equality conflates bool/int/float values. Reuse
-                    # requires the exact JSON contents, including their types.
-                    prior_json = previous.snapshots.get(location)
-                    if prior_json is None:
-                        prior: Any = previous.state
-                        for position, part in enumerate(path):
-                            if position == 0 and previous.fields is not None and isinstance(part, str) and part in previous.fields:
-                                prior = json.loads(previous.fields[part])
-                            else:
-                                prior = prior[part]
-                        prior_json = _json(prior)
-                    if prior_json == _json(value):
-                        objects[location] = old
-                        references = previous.snapshot_refs.get(location)
-                        if references is None:
-                            reuse_material(json.loads(old[1]))
-                        else:
-                            materials.update((identity, previous.materials[identity]) for identity in references)
-                        return
                 objects[location] = ("snapshot", _json(snapshot(value)))
             elif isinstance(value, Mapping):
                 objects[location] = ("map", "null")
@@ -1007,70 +961,40 @@ class SQLiteStateRepository:
         raise ValueError("Missing or invalid SQLite Run snapshot material")
 
     def save(self, run_id: str, state: Mapping[str, Any]) -> None:
-        previous = cast(_RunView | None, getattr(self._local, "view", None))
-        if previous is not None and previous.run_id != run_id:
-            previous = None
-        if previous is None:
-            self._check_size(state)
-        objects, materials = self._objects(state, previous=previous)
-        representation_bytes = sum(len(path.encode()) + len(value.encode())
-                                   for path, (_, value) in objects.items())
-        representation_bytes += sum(len(value.encode()) for value in materials.values())
-        if representation_bytes > 8 * self.max_bytes:
-            raise ValueError(f"Run state exceeds {self.max_bytes} byte persistence limit")
-        parent = state.get("parent")
-        parent_number = parent.get("number") if isinstance(parent, Mapping) else None
-        if type(parent_number) is not int:
-            parent_number = None
-        metadata = tuple(
-            value if isinstance(value, str) else None
-            for value in (state.get("repository"), state.get("status"), state.get("phase"),
-                          state.get("created_at"), state.get("updated_at"))
-        )
+        """Create one new Run; existing Runs require explicit object commits."""
         with self.atomic():
-            # A following read must see this write, including normalization to
-            # JSON types. A failed write also cannot leave a reusable old view.
+            connection = self._local.connection
+            if connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None:
+                raise ValueError("SQLite Run already exists; use object commits to update it")
+            self._check_size(state)
+            objects, materials = self._objects(state)
+            representation_bytes = sum(len(path.encode()) + len(value.encode())
+                                       for path, (_, value) in objects.items())
+            representation_bytes += sum(len(value.encode()) for value in materials.values())
+            if representation_bytes > 8 * self.max_bytes:
+                raise ValueError(f"Run state exceeds {self.max_bytes} byte persistence limit")
+            parent = state.get("parent")
+            parent_number = parent.get("number") if isinstance(parent, Mapping) else None
+            if type(parent_number) is not int:
+                parent_number = None
+            metadata = tuple(
+                value if isinstance(value, str) else None
+                for value in (state.get("repository"), state.get("status"), state.get("phase"),
+                              state.get("created_at"), state.get("updated_at"))
+            )
             self._local.view = None
             self._local.work_source = None
-            connection = self._local.connection
-            from agent_run.sqlite_integrity import require_field_sizes
-            if connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None:
-                # Retain unchanged field proofs only after checking the old
-                # manifest and source headers, before changing either one.
-                require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
             connection.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(run_id) DO UPDATE SET repository=excluded.repository, "
-                "parent_number=excluded.parent_number, status=excluded.status, phase=excluded.phase, "
-                "created_at=excluded.created_at, updated_at=excluded.updated_at, root_keys_json=excluded.root_keys_json "
-                "WHERE (repository, parent_number, status, phase, created_at, updated_at, root_keys_json) "
-                "IS NOT (excluded.repository, excluded.parent_number, excluded.status, "
-                "excluded.phase, excluded.created_at, excluded.updated_at, excluded.root_keys_json)",
+                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, metadata[0], parent_number, *metadata[1:], _json(sorted(state))),
             )
-            prior_objects = previous.objects if previous is not None else {
-                path: (kind, value) for path, kind, value in connection.execute(
-                    "SELECT object_path, kind, value_json FROM run_objects WHERE run_id = ?", (run_id,)
-                )
-            }
             from agent_run.sqlite_objects import index_objects
-
-            history = previous.state.get("agent_invocation_history") if previous is not None else None
-            index_objects(connection, run_id, state, objects, materials, prior_objects,
-                          previous_history=history if isinstance(history, list) else None)
-            connection.execute("DELETE FROM run_object_material_refs WHERE run_id = ?", (run_id,))
-            self._aggregate_rows = patch_run(
-                connection, run_id, objects=objects, previous=prior_objects, materials=materials,
-                known_materials=previous.materials if previous is not None else {}, native=self._aggregate_rows,
+            index_objects(connection, run_id, state, objects, materials, {})
+            self._aggregate_rows = create_run_objects(
+                connection, run_id, objects=objects, materials=materials, native=self._aggregate_rows,
             )
             from agent_run.sqlite_integrity import sync_material_counts
             sync_material_counts(connection, run_id)
-            if previous is not None:
-                # The current transaction's proven old field sizes and newly
-                # generated changed-field proofs cover the complete logical
-                # value. Check after patching, with rollback on overflow,
-                # instead of encoding the entire unchanged history again.
-                require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
             index_run(self, connection, run_id, state, objects, materials)
             self._local.work_view = None
 

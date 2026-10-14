@@ -26,11 +26,11 @@ def test_ticket_pause_query_reopens_reads_latest_intent_and_ignores_unrelated_ma
     lane = TicketState(states, "run-1", 2)
     assert lane.ticket_pause_requested("run-1", 2) is False
     state["ticket_pause_requests"] = {"2": timestamp, "3": "sibling"}
-    repository.save("run-1", state)
+    repository.save_objects("run-1", state, fields={"ticket_pause_requests"})
     assert StateStore(tmp_path).ticket_pause_requested("run-1", 2) is True
     assert lane.ticket_pause_requested("run-1", 2) is True
     state["ticket_pause_requests"] = {"3": "sibling"}
-    repository.save("run-1", state)
+    repository.save_objects("run-1", state, fields={"ticket_pause_requests"})
     assert lane.ticket_pause_requested("run-1", 2) is False
     with repository.atomic():
         connection = repository._local.connection
@@ -125,7 +125,7 @@ def test_pause_native_sessions_read_other_process_commit(tmp_path: Path) -> None
         result = subprocess.run([
             sys.executable, "-c",
             "from pathlib import Path; import sys; from agent_run.sqlite_state import SQLiteStateRepository; "
-            "SQLiteStateRepository(Path(sys.argv[1]),max_bytes=65536).save('run-1',{'ticket_pause_requests':{'2':'child'}})",
+            "SQLiteStateRepository(Path(sys.argv[1]),max_bytes=65536).save_objects('run-1',{'ticket_pause_requests':{'2':'child'}},fields={'ticket_pause_requests'})",
             str(tmp_path),
         ], env=environment, capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stderr

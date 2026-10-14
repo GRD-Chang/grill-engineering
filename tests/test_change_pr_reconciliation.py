@@ -9,6 +9,7 @@ import pytest
 
 from agent_run.change_pr_reconciliation import reconcile_pending_pr_write
 from agent_run.github import GitHubReadError
+from agent_run.object_state import save_owned
 
 
 def boundary() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -162,7 +163,7 @@ def test_invalidated_change_write_survives_reload_until_original_result_is_known
     def block(current: dict[str, Any], current_job: dict[str, Any], code: str, message: str) -> None:
         current_job.update(phase="blocked", execution_resume_phase=current_job["phase"])
         current["diagnostics"] = [{"code": code, "message": message}]
-        states.save_run("test", current)
+        save_owned(states, "test", current, fields={'diagnostics', 'job'})
 
     stage = SimpleNamespace(
         github=SimpleNamespace(
@@ -173,7 +174,7 @@ def test_invalidated_change_write_survives_reload_until_original_result_is_known
             },
             read_run_pr_narrative=read,
         ),
-        save=lambda current: states.save_run("test", current), _block=block,
+        save=lambda current: save_owned(states, "test", current, fields={'diagnostics', 'job'}), _block=block,
     )
     loaded = StateStore(states.root).load_run("test")
     assert loaded is not None

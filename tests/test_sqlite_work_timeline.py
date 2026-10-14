@@ -93,7 +93,7 @@ def test_thin_timeline_requires_current_source_proof_and_absent_field(
             baseline = repository.load_work("run-1", 2, thin_timeline=True)
             repository.save_work("run-1", {**baseline, "timeline": []}, baseline)
     changed = {"timeline": [{"summary": "actual changed object"}]}
-    repository.save("run-1", changed)
+    repository.save_objects("run-1", changed, fields={"timeline"})
     assert repository.load_work("run-1", 2, thin_timeline=True) == {}
     assert json.loads(repository.work_timelines()["timeline"].encoded) == changed["timeline"]
     repository.save("run-2", changed)
@@ -290,7 +290,7 @@ def test_complete_view_scope_source_requires_current_header_shape(tmp_path: Path
             expected["timeline"][0]["summary"] = "current changed"
         # Preserve the reader's complete view while a real second writer
         # changes current source headers and current material identities.
-        SQLiteStateRepository(tmp_path, max_bytes=65536).save("run-1", expected)
+        SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"timeline"})
     else:
         with closing(sqlite3.connect(repository.path)) as connection:
             if change == "override":
@@ -352,7 +352,7 @@ def test_scope_source_metadata_is_bounded_and_complete_read_can_fall_back(tmp_pa
     bounded = replace(view, logical_bytes=512 * 1024)
     assert not bounded.timeline_sources
     original["large"] = "payload" * 80000
-    repository.save("run-1", original)
+    repository.save_objects("run-1", original, fields={"large"})
     assert repository.load("run-1") == original
     assert repository._read_view is None
     assert repository.load_work("run-1", 2, thin_timeline=True) == {"large": original["large"]}

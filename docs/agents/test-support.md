@@ -9,13 +9,13 @@
 | 用户/Git 环境隔离 | `environment` | 每例 HOME/XDG 独立；模板环境使用同一解释器，清除继承的 Git overrides |
 | 初始 Run、Fixture GitHub 数据、显式 idle ownership | `seeding` | 调用真实 Controller/StateStore，选项只覆盖现有前置需要；缺失 ownership 的负向测试不要调用 idle seed |
 | 真实 CLI、状态读取、内部阶段入口 | `cli` | `run_cli` 保留子进程及环境继承；`run_internal_stage` 仅用于测试准备，不是产品公开命令 |
-| Run 查询、持久逻辑快照与原始负向输入 | `state` | 通过真实 StateStore 读取；原有故障注入与精确 history fixture 用 SQLite repository 写入，普通合法准备仍用 StateStore，不模拟 JSON 文件布局 |
+| Run 查询、持久逻辑快照与原始负向输入 | `state` | 通过真实 StateStore 读取；原有故障注入与精确 history fixture 用 SQLite repository 写入，首次创建使用 StateStore；已有场景准备使用 persist_run_fixture，业务动作使用对象入口，不模拟 JSON 文件布局 |
 | 进程内 CLI | `inprocess_cli` | 展示或规则变体；调用结束恢复 cwd、环境和输出流；信号、重启、跨目录选择必须使用真实进程 |
 | CLI Agent payload 与完整流程 fixture | `cli_payloads`、`cli_fixtures` | 每次返回新可变数据；不能代替被测持久状态的独立断言 |
 | Delivery Agent/Publisher fake | `delivery_agents`、`delivery_publisher` | fake 只控制外部响应；Git、StateStore 和产品状态转换仍真实执行 |
 | Run Artifact、Agent 与发布 fake | `run_artifacts`、`run_agents`、`run_publication` | Artifact 数据不反向依赖场景 builder；故障注入保持在消费它的场景 |
 | 已完成 Ticket / accepted Integration / accepted Run | `run_scenarios` | 创建真实 commit/ref，Integration 的 parents/tree 与 Git 一致，持久化后供 Acceptance/Repair/Publication 消费 |
-| repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，保存 StateStore；Candidate 和 currentness 由被测 Engine 执行 |
+| repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，以显式 fixture 设置已有场景；Candidate 和 currentness 由被测 Engine 执行 |
 | CLI 所需 accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号 |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
 | 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision`、`parent_approval_update`、`run_approval_update` | 保留真实 Git 冲突、子进程、信号及归属清理 |

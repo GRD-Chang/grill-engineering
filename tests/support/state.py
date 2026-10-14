@@ -50,14 +50,60 @@ def snapshot_runs(root: Path) -> dict[str, bytes]:
 
 
 def write_run_fixture(reference: RunRef, state: dict[str, Any]) -> None:
-    """写入原始故障/历史 fixture，保留故意不满足当前合同的输入。
+    """在准备阶段设置原始故障/历史 fixture，保留故意非法的输入。
 
-    普通合法场景继续调用 StateStore.save_run。本入口替代原有直接写 JSON 的
-    故障注入和精确 timeline fixture；不执行 StateStore 的队列与历史归一化。
-    repository 负责真实 SQLite 事务与数据库版本，不在测试中复制 SQL schema。
+    这是测试专用的准确场景替换，不代表生产提交行为。删除和重建只作用于
+    本例指定的 Run，处于同一真实事务；生产的首次创建拒绝覆盖已有身份。
     """
     root, run_id = reference
-    SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES).save(run_id, state)
+    repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+    with repository.atomic():
+        connection = repository._local.connection
+        released = [row[0] for row in connection.execute(
+            "SELECT material_id FROM run_material_refs WHERE run_id=?", (run_id,),
+        )]
+        connection.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
+        repository.save(run_id, state)
+        # Replacing test preparation must not accumulate orphaned evidence.
+        # Shared materials still referenced by any other Run remain intact.
+        connection.executemany(
+            "DELETE FROM run_materials WHERE material_id=? AND NOT EXISTS "
+            "(SELECT 1 FROM run_material_refs WHERE material_id=run_materials.material_id)",
+            ((identity,) for identity in released),
+        )
+
+
+def persist_run_fixture(store: StateStore, run_id: str, state: dict[str, Any]) -> None:
+    """只用于 arrange：设置完整合法场景，业务动作须调用生产对象入口。
+
+    历史事件与队列归一化保持原 fixture 意义；读取及完整复制的成本只属于
+    测试准备，不得用本函数测量日常保存、授权、并发或故障回滚。
+    """
+    from copy import deepcopy
+    from agent_run.state import _append_timeline_event, _sanitize_durable_errors
+    from agent_run.state_retention import compact_invocation_details
+    from agent_run.ticket_state import capture_ticket_wait
+    from agent_run.ticket_work import reconcile
+
+    if not store.has_run(run_id):
+        store.save_run(run_id, state)
+        return
+    previous = store.load_run(run_id)
+    invocation, job = state.get("active_agent_invocation"), state.get("active_ticket_job")
+    if (isinstance(invocation, dict) and isinstance(job, dict)
+            and invocation.get("work_subject") == f"ticket:{job.get('ticket_number')}"):
+        state.setdefault("ticket_agent_invocations", {})[str(job["ticket_number"])] = deepcopy(invocation)
+    capture_ticket_wait(state)
+    if "ticket_work_queue" in state:
+        reconcile(state)
+    durable = _sanitize_durable_errors(state)
+    compact_invocation_details(durable)
+    if "run_id" in durable:
+        _append_timeline_event(durable, previous)
+    write_run_fixture((store.root, run_id), durable)
+    for field in ("agent_invocation_history", "timeline", "timeline_continuation", "timeline_at_capacity"):
+        if field in durable:
+            state[field] = deepcopy(durable[field])
 
 
 def include_in_state_snapshot(path: Path) -> bool:

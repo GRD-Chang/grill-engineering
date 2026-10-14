@@ -17,6 +17,7 @@ from agent_run.state import StateStore
 from support.seeding import write_fixture
 
 from support.state import run_refs, snapshot_run
+from support.state import persist_run_fixture
 
 
 def _issue(number: int) -> dict[str, Any]:
@@ -48,7 +49,7 @@ def test_initial_state_failure_happens_before_branch_creation(
     def fail_save(_run_id: str, _state: dict[str, Any]) -> None:
         raise OSError("simulated first-write interruption")
 
-    monkeypatch.setattr(store, "save_run", fail_save)
+    monkeypatch.setattr(store._repository, "save", fail_save)
 
     with pytest.raises(OSError, match="first-write interruption"):
         controller.start(1)
@@ -186,7 +187,7 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
         state["language"] = "fr"
     else:
         state["prompt_resources"].pop("methods/acceptance")
-    store.save_run(str(state["run_id"]), state)
+    persist_run_fixture(store, str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 
     with pytest.raises(IncompatibleRunStateError, match="legacy state|Prompt"):
@@ -207,7 +208,7 @@ def test_state_missing_active_invocation_fails_closed_before_controller_mutates_
     )
     state, _ = controller.start(1)
     state.pop("active_agent_invocation")
-    store.save_run(str(state["run_id"]), state)
+    persist_run_fixture(store, str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 
     with pytest.raises(IncompatibleRunStateError, match="active_agent_invocation"):

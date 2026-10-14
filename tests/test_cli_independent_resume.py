@@ -14,6 +14,7 @@ from support.seeding import write_fixture
 from support.workspace import managed_repo, managed_state
 
 from support.state import snapshot_run, write_run_fixture
+from support.state import persist_run_fixture
 
 
 # 只替换外部进程 Host。子解释器执行生产 Executor 和完整 CLI，既不 fork
@@ -92,7 +93,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
         before['parent_job'].update(phase='blocked', blocked_reason='unclassified_runtime_failure',
                                     execution_resume_phase='developing')
         from agent_run.state import StateStore
-        StateStore(managed_state(git_repo)).save_run(run_id, before)
+        persist_run_fixture(StateStore(managed_state(git_repo)), run_id, before)
     history_before = before['agent_invocation_history']
     assert len(history_before) == 1
     control_file, = (managed_state(git_repo) / 'task-control').glob('*.json')

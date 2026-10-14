@@ -26,6 +26,7 @@ from support.lifecycle import _file_snapshot, _isolated_environment
 from support.resume import _fail_parent_run
 
 from support.state import snapshot_runs
+from support.state import persist_run_fixture
 
 
 _OBSERVE = """
@@ -142,7 +143,7 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
     state["agent_invocation_history"][-1] = copy.deepcopy(invocation)
     record = control.load(task)
     prepare_action_application_receipt(state, record["action"])
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     control.record_application(
         task, action_id=spec.action_id, run_id=spec.run_id, generation=spec.generation,
         payload_digest=record["action"]["payload_digest"],

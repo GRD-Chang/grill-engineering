@@ -40,6 +40,7 @@ from support.cli import (
 )
 
 from support.state import only_run_ref, write_run_fixture
+from support.state import persist_run_fixture
 
 
 def assert_invalid_policy_cli_result(result: subprocess.CompletedProcess[str]) -> None:
@@ -3223,7 +3224,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     canonical_stale = load_only_run_state(git_repo)
     wrong_subject = json.loads(json.dumps(canonical_stale))
     wrong_subject["requeue_required"]["work_subject"] = "parent-only:wrong-run"
-    StateStore(managed_state(git_repo)).save_run(run_id, wrong_subject)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, wrong_subject)
 
     incompatible = run_cli(git_repo, fixture, "requeue", run_id)
 
@@ -3232,13 +3233,13 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     wrong_generation_kind = json.loads(json.dumps(canonical_stale))
     wrong_generation_kind["parent_job"]["ticket_branch_generation"] = 999
     wrong_generation_kind["requeue_required"]["generation"] = 999
-    StateStore(managed_state(git_repo)).save_run(run_id, wrong_generation_kind)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, wrong_generation_kind)
 
     incompatible = run_cli(git_repo, fixture, "requeue", run_id)
 
     assert incompatible.returncode == 2
     assert stdout_json(incompatible)["status"] == "incompatible_run_state"
-    StateStore(managed_state(git_repo)).save_run(run_id, canonical_stale)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, canonical_stale)
 
     replacement_agents = git_repo / "parent-replacement.json"
     replacement_agents.write_text(
@@ -4214,9 +4215,7 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
     resumed_publication["status"] = "waiting_external"
     resumed_publication["terminal_kind"] = "waiting_external"
     resumed_publication["run_publication"]["phase"] = "waiting_external"
-    StateStore(managed_state(git_repo)).save_run(
-        str(before_state["run_id"]), resumed_publication
-    )
+    persist_run_fixture(StateStore(managed_state(git_repo)), str(before_state["run_id"]), resumed_publication)
 
     failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -4256,9 +4255,7 @@ def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) 
     resumed_publication["status"] = "waiting_external"
     resumed_publication["terminal_kind"] = "waiting_external"
     resumed_publication["run_publication"]["phase"] = "waiting_external"
-    StateStore(managed_state(git_repo)).save_run(
-        str(before_state["run_id"]), resumed_publication
-    )
+    persist_run_fixture(StateStore(managed_state(git_repo)), str(before_state["run_id"]), resumed_publication)
 
     failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 

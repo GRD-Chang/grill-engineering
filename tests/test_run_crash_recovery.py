@@ -14,6 +14,7 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import passing_acceptance
 from support.cli_crash import run_cli_at_resume_boundary
+from support.state import persist_run_fixture
 
 
 def _ticket(
@@ -341,7 +342,7 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     for invocation in after_first["agent_invocation_history"]:
         if invocation.get("started_at") == started_at:
             invocation["status"] = "resuming"
-    StateStore(managed_state(git_repo)).save_run(run_id, after_first)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, after_first)
 
     interrupted_again = run_cli_at_resume_boundary(
         git_repo,

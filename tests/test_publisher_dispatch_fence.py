@@ -16,6 +16,7 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_driver import _FencedExternal, _fenced_publisher
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
 
 from support.state import snapshot_run
 
@@ -111,7 +112,7 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
     if revocation != "none":
         assert remote["state"] == "OPEN"
         with pytest.raises(ActionReconciliationError):
-            states.save_run("run-156", {**state, "status": "completed"})
+            save_owned(states, "run-156", {**state, "status": "completed"}, fields={'status'})
         assert snapshot_run((states.root, 'run-156')) == before
 
 

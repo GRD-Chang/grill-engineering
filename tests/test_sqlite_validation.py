@@ -9,6 +9,7 @@ import pytest
 from agent_run import state_contract
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state import StateStore
+from agent_run.object_state import save_owned
 from support.ticket_parallel import ticket_run
 
 
@@ -23,7 +24,7 @@ def test_caller_mutations_do_not_become_validated_durable_facts(git_repo: Path) 
         assert states.load_current_run(run_id)["parent"]["body"] == state["parent"]["body"]
         changed = states.load_current_run(run_id)
         changed["policy_snapshot"] = None
-        states._repository.save(run_id, changed)
+        states._repository.save_objects(run_id, changed, fields={"policy_snapshot"})
         with pytest.raises(ValueError):
             states.load_current_run(run_id)
         with pytest.raises(ValueError):
@@ -75,13 +76,13 @@ def test_rollbacks_and_other_store_changes_are_not_labelled_validated(git_repo: 
         with states._repository.atomic():
             current = states.load_current_run(run_id)
             current["status"] = "operator_stopped"
-            states._repository.save(run_id, current)
+            states._repository.save_objects(run_id, current, fields={"status"})
             assert states.load_current_run(run_id)["status"] == "operator_stopped"
             raise OSError("rollback")
     assert states.load_current_run(run_id)["status"] == state["status"]
     changed = deepcopy(state)
     changed["policy_snapshot"] = None
-    SQLiteStateRepository(states.root, max_bytes=4 * 1024 * 1024).save(run_id, changed)
+    SQLiteStateRepository(states.root, max_bytes=4 * 1024 * 1024).save_objects(run_id, changed, fields={"policy_snapshot"})
     with pytest.raises(ValueError):
         states.load_current_run(run_id)
     with pytest.raises(ValueError):
@@ -93,12 +94,12 @@ def test_large_projection_changes_and_caller_mutations_remain_independent(git_re
     run_id = state["run_id"]
     assert states.load_current_run(run_id) is not None
     state["extension"] = {"body": "large exact evidence " * 30000}
-    states.save_run(run_id, state)
+    save_owned(states, run_id, state, fields={"extension"})
     first = states.load_current_run(run_id)
     first["policy_snapshot"] = None
     assert states.load_current_run(run_id)["policy_snapshot"] == state["policy_snapshot"]
     damaged = states.load_current_run(run_id)
     damaged["policy_snapshot"] = None
-    states._repository.save(run_id, damaged)
+    states._repository.save_objects(run_id, damaged, fields={"policy_snapshot"})
     with pytest.raises(ValueError):
         states.load_current_run(run_id)

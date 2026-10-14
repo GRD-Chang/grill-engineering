@@ -34,6 +34,7 @@ from agent_run.task_control import (
 )
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -279,7 +280,7 @@ def test_running_control_attaches_with_oversize_observer_environment(
     current = states.load_run(run_id)
     assert current is not None
     prepare_action_application_receipt(current, first.action)
-    states.save_run(run_id, current)
+    persist_run_fixture(states, run_id, current)
     control.record_application(
         task,
         action_id=first.action_id,

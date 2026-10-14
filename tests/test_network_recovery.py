@@ -20,6 +20,7 @@ from agent_run.run_driver import DirectRunOperations, RunDriver
 from support.seeding import write_fixture
 from support.delivery_agents import PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("failure_point", ["revision", "verify", "publish"])
@@ -77,7 +78,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
         now=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds)
     )
     while supervisor.before_retry(waiting):
-        states.save_run(run_id, waiting)
+        persist_run_fixture(states, run_id, waiting)
         waiting = engine.deliver(run_id)
         retried_job = deepcopy(waiting["active_ticket_job"])
         retried_wait = retried_job.pop("external_wait")
@@ -96,7 +97,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
 
     github.offline = False
     restore_supervision_wait(waiting)
-    states.save_run(run_id, waiting)
+    persist_run_fixture(states, run_id, waiting)
     completed = engine.deliver(run_id)
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["publication_sha"] == job["publication_sha"]

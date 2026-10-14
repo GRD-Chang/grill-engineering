@@ -33,6 +33,7 @@ from support.seeding import seed_run, write_fixture
 from support.lifecycle import _file_snapshot, _isolated_environment
 
 from support.state import snapshot_runs
+from support.state import persist_run_fixture
 
 
 @pytest.fixture
@@ -101,7 +102,7 @@ def completed_action(
     record = control.load(task)
     assert record is not None
     prepare_action_application_receipt(state, record["action"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control.record_application(
         task, action_id=spec.action_id, run_id=run_id, generation=spec.generation,
         payload_digest=record["action"]["payload_digest"],
@@ -187,7 +188,7 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     final = states.load_current_run(spec.run_id)
     final["status"] = final_status
     final["terminal_kind"] = "completed" if final_status == "completed" else "waiting_human"
-    states.save_run(spec.run_id, final)
+    persist_run_fixture(states, spec.run_id, final)
     state_before = snapshot_runs(states.root)
     action_before = control.load(spec.task)["action"]
     transport.unit = replace(transport.unit, status="exited", pid=None)

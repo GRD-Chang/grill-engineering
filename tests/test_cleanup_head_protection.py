@@ -12,6 +12,7 @@ from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.git import GitRepository
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
+from support.state import persist_run_fixture
 
 
 def _git(root: Path, *args: str) -> str:
@@ -28,7 +29,7 @@ def _completed_ticket(git_repo: Path) -> tuple[GitRepository, StateStore, dict[s
     git.ensure_run_branch(branch, publication)
     job = {'ticket_number': 2, 'ticket_branch': branch, 'phase': 'completed', 'publication_sha': publication, 'integrated_sha': integrated}
     state = {'run_id': 'run-cleanup', 'status': 'completed', 'ticket_jobs': {'2': job}}
-    states.save_run(str(state['run_id']), state)
+    persist_run_fixture(states, str(state['run_id']), state)
     return git, states, state, job
 
 

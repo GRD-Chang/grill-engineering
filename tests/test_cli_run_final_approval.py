@@ -20,6 +20,7 @@ from support.cli_supervision import (
     _interrupt_at_pending_retry,
     _parent_only_agents,
 )
+from support.state import persist_run_fixture
 
 
 def test_approval_failure_history_only_includes_exact_final_operations() -> None:
@@ -597,7 +598,7 @@ def test_resume_finished_delivery_only_retries_unfinished_cleanup(git_repo: Path
     cleanup["status"] = "cleanup_pending"
     for item in cleanup["items"].values():
         item["status"] = "cleanup_pending"
-    StateStore(managed_state(git_repo)).save_run(run_id, state)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, state)
 
     resumed = run_cli(git_repo, fixture, "resume", "1")
     assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"

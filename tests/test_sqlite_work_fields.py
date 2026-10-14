@@ -74,7 +74,7 @@ def test_complete_field_reuse_observes_current_changed_nodes(
         expected["creation_configuration"]["policy"]["attempts"] = {"nested": 4}
     else:
         expected["creation_configuration"]["evidence"] = "changed body" * 200
-    SQLiteStateRepository(tmp_path, max_bytes=65536).save("run-1", expected)
+    SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"creation_configuration"})
     assert repository.load_work("run-1", 2) == expected
     assert "creation_configuration" not in contexts[-1].fields
     assert "graph" in contexts[-1].fields

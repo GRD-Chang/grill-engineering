@@ -27,6 +27,7 @@ from support.cli_payloads import final_run_agents, passing_acceptance, publicati
 from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
+from support.state import persist_run_fixture
 
 
 def _bind_current_process(repo: Path, run_id: str) -> None:
@@ -54,7 +55,7 @@ def _bind_current_process(repo: Path, run_id: str) -> None:
     record = control.load(task)
     assert state is not None and record is not None
     prepare_action_application_receipt(state, record["action"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control.complete_action(task, **binding, result_status=str(state["status"]))
 
 

@@ -69,7 +69,7 @@ def test_work_session_rechecks_external_commits_between_transactions(tmp_path: P
         assert repository.load("run-1") == {"value": 1}
         with repository.atomic():
             assert repository.load_work("run-1", 2) == {"value": 1}
-        _repository(tmp_path).save("run-1", {"value": 2})
+        _repository(tmp_path).save_objects("run-1", {"value": 2}, fields={"value"})
         assert repository.load("run-1") == {"value": 2}
         with repository.atomic():
             baseline = repository.load_work("run-1", 2)

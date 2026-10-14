@@ -84,12 +84,6 @@ class TicketState:
         self._loaded = False
         self._last_holder: int | None = None
 
-    def _load_owned_run(self, run_id: str) -> dict[str, Any] | None:
-        loader = getattr(self.states, "load_current_run_for_ticket", None)
-        if callable(loader):
-            return cast(dict[str, Any] | None, loader(run_id, self.ticket_number))
-        return self.states.load_current_run(run_id)
-
     @contextmanager
     def work_session(self) -> Iterator[None]:
         with self.states._repository.work_session():
@@ -438,9 +432,10 @@ class TicketState:
     def block_shared_failure(self, error: Exception) -> None:
         """Fence the Run before other lanes can commit after proven auth loss."""
         from agent_run.operator_gate import run_failure_diagnostic
+        from agent_run.object_state import save_owned
 
         def commit() -> None:
-            latest = self._load_owned_run(self.run_id)
+            latest = self.states._repository.load_fields(self.run_id, {"run_id", "status", "terminal_kind"})
             if latest is None:
                 raise ValueError("Delivery Run disappeared during credential failure")
             if latest.get("status") in RUN_STOP_STATUSES or latest.get("terminal_kind") == "permanent_blocked":
@@ -451,7 +446,7 @@ class TicketState:
                     latest, code="runner_credential_failed", message=str(error),
                 )],
             })
-            self.states._save_run_and_notify_unlocked(self.run_id, latest)
+            save_owned(self.states, self.run_id, latest, fields={"status", "terminal_kind", "diagnostics"})
 
         self.states._commit_run(commit)
 

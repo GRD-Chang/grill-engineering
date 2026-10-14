@@ -59,8 +59,10 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
+from agent_run.object_state import save_owned
 
 from support.state import snapshot_run, snapshot_runs
+from support.state import persist_run_fixture
 
 
 def test_control_action_atomically_fences_the_previous_executor(tmp_path: Path) -> None:
@@ -168,7 +170,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
         current.update(
             {"status": "operator_stopped", "terminal_kind": "operator_stopped"}
         )
-        states.save_run(run_id, current)
+        persist_run_fixture(states, run_id, current)
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control = TaskControlStore(managed_state(git_repo))
     pending = control.claim_action(
@@ -759,7 +761,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
                 terminal = states.load_run(run_id)
                 assert terminal is not None
                 terminal.update({"status": "completed", "terminal_kind": "completed"})
-                states.save_run(run_id, terminal)
+                persist_run_fixture(states, run_id, terminal)
 
         assert rejected_targets == [expected_target, expected_target]
         if failure_mode == "confirmation":
@@ -1090,7 +1092,7 @@ def test_abandon_executor_survives_observer_exit_with_canonical_receipt(
             result = states.load_current_run(bound_run_id)
             assert result is not None
             result.update({"status": "abandoned", "terminal_kind": "abandoned"})
-            states.save_run(bound_run_id, result)
+            save_owned(states, bound_run_id, result, fields={"status", "terminal_kind"})
             return result
 
         lifecycle = RunLifecycle(
@@ -1615,7 +1617,7 @@ def test_stop_fences_executor_across_external_and_api_barriers(
             assert stopped is not None
             record_operator_stop(
                 stopped,
-                save=lambda value: states.save_run(bound_run_id, value),
+                save=lambda value: save_owned(states, bound_run_id, value, fields={"status", "terminal_kind", "diagnostics", "operator_stop", "github_refresh_resume_status", "active_agent_invocation", "ticket_agent_invocations", "agent_invocation_history", "ticket_work_queue"}),
             )
             return stopped
 
@@ -1700,7 +1702,7 @@ def test_public_stop_rejects_unknown_ownership_without_mutating_run(
     assert snapshot_run(state_ref) == before
 
     run.update({"status": "completed", "terminal_kind": "completed"})
-    states.save_run(run_id, run)
+    persist_run_fixture(states, run_id, run)
     terminal_before = snapshot_run(state_ref)
 
     terminal = _run_cli(git_repo, fixture, "stop", run_id)
@@ -1956,7 +1958,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
         terminal = states.load_current_run(run_id)
         assert terminal is not None
         terminal.update({"status": "completed", "terminal_kind": "completed"})
-        states.save_run(run_id, terminal)
+        persist_run_fixture(states, run_id, terminal)
         control.mark_executor_absent(
             task,
             action_id=str(executor["action_id"]),
@@ -2065,7 +2067,7 @@ def test_public_stop_reloads_state_after_executor_exit(
             terminal = states.load_current_run(run_id)
             assert terminal is not None
             terminal.update({"status": "completed", "terminal_kind": "completed"})
-            states.save_run(run_id, terminal)
+            persist_run_fixture(states, run_id, terminal)
         if observation_status == "running":
             control.mark_executor_absent(
                 task,
@@ -2215,7 +2217,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     current.update({"status": "completed", "terminal_kind": "completed"})
-    states.save_run(run_id, current)
+    persist_run_fixture(states, run_id, current)
     control, task, worker = _bind_running_executor(git_repo, run_id)
     record = control.load(task)
     assert record is not None
@@ -2351,7 +2353,7 @@ def test_production_read_only_stop_skips_execution_dependencies(
         terminal = states.load_run(run_id)
         assert terminal is not None
         terminal.update({"status": "completed", "terminal_kind": "completed"})
-        states.save_run(run_id, terminal)
+        persist_run_fixture(states, run_id, terminal)
 
     profile_path = managed_state(git_repo) / "profiles" / f"{run_id}.json"
     if unavailable_dependency == "profile":
@@ -2499,7 +2501,7 @@ def test_terminal_abandon_replay_completes_its_applying_control_action(
         state_dir=states.root,
     )
     run.update({"status": "abandoned", "terminal_kind": "abandoned"})
-    states.save_run(run_id, run)
+    persist_run_fixture(states, run_id, run)
     before_state = snapshot_run((states.root, str(run_id)))
 
     replayed = _run_cli(git_repo, fixture, "abandon", run_id)
@@ -2598,7 +2600,7 @@ def test_control_action_reconciles_durable_outcome_after_executor_exit(
     assert current is not None
     prepare_action_application_receipt(current, claim.action)
     current.update({"status": durable_status, "terminal_kind": durable_status})
-    states.save_run(run_id, current)
+    persist_run_fixture(states, run_id, current)
     control.record_application(
         task,
         action_id=claim.action_id,

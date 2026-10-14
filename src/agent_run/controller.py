@@ -5,7 +5,7 @@ import secrets
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol, cast
 
 from agent_run.resume_work import continuation_phase
 from agent_run.artifacts import AcceptanceArtifact
@@ -87,7 +87,7 @@ from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
-from agent_run.object_state import object_store
+from agent_run.object_state import ObjectStateStore, object_store
 from agent_run.state import ConcurrentRunStateError, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -299,7 +299,7 @@ class Controller:
         for attempt in range(attempts):
             baseline = self._load_run(run_id)
             try:
-                with self.states.require_unchanged_run(run_id, baseline):
+                with cast(ObjectStateStore, self.states).require_unchanged_run(run_id, baseline):
                     result = self._resume_once(
                         run_id,
                         resume_human_blocker=resume_human_blocker,
@@ -314,7 +314,7 @@ class Controller:
                         validate_resume_state=validate_resume_state,
                         ticket_number=ticket_number,
                     )
-                    latest = self.states.load_unchanged_run(run_id)
+                    latest = cast(ObjectStateStore, self.states).load_unchanged_run(run_id)
                     if latest is not None and any(
                         result[0].get(key) != latest.get(key)
                         for key in (
@@ -898,7 +898,7 @@ class Controller:
                     "updated_at": _now(),
                 }
             )
-            self.states._save_run_and_notify_unlocked(run_id, state)
+            cast(ObjectStateStore, self.states)._save_objects_and_notify_unlocked(run_id, state)
             return True
 
         return self.states._commit_run(record)
@@ -949,7 +949,7 @@ class Controller:
                     "updated_at": _now(),
                 }
             )
-            self.states._save_run_and_notify_unlocked(run_id, state)
+            cast(ObjectStateStore, self.states)._save_objects_and_notify_unlocked(run_id, state)
             return True
 
         return self.states._commit_run(record)

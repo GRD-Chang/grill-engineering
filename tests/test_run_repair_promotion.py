@@ -36,6 +36,7 @@ from support.cli import stdout_json
 
 from support.run_agents import ScriptedRunAgents
 from support.run_publication import RunPublicationAgents
+from support.state import persist_run_fixture
 
 
 def _malformed_candidate_history() -> list[dict[str, object]]:
@@ -52,7 +53,7 @@ def test_candidate_history_state_load_rejects_nested_acceptance_record_before_mu
         "review_budget_history": [],
         "candidate_acceptance_history": _malformed_candidate_history(),
     }
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError):
         states.load_current_run(str(state["run_id"]))
@@ -271,7 +272,7 @@ def test_parent_integration_resume_requires_review_when_record_is_missing(git_re
     job.update(phase="blocked", blocked_reason="integration_failed")
     run["phase"] = "ready_for_human"
     paused.update(status="ready_for_human", terminal_kind="waiting_human")
-    states.save_run(state["run_id"], paused)
+    persist_run_fixture(states, state["run_id"], paused)
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         state["run_id"], explicit_resume=True,
     )
@@ -498,7 +499,7 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
     state, states, git = _completed_run(repo, state_root=workspace.state_root)
     state.setdefault("policy_snapshot", {})["development_thread_policy"] = thread_policy
     state["policy_snapshot"]["integration_resync_limit"] = resync_limit
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     successor_thread = (
         "run-repair-successor" if thread_policy == "new-per-attempt"
         else "run-repair-developer"
@@ -1001,7 +1002,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                     ]
                     gated["status"] = "ready_for_human"
                     gated["terminal_kind"] = "ready_for_human"
-                states.save_run(str(state["run_id"]), gated)
+                persist_run_fixture(states, str(state["run_id"]), gated)
 
                 gated_json_result = invoke_cli_inprocess(
                     repo,
@@ -1031,7 +1032,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                 assert "当前对象:   整体交付" in gated_text.stdout
                 assert "运行修复开发工作代理" not in gated_text.stdout
 
-            states.save_run(str(state["run_id"]), active_repair)
+            persist_run_fixture(states, str(state["run_id"]), active_repair)
             return super().develop(request)
 
     repair_agents = StatusAssertingRepairAgents()

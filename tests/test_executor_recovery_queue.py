@@ -11,6 +11,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.resume_intent import bind_resume_intent
 from agent_run.ticket_pause import TicketStopRequested, request_ticket_pause
 from agent_run.ticket_work import TicketWorkAdmission
+from agent_run.object_state import save_owned
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -42,7 +43,7 @@ def test_executor_recovery_preserves_fifo_and_local_pause(
     paused_job = deepcopy(before["ticket_jobs"].get("2"))
     paused_invocation = deepcopy(before["ticket_agent_invocations"].get("2"))
     record = record_session_interruption if boundary == "interruption" else record_operator_stop
-    record(before, save=lambda value: states.save_run(run_id, value))
+    record(before, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     interrupted = states.load_current_run(run_id)
     assert interrupted is not None
     assert [item["ticket_number"] for item in interrupted["ticket_work_queue"]] == [4, 3]
@@ -115,7 +116,7 @@ def test_global_resume_binds_ticket_authority_not_active_projection(
     assert paused["active_agent_invocation"]["work_subject"] == "ticket:2"
     assert paused["ticket_integration_queue"][0]["ticket_number"] == 3
     record = record_session_interruption if boundary == "interruption" else record_operator_stop
-    record(paused, save=lambda value: states.save_run(run_id, value))
+    record(paused, save=lambda value: save_owned(states, run_id, value, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     paused = states.load_current_run(run_id)
     assert paused is not None
     intent = bind_resume_intent(paused)
@@ -200,7 +201,7 @@ def test_global_resume_can_select_ticket_before_its_first_invocation(
     paused = states.load_current_run(run_id)
     assert paused is not None
     assert "3" not in paused["ticket_jobs"]
-    record_session_interruption(paused, save=lambda current: states.save_run(run_id, current))
+    record_session_interruption(paused, save=lambda current: save_owned(states, run_id, current, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     intent = bind_resume_intent(paused)
     for remove in (False, True):
         changed = deepcopy(paused)

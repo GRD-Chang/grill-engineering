@@ -11,6 +11,7 @@ from agent_run.ci_recovery_budget import (
 )
 from agent_run.state import StateStore
 from support.run_artifacts import _canonical_run_budget, _repair_artifact
+from support.state import persist_run_fixture
 
 
 def prepare_run_repair(
@@ -48,5 +49,5 @@ def prepare_run_repair(
         "terminal_kind": "run_repair_pending",
         "diagnostics": [],
     })
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     states.load_current_run(str(state["run_id"]))

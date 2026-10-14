@@ -27,8 +27,10 @@ from agent_run.task_control import (
     TaskControlBusyError,
     TaskControlStore,
 )
+from agent_run.object_state import save_owned
 
 from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("revocation", ["none", "stop", "generation"])
@@ -48,7 +50,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
     # Only a terminal Run now takes the read-only Stop preflight. Keep the
     # real ownership-lock contention and subsequent fence revocation unchanged.
     state.update(status="completed", terminal_kind="completed")
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control, task, worker = _bind_running_executor(git_repo, run_id)
     try:
         record = control.load(task)
@@ -183,11 +185,11 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         assert dispatched == (["commit"] if revocation == "none" else [])
         if revocation == "none":
             assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) != head
-            states.save_run(run_id, {**state, "status": "completed"})
+            save_owned(states, run_id, {**state, "status": "completed"}, fields={'status'})
         else:
             assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) == head
             with pytest.raises(ActionReconciliationError):
-                states.save_run(run_id, {**state, "status": "completed"})
+                save_owned(states, run_id, {**state, "status": "completed"}, fields={'status'})
             assert snapshot_run((states.root, str(run_id))) == before_state
     finally:
         if worker.poll() is None:

@@ -22,6 +22,7 @@ from support.run_artifacts import _passing_artifact
 from support.run_agents import ScriptedRunAgents
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run, _completed_run
+from support.state import persist_run_fixture
 
 
 def _git(directory: Path, *arguments: str) -> str:
@@ -100,7 +101,7 @@ def test_own_final_ref_readback_does_not_open_new_run_integration(
     record = dict(run["run_integration"])
     assert failed["run_publication"]["published_head_sha"] == record["head_sha"]
     run["phase"] = "pending"
-    states.save_run(str(state["run_id"]), failed)
+    persist_run_fixture(states, str(state["run_id"]), failed)
     owner = RunAcceptanceEngine(
         git=git, states=states, agents=ScriptedRunAgents(), github=publisher,
     )
@@ -240,7 +241,7 @@ def test_run_resync_resume_renews_only_exhausted_allowance(git_repo: Path) -> No
     run["blocked_reason"] = "integration_resync_exhausted"
     accepted["status"] = "ready_for_human"
     accepted["terminal_kind"] = "waiting_human"
-    states.save_run(str(state["run_id"]), accepted)
+    persist_run_fixture(states, str(state["run_id"]), accepted)
     review_before = dict(run["review_budget"])
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
@@ -278,7 +279,7 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
         "blocked_reason": "integration_resync_exhausted",
     })
     accepted.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
-    states.save_run(str(state["run_id"]), accepted)
+    persist_run_fixture(states, str(state["run_id"]), accepted)
 
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"]), explicit_resume=True,
@@ -348,7 +349,7 @@ def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> No
     }
     accepted["run_publication"] = {"phase": "stale", "pr_number": final_pr}
     accepted.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
-    states.save_run(str(state["run_id"]), accepted)
+    persist_run_fixture(states, str(state["run_id"]), accepted)
     review_before = dict(run["review_budget"])
     resync_before = dict(run["integration_resync"])
 

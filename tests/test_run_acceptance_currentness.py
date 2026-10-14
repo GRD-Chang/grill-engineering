@@ -27,6 +27,7 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
 from support.run_agents import FreshCycleRunAgents, ScriptedRunAgents
+from support.state import persist_run_fixture
 
 
 def test_prior_rejection_is_history_not_new_candidate_authority() -> None:
@@ -906,7 +907,7 @@ def test_run_integration_conflict_attempt_survives_interruption_and_reload(
     attempt_id = attempt["attempt_id"]
     ordinal = persisted["run_acceptance"]["integration_conflict_agent_ordinal"]
     record_session_interruption(
-        persisted, save=lambda current: states.save_run(str(state["run_id"]), current),
+        persisted, save=lambda current: persist_run_fixture(states, str(state["run_id"]), current),
     )
     resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"]), explicit_resume=True, new_thread=new_thread,
@@ -1133,10 +1134,10 @@ def test_returned_run_review_survives_currentness_read_failure(
     attempt_id = run["pending_semantic_attempt"]["attempt_id"]
     if drift:
         saved["parent"]["revision"] = "changed-parent-revision"
-        states.save_run(state["run_id"], saved)
+        persist_run_fixture(states, state["run_id"], saved)
     else:
         saved.update(status="execution_failed", terminal_kind="execution_failed")
-        states.save_run(state["run_id"], saved)
+        persist_run_fixture(states, state["run_id"], saved)
         resumed_state, _ = Controller(
             FixtureGitHubReader(git_repo / "github.json"), git, states,
         ).resume(state["run_id"], explicit_resume=True, new_thread=new_thread)

@@ -31,6 +31,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.operator_action_presentation import print_operator_action
 from agent_run.presentation_helpers import human_next_action
 from agent_run.requeue import RequeueError
+from agent_run.object_state import save_owned
 from agent_run.state import StateStore
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
@@ -3081,7 +3082,8 @@ def test_timeline_projects_semantic_invocation_output_and_retry_counters(
 
     store.save_run("run-1", state)
     state["active_agent_invocation"]["attempt_count"] = 2
-    store.save_run("run-1", state)
+    state.setdefault("ticket_agent_invocations", {})["3"] = deepcopy(state["active_agent_invocation"])
+    save_owned(store, "run-1", state, fields={"active_agent_invocation", "ticket_agent_invocations"})
 
     timeline = store.load_run("run-1")["timeline"]
     assert [event["output_attempt"] for event in timeline] == [1, 2]

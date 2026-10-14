@@ -17,6 +17,7 @@ from agent_run.task_control import TaskControlBusyError
 from agent_run.ticket_state import TicketState
 from support.cli_payloads import human_blocker_step
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(('workers', 'role'), [(1, 'development'), (3, 'development'), (1, 'review')])
@@ -214,7 +215,7 @@ def test_ticket_state_rejects_late_result_even_after_control_read(git_repo: Path
     latest['ticket_jobs']['2']['source_revision_changed'] = True
     latest['ticket_jobs']['2']['base_sha'] = 'replaced-job'
     latest['active_ticket_job'] = latest['ticket_jobs']['2']
-    states.save_run(run_id, latest)
+    persist_run_fixture(states, run_id, latest)
     # A pause/ownership read during a running call must not rebase its CAS token.
     lane.load_current_run(run_id)
     with pytest.raises(TaskControlBusyError):

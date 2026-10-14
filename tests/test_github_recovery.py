@@ -16,6 +16,7 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 from agent_run.models import Repository
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
+from agent_run.object_state import save_owned
 
 from support.state import run_refs
 
@@ -279,7 +280,10 @@ def test_timeline_stops_appending_at_the_bounded_capacity(git_repo: Path) -> Non
 
     for number in range(MAX_TIMELINE_EVENTS + 10):
         state["status"] = f"state-{number}"
-        states.save_run("bounded", state)
+        if number == 0:
+            states.save_run("bounded", state)
+        else:
+            save_owned(states, "bounded", state, fields={"status"})
 
     stored = states.load_run("bounded")
     assert stored is not None

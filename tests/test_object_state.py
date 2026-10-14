@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_run.object_state import save_owned
 from agent_run.sqlite_state import SQLiteStateRepository
+from support.state import persist_run_fixture
 
 
 def _invocation(position: int, **extra: object) -> dict[str, object]:
@@ -109,7 +111,7 @@ def test_owned_commit_checks_action_receipt_and_notifies_after_durability(tmp_pa
     original = store.load_run("run-1")
     assert original is not None
     stopped = {**original, "action_application_receipt": {"action_id": "stop-action"}}
-    store.save_run("run-1", stopped)
+    save_owned(store, "run-1", stopped, fields={'action_application_receipt'})
     requested = {**original, "supervision_window": {"retry_count": 1}}
     with pytest.raises(ConcurrentRunStateError, match="action_application_receipt"):
         save_owned(store, "run-1", requested, fields={"supervision_window"}, expected=original)
@@ -356,7 +358,7 @@ def test_object_commit_distinguishes_missing_fields_from_explicit_null(git_repo:
     run_id = state["run_id"]
     RunAcceptanceEngine(git=git, states=states, agents=ScriptedRunAgents())._run_state(state)
     state["scope_change"] = None
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     adapter = object_store(states)
     staged = adapter.load_current_run(run_id)
     assert staged is not None
@@ -397,7 +399,7 @@ def test_null_field_change_preserves_concurrent_owner_fact(
     owner.pop(field, None)
     if initially_present:
         owner[field] = None
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     adapter = object_store(states)
     staged = adapter.load_current_run(run_id)
     assert staged is not None
@@ -410,7 +412,7 @@ def test_null_field_change_preserves_concurrent_owner_fact(
     assert concurrent is not None
     owner = concurrent["run_acceptance"] if nested else concurrent
     owner[field] = "concurrent-thread" if nested else {"reason": "concurrent"}
-    states.save_run(run_id, concurrent)
+    save_owned(states, run_id, concurrent, fields={'run_acceptance', 'scope_change'})
     with pytest.raises(ConcurrentRunStateError, match="changed before commit"):
         adapter.save_run(run_id, staged)
     assert StateStore(states.root).load_current_run(run_id) == concurrent

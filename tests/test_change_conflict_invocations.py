@@ -11,6 +11,7 @@ from agent_run.agents import DevelopmentResult
 from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from support.conflict_invocations import prepared_conflict, run_conflict
+from support.state import write_run_fixture
 
 
 # Ticket CI now finishes Development–Review before integration. Its live
@@ -110,7 +111,8 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
                 job["integration_development_budget"]["window"] = 2
         else:
             state["active_agent_invocation"]["role"] = "publication"
-        stage.save(state)
+        # 损坏注入绕过业务校验，仅用于读取拒绝断言。
+        write_run_fixture((store.root, state["run_id"]), state)
         with pytest.raises(IncompatibleRunStateError) as caught:
             StateStore(store.root).load_current_run(state["run_id"])
         if damage != "budget":
@@ -135,7 +137,8 @@ def test_candidate_conflict_requires_its_production_entry_conditions(git_repo: P
             job.pop("parent_integration")
         else:
             job["integrated_sha"] = job["candidate_sha"]
-        stage.save(state)
+        # 损坏注入绕过业务校验，仅用于读取拒绝断言。
+        write_run_fixture((store.root, state["run_id"]), state)
         with pytest.raises(IncompatibleRunStateError, match="owner, generation, phase or conflict context"):
             StateStore(store.root).load_current_run(state["run_id"])
         raise InterruptedError("invalid candidate")
