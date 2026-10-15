@@ -18,6 +18,7 @@
 | repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，以显式 fixture 设置已有场景；Candidate 和 currentness 由被测 Engine 执行 |
 | CLI 所需 completed/accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号；completed 起点不预先执行 Run Acceptance |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
+| 受控后台交付 | `background_delivery` | 共享真实 Executor 取消上下文；失败时关闭准入、释放阶段屏障并有界回收交付线程，再结束所有权占位进程和通知；业务完成由用例独立确认 |
 | 并发测试的线程生命周期 | `ticket_execution` | 原窗口内先断言正常退出；失败时独立取消并释放 gate，等待本次线程池退出后才能关闭 sender 或撤销 fixture；取消不能制造成功 |
 | 共享存储故障的真实 Worker | `shared_storage`、`shared_storage_processes` | 历史准备先于 ready 计时；测试资源登记独立于受测故障存储，按 PID/start token 回收全部启动者，使用 subreaper 回收孤儿并保护无关进程 |
 | 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision`、`parent_approval_update`、`run_approval_update` | 保留真实 Git 冲突、子进程、信号及归属清理 |

@@ -124,4 +124,3 @@ def commit_settlement(
     _sync_invocation_history(latest, settled)
     permission.commits += 1
     return store._save_work_and_notify_unlocked(run_id, latest, baseline, ticket_number=ticket_number)
-
