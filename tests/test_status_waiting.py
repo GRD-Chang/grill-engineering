@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import delete_control_fixture, only_control, persist_control_fixture
+
 import json
 from contextlib import redirect_stdout
 from datetime import UTC, datetime
@@ -269,13 +271,13 @@ def test_waiting_status_does_not_promise_an_exited_or_unknown_runner_will_contin
     waiting_run: tuple[Path, dict[str, Any]], host: str,
 ) -> None:
     repo, state = waiting_run
-    control_path = next((managed_state(repo) / "task-control").glob("*.json"))
+    control_path_store, control_path_task = only_control(managed_state(repo))
     if host == "unknown":
-        control_path.unlink()
+        delete_control_fixture(control_path_store, control_path_task)
     else:
-        control = json.loads(control_path.read_text())
+        control = control_path_store.load(control_path_task)
         control["executor"].update(status="exited", pid=None)
-        control_path.write_text(json.dumps(control))
+        persist_control_fixture(control_path_store, control_path_task, control)
     before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)

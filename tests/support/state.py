@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,13 @@ from agent_run.sqlite_state import SQLiteStateRepository
 
 
 RunRef = tuple[Path, str]
+
+
+class _FixtureStateRepository(SQLiteStateRepository):
+    def _observe_application(
+        self, connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any],
+    ) -> None:
+        """原始负向 fixture 不执行业务 Action 的 application receipt 对账。"""
 
 
 def only_run_ref(root: Path) -> RunRef:
@@ -56,7 +65,7 @@ def write_run_fixture(reference: RunRef, state: dict[str, Any]) -> None:
     本例指定的 Run，处于同一真实事务；生产的首次创建拒绝覆盖已有身份。
     """
     root, run_id = reference
-    repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+    repository = _FixtureStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
     with repository.atomic():
         connection = repository._local.connection
         released = [row[0] for row in connection.execute(

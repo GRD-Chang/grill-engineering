@@ -16,13 +16,13 @@ from support.cli_fixtures import run_agents as _run_agents
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
+from support.state import write_run_fixture
 from support.cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
     read_run_state_bytes,
     replace_only_run_state,
     run_cli,
-    save_run_state,
     snapshot_run_states,
     stdout_json,
 )
@@ -225,11 +225,13 @@ def test_parent_approval_selector_refuses_two_approval_ready_runs(
 
     rebind_attempts(duplicate)
     duplicate = replace_attempt_references(duplicate)
-    save_run_state(git_repo, duplicate)
+    # 故意注入同 Parent 的歧义记录；复制 Run 不能复用原 Action 的授权。
+    write_run_fixture((managed_state(git_repo), duplicate_id), duplicate)
     before = {
         run_id: read_run_state_bytes(git_repo, run_id),
         duplicate_id: read_run_state_bytes(git_repo, duplicate_id),
     }
+    remote_before = fixture.read_bytes()
 
     ambiguous = run_cli(git_repo, fixture, "approve", "1", "--repo", "example/project")
 
@@ -241,6 +243,7 @@ def test_parent_approval_selector_refuses_two_approval_ready_runs(
         run_id: read_run_state_bytes(git_repo, run_id),
         duplicate_id: read_run_state_bytes(git_repo, duplicate_id),
     } == before
+    assert fixture.read_bytes() == remote_before
 
 
 def test_current_long_blocker_is_full_in_status_and_bounded_in_history(

@@ -1,9 +1,10 @@
 # Run 状态存储与提交合同
 
-新 Run 的工作事实保存在 StateStore 根目录的 `state.sqlite3`。Run、工作对象、
-Invocation 和关联历史使用同一数据库；完整 Run 字典是按需读取的投影，
-不再另存或双写 `runs/<id>.json`。Task Control 继续保存原有 Action、Executor
-及其对账事实；它不是第二份业务进度，也不凭数据库提交推定宿主已经退出。
+受管仓库的 Task 控制与新 Run 工作事实共用状态根目录的 `state.sqlite3`。
+Task、Action、Executor、Worker、控制历史及 Action payload 使用明确关系表；
+Task 可先于 Run 存在。Run、工作对象、Invocation 和业务历史沿用原对象表示。
+完整 Run 与有界 Control 字典均为按需读取的投影，不另存或双写 Control JSON /
+`runs/<id>.json`，也不凭数据库提交推定宿主已经退出。
 
 ## 故障归属
 
@@ -34,8 +35,11 @@ Attempt 取回原 Thread，包括未被选中的兄弟调用；`completed` 调�
 `has_run`、`list_run_ids` 和按仓库/Parent 发现共用 StateStore，不由调用方猜测文件布局。
 单次 Run 投影在一致读事务中组装。查询连接使用 SQLite `mode=ro` 与
 `query_only`，不修改业务事实、执行恢复动作或发送通知。
+Control 在同一快照内先检查引用行的实际字节数，再读取文本；整体控制投影仍受
+256 KiB 上限约束，单份 Action payload 不超过 32 KiB。损坏超限时明确拒绝，
+不先把完整大字段读入 Python，也不截断必要证据。
 
-数据库协议为 `sqlite-run-objects-v2`；不兼容的旧 SQLite 协议与结构明确拒绝，
+数据库协议为 `sqlite-task-run-v3`；此前 SQLite 协议与结构明确拒绝，
 保留原文件，不迁移或补建索引。旧 JSON 只可用于发现身份，不读取、迁移或覆盖；
 准确查询旧身份会报不兼容。按 Parent 创建 Run 时遇到无法确定归属的旧 JSON 也拒绝，
 避免另建一个可能重复的获准执行 Run。已有 SQLite Run 的准确 ID 查询不受其他旧记录影响。
@@ -43,7 +47,7 @@ Attempt 取回原 Thread，包括未被选中的兄弟调用；`completed` 调�
 ## 同步提交
 
 同一进程、同一状态目录共享 FIFO 提交席位，最多容纳 128 个在途或等待请求，
-等待最多 60 秒。等待发生在 Control 锁、Run 锁和数据库事务之外；不用额外线程、
+等待最多 60 秒。等待发生在 Control 锁和数据库事务之外；不用额外线程、
 服务或消息队列。取得席位后进入原 Task Control transaction，重新核验 Action、
 Executor ownership/generation、Run 绑定及 Stop/Abandon 栅栏。
 调度轮询使用已读取的快照预检 FIFO 补位；队列不需要变化时不发起保存请求。
@@ -51,7 +55,8 @@ Executor ownership/generation、Run 绑定及 Stop/Abandon 栅栏。
 不以旧快照覆盖新租约、角色或兄弟工作。进入补位提交后调度器再次读取；
 无变化预检沿用本轮观察，实际租约取得仍独立重读和重验。
 
-随后在 Run 锁下开启真实数据库写事务。读取最新事实、核验相关对象身份、修改 Job、
+Control 与业务保存按状态根目录及线程复用同一个真实数据库写事务，不再等待 Run 文件锁。
+读取最新事实、核验相关对象身份、修改 Job、
 Attempt、Invocation、预算、门禁和历史，并一起提交。异常一起回滚；事务体不自动重试。
 TicketState 和 ObjectStateStore 在同一提交入口读取最新所属对象，校验关联业务合同，
 以差量提交 Job、Invocation 与必要历史，不能用旧整 Run 投影覆盖兄弟对象。
@@ -86,7 +91,11 @@ Ticket Job 的已完成 Attempt、旧预算窗口、人工阻塞、发布重试�
 
 取得保存席位后独立核验当前本票 Stop、Job、Invocation、需求、Generation 及
 调用持有的准确租约。已释放 Agent 租约的阶段消费仍核验 Job 和 Attempt；
-失败或暂停收口可以保存原对象的退出事实，正常迟到返回不能越过本票 Stop。
+失败或暂停收口可以保存原对象的退出事实。已准入 Invocation 的准确观察和
+`returned_result` 有单独的收口权限：重验 Run、Invocation、pending Attempt、
+代次及 Thread，只更新该调用、历史和原 Attempt 的结果。Stop、已释放租约或
+旧 Executor 被替换均不阻止这类事实收口；预算、阶段、Candidate、门禁和队列
+保留当前值，收口不能授权新调用、外部动作或阶段消费。
 阶段推进时的本票 Stop 观察只读取请求映射、本票值及其必要材料引用；每次核验
 当前协议、结构、Run 存在和大小界限，不加载执行或历史正文。该观察只决定是否
 进入暂停路径，保存时仍重新核验最新工作事实、控制和租约，不以观察结果授权。
@@ -95,9 +104,12 @@ Ticket Job 的已完成 Attempt、旧预算窗口、人工阻塞、发布重试�
 Agent 或 Reviewer 要求人工介入时，事件保留 `ready_for_human` 语义及原始审核
 证据；其他暂停仍使用自身原因，不借用当前选中 Ticket 的人工阻塞状态。
 
-`commit_admission()` 供已有“Control 对账包含 Run 保存”的复合路径先取得席位；
-同一 StateStore 的内层保存复用席位。Action application receipt 在业务事务中保存，控制面按原准确
-receipt 对账；不另建批准或恢复授权。Git、GitHub、Agent 和宿主操作必须在数据库事务外。
+`commit_admission()` 供复合业务保存复用席位并延迟提交后通知；生命周期 Action
+通过独立作用域跳过业务 FIFO，Stop 不排队等待业务保存席位。该作用域只选择提交入口，
+不能替代准确 Action / Executor 授权。Action application receipt 及关联业务变化
+在保存时重验当前关系，和 Task / Action / Executor 的应用事实同一事务提交。
+提交中断只留下完整旧迁移或完整新迁移，不从业务 receipt 重建丢失的控制授权。
+外部动作前的授权检查使用只读连接，Git、GitHub、Agent、Host 操作及等待必须在数据库写事务外。
 
 Parent 与普通运行控制通过 `ObjectStateStore` 读取当前对象投影并提交相关变化，
 不使用仅限首次创建的完整字典写入。当前 Invocation 与 Resume successor 的历史记录
@@ -129,7 +141,7 @@ cleanup 对账边界另读完整 Ticket Completion 证据，以补登记完成�
 公开生命周期 Action 返回完整查询结果，Engine 的内部阶段和保存不以完整历史为工作输入。
 `load_run` / status / history / 导出继续按一致读事务组装完整持久事实。
 
-observer 只在持久提交且释放提交席位、数据库及 Control/Run 锁之后调用。
+observer 只在持久提交且释放提交席位、数据库及 Control 锁之后调用。
 observer 失败记录日志，保存仍成功，不重放事务或外部动作。故障注入的
 `_after_run_saved` 也在持久提交后运行，其崩溃信号保留测试语义。
 通知沿用 History 的 Attempt 关联、结果证据和执行时长，只省去通知不显示的预算
@@ -158,7 +170,7 @@ Worker 沙箱遮蔽状态根目录及数据库、WAL/SHM 和控制锁，只重�
 角色失败诊断再次保存失败时，退出未知异常仍穿过完整角色调用与阶段清理边界；
 诊断错误作为异常附注和宿主日志保留，不能使内部收尾提前释放该 Worker 的租约。
 
-SQLite 或 Task Control 无法保存停止记录时，原有效提交保持不变，宿主 stderr /
+统一 SQLite 无法保存停止记录时，原有效提交保持不变，宿主 stderr /
 journal 中报告记录缺口，不能声称失败或退出状态已经持久化。实际执行停止与
 持久状态可能因此不同；没有自动重启或恢复，操作者仍须通过既有准确宿主退出
 核验和人工显式恢复边界继续工作。
@@ -169,7 +181,7 @@ journal 中报告记录缺口，不能声称失败或退出状态已经持久化
 等快照及至少 1024 UTF-8 字节的字符串按完整内容 SHA256 身份存一次，其他位置引用。
 Ticket Job、当前和历史 Invocation、timeline 事件各自使用对象路径及内容引用，
 不逐项拆成标量行；对象变化时替换该路径的引用，内部固定审核材料仍独立去重。
-这沿用同一 SQLite 协议，原有节点投影在下一次工作迁移前也能直接读取。
+业务域在新协议内继续沿用节点投影；不因此兼容此前数据库协议。
 身份覆盖实际内容，不用标题或当前选择对象认领证据。材料引用与对象变化同事务提交；
 本次移除引用后无任何引用的材料在写事务中回收，仍被其他 Run 或审核历史引用的材料保留。
 
@@ -327,6 +339,14 @@ BLOB 值不能借 JSON 文本的兼容行为冒充原始 TEXT。
 提交；崩溃后只读连接可读取最后提交，SQLite 的共享索引与锁文件属于内部协调材料，
 不构成另一份 Run 权威。正常关闭连接由 SQLite 管理 checkpoint 和协调文件回收，
 程序不在查询中删除日志或猜测恢复业务状态。
+
+运行库必须包含官方 WAL-reset 修复：SQLite >= 3.51.3，或官方回补分支
+3.50.7–3.50.x / 3.44.6–3.44.x。读已有库及首次写入均检查实际 Python
+`sqlite3.sqlite_version_info`；不以 SQLite CLI 版本或未经核验的系统补丁声明放行。
+不支持的运行库在创建数据库前报错。成功和异常边界关闭连接；Ticket 作用域复用的
+连接在异常或作用域退出时关闭，不跨线程共享。
+版本依据见 [WAL-reset 缺陷说明](https://sqlite.org/wal.html#walreset) 与
+[SQLite 3.51.3 发布记录](https://sqlite.org/releaselog/3_51_3.html)。
 
 设计依据：[Python sqlite3 事务与只读 URI](https://docs.python.org/3/library/sqlite3.html)、
 [SQLite 隔离](https://www.sqlite.org/isolation.html)、

@@ -14,7 +14,7 @@ from support.cli_fixtures import run_agents
 from support.seeding import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.published_run import prepare_accepted_run
-from support.workspace import managed_state
+from support.workspace import managed_repo, managed_state
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import (
     parent_publication,
@@ -31,24 +31,20 @@ from support.cli_supervision import (
 )
 from agent_run.executor_host import _process_start_token
 from agent_run.notification_events import events
+from agent_run.task_control import TaskControlStore, TaskKey
 
 from support.state import snapshot_runs
 
 
 def _write_executor_record(repo: Path, pid: int, start_token: str) -> None:
-    directory = managed_state(repo) / "task-control"
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "fixture.json").write_text(
-        json.dumps(
-            {
-                "executor": {
-                    "status": "running",
-                    "pid": pid,
-                    "process_start_token": start_token,
-                }
-            }
-        ),
-        encoding="utf-8",
+    control = TaskControlStore(managed_state(repo))
+    task = TaskKey(managed_repo(repo), "example/project", 1)
+    claim = control.claim_action(task, kind="run", payload={"parent": 1})
+    assert claim.action_id is not None
+    reservation = control.begin_executor(task, action_id=claim.action_id, run_id=None)
+    control.mark_handshake(
+        task, action_id=claim.action_id, generation=reservation.generation,
+        pid=pid, process_start_token=start_token,
     )
 
 
@@ -102,6 +98,8 @@ def test_interrupt_helper_escalates_for_an_executor_ignoring_sigterm(
             executor.kill()
         observer.wait(timeout=3)
         executor.wait(timeout=3)
+        if executor.stdout is not None:
+            executor.stdout.close()
 
 def test_run_supervises_pending_parent_only_checks_in_one_call(
     git_repo: Path,

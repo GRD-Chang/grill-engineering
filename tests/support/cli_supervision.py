@@ -239,10 +239,15 @@ def _interrupt_run(process: subprocess.Popen[str], repo: Path) -> None:
         process.communicate(timeout=3)
     assert process.returncode is not None
     executors: list[tuple[int, str]] = []
-    for path in (managed_state(repo) / "task-control").glob("*.json"):
+    from agent_run.task_control import TaskControlError
+    from support.control_state import control_refs
+
+    for control, task in control_refs(managed_state(repo)):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            record = control.load(task)
+        except (OSError, TaskControlError):
+            continue
+        if record is None:
             continue
         executor = record.get("executor")
         if (

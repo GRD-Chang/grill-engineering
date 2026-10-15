@@ -196,14 +196,9 @@ def test_public_recovery_preserves_local_stop_and_finishes_parent(
     completed_ticket = deepcopy(interrupted["ticket_jobs"]["2"])
     queued = deepcopy(interrupted["ticket_work_queue"])
     remote_before = fixture.read_text()
-    denied = run_cli(git_repo, fixture, "run", "1")
-    assert denied.returncode == 2, denied.stdout
-    assert fixture.read_text() == remote_before
-    assert states.load_current_run(run_id) == interrupted
 
-    # The Executor is dead, but an exactly bound Worker still owns live work.
-    # Register the surviving process against the original Action/Generation;
-    # public recovery must refuse it until public Stop proves it has exited.
+    # Executor 已退出，原 Action/Generation 绑定的 Worker 仍存活。
+    # 在公开生命周期核验退出前登记，恢复必须等待公开 Stop 确认 Worker 退出。
     control = TaskControlStore(states.root)
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
     ownership = control.load(task)
@@ -221,13 +216,18 @@ def test_public_recovery_preserves_local_stop_and_finishes_parent(
             generation=old_executor["generation"],
             pid=orphan.pid, process_start_token=token,
         )
-        ownership_with_orphan = control.path_for(task).read_bytes()
+        ownership_with_orphan = control.load(task)
+        denied = run_cli(git_repo, fixture, "run", "1")
+        assert denied.returncode == 2, denied.stdout + denied.stderr
+        assert states.load_current_run(run_id) == interrupted
+        assert control.load(task) == ownership_with_orphan
+        assert fixture.read_text() == remote_before
         refused = run_cli(git_repo, fixture, "resume", run_id)
         assert refused.returncode == 2, refused.stdout + refused.stderr
         assert "stop" in refused.stdout
         assert orphan.poll() is None, "Resume must not terminate an outstanding Worker"
         assert states.load_current_run(run_id) == interrupted
-        assert control.path_for(task).read_bytes() == ownership_with_orphan
+        assert control.load(task) == ownership_with_orphan
         assert fixture.read_text() == remote_before
 
         stopped = run_cli(git_repo, fixture, "stop", run_id)
@@ -242,11 +242,21 @@ def test_public_recovery_preserves_local_stop_and_finishes_parent(
         ]
         assert stopped_run["ticket_jobs"]["3"] == local_stop
         assert stopped_run["ticket_jobs"]["2"] == completed_ticket
-        for number in (3, 4, 5):
-            before = interrupted["ticket_jobs"].get(str(number), {})
-            after = stopped_run["ticket_jobs"].get(str(number), {})
-            for key in ("review_budget", "review_budget_history", "pending_semantic_attempt"):
-                assert after.get(key) == before.get(key), (number, key)
+        assert stopped_run["ticket_jobs"] == interrupted["ticket_jobs"]
+        closed_invocation = stopped_run["ticket_agent_invocations"]["4"]
+        assert closed_invocation["interruption_observed_at"]
+        assert closed_invocation == {
+            **interrupted_invocation, "status": "failed", "error": "operator_stopped",
+            "interruption_observed_at": closed_invocation["interruption_observed_at"],
+        }
+        assert stopped_run["agent_invocation_history"] == [
+            closed_invocation if (
+                item["work_subject"], item["started_at"]
+            ) == (
+                interrupted_invocation["work_subject"], interrupted_invocation["started_at"]
+            ) else item
+            for item in interrupted["agent_invocation_history"]
+        ]
         assert fixture.read_text() == remote_before
     finally:
         if orphan.poll() is None:

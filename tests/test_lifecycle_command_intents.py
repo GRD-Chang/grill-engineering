@@ -49,16 +49,17 @@ def test_unbound_reentry_applies_real_existing_run_command(
         fixture, initial = prepare_published_run(git_repo)
     run_id = initial["run_id"]
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
-    # 场景 builder 的 idle CLI ownership 不参与此处独立 Task Control 测试。
-    # 以新控制目录真实准入空绑定 Action，不修改或清除已有控制记录。
-    control = TaskControlStore(tmp_path / "control")
+    # 同一仓库共用业务与控制库；前一个 idle Action 保留为历史，新 Action
+    # 仍从空绑定开始，不另建控制授权源。
+    control = TaskControlStore(managed_state(git_repo))
     payload = {"parent": 1, "run_id": run_id}
     if kind == "revise":
         payload["message"] = " Preserve this exact feedback "
     claim = control.claim_action(task, kind=kind, payload=payload)
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id=None)
     admitted = control.load(task)
-    assert admitted["run_id"] is admitted["action"]["run_id"] is admitted["executor"]["run_id"] is None
+    assert admitted["run_id"] in {None, run_id}
+    assert admitted["action"]["run_id"] is admitted["executor"]["run_id"] is None
     assert admitted["action"]["payload"]["run_id"] == run_id
 
     # 新读取实例和真实生产命令适配器；不携带 initial 作为 current。
@@ -147,7 +148,7 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
     other["response_store_marker"] = "unrelated"
     unrelated.save_run(run_id, other)
     task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(actual.root)
     payload = {"parent": 1}
     claim = control.claim_action(task, kind="run", payload=payload)
     assert claim.action_id is not None
@@ -158,9 +159,11 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
         def ensure(self, *args, **kwargs):
             observation = super().ensure(*args, **kwargs)
             if successor:
-                following = control.claim_action(task, kind="run", payload={"parent": 1, "message": "successor"})
+                following = control.claim_action(task, kind="resume", payload={
+                    "parent": 1, "run_id": run_id, "message": "successor",
+                })
                 assert following.action_id != claim.action_id
-                control.bind_run(task, following.action_id, run_id, state_dir=unrelated.root)
+                control.bind_run(task, following.action_id, run_id, state_dir=actual.root)
             return observation
 
     def select(action):
@@ -171,7 +174,7 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
         return current, True
 
     lifecycle = RunLifecycle(
-        states=unrelated, control=control, task=task,
+        states=actual, control=control, task=task,
         host=ReplacingHost(action_id=claim.action_id, generation=reservation.generation),
         preflight=lambda: actual.load_current_run(run_id), select_run=select,
         initialize_profile=None,
@@ -206,4 +209,4 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
     assert observed["executor"]["status"] == "exited"
     assert unrelated.load_current_run(run_id) == other
     if successor:
-        assert control.load(task)["run_state_dir"] == str(unrelated.root.resolve())
+        assert control.load(task)["run_state_dir"] == str(actual.root.resolve())

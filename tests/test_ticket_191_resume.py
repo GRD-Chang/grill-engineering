@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from support.control_state import (
+    corrupt_control_fixture,
+    delete_control_fixture,
+    only_control,
+    raw_control_snapshot,
+    snapshot_control,
+)
+
+
 from support.resume import (
     _assert_production_run_rejects_before_readiness,
     _block_parent_for_human,
@@ -486,7 +495,7 @@ def _assert_production_run_does_not_prepare_executor(
     "boundary",
     ["execution_failed", "ready_for_human", "operator_stopped"],
 )
-def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
+def test_resume_cannot_recreate_control_from_terminal_receipt(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -497,25 +506,17 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
     fixture = write_fixture(git_repo / "github.json", issues={})
     _establish_ordinary_run_boundary(git_repo, fixture, boundary)
     state_before = load_only_run_state(git_repo)
-    receipt_before = state_before["action_application_receipt"]
-    assert isinstance(receipt_before, dict)
     control_store = TaskControlStore(managed_state(git_repo))
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
-    control_before = control_store.load(task)
-    assert control_before is not None
-    old_action = control_before["action"]
-    assert isinstance(old_action, dict)
-    old_generation = old_action["executor_generation"]
-    control_path = control_store.path_for(task)
+    assert control_store.load(task) is not None
     if control_case == "missing":
-        control_path.unlink()
+        delete_control_fixture(control_store, task)
     else:
-        control_path.write_text("not json", encoding="utf-8")
-
+        corrupt_control_fixture(control_store, task)
+    control_before = raw_control_snapshot(control_store, task)
     arguments = (
         ("--message", "operator granted the requested input")
-        if boundary == "ready_for_human"
-        else ()
+        if boundary == "ready_for_human" else ()
     )
 
     class UsageLease:
@@ -523,9 +524,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
             return 1
 
     class ReconciliationHost(cli_module.FakeExecutorHost):
-        def __init__(self) -> None:
-            super().__init__()
-            self.observe_count = 0
+        observe_count = 0
 
         def check_readiness(self) -> None:
             pass
@@ -533,110 +532,47 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         def prepare_environment(self, _arguments: object) -> None:
             pass
 
-        def observe(
-            self, spec: ExecutorSpec, _control: TaskControlStore
-        ) -> HostObservation:
+        def observe(self, spec: ExecutorSpec, _control: TaskControlStore) -> HostObservation:
             self.observe_count += 1
             return HostObservation(
                 host_status,  # type: ignore[arg-type]
-                spec.generation,
-                None,
-                False,
-                "original Executor ownership is not proven"
-                if host_status != "exited"
-                else None,
+                spec.generation, None, False,
                 runner_binding="0" * 16 if host_status == "exited" else None,
             )
 
     host = ReconciliationHost()
     monkeypatch.chdir(git_repo)
-
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
-    monkeypatch.setattr(
-        cli_module, "runner_usage_lease", lambda _path: nullcontext(UsageLease())
-    )
+    monkeypatch.setattr(cli_module, "runner_usage_lease", lambda _path: nullcontext(UsageLease()))
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: True)
+    monkeypatch.setattr(cli_module, "SystemdUserExecutorHost", lambda **_options: host)
     monkeypatch.setattr(
-        cli_module, "SystemdUserExecutorHost", lambda **_options: host
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "GhGitHubReader",
+        cli_module, "GhGitHubReader",
         lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
     )
-    monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture))
     monkeypatch.setattr(
-        cli_module,
-        "GhGitHubPublisher",
+        "agent_run.workspace_cli.GhGitHubReader",
+        lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture),
+    )
+    monkeypatch.setattr(
+        cli_module, "GhGitHubPublisher",
         lambda _repo, git: FixtureGitHubPublisher(fixture, git),
     )
     command = [
-        "resume",
-        str(state_before["run_id"]),
-        "--repo",
-        "example/project",
-        *arguments,
-        "--agent-fixture",
-        str(_resumed_parent_agents(git_repo)),
-        "--json",
+        "resume", str(state_before["run_id"]), "--repo", "example/project",
+        *arguments, "--agent-fixture", str(_resumed_parent_agents(git_repo)), "--json",
     ]
     state_ref = only_run_ref(managed_state(git_repo))
     state_bytes = snapshot_run(state_ref)
     fixture_bytes = fixture.read_bytes()
-    return_code = cli_module.main(command)
-    output = json.loads(capsys.readouterr().out)
-
-    if host_status != "exited":
+    for _attempt in range(2):
+        return_code = cli_module.main(command)
+        output = json.loads(capsys.readouterr().out)
         assert return_code == 2, output
-        assert output["diagnostics"][0]["code"] == "executor_start_unknown"
-        assert host.start_count == 0
+        assert host.start_count == host.observe_count == 0
+        assert raw_control_snapshot(control_store, task) == control_before
         assert snapshot_run(state_ref) == state_bytes
         assert fixture.read_bytes() == fixture_bytes
-        repaired_bytes = control_path.read_bytes()
-        repaired = control_store.load(task)
-        assert repaired is not None
-        assert repaired["next_generation"] == old_generation + 1
-        assert repaired["action"]["action_id"] == receipt_before["action_id"]
-
-        repeated_return_code = cli_module.main(command)
-        repeated_output = json.loads(capsys.readouterr().out)
-        assert repeated_return_code == 2, repeated_output
-        assert repeated_output["diagnostics"][0]["code"] == "executor_start_unknown"
-        assert control_path.read_bytes() == repaired_bytes
-        assert snapshot_run(state_ref) == state_bytes
-        assert fixture.read_bytes() == fixture_bytes
-        assert host.observe_count == 2
-        assert host.start_count == 0
-        return
-
-    assert return_code == 0, output
-    assert output["action"]["submission"] == "started"
-    assert host.observe_count == 1
-    assert host.start_count == 1
-    repaired = control_store.load(task)
-    assert repaired is not None
-    successor = repaired["action"]
-    assert successor["kind"] == "resume"
-    assert successor["executor_generation"] == old_generation + 1
-    predecessors = [
-        entry["action"]
-        for entry in repaired["action_history"]
-        if entry["action"]["action_id"] == receipt_before["action_id"]
-    ]
-    assert len(predecessors) == 1
-    predecessor = predecessors[0]
-    assert predecessor["status"] == "completed"
-    assert predecessor["receipt_only_reconciliation"] is True
-    assert "payload" not in predecessor
-    assert all(
-        predecessor[key] == receipt_before[key]
-        for key in ("action_id", "kind", "payload_digest", "run_id")
-    )
-    durable = load_only_run_state(git_repo)
-    assert durable["action_application_receipt"]["action_id"] == successor[
-        "action_id"
-    ]
-    assert durable["resume_audit"]["total"] == 1
 
 
 @pytest.mark.parametrize(
@@ -698,12 +634,12 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
         fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     state_root = managed_state(git_repo)
     state_ref = only_run_ref(state_root)
-    control_path = next((state_root / "task-control").glob("*.json"))
+    control_path_store, control_path_task = only_control(state_root)
     current_state = load_only_run_state(git_repo)
     receipt_before = current_state["action_application_receipt"]
     assert isinstance(receipt_before, dict)
     state_before = snapshot_run(state_ref)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control_path_store, control_path_task)
     control_document_before = json.loads(control_before)
     state_tree_before = _tree_snapshot(state_root)
     fixture_before = fixture.read_bytes()
@@ -747,13 +683,13 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
                 if expected_status == "publication_pending":
                     assert output["result"] == "rejected"
                 assert snapshot_run(state_ref) == state_before
-                assert control_path.read_bytes() == control_before
+                assert snapshot_control(control_path_store, control_path_task) == control_before
                 assert _tree_snapshot(state_root) == state_tree_before
                 assert (
                     load_only_run_state(git_repo)["action_application_receipt"]
                     == receipt_before
                 )
-                control_document_after = json.loads(control_path.read_bytes())
+                control_document_after = control_path_store.load(control_path_task)
                 assert control_document_after["action"]["executor_generation"] == (
                     control_document_before["action"]["executor_generation"]
                 )
@@ -784,7 +720,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
                         expected_return_code=expected_return_code,
                     )
                 assert snapshot_run(state_ref) == state_before
-                assert control_path.read_bytes() == control_before
+                assert snapshot_control(control_path_store, control_path_task) == control_before
                 capsys.readouterr()
         except AssertionError as error:
             error.add_note(f"run_arguments={run_arguments!r}")

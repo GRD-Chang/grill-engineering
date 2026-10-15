@@ -15,6 +15,12 @@ from support.seeding import write_fixture
 from support.cli import run_cli, stdout_json
 from support.cli_payloads import ticket
 from support.lifecycle import _file_snapshot, _isolated_environment
+from support.control_state import (
+    delete_control_fixture,
+    only_control,
+    persist_control_fixture,
+    raw_control_snapshot,
+)
 
 from support.state import only_run_ref, read_run, write_run_fixture
 
@@ -60,18 +66,19 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
         invocation['ended_at'] = '2026-09-07T01:47:25+00:00'
         invocation['execution_segments'][0]['ended_at'] = invocation['ended_at']
         state['agent_invocation_history'][-1] = dict(invocation)
-    control_path = next((managed_state(git_repo, extra_env=environment) / 'task-control').glob('*.json'))
+    control_store, control_task = only_control(managed_state(git_repo, extra_env=environment))
     if case == 'unknown':
-        control_path.unlink()
+        delete_control_fixture(control_store, control_task)
     if case == 'capacity':
         invocation.update(
             status='resuming', recovery_waiting=True, recovery_kind='capacity',
             capacity_recovery_count=3, ordinary_recovery_used=False,
         )
         state['agent_invocation_history'][-1] = dict(invocation)
-        control = json.loads(control_path.read_text())
+        control = control_store.load(control_task)
+        assert control is not None
         control['executor'].update(status='running', pid=123)
-        control_path.write_text(json.dumps(control))
+        persist_control_fixture(control_store, control_task, control)
         monkeypatch.setattr(
             cli, 'observe_systemd_executor',
             lambda spec, *args, **kwargs: HostObservation(
@@ -83,9 +90,11 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     before = _workspace_snapshot(git_repo, extra_env=environment)
+    control_before = raw_control_snapshot(control_store, control_task)
     for command in ('status', 'history'):
         assert cli.main([command, run_id, '--json']) == 0
         output = json.loads(capsys.readouterr().out)
+        assert raw_control_snapshot(control_store, control_task) == control_before
         expected_activity = {
             'unknown': 'unknown', 'capacity': 'running',
         }.get(case, 'not_running')

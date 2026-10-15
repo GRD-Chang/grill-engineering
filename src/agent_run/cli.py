@@ -1480,13 +1480,6 @@ def _reject_conflicting_stop_action(
         "applying",
     }:
         return
-    executor = record.get("executor") if isinstance(record, Mapping) else None
-    if (
-        isinstance(executor, Mapping)
-        and executor.get("binding_token") == "reconciliation-required"
-        and action_receipt_matches(state, action)
-    ):
-        return
     if action.get("kind") == "stop" and _mutation_request_matches_action(
         parsed, action, parsed.run_id
     ):
@@ -2573,8 +2566,8 @@ def _run_lifecycle(
         controller.creation_github_identity = validate_identity_snapshot(run_payload["github_identity"])
         controller.creation_runner_github_identity = validate_identity_snapshot(run_payload["runner_github_identity"])
         def prepare_creation(state: dict[str, Any]) -> None:
-            # Keep the initial configuration beside the creation receipt so a
-            # lost Task Control can be reconciled without reading user defaults.
+            # Preserve creation inputs for an exact retry of this intent,
+            # without consulting changed personal defaults.
             state.setdefault("creation_configuration", dict(run_payload))
             state.setdefault("notifications", dict(run_payload.get("notifications", {"enabled": False})))
             prepare_action_application_receipt(state, action)
@@ -2603,9 +2596,20 @@ def _run_lifecycle(
                 allow_create = (
                     isinstance(action, Mapping)
                     and action.get("status") in {"accepted", "applying"}
-                    and action.get("application_observed") is False
                     and action.get("run_id") in {None, run_id}
                     and receipt_matches
+                    and (
+                        action.get("application_observed") is False
+                        or (
+                            action.get("kind") == "run"
+                            and isinstance(receipt, Mapping)
+                            and receipt.get("executor_generation") == action.get("executor_generation")
+                            and action.get("run_id") == run_id
+                            and not value.get("agent_invocation_history")
+                            and isinstance(action.get("payload"), Mapping)
+                            and isinstance(action["payload"].get("profile"), Mapping)
+                        )
+                    )
                 )
         configuration = creation_profile
         if allow_create:
@@ -2840,9 +2844,8 @@ def _reconcile_resume_exit(
     try:
         record = control.inspect_run(task, current)
     except TaskControlError:
-        # This preflight only repairs an intact, concrete process binding.
-        # Leave receipt-only reconstruction to the existing lifecycle spine,
-        # which requires its own exact Host evidence before admission.
+        # Lifecycle admission rejects missing authority; a business receipt
+        # cannot reconstruct it.
         return current
     executor = record.get("executor") if isinstance(record, Mapping) else None
     action = record.get("action") if isinstance(record, Mapping) else None
@@ -2900,26 +2903,32 @@ def _reconcile_resume_exit(
             result_status=str(current.get("status")), failure=final_approval_failure(current),
         )
         return current
-    control.finish_executor(
-        task, action_id=spec.action_id, generation=spec.generation,
-        run_id=spec.run_id, runner_binding=spec.runner_binding,
-        failure=(final_approval_failure(current) if is_final_approval_action(action, current) else None),
-        result_status=str(current.get("status")),
-    )
-    if is_final_approval_action(action, current):
-        return current
-    if has_run_operator_gate(current):
-        # The failure gate is not exit proof. Close this generation's work
-        # before a successor can refresh stages or admit another invocation.
-        with states.commit_admission(), control.exited_executor_transaction(
+    from agent_run.state_commits import lifecycle_commits
+    # Host/process evidence above is external. Exact relational closeout and
+    # business facts below commit together before any successor admission.
+    with lifecycle_commits(states.root), states.commit_admission(), control._locked(
+        task, wait=True, operation="session exit",
+    ):
+        latest = object_states.load_scheduler_current_run(str(current["run_id"]))
+        if latest is None or not action_receipt_matches(latest, action):
+            raise ExecutorStartUnknownError(error_message('cli.error.executor_changed'))
+        current = latest
+        control.finish_executor(
             task, action_id=spec.action_id, generation=spec.generation,
-            application_receipt=current["action_application_receipt"],
-        ):
-            with object_states.require_unchanged_run(str(current["run_id"]), current):
+            run_id=spec.run_id, runner_binding=spec.runner_binding,
+            failure=(final_approval_failure(current) if is_final_approval_action(action, current) else None),
+            result_status=str(current.get("status")),
+        )
+        if is_final_approval_action(action, current):
+            return current
+        if has_run_operator_gate(current):
+            with control.exited_executor_transaction(
+                task, action_id=spec.action_id, generation=spec.generation,
+                application_receipt=current["action_application_receipt"],
+            ), object_states.require_unchanged_run(str(current["run_id"]), current):
                 interrupt_exited_invocations(current, "controller_interrupted")
                 states.save_run(str(current["run_id"]), current)
-    else:
-        with states.commit_admission():
+        else:
             control.fail_session_from_application_receipt(
                 task, action_id=spec.action_id, generation=spec.generation,
                 application_receipt=current["action_application_receipt"],
@@ -3511,10 +3520,6 @@ def _with_executor_control(
     ):
         # The Control Executor's exit says nothing about its unresolved target.
         reason = "control_target_unresolved"
-    elif isinstance(executor, Mapping) and executor.get(
-        "reconciliation_required"
-    ) is True:
-        reason = "executor_reconciliation_required"
     elif executor_status in {"exited", "absent"}:
         activity = "not_running"
         reason = None

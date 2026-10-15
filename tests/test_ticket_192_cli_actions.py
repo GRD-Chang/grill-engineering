@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import control_refs, only_control, snapshot_control
+
 from support.cli_actions import (
     _parent_agents,
     _revision_agents,
@@ -148,8 +150,8 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         status_term="任务已完成",
         next_action="下一步: 无",
     )
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    first_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    first_control = control_path_store.load(control_path_task)
     first_action_id = first_control["action"]["action_id"]
     delivery_before = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
 
@@ -251,8 +253,8 @@ def test_revise_parent_intent_creates_a_successor_at_the_next_human_boundary(
         (f"run-publication:{run_id}", "final_publication"),
     ]
     assert all(item["status"] == "completed" for item in successor_invocations)
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    control = control_path_store.load(control_path_task)
     assert control["action"]["action_id"] == repeated_output["action_audit"]["action_id"]
     assert any(
         item["action"]["action_id"] == receipt["action_id"]
@@ -298,8 +300,8 @@ def test_revise_durable_save_crash_is_not_replayed(
     )
     invocation_count_before = len(crashed_state["agent_invocation_history"])
     fixture_before = fixture.read_bytes()
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    control_before = json.loads(control_path.read_text(encoding="utf-8"))
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    control_before = control_path_store.load(control_path_task)
 
     repeated = run_cli(
         git_repo,
@@ -328,7 +330,7 @@ def test_revise_durable_save_crash_is_not_replayed(
     assert len(current["agent_invocation_history"]) == invocation_count_before
     assert current["action_application_receipt"] == receipt_before
     assert fixture.read_bytes() == fixture_before
-    control_after = json.loads(control_path.read_text(encoding="utf-8"))
+    control_after = control_path_store.load(control_path_task)
     assert (
         control_after["action"]["action_id"]
         == control_before["action"]["action_id"]
@@ -443,9 +445,9 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     profile_path = state_root / "profiles" / f"{run_id}.json"
     profile_before = json.loads(profile_path.read_bytes())
     state_before = read_run_state_bytes(git_repo, run_id)
-    task_control = state_root / "task-control"
     control_before = {
-        path.name: path.read_bytes() for path in task_control.glob("*.json")
+        task.fingerprint: snapshot_control(control, task)
+        for control, task in control_refs(state_root)
     }
     tree_before = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
@@ -461,7 +463,8 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     assert run_id not in configured.stdout
     assert read_run_state_bytes(git_repo, run_id) == state_before
     assert {
-        path.name: path.read_bytes() for path in task_control.glob("*.json")
+        task.fingerprint: snapshot_control(control, task)
+        for control, task in control_refs(state_root)
     } == control_before
     tree_after = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()

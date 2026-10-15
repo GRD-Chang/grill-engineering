@@ -1,8 +1,8 @@
 """Durable, task-scoped control state for lifecycle actions.
 
-The Delivery Run JSON remains the business state.  This module only stores the
-small amount of coordination state needed to admit one action and one
-executor for a repository/Parent pair.
+Control relations share the repository SQLite database with business facts.
+External operations use read-only authorization; local changes join one short
+transaction without admitting lifecycle Actions through the business FIFO.
 """
 
 from __future__ import annotations
@@ -10,8 +10,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
-import os
-import tempfile
+import sqlite3
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -23,19 +22,19 @@ from time import monotonic, sleep
 from typing import Any
 
 from agent_run.error_safety import bounded_error
+from agent_run import sqlite_control
+from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.task_identity import TaskControlError as TaskControlError, TaskKey as TaskKey
 
 TASK_CONTROL_PROTOCOL = 1
-MAX_TASK_CONTROL_BYTES = 256 * 1024
+MAX_TASK_CONTROL_BYTES = sqlite_control.MAX_CONTROL_BYTES
 _ACTIVE_ACTION_STATUSES = frozenset({"accepted", "applying"})
 _TERMINAL_ACTION_STATUSES = frozenset({"completed", "failed"})
 _ACTIVE_EXECUTOR_STATUSES = frozenset({"starting", "running"})
 _MAX_ACTION_HISTORY = 4
 _CONTROL_WRITE_RETRY_WINDOW_SECONDS = 1.0
 _CONTROL_WRITE_RETRY_INTERVAL_SECONDS = 0.01
-
-class TaskControlError(ValueError):
-    """The task control record is unavailable or violates its contract."""
-
 
 class TaskControlBusyError(TaskControlError):
     """Another process owns the bounded Task Control transaction."""
@@ -52,42 +51,7 @@ class ActionBusyError(TaskControlError):
 
 
 class ActionReconciliationError(TaskControlError):
-    """The control record cannot be repaired from deterministic Run evidence."""
-
-
-@dataclass(frozen=True)
-class TaskKey:
-    """Stable identity of one local Delivery Task."""
-
-    workspace: Path
-    repository: str
-    parent_number: int
-
-    def __post_init__(self) -> None:
-        workspace = Path(self.workspace).resolve()
-        if not workspace.is_absolute():  # pragma: no cover - resolve is absolute
-            raise TaskControlError("Delivery Task workspace must be absolute")
-        if not isinstance(self.repository, str) or not self.repository.strip():
-            raise TaskControlError("Delivery Task repository must be non-empty")
-        if type(self.parent_number) is not int or self.parent_number <= 0:
-            raise TaskControlError("Delivery Task Parent Issue must be positive")
-        object.__setattr__(self, "workspace", workspace)
-        object.__setattr__(self, "repository", self.repository.strip().lower())
-
-    @property
-    def identity(self) -> dict[str, object]:
-        return {
-            "workspace": str(self.workspace),
-            "repository": self.repository,
-            "parent": self.parent_number,
-        }
-
-    @property
-    def fingerprint(self) -> str:
-        encoded = json.dumps(
-            self.identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+    """The command does not match durable ownership or application evidence."""
 
 
 @dataclass(frozen=True)
@@ -146,15 +110,29 @@ class TaskControlStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
         self.directory = self.root / "task-control"
+        self._repository = SQLiteStateRepository(self.root, max_bytes=4 * 1024 * 1024)
 
     def path_for(self, task: TaskKey) -> Path:
         return self.directory / f"{task.fingerprint}.json"
 
     def load(self, task: TaskKey) -> dict[str, Any] | None:
-        path = self.path_for(task)
-        if not path.exists():
-            return None
-        return self._read_path(path, task)
+        if self.path_for(task).exists():
+            raise IncompatibleRunStateError(
+                "Incompatible legacy Task Control JSON; old Run artifacts are preserved and cannot be resumed with this protocol"
+            )
+        try:
+            with self._repository._reading() as connection:
+                record = (sqlite_control.load(connection, task.fingerprint, task.identity)
+                          if connection is not None else None)
+            if record is not None:
+                _validate_record(record, task)
+            return record
+        except IncompatibleRunStateError:
+            raise
+        except (OSError, ValueError, sqlite3.Error) as error:
+            if isinstance(error, TaskControlError):
+                raise
+            raise TaskControlError(f"Cannot read Task Control: {error}") from error
 
     def inspect_run(
         self, task: TaskKey, run_state: Mapping[str, Any]
@@ -241,14 +219,7 @@ class TaskControlStore:
                     action=current,
                 )
             executor = record.get("executor")
-            reconciled_exit = (
-                isinstance(executor, Mapping)
-                and executor.get("binding_token") == "reconciliation-required"
-                and executor.get("status") == "exited"
-                and executor.get("reconciliation_required") is not True
-                and isinstance(executor.get("runner_binding"), str)
-            )
-            if unresolved_control_target(current) is not None and not reconciled_exit:
+            if unresolved_control_target(current) is not None:
                 raise ActionReconciliationError(
                     "失败 Control Action 的目标 ownership 尚未收口；"
                     "请先重试 Stop 或 Abandon"
@@ -397,6 +368,8 @@ class TaskControlStore:
         if not isinstance(run_id, str) or not run_id:
             raise TaskControlError("control action requires a Delivery Run")
         state_root = Path(state_dir).resolve()
+        if state_root != self.root:
+            raise ActionReconciliationError("Task Control 与 Run 必须使用同一状态目录和数据库")
         normalized_payload = _bounded_payload(payload)
         digest = _payload_digest(normalized_payload)
 
@@ -557,152 +530,23 @@ class TaskControlStore:
             return deepcopy(record)
 
     def reconcile_from_run(
-        self,
-        task: TaskKey,
-        run_state: Mapping[str, Any] | None,
-        *,
-        payload: Mapping[str, Any] | None = None,
-        state_dir: Path | None = None,
+        self, task: TaskKey, run_state: Mapping[str, Any] | None, *,
+        payload: Mapping[str, Any] | None = None, state_dir: Path | None = None,
     ) -> dict[str, Any] | None:
-        """Repair a missing/corrupt record only when its Run receipt is exact."""
-
-        try:
-            existing = self.load(task)
-        except TaskControlError:
-            existing = None
-        if existing is not None:
-            _verify_record_matches_run(existing, run_state)
-            return existing
-
-        receipt = _action_receipt(run_state)
-        if receipt is None:
-            if run_state is not None and run_state.get("status") not in {
-                "completed", "abandoned"
-            }:
+        """Validate the sole control authority; Run receipts cannot reconstruct it."""
+        record = self.load(task)
+        if record is None:
+            if isinstance(run_state, Mapping) and (
+                run_state.get("action_application_receipt") is not None
+                or run_state.get("status") not in {"completed", "abandoned"}
+            ):
                 raise ActionReconciliationError(
-                    "未完成 Delivery Run 的 Task Control 不可用，且缺少准确 Action "
-                    "Application Receipt；Executor ownership 无法确认。"
-                    "请恢复该 Run 的控制证据后重试；不会创建 Action 或启动 Executor"
-                )
-            if self.path_for(task).exists():
-                raise ActionReconciliationError(
-                    "Task Control Record 损坏，且 Delivery Run 没有可验证的 Action Application Receipt"
+                    "Task Control 不可用；无法证明原 Executor ownership/退出，"
+                    "不会从业务 Receipt 重建授权或启动后继"
                 )
             return None
-        normalized_payload = _bounded_payload(payload) if payload is not None else None
-        if normalized_payload is not None and (
-            _payload_digest(normalized_payload) != receipt["payload_digest"]
-        ):
-            raise ActionReconciliationError(
-                "Delivery Run Receipt 与待对账 Action payload 不一致"
-            )
-        record = _new_record(task)
-        if state_dir is not None:
-            record["run_state_dir"] = str(Path(state_dir).resolve())
-        receipt_only = normalized_payload is None
-        target_executor = None
-        if receipt["kind"] in {"stop", "abandon"}:
-            if "target_executor" not in receipt:
-                raise ActionReconciliationError(
-                    "Control Action Receipt 缺少原 target Executor ownership；"
-                    "不会猜测目标已退出"
-                )
-            target_executor = receipt["target_executor"]
-            if target_executor is not None:
-                if not isinstance(target_executor, dict):
-                    raise ActionReconciliationError(
-                        "Control Action Receipt target Executor 无效"
-                    )
-                try:
-                    _validate_executor_snapshot(target_executor)
-                except TaskControlError as error:
-                    raise ActionReconciliationError(
-                        "Control Action Receipt target Executor ownership 无效"
-                    ) from error
-                if (
-                    target_executor.get("run_id") != receipt["run_id"]
-                    or target_executor["generation"] >= receipt["executor_generation"]
-                ):
-                    raise ActionReconciliationError(
-                        "Control Action Receipt target Run/generation 不匹配"
-                    )
-                workers = _executor_workers(target_executor)
-                for target_process in workers or [target_executor]:
-                    token = target_process.get("process_start_token")
-                    if (
-                        type(target_process.get("pid")) is not int
-                        or not isinstance(token, str)
-                        or not token
-                        or token == "[REDACTED]"
-                    ):
-                        raise ActionReconciliationError(
-                            "Control Action Receipt target 进程 identity 缺失；"
-                            "不会猜测目标已退出"
-                        )
-        action = {
-            "action_id": receipt["action_id"],
-            "kind": receipt["kind"],
-            "payload_digest": receipt["payload_digest"],
-            "status": "accepted",
-            "run_id": receipt["run_id"],
-            "executor_generation": receipt.get("executor_generation", 1),
-            "application_observed": True,
-            "submitted_at": receipt.get("applied_at", _now()),
-            "completed_at": None,
-            "result_status": None,
-            "failure": None,
-        }
-        if target_executor is not None:
-            action["target_executor"] = deepcopy(target_executor)
-        if receipt_only:
-            action["receipt_only_reconciliation"] = True
-        else:
-            action["payload"] = normalized_payload
-        approval_subject = (
-            run_state.get(
-                "parent_job" if run_state.get("delivery_type") == "parent_only"
-                else "run_publication"
-            )
-            if isinstance(run_state, Mapping) else None
-        )
-        if receipt["kind"] == "approve" or (
-            receipt["kind"] == "resume"
-            and isinstance(approval_subject, Mapping)
-            and isinstance(approval_subject.get("approval_grant"), Mapping)
-        ):
-            action["final_approval_operation"] = True
-        record["run_id"] = receipt["run_id"]
-        record["action"] = action
-        record["executor"] = {
-            "status": "absent",
-            "action_id": action["action_id"],
-            "run_id": action["run_id"],
-            "generation": action["executor_generation"],
-            "binding_token": "reconciliation-required",
-            "pid": None,
-            "process_start_token": None,
-            "handshake_at": None,
-            "started_at": action["submitted_at"],
-            "exited_at": None,
-            "failure": (
-                "Task Control Record was missing; Executor ownership is unknown"
-            ),
-            "reconciliation_required": True,
-        }
-        record["next_generation"] = max(
-            2, _positive_integer(action["executor_generation"]) + 1
-        )
-        record["updated_at"] = _now()
-        with self._locked(task):
-            try:
-                current = self._read_unlocked(task)
-            except TaskControlError:
-                current = None
-            if current is not None:
-                _verify_record_matches_run(current, run_state)
-                return current
-            self._write_unlocked(task, record)
-        return deepcopy(record)
+        _verify_record_matches_run(record, run_state)
+        return record
 
     def bind_run(
         self,
@@ -715,6 +559,8 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         if not run_id:
             raise TaskControlError("Lifecycle Action is missing its Delivery Run ID")
+        if state_dir is not None and Path(state_dir).resolve() != self.root:
+            raise ActionReconciliationError("Task Control 与 Run 必须使用同一状态目录和数据库")
         with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
@@ -791,6 +637,8 @@ class TaskControlStore:
         generation: int | None = None,
         state_dir: Path | None = None,
     ) -> dict[str, Any]:
+        if state_dir is not None and Path(state_dir).resolve() != self.root:
+            raise ActionReconciliationError("Task Control 与 Run 必须使用同一状态目录和数据库")
         with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor: dict[str, Any] | None = None
@@ -821,7 +669,7 @@ class TaskControlStore:
     def require_mutation_available(self, task: TaskKey) -> None:
         """Reject a legacy mutation from one short control transaction."""
 
-        if not self.path_for(task).exists():
+        if self.load(task) is None:
             return
         with self._locked(task):
             record = self._read_unlocked(task)
@@ -970,106 +818,40 @@ class TaskControlStore:
                 )
             return deepcopy(record)
 
-    def record_reconciled_executor_exit(
-        self,
-        task: TaskKey,
-        *,
-        action_id: str,
-        run_id: str,
-        generation: int,
-        observed_status: str,
-        observed_generation: int | None,
-        observed_runner_binding: str,
-    ) -> dict[str, Any]:
-        """Persist an exact Host exit proof while retaining the Action gate."""
-
-        with self._locked(task, wait=True):
-            record = self._require_unlocked(task)
-            action = _require_active_action(record, action_id)
-            executor = _require_executor(record, action_id, generation)
-            if not (
-                observed_status == "exited"
-                and observed_generation == generation
-                and record.get("run_id") == run_id
-                and action.get("run_id") == run_id
-                and action.get("executor_generation") == generation
-                and executor.get("run_id") == run_id
-                and executor.get("status") == "absent"
-                and executor.get("binding_token") == "reconciliation-required"
-                and executor.get("reconciliation_required") is True
-                and executor.get("pid") is None
-                and executor.get("process_start_token") is None
-                and executor.get("handshake_at") is None
-            ):
-                raise ActionReconciliationError(
-                    "Host 证据无法恢复准确的 receipt-only Executor ownership"
-                )
-            try:
-                runner_binding = _validate_runner_binding(observed_runner_binding)
-            except TaskControlError as error:
-                raise ActionReconciliationError(
-                    "Host 证据缺少准确的 receipt-only Runner binding"
-                ) from error
-            executor.update(
-                {
-                    "status": "exited",
-                    "exited_at": _now(),
-                    "failure": "host proved the receipt-bound Executor exited",
-                }
-            )
-            executor["runner_binding"] = runner_binding
-            executor.pop("reconciliation_required", None)
-            record["updated_at"] = _now()
-            self._write_unlocked(task, record)
-            return deepcopy(record)
 
     def assert_executor_current(
-        self,
-        task: TaskKey,
-        *,
-        action_id: str,
-        generation: int,
-        run_id: str | None = None,
+        self, task: TaskKey, *, action_id: str, generation: int, run_id: str | None = None,
     ) -> None:
-        """Revalidate the exact Executor fence before an external side effect."""
-
-        with self._executor_current_transaction(
-            task, action_id=action_id, generation=generation, run_id=run_id,
-        ):
-            return
+        """Read-only authorization before an external operation, without a write transaction."""
+        record = self.load(task)
+        if record is None:
+            raise ActionReconciliationError("Delivery Task Control Record 不存在")
+        _verify_current_executor(record, action_id, generation, run_id)
 
     @contextmanager
     def _executor_current_transaction(
-        self,
-        task: TaskKey,
-        *,
-        action_id: str,
-        generation: int,
-        run_id: str | None = None,
+        self, task: TaskKey, *, action_id: str, generation: int, run_id: str | None = None,
     ) -> Iterator[None]:
-        """Hold ownership through one short external/state commit boundary."""
-
+        """Revalidate normal advancement or exact Invocation-only closeout in the write transaction."""
+        from agent_run.invocation_settlement import current_settlement
         with self._locked(task, wait=True, operation="executor/state commit"):
             record = self._require_unlocked(task)
-            executor = _require_executor(record, action_id, generation)
-            if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
-                raise ActionReconciliationError(
-                    "Executor ownership is no longer active at Run state commit"
-                )
-            if run_id is not None and executor.get("run_id") not in {None, run_id}:
-                raise ActionReconciliationError(
-                    "Executor is bound to another Delivery Run"
-                )
-            action = record.get("action")
-            if not isinstance(action, dict) or action.get("action_id") != action_id:
-                raise ActionReconciliationError(
-                    "Executor Action is no longer the current Task Action"
-                )
-            if action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}:
-                raise ActionReconciliationError(
-                    "Executor Action is no longer authorized"
-                )
+            permission = current_settlement()
+            prior_commits = permission.commits if permission is not None else 0
+            try:
+                _verify_current_executor(record, action_id, generation, run_id)
+            except ActionReconciliationError:
+                if permission is None:
+                    raise
+                executor = _known_executor(record, action_id, generation)
+                if (executor.get("run_id") != permission.run_id
+                        or run_id not in {None, permission.run_id}):
+                    raise ActionReconciliationError("Invocation closeout belongs to another Run")
+                permission.limited = True
             yield
+            if (permission is not None and permission.limited
+                    and permission.commits == prior_commits):
+                raise ActionReconciliationError("Revoked Executor permits only exact Invocation closeout")
 
     @contextmanager
     def ticket_resume_transaction(
@@ -1194,36 +976,20 @@ class TaskControlStore:
             return deepcopy(record)
 
     def mark_worker_finished(
-        self,
-        task: TaskKey,
-        *,
-        action_id: str,
-        generation: int,
-        pid: int,
-        process_start_token: str,
+        self, task: TaskKey, *, action_id: str, generation: int, pid: int, process_start_token: str,
     ) -> dict[str, Any]:
-        """Clear the exact Worker binding without affecting Executor ownership."""
-
+        """Record only this exact Worker's exit, including after Stop replaced its Action."""
         with self._locked(task, wait=True, operation="worker finish"):
             record = self._require_unlocked(task)
-            executor = _require_executor(record, action_id, generation)
-            workers = _executor_workers(executor)
-            if not workers:
-                return deepcopy(record)
-            matching = [worker for worker in workers if worker["pid"] == pid]
-            if len(matching) != 1 or matching[0]["process_start_token"] != process_start_token:
-                raise ActionReconciliationError("Worker completion binding does not match")
-            if "workers" in executor:
-                remaining = [worker for worker in workers if worker["pid"] != pid]
-                if remaining:
-                    executor["workers"] = remaining
-                else:
-                    executor.pop("workers")
-            else:
-                executor.pop("worker", None)
-            record["updated_at"] = _now()
-            self._write_unlocked(task, record)
-            return deepcopy(record)
+            _known_executor(record, action_id, generation)
+            try:
+                sqlite_control.finish_worker(
+                    self._repository._local.connection, task.fingerprint,
+                    action_id, generation, pid, process_start_token,
+                )
+            except ValueError as error:
+                raise ActionReconciliationError(str(error)) from error
+            return deepcopy(self._require_unlocked(task))
 
     def finish_executor(
         self,
@@ -1238,7 +1004,22 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         with self._locked(task, wait=True):
             record = self._require_unlocked(task)
-            executor = _require_executor(record, action_id, generation)
+            try:
+                executor = _require_executor(record, action_id, generation)
+            except ActionReconciliationError:
+                executor = _known_executor(record, action_id, generation)
+                if ((run_id is not None and executor.get("run_id") != run_id)
+                        or (runner_binding is not None and executor.get("runner_binding") != runner_binding)):
+                    raise ActionReconciliationError("Executor closeout Run/Runner binding 不匹配")
+                if executor.get("status") not in {"exited", "absent"}:
+                    executor["status"] = "exited"
+                    executor["exited_at"] = _now()
+                    if failure is not None:
+                        executor["failure"] = _bounded_text(failure)
+                    sqlite_control.save_executor(
+                        self._repository._local.connection, task.fingerprint, executor,
+                    )
+                return deepcopy(self._require_unlocked(task))
             action = record.get("action")
             if not isinstance(action, dict) or action.get("action_id") != action_id:
                 raise ActionReconciliationError(
@@ -1345,26 +1126,14 @@ class TaskControlStore:
                 )
             action = action_value
             executor = _require_executor(record, action_id, generation)
-            if executor.get("reconciliation_required") is True:
-                raise ActionReconciliationError(
-                    "Executor Session ownership 仅由 Run Receipt 合成；"
-                    "未证明原 Executor 已退出"
-                )
             if executor.get("status") not in {"exited", "absent"}:
                 raise ActionReconciliationError(
                     "Lifecycle Action 崩溃对账前未证明 Executor 已退出"
                 )
             receipt_run_id = application_receipt.get("run_id")
-            if action.get("run_id") is None:
-                payload = action.get("payload")
-                if not (
-                    action.get("kind") in {"approve", "resume"}
-                    and isinstance(receipt_run_id, str) and receipt_run_id
-                    and isinstance(payload, Mapping) and payload.get("run_id") == receipt_run_id
-                    and executor.get("run_id") in {None, receipt_run_id}
-                    and record.get("run_id") in {None, receipt_run_id}
-                ):
-                    raise ActionReconciliationError("未绑定的原操作缺少准确 Run 关联")
+            if (action.get("run_id") != receipt_run_id or executor.get("run_id") != receipt_run_id
+                    or record.get("run_id") != receipt_run_id or action.get("application_observed") is not True):
+                raise ActionReconciliationError("Action application has no committed Run binding")
             expected = {
                 "action_id": action_id,
                 "kind": action.get("kind"),
@@ -1416,11 +1185,6 @@ class TaskControlStore:
                 )
             action = action_value
             executor = _require_executor(record, action_id, generation)
-            if executor.get("reconciliation_required") is True:
-                raise ActionReconciliationError(
-                    "Executor Session ownership 仅由 Run Receipt 合成；"
-                    "未证明原 Executor 已退出"
-                )
             if executor.get("status") not in {"exited", "absent"}:
                 raise ActionReconciliationError(
                     "Executor Session 对账前未证明 Executor 已退出"
@@ -1540,11 +1304,14 @@ class TaskControlStore:
     def _locked(
         self, task: TaskKey, *, wait: bool = False, operation: str = "control transaction",
     ) -> Iterator[None]:
-        """Retry only acquisition for authorized work, never the transaction body.
-
-        New Action admission remains nonblocking. Waiting holds no shared lock;
-        the caller rereads and validates its exact binding after acquisition.
-        """
+        """Acquire only the short local boundary; lifecycle Actions never enter the business FIFO."""
+        if self._repository.in_transaction:
+            with self._repository.atomic():
+                yield
+            return
+        # Reject old authority before creating coordination files or dispatching work.
+        if self.path_for(task).exists():
+            self.load(task)
         deadline = monotonic() + _CONTROL_WRITE_RETRY_WINDOW_SECONDS if wait else None
         self.directory.mkdir(parents=True, exist_ok=True)
         lock_path = self.directory / f".{task.fingerprint}.lock"
@@ -1556,27 +1323,32 @@ class TaskControlStore:
                 except BlockingIOError as error:
                     remaining = deadline - monotonic() if deadline is not None else 0
                     if remaining <= 0:
-                        message = (
-                            "Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
-                            if wait else
-                            "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
-                        )
-                        raise TaskControlBusyError(f"{operation}: {message}") from error
-                    sleep(min(_CONTROL_WRITE_RETRY_INTERVAL_SECONDS, remaining))
-                    if deadline is not None and monotonic() >= deadline:
                         raise TaskControlBusyError(
-                            f"{operation}: Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
+                            f"{operation}: Delivery Task Control 短事务忙；本次未写入，请重试"
                         ) from error
+                    sleep(min(_CONTROL_WRITE_RETRY_INTERVAL_SECONDS, remaining))
             try:
-                yield
+                timeout = max(0.0, deadline - monotonic()) if deadline is not None else 0.0
+                with self._repository.atomic(timeout=timeout):
+                    yield
+            except OSError as error:
+                cause = error.__cause__
+                if not isinstance(cause, sqlite3.Error):
+                    # Business callbacks and simulated abrupt exits keep their
+                    # original failure/cleanup semantics.
+                    raise
+                if (isinstance(cause, sqlite3.Error)
+                        and getattr(cause, "sqlite_errorcode", 0) & 255
+                        in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}):
+                    raise TaskControlBusyError(
+                        f"{operation}: Delivery Task Control 短事务忙；本次未写入，请重试"
+                    ) from error
+                raise TaskControlError(f"{operation}: {error}") from error
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self, task: TaskKey) -> dict[str, Any] | None:
-        path = self.path_for(task)
-        if not path.exists():
-            return None
-        return self._read_path(path, task)
+        return self.load(task)
 
     def _require_unlocked(self, task: TaskKey) -> dict[str, Any]:
         record = self._read_unlocked(task)
@@ -1584,52 +1356,17 @@ class TaskControlStore:
             raise ActionReconciliationError("Delivery Task Control Record 不存在")
         return record
 
-    def _read_path(self, path: Path, task: TaskKey) -> dict[str, Any]:
-        try:
-            with path.open("rb") as source:
-                data = source.read(MAX_TASK_CONTROL_BYTES + 1)
-        except OSError as error:
-            raise TaskControlError(f"无法读取 Task Control Record: {path}") from error
-        if len(data) > MAX_TASK_CONTROL_BYTES:
-            raise TaskControlError("Task Control Record 超过大小上限")
-        try:
-            loaded: object = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise TaskControlError("Task Control Record 不是有效 JSON") from error
-        if not isinstance(loaded, dict):
-            raise TaskControlError("Task Control Record 必须是对象")
-        _validate_record(loaded, task)
-        return loaded
 
     def _write_unlocked(self, task: TaskKey, record: Mapping[str, Any]) -> None:
-        encoded = json.dumps(
-            record, ensure_ascii=False, indent=2, sort_keys=True
-        ).encode("utf-8")
+        if not self._repository.in_transaction:
+            raise RuntimeError("Task Control save requires a short SQLite transaction")
+        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(encoded) > MAX_TASK_CONTROL_BYTES:
             raise TaskControlError("Task Control Record 超过大小上限")
-        self.directory.mkdir(parents=True, exist_ok=True)
-        destination = self.path_for(task)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.directory,
-            prefix=f".{task.fingerprint}.",
-            suffix=".tmp",
-        )
-        temporary_path = Path(temporary_name)
         try:
-            with os.fdopen(descriptor, "wb") as temporary_file:
-                temporary_file.write(encoded)
-                temporary_file.write(b"\n")
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, destination)
-            descriptor = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
+            sqlite_control.save(self._repository._local.connection, task.fingerprint, record)
+        except (ValueError, sqlite3.Error) as error:
+            raise TaskControlError(f"Cannot persist Task Control: {error}") from error
 
 
 def _new_record(task: TaskKey) -> dict[str, Any]:
@@ -1736,50 +1473,23 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
             or not action["payload_digest"]
         ):
             raise TaskControlError("Task Control Record Action digest is invalid")
-        receipt_only = action.get("receipt_only_reconciliation") is True
-        if "receipt_only_reconciliation" in action and not receipt_only:
-            raise TaskControlError(
-                "Task Control Record receipt-only marker is invalid"
-            )
-        if receipt_only:
-            failed_operation = (
-                action.get("status") == "failed"
-                and (
-                    action.get("kind") in {"stop", "abandon", "approve"}
-                    or action.get("final_approval_operation") is True
-                )
-                and isinstance(action.get("failure"), str)
-            )
-            if (
-                "payload" in action
-                or (
-                    action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}
-                    and not failed_operation
-                )
-                or action.get("application_observed") is not True
-                or (action.get("failure") is not None and not failed_operation)
-            ):
-                raise TaskControlError(
-                    "Task Control Record receipt-only Action is invalid"
-                )
-        elif not isinstance(action.get("payload"), dict):
+        if not isinstance(action.get("payload"), dict):
             raise TaskControlError("Task Control Record Action payload is invalid")
         _positive_integer(action.get("executor_generation"))
         if action.get("run_id") is not None and not isinstance(
             action.get("run_id"), str
         ):
             raise TaskControlError("Task Control Record Action Run ID is invalid")
-        if not receipt_only:
-            try:
-                normalized_payload = _bounded_payload(action["payload"])
-            except TaskControlError as error:
-                raise TaskControlError(
-                    "Task Control Record Action payload is invalid"
-                ) from error
-            if _payload_digest(normalized_payload) != action["payload_digest"]:
-                raise TaskControlError(
-                    "Task Control Record Action payload digest is invalid"
-                )
+        try:
+            normalized_payload = _bounded_payload(action["payload"])
+        except TaskControlError as error:
+            raise TaskControlError(
+                "Task Control Record Action payload is invalid"
+            ) from error
+        if _payload_digest(normalized_payload) != action["payload_digest"]:
+            raise TaskControlError(
+                "Task Control Record Action payload digest is invalid"
+            )
         if (
             record.get("run_id") is not None
             and action.get("run_id") is not None
@@ -1800,14 +1510,6 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                     "Control Action target Executor Run ID is invalid"
                 )
     executor = record.get("executor")
-    if (
-        isinstance(action, dict)
-        and action.get("receipt_only_reconciliation") is True
-        and not isinstance(executor, dict)
-    ):
-        raise TaskControlError(
-            "Task Control Record receipt-only Action lacks Executor evidence"
-        )
     if executor is not None:
         if not isinstance(executor, dict):
             raise TaskControlError("Task Control Record Executor is invalid")
@@ -1829,26 +1531,6 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
         runner_binding = executor.get("runner_binding")
         if runner_binding is not None:
             _validate_runner_binding(runner_binding)
-        if (
-            isinstance(action, dict)
-            and action.get("receipt_only_reconciliation") is True
-        ):
-            if action.get("status") in {"completed", "failed"} and (
-                executor.get("status") != "exited"
-                or executor.get("reconciliation_required") is True
-            ):
-                raise TaskControlError(
-                    "Task Control Record completed receipt-only Action lacks "
-                    "proven Executor exit"
-                )
-            if (
-                executor.get("status") == "exited"
-                and executor.get("reconciliation_required") is not True
-                and not isinstance(runner_binding, str)
-            ):
-                raise TaskControlError(
-                    "Task Control Record receipt-only Executor lacks Runner binding"
-                )
         _executor_workers(executor)
         if isinstance(action, dict):
             if executor.get("action_id") != action.get("action_id"):
@@ -2064,7 +1746,6 @@ def _is_unapplied_successor_of_receipt(
         action.get("status") == "failed"
         and isinstance(executor, Mapping)
         and executor.get("status") in {"exited", "absent"}
-        and executor.get("reconciliation_required") is not True
     )
     if (
         (
@@ -2182,3 +1863,31 @@ def _bounded_text(value: str) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _verify_current_executor(
+    record: Mapping[str, Any], action_id: str, generation: int, run_id: str | None,
+) -> None:
+    executor = _require_executor(record, action_id, generation)
+    if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
+        raise ActionReconciliationError("Executor ownership is no longer active at Run state commit")
+    if run_id is not None and executor.get("run_id") not in {None, run_id}:
+        raise ActionReconciliationError("Executor is bound to another Delivery Run")
+    action = record.get("action")
+    if not isinstance(action, Mapping) or action.get("action_id") != action_id:
+        raise ActionReconciliationError("Executor Action is no longer the current Task Action")
+    if action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}:
+        raise ActionReconciliationError("Executor Action is no longer authorized")
+
+
+def _known_executor(record: Mapping[str, Any], action_id: str, generation: int) -> dict[str, Any]:
+    for entry in [record, *record.get("action_history", [])]:
+        action = entry.get("action")
+        candidates = [entry.get("executor")]
+        if isinstance(action, Mapping):
+            candidates.append(action.get("target_executor"))
+        for executor in candidates:
+            if (isinstance(executor, dict) and executor.get("action_id") == action_id
+                    and executor.get("generation") == generation):
+                return executor
+    raise ActionReconciliationError("Executor closeout has no exact retained ownership")

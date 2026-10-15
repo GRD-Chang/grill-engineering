@@ -1,6 +1,7 @@
 """共享存储失效场景的独立 Executor；只替换外部 Agent/Host 边界。"""
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 import json
 import os
@@ -24,6 +25,7 @@ from agent_run.executor_host import FakeExecutorHost, _process_start_token
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_lifecycle import prepare_action_application_receipt
+from agent_run.sqlite_rows import ReadConnection
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_payloads import human_blocker_step
@@ -60,9 +62,10 @@ def prepare_shared_storage(repo: Path) -> None:
 
 
 def interrupt_shared_storage(
-    repo: Path, *, storage_loss: bool, hold_reviewer_ready: bool = False,
+    repo: Path, *, fault_kind: str, hold_reviewer_ready: bool = False,
 ) -> None:
-    """运行真实并发 Reviewer/Developer，等待父进程注入持续 commit 失效。"""
+    """复用真实并发 Worker，准备完成后注入共享故障、不可读或磁盘满。"""
+    assert fault_kind in {"shared", "unavailable", "full"}
     fixture = repo / "github.json"
     states = StateStore(managed_state(repo))
     git = GitRepository(managed_repo(repo))
@@ -105,6 +108,7 @@ while True:
 ''', encoding="utf-8")
     starts: list[int] = []
     processes: list[subprocess.Popen[Any]] = []
+    tokens: dict[int, str] = {}
     real_popen = subprocess.Popen
 
     def popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
@@ -144,37 +148,74 @@ while True:
             return backend.review(request)
 
     engine = ticket_engine(git, states, fixture, Processes(repo, (3, 4, 5, 6), lambda _: None))
-    tokens: dict[int, str] = {}
-    failed_commits: list[str] = []
-    failed_control: list[str] = []
+    failed_existing: list[str] = []
+    failed_connects: list[str] = []
+    full_errors: list[int | None] = []
+    open_connections: set[int] = set()
     real_connect = sqlite3.connect
-    real_write = control._write_unlocked
     fault_path = repo / "storage-fault"
 
     class FailingConnection(sqlite3.Connection):
+        def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+            if fault_kind == "unavailable" and fault_path.exists():
+                failed_existing.append("already-open SQLite connection unavailable")
+                raise sqlite3.OperationalError(failed_existing[-1])
+            return super().execute(*args, **kwargs)
+
         def commit(self) -> None:
-            if storage_loss and fault_path.exists():
-                failed_commits.append("shared commit")
-                raise sqlite3.OperationalError("database or disk is full")
+            if fault_kind == "full" and fault_path.exists():
+                # 在真实业务事务内限制 main 数据库页数，由 SQLite 自己抛
+                # SQLITE_FULL。失败回滚必须同时撤销业务、控制与此测试表。
+                assert self.in_transaction
+                pages = self.execute("PRAGMA page_count").fetchone()[0]
+                page_bytes = self.execute("PRAGMA page_size").fetchone()[0]
+                self.execute(f"PRAGMA max_page_count = {pages}")
+                try:
+                    self.execute("CREATE TABLE storage_full_probe(value BLOB)")
+                    self.execute("INSERT INTO storage_full_probe VALUES (zeroblob(?))",
+                                 ((pages + 1) * page_bytes,))
+                except sqlite3.Error as error:
+                    full_errors.append(getattr(error, "sqlite_errorcode", None))
+                    raise
+                raise AssertionError("SQLite page limit did not reject the write")
             super().commit()
 
-    def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
-        if database == states.root / "state.sqlite3":
-            kwargs["factory"] = FailingConnection
-        return cast(sqlite3.Connection, real_connect(database, *args, **kwargs))
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                open_connections.discard(id(self))
 
-    def write(target: TaskKey, record: Any) -> None:
-        if storage_loss and fault_path.exists():
-            failed_control.append("control write")
-            raise OSError("control storage unavailable")
-        real_write(target, record)
+    class FailingReadConnection(FailingConnection, ReadConnection):
+        pass
+
+    def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        path = Path(os.fsdecode(database).removeprefix("file:").partition("?")[0])
+        if path != states.root / "state.sqlite3":
+            return cast(sqlite3.Connection, real_connect(database, *args, **kwargs))
+        if fault_kind == "unavailable" and fault_path.exists():
+            failed_connects.append("SQLite database remains unavailable")
+            raise sqlite3.OperationalError(failed_connects[-1])
+        factory = kwargs.get("factory", sqlite3.Connection)
+        kwargs["factory"] = FailingReadConnection if factory is ReadConnection else FailingConnection
+        connection = cast(sqlite3.Connection, real_connect(database, *args, **kwargs))
+        open_connections.add(id(connection))
+        return connection
 
     def supervise(_lanes: frozenset[int]) -> None:
+        if fault_kind == "unavailable":
+            # 连接先打开并成功读取；ready 后同一连接的 execute 失效。
+            # 之后准入关闭与故障诊断的新 connect 也必须失败，不能靠重新
+            # 打开控制库才能取消已经运行的 Worker。
+            with closing(connect(states.root / "state.sqlite3")) as existing:
+                existing.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
+                (repo / "storage-ready").touch()
+                wait_until(lambda: fault_path.exists())
+                existing.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
+            raise AssertionError("unavailable database unexpectedly remained readable")
+        (repo / "storage-ready").touch()
         wait_until(lambda: fault_path.exists())
-        record = control.load(task)
-        assert record is not None
-        tokens.update({worker["pid"]: worker["process_start_token"] for worker in record["executor"]["workers"]})
-        if not storage_loss:
+        if fault_kind == "shared":
             raise RuntimeError("shared execution unavailable")
         controller.record_execution_failure(run_id, "shared state save failed")
 
@@ -185,7 +226,7 @@ while True:
 
     try:
         with patch("agent_run.codex.bubblewrap_command", command), patch.object(subprocess, "Popen", popen), \
-                patch.object(sqlite3, "connect", connect), patch.object(control, "_write_unlocked", write), \
+                patch.object(sqlite3, "connect", connect), \
                 executor_admission_scope(close):
             (repo / "storage-prepared").touch()
             DeliveryExecutor(
@@ -202,7 +243,8 @@ while True:
             "process_returns": [process.poll() for process in processes],
             "live_threads": [item.name for item in threads()
                              if item.name.startswith(("ticket_", "agent-run-worker-"))],
-            "failed_commits": len(failed_commits), "failed_control": len(failed_control),
+            "failed_existing": len(failed_existing), "failed_connects": len(failed_connects),
+            "full_errors": full_errors, "open_connections": len(open_connections),
         }), encoding="utf-8")
     finally:
         for child in processes:
@@ -217,7 +259,13 @@ class IndependentResumeHost(FakeExecutorHost):
         reservation = control.begin_executor(spec.task, action_id=spec.action_id,
                                              run_id=spec.run_id, reclaim=recover)
         assert reservation.created
-        Path(os.environ["RESUME_SNAPSHOT"]).write_text(json.dumps(control.load(spec.task)))
+        record = control.load(spec.task)
+        assert record is not None
+        run_id = spec.run_id or record["action"]["payload"]["run_id"]
+        before_successor = StateStore(control.root).load_current_run(run_id)
+        Path(os.environ["RESUME_SNAPSHOT"]).write_text(json.dumps({
+            **record, "run_before_successor": before_successor,
+        }))
         spec = replace(spec, generation=reservation.generation)
         carrier = write_environment_carrier(Path(os.environ["RESUME_RUNTIME"]), spec,
             capture_executor_environment(os.environ, command=spec.command))
@@ -242,8 +290,10 @@ class IndependentResumeHost(FakeExecutorHost):
 
 if __name__ == "__main__":
     if sys.argv[1] == "interrupt":
-        interrupt_shared_storage(Path(sys.argv[2]), storage_loss=sys.argv[3] == "storage",
-                                 hold_reviewer_ready=sys.argv[3] == "ready-timeout")
+        mode = sys.argv[3]
+        interrupt_shared_storage(Path(sys.argv[2]),
+                                 fault_kind="shared" if mode == "ready-timeout" else mode,
+                                 hold_reviewer_ready=mode == "ready-timeout")
     else:
         setattr(cli, "FakeExecutorHost", IndependentResumeHost)
         raise SystemExit(cli.main(sys.argv[2:]))

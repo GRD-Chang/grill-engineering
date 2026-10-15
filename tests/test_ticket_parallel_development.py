@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from support.control_state import (
+    delete_control_fixture,
+    only_control,
+    persist_control_fixture,
+    snapshot_control,
+)
+
 import json
 from pathlib import Path
 from threading import Barrier, Event, Lock, Thread
@@ -271,7 +278,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
     assert seeded.returncode == 0, seeded.stderr
     run_id = stdout_json(seeded)["run_id"]
     states = StateStore(managed_state(git_repo))
-    control_path = next((states.root / "task-control").glob("*.json"))
+    control_path_store, control_path_task = only_control(states.root)
     run_ref = (states.root, str(run_id))
     evidence_path = git_repo / "branch-preparation-observed.json"
     observed: list[str] = []
@@ -281,12 +288,12 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
         assert preparing is not None
         assert preparing["ticket_jobs"]["2"]["phase"] == "developing"
         assert "2" not in preparing["ticket_agent_invocations"]
-        original_control = control_path.read_bytes()
+        original_control = snapshot_control(control_path_store, control_path_task)
         original_run = snapshot_run(run_ref)
         try:
             for activity in ("not_running", "running", "unknown"):
                 if activity == "unknown":
-                    control_path.unlink()
+                    delete_control_fixture(control_path_store, control_path_task)
                 else:
                     control = json.loads(original_control)
                     control["executor"].update(
@@ -294,7 +301,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
                         pid=123 if activity == "running" else control["executor"].get("pid"),
                         handshake_at="2026-09-27T00:00:00+00:00",
                     )
-                    control_path.write_text(json.dumps(control), encoding="utf-8")
+                    persist_control_fixture(control_path_store, control_path_task, control)
                 with monkeypatch.context() as host_patch:
                     if activity == "running":
                         host_patch.setattr(
@@ -304,7 +311,7 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
                             ),
                         )
                     before_control = (
-                        control_path.read_bytes() if control_path.exists() else None
+                        snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None
                     )
                     for command in ("status", "history"):
                         result = invoke_cli_inprocess(
@@ -329,10 +336,10 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
                                 "unknown": "unknown",
                             }[activity]
                     assert snapshot_run(run_ref) == original_run
-                    assert (control_path.read_bytes() if control_path.exists() else None) == before_control
+                    assert (snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None) == before_control
                     observed.append(activity)
         finally:
-            control_path.write_bytes(original_control)
+            persist_control_fixture(control_path_store, control_path_task, json.loads(original_control))
         evidence_path.write_text(json.dumps(observed), encoding="utf-8")
         raise RuntimeError("branch preparation probe complete")
 

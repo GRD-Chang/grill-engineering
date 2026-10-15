@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import os
+import subprocess
 import sys
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import replace
 from itertools import count
@@ -12,7 +16,9 @@ import pytest
 
 from support.workspace import managed_repo, managed_state
 
-from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
+from agent_run.executor_host import (
+    ExecutorSpec, ExecutorStartUnknownError, _process_start_token,
+)
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import human_next_action_for_state
 from agent_run.git import GitRepository
@@ -37,8 +43,26 @@ from support.state import persist_run_fixture
 
 
 @pytest.fixture
+def executor_process() -> Iterator[subprocess.Popen[bytes]]:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        assert process.stdin is not None
+        process.stdin.close()
+
+
+@pytest.fixture
 def completed_action(
-    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    executor_process: subprocess.Popen[bytes],
 ) -> tuple[StateStore, TaskControlStore, ExecutorSpec, SystemdUserExecutorHost, FakeSystemdTransport]:
     for name, value in _isolated_environment(tmp_path / "environment").items():
         monkeypatch.setenv(name, value)
@@ -91,13 +115,15 @@ def completed_action(
         environment=dict(os.environ), executor_python=Path(sys.executable),
     )
     assert host.ensure(spec, control).status == "starting"
+    process_token = _process_start_token(executor_process.pid)
+    assert process_token is not None
     control.mark_process_started(
         task, action_id=spec.action_id, generation=spec.generation,
-        pid=os.getpid(), process_start_token=None,
+        pid=executor_process.pid, process_start_token=process_token,
     )
     control.mark_handshake(
         task, action_id=spec.action_id, generation=spec.generation,
-        pid=os.getpid(), process_start_token=None,
+        pid=executor_process.pid, process_start_token=process_token,
     )
     record = control.load(task)
     assert record is not None
@@ -112,7 +138,7 @@ def completed_action(
         result_status=state["status"],
     )
     transport.unit = SystemdUnitObservation(
-        "running", str(transport.launches[0]["description"]), os.getpid(), None
+        "running", str(transport.launches[0]["description"]), executor_process.pid, None
     )
     assert host.inspect(spec, control).status == "running"
     return states, control, spec, host, transport
@@ -140,6 +166,7 @@ def _lifecycle(
 @pytest.mark.parametrize("native_status", ["exited", "absent"])
 def test_systemd_completed_action_exit_closes_only_its_executor(
     completed_action: tuple, native_status: str, git_repo: Path,
+    executor_process: subprocess.Popen[bytes],
 ) -> None:
     states, control, spec, host, transport = completed_action
     initial = control.load(spec.task)
@@ -148,6 +175,8 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
     worktrees = _file_snapshot(states.root / "worktrees")
     fixture = git_repo / "github.json"
     fixture_before = fixture.read_bytes()
+    executor_process.kill()
+    assert executor_process.wait(timeout=5) < 0
     transport.unit = replace(
         transport.unit, status=native_status, pid=None,
         description=transport.unit.description if native_status == "exited" else None,
@@ -167,12 +196,12 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
     assert record["executor"]["failure"] == "session_interrupted"
     assert record["executor"]["generation"] == spec.generation
     assert record["executor"]["runner_binding"] == initial["executor"]["runner_binding"]
-    control_before = control.path_for(spec.task).read_bytes()
+    control_before = snapshot_control(control, spec.task)
     states_before = snapshot_runs(states.root)
     host.inspect(spec, control)
     again, _, _ = lifecycle.submit(request)
     assert again == result
-    assert control.path_for(spec.task).read_bytes() == control_before
+    assert snapshot_control(control, spec.task) == control_before
     assert snapshot_runs(states.root) == states_before
     assert _file_snapshot(states.root / "worktrees") == worktrees
     assert fixture.read_bytes() == fixture_before
@@ -183,6 +212,7 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
 @pytest.mark.parametrize("final_status", ["completed", "run_approval_pending", "ready_for_human"])
 def test_systemd_completed_action_normal_boundary_is_preserved(
     completed_action: tuple, final_status: str,
+    executor_process: subprocess.Popen[bytes],
 ) -> None:
     states, control, spec, host, transport = completed_action
     final = states.load_current_run(spec.run_id)
@@ -191,6 +221,8 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     persist_run_fixture(states, spec.run_id, final)
     state_before = snapshot_runs(states.root)
     action_before = control.load(spec.task)["action"]
+    executor_process.kill()
+    assert executor_process.wait(timeout=5) < 0
     transport.unit = replace(transport.unit, status="exited", pid=None)
     assert host.inspect(spec, control).status == "exited"
     assert control.load(spec.task)["executor"]["status"] == "exited"
@@ -212,7 +244,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
         transport.unit = SystemdUnitObservation("unknown", None, None, "manager unavailable")
     elif native_status == "conflict":
         transport.unit = replace(transport.unit, description="another Executor")
-    control_before = control.path_for(spec.task).read_bytes()
+    control_before = snapshot_control(control, spec.task)
     state_before = snapshot_runs(states.root)
     lifecycle = _lifecycle(states, control, spec, host)
     request = LifecycleRequest(task=spec.task, kind="run", payload={"parent": 1})
@@ -222,7 +254,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
     else:
         with pytest.raises(ExecutorStartUnknownError):
             lifecycle.submit(request)
-    assert control.path_for(spec.task).read_bytes() == control_before
+    assert snapshot_control(control, spec.task) == control_before
     assert snapshot_runs(states.root) == state_before
     assert transport.start_count == 1
 
@@ -242,9 +274,9 @@ def test_systemd_completed_action_rejects_foreign_native_exit_binding(
     transport.unit = SystemdUnitObservation(
         "exited", host._description(foreign), None, "signal 9"
     )
-    before = control.path_for(spec.task).read_bytes()
+    before = snapshot_control(control, spec.task)
     assert host.inspect(spec, control).status == "conflict"
-    assert control.path_for(spec.task).read_bytes() == before
+    assert snapshot_control(control, spec.task) == before
     assert transport.start_count == 1
 
 
@@ -252,15 +284,18 @@ def test_systemd_completed_action_rejects_foreign_native_exit_binding(
 @pytest.mark.parametrize("already_exited", [False, True])
 def test_host_exit_evidence_is_checked_before_atomic_finish_or_noop(
     completed_action: tuple, binding: str, already_exited: bool,
+    executor_process: subprocess.Popen[bytes],
 ) -> None:
     _states, control, spec, _host, _transport = completed_action
     if already_exited:
+        executor_process.kill()
+        assert executor_process.wait(timeout=5) < 0
         control.finish_executor(
             spec.task, action_id=spec.action_id, generation=spec.generation,
             failure="session_interrupted",
         )
     record = control.load(spec.task)
-    before = control.path_for(spec.task).read_bytes()
+    before = snapshot_control(control, spec.task)
     with pytest.raises(ActionReconciliationError, match="Run/Runner binding"):
         control.finish_executor(
             spec.task, action_id=spec.action_id, generation=spec.generation,
@@ -270,4 +305,4 @@ def test_host_exit_evidence_is_checked_before_atomic_finish_or_noop(
             ),
             failure="late Host proof",
         )
-    assert control.path_for(spec.task).read_bytes() == before
+    assert snapshot_control(control, spec.task) == before

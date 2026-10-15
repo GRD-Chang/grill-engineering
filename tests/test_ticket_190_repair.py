@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import only_control
+
 import json
 import os
 import subprocess
@@ -128,6 +130,8 @@ elif role == "first":
     fcntl.flock = observed_flock
 
 elif role == "second":
+    from support.control_state import hold_control_lock
+
     original_locked = TaskControlStore._locked
     hold_state = {"used": False, "initial_contention": False}
 
@@ -140,7 +144,7 @@ elif role == "second":
                 hold_state["initial_contention"] = True
                 # Force the startup race once using the real nonblocking lock.
                 # A second open must contend even within the same process.
-                with original_locked(self, task):
+                with hold_control_lock(self, task):
                     with manager:
                         raise AssertionError("Task Control lock admitted a competing holder")
             with manager:
@@ -223,7 +227,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     environment = _isolated_environment(tmp_path / "generation")
     source_path = str(Path(__file__).resolve().parents[1] / "src")
     environment.update({
-        "PYTHONPATH": f"{sitecustomize}{os.pathsep}{source_path}",
+        "PYTHONPATH": f"{sitecustomize}{os.pathsep}{source_path}{os.pathsep}{Path(__file__).parent}",
         "TICKET_190_ROLE": "replacement",
         "TICKET_190_AGENT_STARTED": str(started),
         "TICKET_190_EXECUTOR_PARKED": str(parked),
@@ -257,8 +261,8 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         state_ref = only_run_ref(workspace.state_root)
         control = TaskControlStore(workspace.state_root)
         task = TaskKey(workspace.repository_root, "example/project", 1)
-        control_path = next((workspace.state_root / "task-control").glob("*.json"))
-        record = json.loads(control_path.read_text(encoding="utf-8"))
+        control_path_store, control_path_task = only_control(workspace.state_root)
+        record = control_path_store.load(control_path_task)
         action_id = record["action"]["action_id"]
         generation = record["executor"]["generation"]
         state_before_release = snapshot_run(state_ref)
@@ -295,7 +299,26 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         release.touch()
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode == 2, f"{stdout}\n{stderr}"
-        assert snapshot_run(state_ref) == state_before_release
+        before_release = json.loads(state_before_release)
+        after_release = read_run(state_ref)
+        # Revocation still prevents stage/budget/checkout advancement. The
+        # already admitted Invocation may synchronize its exact factual history.
+        expected = dict(before_release)
+        invocation = after_release["active_agent_invocation"]
+        expected_invocation = dict(before_release["active_agent_invocation"])
+        expected_invocation["execution_segments"] = invocation["execution_segments"]
+        assert invocation == expected_invocation
+        previous_segments = before_release["active_agent_invocation"]["execution_segments"]
+        assert invocation["execution_segments"][:len(previous_segments)] == previous_segments
+        assert len(invocation["execution_segments"]) <= len(previous_segments) + 1
+        expected["active_agent_invocation"] = invocation
+        expected["ticket_agent_invocations"] = {
+            **before_release["ticket_agent_invocations"], "3": invocation,
+        }
+        expected["agent_invocation_history"] = after_release["agent_invocation_history"]
+        expected["timeline"] = after_release["timeline"]
+        assert after_release == expected
+        assert after_release["agent_invocation_history"] == [invocation]
         assert fixture.read_bytes() == fixture_before_release
         assert agents.read_bytes() == agents_before_release
         assert {
@@ -357,7 +380,7 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
     source_path = str(Path(__file__).resolve().parents[1] / "src")
     base_environment = _isolated_environment(tmp_path / "cli-race")
     base_environment["PYTHONPATH"] = (
-        f"{sitecustomize}{os.pathsep}{source_path}"
+        f"{sitecustomize}{os.pathsep}{source_path}{os.pathsep}{Path(__file__).parent}"
     )
     workspace = managed_workspace(git_repo, extra_env=base_environment)
     command = [
@@ -419,10 +442,8 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
             stderr=subprocess.PIPE,
         )
         _wait_for_marker(second, holder)
-        control_path = next(
-            (workspace.state_root / "task-control").glob("*.json")
-        )
-        record_before = json.loads(control_path.read_text(encoding="utf-8"))
+        control_path_store, control_path_task = only_control(workspace.state_root)
+        record_before = control_path_store.load(control_path_task)
         executor_before = record_before["executor"]
         assert executor_before["status"] == "running"
         agent_release.touch()
@@ -435,13 +456,10 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
         assert not holder_error.exists()
 
         run_records = run_refs(workspace.state_root)
-        control_files = list(
-            (workspace.state_root / "task-control").glob("*.json")
-        )
         assert len(run_records) == 1
-        assert len(control_files) == 1
         state = read_run(run_records[0])
-        record = json.loads(control_files[0].read_text(encoding="utf-8"))
+        control_path_store, control_path_task = only_control(workspace.state_root)
+        record = control_path_store.load(control_path_task)
         assert state["status"] not in {"completed", "abandoned"}
         assert state["status"] != "execution_failed"
         assert record["action"]["status"] == "completed"

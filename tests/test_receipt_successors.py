@@ -1,6 +1,10 @@
-"""Production CLI admission with unavailable Control and a durable Run receipt."""
+"""控制缺失时拒绝 Receipt 重建；完整控制保留后继和 Host 未知结果。"""
 
 from __future__ import annotations
+
+from support.control_state import (
+    corrupt_control_fixture, delete_control_fixture, raw_control_snapshot, snapshot_control,
+)
 
 from support.receipt_host import (
     _install_host,
@@ -19,8 +23,8 @@ from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state_contract import require_current_run_state
 from agent_run.state import StateStore
-from agent_run.task_control import TaskControlStore, TaskKey, payload_digest
-from support.seeding import seed_run, write_fixture
+from agent_run.task_control import ActionBusyError, TaskControlStore, TaskKey, payload_digest
+from support.seeding import seed_idle_control, seed_run, write_fixture
 from support.cli import load_only_run_state
 from support.run_artifacts import _canonical_run_budget
 
@@ -37,15 +41,13 @@ def isolated_environment(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
 @pytest.mark.parametrize("command", ["approve", "revise", "requeue"])
 @pytest.mark.parametrize("intent", ["repeat", "repeat_ready", "successor"])
-def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
+def test_dedicated_actions_cannot_rebuild_control_from_exact_receipt(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     control_case: str,
-    host_status: str,
     command: str,
     intent: str,
 ) -> None:
@@ -95,21 +97,20 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
             ]
     require_current_run_state(state)
     persist_run_fixture(StateStore(state_root), run_id, state)
-    old_generation = receipt["executor_generation"]
-    control_path = control.path_for(task)
     if control_case == "missing":
-        control_path.unlink()
+        delete_control_fixture(control, task)
     else:
-        control_path.write_text("not json", encoding="utf-8")
+        corrupt_control_fixture(control, task)
 
-    host = _install_host(git_repo, fixture, monkeypatch, host_status)
+    host = _install_host(git_repo, fixture, monkeypatch, "exited")
+    monkeypatch.setattr(host, "observe", lambda *_: pytest.fail("缺失控制权威不得查询 Host"))
     arguments = [command, run_id, "--repo", "example/project", "--json"]
     if command == "revise":
         arguments.extend(["--message", "apply this exact revision"])
     state_ref = (state_root, str(run_id))
     state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
-    control_before = control_path.read_bytes() if control_path.exists() else None
+    control_before = raw_control_snapshot(control, task)
 
     # Ordinary run cannot turn the dedicated boundary into new authorization.
     if intent == "successor":
@@ -117,71 +118,21 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         capsys.readouterr()
         assert host.start_count == 0
         assert snapshot_run(state_ref) == state_before
-        # A read-only refusal may leave the missing/corrupt evidence intact.
-        assert (
-            control_path.read_bytes() if control_path.exists() else None
-        ) == control_before
+        assert raw_control_snapshot(control, task) == control_before
 
-    code = cli_module.main(arguments)
-    output = json.loads(capsys.readouterr().out)
-    assert host.observed, output
-    assert all(
-        spec.action_id == receipt["action_id"] and spec.generation == old_generation
-        for spec in host.observed
-    )
-    assert snapshot_run(state_ref) == state_before
-    assert fixture.read_bytes() == fixture_before
-    repaired = control.load(task)
-    assert repaired is not None
-    if host_status != "exited":
+    for _attempt in range(2):
+        code = cli_module.main(arguments)
+        output = json.loads(capsys.readouterr().out)
         assert code == 2, output
         assert host.start_count == 0
-        assert repaired["action"]["action_id"] == receipt["action_id"]
-        assert repaired["next_generation"] == old_generation + 1
-        before_retry = control_path.read_bytes()
-        assert cli_module.main(arguments) == 2
-        capsys.readouterr()
-        assert host.start_count == 0
-        assert len(host.observed) == 2
-        assert control_path.read_bytes() == before_retry
+        assert host.observed == []
+        assert raw_control_snapshot(control, task) == control_before
         assert snapshot_run(state_ref) == state_before
         assert fixture.read_bytes() == fixture_before
-        return
-
-    if intent.startswith("repeat"):
-        assert code == 2, output
-        assert output["action"]["submission"] == "attached"
-        assert host.start_count == 0
-        assert repaired["action"]["action_id"] == receipt["action_id"]
-        # Saving approval is not completion: this receipt has no successful
-        # merge and closeout, so its stopped final operation must fail closed.
-        assert repaired["action"]["status"] == (
-            "failed" if command == "approve" else "completed"
-        )
-    else:
-        assert code == 2, output
-        assert host.start_count == 1
-        assert repaired["action"]["kind"] == command
-        assert repaired["action"]["executor_generation"] == old_generation + 1
-        assert repaired["action"]["payload"] == payload
-        predecessors = [
-            entry["action"]
-            for entry in repaired["action_history"]
-            if entry["action"]["action_id"] == receipt["action_id"]
-        ]
-        assert len(predecessors) == 1
-        assert predecessors[0]["status"] == "completed"
-    before_retry = control_path.read_bytes()
-    assert cli_module.main(arguments) == 2
-    capsys.readouterr()
-    assert host.start_count == (1 if intent == "successor" else 0)
-    assert control_path.read_bytes() == before_retry
-    assert snapshot_run(state_ref) == state_before
-    assert fixture.read_bytes() == fixture_before
 
 
 @pytest.mark.parametrize("command", ["approve", "revise", "requeue"])
-def test_recovered_receipt_successor_executes_the_real_cli_action(
+def test_intact_control_successor_executes_the_real_cli_action(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -215,7 +166,8 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
     receipt = state["action_application_receipt"]
     control = TaskControlStore(managed_state(git_repo))
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
-    control.path_for(task).write_text("not json", encoding="utf-8")
+    predecessor_control = control.load(task)
+    assert predecessor_control is not None
     host = _install_host(git_repo, fixture, monkeypatch, "exited", launch_unknown=False)
     arguments = [
         command,
@@ -261,7 +213,7 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
     for field in ("action_id", "kind", "payload_digest", "run_id", "executor_generation"):
         assert predecessor["action"][field] == receipt[field]
     assert predecessor["executor"]["status"] == "exited"
-    assert predecessor["executor"]["runner_binding"] == "0" * 16
+    assert predecessor["executor"] == predecessor_control["executor"]
     if command == "requeue":
         assert predecessor["action"]["kind"] == "approve"
         assert predecessor["action"]["result_status"] == "requeue_required"
@@ -279,7 +231,7 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
 
 
 @pytest.mark.parametrize("original_command", ["approve", "revise", "requeue"])
-def test_original_retry_unknown_then_different_successor_reconciles_again(
+def test_unknown_host_launch_retains_intent_and_rejects_different_action(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -289,44 +241,56 @@ def test_original_retry_unknown_then_different_successor_reconciles_again(
     assert seed_run(git_repo, fixture).returncode == 0
     state = load_only_run_state(git_repo)
     run_id = str(state["run_id"])
-    payload = {"parent": 1, "run_id": run_id}
-    if original_command == "revise":
-        payload["message"] = "original revision"
     control = TaskControlStore(managed_state(git_repo))
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
-    original = control.claim_action(task, kind=original_command, payload=payload)
-    prepare_action_application_receipt(state, original.action)
-    state.update({"status": "run_approval_pending", "terminal_kind": None})
+    seed_idle_control(control, task, run_id)
+    state.update(status="run_approval_pending", terminal_kind=None)
+    if original_command == "requeue":
+        state.update(status="requeue_required")
+        state["parent_job"] = {
+            "parent_generation": 1, "phase": "pending",
+            "review_budget": _canonical_run_budget(), "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
+        }
+        state["requeue_required"] = {
+            "work_subject": f"parent-only:{run_id}", "generation": 1,
+            "reason": "parent_requirements_changed",
+        }
+        state["diagnostics"] = [{"code": "parent_requirements_changed", "message": "changed"}]
     persist_run_fixture(StateStore(managed_state(git_repo)), run_id, state)
-    control.path_for(task).unlink()
+    state_before = snapshot_run((control.root, run_id))
+    fixture_before = fixture.read_bytes()
     first_host = _install_host(git_repo, fixture, monkeypatch, "unknown")
     arguments = [original_command, run_id, "--repo", "example/project", "--json"]
     if original_command == "revise":
         arguments.extend(["--message", "original revision"])
     assert cli_module.main(arguments) == 2
     capsys.readouterr()
-    assert first_host.start_count == 0
-    recovered = control.load(task)
-    assert recovered is not None
-    assert recovered["action"]["payload"] == payload
-    assert recovered["action"]["action_id"] == original.action["action_id"]
+    assert first_host.start_count == 1
+    original = control.load(task)
+    assert original is not None
+    assert original["action"]["kind"] == original_command
+    assert original["executor"]["status"] == "starting"
+    assert snapshot_run((control.root, run_id)) == state_before
+    before_retry = snapshot_control(control, task)
+    assert cli_module.main(arguments) == 2
+    capsys.readouterr()
+    assert first_host.start_count == 1
+    assert snapshot_control(control, task) == before_retry
     successor = "approve" if original_command == "revise" else "revise"
     successor_arguments = [successor, run_id, "--repo", "example/project", "--json"]
     if successor == "revise":
         successor_arguments.extend(["--message", "authorized next revision"])
+    with pytest.raises(ActionBusyError):
+        control.claim_action(task, kind=successor, payload={"run_id": run_id})
     host = _install_host(git_repo, fixture, monkeypatch, "exited")
     assert cli_module.main(successor_arguments) == 2
     output = json.loads(capsys.readouterr().out)
-    assert host.start_count == 1, output
-    repaired = control.load(task)
-    assert repaired is not None
-    assert repaired["action"]["kind"] == successor
-    assert (
-        repaired["action"]["executor_generation"]
-        == original.action["executor_generation"] + 1
-    )
-    before_retry = control.path_for(task).read_bytes()
+    assert host.start_count == 0, output
+    assert snapshot_control(control, task) == before_retry
     assert cli_module.main(successor_arguments) == 2
     capsys.readouterr()
-    assert host.start_count == 1
-    assert control.path_for(task).read_bytes() == before_retry
+    assert host.start_count == 0
+    assert snapshot_control(control, task) == before_retry
+    assert snapshot_run((control.root, run_id)) == state_before
+    assert fixture.read_bytes() == fixture_before

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ def test_final_approval_holds_admission_until_delivery_finishes(
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     seed_idle_control(control, task, "run-1")
 
     def execute(_run_id: str) -> Mapping[str, Any]:
@@ -81,6 +84,7 @@ def test_parent_update_releases_admission_and_preserves_executor(
         },
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     seed_idle_control(control, task, "run-1")
     host = FakeExecutorHost()
     binding: tuple[str, int] | None = None
@@ -122,7 +126,7 @@ def test_parent_update_releases_admission_and_preserves_executor(
             # Exercise the same admission transaction used by public Stop.
             stop = control.claim_control_action(
                 task, kind="stop", payload={"parent": 156, "run_id": run_id},
-                run_id=run_id, state_dir=tmp_path / "states",
+                run_id=run_id, state_dir=control.root,
             )
             assert stop is not None and stop.target_executor is not None
             assert stop.target_executor["action_id"] == binding[0]
@@ -172,6 +176,7 @@ def test_resume_reconciles_saved_update_before_starting_a_successor(
         "parent_job": {"phase": "accepted", "approval_update": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     claim = control.claim_action(
         task, kind=original_kind, payload={"parent": 156, "run_id": "run-1"},
     )
@@ -256,6 +261,7 @@ def test_resume_closes_an_exited_unfinished_approval_as_failed_before_continuing
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     claim = control.claim_action(
         task, kind="approve", payload={"parent": 156, "run_id": "run-1"}
     )
@@ -301,6 +307,7 @@ def test_resume_stops_when_refresh_invalidates_the_original_approval(tmp_path: P
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     seed_idle_control(control, task, "run-1")
 
     def select(_action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -333,6 +340,7 @@ def test_failed_approval_cannot_resume_while_its_executor_is_still_alive(tmp_pat
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
+    states.root = control.root
     claim = control.claim_action(
         task, kind="approve", payload={"parent": 156, "run_id": "run-1"}
     )
@@ -354,10 +362,10 @@ def test_failed_approval_cannot_resume_while_its_executor_is_still_alive(tmp_pat
         ),
         execute=lambda _run_id: pytest.fail("must not start a second Executor"),
     )
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     with pytest.raises(ActionBusyError):
         lifecycle.submit(LifecycleRequest(task, "resume", {"parent": 156, "run_id": "run-1"}))
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
     assert host.start_count == 1
 
 
@@ -379,10 +387,10 @@ def test_unbound_approval_reconciliation_rejects_a_foreign_receipt(
     control.fail_action(task, action_id=claim.action_id, failure="process exited")
     receipt = state["action_application_receipt"]
     receipt[wrong_field] = 2 if wrong_field == "executor_generation" else "foreign"
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     with pytest.raises(ActionReconciliationError):
         control.complete_action_from_application_receipt(
             task, action_id=claim.action_id, generation=reservation.generation,
             application_receipt=receipt, result_status="completed",
         )
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before

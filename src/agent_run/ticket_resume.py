@@ -72,7 +72,7 @@ def admit_ticket_resume(
         with control.ticket_resume_transaction(
             task, action_id=str(executor['action_id']),
             generation=int(executor['generation']), run_id=run_id,
-        ), states.locked():
+        ):
             latest = states.load_work_run(run_id, number)
             if latest is None:
                 raise ResumeIntentError('Delivery Run 已不存在')

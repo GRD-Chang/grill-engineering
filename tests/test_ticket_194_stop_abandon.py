@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.control_state import persist_control_fixture, raw_control_snapshot, snapshot_control
+
+
 from support.control import (
     _ControlReceiptHost,
     _bind_running_executor,
@@ -108,7 +111,7 @@ def test_identical_unresolved_stop_attaches_without_a_second_action(
     )
     first_record = control.load(task)
     assert first_record is not None
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
 
     repeated = control.claim_control_action(
         task,
@@ -121,7 +124,7 @@ def test_identical_unresolved_stop_attaches_without_a_second_action(
     assert repeated.attached
     assert repeated.action_id == first.action_id
     assert repeated.target_executor == first.target_executor
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
     record = control.load(task)
     assert record is not None
     assert record["action"]["action_id"] == first.action_id
@@ -137,7 +140,7 @@ def test_stop_rejects_action_accepted_before_executor(tmp_path: Path) -> None:
     control = TaskControlStore(tmp_path / "control")
     old = control.claim_action(task, kind="run", payload={"parent": 194})
     assert old.action_id is not None
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
 
     with pytest.raises(ActionBusyError, match="不会等待或排队"):
         control.claim_control_action(
@@ -145,12 +148,12 @@ def test_stop_rejects_action_accepted_before_executor(tmp_path: Path) -> None:
             kind="stop",
             payload={"parent": 194, "run_id": "run-194"},
             run_id="run-194",
-            state_dir=tmp_path / "state",
+            state_dir=control.root,
         )
 
     record = control.load(task)
     assert record is not None
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
     assert record["action"]["action_id"] == old.action_id
     assert record["action"]["status"] == "accepted"
     assert record["action_history"] == []
@@ -189,7 +192,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     )
     state_ref = (states.root, str(run_id))
     before_state = snapshot_run(state_ref)
-    before_control = control.path_for(task).read_bytes()
+    before_control = snapshot_control(control, task)
     entered = threading.Barrier(2, timeout=5)
     release = threading.Event()
     original_preflight = lifecycle.preflight
@@ -219,7 +222,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     try:
         entered.wait()
         assert snapshot_run(state_ref) == before_state
-        assert control.path_for(task).read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
     except BaseException:
         entered.abort()
         raise
@@ -231,7 +234,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     assert len(failures) == 1
     assert isinstance(failures[0], ActionBusyError)
     assert snapshot_run(state_ref) == before_state
-    assert control.path_for(task).read_bytes() == before_control
+    assert snapshot_control(control, task) == before_control
     assert host.start_count == 0
     record = control.load(task)
     assert record is not None
@@ -306,14 +309,14 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     assert durable["action_application_receipt"]["kind"] == "stop"
     state_ref = (states.root, str(run_id))
     before_state = snapshot_run(state_ref)
-    before_control = control.path_for(task).read_bytes()
+    before_control = snapshot_control(control, task)
 
     repeated = _run_cli(git_repo, fixture, "stop", run_id)
 
     assert repeated.returncode == 0, repeated.stderr
     assert json.loads(repeated.stdout)["status"] == "operator_stopped"
     assert snapshot_run(state_ref) == before_state
-    assert control.path_for(task).read_bytes() == before_control
+    assert snapshot_control(control, task) == before_control
 
     assert cli_surface._resume_is_ready(durable)
     resumed_result = _run_cli(
@@ -331,7 +334,7 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     assert "operator_stop" not in resumed
     assert resumed["resume_audit"]["history"][-1]["kind"] == "operator_stopped"
     resumed_state = snapshot_run(state_ref)
-    resumed_control = control.path_for(task).read_bytes()
+    resumed_control = snapshot_control(control, task)
 
     no_active_executor = _run_cli(git_repo, fixture, "stop", run_id)
 
@@ -340,7 +343,7 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     assert no_active_payload["status"] == "operator_stopped"
     assert no_active_payload["action"]["operation"] == "stop"
     assert snapshot_run(state_ref) != resumed_state
-    assert control.path_for(task).read_bytes() != resumed_control
+    assert snapshot_control(control, task) != resumed_control
 
 
 @pytest.mark.parametrize(
@@ -461,7 +464,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
 
         state_before_run = states.load_run(run_id)
         assert state_before_run is not None
-        control_before_run = control.path_for(task).read_bytes()
+        control_before_run = snapshot_control(control, task)
         ordinary_run = _run_cli(git_repo, fixture, "run", "1")
         assert ordinary_run.returncode == 2
         assert json.loads(ordinary_run.stdout)["status"] == expected_safe_status
@@ -469,7 +472,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
         assert state_after_run is not None
         for field in ("status", "parent_job", "active_agent_invocation"):
             assert state_after_run.get(field) == state_before_run.get(field)
-        assert control.path_for(task).read_bytes() == control_before_run
+        assert snapshot_control(control, task) == control_before_run
 
         state_ref = (states.root, str(run_id))
         state_bytes = snapshot_run(state_ref)
@@ -561,7 +564,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
                     "readiness": 0,
                 }
                 assert snapshot_run(state_ref) == state_bytes
-                assert control.path_for(task).read_bytes() == control_before_run
+                assert snapshot_control(control, task) == control_before_run
                 assert fixture.read_bytes() == fixture_bytes
 
         if kind == "abandon":
@@ -664,6 +667,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
             path: path.read_bytes() for path in states.root.rglob("*.json")
         }
         runs_before = snapshot_runs(states.root)
+        control_before = raw_control_snapshot(control, task)
         for command in ("status", "history"):
             assert cli_module.main([command, run_id, "--json"]) == 0
             view = json.loads(capsys.readouterr().out)
@@ -672,6 +676,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
                 path: path.read_bytes() for path in states.root.rglob("*.json")
             } == before
             assert snapshot_runs(states.root) == runs_before
+            assert raw_control_snapshot(control, task) == control_before
 
     def target_identity(target: Mapping[str, Any]) -> tuple[int, str]:
         target_worker = target.get("worker")
@@ -860,9 +865,7 @@ def test_unresolved_target_blocks_successors_and_run_id_drift(
                 "failure": "Worker ownership cannot be confirmed",
             }
         )
-        control.path_for(task).write_text(
-            json.dumps(record, ensure_ascii=False), encoding="utf-8"
-        )
+        persist_control_fixture(control, task, record)
 
         with pytest.raises(ActionReconciliationError, match="目标 ownership 尚未收口"):
             control.claim_action(
@@ -871,17 +874,20 @@ def test_unresolved_target_blocks_successors_and_run_id_drift(
                 payload={"parent": 1, "run_id": run_id},
             )
 
+        # Current and target references identify one relation. An inconsistent
+        # duplicate view must be rejected before it can become durable state.
+        before = snapshot_control(control, task)
+        action["target_executor"] = dict(action["target_executor"])
         action["target_executor"]["run_id"] = "run-from-another-generation"
-        control.path_for(task).write_text(
-            json.dumps(record, ensure_ascii=False), encoding="utf-8"
-        )
-
-        with pytest.raises(TaskControlError, match="target Executor Run ID"):
+        with pytest.raises(ValueError, match="conflict|inconsistent|contradict"):
+            persist_control_fixture(control, task, record)
+        assert snapshot_control(control, task) == before
+        with pytest.raises(ActionReconciliationError, match="Run binding"):
             control.claim_control_action(
                 task,
                 kind="stop",
-                payload={"parent": 1, "run_id": run_id},
-                run_id=run_id,
+                payload={"parent": 1, "run_id": "run-from-another-generation"},
+                run_id="run-from-another-generation",
                 state_dir=states.root,
             )
         assert worker.poll() is None
@@ -1786,9 +1792,8 @@ def test_stop_proven_no_active_observations_admit_pause_action(
         process.kill()
         process.wait(timeout=3)
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     before_state = snapshot_run(state_ref)
-    before_control = control_path.read_bytes()
+    before_control = snapshot_control(control, task)
 
     final, _resumed, receipt = _control_lifecycle(
         states=states,
@@ -1808,7 +1813,7 @@ def test_stop_proven_no_active_observations_admit_pause_action(
     assert receipt is not None and receipt.kind == "stop"
     assert snapshot_run(state_ref) != before_state
     assert states.load_run(run_id)["action_application_receipt"]["kind"] == "stop"
-    assert control_path.read_bytes() != before_control
+    assert snapshot_control(control, task) != before_control
 
 
 def test_stop_unknown_host_observation_rejects_without_partial_mutation(
@@ -1872,9 +1877,8 @@ def test_stop_unknown_host_observation_rejects_without_partial_mutation(
         result_status=str(current["status"]),
     )
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     before_state = snapshot_run(state_ref)
-    before_control = control_path.read_bytes()
+    before_control = snapshot_control(control, task)
 
     with pytest.raises(ExecutorStartUnknownError, match="permission denied"):
         _control_lifecycle(
@@ -1892,7 +1896,7 @@ def test_stop_unknown_host_observation_rejects_without_partial_mutation(
         )
 
     assert snapshot_run(state_ref) == before_state
-    assert control_path.read_bytes() == before_control
+    assert snapshot_control(control, task) == before_control
 
 
 def test_stop_admission_rechecks_executor_exit_after_running_observation(
@@ -1948,7 +1952,6 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
             failure.append(error)
 
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     worker.kill()
     worker.wait(timeout=3)
     submitter = threading.Thread(target=submit_stop)
@@ -1965,7 +1968,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
             generation=int(executor["generation"]),
         )
         after_exit_state = snapshot_run(state_ref)
-        after_exit_control = control_path.read_bytes()
+        after_exit_control = snapshot_control(control, task)
         after_exit_record = control.load(task)
         assert after_exit_record is not None
         after_exit_history = after_exit_record.get("action_history")
@@ -1980,7 +1983,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
         assert final["status"] == "completed"
         assert cli_module.cli_presentation._next_action(final) == "无"
         assert snapshot_run(state_ref) == after_exit_state
-        assert control_path.read_bytes() == after_exit_control
+        assert snapshot_control(control, task) == after_exit_control
         final_record = control.load(task)
         assert final_record is not None
         assert final_record.get("action") == after_exit_action
@@ -2049,7 +2052,6 @@ def test_public_stop_reloads_state_after_executor_exit(
     executor = record["executor"]
     assert isinstance(executor, dict)
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: True)
     monkeypatch.setattr(cli_module, "SystemdUserExecutorHost", ExitBarrierHost)
@@ -2075,7 +2077,7 @@ def test_public_stop_reloads_state_after_executor_exit(
                 generation=int(executor["generation"]),
             )
         after_exit_state = snapshot_run(state_ref)
-        after_exit_control = control_path.read_bytes()
+        after_exit_control = snapshot_control(control, task)
         release.set()
         submitter.join(timeout=3)
         assert not submitter.is_alive()
@@ -2103,7 +2105,7 @@ def test_public_stop_reloads_state_after_executor_exit(
             assert "agent-run resume 1 --repo example/project" in captured.out
         if becomes_terminal:
             assert snapshot_run(state_ref) == after_exit_state
-            assert control_path.read_bytes() == after_exit_control
+            assert snapshot_control(control, task) == after_exit_control
         else:
             assert states.load_run(run_id)["status"] == "operator_stopped"
     finally:
@@ -2269,7 +2271,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
         assert result == [None]
         state_ref = (states.root, str(run_id))
         before_state = snapshot_run(state_ref)
-        before_control = control.path_for(task).read_bytes()
+        before_control = snapshot_control(control, task)
 
         with pytest.raises(ActionBusyError, match="不会等待或排队"):
             _control_lifecycle(
@@ -2287,7 +2289,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
             )
 
         assert snapshot_run(state_ref) == before_state
-        assert control.path_for(task).read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
         reservation = control.begin_executor(
             task, action_id=resume.action_id, run_id=run_id
         )
@@ -2381,9 +2383,8 @@ def test_production_read_only_stop_skips_execution_dependencies(
             cli_module, "SystemdUserExecutorHost", AvailableSystemdHost
         )
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     before_state = snapshot_run(state_ref)
-    before_control = control_path.read_bytes()
+    before_control = snapshot_control(control, task)
 
     try:
         return_code = cli_module.main(
@@ -2400,7 +2401,7 @@ def test_production_read_only_stop_skips_execution_dependencies(
             assert output["diagnostics"][-1]["code"] == "execution_readiness"
         assert "action" not in output
         assert snapshot_run(state_ref) == before_state
-        assert control_path.read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
     finally:
         if worker_still_running:
             worker.kill()
@@ -2421,9 +2422,8 @@ def test_production_stop_with_active_executor_still_requires_readiness(
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     before_state = snapshot_run(state_ref)
-    before_control = control_path.read_bytes()
+    before_control = snapshot_control(control, task)
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: False)
     try:
@@ -2435,7 +2435,7 @@ def test_production_stop_with_active_executor_still_requires_readiness(
         output = json.loads(capsys.readouterr().out)
         assert output["result"] == "error"
         assert snapshot_run(state_ref) == before_state
-        assert control_path.read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
     finally:
         worker.kill()
         worker.wait(timeout=3)
@@ -2459,9 +2459,8 @@ def test_production_stop_rejects_pending_action_before_execution_readiness(
     control = TaskControlStore(managed_state(git_repo))
     control.claim_action(task, kind=pending_kind, payload={"parent": 1})
     state_ref = (states.root, str(run_id))
-    control_path = control.path_for(task)
     before_state = snapshot_run(state_ref)
-    before_control = control_path.read_bytes()
+    before_control = snapshot_control(control, task)
     readiness_checks: list[bool] = []
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr(
@@ -2479,7 +2478,7 @@ def test_production_stop_rejects_pending_action_before_execution_readiness(
     assert output["diagnostics"][-1]["code"] == "action_busy"
     assert readiness_checks == []
     assert snapshot_run(state_ref) == before_state
-    assert control_path.read_bytes() == before_control
+    assert snapshot_control(control, task) == before_control
 
 
 def test_terminal_abandon_replay_completes_its_applying_control_action(

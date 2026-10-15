@@ -29,6 +29,11 @@ def main() -> None:
         credentials.mkdir(mode=0o700, parents=True)
         name, source = properties["LoadCredential"].split(":", 1)
         shutil.copyfile(source.replace("%%", "%"), credentials / name)
+        # Expiry belongs to startup consumption; the manager's bound copy must
+        # remain usable after a long Session without waiting thirty seconds.
+        material = json.loads((credentials / name).read_text())
+        material["expires_at"] = 0
+        (credentials / name).write_text(json.dumps(material))
         (credentials / name).chmod(0o400)
     notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     notify.settimeout(5)
@@ -45,13 +50,21 @@ def main() -> None:
                .replace("${XDG_RUNTIME_DIR}", str(root))
                for arg in launch["command"]]
     module = command.index("-m")
-    command[module:module + 2] = ["-c", f"EXPECTED_CREDENTIALS = {str(credentials)!r}\n" + """import json, os, subprocess, sys, tempfile
+    command[module:module + 2] = ["-c", f"EXPECTED_CREDENTIALS = {str(credentials)!r}\n" + """import sys
+from agent_run.executor_bootstrap import reexec_for_runtime
+reexec_for_runtime('agent_run.executor')
+import json, os, sqlite3, subprocess, tempfile
+from contextlib import closing
 from pathlib import Path
 import agent_run.cli as cli
 import agent_run.executor as executor
 from agent_run.codex import _worker_hidden_paths
 from agent_run.executor_exit import CREDENTIAL
 from agent_run.worker_sandbox import bubblewrap_command, worker_environment
+from agent_run.sqlite_runtime import require_wal_runtime
+require_wal_runtime()
+with closing(sqlite3.connect(':memory:')):
+    pass
 def controlled(args):
     credentials = Path(EXPECTED_CREDENTIALS)
     assert os.environ['AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY'] == str(credentials.parent.parent)
@@ -113,7 +126,8 @@ raise SystemExit(executor.main(sys.argv[1:]))
                       "EXIT_STATUS": signal.Signals(-code).name.removeprefix("SIG") if code < 0 else str(code),
                       "CREDENTIALS_DIRECTORY": str(credentials)}
             command = shlex.split(hook.removeprefix("-:").replace("%%", "%"))
-            result = subprocess.run(command, env={**os.environ, **native}, timeout=70, check=False)
+            hook_environment = {key: value for key, value in os.environ.items() if key != 'LD_LIBRARY_PATH'}
+            result = subprocess.run(command, env={**hook_environment, **native}, timeout=70, check=False)
             (root / "hook-code").write_text(str(result.returncode))
     finally:
         if executor.poll() is None:

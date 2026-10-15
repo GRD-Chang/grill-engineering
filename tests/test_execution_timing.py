@@ -216,7 +216,9 @@ def test_parallel_subjects_are_summed_without_using_wall_clock_or_timeline_capac
 
 def test_successor_persists_predecessor_for_gap_detection() -> None:
     first = invocation(status="failed")
-    state: dict[str, Any] = {"active_agent_invocation": first, "agent_invocation_history": [first]}
+    state: dict[str, Any] = {
+        "run_id": "r", "active_agent_invocation": first, "agent_invocation_history": [first],
+    }
     recorder = invocation_event_recorder(
         state, role="development", phase="developing", work_subject="ticket:3", generation=1,
         invocation_input={}, currentness_boundary={}, semantic_attempt=first["semantic_attempt"],

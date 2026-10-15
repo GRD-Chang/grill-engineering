@@ -41,6 +41,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
 ) -> None:
     from agent_run.state import StateStore
     from support.lifecycle import _file_snapshot
+    from support.state import write_run_fixture
 
     monkeypatch.chdir(git_repo)
     prepare_workspace(git_repo)
@@ -58,7 +59,8 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
         state.pop("base_resolution_pending")
     elif case == "applied":
         state["action_application_receipt"] = {"action_id": "already-applied"}
-    StateStore(root).save_run("run-settings", state)
+    # 设置查询用的原始缺损输入；非法 receipt 不经生产 application 提交。
+    write_run_fixture((root, "run-settings"), state)
     if case == "corrupt":
         (root / "profiles").mkdir()
         (root / "profiles/run-settings.json").write_text("broken")

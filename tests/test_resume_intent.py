@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import only_control
+
 from support.resume_intent import (
     _checkpoint,
 )
@@ -29,8 +31,8 @@ def test_budget_resume_receipt_records_explicit_window_authority(git_repo: Path)
     output = stdout_json(result)
     assert output["action"]["resume_authorization"] == "new_budget_window"
     assert output["action_audit"]["resume_intent"]["pause_reason"] == "budget_checkpoint"
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    action = json.loads(control_path.read_text())["action"]
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    action = control_path_store.load(control_path_task)["action"]
     assert action["payload"]["resume_intent"] == output["action_audit"]["resume_intent"]
     assert load_only_run_state(git_repo)["parent_job"]["review_budget"]["window"] == 2
 
@@ -93,8 +95,8 @@ def test_repeated_pending_resume_keeps_original_intent_and_generation(
     ]
     assert cli.main(arguments) == 2
     capsys.readouterr()
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    first = json.loads(control_path.read_text())
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    first = control_path_store.load(control_path_task)
     state_ref = only_run_ref(managed_state(git_repo))
     state = read_run(state_ref)
     state["parent_job"]["blocked_reason"] = "modification_budget_exhausted"
@@ -102,7 +104,7 @@ def test_repeated_pending_resume_keeps_original_intent_and_generation(
     write_run_fixture(state_ref, state)
     assert cli.main(arguments) == 2
     capsys.readouterr()
-    repeated = json.loads(control_path.read_text())
+    repeated = control_path_store.load(control_path_task)
     assert repeated["action"]["action_id"] == first["action"]["action_id"]
     assert repeated["action"]["payload"] == first["action"]["payload"]
     assert repeated["executor"]["generation"] == first["executor"]["generation"]

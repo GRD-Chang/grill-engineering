@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import os
+from collections.abc import Iterator
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -8,7 +10,7 @@ import pytest
 
 from support.workspace import managed_repo, managed_state
 
-from agent_run.executor_host import ExecutorSpec, FakeExecutorHost, HostObservation
+from agent_run.executor_host import ExecutorSpec, FakeExecutorHost, HostObservation, _process_start_token
 from agent_run.run_lifecycle import (
     LifecycleRequest,
     RunLifecycle,
@@ -21,6 +23,17 @@ from support.seeding import seed_run, write_fixture
 
 from support.state import snapshot_run
 from support.state import persist_run_fixture
+
+
+@pytest.fixture
+def executor_process() -> Iterator[subprocess.Popen[bytes]]:
+    with subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], start_new_session=True) as process:
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
 
 
 @pytest.mark.parametrize("action_completed", [True, False])
@@ -37,6 +50,7 @@ def test_attach_preserves_executor_completion_at_host_inspection(
     final_status: str,
     close_action: bool,
     initial_status: str,
+    executor_process: subprocess.Popen[bytes],
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
@@ -59,10 +73,12 @@ def test_attach_preserves_executor_completion_at_host_inspection(
     control.record_application(task, action_id=action_id, run_id=run_id,
                                payload_digest=claim.action["payload_digest"])
     reservation = control.begin_executor(task, action_id=action_id, run_id=run_id)
+    token = _process_start_token(executor_process.pid)
+    assert token is not None
     control.mark_process_started(task, action_id=action_id, generation=reservation.generation,
-                                pid=os.getpid(), process_start_token=None)
+                                pid=executor_process.pid, process_start_token=token)
     control.mark_handshake(task, action_id=action_id, generation=reservation.generation,
-                           pid=os.getpid(), process_start_token=None)
+                           pid=executor_process.pid, process_start_token=token)
     if action_completed:
         control.complete_action(task, action_id=action_id, result_status=state["status"])
     inspected = threading.Event()
@@ -86,6 +102,8 @@ def test_attach_preserves_executor_completion_at_host_inspection(
                                         result_status=final_status)
             else:
                 control.mark_executor_absent(task, action_id=action_id, generation=reservation.generation)
+            executor_process.kill()
+            executor_process.wait(timeout=3)
             final_bytes.append(snapshot_run((states.root, str(run_id))))
         except BaseException as error:
             errors.append(error)

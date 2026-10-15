@@ -1,14 +1,17 @@
 """共享保存与诊断保存均失效后，首次公开 resume 必须真实续接原工作。"""
 from __future__ import annotations
 
+from contextlib import closing
+from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -34,9 +37,15 @@ def unrelated() -> Iterator[subprocess.Popen[Any]]:
         child.wait(timeout=5)
 
 
-@pytest.mark.parametrize("storage_loss", [False, True], ids=["shared_failure", "storage_loss"])
+@pytest.mark.parametrize("fault_kind", ["shared", "unavailable", "full"])
 def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
-    git_repo: Path, tmp_path: Path, storage_loss: bool, unrelated: subprocess.Popen[Any],
+    git_repo: Path, tmp_path: Path, fault_kind: str, unrelated: subprocess.Popen[Any],
+) -> None:
+    _exercise_storage_recovery(git_repo, tmp_path, fault_kind, unrelated)
+
+
+def _exercise_storage_recovery(
+    git_repo: Path, tmp_path: Path, fault_kind: str, unrelated: subprocess.Popen[Any],
 ) -> None:
     # 原 test_shared_storage_stop 的代表性真实 Worker 测试在此保留全部退出
     # 边界，并增补 Executor 真正消失后的公开恢复；不重复另一套昂贵准备。
@@ -47,7 +56,7 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
     prepare_shared_storage(git_repo)
     with storage_executor(git_repo, [
         sys.executable, "-m", "support.shared_storage", "interrupt", str(git_repo),
-        "storage" if storage_loss else "shared",
+        fault_kind,
     ], environment, stderr_path) as executor:
         workers = wait_for_storage_workers(git_repo, executor, stderr_path)
         states = StateStore(managed_state(git_repo))
@@ -93,6 +102,7 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         tokens = {item["pid"]: item["process_start_token"] for item in owner["workers"]}
         assert set(tokens) == set(workers.values())
         assert all(_process_start_token(pid) == token for pid, token in tokens.items())
+        wait_until(lambda: (git_repo / "storage-ready").exists())
         started = time.monotonic()
         (git_repo / "storage-fault").touch()
         executor.wait(timeout=5)
@@ -102,14 +112,23 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         assert outcome["process_returns"] == [-signal.SIGKILL, -signal.SIGKILL]
         assert outcome["live_threads"] == []
         assert outcome["starts"] == [3, 4]
-        if storage_loss:
-            assert outcome["failed_commits"] >= 2 and outcome["failed_control"] >= 1
-            assert "database or disk is full" in outcome["error"]
+        assert outcome["open_connections"] == 0
+        if fault_kind != "shared":
+            if fault_kind == "unavailable":
+                assert outcome["failed_existing"] >= 1 and outcome["failed_connects"] >= 2
+                assert "unavailable" in outcome["error"]
+                assert outcome["full_errors"] == []
+            else:
+                assert len(outcome["full_errors"]) >= 2
+                assert set(outcome["full_errors"]) == {sqlite3.SQLITE_FULL}
+                assert "database or disk is full" in outcome["error"]
+                assert outcome["failed_existing"] == outcome["failed_connects"] == 0
             diagnostics = stderr_path.read_text()
             assert "durable failure/exit unknown" in diagnostics
             assert "durable admission unknown" in diagnostics
         else:
-            assert outcome["failed_commits"] == outcome["failed_control"] == 0
+            assert outcome["failed_existing"] == outcome["failed_connects"] == 0
+            assert outcome["full_errors"] == []
             assert outcome["error"] == "shared execution unavailable"
         for pid in workers.values():
             with pytest.raises(ProcessLookupError):
@@ -117,7 +136,7 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         assert not Path(f"/proc/{executor.pid}").exists()
         assert unrelated.poll() is None
         failed = StateStore(states.root).load_current_run(run_id)
-        if storage_loss:
+        if fault_kind != "shared":
             assert failed == before
             assert control.load(task) == saved_control
         else:
@@ -130,6 +149,10 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         developer_checkout = checkout_root / "ticket-4"
         assert (reviewer_checkout / "ticket-3.txt").read_text() == "done\n"
         assert (developer_checkout / "retained-draft.txt").read_text() == "draft 4"
+        with closing(sqlite3.connect(states.root / "state.sqlite3")) as reopened:
+            assert reopened.execute(
+                "SELECT name FROM sqlite_master WHERE name='storage_full_probe'"
+            ).fetchall() == []
 
         # 恢复存储后第一次公开命令，未先调用 status/history 或 Controller.resume。
         (git_repo / "storage-fault").unlink()
@@ -154,6 +177,19 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         admitted = json.loads(admitted_snapshot.read_text())
         assert admitted["action"]["kind"] == "resume"
         assert admitted["action"]["action_id"] != saved_control["action"]["action_id"]
+        # 新 Executor 进程尚未启动，第一次公开 resume 已统一收口旧代次。
+        before_successor = admitted["run_before_successor"]
+        assert before_successor["ticket_jobs"]["2"] == before["ticket_jobs"]["2"]
+        assert before_successor["ticket_jobs"]["6"] == before["ticket_jobs"]["6"]
+        assert all(item["lease_id"] is None for item in before_successor["ticket_work_queue"])
+        for number in ("3", "4"):
+            old_invocation = before_successor["ticket_agent_invocations"][number]
+            assert old_invocation["started_at"] == active[number]["started_at"]
+            assert old_invocation["status"] == "failed"
+            closed, = [item for item in before_successor["agent_invocation_history"]
+                       if item["work_subject"] == old_invocation["work_subject"]
+                       and item["started_at"] == old_invocation["started_at"]]
+            assert closed["status"] == "failed"
         after = states.load_current_run(run_id)
         assert after is not None
         new_control = control.load(task)
@@ -196,6 +232,31 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         assert (developer_checkout / "retained-draft.txt").read_text() == "draft 4"
         assert (developer_checkout / "resumed.txt").read_text() == "successor started\n"
         assert unrelated.poll() is None
+
+
+def test_startup_abort_reaps_workers_before_the_observer_records_their_pids(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unrelated: subprocess.Popen[Any],
+) -> None:
+    original_wait = wait_for_storage_workers
+    started_pids: list[int] = []
+
+    class StartupAbort(Exception):
+        pass
+
+    def abort_after_ready(
+        repo: Path, executor: subprocess.Popen[Any], stderr_path: Path, *, timeout: float = 10,
+    ) -> dict[int, int]:
+        workers = original_wait(repo, executor, stderr_path, timeout=timeout)
+        started_pids.extend(workers.values())
+        # 调用方尚未取得 PID 映射时中断；清理由启动登记与准确进程身份负责。
+        raise StartupAbort("controlled startup abort before PID observation")
+
+    monkeypatch.setattr(sys.modules[__name__], "wait_for_storage_workers", abort_after_ready)
+    with pytest.raises(StartupAbort, match="before PID observation"):
+        _exercise_storage_recovery(git_repo, tmp_path, "shared", unrelated)
+    assert len(started_pids) == 2
+    assert all(not Path(f"/proc/{pid}").exists() for pid in started_pids)
+    assert unrelated.poll() is None
 
 
 def test_unready_reviewer_cleanup_reaps_the_earlier_ready_developer(

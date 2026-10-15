@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from support.control_state import (
+    corrupt_control_fixture, delete_control_fixture, raw_control_snapshot,
+)
+
 import json
 import subprocess
 import sys
-from functools import partial
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,6 @@ from support.workspace import managed_repo, managed_state
 from agent_run import cli as cli_module
 from agent_run.delivery_policy import policy_snapshot_for_state
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.executor_host import ExecutorSpec, HostObservation
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.git import Publisher
 from agent_run.state import StateStore
@@ -36,17 +38,7 @@ from support.state import persist_run_fixture
     "command", ["run", "resume", "approve", "revise", "requeue", "stop", "abandon"]
 )
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize(
-    ("receipt_case", "host_status"),
-    [
-        ("absent", None),
-        ("invalid", None),
-        ("exact", "exited"),
-        ("exact", "running"),
-        ("exact", "unknown"),
-        ("exact", "conflict"),
-    ],
-)
+@pytest.mark.parametrize("receipt_case", ["absent", "invalid", "exact"])
 def test_cli_requires_exact_ownership_before_lifecycle_admission(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -54,20 +46,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
     command: str,
     control_case: str,
     receipt_case: str,
-    host_status: str | None,
 ) -> None:
-    # An unknown launch is a synchronous FakeHost outcome here. Advance its
-    # existing startup deadline without waiting for a nonexistent successor.
-    now = 1000.25
-
-    def advance(seconds: float) -> None:
-        nonlocal now
-        now += seconds
-
-    monkeypatch.setattr(
-        cli_module, "RunLifecycle",
-        partial(cli_module.RunLifecycle, clock=lambda: now, sleep=advance),
-    )
     for key, value in _isolated_environment(git_repo.parent / "user-env").items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo.parent / "runtime"))
@@ -124,42 +103,26 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                 # Syntactically valid evidence referring to a different Run.
                 receipt["run_id"] = "run-unrelated"
         persist_run_fixture(states, run_id, state)
-        path = control.path_for(task)
         if control_case == "missing":
-            path.unlink()
+            delete_control_fixture(control, task)
         else:
-            path.write_text("not json", encoding="utf-8")
-        control_before = path.read_bytes() if path.exists() else None
+            corrupt_control_fixture(control, task)
+        control_before = raw_control_snapshot(control, task)
         state_ref = (states.root, str(run_id))
         state_before = snapshot_run(state_ref)
         fixture_before = fixture.read_bytes()
         agents_before = agents.read_bytes()
-        host = _install_host(git_repo, fixture, monkeypatch, host_status or "unknown")
+        host = _install_host(git_repo, fixture, monkeypatch, "exited")
         monkeypatch.setattr(
             cli_module,
             "GhGitHubReader",
             lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture),
         )
         prepared: list[object] = []
-        observed: list[ExecutorSpec] = []
         monkeypatch.setattr(host, "prepare_environment", prepared.append)
 
-        def observe(spec: ExecutorSpec, _store: TaskControlStore) -> HostObservation:
-            # No Host response can affect admission without an exact receipt;
-            # a failing sentinel covers all otherwise redundant response cases.
-            if host_status is None:
-                pytest.fail("Host must not be queried without an exact Run receipt")
-            observed.append(spec)
-            assert spec.action_id == receipt["action_id"]
-            assert spec.generation == receipt["executor_generation"]
-            assert spec.run_id == run_id
-            return HostObservation(
-                host_status,  # type: ignore[arg-type]
-                spec.generation,
-                None,
-                False,
-                runner_binding="b" * 16 if host_status == "exited" else None,
-            )
+        def observe(*_args: object) -> None:
+            pytest.fail("丢失控制权威时，业务 receipt 不能授权 Host 对账")
 
         monkeypatch.setattr(host, "observe", observe)
         arguments = [command, "1", "--repo", "example/project", "--json"]
@@ -167,73 +130,17 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             arguments.extend(["--agent-fixture", str(agents)])
         if command == "revise":
             arguments.extend(["--message", "exact revision"])
-        proven_exited = receipt_case == "exact" and host_status == "exited"
-        if proven_exited:
-            worker.kill()
-            worker.wait(timeout=3)
-        for attempt in range(2):
+        for _attempt in range(2):
             code = cli_module.main(arguments)
             output = json.loads(capsys.readouterr().out)
-            if proven_exited and command == "run":
-                reconciled_state = states.load_run(run_id)
-                assert reconciled_state is not None
-                assert reconciled_state["status"] == "execution_failed"
-                assert reconciled_state["action_application_receipt"] == receipt
-                assert (
-                    reconciled_state["diagnostics"][-1]["code"] == "session_interrupted"
-                )
-            else:
-                assert snapshot_run(state_ref) == state_before
+            assert code == 2, output
+            assert snapshot_run(state_ref) == state_before
             assert fixture.read_bytes() == fixture_before
             assert agents.read_bytes() == agents_before
-            if not proven_exited:
-                assert code == 2, output
-                assert host.start_count == 0
-                assert prepared == []
-                assert worker.poll() is None
-                if receipt_case != "exact":
-                    assert observed == []
-                    assert (
-                        path.read_bytes() if path.exists() else None
-                    ) == control_before
-                else:
-                    recovered = control.load(task)
-                    assert recovered is not None
-                    assert recovered["action"]["action_id"] == receipt["action_id"]
-                    assert (
-                        recovered["next_generation"]
-                        == receipt["executor_generation"] + 1
-                    )
-            else:
-                recovered = control.load(task)
-                assert recovered is not None
-                if command == "run":
-                    assert host.start_count == 0, output
-                    assert recovered["action"]["action_id"] == receipt["action_id"]
-                    assert recovered["action"]["status"] == "failed"
-                else:
-                    assert host.start_count == 1, output
-                    assert len(prepared) == 1
-                    assert recovered["action"]["kind"] == command
-                    assert (
-                        recovered["action"]["executor_generation"]
-                        == receipt["executor_generation"] + 1
-                    )
-                    assert (
-                        sum(
-                            entry["action"]["action_id"] == receipt["action_id"]
-                            for entry in recovered["action_history"]
-                        )
-                        == 1
-                    )
-                assert worker.poll() is not None
-            after = path.read_bytes() if path.exists() else None
-            if attempt == 0:
-                after_first = after
-                state_after_first = snapshot_run(state_ref)
-            else:
-                assert after == after_first
-                assert snapshot_run(state_ref) == state_after_first
+            assert host.start_count == 0
+            assert prepared == []
+            assert worker.poll() is None
+            assert raw_control_snapshot(control, task) == control_before
     finally:
         if worker.poll() is None:
             worker.kill()
@@ -282,12 +189,11 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
         state["terminal_kind"] = "operator_stopped" if command == "stop" else None
         state.pop("action_application_receipt", None)
         persist_run_fixture(states, run_id, state)
-        path = control.path_for(task)
         if control_case == "missing":
-            path.unlink()
+            delete_control_fixture(control, task)
         else:
-            path.write_text("not json", encoding="utf-8")
-        before_control = path.read_bytes() if path.exists() else None
+            corrupt_control_fixture(control, task)
+        before_control = raw_control_snapshot(control, task)
         state_ref = (states.root, str(run_id))
         before_state = snapshot_run(state_ref)
         before_fixture = fixture.read_bytes()
@@ -328,7 +234,7 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
             assert worker.poll() is None
             assert snapshot_run(state_ref) == before_state
             assert fixture.read_bytes() == before_fixture
-            assert (path.read_bytes() if path.exists() else None) == before_control
+            assert raw_control_snapshot(control, task) == before_control
     finally:
         if worker.poll() is None:
             worker.kill()

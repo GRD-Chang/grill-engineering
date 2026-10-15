@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from support.control_state import (
+    corrupt_control_fixture,
+    delete_control_fixture,
+    raw_control_snapshot,
+    snapshot_control,
+)
+
 from collections.abc import Sequence
 import json
 import os
@@ -36,6 +43,7 @@ from agent_run.systemd_executor_host import (
 )
 from agent_run.task_control import (
     ActionReconciliationError,
+    TaskControlError,
     TaskControlStore,
     TaskKey,
 )
@@ -214,7 +222,7 @@ def test_systemd_host_accepts_launch_without_putting_environment_in_unit_metadat
 ) -> None:
     spec = _spec(tmp_path, run_id="run-1")
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -439,7 +447,7 @@ def test_observer_does_not_fail_reservation_before_unit_is_visible(
 
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = PausingTransport()
     owner = SystemdUserExecutorHost(
@@ -494,7 +502,7 @@ def test_observer_closes_absent_reservation_after_startup_owner_crashes(
 
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = CrashingTransport()
     owner = SystemdUserExecutorHost(
@@ -528,7 +536,7 @@ def test_lease_guardian_holds_parent_lease_until_deadline_cleanup(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     lock = tmp_path / "runner" / "install.lock"
@@ -569,7 +577,7 @@ def test_systemd_host_fails_closed_on_unavailable_manager_before_action(
         environment={"PATH": "/bin"},
         executor_python=Path("/usr/bin/python3"),
     )
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _spec(tmp_path)
 
     with pytest.raises(Exception, match="systemd"):
@@ -588,7 +596,7 @@ def test_systemd_host_rejects_oversize_environment_before_action(
         executor_python=Path("/usr/bin/python3"),
         max_environment_bytes=128,
     )
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _spec(tmp_path)
 
     host.check_readiness()
@@ -607,9 +615,9 @@ def test_systemd_host_rejects_oversize_environment_before_executor_reservation(
     tmp_path: Path,
 ) -> None:
     spec = _spec(tmp_path)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
-    before = control.path_for(spec.task).read_bytes()
+    before = snapshot_control(control, spec.task)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
         transport=transport,
@@ -622,7 +630,7 @@ def test_systemd_host_rejects_oversize_environment_before_executor_reservation(
     with pytest.raises(Exception, match="过大"):
         host.ensure(spec, control)
 
-    assert control.path_for(spec.task).read_bytes() == before
+    assert snapshot_control(control, spec.task) == before
     assert transport.start_count == 0
     assert not list((tmp_path / "runtime").glob("environment-*.json"))
 
@@ -633,7 +641,7 @@ def test_systemd_host_reports_binding_conflict_without_replacing_unit(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport(
         unit=SystemdUnitObservation(
@@ -677,7 +685,7 @@ def test_systemd_host_observe_is_exact_and_strictly_read_only(
     expected_status: str,
 ) -> None:
     spec = _spec(tmp_path, run_id="run-1")
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -697,12 +705,12 @@ def test_systemd_host_observe_is_exact_and_strictly_read_only(
         os.getpid() if native_status == "running" else None,
         None,
     )
-    before = control.path_for(spec.task).read_bytes()
+    before = snapshot_control(control, spec.task)
 
     observation = host.observe(spec, control)
 
     assert observation.status == expected_status
-    assert control.path_for(spec.task).read_bytes() == before
+    assert snapshot_control(control, spec.task) == before
     assert not (tmp_path / "runtime").exists()
 
 
@@ -713,7 +721,7 @@ def test_started_executor_remains_identifiable_after_run_binding(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -732,10 +740,10 @@ def test_started_executor_remains_identifiable_after_run_binding(
         os.getpid() if native_status == "running" else None, None,
     )
     bound = replace(spec, run_id="wrong-run" if wrong_run else "run-1")
-    before = control.path_for(spec.task).read_bytes()
+    before = snapshot_control(control, spec.task)
     observation = host.observe(bound, control)
     assert observation.status == ("conflict" if wrong_run else native_status)
-    assert control.path_for(spec.task).read_bytes() == before
+    assert snapshot_control(control, spec.task) == before
     if not wrong_run:
         assert host.inspect(bound, control).status == native_status
         assert len(transport.launches) == 1
@@ -758,7 +766,7 @@ def test_systemd_observer_uses_the_generation_historical_runner_binding(
 ) -> None:
     spec = _spec(tmp_path, run_id="run-1")
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     historical_host = SystemdUserExecutorHost(
@@ -769,7 +777,7 @@ def test_systemd_observer_uses_the_generation_historical_runner_binding(
     )
     historical_host.ensure(spec, control)
     historical_description = str(transport.launches[0]["description"])
-    control_before = control.path_for(spec.task).read_bytes()
+    control_before = snapshot_control(control, spec.task)
 
     current_host = SystemdUserExecutorHost(
         transport=transport,
@@ -794,7 +802,7 @@ def test_systemd_observer_uses_the_generation_historical_runner_binding(
     assert observation.status == expected_status
     if description_kind == "historical":
         assert observation.runner_binding == historical_host._runner_binding()
-    assert control.path_for(spec.task).read_bytes() == control_before
+    assert snapshot_control(control, spec.task) == control_before
     assert transport.start_count == 1
 
 
@@ -808,7 +816,7 @@ def test_systemd_observer_uses_the_generation_historical_runner_binding(
         ("exited", "conflict", "conflict"),
     ],
 )
-def test_receipt_only_control_recovers_runner_binding_from_exact_host_ownership(
+def test_host_ownership_cannot_recreate_missing_or_corrupt_control(
     tmp_path: Path,
     control_case: str,
     native_status: str,
@@ -816,7 +824,7 @@ def test_receipt_only_control_recovers_runner_binding_from_exact_host_ownership(
     expected_status: str,
 ) -> None:
     spec = _spec(tmp_path, run_id="run-1")
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(spec.state_root)
     spec = _admit(control, spec)
     control.bind_run(spec.task, spec.action_id, "run-1")
     record = control.load(spec.task)
@@ -831,18 +839,10 @@ def test_receipt_only_control_recovers_runner_binding_from_exact_host_ownership(
         "executor_generation": action["executor_generation"],
     }
     if control_case == "missing":
-        control.path_for(spec.task).unlink()
+        delete_control_fixture(control, spec.task)
     else:
-        control.path_for(spec.task).write_text("not json", encoding="utf-8")
-    repaired = control.reconcile_from_run(
-        spec.task,
-        {"run_id": "run-1", "status": "active", "action_application_receipt": receipt},
-        payload=action["payload"],
-    )
-    assert repaired is not None
-    assert repaired["executor"]["reconciliation_required"] is True
-    assert "runner_binding" not in repaired["executor"]
-
+        corrupt_control_fixture(control, spec.task)
+    before = raw_control_snapshot(control, spec.task)
     historical_host = SystemdUserExecutorHost(
         transport=FakeSystemdTransport(),
         runtime_directory=tmp_path / "runtime-v1",
@@ -869,45 +869,20 @@ def test_receipt_only_control_recovers_runner_binding_from_exact_host_ownership(
         environment={},
         executor_python=Path("/runner-v2/python"),
     )
-
-    observation = current_host.observe(spec, control)
-
-    assert observation.status == expected_status
-    if expected_status == "exited":
-        control_before_missing_binding = control.path_for(spec.task).read_bytes()
-        with pytest.raises(ActionReconciliationError, match="Runner binding"):
-            control.record_reconciled_executor_exit(
-                spec.task,
-                action_id=spec.action_id,
-                run_id="run-1",
-                generation=spec.generation,
-                observed_status="exited",
-                observed_generation=spec.generation,
-                observed_runner_binding=None,  # type: ignore[arg-type]
-            )
-        assert control.path_for(spec.task).read_bytes() == (
-            control_before_missing_binding
+    if control_case == "corrupt":
+        with pytest.raises(TaskControlError):
+            current_host.observe(spec, control)
+    else:
+        observation = current_host.observe(spec, control)
+        assert observation.status == expected_status
+    # Even an exact native exited/running observation is not durable authority.
+    with pytest.raises(TaskControlError):
+        control.reconcile_from_run(
+            spec.task,
+            {"run_id": "run-1", "status": "active", "action_application_receipt": receipt},
+            payload=action["payload"],
         )
-    if expected_status not in {"exited", "running"}:
-        assert observation.runner_binding is None
-        assert control.load(spec.task) == repaired
-        assert transport.start_count == 0
-        return
-    assert observation.runner_binding == historical_host._runner_binding()
-    if expected_status == "running":
-        assert control.load(spec.task) == repaired
-        assert transport.start_count == 0
-        return
-    proven = control.record_reconciled_executor_exit(
-        spec.task,
-        action_id=spec.action_id,
-        run_id="run-1",
-        generation=spec.generation,
-        observed_status=observation.status,
-        observed_generation=observation.generation,
-        observed_runner_binding=observation.runner_binding,
-    )
-    assert proven["executor"]["runner_binding"] == historical_host._runner_binding()
+    assert raw_control_snapshot(control, spec.task) == before
     assert transport.start_count == 0
 
 
@@ -915,7 +890,7 @@ def test_systemd_host_observe_keeps_pending_absence_unknown_without_writes(
     tmp_path: Path,
 ) -> None:
     spec = _spec(tmp_path, run_id="run-1")
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     host = SystemdUserExecutorHost(
         transport=FakeSystemdTransport(),
@@ -926,13 +901,13 @@ def test_systemd_host_observe_keeps_pending_absence_unknown_without_writes(
     pending = host._launch_pending_path(spec)
     pending.parent.mkdir(parents=True)
     pending.touch()
-    control_before = control.path_for(spec.task).read_bytes()
+    control_before = snapshot_control(control, spec.task)
     pending_before = pending.read_bytes()
 
     observation = host.observe(spec, control)
 
     assert observation.status == "unknown"
-    assert control.path_for(spec.task).read_bytes() == control_before
+    assert snapshot_control(control, spec.task) == control_before
     assert pending.read_bytes() == pending_before
 
 
@@ -941,7 +916,7 @@ def test_systemd_host_does_not_treat_transient_inspection_failure_as_conflict(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport(
         unit=SystemdUnitObservation(
@@ -974,7 +949,7 @@ def test_systemd_host_closes_original_generation_after_executor_signal(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -1013,7 +988,7 @@ def test_systemd_host_closes_original_generation_when_handshake_is_lost(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -1056,7 +1031,7 @@ def test_systemd_host_bounds_journal_diagnostics_and_cleans_failed_launch(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport(
         start_error="launch rejected",
@@ -1082,7 +1057,7 @@ def test_systemd_host_preserves_unknown_launch_until_deadline_reconciliation(
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = FakeSystemdTransport(
         start_error="systemd-run response lost", start_unknown=True
@@ -1140,7 +1115,7 @@ def test_systemd_host_reconciles_response_loss_with_accepted_unit(
 
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "custom-state")
     spec = _admit(control, spec)
     transport = AcceptedUnknownTransport()
     host = SystemdUserExecutorHost(

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import copy
 import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from support.workspace import managed_repo, managed_state
 
-from agent_run.executor_host import ExecutorSpec
+from agent_run.executor_host import ExecutorSpec, _process_start_token
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.systemd_executor_host import (
@@ -74,6 +77,23 @@ raise SystemExit(result)
 """
 
 
+@pytest.fixture
+def executor_process() -> Iterator[subprocess.Popen[bytes]]:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        assert process.stdin is not None
+        process.stdin.close()
+
+
 @pytest.mark.parametrize("invocation_status", ["running", "resuming"])
 @pytest.mark.parametrize(
     ("host_status", "exit_proof_persisted", "source_action"),
@@ -96,6 +116,7 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
     host_status: str,
     exit_proof_persisted: bool,
     source_action: str,
+    executor_process: subprocess.Popen[bytes],
 ) -> None:
     environment = _isolated_environment(tmp_path / "environment")
     environment["XDG_RUNTIME_DIR"] = str(tmp_path / "runtime")
@@ -130,9 +151,11 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
         executor_python=Path(sys.executable), transport=transport,
     )
     assert host.ensure(spec, control).status == "starting"
+    process_token = _process_start_token(executor_process.pid)
+    assert process_token is not None
     control.mark_handshake(
         task, action_id=spec.action_id, generation=spec.generation,
-        pid=os.getpid(), process_start_token=None,
+        pid=executor_process.pid, process_start_token=process_token,
     )
     state["status"] = "parent_delivery_pending"
     state["terminal_kind"] = None
@@ -153,7 +176,9 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
         result_status=state["status"],
     )
     description = str(transport.launches[0]["description"])
-    transport.unit = SystemdUnitObservation("running", description, os.getpid(), None)
+    transport.unit = SystemdUnitObservation(
+        "running", description, executor_process.pid, None,
+    )
     assert host.inspect(spec, control).status == "running"
     native = {
         "status": "exited" if host_status == "conflict" else host_status,
@@ -161,12 +186,15 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
             None if host_status in {"absent", "unknown"}
             else "another Executor" if host_status == "conflict" else description
         ),
-        "pid": os.getpid() if host_status == "running" else None,
+        "pid": executor_process.pid if host_status == "running" else None,
         "reason": (
             "fixture signal exit"
             if host_status == "exited" and not exit_proof_persisted else None
         ),
     }
+    if host_status in {"exited", "absent"}:
+        executor_process.kill()
+        assert executor_process.wait(timeout=5) < 0
     if exit_proof_persisted:
         # Stop at the durable Host-exit boundary before lifecycle can record
         # session_interrupted; the next independent CLI must finish that work.
@@ -228,8 +256,8 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
             if host_status != "running":
                 assert output["diagnostics"][0]["code"] == "executor_start_unknown"
         if previous_control is not None:
-            assert control.path_for(task).read_bytes() == previous_control
+            assert snapshot_control(control, task) == previous_control
             assert snapshot_runs(states.root) == previous_runs
-        previous_control = control.path_for(task).read_bytes()
+        previous_control = snapshot_control(control, task)
         previous_runs = snapshot_runs(states.root)
     assert not list((tmp_path / "runtime").rglob("*.json"))

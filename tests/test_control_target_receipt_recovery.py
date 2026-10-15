@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import signal
 from collections.abc import Callable, Mapping
@@ -24,15 +25,14 @@ from support.seeding import seed_run, write_fixture
 from support.lifecycle import _isolated_environment
 from support.cli_supervision import _parent_only_agents
 from support.control import _bind_running_executor, _ControlReceiptHost
+from support.control_state import delete_control_fixture, raw_control_snapshot, snapshot_control
 
 
-@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
 @pytest.mark.parametrize("failure_mode", ["ownership", "confirmation"])
-def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
+def test_failed_stop_keeps_authoritative_target_until_confirmed_exit(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    control_case: str,
     failure_mode: str,
 ) -> None:
     for key, value in _isolated_environment(git_repo.parent / "user-env").items():
@@ -48,22 +48,7 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
     original = control.load(task)
     assert original is not None
     original_target = original["executor"]
-    expected_target = {
-        key: original_target[key]
-        for key in (
-            "status",
-            "action_id",
-            "run_id",
-            "generation",
-            "runner_binding",
-            "pid",
-            "process_start_token",
-        )
-        if key in original_target
-    }
-    expected_target["worker"] = {
-        key: original_target["worker"][key] for key in ("pid", "process_start_token")
-    }
+    expected_target = deepcopy(original_target)
     real_terminate = FakeExecutorHost.terminate_control_target
     real_killpg = host_module.os.killpg
     real_wait = host_module._wait_for_process_exit
@@ -83,8 +68,6 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
             recover: bool = False,
         ) -> HostObservation:
             self.ensure_count += 1
-            if spec.generation > 2:
-                assert worker.poll() is not None
             return super().ensure(spec, store, execute, recover)
 
         def observe(
@@ -135,15 +118,10 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
         assert failed is not None and failed["action"]["status"] == "failed"
         predecessor_id = failed["action"]["action_id"]
         generation = failed["action"]["executor_generation"]
-        if control_case == "missing":
-            control.path_for(task).unlink()
-        else:
-            control.path_for(task).write_text("broken json", encoding="utf-8")
         state_before = states.load_run(run_id)
-        assert (
-            state_before["action_application_receipt"]["target_executor"]
-            == expected_target
-        )
+        assert "target_executor" not in state_before["action_application_receipt"]
+        assert failed["action"]["target_executor"] == expected_target
+        control_before = snapshot_control(control, task)
         fixture_before = fixture.read_bytes()
         for _attempt in range(2):
             assert (
@@ -167,27 +145,34 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
             assert retained["action"]["target_executor"] == expected_target
             assert retained["next_generation"] == generation + 1
             assert host.ensure_count == 1
+            assert snapshot_control(control, task) == control_before
             assert worker.poll() is None
             assert states.load_run(run_id) == state_before
             assert fixture.read_bytes() == fixture_before
-        assert len(rejected) == 3
+        assert len(rejected) == 1
         assert host.observe_count >= 2
         if failure_mode == "confirmation":
-            assert signals == [(worker.pid, signal.SIGKILL)] * 3
+            assert signals == [(worker.pid, signal.SIGKILL)]
+        # Resume 不授权终止旧 target；明确重试 Stop 才能继续同一真实控制动作。
+        assert cli.main(["stop", run_id, "--json", "--github-fixture", str(fixture)]) == 2
+        capsys.readouterr()
+        retried = control.load(task)
+        assert retried is not None
+        assert retried["action"]["target_executor"] == expected_target
+        assert retried["action"]["executor_generation"] == generation + 1
+        assert host.ensure_count == 2 and worker.poll() is None
+        assert len(rejected) == 2
         monkeypatch.setattr(host_module.os, "killpg", real_killpg)
         monkeypatch.setattr(host_module, "_wait_for_process_exit", real_wait)
         host.fail_target = False
-        # The legal successor is admitted only after the real exact process
-        # termination path confirms that the old Worker has exited.
+        # 准确 target 的真实终止和退出确认仍在事务外完成。
         code = cli.main(
             [
-                "resume",
+                "stop",
                 run_id,
                 "--json",
                 "--github-fixture",
                 str(fixture),
-                "--agent-fixture",
-                str(agents),
             ]
         )
         output = json.loads(capsys.readouterr().out)
@@ -195,9 +180,10 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
         assert worker.wait(timeout=3) == -signal.SIGKILL
         recovered = control.load(task)
         assert recovered is not None
-        assert recovered["action"]["kind"] == "resume"
-        assert recovered["action"]["executor_generation"] == generation + 1
-        assert host.ensure_count == 2
+        assert recovered["action"]["kind"] == "stop"
+        assert recovered["action"]["executor_generation"] == generation + 2
+        assert states.load_run(run_id)["status"] == "operator_stopped"
+        assert host.ensure_count == 3
     finally:
         if worker.poll() is None:
             worker.kill()
@@ -216,7 +202,7 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
         "redacted_executor",
     ],
 )
-def test_control_receipt_rejects_missing_or_inconsistent_target_evidence(
+def test_control_receipt_target_cannot_replace_missing_authority(
     tmp_path: Path,
     kind: str,
     target_case: str,
@@ -252,35 +238,36 @@ def test_control_receipt_rejects_missing_or_inconsistent_target_evidence(
     elif target_case == "redacted_executor":
         target["process_start_token"] = "[REDACTED]"
     for _attempt in range(2):
-        with pytest.raises(ActionReconciliationError, match="target"):
+        with pytest.raises(ActionReconciliationError, match="Task Control"):
             store.reconcile_from_run(
                 task, {"run_id": "run-1", "action_application_receipt": receipt}
             )
-        assert not store.path_for(task).exists()
+        assert store.load(task) is None
 
 
-def test_only_receipt_process_identity_survives_durable_sanitization() -> None:
-    from agent_run.state import _sanitize_durable_errors
+def test_target_process_identity_stays_in_control_without_a_receipt_copy(tmp_path: Path) -> None:
+    from agent_run.run_lifecycle import prepare_action_application_receipt
 
-    original = {
-        "action_application_receipt": {
-            "target_executor": {
-                "process_start_token": "12345",
-                "binding_token": "control-capability",
-                "worker": {"process_start_token": "67890", "api_token": "secret"},
-            },
-        },
-        "diagnostics": [{"process_start_token": "secret"}],
-        "other": {"target_executor": {"process_start_token": "secret"}},
-    }
-    saved = _sanitize_durable_errors(original)
-    target = saved["action_application_receipt"]["target_executor"]
+    task = TaskKey(tmp_path / "repo", "example/project", 1)
+    store = TaskControlStore(tmp_path / "state")
+    action = store.claim_action(task, kind="run", payload={"parent": 1})
+    owner = store.begin_executor(task, action_id=action.action_id, run_id="run-1")
+    binding = {"action_id": action.action_id, "generation": owner.generation}
+    store.mark_handshake(task, **binding, pid=1234, process_start_token="12345")
+    store.bind_run(task, action.action_id, "run-1", generation=owner.generation)
+    store.record_application(task, **binding, run_id="run-1",
+                             payload_digest=action.action["payload_digest"])
+    store.complete_action(task, **binding, result_status="active")
+    store.mark_worker_started(task, **binding, pid=5678, process_start_token="67890")
+    stopped = store.claim_control_action(task, kind="stop", payload={}, run_id="run-1",
+                                         state_dir=store.root)
+    assert stopped is not None
+    target = TaskControlStore(store.root).load(task)["action"]["target_executor"]
     assert target["process_start_token"] == "12345"
     assert target["worker"]["process_start_token"] == "67890"
-    assert target["binding_token"] == "[REDACTED]"
-    assert target["worker"]["api_token"] == "[REDACTED]"
-    assert saved["diagnostics"][0]["process_start_token"] == "[REDACTED]"
-    assert saved["other"]["target_executor"]["process_start_token"] == "[REDACTED]"
+    state: dict[str, Any] = {"run_id": "run-1"}
+    prepare_action_application_receipt(state, stopped.action)
+    assert "target_executor" not in state["action_application_receipt"]
 
 
 @pytest.mark.parametrize(
@@ -296,10 +283,10 @@ def test_final_run_receipt_still_requires_executor_exit_proof(
     claim = store.claim_action(task, kind="abandon", payload={"parent": 1})
     state: dict[str, Any] = {"run_id": "run-1", "status": status}
     prepare_action_application_receipt(state, claim.action)
-    assert state["action_application_receipt"]["target_executor"] is None
-    store.path_for(task).unlink()
-    rebuilt = store.reconcile_from_run(task, state, payload={"parent": 1})
-    assert rebuilt is not None
-    assert rebuilt["action"]["status"] == "accepted"
-    assert rebuilt["executor"]["reconciliation_required"] is True
-    assert "target_executor" not in rebuilt["action"]
+    assert "target_executor" not in state["action_application_receipt"]
+    delete_control_fixture(store, task)
+    before = raw_control_snapshot(store, task)
+    for _attempt in range(2):
+        with pytest.raises(ActionReconciliationError, match="Task Control"):
+            store.reconcile_from_run(task, state, payload={"parent": 1})
+        assert raw_control_snapshot(store, task) == before

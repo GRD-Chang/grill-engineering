@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import subprocess
 import sys
 from pathlib import Path
@@ -115,7 +117,7 @@ def test_stopping_executor_requires_terminal_host_proof_before_successor(
             f"ActiveState=deactivating\nSubState={substate}\n"
             f"ExecMainPID={process.pid}\nDescription={description}\nResult=success\n"
         )
-        before = control.path_for(task).read_bytes()
+        before = snapshot_control(control, task)
         for _ in range(2):
             # Observation stays strictly read-only; reconciliation also cannot
             # close the Action while the original process is still stopping.
@@ -123,7 +125,7 @@ def test_stopping_executor_requires_terminal_host_proof_before_successor(
             assert host.inspect(spec, control).status == "unknown"
             with pytest.raises(ActionBusyError):
                 control.claim_action(task, kind="resume", payload={"run_id": "run-156"})
-            assert control.path_for(task).read_bytes() == before
+            assert snapshot_control(control, task) == before
             assert process.poll() is None
 
         process.terminate()
@@ -133,26 +135,26 @@ def test_stopping_executor_requires_terminal_host_proof_before_successor(
             f"Description={description}\nResult=signal\n"
         )
         assert host.observe(spec, control).status == "exited"
-        assert control.path_for(task).read_bytes() == before
+        assert snapshot_control(control, task) == before
         assert host.inspect(spec, control).status == "exited"
-        closed = control.path_for(task).read_bytes()
+        closed = snapshot_control(control, task)
         record = control.load(task)
         assert record is not None
         assert record["action"]["status"] == "failed"
         assert record["executor"]["status"] == "exited"
         assert host.inspect(spec, control).status == "exited"
-        assert control.path_for(task).read_bytes() == closed
+        assert snapshot_control(control, task) == closed
         successor = control.claim_action(
             task, kind="resume", payload={"run_id": "run-156"}
         )
         assert successor.action is not None
         assert successor.action["executor_generation"] == spec.generation + 1
-        admitted = control.path_for(task).read_bytes()
+        admitted = snapshot_control(control, task)
         attached = control.claim_action(
             task, kind="resume", payload={"run_id": "run-156"}
         )
         assert attached.attached
-        assert control.path_for(task).read_bytes() == admitted
+        assert snapshot_control(control, task) == admitted
     finally:
         if process.poll() is None:
             process.kill()

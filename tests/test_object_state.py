@@ -100,17 +100,43 @@ def test_scoped_material_replacement_preserves_shared_archive_and_collects_unuse
 
 
 def test_owned_commit_checks_action_receipt_and_notifies_after_durability(tmp_path: Path) -> None:
+    import os
+
+    from agent_run.executor_host import _process_start_token
     from agent_run.object_state import save_owned
+    from agent_run.run_lifecycle import prepare_action_application_receipt
     from agent_run.state import ConcurrentRunStateError, StateStore
+    from agent_run.task_control import TaskControlStore, TaskKey
 
     store = StateStore(tmp_path)
+    control = TaskControlStore(store.root)
+    task = TaskKey(tmp_path / "repo", "example/repo", 1)
+    waiting = control.claim_action(task, kind="run", payload={"parent": 1})
+    assert waiting.action is not None and waiting.action_id is not None
+    reservation = control.begin_executor(task, action_id=waiting.action_id, run_id="run-1")
+    control.bind_run(task, waiting.action_id, "run-1", state_dir=store.root)
+    control.mark_handshake(
+        task, action_id=waiting.action_id, generation=reservation.generation,
+        pid=os.getpid(), process_start_token=_process_start_token(os.getpid()),
+    )
     original = {"run_id": "run-1", "repository": "example/repo", "parent": {"number": 1},
-                "status": "waiting_external", "supervision_window": {"retry_count": 0},
-                "action_application_receipt": {"action_id": "wait-action"}}
+                "status": "waiting_external", "supervision_window": {"retry_count": 0}}
+    prepare_action_application_receipt(original, waiting.action)
     store.save_run("run-1", original)
     original = store.load_run("run-1")
     assert original is not None
-    stopped = {**original, "action_application_receipt": {"action_id": "stop-action"}}
+    control.complete_action(
+        task, action_id=waiting.action_id, generation=reservation.generation,
+        result_status="waiting_external",
+    )
+    stop = control.claim_control_action(
+        task, kind="stop", payload={"run_id": "run-1"},
+        run_id="run-1", state_dir=store.root,
+    )
+    assert stop is not None
+    control.begin_executor(task, action_id=stop.action_id, run_id="run-1")
+    stopped = dict(original)
+    prepare_action_application_receipt(stopped, stop.action)
     save_owned(store, "run-1", stopped, fields={'action_application_receipt'})
     requested = {**original, "supervision_window": {"retry_count": 1}}
     with pytest.raises(ConcurrentRunStateError, match="action_application_receipt"):

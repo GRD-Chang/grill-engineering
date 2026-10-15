@@ -6,12 +6,28 @@ import weakref
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from time import monotonic
 
 
 MAX_PENDING_COMMITS = 128
 COMMIT_WAIT_SECONDS = 60.0
+_lifecycle_root: ContextVar[Path | None] = ContextVar("lifecycle_commit_root", default=None)
+
+
+@contextmanager
+def lifecycle_commits(root: Path) -> Iterator[None]:
+    """Keep lifecycle mutations out of the business FIFO, without holding a lock."""
+    token = _lifecycle_root.set(root.resolve())
+    try:
+        yield
+    finally:
+        _lifecycle_root.reset(token)
+
+
+def is_lifecycle_commit(root: Path) -> bool:
+    return _lifecycle_root.get() == root.resolve()
 
 
 class StateCommitBusyError(RuntimeError):

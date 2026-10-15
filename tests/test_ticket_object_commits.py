@@ -311,6 +311,9 @@ def test_waiting_ticket_return_revalidates_authority_without_recalling_agent(
             assert waiting.wait(10), "Agent return did not wait for a commit seat"
             pending = states.load_current_run(run_id)
             assert "returned_result" not in pending["ticket_jobs"]["2"]["pending_semantic_attempt"]
+            original_job = deepcopy(pending["ticket_jobs"]["2"])
+            sibling = deepcopy(pending["ticket_jobs"].get("3"))
+            remote_before = fixture.read_bytes()
             assert agents.calls["development"] == [2]
             if revocation == "stop":
                 request_ticket_pause(states, run_id, 2)
@@ -328,7 +331,23 @@ def test_waiting_ticket_return_revalidates_authority_without_recalling_agent(
     assert not worker.is_alive(), "Ticket worker did not leave the rejected commit"
     saved = StateStore(states.root).load_current_run(run_id)
     job = saved["ticket_jobs"]["2"]
-    assert "returned_result" not in job["pending_semantic_attempt"]
+    attempt = deepcopy(job["pending_semantic_attempt"])
+    if revocation == "job":
+        assert "returned_result" not in attempt
+    else:
+        # Stop 或换代只撤销推进权限，原 Invocation 的准确返回仍应收口。
+        assert attempt.pop("returned_result") == {
+            "kind": "development", "thread_id": "developer-2",
+            "summary": "Ticket 2", "replaced_thread_id": None,
+        }
+    assert attempt == original_job["pending_semantic_attempt"]
+    for key in (
+        "candidate_sha", "development_thread_id", "review_budget", "review_budget_history",
+        "semantic_attempt_history", "publication_attempts",
+    ):
+        assert job.get(key) == original_job.get(key), key
+    assert saved["ticket_jobs"].get("3") == sibling
+    assert fixture.read_bytes() == remote_before
     assert agents.calls == {"development": [2], "reviewer": [], "publication": []}
     assert saved["ticket_integration_queue"] == []
     if revocation == "stop":
@@ -336,8 +355,10 @@ def test_waiting_ticket_return_revalidates_authority_without_recalling_agent(
         assert job["blocked_reason"] == "ticket_paused"
     elif revocation == "job":
         assert job["base_sha"] == "replacement-head"
+        assert job["phase"] == original_job["phase"]
         assert errors and isinstance(errors[0], TaskControlBusyError), errors
     else:
+        assert job["phase"] == original_job["phase"]
         assert errors and isinstance(errors[0], ActionReconciliationError), errors
 
 

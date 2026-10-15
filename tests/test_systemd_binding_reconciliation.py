@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import subprocess
 import sys
 from dataclasses import replace
@@ -84,11 +86,11 @@ def test_binding_conflict_cannot_release_original_generation(
             execute=lambda _run_id: pytest.fail("must not dispatch Agent or Publisher"),
         )
         request = LifecycleRequest(task=task, kind="run", payload={"parent": 156})
-        before = control.path_for(task).read_bytes()
+        before = snapshot_control(control, task)
         for _ in range(2):
             with pytest.raises(ExecutorStartUnknownError):
                 lifecycle.submit(request)
-            assert control.path_for(task).read_bytes() == before
+            assert snapshot_control(control, task) == before
             assert process.poll() is None
             assert transport.start_count == 0
         transport.unit = SystemdUnitObservation(
@@ -104,9 +106,9 @@ def test_binding_conflict_cannot_release_original_generation(
             "exited", host._description(spec), None, "signal",
         )
         assert host.inspect(spec, control).status == "exited"
-        closed = control.path_for(task).read_bytes()
+        closed = snapshot_control(control, task)
         assert host.inspect(spec, control).status == "exited"
-        assert control.path_for(task).read_bytes() == closed
+        assert snapshot_control(control, task) == closed
         successor = control.claim_action(
             task, kind="resume", payload={"run_id": "run-1"},
         )

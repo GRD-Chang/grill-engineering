@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,11 +13,13 @@ from agent_run.delivery_loop import TicketDeliveryLoop
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.executor_host import _process_start_token
 from agent_run.models import DeliveryGraph
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.review_budget import new_budget
 from agent_run.ticket_eligibility import TicketEligibilityError
+from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import write_fixture
 from support.delivery_agents import PassAgents, issue
 from support.state import persist_run_fixture
@@ -158,10 +161,19 @@ def test_resume_retry_reuses_only_successful_action_label_qualification(
     })
     persist_run_fixture(states, run_id, state)
     controller.record_execution_failure(run_id, "interrupted")
-    action = {
-        "action_id": "resume-1", "kind": "resume",
-        "payload_digest": "first-intent", "executor_generation": 1,
-    }
+    control = TaskControlStore(states.root)
+    task = TaskKey(git_repo, "example/project", 1)
+    claim = control.claim_action(
+        task, kind="resume", payload={"run_id": run_id, "message": "first intent"},
+    )
+    assert claim.action is not None and claim.action_id is not None
+    action = claim.action
+    reservation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id)
+    control.bind_run(task, claim.action_id, run_id, state_dir=states.root)
+    control.mark_handshake(
+        task, action_id=claim.action_id, generation=reservation.generation,
+        pid=os.getpid(), process_start_token=_process_start_token(os.getpid()),
+    )
     reader.reads_until_failure = 1 if failure_at == "qualification" else 2
     waiting, _ = controller.resume(
         run_id, explicit_resume=True,
@@ -186,7 +198,18 @@ def test_resume_retry_reuses_only_successful_action_label_qualification(
     assert continued["active_ticket_job"]["ticket_number"] == 3
     before = deepcopy(states.load_run(run_id))
     # A new explicit Action must qualify again, even for the same Ticket.
-    action.update(action_id="resume-2", payload_digest="new-intent", executor_generation=2)
+    control.complete_action(
+        task, action_id=claim.action_id, generation=reservation.generation,
+        result_status=continued["status"],
+    )
+    control.finish_executor(task, action_id=claim.action_id, generation=reservation.generation)
+    successor = control.claim_action(
+        task, kind="resume", payload={"run_id": run_id, "message": "new intent"},
+    )
+    assert successor.action is not None and successor.action_id is not None
+    control.begin_executor(task, action_id=successor.action_id, run_id=run_id)
+    control.bind_run(task, successor.action_id, run_id, state_dir=states.root)
+    action = successor.action
     with pytest.raises(TicketEligibilityError):
         controller.resume(
             run_id, explicit_resume=True,

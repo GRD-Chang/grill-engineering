@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import weakref
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -23,9 +23,12 @@ from agent_run.sqlite_work_indexes import IndexFacts
 from agent_run.sqlite_work_fields import field_node_counts
 from agent_run.sqlite_rows import ReadConnection, RowSource, read_document, read_run_rows, read_schema
 from agent_run.sqlite_job_history import FIELDS as JOB_HISTORIES, CURRENT_WORK_PREDICATE
+from agent_run import sqlite_control
+from agent_run.sqlite_scope import context_for
+from agent_run.sqlite_runtime import require_wal_runtime
 
 
-_PROTOCOL = "sqlite-run-objects-v2"
+_PROTOCOL = "sqlite-task-run-v3"
 _MATERIAL_THRESHOLD = 1024
 _SNAPSHOT_FIELDS = {"prompt_resources", "review_context", "parent", "ticket", "issue_snapshot"}
 _OBJECT_COLLECTIONS = {"ticket_jobs", "ticket_agent_invocations", "agent_invocation_history",
@@ -86,7 +89,7 @@ _FOREIGN_KEYS = {
         ("run_objects", "object_path", "object_path", "CASCADE"),
     },
 }
-_SCHEMA = (
+_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE runs (run_id TEXT PRIMARY KEY, repository TEXT, "
     "parent_number INTEGER, status TEXT, phase TEXT, created_at TEXT, updated_at TEXT, root_keys_json TEXT NOT NULL)",
@@ -138,8 +141,14 @@ _SCHEMA = (
     "CREATE INDEX current_work_objects ON run_objects(run_id, object_path) WHERE " + CURRENT_WORK_PREDICATE,
     "CREATE INDEX material_run_refs ON run_material_refs(material_id, run_id)",
 )
-_CANONICAL_TABLES = dict(zip(_COLUMNS, _SCHEMA[:len(_COLUMNS)], strict=True))
-_CANONICAL_INDEXES = {statement.split()[2]: statement for statement in _SCHEMA[len(_COLUMNS):]}
+_BUSINESS_TABLES = dict(zip(_COLUMNS, _SCHEMA[:len(_COLUMNS)], strict=True))
+_BUSINESS_INDEXES = {statement.split()[2]: statement for statement in _SCHEMA[len(_COLUMNS):]}
+_COLUMNS.update(sqlite_control.COLUMNS)
+_KEYS.update(sqlite_control.KEYS)
+_FOREIGN_KEYS.update(sqlite_control.FOREIGN_KEYS)
+_CANONICAL_TABLES = {**_BUSINESS_TABLES, **sqlite_control.TABLES}
+_CANONICAL_INDEXES = {**_BUSINESS_INDEXES, **sqlite_control.INDEXES}
+_SCHEMA = (*_CANONICAL_TABLES.values(), *_CANONICAL_INDEXES.values())
 _WORK_SCHEMA_PARAMETERS = {
     "schema_definitions": encode_json(sorted(
         [("table", name, ddl) for name, ddl in _CANONICAL_TABLES.items()]
@@ -215,7 +224,7 @@ class SQLiteStateRepository:
         self.root = root
         self.path = root / "state.sqlite3"
         self.max_bytes = max_bytes
-        self._local = threading.local()
+        self._local = context_for(root)
         self._read_view: _ReadView | None = None
         self._read_view_lock = threading.Lock()
         self._aggregate_rows = True
@@ -243,31 +252,35 @@ class SQLiteStateRepository:
             identity = None
         if identity != connections.identity:
             connections.close()
-        if readonly:
-            if identity is None:
-                return None
-            if connections.reader is None:
-                connections.reader = sqlite3.connect(
-                    self.path.resolve().as_uri() + "?mode=ro", uri=True,
-                    timeout=5.0, isolation_level=None, factory=ReadConnection,
-                )
-                connections.reader.execute("PRAGMA query_only = ON")
-            connection: sqlite3.Connection = connections.reader
-        else:
-            if connections.writer is None:
-                connections.writer = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-            connection = connections.writer
         try:
-            stat = self.path.stat()
-        except FileNotFoundError:
+            if readonly:
+                if identity is None:
+                    return None
+                if connections.reader is None:
+                    connections.reader = sqlite3.connect(
+                        self.path.resolve().as_uri() + "?mode=ro", uri=True,
+                        timeout=5.0, isolation_level=None, factory=ReadConnection,
+                    )
+                    connections.reader.execute("PRAGMA query_only = ON")
+                connection: sqlite3.Connection = connections.reader
+            else:
+                if connections.writer is None:
+                    connections.writer = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+                connection = connections.writer
+            try:
+                stat = self.path.stat()
+            except FileNotFoundError:
+                connections.close()
+                raise
+            opened_identity = stat.st_dev, stat.st_ino
+            if identity is not None and identity != opened_identity:
+                connections.close()
+                raise OSError("SQLite Run database changed while opening a work connection")
+            connections.identity = opened_identity
+            return connection
+        except BaseException:
             connections.close()
             raise
-        opened_identity = stat.st_dev, stat.st_ino
-        if identity is not None and identity != opened_identity:
-            connections.close()
-            raise OSError("SQLite Run database changed while opening a work connection")
-        connections.identity = opened_identity
-        return connection
 
     @staticmethod
     def _check_schema(connection: sqlite3.Connection, *, allow_empty: bool = False) -> bool:
@@ -300,6 +313,12 @@ class SQLiteStateRepository:
             if definitions in _VALID_SCHEMAS:
                 return True
         for name, expected in _COLUMNS.items():
+            if name in sqlite_control.COLUMNS:
+                actual = next((ddl for kind, table, _, ddl in definitions
+                               if kind == "table" and table == name), None)
+                if actual != _CANONICAL_TABLES[name]:
+                    raise IncompatibleRunStateError("Incompatible SQLite Task Control schema")
+                continue
             info = list(connection.execute(f"PRAGMA table_info({name})"))
             keys = tuple(row[1] for row in sorted(info, key=lambda row: row[5]) if row[5])
             foreign_keys = {
@@ -326,7 +345,7 @@ class SQLiteStateRepository:
         return True
 
     @contextmanager
-    def atomic(self) -> Iterator[None]:
+    def atomic(self, *, timeout: float = 5.0) -> Iterator[None]:
         """Commit all nested repository calls together, or roll them back.
 
         Reentry joins the current transaction; it is not an independent commit
@@ -340,13 +359,15 @@ class SQLiteStateRepository:
                 self._local.failed = True
                 raise
             return
+        require_wal_runtime()
         self.root.mkdir(parents=True, exist_ok=True)
         connection: sqlite3.Connection | None = None
         session = getattr(self._local, "work_connections", None)
         try:
             connection = (self._work_connection(readonly=False) if session is not None
-                          else sqlite3.connect(self.path, timeout=5.0, isolation_level=None))
+                          else sqlite3.connect(self.path, timeout=timeout, isolation_level=None))
             assert connection is not None
+            connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))}")
             initialized = self._check_schema(connection, allow_empty=True)
             # Reapplying this flag expires all prepared statements, even when
             # unchanged. A scoped writer still proves its actual flag at every
@@ -358,7 +379,9 @@ class SQLiteStateRepository:
                 raise OSError("SQLite Run state requires WAL journal support")
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("BEGIN IMMEDIATE")
-            if not initialized:
+            if initialized:
+                self._check_schema(connection)
+            else:
                 # A concurrent creator may have initialized the database while
                 # this connection waited for the write transaction.
                 if not self._check_schema(connection, allow_empty=True):
@@ -369,6 +392,7 @@ class SQLiteStateRepository:
                     )
             self._local.connection = connection
             self._local.failed = False
+            self._local.rollback_callbacks = []
             self._local.view = None
             self._local.work_view = None
             self._local.work_source = None
@@ -381,15 +405,24 @@ class SQLiteStateRepository:
                     raise RuntimeError("SQLite Run transaction contains a failed nested operation")
                 connection.commit()
             except BaseException:
-                connection.rollback()
+                try:
+                    connection.rollback()
+                finally:
+                    for invalidate in self._local.rollback_callbacks:
+                        invalidate()
                 raise
         except sqlite3.Error as error:
             if session is not None:
                 session.close()
             raise OSError(f"Cannot persist SQLite Run state: {error}") from error
+        except BaseException:
+            if session is not None:
+                session.close()
+            raise
         finally:
             self._local.connection = None
             self._local.failed = False
+            self._local.rollback_callbacks = []
             self._local.view = None
             self._local.work_view = None
             self._local.work_source = None
@@ -405,6 +438,11 @@ class SQLiteStateRepository:
     @property
     def in_transaction(self) -> bool:
         return getattr(self._local, "connection", None) is not None
+
+    def _on_rollback(self, invalidate: Callable[[], None]) -> None:
+        """Invalidate provisional in-memory baselines if the shared commit fails."""
+        if self.in_transaction:
+            self._local.rollback_callbacks.append(invalidate)
 
     @contextmanager
     def use_reader(self, connection: ReadConnection | None) -> Iterator[None]:
@@ -427,8 +465,10 @@ class SQLiteStateRepository:
                 session.close()
             yield None
             return
+        require_wal_runtime()
         borrowed = cast(ReadConnection | None, getattr(self._local, "reader", None))
         connection: sqlite3.Connection | None = borrowed
+        failed = False
         try:
             if borrowed is None:
                 connection = (self._work_connection(readonly=True) if session is not None else sqlite3.connect(
@@ -459,7 +499,11 @@ class SQLiteStateRepository:
                 # database file. It contains no Run and needs no read repair.
                 yield None
         except sqlite3.Error as error:
+            failed = True
             raise ValueError(f"Cannot read SQLite Run state: {error}") from error
+        except BaseException:
+            failed = True
+            raise
         finally:
             if connection is not None:
                 try:
@@ -470,6 +514,8 @@ class SQLiteStateRepository:
                         connection.run_rows = None
                     if borrowed is None and session is None:
                         connection.close()
+                    elif borrowed is None and session is not None and failed:
+                        session.close()
 
     def _check_size(
         self, state: Mapping[str, Any], *, fields: dict[str, str] | None = None,
@@ -861,6 +907,8 @@ class SQLiteStateRepository:
         with self.atomic():
             self._local.work_source = None
             save_work(self, run_id, state, baseline, timeline_updates=timeline_updates)
+            if state.get("action_application_receipt") != baseline.get("action_application_receipt"):
+                self._observe_application(self._local.connection, run_id, state)
 
     def _objects(
         self, state: Mapping[str, Any],
@@ -997,6 +1045,16 @@ class SQLiteStateRepository:
             sync_material_counts(connection, run_id)
             index_run(self, connection, run_id, state, objects, materials)
             self._local.work_view = None
+            if "action_application_receipt" in state:
+                self._observe_application(connection, run_id, state)
+
+    def _observe_application(
+        self, connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any],
+    ) -> None:
+        receipt = state.get("action_application_receipt")
+        if not isinstance(receipt, Mapping) or receipt.get("run_id") != run_id:
+            raise ValueError("Cannot remove or replace the Run application receipt identity")
+        sqlite_control.observe_application(connection, receipt, str(self.root.resolve()))
 
     def load_objects(
         self, run_id: str, *, excluded_fields: set[str] | None = None,
@@ -1024,6 +1082,8 @@ class SQLiteStateRepository:
             save_projection(self, self._local.connection, run_id, state, fields,
                             history_positions or {}, keyed_changes=keyed_changes)
             self._local.view = None
+            if "action_application_receipt" in fields:
+                self._observe_application(self._local.connection, run_id, state)
 
     def load_paths(self, run_id: str, paths: set[tuple[str | int, ...]]) -> dict[str, Any] | None:
         from agent_run.sqlite_collections import load_paths

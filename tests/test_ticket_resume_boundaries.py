@@ -1,4 +1,6 @@
 """Small boundary tests complement the public concurrent Resume flow."""
+
+from support.control_state import snapshot_control
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -302,7 +304,7 @@ def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: boo
             run_id=payload['run_id'], can_exit=lambda: True, failure='scheduler stopped',
         )
     state_before = snapshot_run((controller.states.root, str(payload['run_id'])))
-    control_before = control.path_for(task).read_bytes()
+    control_before = snapshot_control(control, task)
     if closed:
         with pytest.raises(ActionBusyError, match='收口'):
             admit_ticket_resume(controller, control, task, executor, payload)
@@ -310,7 +312,7 @@ def test_duplicate_resume_rechecks_executor_admission(paused_ticket, closed: boo
         duplicate, repeated = admit_ticket_resume(controller, control, task, executor, payload)
         assert repeated and duplicate == admitted
     assert snapshot_run((controller.states.root, str(payload['run_id']))) == state_before
-    assert control.path_for(task).read_bytes() == control_before
+    assert snapshot_control(control, task) == control_before
 
 
 def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(paused_ticket) -> None:

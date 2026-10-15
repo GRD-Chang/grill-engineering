@@ -24,6 +24,7 @@ from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
 )
+from agent_run.task_control import TaskControlStore, TaskKey
 
 from support.inprocess_cli import invoke_cli_inprocess
 from support.lifecycle import _file_snapshot
@@ -724,27 +725,29 @@ def test_parent_closeout_recovers_without_a_second_merge(
     assert preserved is not None
     assert preserved["status"] == "parent_closeout_pending"
 
-    successor = {
-        "action_id": "successor-approve",
-        "kind": "approve",
-        "payload_digest": "successor-payload",
-        "executor_generation": 2,
-    }
+    control = TaskControlStore(states.root)
+    task = TaskKey(git.root, str(state["repository"]), 1)
+    successor = control.claim_action(
+        task, kind="approve", payload={"run_id": state["run_id"]},
+    )
+    assert successor.action is not None and successor.action_id is not None
+    control.begin_executor(task, action_id=successor.action_id, run_id=str(state["run_id"]))
+    control.bind_run(task, successor.action_id, str(state["run_id"]), state_dir=states.root)
     completed = engine.recover_closeout(
         str(state["run_id"]),
         prepare_state=lambda current: prepare_action_application_receipt(
-            current, successor
+            current, successor.action
         ),
     )
 
     assert completed["status"] == "completed"
     assert completed["action_application_receipt"]["action_id"] == (
-        "successor-approve"
+        successor.action_id
     )
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
     assert persisted["action_application_receipt"]["action_id"] == (
-        "successor-approve"
+        successor.action_id
     )
     assert publisher.data["delivery"]["closed_issues"].count(1) == 1
     assert publisher.data["parent"]["state"] == "CLOSED"

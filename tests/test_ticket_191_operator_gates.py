@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import control_refs, only_control, snapshot_control
+
 from support.run_artifacts import _canonical_run_budget, _repair_artifact
 from support.run_scenarios import _completed_run
 
@@ -154,7 +156,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
                 assert stdout_json(rejected)["status"] == "blocked"
                 assert _tree_snapshot(state_root) == state_before
                 assert fixture.read_bytes() == fixture_before
-                assert not list((state_root / "task-control").glob("*.json"))
+                assert not control_refs(state_root)
         except AssertionError as error:
             error.add_note(f"run_arguments={run_arguments!r}")
             raise
@@ -261,7 +263,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
                 assert stdout_json(rejected)["status"] == "supervision_timeout"
                 assert _tree_snapshot(state_root) == state_before
                 assert fixture.read_bytes() == fixture_before
-                assert not list((state_root / "task-control").glob("*.json"))
+                assert not control_refs(state_root)
 
                 _assert_production_run_rejects_before_readiness(
                     git_repo,
@@ -273,7 +275,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
                 )
                 assert _tree_snapshot(state_root) == state_before
                 assert fixture.read_bytes() == fixture_before
-                assert not list((state_root / "task-control").glob("*.json"))
+                assert not control_refs(state_root)
                 capsys.readouterr()
         except AssertionError as error:
             error.add_note(f"run_arguments={run_arguments!r}")
@@ -390,9 +392,9 @@ def _assert_run_preserves_boundary(
 ) -> None:
     state_root = managed_state(git_repo)
     state_ref = only_run_ref(state_root)
-    control_path = next((state_root / "task-control").glob("*.json"))
+    control_path_store, control_path_task = only_control(state_root)
     state_before = snapshot_run(state_ref)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control_path_store, control_path_task)
     control_document_before = json.loads(control_before)
     tree_before = _tree_snapshot(state_root)
     fixture_before = fixture.read_bytes()
@@ -416,10 +418,10 @@ def _assert_run_preserves_boundary(
     assert rejected.returncode == 2, rejected.stderr
     assert stdout_json(rejected)["status"] == expected_status
     assert snapshot_run(state_ref) == state_before
-    assert control_path.read_bytes() == control_before
+    assert snapshot_control(control_path_store, control_path_task) == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert fixture.read_bytes() == fixture_before
-    control_document_after = json.loads(control_path.read_bytes())
+    control_document_after = control_path_store.load(control_path_task)
     assert control_document_after["action"]["executor_generation"] == (
         control_document_before["action"]["executor_generation"]
     )
@@ -496,9 +498,9 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     state_root = managed_state(git_repo)
     state_ref = only_run_ref(state_root)
-    control_path = next((state_root / "task-control").glob("*.json"))
+    control_path_store, control_path_task = only_control(state_root)
     state_before = snapshot_run(state_ref)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control_path_store, control_path_task)
     tree_before = _tree_snapshot(state_root)
     unused_agents = _parent_only_agents(git_repo / "unused-agents.json")
 
@@ -514,7 +516,7 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
     assert waiting.returncode == 0, waiting.stderr
     assert stdout_json(waiting)["status"] == "waiting_external"
     assert snapshot_run(state_ref) == state_before
-    assert control_path.read_bytes() == control_before
+    assert snapshot_control(control_path_store, control_path_task) == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert json.loads(fixture.read_text(encoding="utf-8"))[
         "delivery_graph_read_failures"
@@ -564,10 +566,8 @@ def test_ordinary_run_advances_normal_run_publication_pending(
 
     assert advanced.returncode == 0, advanced.stderr
     assert stdout_json(advanced)["status"] == "run_approval_pending"
-    control_path = next(
-        (managed_state(git_repo) / "task-control").glob("*.json")
-    )
-    control = json.loads(control_path.read_bytes())
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    control = control_path_store.load(control_path_task)
     assert control["action"]["kind"] == "run"
     assert control["action"]["executor_generation"] == 1
     assert control["action"]["status"] == "completed"

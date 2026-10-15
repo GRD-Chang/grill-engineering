@@ -22,6 +22,16 @@
 
 只读取本轮分支及其要求的参考，不必通读全部运行规则。
 
+本版状态协议要求 Python 实际加载包含 WAL-reset 修复的 SQLite：
+3.51.3 及以上，或官方回补分支 3.50.7–3.50.x / 3.44.6–3.44.x。
+用 `python -c 'import sqlite3; print(sqlite3.sqlite_version)'` 核对运行 Runner 的解释器；
+已有 JSON 与此前 SQLite Run 保留成果，但不能由新协议直接续接或迁移。
+详见[状态协议和运行库](agents/state-storage.md)。
+
+后台 Executor 与退出通知钩子在加载状态层前，从准确绑定的私有环境材料取得
+`LD_LIBRARY_PATH` 并重新启动同一 Snapshot 解释器；终端选择的修复库因而可用于
+后台。启动载体仍由原入口一次性消费，退出副本保留到宿主完成清理。
+
 ## 运行任务
 
 1. 读取 Parent Issue 的当前正文和评论，确认范围与验收标准。

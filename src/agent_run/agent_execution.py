@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent_run.agent_invocation import invocation_event_recorder
+from agent_run.invocation_settlement import settlement_scope
 from agent_run.agent_return import AgentReturn, restore_agent_return, store_agent_return
 from agent_run.agents import (
     AgentBackend, DevelopmentResult, HumanBlockerResult, ReviewResult, PublicationResult,
@@ -104,7 +105,8 @@ def execute_agent_work(
             save(state)
         raise
     # This boundary precedes remote observations, Git writes and role closeout.
-    save(state)
+    with settlement_scope(state):
+        save(state)
     return restore_agent_return(semantic_attempt["returned_result"], semantic_attempt)
 
 

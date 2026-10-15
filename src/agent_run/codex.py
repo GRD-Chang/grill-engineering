@@ -322,6 +322,7 @@ class CodexCliBackend:
         """Run one Invocation with at most two same-Thread output repairs."""
 
         from agent_run.worker_control import check_worker_control
+        from agent_run.executor_admission import ExecutorCancelledError
 
         event = request.get("_invocation_event")
         event_deadline_seconds = getattr(event, "deadline_seconds", None)
@@ -494,6 +495,11 @@ class CodexCliBackend:
                 if process_started:
                     failure_facts["execution_interrupted"] = not getattr(error, "completed_output", False)
                     failure_facts["machine_error"] = getattr(error, "machine_error", None)
+                if isinstance(error, ExecutorCancelledError):
+                    # Keep the original diagnostic while giving explicit
+                    # Resume the established interrupted-Invocation identity.
+                    failure_facts["machine_error"] = failure_facts["error"]
+                    failure_facts["error"] = "controller_interrupted"
                 try:
                     notify("failed", **failure_facts)
                 except BaseException as diagnostic_error:

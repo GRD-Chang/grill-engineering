@@ -217,25 +217,21 @@ def seed_idle_control(
     Use only before any Executor is reserved. Missing-ownership fault fixtures
     deliberately keep using bare seed_run, without this explicit evidence.
     """
-    path = control.path_for(task)
-    assert not path.exists(), "idle fixture must not replace existing ownership"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "protocol": TASK_CONTROL_PROTOCOL,
-                "task": task.identity,
-                "run_id": run_id,
-                "run_state_dir": (
-                    str(state_dir.resolve()) if state_dir is not None else None
-                ),
-                "next_generation": 1,
-                "action": None,
-                "action_history": [],
-                "executor": None,
-                "updated_at": "2026-09-07T00:00:00+00:00",
-            }
-        ),
-        encoding="utf-8",
+    from support.control_state import persist_control_fixture
+
+    assert control.load(task) is None, "idle fixture must not replace existing ownership"
+    persist_control_fixture(
+        control, task,
+        {
+            "protocol": TASK_CONTROL_PROTOCOL,
+            "task": task.identity,
+            "run_id": run_id,
+            "run_state_dir": str((state_dir or control.root).resolve()),
+            "next_generation": 1,
+            "action": None,
+            "action_history": [],
+            "executor": None,
+            "updated_at": "2026-09-07T00:00:00+00:00",
+        },
     )
     assert control.load(task) is not None

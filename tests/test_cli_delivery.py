@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import load_only_control, only_control, snapshot_control
+
 from support.cli_payloads import (
     HUMAN_BLOCKER,
     SPEC_PASS_EVIDENCE,
@@ -681,11 +683,7 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     assert interrupted_output["diagnostics"][0]["code"] == (
         "executor_agent_interrupted"
     )
-    control = json.loads(
-        next((managed_state(git_repo) / "task-control").glob("*.json")).read_text(
-            encoding="utf-8"
-        )
-    )
+    control = load_only_control(managed_state(git_repo))
     assert control["action"]["status"] == "completed"
     assert control["executor"]["status"] == "exited"
     assert control["executor"]["failure"] == "executor_agent_interrupted"
@@ -1974,12 +1972,12 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         capture_output=True,
         check=False,
     ).returncode != 0
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    completed_control = control_path.read_bytes()
+    control_store, control_task = only_control(managed_state(git_repo))
+    completed_control = snapshot_control(control_store, control_task)
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 2
     assert stdout_json(replayed)["status"] == "completed"
-    assert control_path.read_bytes() == completed_control
+    assert snapshot_control(control_store, control_task) == completed_control
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
     assert abandoned.returncode == 0, abandoned.stderr
     assert stdout_json(abandoned)["status"] == "completed"
@@ -3009,14 +3007,14 @@ def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
     if waiting_case in {"pending", "unknown"}:
-        control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-        control_before = control_path.read_bytes()
+        control_store, control_task = only_control(managed_state(git_repo))
+        control_before = snapshot_control(control_store, control_task)
         fixture_before = fixture.read_bytes()
         refused = run_cli(git_repo, fixture, "run", "1")
         assert refused.returncode == 2, refused.stdout
         assert stdout_json(refused)["status"] == "supervision_timeout"
         assert load_only_run_state(git_repo) == waiting
-        assert control_path.read_bytes() == control_before
+        assert snapshot_control(control_store, control_task) == control_before
         assert fixture.read_bytes() == fixture_before
 
     recovered = (
@@ -3289,8 +3287,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     ]
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert [pull["state"] for pull in pulls] == ["CLOSED", "OPEN"]
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    first_control = json.loads(control_path.read_text(encoding="utf-8"))
+    first_control = load_only_control(managed_state(git_repo))
     first_requeue_action_id = first_control["action"]["action_id"]
 
     data = json.loads(fixture.read_text(encoding="utf-8"))

@@ -141,7 +141,9 @@ class ObjectStateStore:
         baselines[run_id] = (record.facts, record.history_positions)
         carrier = state if projection is None else projection
         if isinstance(carrier, ObjectProjection):
-            carrier.record_baseline(self._projection_key(run_id), record)
+            key = self._projection_key(run_id)
+            carrier.record_baseline(key, record)
+            self._store._repository._on_rollback(lambda: carrier.invalidate_baseline(key))
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
         return self._load_objects(run_id)
@@ -248,6 +250,15 @@ class ObjectStateStore:
                 self._record_baseline(run_id, created[0], created[1], projection=state)
             return
         latest, positions = loaded
+        from agent_run.invocation_settlement import current_settlement, commit_settlement
+        from agent_run.ticket_state import RUN_STOP_STATUSES
+        permission = current_settlement()
+        if permission is not None and (
+            permission.limited or latest.get("status") in RUN_STOP_STATUSES
+        ):
+            commit_settlement(self._store, run_id, state)
+            self.invalidate_baseline()
+            return
         if baseline is None:
             raise ValueError("Object save requires a loaded baseline or explicit save_owned")
         old = baseline[0]

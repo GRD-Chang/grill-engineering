@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import json
 import os
 import subprocess
@@ -57,7 +59,7 @@ def test_rejected_action_requires_exact_unapplied_exit_evidence(
         )
     if case == "foreign_receipt":
         state["action_application_receipt"]["executor_generation"] = 99
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
 
     if case in {"exited", "bound_exited"}:
         result = control.reconcile_from_run(task, state)
@@ -67,7 +69,7 @@ def test_rejected_action_requires_exact_unapplied_exit_evidence(
     else:
         with pytest.raises(ActionReconciliationError):
             control.reconcile_from_run(task, state)
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
 
 
 def test_public_resume_preserves_work_after_unclassified_transport_failure(

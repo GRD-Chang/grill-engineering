@@ -1,3 +1,5 @@
+
+from support.control_state import snapshot_control
 import json
 import subprocess
 import sys
@@ -34,10 +36,10 @@ def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["status"] == "operator_stopped"
     assert states.load_run(run_id)["status"] == "operator_stopped"
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     repeated = _run_cli(git_repo, fixture, "stop", run_id)
     assert repeated.returncode == 0, repeated.stderr
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
 
 
 @pytest.mark.parametrize("case", [
@@ -96,7 +98,7 @@ def test_resume_reconciles_externally_exited_executor(
                 control.finish_executor(task, action_id=claim.action_id,
                     generation=reservation.generation)
         before = states.load_run(run_id)
-        control_before = control.path_for(task).read_bytes()
+        control_before = snapshot_control(control, task)
         if case == "save_interrupted":
             from agent_run.object_state import ObjectStateStore
             original_save = ObjectStateStore.save_run
@@ -117,7 +119,8 @@ def test_resume_reconciles_externally_exited_executor(
                     str(fixture), "--agent-fixture",
                     str(_parent_only_agents(git_repo / "agents.json")),
                 ]) == 2
-            assert control.load(task)["executor"]["status"] == "exited"
+            # The failed business save rolls its exact Control exit back too.
+            assert snapshot_control(control, task) == control_before
             assert states.load_run(run_id) == before
         result = _run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture",
             str(_parent_only_agents(git_repo / "agents.json")))
@@ -125,13 +128,13 @@ def test_resume_reconciles_externally_exited_executor(
             assert result.returncode == 2, result.stdout + result.stderr
             assert ("仍在运行" if case == "recorded_exit_alive" else "退出证据不足") in result.stdout
             assert states.load_run(run_id) == before
-            assert control.path_for(task).read_bytes() == control_before
+            assert snapshot_control(control, task) == control_before
         elif workers:
             assert result.returncode == 2, result.stdout + result.stderr
             assert "stop" in result.stdout
             assert all(worker.poll() is None for worker in workers)
             assert states.load_run(run_id) == before
-            assert control.path_for(task).read_bytes() == control_before
+            assert snapshot_control(control, task) == control_before
             stopped = _run_cli(git_repo, fixture, "stop", run_id)
             assert stopped.returncode == 0, stopped.stdout + stopped.stderr
             for worker in workers:

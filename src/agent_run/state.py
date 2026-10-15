@@ -10,7 +10,7 @@ import os
 import threading
 import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,7 +21,7 @@ from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.sqlite_state import SQLiteStateRepository
-from agent_run.state_commits import coordinator_for
+from agent_run.state_commits import coordinator_for, is_lifecycle_commit
 from agent_run.state_errors import IncompatibleRunStateError
 
 
@@ -185,12 +185,12 @@ class StateStore:
             yield
 
     def _commit_run(self, operation: Callable[[], _T]) -> _T:
-        # Queue before acquiring Control/Run locks. Never replay a transaction.
+        # Queue before acquiring Control or database locks. Never replay a transaction.
         with self.commit_admission():
             notifications = self._commit_context.notifications
             checkpoint = len(notifications)
             try:
-                with self._write_boundary(), self.locked(), self._repository.atomic():
+                with self._write_boundary(), self._repository.atomic():
                     return operation()
             except BaseException:
                 del notifications[checkpoint:]
@@ -204,19 +204,28 @@ class StateStore:
 
     @contextmanager
     def commit_admission(self) -> Iterator[None]:
-        """Acquire a FIFO seat before callers enter a compound Control boundary.
+        """Coordinate business saves before a compound Control boundary.
 
-        Nested saves on this StateStore reuse the seat. Notifications wait until its outer scope
+        Lifecycle scopes bypass the business FIFO. Nested saves reuse their seat.
+        Notifications wait until the outer scope
         has released all Control and database locks, and never fail the save.
         """
         nested = getattr(self._commit_context, "notifications", None) is not None
         notifications: list[dict[str, Any] | Callable[[], dict[str, Any] | None] | None] = []
         try:
-            with self._coordinator.admitted():
+            with (nullcontext() if is_lifecycle_commit(self.root) else self._coordinator.admitted()):
                 if not nested:
                     self._commit_context.notifications = notifications
                 try:
                     yield
+                except BaseException:
+                    if not nested:
+                        notifications.clear()
+                        for attribute in ("_object_store_adapter", "_parent_object_store_adapter"):
+                            adapter = getattr(self, attribute, None)
+                            if adapter is not None:
+                                adapter.invalidate_baseline()
+                    raise
                 finally:
                     if not nested:
                         self._commit_context.notifications = None
@@ -1084,13 +1093,7 @@ def _is_credential_key(normalized: str) -> bool:
 
 
 def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
-    return path in {
-        ("action_application_receipt", "target_executor", "process_start_token"),
-        (
-            "action_application_receipt", "target_executor", "worker",
-            "process_start_token",
-        ),
-    } or path[-4:] == (
+    return path[-4:] == (
         "last_ticket_resume", "payload", "resume_intent", "authorization"
     ) or path[-2:] == ("candidate_commit_intent", "token") or (
         bool(path)

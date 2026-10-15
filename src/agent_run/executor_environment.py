@@ -8,13 +8,16 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
-from agent_run.executor_host import ExecutorSpec
 from agent_run.paths import app_runtime_root
+
+if TYPE_CHECKING:
+    from agent_run.executor_host import ExecutorSpec
 
 DEFAULT_MAX_ENVIRONMENT_BYTES = 1024 * 1024
 DEFAULT_CARRIER_TTL_SECONDS = 30.0
+EXIT_ENVIRONMENT_CREDENTIAL = "agent-run-exit-environment"
 _MAX_CARRIER_METADATA_BYTES = 4096
 _CARRIER_VERSION = 1
 
@@ -148,6 +151,27 @@ def consume_environment_carrier(
     """Consume a carrier once; mismatched bindings leave it for its owner."""
 
     path = Path(path)
+    environment, command = read_environment_carrier(path, _binding(spec), now=now)
+    claimed = _claimed_path(path)
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError as error:
+        raise EnvironmentCarrierError("Executor 环境载体不存在或已经消费") from error
+    try:
+        return environment, command
+    finally:
+        claimed.unlink(missing_ok=True)
+
+
+def read_environment_carrier(
+    path: Path, binding: Mapping[str, object], *, now: float | None = None,
+    check_expiry: bool = True,
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Read exact private material without consuming it or opening state.
+
+    The manager's exit credential has the Session lifetime, not the startup TTL.
+    """
+    path = Path(path)
     try:
         with path.open("rb") as carrier:
             stat = os.fstat(carrier.fileno())
@@ -165,11 +189,11 @@ def consume_environment_carrier(
         raise EnvironmentCarrierError("Executor 环境载体损坏") from error
     if not isinstance(value, dict) or value.get("version") != _CARRIER_VERSION:
         raise EnvironmentCarrierError("Executor 环境载体版本无效")
-    if value.get("binding") != _binding(spec):
+    if value.get("binding") != binding:
         raise EnvironmentCarrierError("Executor 环境载体 binding 不匹配")
     expires_at = value.get("expires_at")
     current = time.time() if now is None else now
-    if not isinstance(expires_at, (int, float)) or current > float(expires_at):
+    if check_expiry and (not isinstance(expires_at, (int, float)) or current > float(expires_at)):
         path.unlink(missing_ok=True)
         raise EnvironmentCarrierError("Executor 环境载体已经过期")
     environment = value.get("environment")
@@ -181,17 +205,7 @@ def consume_environment_carrier(
         for key, item in environment.items()
     ) or any(not isinstance(argument, str) for argument in command):
         raise EnvironmentCarrierError("Executor 环境载体内容无效")
-    claimed = _claimed_path(path)
-    try:
-        os.replace(path, claimed)
-    except FileNotFoundError as error:
-        raise EnvironmentCarrierError(
-            "Executor 环境载体不存在或已经消费"
-        ) from error
-    try:
-        return dict(environment), tuple(command)
-    finally:
-        claimed.unlink(missing_ok=True)
+    return dict(environment), tuple(command)
 
 
 def cleanup_expired_carriers(

@@ -12,6 +12,7 @@ import pytest
 
 from agent_run.user_defaults import UserDefaultsStore
 from support.cli import load_only_run_state
+from support.control_state import control_refs, control_state_text, snapshot_control
 from support.seeding import write_fixture
 from support.user_defaults import settings
 from support.workspace import managed_state
@@ -154,12 +155,15 @@ raise SystemExit(cli.main(sys.argv[1:]))
     assert [json.loads(line)["token"] for line in capture.read_text().splitlines()] == ["pat-first", "pat-repaired"]
     texts = [path.read_text() for path in managed_state(git_repo).rglob("*.json")]
     texts.extend(run_state_text(reference) for reference in run_refs(managed_state(git_repo)))
+    controls = control_refs(managed_state(git_repo))
+    assert controls
+    texts.extend(control_state_text(control, task) for control, task in controls)
     assert all(secret not in text for text in texts
                for secret in ("pat-first", "pat-repaired", "independent-runner-secret"))
     if reference == "app":
         state_ref = only_run_ref(managed_state(git_repo))
         compatible_state = read_run(state_ref)
-        control_root = managed_state(git_repo) / "task-control"
+        control_root = managed_state(git_repo)
         for missing in ("app_read_only", "app_current_repository_only", "github_identity"):
             legacy_state = deepcopy(compatible_state)
             if missing == "github_identity":
@@ -168,12 +172,19 @@ raise SystemExit(cli.main(sys.argv[1:]))
                 legacy_state["github_identity"].pop(missing)
             write_run_fixture(state_ref, legacy_state)
             before = snapshot_run(state_ref)
-            controls_before = {path.name: path.read_bytes() for path in control_root.glob("*.json")}
+            controls_before = {
+                task.fingerprint: snapshot_control(control, task)
+                for control, task in control_refs(control_root)
+            }
+            assert controls_before
             capture_before, fixture_before = capture.read_bytes(), fixture.read_bytes()
             incompatible = call("resume", first["run_id"], "--message", "旧授权不能猜测")
             assert json.loads(incompatible.stdout)["diagnostics"][0]["code"] == "incompatible_run_state"
             assert snapshot_run(state_ref) == before
-            assert {path.name: path.read_bytes() for path in control_root.glob("*.json")} == controls_before
+            assert {
+                task.fingerprint: snapshot_control(control, task)
+                for control, task in control_refs(control_root)
+            } == controls_before
             assert capture.read_bytes() == capture_before
             assert fixture.read_bytes() == fixture_before
 

@@ -182,7 +182,7 @@ def _running_executor(
     tmp_path: Path,
 ) -> tuple[TaskControlStore, TaskKey, dict[str, object]]:
     task = TaskKey(tmp_path / "repo", "owner/repo", 194)
-    control = TaskControlStore(tmp_path / "control")
+    control = TaskControlStore(tmp_path / "state")
     claim = control.claim_action(task, kind="run", payload={"parent": 194})
     assert claim.action_id is not None
     reservation = control.begin_executor(

@@ -1,6 +1,11 @@
 """Finite systemd post-exit observation; no execution or business-state authority."""
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from agent_run.executor_bootstrap import reexec_for_runtime
+
+    reexec_for_runtime("agent_run.executor_exit")
+
 import argparse
 import json
 import os
@@ -8,7 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent_run.executor_environment import DEFAULT_MAX_ENVIRONMENT_BYTES, _binding
+from agent_run.executor_environment import (
+    EXIT_ENVIRONMENT_CREDENTIAL as CREDENTIAL, _binding, read_environment_carrier,
+)
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notification_event_facts import event_copy, event_envelope
 from agent_run.notification_outbox import transaction
@@ -17,7 +24,6 @@ from agent_run.runner_lease import default_runner_lock_path, runner_usage_lease
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 
-CREDENTIAL = "agent-run-exit-environment"
 STOP_TIMEOUT_SECONDS = 70
 
 
@@ -137,16 +143,7 @@ def main(arguments: list[str] | None = None) -> int:
         # systemd copies this at activation, before the one-shot startup carrier
         # is consumed. Its private, read-only copy lives only until unit cleanup.
         credential = Path(os.environ["CREDENTIALS_DIRECTORY"]) / CREDENTIAL
-        with credential.open("rb") as stream:
-            raw = stream.read(DEFAULT_MAX_ENVIRONMENT_BYTES + 1)
-        if len(raw) > DEFAULT_MAX_ENVIRONMENT_BYTES:
-            raise ValueError("exit environment exceeds limit")
-        snapshot = json.loads(raw)
-        if snapshot.get("binding") != _binding(spec):
-            raise ValueError("exit environment binding mismatch")
-        environment = snapshot["environment"]
-        if not isinstance(environment, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in environment.items()):
-            raise ValueError("invalid exit environment")
+        environment, _ = read_environment_carrier(credential, _binding(spec), check_expiry=False)
         os.environ.clear()
         os.environ.update(environment)
         with runner_usage_lease(default_runner_lock_path(environment)):

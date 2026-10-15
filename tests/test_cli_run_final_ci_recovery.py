@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import only_control, snapshot_control
+
 import json
 from pathlib import Path
 from typing import Any
@@ -218,14 +220,14 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
     )
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     recovery_agents = _two_round_ci_repair_agents(git_repo / "recovery-agents.json")
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    control_before = control_path.read_bytes()
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    control_before = snapshot_control(control_path_store, control_path_task)
     fixture_before = fixture.read_bytes()
     refused = run_cli(git_repo, fixture, "run", "1")
     assert refused.returncode == 2, refused.stdout
     assert stdout_json(refused)["status"] == "supervision_timeout"
     assert load_only_run_state(git_repo) == waiting_state
-    assert control_path.read_bytes() == control_before
+    assert snapshot_control(control_path_store, control_path_task) == control_before
     assert fixture.read_bytes() == fixture_before
     recovered = run_cli(
         git_repo, fixture, "resume", "1", "--agent-fixture", str(recovery_agents)

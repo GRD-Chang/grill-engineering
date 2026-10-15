@@ -1,6 +1,8 @@
 """Host exit facts share notification identity, validity and finite delivery budgets."""
 from __future__ import annotations
 
+from support.control_state import control_refs, persist_control_fixture, raw_control_snapshot
+
 import hashlib
 import json
 import os
@@ -33,10 +35,10 @@ def _observe(spec: ExecutorSpec) -> None:
     observe_exit(spec, service_result="signal", exit_code="killed", exit_status="KILL")
 
 
-def _business_files(states: StateStore) -> dict[str, bytes]:
+def _business_files(states: StateStore) -> dict[str, object]:
     snapshot = {
-        str(path.relative_to(states.root)): path.read_bytes()
-        for path in (states.root / "task-control").rglob("*") if path.is_file()
+        f"control:{task.fingerprint}": raw_control_snapshot(control, task)
+        for control, task in control_refs(states.root)
     }
     snapshot.update({f"run:{run_id}": state for run_id, state in snapshot_runs(states.root).items()})
     return snapshot
@@ -149,7 +151,7 @@ def test_exit_observer_suppresses_non_crashes_and_obsolete_sessions(
             record["action"]["executor_generation"] += 1
         else:
             record["action"]["run_id"] = None
-        control.path_for(spec.task).write_text(json.dumps(record), encoding="utf-8")
+        persist_control_fixture(control, spec.task, record)
     elif case == "recovered":
         successor = _resume(states, control, spec)
         assert successor.generation > spec.generation

@@ -1,6 +1,8 @@
 """首次 resume 必须从持久请求定位 Run，不能继承观察者的内存闭包。"""
 from __future__ import annotations
 
+from support.control_state import only_control, snapshot_control
+
 import json
 import os
 from pathlib import Path
@@ -96,8 +98,8 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
         persist_run_fixture(StateStore(managed_state(git_repo)), run_id, before)
     history_before = before['agent_invocation_history']
     assert len(history_before) == 1
-    control_file, = (managed_state(git_repo) / 'task-control').glob('*.json')
-    old_control = json.loads(control_file.read_text())
+    control_file_store, control_file_task = only_control(managed_state(git_repo))
+    old_control = control_file_store.load(control_file_task)
     checkout = managed_state(git_repo) / 'worktrees' / run_id / 'parent'
     if missing_material is not None:
         # 缺损只来自本例故障注入；修复必须使用准确备份和真实 Git 身份，
@@ -122,8 +124,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
                            cwd=managed_repo(git_repo), check=True, capture_output=True)
             assert not checkout.exists()
         state_bytes = snapshot_run(state_ref)
-        control_bytes = {path.name: path.read_bytes()
-                         for path in control_file.parent.glob('*.json')}
+        control_bytes = snapshot_control(control_file_store, control_file_task)
         rejected = run_cli(git_repo, fixture, 'resume', run_id,
                            '--agent-fixture', str(agents))
         assert rejected.returncode == 2, rejected.stdout + rejected.stderr
@@ -139,8 +140,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
             assert head in diagnostic
             assert not checkout.exists()
         assert snapshot_run(state_ref) == state_bytes
-        assert {path.name: path.read_bytes()
-                for path in control_file.parent.glob('*.json')} == control_bytes
+        assert snapshot_control(control_file_store, control_file_task) == control_bytes
         assert json.loads(agents.read_text()) == script
         if missing_material == 'timeline':
             write_run_fixture(state_ref, json.loads(trusted_state))
@@ -163,8 +163,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
             assert 'recovery_materials_missing' in wrong.stdout
             assert head in wrong.stdout
             assert snapshot_run(state_ref) == state_bytes
-            assert {path.name: path.read_bytes()
-                    for path in control_file.parent.glob('*.json')} == control_bytes
+            assert snapshot_control(control_file_store, control_file_task) == control_bytes
             assert json.loads(agents.read_text()) == script
             assert (checkout / 'progress.txt').read_bytes() == progress
             assert subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=checkout,
@@ -190,7 +189,7 @@ def test_first_public_resume_reenters_real_cli_in_independent_executor(
     assert admitted['action']['payload']['run_id'] == run_id
     assert admitted['action']['action_id'] != old_control['action']['action_id']
     after = load_only_run_state(git_repo)
-    control = json.loads(control_file.read_text())
+    control = control_file_store.load(control_file_task)
     assert control['run_id'] == control['action']['run_id'] == control['executor']['run_id'] == run_id
     assert control['action']['application_observed'] is True
     assert control['executor']['generation'] > old_control['executor']['generation']

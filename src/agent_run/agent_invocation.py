@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 from typing import Any, Callable
 
 from agent_run.operator_gate import run_failure_diagnostic
+from agent_run.invocation_settlement import settlement_scope
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
 from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.resume_audit import bind_resume_to_successor
@@ -266,7 +268,8 @@ def invocation_event_recorder(
                             ],
                         }
                     )
-                    save(state)
+                    with settlement_scope(state):
+                        save(state)
                     raise ValueError(error)
             elif kind in {"completed", "failed"}:
                 invocation["status"] = kind
@@ -291,7 +294,14 @@ def invocation_event_recorder(
                         }
                     )
             _sync_invocation_history(state, invocation)
-        save(state)
+        # Admission/recovery starts keep normal authority. These observations
+        # can settle an already admitted Invocation even after Stop.
+        scope = settlement_scope(state) if kind in {
+            "thread_started", "execution_started", "execution_finished",
+            "completed", "failed", "output_step", "recovery_waiting",
+        } else nullcontext()
+        with scope:
+            save(state)
 
     setattr(record, "deadline_seconds", invocation_deadline_seconds)
     setattr(record, "recovery_state", recovery_state)

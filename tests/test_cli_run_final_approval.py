@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import only_control, snapshot_control
+
 import json
 from pathlib import Path
 from typing import Any
@@ -494,8 +496,8 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
     receipt = paused["action_application_receipt"]
     assert receipt["kind"] == "approve"
     assert paused["status"] != "completed"
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    interrupted_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    interrupted_control = control_path_store.load(control_path_task)
     assert interrupted_control["run_id"] == run_id
     assert interrupted_control["action"]["run_id"] == run_id
     assert interrupted_control["executor"]["run_id"] == run_id
@@ -504,7 +506,7 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
     assert "status comment EOF" in interrupted_control["action"]["failure"]
     assert json.loads(fixture.read_text())["delivery"]["pull_requests"][-1]["state"] == "OPEN"
     run_before_query = paused.copy()
-    control_before_query = control_path.read_bytes()
+    control_before_query = snapshot_control(control_path_store, control_path_task)
     status = run_cli(git_repo, fixture, "status", run_id, "--json")
     history = run_cli(git_repo, fixture, "history", run_id, "--json")
     assert status.returncode == history.returncode == 0
@@ -523,7 +525,7 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
         assert "status comment EOF" in report
         assert "agent-run resume 1 --repo example/project" in report
     assert load_only_run_state(git_repo) == run_before_query
-    assert control_path.read_bytes() == control_before_query
+    assert snapshot_control(control_path_store, control_path_task) == control_before_query
 
     if transient_selection_failure:
         def failed_selection(*args: Any, **kwargs: Any) -> Any:
@@ -534,7 +536,7 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
             rejected = invoke_cli_inprocess(git_repo, fixture, "resume", run_id, "--json")
         assert rejected.returncode == 2
         assert load_only_run_state(git_repo) == paused
-        unapplied = json.loads(control_path.read_text(encoding="utf-8"))
+        unapplied = control_path_store.load(control_path_task)
         assert unapplied["action"]["run_id"] == run_id
         assert unapplied["action"]["application_observed"] is False
         assert unapplied["action"]["status"] == "failed"
@@ -549,7 +551,7 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
     assert completed["run_publication"]["approval_grant"] == grant
     assert completed["agent_invocation_history"] == paused["agent_invocation_history"]
     assert json.loads(fixture.read_text())["delivery"]["pull_requests"][-1]["state"] == "MERGED"
-    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control = control_path_store.load(control_path_task)
     assert control["action"]["kind"] == "resume"
     assert control["action"]["final_approval_operation"] is True
     assert any(
@@ -627,8 +629,8 @@ def test_resume_only_reconciles_success_when_executor_lost_the_final_receipt(
     assert interrupted.returncode == 2
     completed = load_only_run_state(git_repo)
     assert completed["status"] == "completed"
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    original_control = json.loads(control_path.read_text())
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    original_control = control_path_store.load(control_path_task)
     assert original_control["action"]["status"] == (
         "completed" if receipt_saved else "applying"
     )
@@ -637,17 +639,17 @@ def test_resume_only_reconciles_success_when_executor_lost_the_final_receipt(
 
     resumed = run_cli(git_repo, fixture, "resume", "1")
     assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
-    current_control = json.loads(control_path.read_text())
+    current_control = control_path_store.load(control_path_task)
     assert current_control["action"]["action_id"] == original_control["action"]["action_id"]
     assert current_control["action"]["status"] == "completed"
     assert current_control["executor"]["generation"] == original_control["executor"]["generation"]
     assert current_control["executor"]["status"] == "exited"
     assert load_only_run_state(git_repo) == completed
     assert fixture.read_bytes() == fixture_before
-    reconciled_control = control_path.read_bytes()
+    reconciled_control = snapshot_control(control_path_store, control_path_task)
     repeated = run_cli(git_repo, fixture, "resume", "1")
     assert repeated.returncode == 2
-    assert control_path.read_bytes() == reconciled_control
+    assert snapshot_control(control_path_store, control_path_task) == reconciled_control
     assert load_only_run_state(git_repo) == completed
     assert fixture.read_bytes() == fixture_before
 

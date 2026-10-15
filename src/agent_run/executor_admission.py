@@ -12,6 +12,10 @@ from agent_run.task_control import TaskControlBusyError
 _cancelled: ContextVar[Event | None] = ContextVar("executor_cancelled", default=None)
 
 
+class ExecutorCancelledError(TaskControlBusyError):
+    """This execution scope has closed admission and cancelled its own Worker."""
+
+
 @contextmanager
 def executor_cancellation_scope() -> Iterator[None]:
     """Share a stop signal with this execution's copied Worker contexts only."""
@@ -28,13 +32,13 @@ def executor_cancellation_scope() -> Iterator[None]:
 def check_executor_cancelled() -> None:
     stopped = _cancelled.get()
     if stopped is not None and stopped.is_set():
-        raise TaskControlBusyError("Executor stopped; no new work is authorized")
+        raise ExecutorCancelledError("Executor stopped; no new work is authorized")
 
 
 def _record_gap(error: BaseException, message: str) -> None:
     message = bounded_error(message)
     error.add_note(message)
-    # The host captures stderr/journal even when neither durable store accepts
+    # The host captures stderr/journal even when the shared database rejects
     # diagnostics. This reports a gap, never a persisted failure/exit fact.
     logging.getLogger(__name__).error("%s", message)
 

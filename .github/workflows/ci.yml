@@ -79,7 +79,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
+          sudo apt-get install --no-install-recommends --yes bubblewrap gcc
+
+      - name: Prepare verified SQLite runtime
+        run: python tests/support/prepare_sqlite.py --output-dir "$RUNNER_TEMP/agent-run-sqlite"
 
       - name: Install product and development tools
         run: make test-bootstrap
@@ -95,6 +98,13 @@ jobs:
           path: .test-results/
           include-hidden-files: true
           retention-days: 7
+
+      - name: Remove SQLite test runtime
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/agent-run-sqlite" ]; then
+            rm -r -- "$RUNNER_TEMP/agent-run-sqlite"
+          fi
 
   quality:
     name: quality
@@ -122,7 +132,11 @@ jobs:
         if: needs.selection.outputs.product == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
+          sudo apt-get install --no-install-recommends --yes bubblewrap gcc
+
+      - name: Prepare verified SQLite runtime
+        if: needs.selection.outputs.product == 'true'
+        run: python tests/support/prepare_sqlite.py --output-dir "$RUNNER_TEMP/agent-run-sqlite"
 
       - name: Install project and development tools
         if: needs.selection.outputs.product == 'true'
@@ -141,3 +155,10 @@ jobs:
       - name: Run type checks
         if: needs.selection.outputs.product == 'true'
         run: python -m mypy src/agent_run
+
+      - name: Remove SQLite test runtime
+        if: always() && needs.selection.outputs.product == 'true'
+        run: |
+          if [ -d "$RUNNER_TEMP/agent-run-sqlite" ]; then
+            rm -r -- "$RUNNER_TEMP/agent-run-sqlite"
+          fi

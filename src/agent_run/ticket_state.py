@@ -172,6 +172,23 @@ class TicketState:
             if loaded is None:
                 raise ValueError("Delivery Run disappeared during Ticket execution")
             latest, baseline = loaded
+            from agent_run.invocation_settlement import current_settlement, commit_settlement
+            permission = current_settlement()
+            released = lease is not None and not any(
+                item["ticket_number"] == self.ticket_number and item["lease_id"] == lease
+                for item in latest["ticket_work_queue"]
+            )
+            if permission is not None and (
+                permission.limited or latest.get("status") in RUN_STOP_STATUSES
+                or released or number in latest["ticket_pause_requests"]
+            ):
+                durable = commit_settlement(
+                    self.states, run_id, state, ticket_number=self.ticket_number,
+                )
+                self._last_job = copy_json_tree(durable["ticket_jobs"].get(number))
+                self._last_invocation = copy_json_tree(durable["ticket_agent_invocations"].get(number))
+                self._last_holder = durable["ticket_integration_holder"]
+                return
             if latest.get("status") in RUN_STOP_STATUSES:
                 raise TaskControlBusyError("Ticket lost Run authorization")
             if lease is not None and not any(

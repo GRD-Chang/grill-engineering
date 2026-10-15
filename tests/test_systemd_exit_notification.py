@@ -8,7 +8,6 @@ import socket
 import subprocess
 import sys
 import time
-import venv
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,7 @@ from agent_run.systemd_executor_host import (
     FakeSystemdTransport, SystemdStartResult, SystemdUnitObservation, SystemdUserExecutorHost,
 )
 from support.executor_exit import create_exit_run
+from support.native_runtime import current_runtime, observed_runtimes, snapshot_python
 
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["automatic-alert", "disabled"])
@@ -31,13 +31,11 @@ def test_forced_executor_death_notifies_without_further_lifecycle_commands(
 ) -> None:
     states, control, spec = create_exit_run(tmp_path, enabled=enabled, reserved=False)
     spec = replace(spec, command=("run", "1"))
-    snapshot = tmp_path / "snapshot"
-    venv.EnvBuilder(with_pip=False, symlinks=True, system_site_packages=True).create(snapshot)
+    report = tmp_path / "loaded-runtime.jsonl"
+    python = snapshot_python(tmp_path / "snapshot", report)
     source = Path(__file__).resolve().parents[1] / "src"
-    site = snapshot / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-    (site / "source.pth").write_text(str(source))
     environment = {key: value for key, value in os.environ.items()
-                   if key in {"PATH", "HOME", "TMPDIR"} or key.startswith("XDG_")}
+                   if key in {"PATH", "HOME", "TMPDIR", "LD_LIBRARY_PATH"} or key.startswith("XDG_")}
     environment["PYTHONPATH"] = str(source)
     environment.update(
         GH_TOKEN="fixture-runner-secret", AGENT_RUN_GITHUB_APP_PRIVATE_KEY="fixture-private-key",
@@ -95,7 +93,7 @@ else:
 
     transport = IsolatedManager()
     host = SystemdUserExecutorHost(transport=transport, runtime_directory=tmp_path / "runtime",
-                                  environment=environment, executor_python=snapshot / "bin" / "python")
+                                  environment=environment, executor_python=python)
     try:
         assert host.ensure(spec, control).status == "running"
         assert manager is not None
@@ -153,6 +151,9 @@ else:
             assert not (launch_root / "hook-code").exists()
         assert states.load_current_run(str(spec.run_id)) == run_before
         assert control.load(spec.task) == control_before
+        runtimes = observed_runtimes(report)
+        assert len(runtimes) == (2 if enabled else 1)
+        assert all(runtime == current_runtime() for runtime in runtimes)
         assert not (launch_root / "credentials").exists()
         assert not list((tmp_path / "runtime").glob("environment-*.json"))
         with runner_management_lease(default_runner_lock_path(environment)):

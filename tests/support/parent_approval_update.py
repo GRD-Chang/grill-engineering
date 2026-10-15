@@ -80,9 +80,9 @@ def update_agents(repo: Path, *, conflict: bool = False) -> Path:
 
 
 def control_record(repo: Path) -> dict[str, Any]:
-    paths = list((managed_state(repo) / "task-control").glob("*.json"))
-    assert len(paths) == 1
-    return json.loads(paths[0].read_text())
+    from support.control_state import load_only_control
+
+    return load_only_control(managed_state(repo))
 
 
 _GATED_APPROVAL = """

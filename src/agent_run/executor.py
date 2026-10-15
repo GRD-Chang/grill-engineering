@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # This import chain must stay SQL-free until the native loader is ready.
+    from agent_run.executor_bootstrap import reexec_for_runtime
+
+    reexec_for_runtime("agent_run.executor")
+
 import argparse
 import os
 from collections.abc import Callable, Mapping

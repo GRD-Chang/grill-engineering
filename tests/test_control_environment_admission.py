@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import snapshot_control
+
 import json
 import os
 from pathlib import Path
@@ -106,14 +108,14 @@ def test_control_environment_rejected_before_ownership_changes(
         )
     state_ref = (states.root, str(run_id))
     before_state = snapshot_run(state_ref)
-    before_control = control.path_for(task).read_bytes()
+    before_control = snapshot_control(control, task)
     before_fixture = fixture.read_bytes()
     for _ in range(2):
         code = cli_module.main([kind, "1", "--json"])
         output = json.loads(capsys.readouterr().out)
         assert code == 2, output
         assert "发起终端环境过大" in json.dumps(output, ensure_ascii=False), output
-        assert control.path_for(task).read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
         assert snapshot_run(state_ref) == before_state
         assert fixture.read_bytes() == before_fixture
         assert transport.start_count == 0
@@ -169,7 +171,7 @@ def test_identical_control_attach_does_not_prepare_observer_environment(
         run_id="run-194",
         state_dir=tmp_path / "state",
     )
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     duplicate = control.claim_control_action(
         task,
         kind=kind,
@@ -182,7 +184,7 @@ def test_identical_control_attach_does_not_prepare_observer_environment(
     )
     assert duplicate.attached
     assert duplicate.action_id == first.action_id
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
 
 
 @pytest.mark.parametrize("kind", ["stop", "abandon"])
@@ -215,11 +217,11 @@ def test_running_control_attaches_with_oversize_observer_environment(
         environment={"PROJECT_SETTING": "preserved"},
         executor_python=Path("/usr/bin/python3"),
     )
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     prepared = []
 
     def prepare() -> None:
-        assert control.path_for(task).read_bytes() == before
+        assert snapshot_control(control, task) == before
         normal_host.prepare_environment((kind, "1"))
         prepared.append(True)
 
@@ -288,7 +290,7 @@ def test_running_control_attaches_with_oversize_observer_environment(
         generation=reservation.generation,
         payload_digest=first.action["payload_digest"],
     )
-    before_control = control.path_for(task).read_bytes()
+    before_control = snapshot_control(control, task)
     state_ref = (states.root, str(run_id))
     before_run = snapshot_run(state_ref)
 
@@ -305,7 +307,7 @@ def test_running_control_attaches_with_oversize_observer_environment(
             lifecycle.submit_control(
                 LifecycleRequest(task=task, kind=kind, payload=payload)
             )
-        assert control.path_for(task).read_bytes() == before_control
+        assert snapshot_control(control, task) == before_control
         assert snapshot_run(state_ref) == before_run
         assert transport.start_count == 0
         assert worker.poll() is None
@@ -372,7 +374,7 @@ def test_control_admission_rejects_run_changed_during_preparation(
                 action_id=successor.action_id,
                 failure="before Executor reservation",
             )
-        other_bytes = other.path_for(task).read_bytes()
+        other_bytes = snapshot_control(other, task)
 
     with pytest.raises(ActionReconciliationError, match="Delivery Run"):
         control.claim_control_action(
@@ -384,5 +386,5 @@ def test_control_admission_rejects_run_changed_during_preparation(
             before_create=prepare,
         )
     assert other_bytes is not None
-    assert control.path_for(task).read_bytes() == other_bytes
+    assert snapshot_control(control, task) == other_bytes
     assert control.load(task)["run_id"] == "run-successor"

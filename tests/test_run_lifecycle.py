@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+from support.control_state import (
+    control_state_text,
+    corrupt_control_fixture,
+    delete_control_fixture,
+    load_only_control,
+    only_control,
+    persist_control_fixture,
+    raw_control_snapshot,
+    snapshot_control,
+)
 
 from support.lifecycle import (
     _InMemoryRunState,
@@ -50,6 +60,7 @@ from agent_run.systemd_executor_host import (
 from agent_run.task_control import (
     ActionBusyError,
     ActionReconciliationError,
+    TaskControlError,
     TaskControlStore,
     TaskKey,
 )
@@ -156,10 +167,10 @@ def test_task_action_admission_is_single_slot_and_duplicate_is_idempotent(
     assert duplicate.attached is True
     assert duplicate.action_id == first.action_id
 
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     with pytest.raises(ActionBusyError):
         control.claim_action(task, kind="approve", payload={"parent": 156})
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
 
 
 def test_run_prepares_executor_environment_before_persisting_a_new_action(
@@ -237,7 +248,7 @@ def test_oversize_second_terminal_attaches_to_running_executor(
         process_start_token=None,
     )
     control.complete_action(task, action_id=action_id, result_status="active")
-    before = control.path_for(task).read_bytes()
+    before = snapshot_control(control, task)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
         transport=transport,
@@ -285,7 +296,7 @@ def test_oversize_second_terminal_attaches_to_running_executor(
     assert receipt.attached is True
     assert receipt.action_id == action_id
     assert receipt.executor_generation == reservation.generation
-    assert control.path_for(task).read_bytes() == before
+    assert snapshot_control(control, task) == before
     assert transport.start_count == 0
     assert not list((tmp_path / "runtime").glob("environment-*.json"))
 
@@ -419,16 +430,11 @@ def test_action_admission_crash_window_is_deterministic(
         faulting.claim_action(task, kind="run", payload={"parent": 156})
 
     control = TaskControlStore(root)
-    record = control.load(task)
-    if not after_write:
-        assert record is None
-        return
-
-    assert record is not None
-    assert record["action"]["status"] == "accepted"
-    attached = control.claim_action(task, kind="run", payload={"parent": 156})
-    assert attached.attached is True
-    assert attached.action_id == record["action"]["action_id"]
+    assert control.load(task) is None
+    assert not control.path_for(task).exists()
+    accepted = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert accepted.attached is False
+    assert accepted.action_id is not None
 
 
 @pytest.mark.parametrize(
@@ -502,7 +508,7 @@ def test_executor_crash_window_matrix_repeats_without_duplicate_side_effects(
     assert interrupted is not None
     action_id = interrupted["action"]["action_id"]
     generation = interrupted["action"]["executor_generation"]
-    control_bytes = control.path_for(task).read_bytes()
+    control_bytes = snapshot_control(control, task)
     state_before_retry = dict(states.value)
 
     host.inspect = lambda spec, _control: HostObservation(  # type: ignore[method-assign]
@@ -524,7 +530,7 @@ def test_executor_crash_window_matrix_repeats_without_duplicate_side_effects(
     assert repeated["action"]["action_id"] == action_id
     assert repeated["action"]["executor_generation"] == generation == 1
     assert repeated["executor"]["generation"] == generation
-    assert control.path_for(task).read_bytes() == control_bytes
+    assert snapshot_control(control, task) == control_bytes
     assert states.value == state_before_retry
     assert host.start_count == 1
     assert agent_invocations == 0
@@ -657,9 +663,7 @@ def test_task_control_failure_evidence_is_credential_safe(tmp_path: Path) -> Non
 
     failure = record["action"]["failure"]
     assert failure == "Authorization: [REDACTED]"
-    assert "super-secret-token" not in control.path_for(task).read_text(
-        encoding="utf-8"
-    )
+    assert "super-secret-token" not in control_state_text(control, task)
 
 
 def test_unknown_host_result_keeps_generation_without_starting_again(
@@ -696,7 +700,7 @@ def test_unknown_host_result_keeps_generation_without_starting_again(
     assert record["executor"]["generation"] == 1
     assert record["executor"]["status"] == "starting"
     assert (
-        json.loads(control.path_for(task).read_text(encoding="utf-8"))["action"][
+        control.load(task)["action"][
             "action_id"
         ]
         == claim.action_id
@@ -869,6 +873,7 @@ def test_approval_boundary_is_not_written_before_executor_handshake(
     task = _task(tmp_path)
     control = TaskControlStore(tmp_path / "state")
     states = _InMemoryRunState()
+    states.root = control.root  # type: ignore[attr-defined]
     states.value["status"] = "run_approval_pending"
     seed_idle_control(control, task, str(states.value["run_id"]))
     host = FakeExecutorHost()
@@ -1057,7 +1062,7 @@ def test_applied_receipt_without_executor_fails_closed(
     control.bind_run(task, action_id, "run-1")
     prepare_action_application_receipt(states.value, claim.action)
     states.save_run("run-1", states.value)
-    control_before = control.path_for(task).read_bytes()
+    control_before = snapshot_control(control, task)
     host = FakeExecutorHost()
     business_calls = 0
 
@@ -1090,25 +1095,26 @@ def test_applied_receipt_without_executor_fails_closed(
 
     assert host.start_count == 0
     assert business_calls == 0
-    assert control.path_for(task).read_bytes() == control_before
+    assert snapshot_control(control, task) == control_before
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize("host_status", ["running", "unknown", "conflict"])
+@pytest.mark.parametrize("host_status", ["running", "exited", "unknown", "conflict"])
+@pytest.mark.parametrize("invocation_status", ["running", "completed"])
 def test_untrusted_control_receipt_retries_stay_fail_closed(
-    tmp_path: Path, control_case: str, host_status: str
+    tmp_path: Path, control_case: str, host_status: str, invocation_status: str
 ) -> None:
     task = _task(tmp_path)
     control = TaskControlStore(tmp_path / "state")
     states = _InMemoryRunState()
-    active_invocation = {
-        "status": "running",
+    invocation = {
+        "status": invocation_status,
         "role": "development",
         "started_at": "2026-09-01T00:00:00+00:00",
         "work_subject": "ticket:193",
     }
-    states.value["active_agent_invocation"] = dict(active_invocation)
-    states.value["agent_invocation_history"] = [dict(active_invocation)]
+    states.value["active_agent_invocation"] = dict(invocation)
+    states.value["agent_invocation_history"] = [dict(invocation)]
     claim = control.claim_action(task, kind="run", payload={"parent": 156})
     assert claim.action is not None
     action = claim.action
@@ -1116,16 +1122,16 @@ def test_untrusted_control_receipt_retries_stay_fail_closed(
     prepare_action_application_receipt(states.value, action)
     states.save_run("run-1", states.value)
     if control_case == "missing":
-        control.path_for(task).unlink()
+        delete_control_fixture(control, task)
     else:
-        control.path_for(task).write_text("not json", encoding="utf-8")
+        corrupt_control_fixture(control, task)
+    control_before = raw_control_snapshot(control, task)
+    state_before = json.dumps(states.value, sort_keys=True)
 
     class UncertainHost(FakeExecutorHost):
-        def __init__(self) -> None:
-            super().__init__()
-            self.observe_count = 0
+        observe_count = 0
 
-        def observe(
+        def inspect(
             self, spec: ExecutorSpec, store: TaskControlStore
         ) -> HostObservation:
             del store
@@ -1135,98 +1141,52 @@ def test_untrusted_control_receipt_retries_stay_fail_closed(
                 spec.generation,
                 None,
                 False,
-                "host ownership remains uncertain",
+                "Host evidence cannot reconstruct Control authority",
             )
 
     host = UncertainHost()
-    business_calls = 0
-
-    def execute(_run_id: str) -> dict[str, str]:
-        nonlocal business_calls
-        business_calls += 1
-        return {"status": "completed"}
-
     lifecycle = RunLifecycle(
         states=states,  # type: ignore[arg-type]
         control=control,
         host=host,
         task=task,
         preflight=lambda: dict(states.value),
-        select_run=lambda _action: pytest.fail(
-            "receipt reconciliation must not select a new Run"
-        ),
+        select_run=lambda _action: pytest.fail("must retain the original Run"),
         initialize_profile=None,
         executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
-            task=task,
-            action_id=action_id,
-            run_id=run_id,
-            generation=generation,
+            task=task, action_id=action_id, run_id=run_id, generation=generation,
         ),
-        execute=execute,
+        execute=lambda _run_id: pytest.fail("must not replay Agent work"),
     )
 
-    with pytest.raises(ExecutorStartUnknownError):
-        lifecycle.submit(
-            LifecycleRequest(
-                task=task,
-                kind="run",
-                payload={"parent": 156},
+    for kind in ("run", "run", "resume"):
+        payload: dict[str, object] = {"parent": 156}
+        if kind == "resume":
+            payload["run_id"] = "run-1"
+        with pytest.raises(TaskControlError):
+            lifecycle.submit(
+                LifecycleRequest(
+                    task=task, kind=kind, payload=payload,
+                    allow_terminal_successor=kind == "resume",
+                )
             )
-        )
+        assert raw_control_snapshot(control, task) == control_before
+        assert json.dumps(states.value, sort_keys=True) == state_before
+        assert host.start_count == host.observe_count == 0
 
-    assert host.start_count == 0
-    assert host.observe_count == 1
-    assert business_calls == 0
-    repaired = control.load(task)
-    assert repaired is not None
-    assert repaired["executor"]["reconciliation_required"] is True
-    repaired_bytes = control.path_for(task).read_bytes()
-    state_before_retry = dict(states.value)
-    persisted_failure = False
-
-    def persist_failure() -> None:
-        nonlocal persisted_failure
-        persisted_failure = True
-
-    with pytest.raises(ActionReconciliationError, match="未证明原 Executor 已退出"):
+    with pytest.raises(TaskControlError):
         control.fail_session_from_application_receipt(
             task,
             action_id=str(action["action_id"]),
             generation=1,
             application_receipt=states.value["action_application_receipt"],
-            persist_run_failure=persist_failure,
+            persist_run_failure=lambda: pytest.fail("must not change the Run"),
         )
-    assert persisted_failure is False
-    assert control.path_for(task).read_bytes() == repaired_bytes
-
-    for _attempt in range(2):
-        with pytest.raises(ExecutorStartUnknownError):
-            lifecycle.submit(
-                LifecycleRequest(task=task, kind="run", payload={"parent": 156})
-            )
-        assert states.value == state_before_retry
-        assert control.path_for(task).read_bytes() == repaired_bytes
-        assert host.start_count == 0
-        assert host.observe_count == _attempt + 2
-        assert business_calls == 0
-
-    with pytest.raises(ExecutorStartUnknownError):
-        lifecycle.submit(
-            LifecycleRequest(
-                task=task,
-                kind="resume",
-                payload={"parent": 156, "run_id": "run-1"},
-                allow_terminal_successor=True,
-            )
-        )
-    final = control.load(task)
-    assert final is not None
-    assert final["next_generation"] == 2
-    assert final["action"]["executor_generation"] == 1
+    assert raw_control_snapshot(control, task) == control_before
+    assert json.dumps(states.value, sort_keys=True) == state_before
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
 @pytest.mark.parametrize(
     ("predecessor_kind", "predecessor_status", "final_approval"),
     [
@@ -1236,10 +1196,9 @@ def test_untrusted_control_receipt_retries_stay_fail_closed(
         ("resume", "execution_failed", True),
     ],
 )
-def test_resume_reconciles_a_receipt_before_admitting_its_successor(
+def test_resume_cannot_rebuild_a_predecessor_from_its_receipt(
     tmp_path: Path,
     control_case: str,
-    host_status: str,
     predecessor_kind: str,
     predecessor_status: str,
     final_approval: bool,
@@ -1252,530 +1211,205 @@ def test_resume_reconciles_a_receipt_before_admitting_its_successor(
         states.value["run_publication"] = {
             "approval_grant": {"granted_at": "approved"},
         }
-    if predecessor_status == "supervision_timeout":
-        states.value.update(
-            {
-                "terminal_kind": "supervision_timeout",
-                "supervision_wait": {
-                    "kind": "required_checks",
-                    "resume_status": "waiting_checks",
-                },
-            }
-        )
-    resume_payload = {"parent": 156, "run_id": "run-1"}
-    predecessor_payload = (
-        resume_payload if predecessor_kind == "resume" else {"parent": 156}
-    )
+    payload = {"parent": 156, "run_id": "run-1"}
     claim = control.claim_action(
-        task,
-        kind=predecessor_kind,
-        payload=predecessor_payload,
+        task, kind=predecessor_kind,
+        payload=payload if predecessor_kind == "resume" else {"parent": 156},
     )
     assert claim.action is not None
-    original_action = claim.action
-    control.bind_run(task, claim.action_id or "", "run-1")
-    prepare_action_application_receipt(states.value, original_action)
-    states.save_run("run-1", states.value)
+    control.bind_run(task, str(claim.action_id), "run-1")
+    prepare_action_application_receipt(states.value, claim.action)
     if control_case == "missing":
-        control.path_for(task).unlink()
+        delete_control_fixture(control, task)
     else:
-        control.path_for(task).write_text("not json", encoding="utf-8")
-
-    class ReconciliationHost(FakeExecutorHost):
-        def __init__(self) -> None:
-            super().__init__()
-            self.observe_count = 0
-
-        def observe(
-            self, spec: ExecutorSpec, store: TaskControlStore
-        ) -> HostObservation:
-            del store
-            self.observe_count += 1
-            return HostObservation(
-                host_status,  # type: ignore[arg-type]
-                spec.generation,
-                None,
-                False,
-                "original Executor ownership is not proven"
-                if host_status != "exited"
-                else None,
-                runner_binding="0" * 16 if host_status == "exited" else None,
-            )
-
-    host = ReconciliationHost()
-    business_calls = 0
-
-    def execute(_run_id: str) -> dict[str, object]:
-        nonlocal business_calls
-        business_calls += 1
-        if final_approval:
-            states.value["status"] = "completed"
-        return dict(states.value)
-
+        corrupt_control_fixture(control, task)
+    before = raw_control_snapshot(control, task)
+    state_before = json.dumps(states.value, sort_keys=True)
+    host = FakeExecutorHost()
     lifecycle = RunLifecycle(
         states=states,  # type: ignore[arg-type]
         control=control,
         host=host,
         task=task,
         preflight=lambda: dict(states.value),
-        select_run=lambda _action: (dict(states.value), True),
+        select_run=lambda _action: pytest.fail("must not admit a successor"),
         initialize_profile=None,
-        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
-            task=task,
-            action_id=action_id,
-            run_id=run_id,
-            generation=generation,
-        ),
-        execute=execute,
+        executor_spec=lambda *_args: pytest.fail("must not contact the Host"),
+        execute=lambda _run_id: pytest.fail("must not replay approval or work"),
     )
-    request = LifecycleRequest(
-        task=task,
-        kind="resume",
-        payload=resume_payload,
-        allow_terminal_successor=True,
-    )
-
-    if host_status == "exited":
-        _state, _resumed, receipt = lifecycle.submit(request)
-        assert receipt.kind == "resume"
-        assert receipt.executor_generation == 2
-        assert host.observe_count == 1
-        assert host.start_count == 1
-        assert business_calls == 1
-        repaired = control.load(task)
-        assert repaired is not None
-        predecessors = [
-            entry["action"]
-            for entry in repaired["action_history"]
-            if entry["action"]["action_id"] == original_action["action_id"]
-        ]
-        assert len(predecessors) == 1
-        predecessor = predecessors[0]
-        assert predecessor["receipt_only_reconciliation"] is True
-        assert predecessor["status"] == ("failed" if final_approval else "completed")
-        assert predecessor["result_status"] == predecessor_status
-        for field in ("action_id", "kind", "payload_digest", "executor_generation"):
-            assert predecessor[field] == original_action[field]
-        if final_approval:
-            assert predecessor["final_approval_operation"] is True
-            assert predecessor["failure"]
-        else:
-            assert predecessor["failure"] is None
-        return
-
-    for attempt in range(2):
-        with pytest.raises(ExecutorStartUnknownError):
-            lifecycle.submit(request)
-        assert host.observe_count == attempt + 1
+    for _attempt in range(2):
+        with pytest.raises(TaskControlError):
+            lifecycle.submit(
+                LifecycleRequest(
+                    task=task, kind="resume", payload=payload,
+                    allow_terminal_successor=True,
+                )
+            )
+        assert raw_control_snapshot(control, task) == before
+        assert json.dumps(states.value, sort_keys=True) == state_before
         assert host.start_count == 0
-        assert business_calls == 0
-        current = control.load(task)
-        assert current is not None
-        assert current["next_generation"] == 2
-        assert current["action"]["action_id"] == original_action["action_id"]
 
 
-@pytest.mark.parametrize(
-    ("crash_after", "proof_damage"),
-    [
-        ("host_proof", None),
-        ("predecessor_completion", None),
-        ("predecessor_completion", "missing_binding"),
-        ("predecessor_completion", "missing_executor"),
-    ],
-)
-def test_resume_finishes_a_receipt_predecessor_after_reconciliation_crash(
-    tmp_path: Path,
-    crash_after: str,
-    proof_damage: str | None,
+@pytest.mark.parametrize("after_write", [False, True])
+def test_predecessor_completion_is_atomic_before_successor_admission(
+    tmp_path: Path, after_write: bool,
 ) -> None:
     task = _task(tmp_path)
-
-    class ProofCrashStore(TaskControlStore):
-        injected = False
-
-        def record_reconciled_executor_exit(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
-            record = super().record_reconciled_executor_exit(*args, **kwargs)  # type: ignore[arg-type]
-            if not self.injected and crash_after == "host_proof":
-                self.injected = True
-                raise SimulatedProcessCrash("after Host exit proof commit")
-            return record
-
-        def complete_action_from_application_receipt(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
-            record = super().complete_action_from_application_receipt(*args, **kwargs)  # type: ignore[arg-type]
-            if not self.injected and crash_after == "predecessor_completion":
-                self.injected = True
-                raise SimulatedProcessCrash("after predecessor completion commit")
-            return record
-
-    control = ProofCrashStore(tmp_path / "state")
-    states = _InMemoryRunState()
-    states.value.update(
-        {
-            "status": "supervision_timeout",
-            "terminal_kind": "supervision_timeout",
-            "supervision_wait": {
-                "kind": "required_checks",
-                "resume_status": "waiting_checks",
-            },
-        }
-    )
+    root = tmp_path / "state"
+    control = TaskControlStore(root)
     claim = control.claim_action(task, kind="run", payload={"parent": 156})
     assert claim.action is not None
-    original_action = claim.action
-    control.bind_run(task, claim.action_id or "", "run-1")
-    prepare_action_application_receipt(states.value, original_action)
-    states.save_run("run-1", states.value)
-    control.path_for(task).unlink()
-
-    host_status = "exited"
-
-    class ReconciliationHost(FakeExecutorHost):
-        def __init__(self) -> None:
-            super().__init__()
-            self.observe_count = 0
-
-        def observe(
-            self, spec: ExecutorSpec, store: TaskControlStore
-        ) -> HostObservation:
-            del store
-            self.observe_count += 1
-            return HostObservation(
-                host_status,  # type: ignore[arg-type]
-                spec.generation,
-                None,
-                False,
-                (
-                    "original Executor ownership is not proven"
-                    if host_status != "exited"
-                    else None
-                ),
-                runner_binding="0" * 16 if host_status == "exited" else None,
-            )
-
-    host = ReconciliationHost()
-    business_calls = 0
-
-    def execute(_run_id: str) -> dict[str, object]:
-        nonlocal business_calls
-        business_calls += 1
-        return dict(states.value)
-
-    lifecycle = RunLifecycle(
-        states=states,  # type: ignore[arg-type]
-        control=control,
-        host=host,
-        task=task,
-        preflight=lambda: dict(states.value),
-        select_run=lambda _action: (dict(states.value), True),
-        initialize_profile=None,
-        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
-            task=task,
-            action_id=action_id,
-            run_id=run_id,
-            generation=generation,
-        ),
-        execute=execute,
+    action_id = str(claim.action_id)
+    control.bind_run(task, action_id, "run-1")
+    reservation = control.begin_executor(task, action_id=action_id, run_id="run-1")
+    control.record_application(
+        task, action_id=action_id, run_id="run-1",
+        payload_digest=str(claim.action["payload_digest"]),
+        generation=reservation.generation,
     )
-    request = LifecycleRequest(
-        task=task,
-        kind="resume",
-        payload={"parent": 156, "run_id": "run-1"},
-        allow_terminal_successor=True,
+    control.mark_executor_absent(
+        task, action_id=action_id, generation=reservation.generation,
     )
+    state: dict[str, object] = {"run_id": "run-1"}
+    prepare_action_application_receipt(state, claim.action)
+    before = snapshot_control(control, task)
+    faulting = _FaultInjectingTaskControlStore(root, after_write=after_write)
 
-    with pytest.raises(SimulatedProcessCrash, match="after .* commit"):
-        lifecycle.submit(request)
+    with pytest.raises(SimulatedProcessCrash):
+        faulting.complete_action_from_application_receipt(
+            task, action_id=action_id, generation=reservation.generation,
+            application_receipt=state["action_application_receipt"],
+            result_status="supervision_timeout",
+        )
+    assert snapshot_control(control, task) == before
+    with pytest.raises(ActionBusyError):
+        control.claim_action(
+            task, kind="resume", payload={"parent": 156, "run_id": "run-1"},
+        )
+    assert snapshot_control(control, task) == before
 
-    after_proof = control.load(task)
-    assert after_proof is not None
-    assert after_proof["action"]["action_id"] == original_action["action_id"]
-    assert after_proof["action"]["status"] == (
-        "accepted" if crash_after == "host_proof" else "completed"
+    closed = control.complete_action_from_application_receipt(
+        task, action_id=action_id, generation=reservation.generation,
+        application_receipt=state["action_application_receipt"],
+        result_status="supervision_timeout",
     )
-    assert after_proof["action"]["receipt_only_reconciliation"] is True
-    assert after_proof["executor"]["status"] == "exited"
-    assert "reconciliation_required" not in after_proof["executor"]
-    assert after_proof["next_generation"] == 2
-    assert host.observe_count == 1
-    assert host.start_count == 0
-    assert business_calls == 0
-
-    if proof_damage is not None:
-        damaged = json.loads(control.path_for(task).read_text(encoding="utf-8"))
-        if proof_damage == "missing_binding":
-            del damaged["executor"]["runner_binding"]
-        else:
-            damaged["executor"] = None
-        control.path_for(task).write_text(json.dumps(damaged), encoding="utf-8")
-        host_status = "unknown"
-
-        with pytest.raises(ExecutorStartUnknownError):
-            lifecycle.submit(request)
-        repaired_bytes = control.path_for(task).read_bytes()
-        with pytest.raises(ExecutorStartUnknownError):
-            lifecycle.submit(request)
-        assert control.path_for(task).read_bytes() == repaired_bytes
-        assert host.observe_count == 3
-        assert host.start_count == 0
-        assert business_calls == 0
-        return
-
-    _state, _resumed, receipt = lifecycle.submit(request)
-
-    assert receipt.kind == "resume"
-    assert receipt.executor_generation == 2
-    assert host.observe_count == 1
-    assert host.start_count == 1
-    assert business_calls == 1
-    repaired = control.load(task)
-    assert repaired is not None
-    assert repaired["action"]["action_id"] == receipt.action_id
-    assert repaired["action"]["kind"] == "resume"
-    predecessors = [
-        entry["action"]
-        for entry in repaired["action_history"]
-        if entry["action"]["action_id"] == original_action["action_id"]
-    ]
-    assert len(predecessors) == 1
-    assert predecessors[0]["status"] == "completed"
+    assert closed["action"]["status"] == "completed"
+    successor = control.claim_action(
+        task, kind="resume", payload={"parent": 156, "run_id": "run-1"},
+    )
+    assert successor.attached is False
+    current = control.load(task)
+    assert current is not None
+    assert current["action"]["executor_generation"] == reservation.generation + 1
+    assert len(current["action_history"]) == 1
+    predecessor = current["action_history"][0]
+    assert predecessor["action"] == closed["action"]
+    assert predecessor["executor"] == closed["executor"]
 
 
-@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
 @pytest.mark.parametrize("action_kind", ["run", "approve"])
-def test_receipt_only_control_closes_once_after_exact_host_exit_proof(
-    git_repo: Path, tmp_path: Path, control_case: str, action_kind: str
+def test_committed_control_closes_once_after_exact_host_exit_proof(
+    git_repo: Path, tmp_path: Path, action_kind: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
-    environment = _isolated_environment(tmp_path / f"host-exit-{control_case}")
+    environment = _isolated_environment(tmp_path / "host-exit")
     interrupted = run_cli_at_development_boundary(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        boundary="running",
-        extra_env=environment,
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents),
+        boundary="running", extra_env=environment,
     )
     assert interrupted.returncode == 2
-
     state_root = managed_state(git_repo, extra_env=environment)
     states = StateStore(state_root)
     state = load_only_run_state(git_repo, extra_env=environment)
     run_id = str(state["run_id"])
-    task = TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1)
-    control = TaskControlStore(state_root)
-    control_path = control.path_for(task)
-    original_control = json.loads(control_path.read_text(encoding="utf-8"))
-    original_action = original_control["action"]
+    control, task = only_control(state_root)
+    original = control.load(task)
+    assert original is not None
+    original["executor"]["status"] = "running"
+    original["action"]["kind"] = action_kind
     if action_kind != "run":
-        original_action["kind"] = action_kind
+        original["action"]["status"] = "applying"
         state["action_application_receipt"]["kind"] = action_kind
         persist_run_fixture(states, run_id, state)
-    payload = dict(original_action["payload"])
-    if control_case == "missing":
-        control_path.unlink()
-    else:
-        control_path.write_text("not json", encoding="utf-8")
+    persist_control_fixture(control, task, original)
+    action = original["action"]
 
-    class ProofCrashStore(TaskControlStore):
-        injected = False
+    class ExitedHost(FakeExecutorHost):
+        observe_count = 0
 
-        def record_reconciled_executor_exit(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
-            record = super().record_reconciled_executor_exit(*args, **kwargs)  # type: ignore[arg-type]
-            if not self.injected:
-                self.injected = True
-                raise SimulatedProcessCrash("after Host exit proof commit")
-            return record
-
-    control = ProofCrashStore(state_root)
-
-    class ExitedHost:
-        def __init__(self) -> None:
-            self.observe_count = 0
-            self.ensure_count = 0
-
-        def observe(
+        def inspect(
             self, spec: ExecutorSpec, store: TaskControlStore
         ) -> HostObservation:
             del store
             self.observe_count += 1
             return HostObservation(
-                "exited",
-                spec.generation,
-                None,
-                False,
+                "exited", spec.generation, None, False,
                 runner_binding="0" * 16,
             )
 
-        def inspect(
-            self, spec: ExecutorSpec, store: TaskControlStore
-        ) -> HostObservation:
-            return self.observe(spec, store)
-
         def ensure(self, *_args: object, **_kwargs: object) -> HostObservation:
-            self.ensure_count += 1
-            raise AssertionError("receipt reconciliation must not start an Executor")
-
-        def cleanup_startup(self, spec: ExecutorSpec) -> None:
-            del spec
+            raise AssertionError("must not start another Executor")
 
     host = ExitedHost()
-    business_calls = 0
-
-    def execute(_run_id: str) -> dict[str, object]:
-        nonlocal business_calls
-        business_calls += 1
-        return dict(state)
-
     lifecycle = RunLifecycle(
-        states=states,
-        control=control,
-        host=host,  # type: ignore[arg-type]
-        task=task,
+        states=states, control=control, host=host, task=task,
         preflight=lambda: states.load_current_run(run_id),
         select_run=lambda _action: pytest.fail("must keep the original Run"),
         initialize_profile=None,
         executor_spec=lambda selected_run_id, action_id, generation: ExecutorSpec(
-            task=task,
-            action_id=action_id,
-            run_id=selected_run_id,
-            generation=generation,
-            state_root=state_root.resolve(),
+            task=task, action_id=action_id, run_id=selected_run_id,
+            generation=generation, state_root=state_root.resolve(),
         ),
-        execute=execute,
+        execute=lambda _run_id: pytest.fail("must not replay original Agent results"),
     )
-    request = LifecycleRequest(task=task, kind=action_kind, payload=payload)  # type: ignore[arg-type]
+    request = LifecycleRequest(
+        task=task, kind=action_kind, payload=dict(action["payload"]),
+    )
     fixture_before = fixture.read_bytes()
-    invocation_history_before = list(state["agent_invocation_history"])
-
-    run_ref = (state_root, str(run_id))
-    run_before_proof = snapshot_run(run_ref)
-    with pytest.raises(SimulatedProcessCrash, match="Host exit proof"):
-        lifecycle.submit(request)
-    proven_control = control.load(task)
-    assert proven_control is not None
-    assert proven_control["action"]["status"] in {"accepted", "applying"}
-    assert proven_control["executor"]["status"] == "exited"
-    assert "reconciliation_required" not in proven_control["executor"]
-    assert snapshot_run(run_ref) == run_before_proof
-    assert host.observe_count == 1
-    assert host.ensure_count == 0
-
-    closed_state, _resumed, receipt = lifecycle.submit(request)
-
-    assert closed_state["status"] == (
+    invocations_before = list(state["agent_invocation_history"])
+    closed, _resumed, receipt = lifecycle.submit(request)
+    assert closed["status"] == (
         "execution_failed" if action_kind == "run" else state["status"]
     )
-    assert receipt.action_id == original_action["action_id"]
-    assert receipt.executor_generation == 1
-    assert host.observe_count == 1
-    assert host.ensure_count == 0
-    assert business_calls == 0
+    assert receipt.action_id == action["action_id"]
+    assert receipt.executor_generation == action["executor_generation"]
+    assert len(closed["agent_invocation_history"]) == len(invocations_before)
+    assert closed["agent_invocation_history"][0]["binding_id"] == invocations_before[0]["binding_id"]
+    if action_kind == "approve":
+        assert closed["agent_invocation_history"] == invocations_before
     assert fixture.read_bytes() == fixture_before
-    if action_kind == "run":
-        assert len(closed_state["agent_invocation_history"]) == len(
-            invocation_history_before
-        )
-        assert (
-            closed_state["agent_invocation_history"][0]["binding_id"]
-            == invocation_history_before[0]["binding_id"]
-        )
-    else:
-        assert closed_state["agent_invocation_history"] == invocation_history_before
-    closed_control_bytes = control_path.read_bytes()
-
-    repeated_state, _resumed, repeated_receipt = lifecycle.submit(request)
-    assert repeated_state == closed_state
+    control_before_retry = snapshot_control(control, task)
+    state_before_retry = snapshot_run((state_root, run_id))
+    repeated, _resumed, repeated_receipt = lifecycle.submit(request)
+    assert repeated == closed
     assert repeated_receipt.action_id == receipt.action_id
-    assert control_path.read_bytes() == closed_control_bytes
+    assert snapshot_control(control, task) == control_before_retry
+    assert snapshot_run((state_root, run_id)) == state_before_retry
     assert host.observe_count == 1
-    assert host.ensure_count == 0
-    assert business_calls == 0
-
-    if action_kind != "run":
-        return
-
-    resumed_host = FakeExecutorHost()
-    resumed_lifecycle = RunLifecycle(
-        states=states,
-        control=control,
-        host=resumed_host,
-        task=task,
-        preflight=lambda: states.load_current_run(run_id),
-        select_run=lambda _action: (states.load_current_run(run_id) or {}, True),
-        initialize_profile=None,
-        executor_spec=lambda selected_run_id, action_id, generation: ExecutorSpec(
-            task=task,
-            action_id=action_id,
-            run_id=selected_run_id,
-            generation=generation,
-            state_root=state_root.resolve(),
-        ),
-        execute=lambda _run_id: states.load_current_run(run_id) or {},
-    )
-    _resumed_state, _resumed, resumed_receipt = resumed_lifecycle.submit(
-        LifecycleRequest(
-            task=task,
-            kind="resume",
-            payload={"parent": 1, "run_id": run_id},
-            allow_terminal_successor=True,
-        )
-    )
-    assert resumed_receipt.executor_generation == 2
-    assert resumed_host.start_count == 1
+    assert host.start_count == 0
 
 
-def test_corrupt_control_reconciles_only_from_an_exact_run_receipt(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("action_id", "another-action"), ("payload_digest", "0" * 64),
+     ("run_id", "run-other"), ("executor_generation", 2)],
+)
+def test_control_rejects_mismatched_receipt_identity_without_writes(
+    tmp_path: Path, field: str, value: object,
 ) -> None:
     task = _task(tmp_path)
     control = TaskControlStore(tmp_path / "state")
-    payload = {"parent": 156}
-    claim = control.claim_action(task, kind="run", payload=payload)
+    claim = control.claim_action(task, kind="run", payload={"parent": 156})
     assert claim.action is not None
-    action = claim.action
-    receipt = {
-        "protocol": 1,
-        "action_id": action["action_id"],
-        "kind": action["kind"],
-        "payload_digest": action["payload_digest"],
-        "run_id": "run-1",
-        "executor_generation": action["executor_generation"],
-    }
-    control.path_for(task).write_text("not json", encoding="utf-8")
-
-    repaired = control.reconcile_from_run(
-        task,
-        {"action_application_receipt": receipt},
-        payload=payload,
-    )
-
-    assert repaired is not None
-    assert repaired["action"]["action_id"] == action["action_id"]
-    assert repaired["action"]["payload"] == payload
-    assert repaired["action"]["run_id"] == "run-1"
-    control.path_for(task).write_text("not json", encoding="utf-8")
+    control.bind_run(task, str(claim.action_id), "run-1")
+    state: dict[str, object] = {"run_id": "run-1", "status": "active"}
+    prepare_action_application_receipt(state, claim.action)
+    before = snapshot_control(control, task)
+    state["action_application_receipt"][field] = value
     with pytest.raises(ActionReconciliationError):
-        control.reconcile_from_run(
-            task,
-            {"action_application_receipt": receipt},
-            payload={"parent": 999},
-        )
-    with pytest.raises(ActionReconciliationError, match="Run ID"):
-        control.reconcile_from_run(
-            task,
-            {"run_id": "run-other", "action_application_receipt": receipt},
-            payload=payload,
-        )
+        control.reconcile_from_run(task, state, payload={"parent": 156})
+    assert snapshot_control(control, task) == before
 
 
 def test_concurrent_public_runs_share_one_task_action_and_executor(
@@ -1825,71 +1459,79 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 10
-    while not started.exists():
-        if first.poll() not in {None, 0}:
-            stdout, stderr = first.communicate()
-            raise AssertionError(f"first run failed early: {stdout}\n{stderr}")
-        if time.monotonic() >= deadline:
-            first.kill()
-            raise AssertionError("first run did not reach the controlled Agent gate")
-        time.sleep(0.01)
+    second: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not started.exists():
+            if first.poll() not in {None, 0}:
+                stdout, stderr = first.communicate()
+                raise AssertionError(f"first run failed early: {stdout}\n{stderr}")
+            if time.monotonic() >= deadline:
+                first.kill()
+                raise AssertionError("first run did not reach the controlled Agent gate")
+            time.sleep(0.01)
 
-    second = subprocess.Popen(
-        command,
-        cwd=git_repo,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+        second = subprocess.Popen(
+            command,
+            cwd=git_repo,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
-    state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    state_before_conflict = snapshot_run(state_ref)
-    control_before_conflict = control_path.read_bytes()
-    conflict = subprocess.run(
-        [*command, "--ticket-review-rounds", "1"],
-        cwd=git_repo,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert conflict.returncode == 0, f"{conflict.stdout}\n{conflict.stderr}"
-    conflict_output = json.loads(conflict.stdout)
-    _assert_public_action_receipt(conflict_output, submission="attached")
-    assert snapshot_run(state_ref) == state_before_conflict
-    assert control_path.read_bytes() == control_before_conflict
+        state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
+        control, task = only_control(managed_state(git_repo, extra_env=environment))
+        state_before_conflict = snapshot_run(state_ref)
+        control_before_conflict = snapshot_control(control, task)
+        conflict = subprocess.run(
+            [*command, "--ticket-review-rounds", "1"],
+            cwd=git_repo,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert conflict.returncode == 0, f"{conflict.stdout}\n{conflict.stderr}"
+        conflict_output = json.loads(conflict.stdout)
+        _assert_public_action_receipt(conflict_output, submission="attached")
+        assert snapshot_run(state_ref) == state_before_conflict
+        assert snapshot_control(control, task) == control_before_conflict
 
-    release.touch()
-    first_stdout, first_stderr = first.communicate(timeout=30)
-    second_stdout, second_stderr = second.communicate(timeout=30)
+        release.touch()
+        first_stdout, first_stderr = first.communicate(timeout=30)
+        second_stdout, second_stderr = second.communicate(timeout=30)
 
-    assert first.returncode == 0, f"{first_stdout}\n{first_stderr}"
-    assert second.returncode == 0, f"{second_stdout}\n{second_stderr}"
-    first_output = json.loads(first_stdout)
-    second_output = json.loads(second_stdout)
-    submissions = [
-        first_output["action"]["submission"],
-        second_output["action"]["submission"],
-    ]
-    assert sorted(submissions) == ["attached", "started"]
-    _assert_public_action_receipt(first_output, submission=submissions[0])
-    _assert_public_action_receipt(second_output, submission=submissions[1])
-    state = load_only_run_state(git_repo, extra_env=environment)
-    assert state["status"] == "run_approval_pending"
-    development_invocations = [
-        invocation
-        for invocation in state["agent_invocation_history"]
-        if invocation.get("role") == "development"
-    ]
-    assert len(development_invocations) == 1
-    controls = list((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    assert len(controls) == 1
-    control_record = json.loads(controls[0].read_text(encoding="utf-8"))
-    assert control_record["action"]["status"] == "completed"
-    assert control_record["executor"]["status"] == "exited"
+        assert first.returncode == 0, f"{first_stdout}\n{first_stderr}"
+        assert second.returncode == 0, f"{second_stdout}\n{second_stderr}"
+        first_output = json.loads(first_stdout)
+        second_output = json.loads(second_stdout)
+        submissions = [
+            first_output["action"]["submission"],
+            second_output["action"]["submission"],
+        ]
+        assert sorted(submissions) == ["attached", "started"]
+        _assert_public_action_receipt(first_output, submission=submissions[0])
+        _assert_public_action_receipt(second_output, submission=submissions[1])
+        state = load_only_run_state(git_repo, extra_env=environment)
+        assert state["status"] == "run_approval_pending"
+        development_invocations = [
+            invocation
+            for invocation in state["agent_invocation_history"]
+            if invocation.get("role") == "development"
+        ]
+        assert len(development_invocations) == 1
+        control_record = load_only_control(managed_state(git_repo, extra_env=environment))
+        assert control_record["action"]["status"] == "completed"
+        assert control_record["executor"]["status"] == "exited"
+    finally:
+        release.touch()
+        for process in (first, second):
+            if process is None:
+                continue
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
 
 def test_different_parent_runs_reach_agents_without_shared_state_lock(
@@ -2027,10 +1669,10 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
     )
     first_output = stdout_json(first)
     state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
     fixture_before = json.loads(fixture.read_text(encoding="utf-8"))
     state_before = snapshot_run(state_ref)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control, task)
 
     defaults_path.write_text("invalid defaults after creation")
     second = run_cli(
@@ -2050,7 +1692,7 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
     _assert_public_action_receipt(second_output, submission="attached")
     assert json.loads(fixture.read_text(encoding="utf-8")) == fixture_before
     assert snapshot_run(state_ref) == state_before
-    assert control_path.read_bytes() == control_before
+    assert snapshot_control(control, task) == control_before
     state = load_only_run_state(git_repo, extra_env=environment)
     assert (
         sum(
@@ -2267,8 +1909,8 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert isinstance(receipt, dict)
     assert isinstance(receipt.get("action_id"), str)
     state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    interrupted_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
+    interrupted_control = control.load(task)
     interrupted_action = interrupted_control["action"]
     interrupted_fixture_bytes = fixture.read_bytes()
     interrupted_development_count = sum(
@@ -2311,7 +1953,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert recovered.returncode == 2, f"{recovered.stdout}\n{recovered.stderr}"
     recovered_diagnostics = json.loads(recovered.stdout)["diagnostics"]
     assert len(recovered_diagnostics) == 1
-    assert recovered_diagnostics[0]["code"] == "session_interrupted"
+    assert recovered_diagnostics[0]["code"] == "session_interrupted", recovered.stdout
     assert recovered_diagnostics[0]["message"] == (
         "Executor Session 已退出；保留现场并等待显式 Resume"
     )
@@ -2342,7 +1984,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
         == interrupted_development_count
     )
     assert fixture.read_bytes() == interrupted_fixture_bytes
-    recovered_control = json.loads(control_path.read_text(encoding="utf-8"))
+    recovered_control = control.load(task)
     assert recovered_control["action"]["action_id"] == interrupted_action["action_id"]
     assert (
         recovered_control["action"]["executor_generation"]
@@ -2368,7 +2010,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
             extra_env=environment,
         )
         assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
-        resumed_control = json.loads(control_path.read_text(encoding="utf-8"))
+        resumed_control = control.load(task)
         assert resumed_control["action"]["action_id"] != interrupted_action["action_id"]
         assert resumed_control["action"]["executor_generation"] == 2
         assert resumed_control["executor"]["generation"] == 2
@@ -2378,7 +2020,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     ("crash_boundary", "expected_invocation_status"),
     [("before_invocation", None), ("running", "running"), ("completed", "completed")],
 )
-def test_session_closeout_retries_only_the_control_commit(
+def test_session_closeout_rolls_back_run_and_control_together(
     git_repo: Path,
     tmp_path: Path,
     crash_boundary: DevelopmentBoundary,
@@ -2428,10 +2070,11 @@ def test_session_closeout_retries_only_the_control_commit(
             )
 
     control = CrashAfterRunSaveStore(state_root)
-    control_path = control.path_for(task)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control, task)
     original_control = json.loads(control_before)
     action = original_control["action"]
+    run_ref = (state_root, run_id)
+    run_before = snapshot_run(run_ref)
     fixture_before = fixture.read_bytes()
     host = FakeExecutorHost()
     business_calls = 0
@@ -2469,18 +2112,11 @@ def test_session_closeout_retries_only_the_control_commit(
     after_run_save = states.load_current_run(run_id)
     assert after_run_save is not None
     require_current_run_state(after_run_save)
-    gate = after_run_save["diagnostics"][0]["operator_gate"]
-    assert gate["work_subject"] == f"run:{run_id}"
-    assert gate["phase"] == "execution_failed"
-    assert session_interruption_is_persisted(after_run_save)
-    successor_state = dict(after_run_save)
-    successor_state["action_application_receipt"] = {
-        **after_run_save["action_application_receipt"],
-        "action_id": "successor-action",
-        "executor_generation": action["executor_generation"] + 1,
-    }
-    assert not session_interruption_is_persisted(successor_state)
-    control_in_window = json.loads(control_path.read_text(encoding="utf-8"))
+    assert snapshot_run(run_ref) == run_before
+    assert not session_interruption_is_persisted(after_run_save)
+    assert snapshot_control(control, task) == control_before
+    assert snapshot_control(TaskControlStore(state_root), task) == control_before
+    control_in_window = control.load(task)
     assert control_in_window["action"]["action_id"] == action["action_id"]
     assert control_in_window["action"]["status"] == action["status"]
     assert control_in_window["executor"]["status"] == "absent"
@@ -2495,13 +2131,27 @@ def test_session_closeout_retries_only_the_control_commit(
 
     closed, _resumed, receipt = lifecycle.submit(request)
     require_current_run_state(closed)
-    assert closed["diagnostics"][0]["operator_gate"] == gate
+    gate = closed["diagnostics"][0]["operator_gate"]
+    assert gate["work_subject"] == f"run:{run_id}"
+    assert gate["phase"] == "execution_failed"
+    assert session_interruption_is_persisted(closed)
+    successor_state = dict(closed)
+    successor_state["action_application_receipt"] = {
+        **closed["action_application_receipt"],
+        "action_id": "successor-action",
+        "executor_generation": action["executor_generation"] + 1,
+    }
+    assert not session_interruption_is_persisted(successor_state)
     assert receipt.action_id == action["action_id"]
     assert receipt.executor_generation == action["executor_generation"]
-    closed_control = json.loads(control_path.read_text(encoding="utf-8"))
+    closed_control = control.load(task)
     assert closed_control["action"]["action_id"] == action["action_id"]
     assert closed_control["executor"]["generation"] == action["executor_generation"]
     assert closed_control["executor"]["status"] == "exited"
+    assert len(closed["agent_invocation_history"]) == len(initial["agent_invocation_history"])
+    if expected_invocation_status == "completed":
+        assert closed["active_agent_invocation"] == initial["active_agent_invocation"]
+        assert closed["agent_invocation_history"] == initial["agent_invocation_history"]
     assert host.start_count == 0
     assert business_calls == 0
     assert fixture.read_bytes() == fixture_before
@@ -2559,8 +2209,8 @@ def test_repeated_run_fails_closed_after_action_acceptance_before_run_receipt(
     assert "action_application_receipt" not in interrupted_state
     state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
     interrupted_state_bytes = snapshot_run(state_ref)
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    interrupted_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
+    interrupted_control = control.load(task)
     interrupted_action = interrupted_control["action"]
 
     recovered = run_cli(
@@ -2575,7 +2225,7 @@ def test_repeated_run_fails_closed_after_action_acceptance_before_run_receipt(
     assert recovered.returncode == 2, f"{recovered.stdout}\n{recovered.stderr}"
     assert json.loads(recovered.stdout)["diagnostics"][0]["code"] == "task_control"
     assert snapshot_run(state_ref) == interrupted_state_bytes
-    recovered_control = json.loads(control_path.read_text(encoding="utf-8"))
+    recovered_control = control.load(task)
     assert recovered_control["action"]["action_id"] == interrupted_action["action_id"]
     assert (
         recovered_control["action"]["executor_generation"]
@@ -2588,102 +2238,51 @@ def test_repeated_run_fails_closed_after_action_acceptance_before_run_receipt(
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-def test_terminal_run_receipt_still_requires_host_exit_proof(
+def test_terminal_run_receipt_cannot_replace_unavailable_control_authority(
     git_repo: Path, tmp_path: Path, control_case: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "terminal-receipt")
     first = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-    first_output = stdout_json(first)
-    state_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    state_before = snapshot_run(state_ref)
-    fixture_before = fixture.read_bytes()
-    if control_case == "missing":
-        control_path.unlink()
-    else:
-        control_path.write_text("not json", encoding="utf-8")
-
-    repeated = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-    repeated_output = stdout_json(repeated)
-
-    assert repeated.returncode == 2, f"{repeated.stdout}\n{repeated.stderr}"
-    assert repeated_output["diagnostics"][0]["code"] == "executor_start_unknown"
-    _assert_public_action_receipt(first_output, submission="started")
-    assert snapshot_run(state_ref) == state_before
-    assert fixture.read_bytes() == fixture_before
-    repaired_controls = list((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    assert len(repaired_controls) == 1
-    repaired_control = json.loads(repaired_controls[0].read_text(encoding="utf-8"))
-    repaired_action = repaired_control["action"]
-    receipt = read_run(state_ref)[
-        "action_application_receipt"
-    ]
-    assert repaired_control["run_id"] == receipt["run_id"] == first_output["run_id"]
-    assert repaired_action["status"] == "accepted"
-    assert repaired_control["executor"]["reconciliation_required"] is True
-    assert repaired_action["application_observed"] is True
-    assert all(
-        repaired_action[key] == receipt[key]
-        for key in ("action_id", "kind", "payload_digest", "run_id")
-    )
-    repaired_before = repaired_controls[0].read_bytes()
-    retried = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents),
         extra_env=environment,
     )
-    assert retried.returncode == 2
-    assert stdout_json(retried)["diagnostics"][0]["code"] == "executor_start_unknown"
-    assert repaired_controls[0].read_bytes() == repaired_before
-    assert snapshot_run(state_ref) == state_before
-    assert fixture.read_bytes() == fixture_before
+    assert first.returncode == 0, first.stdout + first.stderr
+    first_output = stdout_json(first)
+    state_root = managed_state(git_repo, extra_env=environment)
+    state_ref = only_run_ref(state_root)
+    control, task = only_control(state_root)
+    state_before = snapshot_run(state_ref)
+    fixture_before = fixture.read_bytes()
+    agents_before = agents.read_bytes()
+    if control_case == "missing":
+        delete_control_fixture(control, task)
+    else:
+        corrupt_control_fixture(control, task)
+    control_before = raw_control_snapshot(control, task)
 
-    repaired_controls[0].unlink()
-    blocked_state = snapshot_run(state_ref)
-    blocked_fixture = fixture.read_bytes()
-    blocked = run_cli(
-        git_repo,
-        fixture,
-        "resume",
-        first_output["run_id"],
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-
-    assert blocked.returncode == 2, f"{blocked.stdout}\n{blocked.stderr}"
-    assert stdout_json(blocked)["diagnostics"][0]["code"] == "task_control"
-    assert snapshot_run(state_ref) == blocked_state
-    assert fixture.read_bytes() == blocked_fixture
-    assert not repaired_controls[0].exists()
+    for operation, selector in (("run", "1"), ("run", "1"), ("resume", first_output["run_id"])):
+        rejected = run_cli(
+            git_repo, fixture, operation, selector, "--agent-fixture", str(agents),
+            extra_env=environment,
+        )
+        assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+        assert stdout_json(rejected)["diagnostics"][0]["code"] == "task_control"
+        assert raw_control_snapshot(control, task) == control_before
+        assert snapshot_run(state_ref) == state_before
+        assert fixture.read_bytes() == fixture_before
+        assert agents.read_bytes() == agents_before
+    _assert_public_action_receipt(first_output, submission="started")
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
-def test_public_run_reconciles_receipt_only_control_before_replay(
+def test_public_run_rejects_unavailable_control_before_host_or_replay(
     git_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     control_case: str,
-    host_status: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
@@ -2702,8 +2301,8 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
 
     state_root = managed_state(git_repo, extra_env=environment)
     state_ref = only_run_ref(state_root)
-    control_path = next((state_root / "task-control").glob("*.json"))
-    original_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control, task = only_control(state_root)
+    original_control = control.load(task)
     original_action = original_control["action"]
     original_generation = original_action["executor_generation"]
     state_before = snapshot_run(state_ref)
@@ -2713,9 +2312,10 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
     assert len(invocation_history_before) == 1
     assert invocation_history_before[0]["status"] == "running"
     if control_case == "missing":
-        control_path.unlink()
+        delete_control_fixture(control, task)
     else:
-        control_path.write_text("not json", encoding="utf-8")
+        corrupt_control_fixture(control, task)
+    control_before = raw_control_snapshot(control, task)
 
     calls = {"readiness": 0, "observe": 0, "ensure": 0, "prepare": 0}
 
@@ -2736,14 +2336,11 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
             calls["observe"] += 1
             assert spec.generation == original_generation
             return HostObservation(
-                host_status,  # type: ignore[arg-type]
+                "exited",
                 original_generation,
                 None,
                 False,
-                "original Executor ownership is not proven"
-                if host_status != "exited"
-                else None,
-                runner_binding="0" * 16 if host_status == "exited" else None,
+                runner_binding="0" * 16,
             )
 
         def ensure(self, *_args: object, **_kwargs: object) -> HostObservation:
@@ -2769,48 +2366,19 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
     )
     monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: cli.FixtureGitHubReader(fixture))
 
-    control_after_first: bytes | None = None
-    state_after_first: bytes | None = None
-    for attempt in range(2):
+    for _attempt in range(2):
         capsys.readouterr()
-        return_code = cli.main(
-            ["run", "1", "--repo", "example/project", "--json"]
-        )
+        return_code = cli.main(["run", "1", "--repo", "example/project", "--json"])
         output = json.loads(capsys.readouterr().out)
-        if host_status == "exited":
-            assert return_code == 2
-            if attempt == 0:
-                assert output["status"] == "execution_failed"
-                _assert_public_action_receipt(output, submission="attached")
-            else:
-                assert output["result"] == "rejected"
-                assert output["status"] == "execution_failed"
-        else:
-            assert return_code == 2
-            assert output["diagnostics"][0]["code"] == "executor_start_unknown"
+        assert return_code == 2
+        assert output["diagnostics"][0]["code"] == "task_control"
+        assert raw_control_snapshot(control, task) == control_before
+        assert snapshot_run(state_ref) == state_before
         assert fixture.read_bytes() == fixture_before
         assert agents.read_bytes() == agents_before
-        if attempt == 0:
-            control_after_first = control_path.read_bytes()
-            state_after_first = snapshot_run(state_ref)
-        else:
-            assert control_path.read_bytes() == control_after_first
-            assert snapshot_run(state_ref) == state_after_first
 
-    recovered = json.loads(control_path.read_text(encoding="utf-8"))
-    assert recovered["action"]["action_id"] == original_action["action_id"]
-    assert recovered["action"]["executor_generation"] == original_generation
-    assert calls["ensure"] == 0
-    assert calls["prepare"] == 0
-    assert calls["observe"] == (1 if host_status == "exited" else 2)
-    current_state = read_run(state_ref)
-    if host_status == "exited":
-        assert current_state["status"] == "execution_failed"
-        assert len(current_state["agent_invocation_history"]) == len(
-            invocation_history_before
-        )
-    else:
-        assert snapshot_run(state_ref) == state_before
+    assert calls["ensure"] == calls["prepare"] == calls["observe"] == 0
+    assert read_run(state_ref)["agent_invocation_history"] == invocation_history_before
 
 
 def test_status_and_history_do_not_touch_run_or_task_control(
@@ -2831,9 +2399,9 @@ def test_status_and_history_do_not_touch_run_or_task_control(
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
     run_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
     run_before = snapshot_run(run_ref)
-    control_before = control_path.read_bytes()
+    control_before = snapshot_control(control, task)
 
     for command in ("status", "history"):
         inspected = run_cli(
@@ -2849,7 +2417,7 @@ def test_status_and_history_do_not_touch_run_or_task_control(
         assert "binding_token" not in serialized
         assert "process_start_token" not in serialized
         assert snapshot_run(run_ref) == run_before
-        assert control_path.read_bytes() == control_before
+        assert snapshot_control(control, task) == control_before
 
 
 @pytest.mark.parametrize(
@@ -2878,19 +2446,30 @@ def test_status_and_history_mark_unavailable_task_control_unknown_without_writes
     )
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
     if control_case == "missing":
-        control_path.unlink()
+        delete_control_fixture(control, task)
     elif control_case == "corrupt":
-        control_path.write_bytes(b'{"authorization":"Bearer secret-token"')
-    elif control_case == "inconsistent":
-        control = json.loads(control_path.read_text(encoding="utf-8"))
-        control["run_id"] = "run-other"
-        control_path.write_text(json.dumps(control), encoding="utf-8")
+        record = control.load(task)
+        assert record is not None
+        record["action"]["failure"] = "Bearer secret-token"
+        persist_control_fixture(control, task, record)
+        corrupt_control_fixture(control, task)
     else:
-        control = json.loads(control_path.read_text(encoding="utf-8"))
-        control["executor"]["generation"] += 1
-        control_path.write_text(json.dumps(control), encoding="utf-8")
+        record = control.load(task)
+        assert record is not None
+        if control_case == "inconsistent":
+            record["run_id"] = "run-other"
+            record["action"]["run_id"] = "run-other"
+            record["executor"]["run_id"] = "run-other"
+        else:
+            record["action"]["executor_generation"] += 1
+            record["executor"]["generation"] += 1
+            record["next_generation"] += 1
+        persist_control_fixture(control, task, record)
+    control_before = raw_control_snapshot(control, task)
+    run_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
+    run_before = snapshot_run(run_ref)
     persistent_roots = [git_repo, Path(environment["XDG_STATE_HOME"])]
     before = {str(root): _file_snapshot(root) for root in persistent_roots}
 
@@ -2927,6 +2506,8 @@ def test_status_and_history_mark_unavailable_task_control_unknown_without_writes
         assert "Agent 活跃状态: 无法确认" in human.stdout
         assert "secret-token" not in human.stdout
         assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
+        assert raw_control_snapshot(control, task) == control_before
+        assert snapshot_run(run_ref) == run_before
 
 
 @pytest.mark.parametrize(
@@ -2939,7 +2520,6 @@ def test_status_and_history_mark_unavailable_task_control_unknown_without_writes
         ("unknown", "unknown"),
         ("conflict", "unknown"),
         ("unavailable", "unknown"),
-        ("synthetic", "unknown"),
         ("control_starting_host_running", "unknown"),
         ("running_without_handshake", "unknown"),
         ("running_pid_conflict", "unknown"),
@@ -2967,25 +2547,16 @@ def test_status_and_history_project_only_read_only_host_proof(
     )
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
-    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-    control = json.loads(control_path.read_text(encoding="utf-8"))
-    control["executor"]["status"] = (
-        "absent"
-        if host_status == "synthetic"
-        else "starting"
-        if host_status == "control_starting_host_running"
-        else "running"
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
+    record = control.load(task)
+    assert record is not None
+    record["executor"]["status"] = (
+        "starting" if host_status == "control_starting_host_running" else "running"
     )
-    control["executor"]["pid"] = 456 if host_status == "running_pid_conflict" else 123
+    record["executor"]["pid"] = 456 if host_status == "running_pid_conflict" else 123
     if host_status == "running_without_handshake":
-        control["executor"]["handshake_at"] = None
-    if host_status == "synthetic":
-        control["executor"]["reconciliation_required"] = True
-        control["executor"]["binding_token"] = "reconciliation-required"
-        control["executor"]["pid"] = None
-        control["executor"]["process_start_token"] = None
-        control["executor"]["handshake_at"] = None
-    control_path.write_text(json.dumps(control), encoding="utf-8")
+        record["executor"]["handshake_at"] = None
+    persist_control_fixture(control, task, record)
 
     observe_calls = 0
 
@@ -2997,8 +2568,6 @@ def test_status_and_history_project_only_read_only_host_proof(
         nonlocal observe_calls
         del store
         observe_calls += 1
-        if host_status == "synthetic":
-            raise AssertionError("synthetic ownership must remain unknown")
         if host_status == "unavailable":
             raise OSError("systemd unavailable")
         observed_status = (
@@ -3031,7 +2600,7 @@ def test_status_and_history_project_only_read_only_host_proof(
         assert output["executor_control"]["activity"] == expected_activity
         assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
 
-    assert observe_calls == (0 if host_status == "synthetic" else 2)
+    assert observe_calls == 2
 
 
 def test_status_and_history_bypass_an_active_action_without_persistent_writes(
@@ -3114,7 +2683,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
         # Both busy paths must reject without applying or persisting the Resume.
         if diagnostic["code"] == "task_control":
             assert diagnostic["message"] == (
-                "control transaction: Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
+                "control transaction: Delivery Task Control 短事务忙；本次未写入，请重试"
             )
         else:
             assert diagnostic["code"] == "action_busy", rejected.stdout + rejected.stderr
@@ -3349,10 +2918,8 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         assert "<run-id>" not in stdout
         custom_run_id = str(read_run(custom_run_ref)["run_id"])
         assert custom_run_id not in stdout
-        control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
-        control_during_observation_exit = json.loads(
-            control_path.read_text(encoding="utf-8")
-        )
+        control, task = only_control(managed_state(git_repo, extra_env=environment))
+        control_during_observation_exit = control.load(task)
         assert snapshot_run(custom_run_ref) == state_before_interrupt
         assert control_during_observation_exit["action"]["status"] == "completed"
         assert control_during_observation_exit["executor"]["status"] == "running"
@@ -3361,7 +2928,7 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         release.touch()
         deadline = time.monotonic() + 10
         while True:
-            final_control = json.loads(control_path.read_text(encoding="utf-8"))
+            final_control = control.load(task)
             if final_control["executor"]["status"] == "exited":
                 break
             if time.monotonic() >= deadline:
@@ -3380,52 +2947,35 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     assert not (git_repo / ".agent-run").exists()
 
 
-def test_default_run_rejects_noncanonical_state_in_task_control(
+def test_task_control_rejects_noncanonical_run_state_directory(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "custom-start-first")
     custom_state = tmp_path / "custom-start-state"
-
     started = seed_run(
-        git_repo,
-        fixture,
-        "1",
-        "--state-dir",
-        str(custom_state),
+        git_repo, fixture, "1", "--state-dir", str(custom_state),
         extra_env=environment,
     )
-    started_output = stdout_json(started)
-    assert started.returncode == 0, f"{started.stdout}\n{started.stderr}"
-    seed_idle_control(
-        TaskControlStore(managed_state(git_repo, extra_env=environment)),
-        TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1),
-        str(stdout_json(started)["run_id"]),
-        state_dir=custom_state,
-    )
-
+    assert started.returncode == 0, started.stdout + started.stderr
+    run_id = str(stdout_json(started)["run_id"])
+    control = TaskControlStore(managed_state(git_repo, extra_env=environment))
+    task = TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1)
+    claim = control.claim_action(task, kind="run", payload={"parent": 1})
     before_state = _file_snapshot(custom_state)
-    before_control = _file_snapshot(managed_state(git_repo, extra_env=environment))
+    before_control = snapshot_control(control, task)
     before_fixture = fixture.read_bytes()
-    continued = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-    continued_output = stdout_json(continued)
 
-    assert continued.returncode == 2, f"{continued.stdout}\n{continued.stderr}"
-    assert continued_output["result"] == "error"
+    with pytest.raises(TaskControlError, match="database|状态目录"):
+        control.bind_run(
+            task, str(claim.action_id), run_id, state_dir=custom_state,
+        )
+
     assert _file_snapshot(custom_state) == before_state
-    assert _file_snapshot(managed_state(git_repo, extra_env=environment)) == before_control
+    assert snapshot_control(control, task) == before_control
     assert fixture.read_bytes() == before_fixture
     assert len(run_refs(custom_state)) == 1
-    assert not run_refs(managed_state(git_repo, extra_env=environment))
+    assert not run_refs(control.root)
 
 
 def test_default_run_attaches_to_canonical_state_during_executor_handshake(

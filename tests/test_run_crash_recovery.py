@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.control_state import only_control
+
 import json
 from pathlib import Path
 from typing import Any
@@ -377,8 +379,8 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     assert final_state["ticket_jobs"]["2"]["review_budget"][
         "development_attempts"
     ] == 1
-    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
-    final_control = json.loads(control_path.read_text(encoding="utf-8"))
+    control_path_store, control_path_task = only_control(managed_state(git_repo))
+    final_control = control_path_store.load(control_path_task)
     assert final_control["action"]["kind"] == "resume"
     assert final_control["action"]["status"] == "completed"
     assert final_control["action"]["executor_generation"] == 3
@@ -401,7 +403,7 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
             "message": "当前交付运行尚未满足此命令的执行条件",
         }
     ]
-    repeated_control = json.loads(control_path.read_text(encoding="utf-8"))
+    repeated_control = control_path_store.load(control_path_task)
     assert repeated_control["action"]["action_id"] == final_control["action"][
         "action_id"
     ]
