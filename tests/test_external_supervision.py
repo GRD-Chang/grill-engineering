@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from typing import Any
 
 from agent_run.external_supervision import (
     CHECKS_BUDGET_SECONDS,
@@ -518,3 +519,103 @@ def test_unproven_github_read_failures_remain_reconcilable(code: str) -> None:
 )
 def test_proven_github_state_contradictions_do_not_enter_supervision(code: str) -> None:
     assert not is_github_convergence_error(code)
+
+
+def test_nonblocking_retry_persists_schedule_and_expires_without_sleep() -> None:
+    from copy import deepcopy
+    clock = [100.0]
+    state = {'status': 'waiting_checks'}
+    sleeps = []
+    supervisor = ExternalSupervisor(now=lambda: clock[0], sleeper=sleeps.append)
+    assert supervisor.retry_due(state)
+    persisted = deepcopy(state)
+    assert not supervisor.retry_due(persisted)
+    assert persisted == state
+    clock[0] += 5
+    assert supervisor.retry_due(persisted)
+    assert persisted['supervision_window']['retry_count'] == 2
+    clock[0] = persisted['supervision_window']['deadline']
+    assert not supervisor.retry_due(persisted)
+    assert persisted['status'] == 'supervision_timeout'
+    assert sleeps == []
+
+
+def test_unknown_checks_read_does_not_restart_the_same_objects_deadline() -> None:
+    from agent_run.external_supervision import wait_for_github_convergence
+
+    clock = [100.25]
+    supervisor = ExternalSupervisor(now=lambda: clock[0], sleeper=lambda _: None)
+    state: dict[str, Any] = {
+        'run_id': 'run-1', 'status': 'waiting_checks',
+        'active_ticket_job': {'ticket_number': 2, 'pr_number': 20,
+                              'phase': 'waiting_checks', 'publication_sha': 'head-a'},
+    }
+    window = supervisor.observe(state)
+    assert window is not None
+    original = dict(window)
+    clock[0] += 500
+    wait_for_github_convergence(state, code='github_read_failed', message='network unknown', waiting_for='ticket-2')
+    supervisor.observe(state)
+    assert state['supervision_window']['deadline'] == original['deadline']
+    clock[0] += 500
+    state['status'] = 'waiting_checks'
+    supervisor.observe(state)
+    assert state['supervision_window']['started_at'] == original['started_at']
+    clock[0] = float(original['deadline'])
+    assert not supervisor.retry_due(state)
+    assert state['supervision_wait']['deadline'] == original['deadline']
+
+
+def test_nested_delivery_uses_driver_clock_without_leaking_between_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_run import external_supervision
+    from agent_run.external_supervision import supervision_scope
+
+    monkeypatch.setattr(external_supervision, "monotonic", lambda: 900.0)
+    now = [100.25]
+    driver = ExternalSupervisor(now=lambda: now[0], sleeper=lambda delay: now.__setitem__(0, now[0] + delay), poll_interval_seconds=7)
+    state = {"status": "waiting_external"}
+    with supervision_scope(driver):
+        window = ensure_supervision_window(state)
+        assert window["started_at"] == 100.25
+        nested = ExternalSupervisor()
+        assert nested.before_retry(state)
+        assert now[0] == 107.25
+        with pytest.raises(RuntimeError), supervision_scope(ExternalSupervisor(now=lambda: 200.0)):
+            assert ensure_supervision_window({"status": "waiting_external"})["started_at"] == 200.0
+            raise RuntimeError("other delivery failed")
+        assert ensure_supervision_window(state)["deadline"] == 700.25
+    assert ensure_supervision_window({"status": "waiting_external"})["started_at"] == 900.0
+
+
+@pytest.mark.parametrize('handoff_at,persist_cost,expected_sleep', [
+    (0.0, 0.0, 5.0), (2.0, 1.0, 2.0), (5.0, 0.0, None),
+    (CHECKS_BUDGET_SECONDS, 0.0, None),
+])
+def test_foreground_consumes_observers_persisted_retry_without_charging_twice(
+    handoff_at: float, persist_cost: float, expected_sleep: float | None,
+) -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def advance(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    supervisor = ExternalSupervisor(now=lambda: now[0], sleeper=advance)
+    state: dict[str, Any] = {'status': 'waiting_checks'}
+    assert supervisor.retry_due(state)
+    window = state['supervision_window']
+    deadline = window['deadline']
+    assert window['retry_count'] == 1 and window['next_retry_at'] == 5.0
+    now[0] = handoff_at
+    continued = supervisor.before_retry(
+        state, persist_before_sleep=lambda: now.__setitem__(0, now[0] + persist_cost),
+    )
+    assert continued is (handoff_at < deadline)
+    assert sleeps == ([] if expected_sleep is None else [expected_sleep])
+    assert window['retry_count'] == 1 and window['deadline'] == deadline
+    if continued:
+        assert supervisor.retry_due(state)
+        assert window['retry_count'] == 2
+    else:
+        assert state['status'] == 'supervision_timeout'

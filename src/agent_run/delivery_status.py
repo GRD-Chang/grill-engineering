@@ -1,25 +1,40 @@
 from __future__ import annotations
 
-from agent_run.messages import display_text, display_language
-
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
+from agent_run.acceptance_facts import (
+    current_findings,
+    current_artifact,
+    completed_acceptance_artifact,
+    acceptance_subject,
+    has_prior_acceptance_failure,
+)
+from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family, ticket_phase_execution_activity, scheduler_progress
+from agent_run.execution_timing import invocation_execution_seconds, invocation_activity, parse_optional_timestamp
+
+from agent_run.messages import display_text, display_language
+
 if TYPE_CHECKING:
     from rich.text import Text
 
 from agent_run.status_actions import approval_lines, controller_work, delivery_result_lines, status_heading, status_timing
-from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
-from agent_run.final_approval_operation import final_approval_cleanup_pending
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation, scheduler_notice
+from agent_run.final_approval_operation import (
+    approval_failure_text,
+    final_approval_cleanup_pending,
+)
 from agent_run.operator_action_presentation import (
     human_action_type,
+    operator_action_items,
     human_preserved_results,
+    human_trigger_invocation,
 )
 from agent_run.presentation_helpers import (
-    current_work_subject,
-    delivery_object_label,
     human_ci_fix_usage,
     human_delivery_object,
     human_agent_role,
@@ -31,6 +46,39 @@ from agent_run.presentation_helpers import (
     status_diagnostic_command,
     unknown_execution_guidance,
 )
+
+
+def _ci_recovery_usage(recovery: dict[str, Any]) -> str:
+    return display_text('presentation.status.ci_development_usage',
+                        window=recovery.get('window'),
+                        used=recovery.get('developments_used'),
+                        limit=recovery.get('development_limit'))
+
+
+def _ci_recovery_details(recovery: dict[str, Any]) -> list[str]:
+    if not recovery.get("failure_head"):
+        return []
+    details = [display_text(
+        'presentation.status.ci_review_required'
+        if recovery.get('review_required') else 'presentation.status.ci_review_exempt'
+    )]
+    head = recovery.get('failure_head')
+    if isinstance(head, str) and head:
+        details.append(display_text('presentation.status.ci_failure_head', head=head))
+    checks = recovery.get('failed_checks')
+    if isinstance(checks, list):
+        names = [
+            f"{check['workflow']} / {check['name']}"
+            for check in checks
+            if isinstance(check, dict)
+            and isinstance(check.get('workflow'), str)
+            and isinstance(check.get('name'), str)
+        ]
+        if names:
+            details.append(display_text(
+                'presentation.status.ci_failed_checks', checks=', '.join(names)
+            ))
+    return details
 
 
 def status_progress_view(
@@ -56,7 +104,8 @@ def status_progress_view(
         and current[1].get("phase") in {"committing_candidate", "creating_pr"}
         and (not isinstance(control, dict) or control.get("activity") == "unknown")):
         activity = "unknown"
-    findings = _current_findings(state)
+    activity = ticket_phase_execution_activity(state, audit, activity)
+    findings = current_findings(state)
     if current_agent is not None:
         current_agent["activity"] = activity
         if activity != "running":
@@ -71,7 +120,7 @@ def status_progress_view(
     timing = status_timing(state, invocation)
     if current_agent is not None and "round_seconds" in timing:
         current_agent["duration_seconds"] = timing["round_seconds"]
-    return {
+    result = {
         "repository": state.get("repository"),
         "parent": {
             "number": parent_view.get("number"),
@@ -80,20 +129,33 @@ def status_progress_view(
         "status": audit.get("status"),
         "phase": audit.get("phase"),
         "current_object": current_object,
-        "ticket_progress": _ticket_progress(state),
+        "ticket_progress": ticket_progress(state),
         "round_progress": _round_progress(
             state, current, audit.get("review_budget"), invocation
         ),
         "run_repair": _run_repair_progress(audit.get("run_repair")),
+        "integration_resync": audit.get("integration_resync"),
+        "integration_development": audit.get("integration_development"),
+        "ci_recovery": audit.get("ci_recovery"),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
         "execution_activity": activity,
+        "scheduler": scheduler_progress(control),
         "findings": findings,
         "conclusion": _current_conclusion(
             state, current, findings, activity=activity
         ),
         "next_action": audit.get("next_action"),
     }
+    multi_ticket = multi_ticket_progress(
+        state,
+        executor_activity=(
+            control.get("activity", "unknown") if isinstance(control, dict) else "unknown"
+        ),
+    )
+    if multi_ticket is not None:
+        result["multi_ticket"] = multi_ticket
+    return result
 
 
 def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
@@ -105,111 +167,6 @@ def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
     if type(capacity_count) is int and capacity_count > 0:
         details.append(display_text('presentation.status.recovery_this_round_capacity_wait_triggered_v1_times_resume_autom', v1=capacity_count))
     return details
-
-
-def invocation_execution_seconds(
-    invocation: dict[str, Any], *, allow_open: bool = False
-) -> int | None:
-    """Return trusted active execution time, excluding persisted recovery waits."""
-
-    started = _parse_optional_timestamp(invocation.get("started_at"))
-    ended = _parse_optional_timestamp(invocation.get("ended_at"))
-    if started is None:
-        return None
-    if ended is None:
-        if not allow_open:
-            return None
-        ended = datetime.now(UTC)
-    if ended < started:
-        return None
-
-    waits = _recovery_wait_intervals(invocation, started=started, ended=ended)
-    if waits is None:
-        return None
-    wait_seconds = 0.0
-    previous_end = started
-    for wait_start, wait_end in sorted(waits):
-        if wait_start < started or wait_end > ended or wait_start < previous_end:
-            return None
-        wait_seconds += (wait_end - wait_start).total_seconds()
-        previous_end = wait_end
-    return max(0, int((ended - started).total_seconds() - wait_seconds))
-
-
-def _recovery_wait_intervals(
-    invocation: dict[str, Any], *, started: datetime, ended: datetime
-) -> list[tuple[datetime, datetime]] | None:
-    raw_intervals = invocation.get("recovery_wait_intervals")
-    if isinstance(raw_intervals, list) and not raw_intervals:
-        # An explicitly persisted empty list belongs to this Invocation. In
-        # particular, a successor may retain the semantic Attempt's cumulative
-        # recovery count while having no waits of its own.
-        if not invocation.get("recovery_waiting") and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        # A legacy/current waiting record can have an empty list because its
-        # interval was not persisted. Fall through to the conservative legacy
-        # reconstruction below rather than claiming all elapsed time ran.
-        raw_intervals = None
-    if raw_intervals is None:
-        # Older records only have enough evidence for one capacity wait. More
-        # than one unversioned wait cannot be reconstructed safely.
-        count = invocation.get("capacity_recovery_count")
-        if count in (None, 0) and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        if count not in (None, 0, 1):
-            return None
-        raw_intervals = [
-            {
-                "started_at": invocation.get("last_failure_at"),
-                "ended_at": invocation.get("last_recovery_started_at"),
-            }
-        ]
-    if not isinstance(raw_intervals, list):
-        return None
-
-    intervals: list[tuple[datetime, datetime]] = []
-    for raw in raw_intervals:
-        if not isinstance(raw, dict):
-            return None
-        wait_start = _parse_optional_timestamp(raw.get("started_at"))
-        wait_end = _parse_optional_timestamp(raw.get("ended_at"))
-        if wait_start is None:
-            return None
-        if wait_end is None:
-            if not invocation.get("recovery_waiting"):
-                return None
-            wait_end = ended
-        if wait_end < wait_start:
-            return None
-        intervals.append((wait_start, wait_end))
-    return intervals
-
-
-def invocation_activity(
-    invocation: dict[str, Any] | None, audit: dict[str, Any]
-) -> str:
-    """Project execution evidence separately from persisted Invocation status."""
-    if not invocation or invocation.get("status") not in {"running", "resuming"}:
-        return "not_running"
-    control = audit.get("executor_control")
-    activity = control.get("activity") if isinstance(control, dict) else "unknown"
-    if activity == "not_running":
-        return "interrupted"
-    if activity != "running":
-        return "unknown"
-    if invocation.get("recovery_waiting") is True:
-        return (
-            "capacity_wait"
-            if invocation.get("recovery_kind") == "capacity"
-            else "recovery_wait"
-        )
-    return "running"
 
 
 def execution_guidance(
@@ -254,6 +211,8 @@ def print_status_progress(
     )
     status_label = status_heading(state, view, status_label)
     print(display_text('presentation.status.status_v1', v1=_terminal_safe(status_label)))
+    if notice := scheduler_notice(view.get("scheduler")):
+        print(notice)
     for result in delivery_result_lines(state):
         print(display_text('presentation.status.delivery_result_v1', v1=result))
     phase = _phase_term(view["phase"], view["current_object"], display_term)
@@ -265,16 +224,41 @@ def print_status_progress(
 
     for detail in approval_lines(state):
         print(f"  {detail}")
+    control = audit.get("executor_control")
+    failure = control.get("approval_failure") if isinstance(control, dict) else None
+    if isinstance(failure, dict):
+        print(f"  {_terminal_safe(approval_failure_text(failure))}")
     timing = status_timing(state)
     if "total_seconds" in timing:
         print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
+    elif timing.get("execution_timing_complete") is False:
+        print(display_text('presentation.status.timing_incomplete'))
+        if type(timing.get("recorded_execution_seconds")) is int:
+            print(display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds'])))
     print(display_text('presentation.status.nprogress'))
     print(f"  {_ticket_progress_text(state, view)}")
+    for line in _multi_ticket_lines(view):
+        print(f"  {_terminal_safe(line)}")
     rounds = view["round_progress"]
     if rounds is not None and state.get("status") != "completed":
         print(display_text('presentation.status.nexecution_allowance'))
         for line in _round_details(rounds):
             print(f"  {_terminal_safe(line)}")
+    integration = view.get("integration_development")
+    if isinstance(integration, dict):
+        print(display_text("presentation.status.integration_development_usage",
+                           used=integration.get("used"), limit=integration.get("limit"),
+                           window=integration.get("window")))
+    resync = view.get("integration_resync")
+    if isinstance(resync, dict):
+        print(display_text('presentation.status.integration_resync_usage',
+                           used=resync.get('used'), limit=resync.get('limit'),
+                           window=resync.get('window')))
+    ci_recovery = view.get("ci_recovery")
+    if isinstance(ci_recovery, dict):
+        print(_ci_recovery_usage(ci_recovery))
+        for detail in _ci_recovery_details(ci_recovery):
+            print(detail)
     if view["elapsed_seconds"] is not None:
         print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
 
@@ -300,9 +284,10 @@ def print_status_progress(
         _print_scope_change(audit.get("scope_change"))
         print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(wait_view.guidance)}")
-        action = audit.get("operator_action")
-        if isinstance(action, dict):
-            print_operator_action(action)
+        actions = operator_action_items(audit)
+        if actions:
+            for action in actions:
+                print_operator_action(action)
         elif wait_view.show_command:
             print(f"  {_terminal_safe(view['next_action'])}")
         _print_findings(view["findings"])
@@ -344,7 +329,7 @@ def print_status_progress(
         for detail in agent["recovery_details"]:
             print(f"  {_terminal_safe(detail)}")
 
-    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
         print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(execution_guidance(state, activity))}")
         _print_findings(view["findings"])
@@ -378,10 +363,8 @@ def print_status_progress(
 
     _print_scope_change(audit.get("scope_change"))
     print()
-    if operator_action.get("type") == "Final Approval":
-        print(display_text('presentation.status.next_step_v1_36', v1=_terminal_safe(view['next_action'])))
-    else:
-        print_operator_action(operator_action)
+    for action in operator_action_items(audit):
+        print_operator_action(action)
     _print_findings(view["findings"])
 
 
@@ -441,18 +424,50 @@ def print_rich_status_progress(
         or display_text('presentation.status.no_specific_phase_yet'),
     )
     add_identity(display_text('presentation.status.current_object'), human_delivery_object(view.get("current_object")))
+    if notice := scheduler_notice(view.get("scheduler")):
+        add_identity(display_text('presentation.status.status'), notice)
 
     for result in delivery_result_lines(state):
         add_identity(display_text('presentation.status.delivery_result'), result)
     for detail in approval_lines(state):
         add_identity(display_text('presentation.status.approve_merge'), detail)
+    control = audit.get("executor_control")
+    failure = control.get("approval_failure") if isinstance(control, dict) else None
+    if isinstance(failure, dict):
+        add_identity(
+            display_text('presentation.status.approve_merge'),
+            approval_failure_text(failure),
+        )
     timing = status_timing(state)
     if "total_seconds" in timing:
         add_identity(display_text('presentation.status.total_agent_execution_time'), _duration(timing["total_seconds"]))
+    elif timing.get("execution_timing_complete") is False:
+        detail = display_text('presentation.status.timing_incomplete')
+        if type(timing.get("recorded_execution_seconds")) is int:
+            detail += " · " + display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds']))
+        add_identity(display_text('presentation.status.total_agent_execution_time'), detail)
     progress_text = _ticket_progress_text(state, view)
     rounds = view.get("round_progress")
     if isinstance(rounds, dict) and state.get("status") != "completed":
         add_identity(display_text('presentation.status.execution_allowance'), "；".join(_round_details(rounds)))
+    integration = view.get("integration_development")
+    if isinstance(integration, dict):
+        add_identity(display_text("presentation.status.integration_development_label"),
+                     display_text("presentation.status.integration_development_usage",
+                                  used=integration.get("used"), limit=integration.get("limit"),
+                                  window=integration.get("window")))
+    resync = view.get("integration_resync")
+    if isinstance(resync, dict):
+        add_identity(display_text('presentation.status.integration_resync_label'),
+                     display_text('presentation.status.integration_resync_values',
+                                  used=resync.get('used'), limit=resync.get('limit'),
+                                  window=resync.get('window')))
+    ci_recovery = view.get("ci_recovery")
+    if isinstance(ci_recovery, dict):
+        add_identity(display_text('presentation.status.ci_recovery_label'),
+                     _ci_recovery_usage(ci_recovery))
+        for detail in _ci_recovery_details(ci_recovery):
+            add_identity(display_text('presentation.status.ci_recovery_label'), detail)
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (
@@ -461,6 +476,9 @@ def print_rich_status_progress(
     if view.get("elapsed_seconds") is not None:
         progress_text += display_text('presentation.status.task_elapsed_time_v1_48', v1=_duration(view['elapsed_seconds']))
     add_identity(display_text('presentation.status.overall_progress'), progress_text)
+    ticket_lines = _multi_ticket_lines(view)
+    if ticket_lines:
+        add_identity(display_text('presentation.status.ticket_details'), "\n".join(ticket_lines))
 
     automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
@@ -500,7 +518,7 @@ def print_rich_status_progress(
     control = audit.get("executor_control")
     unknown_wait = (
         wait_view is not None and isinstance(control, dict)
-        and control.get("activity") == "unknown" and state.get("status") != "supervision_timeout"
+        and control.get("activity") == "unknown" and not isinstance(state.get("supervision_wait"), dict)
     )
     needs_diagnostic = activity == "unknown" or unknown_wait
     agent_running = (automatic_work is not None or (wait_view is None and activity == "running")) and not isinstance(action, dict)
@@ -515,7 +533,7 @@ def print_rich_status_progress(
             unknown_execution_guidance(state, include_command=False)
             if unknown_wait else wait_view.guidance
         ))
-    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
         action_lines.append(
             _rich_value(
                 execution_guidance(
@@ -523,37 +541,39 @@ def print_rich_status_progress(
                 )
             )
         )
-    elif isinstance(action, dict) and action.get("type") == "Final Approval":
-        action_lines.append(Text(display_text('presentation.status.inspect_the_pr_acceptance_and_pre_merge_checks_then_run_the_appro')))
     elif isinstance(action, dict):
-        action_lines.append(
-            _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
-        )
-        for reason in action.get("reasons", []):
-            message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
-            action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
-        action_lines.append(
-            _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
-        )
-        action_lines.append(
-            _rich_labeled(
-                display_text('presentation.status.blocked_phase'),
-                _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
+        for action in operator_action_items(audit):
+            action_lines.append(_rich_value(display_text("presentation.status.object_v1", v1=human_delivery_object(action.get("object")))))
+            action_lines.append(
+                _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
             )
-        )
-        triggering = action.get("trigger_invocation")
-        if isinstance(triggering, dict):
+            for reason in action.get("reasons", []):
+                message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
+                action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
+            action_lines.append(
+                _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
+            )
             action_lines.append(
                 _rich_labeled(
-                    display_text('presentation.status.agent_that_triggered_the_blocker'),
-                    (
-                        display_text('presentation.status.v0_model_v2_reasoning_effort_v4_round_duration_v6_seconds', v0=_rich_role_label(triggering.get('role')), v2=triggering.get('model'), v4=triggering.get('reasoning_effort'), v6=triggering.get('duration_seconds'))
-                    ),
+                    display_text('presentation.status.blocked_phase'),
+                    _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
                 )
             )
-        action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
-        if action.get("type") == "Review Budget Checkpoint":
-            action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
+            triggering = action.get("trigger_invocation")
+            if isinstance(triggering, dict):
+                action_lines.append(
+                    _rich_labeled(
+                        display_text('presentation.status.agent_that_triggered_the_blocker'),
+                        human_trigger_invocation(triggering),
+                    )
+                )
+            if action.get("scope") == "global":
+                action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
+            else:
+                action_lines.append(Text(display_text('presentation.status.local_operator_gate')))
+            if action.get("type") == "Review Budget Checkpoint":
+                action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
+            action_lines.append(_rich_labeled(display_text('presentation.status.command'), action.get("next_action")))
     else:
         action_lines.append(
             _rich_value(automatic_work or _operator_instruction(state, audit.get("agent_invocation")))
@@ -819,24 +839,78 @@ def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
     return text
 
 
-def _ticket_progress(state: dict[str, Any]) -> dict[str, int]:
-    graph = state.get("ticket_graph")
-    tickets = graph.get("tickets") if isinstance(graph, dict) else None
-    total = len(tickets) if isinstance(tickets, dict) else 0
-    jobs = state.get("ticket_jobs")
-    graph_numbers = set(tickets) if isinstance(tickets, dict) else set()
-    completed = (
-        sum(
-            1
-            for number, job in jobs.items()
-            if (not graph_numbers or str(number) in graph_numbers)
-            if isinstance(job, dict)
-            and job.get("phase") in {"completed", "merged"}
-        )
-        if isinstance(jobs, dict)
-        else 0
-    )
-    return {"completed": completed, "total": total}
+def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
+    multi = view.get("multi_ticket")
+    if not isinstance(multi, dict):
+        return []
+    zh = display_language() == "zh"
+    holder = multi.get("integration_holder")
+    limit = multi.get("work_concurrency_limit")
+    lines = [
+        f"Ticket Agent 工作上限：{limit}；集成席位：{f'Ticket #{holder}' if holder is not None else '空闲'}"
+        if zh else
+        f"Ticket Agent work limit: {limit}; integration holder: {f'Ticket #{holder}' if holder is not None else 'free'}"
+    ]
+    executor_activity = multi.get("executor_activity")
+    activity_key = {
+        "running": "executor_activity_running",
+        "not_running": "executor_activity_exited",
+    }.get(str(executor_activity), "executor_activity_unknown")
+    lines.append(display_text(
+        'presentation.status.executor_activity',
+        activity=display_text(f'presentation.status.{activity_key}'),
+    ))
+    for item in multi.get("tickets", []):
+        if not isinstance(item, dict):
+            continue
+        phase = item.get("phase")
+        phase_label = str(human_status_term(phase))
+        parts = [f"Ticket #{item.get('ticket_number')}: {phase_label}"]
+        position = item.get("queue_position")
+        if type(position) is int:
+            parts.append(f"集成队列第 {position} 位" if zh else f"integration queue #{position}")
+        work_position = item.get("work_queue_position")
+        if item.get("resume_accepted"):
+            parts.append("恢复已接受" if zh else "Resume accepted")
+        if type(work_position) is int:
+            parts.append(f"等待工作名额，第 {work_position} 位" if zh else f"waiting for work slot #{work_position}")
+        stop_reason = item.get("stop_wait_reason")
+        if stop_reason:
+            descriptions = {
+                "agent_exit": ("正在停止，等待 Agent 退出", "stopping; waiting for Agent exit"),
+                "remote_reconciliation": ("正在停止，等待远端结果对账", "stopping; reconciling remote result"),
+                "local_boundary": ("正在停止，等待本地步骤收口", "stopping; finishing local step"),
+            }
+            parts.append(descriptions[str(stop_reason)][0 if zh else 1])
+        if item.get("has_work_slot") and executor_activity == "running" and not stop_reason:
+            parts.append("正在工作" if zh else "working")
+        if item.get("holds_integration"):
+            parts.append("持有集成席位" if zh else "holds integration")
+        usage = item.get("usage")
+        if isinstance(usage, dict) and usage.get("development_attempts") is not None:
+            labels = (
+                ("开发", "development", "development_attempts", "development_limit"),
+                ("验收", "review", "reviewer_invocations", "review_limit"),
+                ("CI 开发", "CI development", "ci_developments_used", "ci_development_limit"),
+                ("集成开发", "integration development", "integration_development_used", "integration_development_limit"),
+                ("同步", "resync", "integration_resync_used", "integration_resync_limit"),
+            )
+            parts.append(" / ".join(
+                f"{cn if zh else en} {usage[used]}/{usage[limit]}"
+                for cn, en, used, limit in labels
+                if usage.get(used) is not None and usage.get(limit) is not None
+            ))
+        blockers = item.get("blocked_by")
+        if blockers:
+            parts.append(("依赖未完成：" if zh else "dependencies incomplete: ") + ", ".join(f"#{number}" for number in blockers))
+        reason = item.get("blocked_reason")
+        if reason and reason != "waiting_for_dependencies":
+            parts.append(("阻塞：" if zh else "blocked: ") + str(human_pause_reason(reason)))
+        action = item.get("recovery_action")
+        if action:
+            parts.append(("可恢复动作：" if zh else "recovery action: ") + str(action))
+        lines.append(" · ".join(parts))
+    return lines
 
 
 def _round_progress(
@@ -945,282 +1019,6 @@ def _current_object(
     return "Delivery Run"
 
 
-def _current_findings(state: dict[str, Any]) -> list[str]:
-    current = current_work_subject(state)
-    if current is None:
-        return []
-    subject = _acceptance_subject(state, current)
-    artifact = _current_artifact(subject)
-    if artifact is not None:
-        return _artifact_findings(artifact)
-    if subject.get("phase") in {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-    }:
-        unresolved = _unresolved_acceptance_artifact(state, current, subject)
-        if unresolved is not None:
-            return _artifact_findings(unresolved)
-    return []
-
-
-def _unresolved_acceptance_artifact(
-    state: dict[str, Any],
-    current: tuple[str, dict[str, Any]],
-    subject: dict[str, Any],
-) -> dict[str, Any] | None:
-    candidates: list[dict[str, Any]] = [subject]
-    if current[0] in {"run_acceptance", "run_repair"}:
-        acceptance = state.get("run_acceptance")
-        repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-        if isinstance(repair, dict) and repair is not subject:
-            candidates.append(repair)
-        if isinstance(acceptance, dict) and acceptance is not subject:
-            candidates.append(acceptance)
-    for candidate in candidates:
-        if candidate.get("repair_source") != "acceptance":
-            continue
-        unresolved = candidate.get("unresolved_acceptance_artifact")
-        if isinstance(unresolved, dict):
-            return unresolved
-        record = candidate.get("acceptance_record")
-        if not isinstance(record, dict):
-            continue
-        artifact = record.get("artifact")
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        candidate_sha = _subject_candidate_identity(candidate)
-        if (
-            isinstance(artifact, dict)
-            and isinstance(reviewed, str)
-            and isinstance(candidate_sha, str)
-            and reviewed != candidate_sha
-            and _artifact_has_failures(artifact)
-        ):
-            return artifact
-    return None
-
-
-def _artifact_has_failures(artifact: dict[str, Any]) -> bool:
-    checks = artifact.get("checks")
-    if not isinstance(checks, dict):
-        return False
-    return bool(_artifact_findings(artifact)) or any(
-        isinstance(check, dict) and check.get("status") == "fail"
-        for check in checks.values()
-    )
-
-
-def _current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
-    """Return only an artifact proven to belong to the current candidate."""
-
-    candidate = _subject_candidate_identity(subject)
-    if not isinstance(candidate, str) or not candidate:
-        return None
-    record = subject.get("acceptance_record")
-    if isinstance(record, dict):
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        artifact = record.get("artifact")
-        if isinstance(artifact, dict) and reviewed == candidate:
-            return artifact
-        return None
-
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if isinstance(artifacts, list):
-        for review in reversed(artifacts):
-            if not isinstance(review, dict):
-                continue
-            review_candidate = review.get("candidate_sha")
-            if review_candidate is None:
-                identity = review.get("review_identity")
-                if isinstance(identity, dict):
-                    review_candidate = identity.get("run_head_sha")
-            if review_candidate != candidate:
-                continue
-            artifact = review.get("artifact")
-            if isinstance(artifact, dict):
-                return artifact
-
-    return None
-
-
-def current_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Read the verdict bound to the current work and candidate, without mutation."""
-    current = current_work_subject(state)
-    if current is None:
-        return _completed_acceptance_artifact(state)
-    return _current_artifact(_acceptance_subject(state, current))
-
-
-def _completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Return a terminal acceptance artifact only when its candidate matches."""
-
-    for key in ("parent_job", "active_ticket_job", "run_acceptance"):
-        subject = state.get(key)
-        if not isinstance(subject, dict) or subject.get("phase") not in {
-            "accepted",
-            "completed",
-            "merged",
-        }:
-            continue
-        artifact = _current_artifact(subject)
-        if not isinstance(artifact, dict):
-            continue
-        checks = artifact.get("checks")
-        if not isinstance(checks, dict):
-            continue
-        statuses = {
-            check.get("status")
-            for check in checks.values()
-            if isinstance(check, dict)
-        }
-        if statuses == {"pass"}:
-            return artifact
-    return None
-
-
-def _acceptance_subject(
-    state: dict[str, Any], current: tuple[str, dict[str, Any]]
-) -> dict[str, Any]:
-    """Use Run Acceptance evidence while publication is waiting on its gate."""
-
-    location, subject = current
-    if location == "run_publication":
-        acceptance = state.get("run_acceptance")
-        publication_head = _publication_boundary_head(subject) or _invocation_publication_head(state, subject)
-        acceptance_head = (
-            _acceptance_publication_boundary_head(acceptance)
-            if isinstance(acceptance, dict)
-            else None
-        )
-        if (
-            isinstance(acceptance, dict)
-            and isinstance(publication_head, str)
-            and publication_head == acceptance_head
-        ):
-            return acceptance
-        return {}
-    return subject
-
-
-def _invocation_publication_head(state: dict[str, Any], subject: dict[str, Any]) -> object:
-    """Resolve the real invocation boundary, authenticated by its semantic attempt."""
-    from agent_run.agent_invocation import canonical_fingerprint
-
-    attempt = subject.get("pending_semantic_attempt")
-    invocation = state.get("active_agent_invocation")
-    if not isinstance(invocation, dict):
-        history = state.get("agent_invocation_history")
-        invocation = next((item for item in reversed(history) if isinstance(item, dict)
-                           and isinstance(item.get("semantic_attempt"), dict)
-                           and isinstance(attempt, dict)
-                           and item["semantic_attempt"].get("attempt_id") == attempt.get("attempt_id")), None) if isinstance(history, list) else None
-    if not isinstance(attempt, dict) or not isinstance(invocation, dict):
-        return None
-    identity = invocation.get("semantic_attempt")
-    boundary = invocation.get("currentness_boundary")
-    if (
-        not isinstance(identity, dict) or not isinstance(boundary, dict)
-        or not attempt.get("attempt_id")
-        or identity.get("attempt_id") != attempt.get("attempt_id")
-        or invocation.get("generation") != attempt.get("generation")
-        or identity.get("generation") != attempt.get("generation")
-        or invocation.get("work_subject") != f"run-publication:{state.get('run_id')}"
-        or canonical_fingerprint(boundary) != attempt.get("currentness_boundary_fingerprint")
-    ):
-        return None
-    for key, owner_key in (("parent_revision", "parent"), ("ticket_graph_revision", "ticket_graph")):
-        owner = state.get(owner_key)
-        if isinstance(owner, dict) and boundary.get(key) != owner.get("revision"):
-            return None
-    acceptance = state.get("run_acceptance")
-    if not isinstance(acceptance, dict) or attempt.get("generation") != acceptance.get("acceptance_generation"):
-        return None
-    record = acceptance.get("acceptance_record")
-    if not isinstance(record, dict):
-        return None
-    for key in ("reviewed_default_base_sha", "expected_merge_tree", "parent_revision", "ticket_graph_revision", "ticket_completion_records_fingerprint"):
-        if key in record and boundary.get(key) != record[key]:
-            return None
-    return boundary.get("reviewed_head_sha")
-
-
-def _acceptance_publication_boundary_head(
-    acceptance: dict[str, Any],
-) -> object:
-    """Return the explicitly promoted Run head, when its proof is intact."""
-
-    record = acceptance.get("acceptance_record")
-    if not isinstance(record, dict) or record.get("acceptance_state") != "integrated":
-        return _subject_candidate_identity(acceptance)
-
-    candidate = acceptance.get("candidate_sha")
-    reviewed_candidate = record.get("reviewed_candidate_sha")
-    reviewed_head = record.get("reviewed_head_sha")
-    if (
-        not isinstance(candidate, str)
-        or not candidate
-        or not isinstance(reviewed_candidate, str)
-        or reviewed_candidate != candidate
-        or not isinstance(reviewed_head, str)
-        or not reviewed_head
-    ):
-        return None
-
-    for key in ("reviewed_head_sha", "integrated_sha"):
-        value = acceptance.get(key)
-        if value is not None and value != reviewed_head:
-            return None
-    record_run_head = record.get("run_head_sha")
-    if record_run_head is not None and record_run_head != reviewed_head:
-        return None
-    return reviewed_head
-
-
-def _publication_boundary_head(subject: dict[str, Any]) -> object:
-    record = subject.get("record")
-    if isinstance(record, dict) and isinstance(record.get("run_head_sha"), str):
-        return record["run_head_sha"]
-    for key in ("head_sha", "run_head_sha"):
-        value = subject.get(key)
-        if isinstance(value, str) and value:
-            return value
-    pending = subject.get("pending_semantic_attempt")
-    history = subject.get("semantic_attempt_history")
-    attempts: list[object] = []
-    if isinstance(pending, dict):
-        attempts.append(pending)
-    if isinstance(history, list):
-        attempts.extend(reversed(history))
-    for attempt in attempts:
-        if not isinstance(attempt, dict) or attempt.get("role") != "publication":
-            continue
-        boundary = attempt.get("currentness_boundary")
-        if not isinstance(boundary, dict):
-            continue
-        for key in ("reviewed_head_sha", "run_head_sha"):
-            value = boundary.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def _subject_candidate_identity(subject: dict[str, Any]) -> object:
-    """Read the current version key used by each delivery subject shape."""
-
-    for key in ("candidate_sha", "reviewed_head_sha", "head_sha", "run_head_sha"):
-        value = subject.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
 def _current_conclusion(
     state: dict[str, Any],
     current: tuple[str, dict[str, Any]] | None,
@@ -1229,11 +1027,11 @@ def _current_conclusion(
     activity: str,
 ) -> str:
     if current is None:
-        if _completed_acceptance_artifact(state) is not None:
+        if completed_acceptance_artifact(state) is not None:
             return "当前有效通过"
         return "尚无有效验收结论"
     location, public_subject = current
-    subject = _acceptance_subject(state, current)
+    subject = acceptance_subject(state, current)
     phase = subject.get("phase")
     if phase == "reviewing":
         if activity == "interrupted":
@@ -1242,7 +1040,7 @@ def _current_conclusion(
             return "验收状态无法确认"
         if activity == "not_running":
             return "验收等待执行"
-        review_kind = "复验" if _has_prior_acceptance_failure(subject) else "首次验收"
+        review_kind = "复验" if has_prior_acceptance_failure(subject, budget_owner=delivery_budget_owner(state, subject)) else "首次验收"
         if activity == "capacity_wait":
             return f"模型容量不足，等待自动续接{review_kind}"
         if activity == "recovery_wait":
@@ -1265,7 +1063,7 @@ def _current_conclusion(
         and subject.get("repair_source") == "acceptance"
     ):
         return "修复完成，待复验"
-    artifact = _current_artifact(subject)
+    artifact = current_artifact(subject, budget_owner=delivery_budget_owner(state, subject))
     if artifact is not None:
         checks = artifact.get("checks")
         if isinstance(checks, dict):
@@ -1286,78 +1084,6 @@ def _current_conclusion(
                     return "验收通过，等待发布"
                 return "当前有效通过"
     return "尚无有效验收结论"
-
-
-def _has_prior_acceptance_failure(subject: dict[str, Any]) -> bool:
-    if isinstance(subject.get("unresolved_acceptance_artifact"), dict):
-        return True
-    record = subject.get("acceptance_record")
-    if isinstance(record, dict):
-        artifact = record.get("artifact")
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        candidate = _subject_candidate_identity(subject)
-        if (
-            isinstance(artifact, dict)
-            and isinstance(reviewed, str)
-            and isinstance(candidate, str)
-            and reviewed != candidate
-            and _artifact_has_failures(artifact)
-        ):
-            return True
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if not isinstance(artifacts, list):
-        return False
-    for review in artifacts:
-        if not isinstance(review, dict):
-            continue
-        artifact = review.get("artifact")
-        if not isinstance(artifact, dict):
-            continue
-        checks = artifact.get("checks")
-        if not isinstance(checks, dict):
-            continue
-        if any(
-            isinstance(check, dict)
-            and (check.get("status") == "fail" or _artifact_findings(artifact))
-            for check in checks.values()
-        ):
-            return True
-    return False
-
-
-def _latest_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
-    record = subject.get("acceptance_record")
-    record_artifact = record.get("artifact") if isinstance(record, dict) else None
-    if isinstance(record_artifact, dict):
-        return record_artifact
-    artifact = subject.get("acceptance_artifact")
-    if isinstance(artifact, dict):
-        return artifact
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if isinstance(artifacts, list) and artifacts:
-        latest = artifacts[-1]
-        latest_artifact = latest.get("artifact") if isinstance(latest, dict) else None
-        if isinstance(latest_artifact, dict):
-            return latest_artifact
-    return None
-
-
-def _artifact_findings(artifact: dict[str, Any]) -> list[str]:
-    checks = artifact.get("checks")
-    if not isinstance(checks, dict):
-        return []
-    return [
-        finding
-        for lane in ("e2e", "standards", "spec")
-        if isinstance((check := checks.get(lane)), dict)
-        and isinstance((lane_findings := check.get("findings")), list)
-        for finding in lane_findings
-        if isinstance(finding, str)
-    ]
 
 
 _FINDING_PARTS = re.compile(
@@ -1392,18 +1118,8 @@ def _subject_label(state: dict[str, Any], subject: str) -> str:
     return delivery_object_label(state, subject)
 
 
-def _role_family(role: str) -> str | None:
-    if role == "development":
-        return "development"
-    if role in {"review", "reviewer", "fresh_acceptance"}:
-        return "review"
-    if role in {"publication", "final_publication"}:
-        return "publication"
-    return None
-
-
 def _role_label(role: str) -> str:
-    family = _role_family(role)
+    family = role_family(role)
     if family is None:
         return role
     return {
@@ -1420,22 +1136,8 @@ def _invocation_duration(
 
 
 def _remaining_until(value: object) -> int | None:
-    deadline = _parse_optional_timestamp(value)
+    deadline = parse_optional_timestamp(value)
     return max(0, int((deadline - datetime.now(UTC)).total_seconds())) if deadline else None
-
-
-def _parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
-
-
-def _parse_optional_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return _parse_timestamp(value).astimezone(UTC)
-    except ValueError:
-        return None
 
 
 def _duration(seconds: object) -> str:

@@ -30,8 +30,8 @@ _ACTIVE_ACTION_STATUSES = frozenset({"accepted", "applying"})
 _TERMINAL_ACTION_STATUSES = frozenset({"completed", "failed"})
 _ACTIVE_EXECUTOR_STATUSES = frozenset({"starting", "running"})
 _MAX_ACTION_HISTORY = 4
-_EXECUTOR_FENCE_RETRY_WINDOW_SECONDS = 1.0
-_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS = 0.01
+_CONTROL_WRITE_RETRY_WINDOW_SECONDS = 1.0
+_CONTROL_WRITE_RETRY_INTERVAL_SECONDS = 0.01
 
 class TaskControlError(ValueError):
     """The task control record is unavailable or violates its contract."""
@@ -141,7 +141,7 @@ def unresolved_control_target(action: object) -> dict[str, Any] | None:
 
 
 class TaskControlStore:
-    """One bounded JSON record and one non-blocking lock per :class:`TaskKey`."""
+    """One bounded record and short admission/ownership lock per TaskKey."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
@@ -460,6 +460,7 @@ class TaskControlStore:
                     and (
                         executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
                         or isinstance(executor.get("worker"), Mapping)
+                        or isinstance(executor.get("workers"), list)
                     )
                     else None
                 )
@@ -535,7 +536,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Close a Stop/Abandon after its exact Run outcome is durable."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             if action.get("kind") not in {"stop", "abandon"}:
@@ -625,19 +626,19 @@ class TaskControlStore:
                     raise ActionReconciliationError(
                         "Control Action Receipt target Run/generation 不匹配"
                     )
-                worker = target_executor.get("worker")
-                target_process = worker if isinstance(worker, Mapping) else target_executor
-                token = target_process.get("process_start_token")
-                if (
-                    type(target_process.get("pid")) is not int
-                    or not isinstance(token, str)
-                    or not token
-                    or token == "[REDACTED]"
-                ):
-                    raise ActionReconciliationError(
-                        "Control Action Receipt target 进程 identity 缺失；"
-                        "不会猜测目标已退出"
-                    )
+                workers = _executor_workers(target_executor)
+                for target_process in workers or [target_executor]:
+                    token = target_process.get("process_start_token")
+                    if (
+                        type(target_process.get("pid")) is not int
+                        or not isinstance(token, str)
+                        or not token
+                        or token == "[REDACTED]"
+                    ):
+                        raise ActionReconciliationError(
+                            "Control Action Receipt target 进程 identity 缺失；"
+                            "不会猜测目标已退出"
+                        )
         action = {
             "action_id": receipt["action_id"],
             "kind": receipt["kind"],
@@ -657,6 +658,19 @@ class TaskControlStore:
             action["receipt_only_reconciliation"] = True
         else:
             action["payload"] = normalized_payload
+        approval_subject = (
+            run_state.get(
+                "parent_job" if run_state.get("delivery_type") == "parent_only"
+                else "run_publication"
+            )
+            if isinstance(run_state, Mapping) else None
+        )
+        if receipt["kind"] == "approve" or (
+            receipt["kind"] == "resume"
+            and isinstance(approval_subject, Mapping)
+            and isinstance(approval_subject.get("approval_grant"), Mapping)
+        ):
+            action["final_approval_operation"] = True
         record["run_id"] = receipt["run_id"]
         record["action"] = action
         record["executor"] = {
@@ -701,7 +715,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         if not run_id:
             raise TaskControlError("Lifecycle Action is missing its Delivery Run ID")
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             if (
@@ -745,6 +759,28 @@ class TaskControlStore:
             self._write_unlocked(task, record)
             return deepcopy(record)
 
+    def mark_final_approval_operation(
+        self, task: TaskKey, *, action_id: str, generation: int
+    ) -> dict[str, Any]:
+        """Keep the exact final-approval role with the durable Action history."""
+
+        with self._locked(task, wait=True):
+            record = self._require_unlocked(task)
+            action = _require_active_action(record, action_id)
+            if (
+                action.get("kind") not in {"approve", "resume"}
+                or action.get("executor_generation") != generation
+            ):
+                raise ActionReconciliationError(
+                    "Final Approval Action identity/generation 不匹配"
+                )
+            if action.get("final_approval_operation") is True:
+                return deepcopy(record)
+            action["final_approval_operation"] = True
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
+
     def record_application(
         self,
         task: TaskKey,
@@ -755,7 +791,7 @@ class TaskControlStore:
         generation: int | None = None,
         state_dir: Path | None = None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor: dict[str, Any] | None = None
             if generation is not None:
@@ -919,7 +955,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Record a host observation before an explicit Executor recovery."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") in _ACTIVE_EXECUTOR_STATUSES:
@@ -947,7 +983,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Persist an exact Host exit proof while retaining the Action gate."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             executor = _require_executor(record, action_id, generation)
@@ -997,23 +1033,10 @@ class TaskControlStore:
     ) -> None:
         """Revalidate the exact Executor fence before an external side effect."""
 
-        deadline = monotonic() + _EXECUTOR_FENCE_RETRY_WINDOW_SECONDS
-        while True:
-            try:
-                with self._executor_current_transaction(
-                    task,
-                    action_id=action_id,
-                    generation=generation,
-                    run_id=run_id,
-                ):
-                    return
-            except TaskControlBusyError:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise
-                # Only retry acquisition/validation, outside every shared lock.
-                # The caller has not dispatched its external operation yet.
-                sleep(min(_EXECUTOR_FENCE_RETRY_INTERVAL_SECONDS, remaining))
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            return
 
     @contextmanager
     def _executor_current_transaction(
@@ -1026,7 +1049,7 @@ class TaskControlStore:
     ) -> Iterator[None]:
         """Hold ownership through one short external/state commit boundary."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="executor/state commit"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
@@ -1048,6 +1071,37 @@ class TaskControlStore:
                 )
             yield
 
+    @contextmanager
+    def ticket_resume_transaction(
+        self, task: TaskKey, *, action_id: str, generation: int, run_id: str,
+    ) -> Iterator[None]:
+        """Admit local work only while the same Executor accepts new work."""
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            record = self._require_unlocked(task)
+            if (record["executor"].get("ticket_resume_closed") is True
+                    or record["action"].get("status") != "completed"):
+                raise ActionBusyError("Executor 正在收口；请在退出后恢复 Ticket")
+            yield
+
+    def close_ticket_resume_admission(
+        self, task: TaskKey, *, action_id: str, generation: int,
+        run_id: str, can_exit: Callable[[], bool], failure: str | None = None,
+    ) -> bool:
+        """Atomically stop admission, or let the owner consume newly added work."""
+        with self._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ):
+            if not can_exit():
+                return False
+            record = self._require_unlocked(task)
+            record["executor"]["ticket_resume_closed"] = True
+            if failure is not None:
+                record["executor"]["failure"] = _bounded_text(failure)
+            self._write_unlocked(task, record)
+            return True
+
     def mark_process_started(
         self,
         task: TaskKey,
@@ -1057,7 +1111,7 @@ class TaskControlStore:
         pid: int,
         process_start_token: str | None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") == "starting":
@@ -1076,7 +1130,7 @@ class TaskControlStore:
         pid: int,
         process_start_token: str | None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("pid") not in {None, pid}:
@@ -1106,30 +1160,35 @@ class TaskControlStore:
         pid: int,
         process_start_token: str,
     ) -> dict[str, Any]:
-        """Bind one active Worker process group to the exact Executor."""
+        """Bind a Worker process group to the exact Executor."""
 
         if type(pid) is not int or pid <= 0:
             raise TaskControlError("Worker PID must be positive")
         if not isinstance(process_start_token, str) or not process_start_token:
             raise TaskControlError("Worker process start token is required")
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="worker start"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
                 raise ActionReconciliationError("Executor is not active")
-            worker = executor.get("worker")
-            if isinstance(worker, dict) and (
-                worker.get("pid") != pid
-                or worker.get("process_start_token") != process_start_token
-            ):
-                raise ActionReconciliationError("Executor already owns another Worker")
-            if isinstance(worker, dict):
-                return deepcopy(record)
-            executor["worker"] = {
+            workers = _executor_workers(executor)
+            for worker in workers:
+                if worker["pid"] == pid:
+                    if worker["process_start_token"] != process_start_token:
+                        raise ActionReconciliationError("Worker PID has another start token")
+                    return deepcopy(record)
+            binding = {
                 "pid": pid,
                 "process_start_token": process_start_token,
                 "started_at": _now(),
             }
+            if "workers" in executor:
+                executor["workers"].append(binding)
+            elif workers:
+                executor["workers"] = [workers[0], binding]
+                executor.pop("worker", None)
+            else:
+                executor["worker"] = binding
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1145,18 +1204,23 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Clear the exact Worker binding without affecting Executor ownership."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True, operation="worker finish"):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
-            worker = executor.get("worker")
-            if worker is None:
+            workers = _executor_workers(executor)
+            if not workers:
                 return deepcopy(record)
-            if not isinstance(worker, dict) or (
-                worker.get("pid") != pid
-                or worker.get("process_start_token") != process_start_token
-            ):
+            matching = [worker for worker in workers if worker["pid"] == pid]
+            if len(matching) != 1 or matching[0]["process_start_token"] != process_start_token:
                 raise ActionReconciliationError("Worker completion binding does not match")
-            executor.pop("worker", None)
+            if "workers" in executor:
+                remaining = [worker for worker in workers if worker["pid"] != pid]
+                if remaining:
+                    executor["workers"] = remaining
+                else:
+                    executor.pop("workers")
+            else:
+                executor.pop("worker", None)
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1172,7 +1236,7 @@ class TaskControlStore:
         run_id: str | None = None,
         runner_binding: str | None = None,
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
             action = record.get("action")
@@ -1228,7 +1292,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Release admission at the command-specific durable completion boundary."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             executor = record.get("executor")
@@ -1267,7 +1331,7 @@ class TaskControlStore:
     ) -> dict[str, Any]:
         """Close an applied Action after the exact Executor is proven gone."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action_value = record.get("action")
             if (
@@ -1327,18 +1391,18 @@ class TaskControlStore:
             self._write_unlocked(task, record)
             return deepcopy(record)
 
-    def fail_session_from_application_receipt(
+    @contextmanager
+    def exited_executor_transaction(
         self,
         task: TaskKey,
         *,
         action_id: str,
         generation: int,
         application_receipt: Mapping[str, Any],
-        persist_run_failure: Callable[[], None],
-    ) -> dict[str, Any]:
-        """Atomically fence a proven dead Executor around its Run failure save."""
+    ) -> Iterator[dict[str, Any]]:
+        """Fence exit reconciliation against a successor Action and generation."""
 
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action_value = record.get("action")
             if (
@@ -1383,6 +1447,26 @@ class TaskControlStore:
                     "Delivery Run Receipt 与中断 Session ownership 不一致"
                 )
 
+            yield record
+
+    def fail_session_from_application_receipt(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        application_receipt: Mapping[str, Any],
+        persist_run_failure: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Atomically fence a proven dead Executor around its Run failure save."""
+
+        with self.exited_executor_transaction(
+            task, action_id=action_id, generation=generation,
+            application_receipt=application_receipt,
+        ) as record:
+            action = record["action"]
+            executor = record["executor"]
+            receipt_run_id = application_receipt["run_id"]
             # Hold the Task Control transaction across the one local Run-state
             # commit so no successor Action can pass admission in between.
             persist_run_failure()
@@ -1409,7 +1493,7 @@ class TaskControlStore:
     def fail_action(
         self, task: TaskKey, *, action_id: str, failure: str
     ) -> dict[str, Any]:
-        with self._locked(task):
+        with self._locked(task, wait=True):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             action["status"] = "failed"
@@ -1453,18 +1537,36 @@ class TaskControlStore:
         return record
 
     @contextmanager
-    def _locked(self, task: TaskKey) -> Iterator[None]:
+    def _locked(
+        self, task: TaskKey, *, wait: bool = False, operation: str = "control transaction",
+    ) -> Iterator[None]:
+        """Retry only acquisition for authorized work, never the transaction body.
+
+        New Action admission remains nonblocking. Waiting holds no shared lock;
+        the caller rereads and validates its exact binding after acquisition.
+        """
+        deadline = monotonic() + _CONTROL_WRITE_RETRY_WINDOW_SECONDS if wait else None
         self.directory.mkdir(parents=True, exist_ok=True)
         lock_path = self.directory / f".{task.fingerprint}.lock"
         with lock_path.open("a+", encoding="utf-8") as lock_file:
-            try:
-                fcntl.flock(
-                    lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-            except BlockingIOError as error:
-                raise TaskControlBusyError(
-                    "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
-                ) from error
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    remaining = deadline - monotonic() if deadline is not None else 0
+                    if remaining <= 0:
+                        message = (
+                            "Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
+                            if wait else
+                            "Delivery Task Control 正在提交短事务；本次未等待且未写入，请重试"
+                        )
+                        raise TaskControlBusyError(f"{operation}: {message}") from error
+                    sleep(min(_CONTROL_WRITE_RETRY_INTERVAL_SECONDS, remaining))
+                    if deadline is not None and monotonic() >= deadline:
+                        raise TaskControlBusyError(
+                            f"{operation}: Delivery Task Control 短事务等待已达上限；本次未写入，请重试"
+                        ) from error
             try:
                 yield
             finally:
@@ -1624,6 +1726,11 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
             raise TaskControlError("Task Control Record Action status is invalid")
         if not isinstance(action.get("kind"), str) or not action["kind"]:
             raise TaskControlError("Task Control Record Action kind is invalid")
+        if "final_approval_operation" in action and (
+            action["final_approval_operation"] is not True
+            or action["kind"] not in {"approve", "resume"}
+        ):
+            raise TaskControlError("Task Control Final Approval marker is invalid")
         if (
             not isinstance(action.get("payload_digest"), str)
             or not action["payload_digest"]
@@ -1635,19 +1742,22 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                 "Task Control Record receipt-only marker is invalid"
             )
         if receipt_only:
-            failed_control = (
+            failed_operation = (
                 action.get("status") == "failed"
-                and action.get("kind") in {"stop", "abandon"}
+                and (
+                    action.get("kind") in {"stop", "abandon", "approve"}
+                    or action.get("final_approval_operation") is True
+                )
                 and isinstance(action.get("failure"), str)
             )
             if (
                 "payload" in action
                 or (
                     action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}
-                    and not failed_control
+                    and not failed_operation
                 )
                 or action.get("application_observed") is not True
-                or (action.get("failure") is not None and not failed_control)
+                or (action.get("failure") is not None and not failed_operation)
             ):
                 raise TaskControlError(
                     "Task Control Record receipt-only Action is invalid"
@@ -1739,9 +1849,7 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                 raise TaskControlError(
                     "Task Control Record receipt-only Executor lacks Runner binding"
                 )
-        worker = executor.get("worker")
-        if worker is not None:
-            _validate_worker_snapshot(worker)
+        _executor_workers(executor)
         if isinstance(action, dict):
             if executor.get("action_id") != action.get("action_id"):
                 raise TaskControlError(
@@ -1772,9 +1880,32 @@ def _validate_executor_snapshot(executor: Mapping[str, Any]) -> None:
     pid = executor.get("pid")
     if pid is not None and (type(pid) is not int or pid <= 0):
         raise TaskControlError("Control Action target Executor PID is invalid")
+    _executor_workers(executor)
+
+
+def _executor_workers(executor: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Read the legacy singleton or the bounded multi-Worker snapshot."""
+
     worker = executor.get("worker")
-    if worker is not None:
-        _validate_worker_snapshot(worker)
+    workers = executor.get("workers")
+    if worker is not None and workers is not None:
+        raise TaskControlError("Executor has conflicting Worker bindings")
+    if workers is not None:
+        if not isinstance(workers, list) or not workers:
+            raise TaskControlError("Executor Worker bindings are invalid")
+        bindings = workers
+    elif worker is not None:
+        bindings = [worker]
+    else:
+        return []
+    seen: set[int] = set()
+    for binding in bindings:
+        _validate_worker_snapshot(binding)
+        pid = binding["pid"]
+        if pid in seen:
+            raise TaskControlError("Executor Worker PID is duplicated")
+        seen.add(pid)
+    return bindings
 
 
 def _validate_worker_snapshot(worker: object) -> None:
@@ -1847,7 +1978,7 @@ def _verify_record_matches_run(
         action.get(key) != receipt[key]
         for key in ("action_id", "kind", "payload_digest")
     ):
-        if not _is_unbound_successor_of_receipt(record, action, receipt):
+        if not _is_unapplied_successor_of_receipt(record, action, receipt):
             raise ActionReconciliationError(
                 "Task Control Record 与 Run Application Receipt 不一致"
             )
@@ -1901,28 +2032,45 @@ def _action_receipt(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return {key: raw[key] for key in raw}
 
 
-def _is_unbound_successor_of_receipt(
+def _is_unapplied_successor_of_receipt(
     record: Mapping[str, Any],
     action: Mapping[str, Any],
     receipt: Mapping[str, Any],
 ) -> bool:
     executor = record.get("executor")
-    # Rejected entry preconditions leave the previous Run receipt untouched;
-    # a proven exited, unapplied successor is not evidence of a conflicting Run.
+    # Rejected entry preconditions leave the previous Run receipt untouched.
+    # A lifecycle successor may already be bound to that Run before selecting
+    # it; binding alone does not mean its application receipt was persisted.
+    bound_run_id = action.get("run_id")
+    if bound_run_id is not None:
+        payload = action.get("payload")
+        if (
+            bound_run_id != receipt["run_id"]
+            or record.get("run_id") != receipt["run_id"]
+            or action.get("kind") not in {"resume", "approve", "revise", "requeue"}
+            or not isinstance(payload, Mapping)
+            or payload.get("run_id") != receipt["run_id"]
+        ):
+            return False
+    if isinstance(executor, Mapping) and (
+        executor.get("action_id") != action.get("action_id")
+        or executor.get("generation") != action.get("executor_generation")
+        or executor.get("run_id") != bound_run_id
+    ):
+        return False
+    # A failed successor needs an exact, proven exit before the previous
+    # receipt can be treated as its unapplied predecessor.
     rejected_before_application = (
         action.get("status") == "failed"
         and isinstance(executor, Mapping)
         and executor.get("status") in {"exited", "absent"}
-        and executor.get("action_id") == action.get("action_id")
-        and executor.get("generation") == action.get("executor_generation")
-        and executor.get("run_id") is None
+        and executor.get("reconciliation_required") is not True
     )
     if (
         (
             action.get("status") not in _ACTIVE_ACTION_STATUSES
             and not rejected_before_application
         )
-        or action.get("run_id") is not None
         or action.get("application_observed") is not False
     ):
         return False

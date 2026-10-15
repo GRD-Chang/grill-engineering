@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,7 @@ def pidfd_capability() -> dict[str, object]:
 def main() -> None:
     report = {
         "python": {"version": sys.version, "executable": sys.executable},
+        "sqlite": {"version": sqlite3.sqlite_version},
         "platform": platform.platform(),
         "os_release": platform.freedesktop_os_release(),
         "cpu_count": os.cpu_count(),

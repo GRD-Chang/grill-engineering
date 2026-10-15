@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from agent_run.executor_host import _process_start_token
+from support.cli_fixtures import run_agents
+from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_state
+from support.cli import PROJECT_ROOT, load_only_run_state, stdout_json
+from support.cli_payloads import parent_publication, passing_acceptance
+
+_WAIT_FIELDS = {
+    "kind",
+    "subject",
+    "head_sha",
+    "base_sha",
+    "started_at",
+    "deadline",
+    "remaining_seconds",
+    "retry_count",
+    "latest_observation",
+    "next_action",
+    "timeout_resume_action",
+}
+
+def _assert_public_wait_projection(
+    repo: Path, fixture: Path, run_id: str, *, secret: str | None = None
+) -> None:
+    for command in ("status", "history"):
+        json_result = invoke_cli_inprocess(repo, fixture, command, run_id, "--json")
+        text_result = invoke_cli_inprocess(repo, fixture, command, run_id)
+
+        assert json_result.returncode == text_result.returncode == 0
+        wait = stdout_json(json_result)["supervision"]
+        assert isinstance(wait, dict)
+        assert _WAIT_FIELDS <= wait.keys()
+        assert wait["kind"] in {"github_convergence", "required_checks"}
+        assert wait["started_at"] is not None
+        assert wait["deadline"] is not None
+        assert wait["timeout_resume_action"] == "agent-run run 1"
+        for label in (
+            "等待 GitHub 的操作结果",
+            "已等待：",
+            "本轮最多还可等待：",
+            "无法确认后台等待是否仍在继续",
+            "agent-run status --repo example/project --parent 1 --json",
+            "先核验原执行的归属和退出状态",
+        ):
+            assert label in text_result.stdout
+        assert "截止=" not in text_result.stdout
+        assert "超时恢复:" not in text_result.stdout
+        assert "agent-run doctor" not in text_result.stdout
+        if secret is not None:
+            assert secret not in json_result.stdout
+            assert secret not in text_result.stdout
+
+def _assert_waiting_external_recovery_action(
+    repo: Path, fixture: Path, run_id: str
+) -> None:
+    expected_action = "agent-run run 1"
+    for command in ("status", "history"):
+        json_result = invoke_cli_inprocess(repo, fixture, command, run_id, "--json")
+        text_result = invoke_cli_inprocess(repo, fixture, command, run_id)
+
+        assert json_result.returncode == text_result.returncode == 0
+        assert stdout_json(json_result)["next_action"] == expected_action
+        assert f"下一步: {expected_action}" in text_result.stdout
+
+def _assert_credential_wait_is_not_public(
+    repo: Path, fixture: Path, run_id: str
+) -> None:
+    for command in ("status", "history"):
+        output = stdout_json(invoke_cli_inprocess(repo, fixture, command, run_id, "--json"))
+        assert output.get("supervision") is None
+
+def _parent_only_agents(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Delivered the Parent-only request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-1", "The Parent-only flow passed."
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+_GATED_PENDING_RETRY = """
+import socket, sys
+from agent_run.cli import main
+from agent_run.external_supervision import ExternalSupervisor
+
+barrier = socket.socket(fileno=int(sys.argv[1]))
+barrier.settimeout(20)
+retries_before_interrupt = int(sys.argv[2])
+original = ExternalSupervisor.before_retry
+def before_retry(self, state, **kwargs):
+    global retries_before_interrupt
+    if state.get('status') == 'waiting_checks':
+        if retries_before_interrupt == 0:
+            barrier.sendall(b'1')
+            assert barrier.recv(1) == b'1', 'pending retry barrier was not released'
+        retries_before_interrupt -= 1
+    return original(self, state, **kwargs)
+ExternalSupervisor.before_retry = before_retry
+raise SystemExit(main(sys.argv[3:]))
+"""
+
+
+def _start_supervised_run(
+    repo: Path,
+    fixture: Path,
+    agents: Path,
+    *,
+    barrier_fd: int | None = None,
+    allow_initial_retry: bool = False,
+) -> subprocess.Popen[str]:
+    environment = os.environ.copy()
+    source_path = str(PROJECT_ROOT / "src")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not environment.get("PYTHONPATH")
+        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
+    )
+    entrypoint = (
+        ["-m", "agent_run"] if barrier_fd is None
+        else ["-c", _GATED_PENDING_RETRY, str(barrier_fd), str(int(allow_initial_retry))]
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            *entrypoint,
+            "run",
+            "1",
+            "--agent-fixture",
+            str(agents),
+            "--github-fixture",
+            str(fixture),
+        ],
+        cwd=repo,
+        env=environment,
+        pass_fds=() if barrier_fd is None else (barrier_fd,),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _interrupt_at_pending_retry(
+    repo: Path, fixture: Path, agents: Path, *, allow_initial_retry: bool = False,
+) -> dict[str, object]:
+    """Interrupt a real CLI with persisted backoff, before another retry starts.
+
+    A relayed progress message is not a barrier: the Executor keeps running
+    while its observer reads stderr. Block in the Executor itself so snapshot
+    reads and signal delivery cannot race with another backoff increment.
+    The initial process completes one retry to establish nonzero backoff;
+    the restarted process must expose that same backoff before any new retry.
+    """
+    observer, executor = socket.socketpair()
+    with observer, executor:
+        process = _start_supervised_run(
+            repo, fixture, agents, barrier_fd=executor.fileno(),
+            allow_initial_retry=allow_initial_retry,
+        )
+        executor.close()
+        try:
+            observer.settimeout(20)
+            assert observer.recv(1) == b"1", "Executor did not reach pending retry"
+            state = load_only_run_state(repo)
+            assert state["status"] == "waiting_checks"
+            assert state["supervision_window"]["retry_count"] > 0
+        finally:
+            _interrupt_run(process, repo)
+    stopped = load_only_run_state(repo)
+    assert stopped["supervision_window"] == state["supervision_window"]
+    return stopped
+
+
+def _run_until_pending_window(
+    repo: Path, fixture: Path, agents: Path,
+) -> tuple[subprocess.Popen[str], dict[str, object]]:
+    process = _start_supervised_run(repo, fixture, agents)
+    # The process may still be preparing its Git and Runner state under CPU
+    # contention; the poll exits immediately once the durable wait exists.
+    timeout = time.monotonic() + 15
+    try:
+        while time.monotonic() < timeout:
+            try:
+                state = load_only_run_state(repo)
+            except (AssertionError, FileNotFoundError, json.JSONDecodeError):
+                time.sleep(0.01)
+                continue
+            window = state.get("supervision_window")
+            if state.get("status") == "waiting_checks" and isinstance(window, dict):
+                return process, state
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                pytest.fail(
+                    "agent-run run stopped before persisting its pending window: "
+                    f"stdout={stdout!r}, stderr={stderr!r}"
+                )
+            time.sleep(0.01)
+    except BaseException:
+        _interrupt_run(process, repo)
+        raise
+    _interrupt_run(process, repo)
+    pytest.fail("agent-run run did not reach its pending-window barrier before timeout")
+
+
+def _interrupt_run(process: subprocess.Popen[str], repo: Path) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate(timeout=3)
+    assert process.returncode is not None
+    executors: list[tuple[int, str]] = []
+    for path in (managed_state(repo) / "task-control").glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        executor = record.get("executor")
+        if (
+            isinstance(executor, dict)
+            and executor.get("status") in {"starting", "running"}
+            and type(executor.get("pid")) is int
+            and isinstance(executor.get("process_start_token"), str)
+        ):
+            executors.append(
+                (executor["pid"], executor["process_start_token"])
+            )
+    for pid, start_token in executors:
+        if not _fixture_process_matches(pid, start_token):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 3
+    for pid, start_token in executors:
+        while time.monotonic() < deadline and _fixture_process_matches(
+            pid, start_token
+        ):
+            time.sleep(0.01)
+        if _fixture_process_matches(pid, start_token):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        kill_deadline = time.monotonic() + 3
+        while time.monotonic() < kill_deadline and _fixture_process_matches(
+            pid, start_token
+        ):
+            time.sleep(0.01)
+        assert not _fixture_process_matches(pid, start_token)
+
+
+def _fixture_process_matches(pid: int, start_token: str) -> bool:
+    if _process_start_token(pid) != start_token:
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    closing = raw.rfind(")")
+    if closing < 0:
+        return False
+    fields = raw[closing + 2 :].split()
+    return bool(fields) and fields[0] != "Z"
+
+def _repair_agents(path: Path, *, repair_generations: int) -> Path:
+    agents = run_agents(path)
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    for generation in range(1, repair_generations + 1):
+        data["developments"].append(
+            {
+                "expected_thread_id": None,
+                "thread_id": f"run-repair-developer-{generation}",
+                "summary": f"Repaired final Run check generation {generation}.",
+                "write_files": {"run-repair.txt": f"repair-{generation}\n"},
+            }
+        )
+        data["run_reviews"].append(
+            passing_acceptance(
+                f"run-reviewer-{generation + 1}",
+                f"Run repair generation {generation} passed.",
+            )
+        )
+    data["run_publications"].append(data["run_publications"][0])
+    agents.write_text(json.dumps(data), encoding="utf-8")
+    return agents
+def _resume_repair_agents(path: Path, *, expected_thread_id: str | None) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": expected_thread_id,
+                        "thread_id": "run-repair-developer-1",
+                        "summary": "Resumed the supervised Run repair.",
+                        "write_files": {"run-repair.txt": "recovered\n"},
+                    }
+                ],
+                "publications": [],
+                "reviews": [],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer-resumed", "The resumed Run repair passed."
+                    )
+                ],
+                "run_publications": [
+                    {
+                        "commit_message": "fix(run): publish supervised repair",
+                        "pr_title": "fix(run): publish supervised repair",
+                        "pr_body_markdown": (
+                            "## What Problem This Solves\n\nThe repair was externally blocked.\n\n"
+                            "## Why This Change Was Made\n\nThe same repair resumed after evidence converged.\n\n"
+                            "## User Impact\n\nThe final Run remains reviewable.\n\n"
+                            "## Evidence\n\nThe public CLI recovery passed."
+                        ),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path

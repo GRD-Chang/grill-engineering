@@ -10,10 +10,12 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 from agent_run.state import SimulatedProcessCrash, StateStore
-from conftest import seed_run, write_fixture
+from agent_run.operator_action_facts import operator_action_facts
+from agent_run.state_contract import require_current_run_state
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import final_run_publication, passing_acceptance
+from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import final_run_publication, passing_acceptance
 
 
 def _ticket() -> dict[str, Any]:
@@ -198,7 +200,6 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
         assert pull_states == ["MERGED", "OPEN"]
     else:
         assert pull_states == ["CLOSED", "MERGED", "OPEN"]
-    assert live["delivery"]["acceptance_records"] == []
     statuses = live["delivery"]["agent_run_status"]
     if action == "publish_branch":
         assert len(statuses) == 2
@@ -251,7 +252,6 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
     ] == [2]
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
-    assert delivery.get("acceptance_records", []) == []
     assert delivery.get("closed_issues", []) == []
     assert delivery.get("mutations", []) == []
     assert not any(
@@ -487,8 +487,10 @@ def test_abandon_recovers_lost_change_pr_close_response(
         )
         action = json_view["operator_action"]
         assert action["type"] == "Abandonment Recovery"
-        assert action["object"] == "Ticket #2"
-        assert action["phase"] == "waiting_checks"
+        assert action["object"] == "Delivery Run（Parent Issue #1）"
+        assert action["work_subject"] == f"run:{run_id}"
+        assert action["scope"] == "global"
+        assert action["phase"] == "abandonment_pending"
         assert action["reasons"] == [
             "Run abandonment recovery is incomplete."
         ]
@@ -496,8 +498,8 @@ def test_abandon_recovers_lost_change_pr_close_response(
         assert json_view["next_action"] == action["next_action"]
         text_view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "类型: 正在完成放弃操作" in text_view.stdout
-        assert "对象: 子任务 #2" in text_view.stdout
-        assert "阶段: 等待合并前检查" in text_view.stdout
+        assert "对象: 整体交付（需求 #1）" in text_view.stdout
+        assert "阶段: 正在完成放弃操作" in text_view.stdout
         assert "原因: 放弃操作尚未完成" in text_view.stdout
         assert "已保留成果:" in text_view.stdout
         assert "整项任务已暂停，其他子任务也不会继续。" in text_view.stdout
@@ -562,11 +564,23 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     fixture.write_text(json.dumps(drifted), encoding="utf-8")
     assert run_internal_stage(git_repo, fixture, "deliver", run_id).returncode == 2
 
+    scoped_out = load_only_run_state(git_repo)
+    require_current_run_state(scoped_out)
+    assert scoped_out["status"] == "unsupported_scope_change"
+    assert {fact["work_subject"] for fact in operator_action_facts(scoped_out)} == {
+        f"run:{run_id}", "ticket:2",
+    }
+
     before_abandonment = json.loads(fixture.read_text(encoding="utf-8"))
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
-    assert abandoned.returncode == 2, abandoned.stderr
-    assert stdout_json(abandoned)["status"] == "incompatible_run_state"
+    assert abandoned.returncode == 0, abandoned.stdout + abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    retired = load_only_run_state(git_repo)
+    require_current_run_state(retired)
+    assert operator_action_facts(retired) == []
+    assert retired["ticket_jobs"]["2"] == scoped_out["ticket_jobs"]["2"]
+    assert "ticket_closed_by_run" not in retired["ticket_jobs"]["2"]
     after = json.loads(fixture.read_text(encoding="utf-8"))
     assert after == before_abandonment
     assert after["issues"]["2"]["state"] == "CLOSED"
@@ -605,26 +619,22 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
-    save_run = StateStore.save_run
     crashed = False
 
-    def crash_after_revision_mismatch_save(
-        store: StateStore, saved_run_id: str, state: dict[str, Any]
-    ) -> None:
+    def crash_after_revision_mismatch_save(store: StateStore) -> None:
         nonlocal crashed
-        save_run(store, saved_run_id, state)
-        job = state.get("ticket_jobs", {}).get("2", {})
-        if (
-            not crashed
-            and saved_run_id == run_id
-            and job.get("phase") == "blocked"
-            and job.get("blocked_reason") == "effective_revision_mismatch"
-        ):
+        # 统一提交后 hook 覆盖对象保存；只在真实已持久化的故障边界中断。
+        current = store.load_current_run(run_id)
+        job = current.get("ticket_jobs", {}).get("2", {}) if current is not None else {}
+        if (not crashed and job.get("phase") == "blocked"
+                and job.get("blocked_reason") == "effective_revision_mismatch"):
             crashed = True
             raise SimulatedProcessCrash("after durable revision mismatch")
 
     with monkeypatch.context() as crash_patch:
-        crash_patch.setattr(StateStore, "save_run", crash_after_revision_mismatch_save)
+        crash_patch.setattr(
+            StateStore, "_after_run_saved", crash_after_revision_mismatch_save
+        )
         interrupted = run_internal_stage(
             git_repo,
             fixture,
@@ -695,7 +705,6 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         assert pull_states == ["MERGED", "OPEN"]
     else:
         assert pull_states == ["CLOSED", "MERGED", "OPEN"]
-    assert delivery["acceptance_records"] == []
     statuses = delivery["agent_run_status"]
     if action == "publish_branch":
         assert len(statuses) == 2

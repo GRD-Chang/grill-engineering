@@ -156,7 +156,6 @@ def unsupported_scope_change_identity_is_consistent(
         or accepted != state.get("accepted_ticket_graph_revision")
         or accepted_graph.get("revision") != accepted
         or not isinstance(observed, str)
-        or observed == accepted
         or not isinstance(observed_graph, dict)
         or observed_graph.get("revision") != observed
         or not isinstance(observed_graph.get("ordered_ticket_numbers"), list)
@@ -178,6 +177,8 @@ def unsupported_scope_change_identity_is_consistent(
     except (TypeError, ValueError):
         return False
     if reopened:
+        # Issue open/closed state is not part of the structural Graph Revision.
+        # Bind this contradiction to the completed owners and observed facts.
         return (
             summary == {"reopened_completed_tickets": reopened}
             and diagnostic.get("code") == "completed_ticket_reopened"
@@ -186,7 +187,8 @@ def unsupported_scope_change_identity_is_consistent(
             and diagnostic.get("ticket_numbers") == reopened
         )
     return (
-        summary == expected_delta
+        observed != accepted
+        and summary == expected_delta
         and diagnostic.get("code") == "unsupported_ticket_graph_change"
         and diagnostic.get("message") == _UNSUPPORTED_GRAPH_CHANGE_MESSAGE
     )

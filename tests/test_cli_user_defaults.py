@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from support.user_defaults import (
+    settings,
+)
+
 import json
 import re
 import subprocess
@@ -15,16 +19,20 @@ from support.workspace import managed_state, prepare_workspace
 from agent_run import cli
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.user_defaults import UserDefaultsStore
-from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import human_blocker_step
+from support.seeding import write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import human_blocker_step
 
 
-def settings(*arguments: str) -> tuple[int, dict[str, Any]]:
-    output = StringIO()
-    with redirect_stdout(output):
-        code = cli.main(["settings", *arguments, "--json"])
-    return code, json.loads(output.getvalue())
+def test_resync_limit_configures_future_runs() -> None:
+    code, saved = settings("configure", "--integration-resync-limit", "0")
+    assert code == 0
+    assert saved["policy"]["integration_resync_limit"] == 0
+    assert UserDefaultsStore().load()["policy"]["integration_resync_limit"] == 0
+    code, shown = settings("show")
+    assert code == 0
+    assert shown["policy_sources"]["integration_resync_limit"] == "user-defaults"
+
 
 
 @pytest.mark.parametrize("case", ["initializing", "missing", "starting_only", "applied", "corrupt"])
@@ -32,7 +40,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
     from agent_run.state import StateStore
-    from test_run_lifecycle import _file_snapshot
+    from support.lifecycle import _file_snapshot
 
     monkeypatch.chdir(git_repo)
     prepare_workspace(git_repo)
@@ -216,6 +224,10 @@ def test_settings_human_output_and_complete_example(tmp_path: Path, monkeypatch:
         if "acceptance_scope" in payload:
             from agent_run.development_prompts import development_prompt
             assert payload["task_issue_url"] in development_prompt(payload)
+            continue
+        if "github" in payload:
+            described = UserDefaultsStore().describe(payload)
+            assert described["github"]["worker"]["source"] == payload["github"]["worker_source"]
             continue
         independent = UserDefaultsStore().describe({"profile": payload})
         assert independent["profile"]["profiles"]["publication"]["reference"] is None
@@ -511,7 +523,20 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
     configured = capsys.readouterr().out
     assert ("个人运行默认配置" if language == "zh" else "Personal Run defaults") in configured
     assert ("语言: " if language == "zh" else "Language: ") + language in configured
-    for arguments in (["--help"], ["run", "--help"], ["settings", "configure", "--help"]):
+    ticket_help = {
+        "resume": {
+            "zh": "选择要恢复的局部 Ticket 门禁",
+            "en": "Ticket gate to resume",
+        },
+        "stop": {
+            "zh": "只暂停指定 Ticket",
+            "en": "Pause only the selected Ticket",
+        },
+    }
+    for arguments in (
+        ["--help"], ["run", "--help"], ["resume", "--help"],
+        ["stop", "--help"], ["settings", "configure", "--help"],
+    ):
         with pytest.raises(SystemExit) as exit_info:
             cli.main(arguments)
         assert exit_info.value.code == 0
@@ -520,6 +545,9 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
         assert ("显示此帮助并退出" if language == "zh" else "show this help message and exit") in output
         if language == "en":
             assert not re.search(r"[\u4e00-\u9fff]", output)
+        if arguments[0] in {"resume", "stop"}:
+            assert "--ticket" in output
+            assert ticket_help[arguments[0]][language] in output
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["run", "0"])
     assert exit_info.value.code == 2
@@ -542,9 +570,9 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
 def test_run_configuration_receipt_keeps_frozen_language_after_personal_change(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], language: str,
 ) -> None:
-    from conftest import seed_run
+    from support.seeding import seed_run
     from support.inprocess_cli import invoke_cli_inprocess
-    from test_run_lifecycle import _file_snapshot
+    from support.lifecycle import _file_snapshot
 
     monkeypatch.chdir(git_repo)
     UserDefaultsStore().configure(language=language)
@@ -612,3 +640,19 @@ def test_profile_and_policy_cli_errors_are_bilingual_and_keep_original_audit(
     diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
     assert diagnostic["message"] == audit + "；请排除上述原因后重试；已有交付请先查询 status 确认状态。"
     assert store.path.read_bytes() == before
+
+
+def test_ticket_ci_settings_are_explicit_and_can_be_disabled() -> None:
+    code, builtin = settings("show")
+    assert code == 0
+    assert builtin["policy"]["ticket_ci_development_limit"] == 3
+    assert builtin["policy"]["ticket_ci_review"] is False
+    code, enabled = settings("configure", "--ticket-ci-development-limit", "5", "--ticket-ci-review")
+    assert code == 0
+    assert enabled["policy"]["ticket_ci_development_limit"] == 5
+    assert enabled["policy"]["ticket_ci_review"] is True
+    code, disabled = settings("configure", "--no-ticket-ci-review")
+    assert code == 0
+    assert disabled["policy"]["ticket_ci_review"] is False
+    assert disabled["policy"]["ticket_ci_development_limit"] == 5
+    assert UserDefaultsStore().load()["policy"]["ticket_ci_review"] is False

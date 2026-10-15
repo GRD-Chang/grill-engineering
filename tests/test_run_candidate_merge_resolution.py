@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
+from support.run_scenarios import _completed_run, _sync_completed_ticket_integrated_sha
+
 import subprocess
 import json
 from copy import deepcopy
@@ -10,33 +13,32 @@ import pytest
 
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 
 from support.workspace import prepare_workspace
-from conftest import seed_idle_control
-from test_cli import run_cli
+from support.seeding import seed_idle_control
+from support.cli import run_cli
+from support.merge_resolution import _LateMergeRepairEngine
+from support.state import persist_run_fixture
 
-from run_acceptance_test_support import (
-    _candidate_finding_artifact,
-    _completed_run,
-    _passing_artifact,
-    _sync_completed_ticket_integrated_sha,
-)
 
 @pytest.mark.parametrize(
-    ("latest_combination_has_finding", "external_base_drift"),
+    ("latest_combination_has_finding", "external_run_branch_rewrite"),
     [(False, False), (True, False), (False, True)],
 )
-def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
+def test_written_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     git_repo: Path,
     latest_combination_has_finding: bool,
-    external_base_drift: bool,
+    external_run_branch_rewrite: bool,
 ) -> None:
     workspace = prepare_workspace(git_repo)
     repo = workspace.repository_root
     state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    # Keep this near-ceiling repair-cycle regression at its original D10/R11 policy.
+    state["policy_snapshot"] = DeliveryPolicy(run_repair_rounds=10).snapshot()
     if not latest_combination_has_finding:
         seed_idle_control(
             TaskControlStore(states.root),
@@ -68,7 +70,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     )
     initial_default = git.resolve("main")
     _sync_completed_ticket_integrated_sha(state, git, run_head)
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["default_head_sha"] = initial_default
     fixture_data.setdefault("delivery", {}).setdefault("published_branches", {})[
@@ -125,9 +127,14 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
                 ),
             }
 
-    class DriftAfterMergePublisher(FixtureGitHubPublisher):
-        def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
-            super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
+    class DriftAfterWritePublisher(FixtureGitHubPublisher):
+        drifted = False
+
+        def publish_branch(self, branch: str, head_sha: str, *, expected_remote_sha: str) -> Any:
+            result = super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
+            if self.drifted:
+                return result
+            self.drifted = True
             (repo / "default-after-merge.txt").write_text(
                 "advanced\n", encoding="utf-8"
             )
@@ -143,13 +150,14 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
             data = json.loads(fixture.read_text(encoding="utf-8"))
             data["default_head_sha"] = git.resolve("main")
             fixture.write_text(json.dumps(data), encoding="utf-8")
+            return result
 
     agents = ConflictThenFreshAgents()
-    first = RunAcceptanceEngine(
+    first = _LateMergeRepairEngine(
         git=git,
         states=states,
         agents=agents,
-        github=DriftAfterMergePublisher(fixture, git),
+        github=DriftAfterWritePublisher(fixture, git),
         default_head_sha=initial_default,
         currentness_reader=FixtureGitHubReader(fixture),
     ).accept(str(state["run_id"]))
@@ -169,23 +177,18 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     assert active_job["candidate_sha"] == integrated
     assert active_job["default_base_sha"] == latest_default
     assert active_job["repair_mode"] == "squash"
-    revalidation_merge = active_job["integrated_revalidation_merge"]
-    assert set(revalidation_merge) == {
-        "base_sha",
-        "default_base_sha",
-        "candidate_sha",
-        "publication_sha",
-    }
-    assert all(isinstance(sha, str) and sha for sha in revalidation_merge.values())
-    assert revalidation_merge["publication_sha"] == active_job["publication_sha"]
+    assert active_job["publication_sha"] == integrated
+    assert git.commit_parents(integrated) == [run_head, initial_default]
+    assert git.is_ancestor(run_head, integrated)
+    assert git.is_ancestor(initial_default, integrated)
+    assert "integrated_revalidation_merge" not in active_job
     assert active_run["repair_cycle"]["code_modification_attempts"] == 1
     assert repair_checkout.exists()
     assert len(agents.review_requests) == 1
 
-    if external_base_drift:
+    if external_run_branch_rewrite:
         data = json.loads(fixture.read_text(encoding="utf-8"))
-        pull = data["delivery"]["pull_requests"][0]
-        pull["base_branch"] = "main"
+        data["delivery"]["published_branches"][run_branch] = latest_default
         mutations = deepcopy(data["delivery"].get("mutations", []))
         fixture.write_text(json.dumps(data), encoding="utf-8")
         empty_agents = repo / "blocked-revalidation-agents.json"
@@ -203,12 +206,14 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         assert blocked.returncode == 2
         blocked_state = states.load_current_run(str(state["run_id"]))
         assert blocked_state is not None
-        assert blocked_state["status"] == "blocked"
+        assert blocked_state["status"] == "ready_for_human"
         assert blocked_state["diagnostics"][0]["code"] == (
-            "change_pr_base_changed_externally"
+            "integration_history_rewritten"
         )
         after = json.loads(fixture.read_text(encoding="utf-8"))
         assert after["delivery"].get("mutations", []) == mutations
+        assert after["delivery"]["published_branches"][run_branch] == latest_default
+        assert git.resolve(run_branch) == integrated
         assert len(agents.review_requests) == 1
         return
 
@@ -218,11 +223,11 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         # a fresh Cycle.
         active_job["modification_attempts"] = 9
         active_job["code_modification_attempts"] = 9
-        active_job["review_budget"]["development_attempts"] = 9
+        active_run["review_budget"]["development_attempts"] = 9
         active_run["repair_cycle"]["code_modification_attempts"] = 9
         active_run["modification_attempts"] = 9
         active_run["code_modification_attempts"] = 9
-        states.save_run(str(state["run_id"]), first)
+        persist_run_fixture(states, str(state["run_id"]), first)
 
     if latest_combination_has_finding:
         exhausted = RunAcceptanceEngine(

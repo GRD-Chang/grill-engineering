@@ -498,10 +498,6 @@ class GitHubAppProfileStore:
         )
 
 
-def load_github_app_profile() -> GitHubAppProfile | None:
-    return GitHubAppProfileStore().load()
-
-
 def _validate_private_key_signature(private_key_path: Path) -> None:
     """Validate App signing locally without contacting GitHub or storing a key."""
 

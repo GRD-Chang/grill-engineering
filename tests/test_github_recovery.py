@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import write_fixture
+from support.seeding import write_fixture
 from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
@@ -16,6 +16,9 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 from agent_run.models import Repository
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
+from agent_run.object_state import save_owned
+
+from support.state import run_refs
 
 
 def test_github_reader_retries_transient_timeout(
@@ -48,15 +51,15 @@ def test_github_command_capture_has_a_direct_byte_bound() -> None:
             "-c",
             (
                 "import sys; "
-                f"sys.stdout.write('x' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096)); "
-                f"sys.stderr.write('y' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096))"
+                f"sys.stdout.write('x' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096) + 'out-tail'); "
+                f"sys.stderr.write('y' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096) + 'err-tail')"
             ),
         ]
     )
 
     assert result.returncode == 0
-    assert len(result.stdout.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
-    assert len(result.stderr.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
+    assert result.stdout == "x" * (MAX_COMMAND_OUTPUT_BYTES - 8) + "out-tail"
+    assert result.stderr == "y" * (MAX_COMMAND_OUTPUT_BYTES - 8) + "err-tail"
 
 
 @pytest.mark.parametrize("stderr", ["permission denied", "unexpected response"])
@@ -124,7 +127,9 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
             }
         return {
             "state": "MERGED",
+            "headRefName": "agent-run-repair/run-1",
             "headRefOid": "head-sha",
+            "headRepository": {"nameWithOwner": "example/project"},
             "baseRefName": "agent-run/run-1",
             "baseRefOid": "integrated-sha",
             "mergeCommit": {"oid": "integrated-sha"},
@@ -135,6 +140,8 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
     live = reader.live_pull_request(12)
 
     assert live["integrated_sha"] == "integrated-sha"
+    assert live["head_branch"] == "agent-run-repair/run-1"
+    assert live["head_repository"] == live["base_repository"] == "example/project"
     assert live["head_tree"] == "head-sha-tree"
     assert live["integrated_tree"] == "integrated-sha-tree"
     assert live["integrated_parents"] == ["parent-a", "parent-b"]
@@ -242,7 +249,7 @@ def test_foreground_run_selection_reuses_one_unfinished_run(git_repo: Path) -> N
     assert not created_resumed
     assert reused_resumed
     assert reused["run_id"] == created["run_id"]
-    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+    assert len(run_refs(git_repo / '.agent-run')) == 1
 
 
 def test_foreground_run_reports_all_conflicting_run_ids(git_repo: Path) -> None:
@@ -273,7 +280,10 @@ def test_timeline_stops_appending_at_the_bounded_capacity(git_repo: Path) -> Non
 
     for number in range(MAX_TIMELINE_EVENTS + 10):
         state["status"] = f"state-{number}"
-        states.save_run("bounded", state)
+        if number == 0:
+            states.save_run("bounded", state)
+        else:
+            save_owned(states, "bounded", state, fields={"status"})
 
     stored = states.load_run("bounded")
     assert stored is not None

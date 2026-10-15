@@ -12,8 +12,8 @@ import pytest
 from agent_run import cli
 from agent_run.codex import CodexCliBackend
 from agent_run.executor_host import FakeExecutorHost
-from conftest import write_fixture
-from test_cli import load_only_run_state
+from support.seeding import write_fixture
+from support.cli import load_only_run_state
 
 
 @pytest.fixture
@@ -56,6 +56,13 @@ def recovery_cli(
         'agent_run.codex.time', SimpleNamespace(monotonic=time.monotonic, sleep=waits.append),
     )
     monkeypatch.setattr(cli, 'FakeExecutorHost', lambda **kwargs: FakeExecutorHost())
+    # 此 fixture 同步执行在 pytest 进程内，未启动实际 Executor 或 Worker。
+    # 只替换虚拟 Host 的退出证据边界；真实 PID/Worker 验证由生命周期用例覆盖。
+    def virtual_exit(executor: Any) -> None:
+        assert executor["status"] == "exited"
+        assert not executor.get("workers") and not executor.get("worker")
+
+    monkeypatch.setattr(cli, "validate_executor_exit", virtual_exit)
     monkeypatch.setattr(cli, 'CodexCliBackend', lambda **kwargs: CodexCliBackend(
         credential_provider=lambda: 'fixture-reader', **kwargs,
     ))
@@ -88,6 +95,7 @@ def test_manual_resume_preserves_spent_recovery_and_interrupted_json_step(recove
     assert failed_again['parent_job']['review_budget'] == budget
     assert failed_again['active_agent_invocation']['semantic_attempt']['attempt_id'] == attempt_id
     assert failed_again['active_agent_invocation']['ordinary_recovery_used'] is True
+    assert failed_again['active_agent_invocation']['predecessor_invocation_started_at'] == first['started_at']
     assert calls[2]['prompt'] == calls[3]['prompt'] == calls[4]['prompt']
     assert '只修正结果格式' in calls[4]['prompt']
     arguments = calls[4]['arguments']
@@ -102,6 +110,7 @@ def test_manual_resume_preserves_spent_recovery_and_interrupted_json_step(recove
     assert blocked['status'] == 'ready_for_human'
     assert blocked['diagnostics'][0]['code'] == 'agent_requires_human'
     assert blocked['active_agent_invocation']['status'] == 'completed'
+    assert blocked['active_agent_invocation']['predecessor_invocation_started_at'] == failed_again['active_agent_invocation']['started_at']
     assert blocked['parent_job']['review_budget'] == budget
 
 
@@ -120,6 +129,7 @@ def test_capacity_continuation_keeps_bounded_history_and_one_business_attempt(
     assert len(state['agent_invocation_history']) == 1
     active = state['active_agent_invocation']
     assert active['capacity_recovery_count'] == 6
+    assert active['predecessor_invocation_started_at'] is None
     assert active.get('machine_error') == machine_error
     assert active['ordinary_recovery_used'] is False
     assert active['status'] == 'completed'

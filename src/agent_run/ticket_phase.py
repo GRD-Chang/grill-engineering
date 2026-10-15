@@ -5,6 +5,10 @@ from typing import Any
 
 
 BLOCKED_MESSAGES = {
+    "ci_investigation_paused": "CI investigation produced no code changes; explicit resume is required",
+    "ticket_supervision_timeout": "Ticket external supervision timed out; explicit resume is required",
+    "ticket_execution_failed": "Ticket execution failed; explicit resume is required",
+    "ticket_paused": "Ticket was paused by the operator; explicit resume is required",
     "ticket_pr_closed_unmerged": "Current Ticket PR was closed without merging",
     "unexpected_external_merge": (
         "Ticket PR merged without a persisted Publisher merge intent"
@@ -23,6 +27,7 @@ BLOCKED_MESSAGES = {
         "Merged Ticket PR was integrated, but no longer matches "
         "the current revision"
     ),
+    "agent_requires_human": "Ticket requires explicit human intervention",
     "reviewer_requires_human": "Ticket requires explicit human intervention",
     "modification_budget_exhausted": (
         "Ticket requires explicit human intervention"
@@ -30,9 +35,17 @@ BLOCKED_MESSAGES = {
     "review_budget_exhausted": (
         "Ticket Review budget requires an explicit new window"
     ),
+    "ci_development_budget_exhausted": "Ticket CI Development allowance requires explicit resume",
     "ticket_close_external_conflict": (
         "Ticket close evidence conflicts with the Publisher intent"
     ),
+    "integration_development_exhausted": "Ticket integration Development allowance requires explicit resume",
+    "integration_resync_exhausted": "Ticket integration resync allowance requires explicit resume",
+    "integration_history_rewritten": "Remote branch history was rewritten; Ticket integration paused",
+    "integration_conflict_unresolved": "Ticket integration conflict requires intervention",
+    "integration_snapshot_changed_during_conflict": "Remote branches changed during conflict resolution",
+    "integration_record_invalid": "Ticket integration record is invalid",
+    "remote_source_missing": "Ticket source ref is missing",
 }
 
 
@@ -43,6 +56,7 @@ class TicketPhase(StrEnum):
     CANDIDATE = "candidate"
     REVIEWING = "reviewing"
     ACCEPTED = "accepted"
+    READY_FOR_INTEGRATION = "ready_for_integration"
     PUBLICATION_PENDING = "publication_pending"
     PUBLISHING = "publishing"
     WAITING_CHECKS = "waiting_checks"

@@ -10,15 +10,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import pytest
 
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
+
+from support.state import include_in_state_snapshot, read_run, run_refs, snapshot_run, write_run_fixture
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -445,7 +447,7 @@ def _file_tree(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in sorted(root.rglob("*"))
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
 
 
@@ -473,13 +475,85 @@ def _managed_state_snapshot(
     }
 
 
-def _install_a_and_b(source: Path, home: Path, fake_bin: Path) -> None:
-    for version in ("a", "b"):
-        (source / "src" / "agent_run" / "__init__.py").write_text(
-            f"__version__ = '{version}'\n", encoding="utf-8"
+@pytest.fixture(scope="session")
+def installed_a_and_b(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Callable[[Path, Path, Path], None]]:
+    """Copy a settled two-generation install into each independent test home."""
+    # Every xdist worker sees the same parent of its private basetemp. Build
+    # the immutable template once, then copy it into each worker's test home.
+    shared = "PYTEST_XDIST_WORKER" in os.environ
+    template_root = (
+        tmp_path_factory.getbasetemp().parent / "installer-a-b-shared"
+        if shared else tmp_path_factory.mktemp("installer-a-b")
+    )
+    template_home = template_root / "home"
+
+    def prepare_template() -> None:
+        template_root.mkdir(exist_ok=True)
+        template_source = _source_tree(template_root)
+        template_bin, template_count, _ = _fake_codex(template_root)
+        template_home.mkdir()
+        for version in ("a", "b"):
+            (template_source / "src" / "agent_run" / "__init__.py").write_text(
+                f"__version__ = '{version}'\n", encoding="utf-8"
+            )
+            result = _run(template_source, template_home, template_bin)
+            assert result.returncode == 0, result.stderr
+        assert template_count.read_text(encoding="utf-8") == "2"
+        shutil.rmtree(template_source)
+        (template_root / "ready").touch()
+
+    if shared:
+        with template_root.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not (template_root / "ready").exists():
+                if template_root.exists():
+                    shutil.rmtree(template_root)
+                try:
+                    prepare_template()
+                except BaseException:
+                    shutil.rmtree(template_root, ignore_errors=True)
+                    raise
+    else:
+        prepare_template()
+
+    def install(source: Path, home: Path, fake_bin: Path) -> None:
+        assert source.parent == home.parent == fake_bin.parent
+        assert not any(home.iterdir())
+        shutil.copytree(
+            template_home, home, dirs_exist_ok=True, symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
-        result = _run(source, home, fake_bin)
-        assert result.returncode == 0, result.stderr
+        old_root = str(template_root).encode()
+        new_root = str(home.parent).encode()
+        for path in home.rglob("*"):
+            if path.is_symlink():
+                target = os.readlink(path)
+                if target.startswith(str(template_root)):
+                    path.unlink()
+                    path.symlink_to(str(home.parent) + target[len(str(template_root)):])
+            elif path.is_file() and path.name in {
+                "pyvenv.cfg", "agent-run", "activate", "activate.csh", "activate.fish",
+            }:
+                contents = path.read_bytes()
+                if old_root in contents:
+                    path.write_bytes(contents.replace(old_root, new_root))
+        assert _active_snapshot(home).is_dir()
+        assert (_data_root(home) / "active" / "previous").resolve().is_dir()
+        assert (home / ".local" / "bin" / "agent-run").resolve() == (
+            _active_snapshot(home) / "bin" / "agent-run"
+        )
+        (source / "src" / "agent_run" / "__init__.py").write_text(
+            "__version__ = 'b'\n", encoding="utf-8"
+        )
+        (fake_bin.parent / "codex-count").write_text("2", encoding="utf-8")
+
+    try:
+        yield install
+    finally:
+        if not shared:
+            shutil.rmtree(template_root)
 
 
 def _write_public_state_fixtures(tmp_path: Path, home: Path) -> tuple[Path, Path, Path]:
@@ -749,6 +823,22 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
         encoding="utf-8",
     )
     codex.chmod(0o755)
+    # This test exercises cleanup of an already running nested process.
+    # Start its short timeout only after that process signals readiness;
+    # Python startup under parallel load is not the boundary under test.
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "            output, error_output = _read_candidate_probe_output(",
+            "            import time\n"
+            "            ready_deadline = time.monotonic() + 5\n"
+            f"            while not Path({str(pid_file)!r}).is_file():\n"
+            "                if time.monotonic() >= ready_deadline:\n"
+            "                    raise AssertionError('nested probe was not ready')\n"
+            "                time.sleep(0.01)\n"
+            "            output, error_output = _read_candidate_probe_output(",
+        ),
+        encoding="utf-8",
+    )
     probe_tmp = tmp_path / "probe-tmp"
     probe_tmp.mkdir()
     monkeypatch.setenv("TMPDIR", str(probe_tmp))
@@ -1015,13 +1105,13 @@ def test_install_rejects_managed_paths_inside_source_without_writing_source(
     ],
 )
 def test_public_install_failures_preserve_existing_state(
-    tmp_path: Path, failure: str
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None], failure: str
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1103,13 +1193,14 @@ def _write_activation_fault_sitecustomize(
 
 @pytest.mark.parametrize("fault", ["rename", "sync"])
 def test_public_activation_faults_preserve_existing_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    installed_a_and_b: Callable[[Path, Path, Path], None], fault: str,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1134,13 +1225,14 @@ def test_public_activation_faults_preserve_existing_state(
 
 @pytest.mark.parametrize("termination_signal", [signal.SIGINT, signal.SIGTERM])
 def test_public_signal_cleans_candidate_probe_process_and_state(
-    tmp_path: Path, termination_signal: signal.Signals
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
+    termination_signal: signal.Signals,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1150,7 +1242,7 @@ def test_public_signal_cleans_candidate_probe_process_and_state(
     )
     (tmp_path / "codex-behavior").write_text("sleep", encoding="utf-8")
     pid_file = tmp_path / "codex-pid"
-    pid_file.unlink()
+    pid_file.unlink(missing_ok=True)
     environment = os.environ.copy()
     environment.update(
         {
@@ -1186,13 +1278,13 @@ def test_public_signal_cleans_candidate_probe_process_and_state(
 
 
 def test_public_signal_during_post_activation_cleanup_keeps_new_generation_complete(
-    tmp_path: Path,
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1244,13 +1336,13 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
 
 
 def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
-    tmp_path: Path,
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1531,7 +1623,7 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
 
 def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    offline_install_environment: dict[str, str],
+    offline_install_environment: dict[str, str], capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = _source_tree(tmp_path, real_install=True)
     source = source.rename(tmp_path / "源码 archive with spaces")
@@ -1556,7 +1648,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     monkeypatch.setenv("TMPDIR", str(probe_tmp))
     shell = tool_directory / "bash"
     git = str(tool_directory / "git")
-    # The two real builds also cover source cleanliness and exact provenance;
+    # The real build covers source cleanliness and exact provenance;
     # a separate initial installation would repeat the same expensive boundary.
     for arguments in (
         ["init", "-q", "-b", "main"],
@@ -1620,30 +1712,49 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
                 env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
             )
             assert configured.returncode == 0, configured.stdout + configured.stderr
-            for body, role, context in (
+            requests = (
                 ("development", "development", {}),
                 ("repair", "development", {
                     "repair_source": "acceptance", "acceptance_artifact": {"verdict": "reject"},
                 }),
                 ("acceptance", "review", {}),
                 ("publishing", "publication", {"acceptance_artifact": {"verdict": "accept"}}),
+            )
+            # Keep all eight installed-resource previews, but load the real
+            # installed interpreter once per language instead of four times.
+            preview_batch = subprocess.run(
+                [
+                    str(_active_snapshot(home) / "bin" / "python"), "-c",
+                    "import contextlib, io, json, pathlib, sys\n"
+                    "from agent_run.cli import main\n"
+                    "request = pathlib.Path(sys.argv[1])\n"
+                    "results = []\n"
+                    "for body, role, context in json.loads(sys.argv[2]):\n"
+                    "    request.write_text(json.dumps({'acceptance_scope': 'parent_only', **context}))\n"
+                    "    out, err = io.StringIO(), io.StringIO()\n"
+                    "    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):\n"
+                    "        code = main(['prompts', 'preview', '--role', role, '--request', str(request)])\n"
+                    "    results.append((body, code, out.getvalue(), err.getvalue()))\n"
+                    "print(json.dumps(results))\n",
+                    str(request_path), json.dumps(requests),
+                ],
+                env=isolated_environment, cwd=tmp_path, capture_output=True,
+                text=True, timeout=60,
+            )
+            assert preview_batch.returncode == 0, preview_batch.stdout + preview_batch.stderr
+            previews = json.loads(preview_batch.stdout)
+            assert len(previews) == len(requests)
+            for (body, _role, _context), (returned_body, code, output, error) in zip(
+                requests, previews, strict=True
             ):
-                request_path.write_text(json.dumps({
-                    "acceptance_scope": "parent_only", **context,
-                }), encoding="utf-8")
-                preview = subprocess.run(
-                    [str(stable_entry), "prompts", "preview", "--role", role,
-                     "--request", str(request_path)],
-                    env=isolated_environment, cwd=tmp_path, capture_output=True,
-                    text=True, timeout=15,
-                )
-                assert preview.returncode == 0, preview.stdout + preview.stderr
+                assert returned_body == body
+                assert code == 0, output + error
                 builtin = (package / f"resources/{language}/methods/{body}.md").read_text(
                     encoding="utf-8",
                 ).strip()
-                assert builtin and builtin in preview.stdout
+                assert builtin and builtin in output
                 language_instruction = "Use English" if language == "en" else "中文"
-                assert language_instruction in preview.stdout
+                assert language_instruction in output
     finally:
         hidden_resources.rename(source_resources)
 
@@ -1749,17 +1860,19 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     managed_root = _data_root(home) / "repositories" / "example" / "project"
     target_state_before_uninstall = _file_tree(managed_root)
     assert target_state_before_uninstall
-    assert list((managed_root / "state" / "runs").glob("*.json"))
+    assert run_refs(managed_root / 'state')
 
     count_before_repeat = int(count.read_text(encoding="utf-8"))
-    repeated = _run(
-        source,
-        home,
-        fake_bin,
-        path=isolated_path,
-        environment=isolated_environment,
-    )
-    assert repeated.returncode == 0, repeated.stderr
+    # The public setup above already built and installed the real wheel.
+    # Rebuild only the identical package tree to exercise idempotent activation.
+    with monkeypatch.context() as repeat_environment:
+        for name, value in isolated_environment.items():
+            repeat_environment.setenv(name, value)
+        repeat_environment.setattr(
+            runner_installer, "_build_candidate", fast_build_candidate
+        )
+        assert runner_installer.main(["--source", str(source)]) == 0
+    assert json.loads(capsys.readouterr().out)["idempotent"] is True
     _assert_process_gone(tmp_path / "codex-descendant-pid")
     assert int(count.read_text(encoding="utf-8")) == count_before_repeat
     assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
@@ -1770,10 +1883,24 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert profile.count("# <<< agent-run managed PATH <<<") == 1
     assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
 
-    # Reuse this isolated real build boundary for archive update, failed build
-    # preservation and rollback. Other lifecycle combinations stay lightweight.
+    # The real offline build above verifies the installed wheel and resources.
+    # The archive update, failed build and rollback exercise the same installer
+    # transaction with the fast build seam used by the lifecycle tests.
     first_snapshot = _active_snapshot(home)
     shutil.rmtree(source / ".git")
+    shutil.copy2(
+        PROJECT_ROOT / "tests/support/fast_runner_installer.py",
+        source / "fast_runner_installer.py",
+    )
+    (source / "install.sh").write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n'
+        'exec python3 "$SOURCE_DIR/fast_runner_installer.py" "$@" '
+        '--source "$SOURCE_DIR"\n',
+        encoding="utf-8",
+    )
+    (source / "install.sh").chmod(0o755)
     version_file = source / "src/agent_run/__init__.py"
     version_file.write_text(version_file.read_text() + "\n# archive update\n")
     updated = _run(source, home, fake_bin, cwd=tmp_path,
@@ -1783,9 +1910,8 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert second_snapshot != first_snapshot
     assert _manifest(second_snapshot)["source_provenance"] == {"kind": "source-directory"}
     assert (_data_root(home) / "active/previous").resolve() == first_snapshot
-    build_config = source / "pyproject.toml"
-    original_config = build_config.read_text()
-    build_config.write_text(original_config.replace("setuptools.build_meta", "missing_backend"))
+    failure_marker = source / ".agent-run-test-build-failure"
+    failure_marker.touch()
     failed = _run(source, home, fake_bin, cwd=tmp_path,
                   path=isolated_path, environment=isolated_environment)
     assert failed.returncode == 1, failed.stdout + failed.stderr
@@ -1795,7 +1921,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     still_usable = subprocess.run([str(stable_entry), "--help"], cwd=tmp_path,
                                  env=isolated_environment, capture_output=True, timeout=15)
     assert still_usable.returncode == 0
-    build_config.write_text(original_config)
+    failure_marker.unlink()
     rolled_back = _run(source, home, fake_bin, "--rollback", cwd=tmp_path,
                       path=isolated_path, environment=isolated_environment)
     assert rolled_back.returncode == 0, rolled_back.stderr
@@ -2645,7 +2771,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     started_output = json.loads(started.stdout)
     run_id = started_output["run_id"]
     state_root = _data_root(home) / "repositories" / "example" / "project" / "state"
-    state_path = state_root / "runs" / f"{run_id}.json"
+    state_ref = (state_root, str(run_id))
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'second'\n", encoding="utf-8"
@@ -2678,20 +2804,20 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     rollback_output = json.loads(continued_after_rollback.stdout)
     assert rollback_output["run_id"] == run_id
 
-    incompatible = json.loads(state_path.read_text(encoding="utf-8"))
+    incompatible = read_run(state_ref)
     incompatible["schema_version"] = 1
-    state_path.write_text(json.dumps(incompatible), encoding="utf-8")
-    before = state_path.read_bytes()
+    write_run_fixture(state_ref, incompatible)
+    before = snapshot_run(state_ref)
     locator_path = _data_root(home) / "run-locator.json"
     locator_before = locator_path.read_bytes()
     target_files_before = {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     }
     target_paths_before = sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     )
     rejected = subprocess.run(
         [
@@ -2710,16 +2836,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected.returncode == 2
     assert json.loads(rejected.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
@@ -2737,16 +2863,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_install.returncode == 2
     assert json.loads(rejected_after_install.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
     rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
@@ -2761,16 +2887,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_rollback.returncode == 2
     assert json.loads(rejected_after_rollback.stdout)["status"] == "incompatible_run_state"
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
         for path in (state_root).rglob("*")
-        if path.is_file()
+        if path.is_file() and include_in_state_snapshot(path)
     } == target_files_before
     assert sorted(
         path.relative_to(state_root)
-        for path in (state_root).rglob("*")
+        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
     ) == target_paths_before
 
 

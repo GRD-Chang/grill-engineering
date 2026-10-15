@@ -8,7 +8,7 @@ import selectors
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -100,6 +100,9 @@ def send(
     card: Mapping[str, Any],
     idempotency_key: str,
     cancel_event: Event,
+    *,
+    timeout_seconds: float = SEND_TIMEOUT_SECONDS,
+    is_current: Callable[[], bool] | None = None,
 ) -> SendResult:
     """Send once, including identity validation, within a ten-second deadline.
 
@@ -117,7 +120,7 @@ def send(
     assert isinstance(profile, str) and isinstance(open_id, str) and isinstance(app_id, str)
     if not open_id.startswith("ou_") or not idempotency_key or len(idempotency_key) > 50:
         return _result("failed", "通知接收人或幂等标识无效")
-    deadline = time.monotonic() + SEND_TIMEOUT_SECONDS
+    deadline = time.monotonic() + min(SEND_TIMEOUT_SECONDS, max(0.0, timeout_seconds))
     identity = _run(
         ["lark-cli", "--profile", profile, "whoami", "--as", "bot"],
         deadline, cancel_event,
@@ -131,6 +134,8 @@ def send(
         return _result("failed", "CLI 机器人身份不可用，请检查该 profile 的凭据")
     if cancel_event.is_set():
         return _result("failed", "通知发送前已取消")
+    if is_current is not None and not is_current():
+        return _result("failed", "通知已不再适用于当前执行会话")
     result = _run(
         [
             "lark-cli", "--profile", profile, "im", "+messages-send", "--as", "bot",

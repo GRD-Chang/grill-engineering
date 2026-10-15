@@ -16,7 +16,11 @@ from agent_run.run_lifecycle import (
 )
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import seed_run, write_fixture
+from agent_run.object_state import save_owned
+from support.seeding import seed_run, write_fixture
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("action_completed", [True, False])
@@ -51,7 +55,7 @@ def test_attach_preserves_executor_completion_at_host_inspection(
     control.bind_run(task, action_id, run_id)
     state["status"] = initial_status
     prepare_action_application_receipt(state, claim.action)
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control.record_application(task, action_id=action_id, run_id=run_id,
                                payload_digest=claim.action["payload_digest"])
     reservation = control.begin_executor(task, action_id=action_id, run_id=run_id)
@@ -76,13 +80,13 @@ def test_attach_preserves_executor_completion_at_host_inspection(
                 "completed" if final_status == "completed" else
                 None if final_status == "parent_delivery_pending" else "waiting_human"
             )
-            states.save_run(run_id, latest)
+            save_owned(states, run_id, latest, fields={'status', 'terminal_kind'})
             if close_action:
                 control.finish_executor(task, action_id=action_id, generation=reservation.generation,
                                         result_status=final_status)
             else:
                 control.mark_executor_absent(task, action_id=action_id, generation=reservation.generation)
-            final_bytes.append((states.root / "runs" / f"{run_id}.json").read_bytes())
+            final_bytes.append(snapshot_run((states.root, str(run_id))))
         except BaseException as error:
             errors.append(error)
         finally:
@@ -122,15 +126,15 @@ def test_attach_preserves_executor_completion_at_host_inspection(
         assert receipt.status == "completed"
     assert receipt.action_id == action_id and receipt.executor_generation == 1
     if not abnormal_exit:
-        assert (states.root / "runs" / f"{run_id}.json").read_bytes() == final_bytes[0]
+        assert snapshot_run((states.root, str(run_id))) == final_bytes[0]
     else:
         assert result["diagnostics"][0]["code"] == "session_interrupted"
-        persisted = (states.root / "runs" / f"{run_id}.json").read_bytes()
+        persisted = snapshot_run((states.root, str(run_id)))
         again, _, again_receipt = lifecycle.submit(
             LifecycleRequest(task=task, kind="run", payload={"parent": 1}))
         assert again["status"] == "execution_failed"
         assert again_receipt.executor_generation == 1
-        assert (states.root / "runs" / f"{run_id}.json").read_bytes() == persisted
+        assert snapshot_run((states.root, str(run_id))) == persisted
     assert host.start_count == 0
     record = control.load(task)
     assert record is not None and record["next_generation"] == 2

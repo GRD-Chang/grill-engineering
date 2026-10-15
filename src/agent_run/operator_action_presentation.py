@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from agent_run.messages import display_text
-
-from datetime import datetime
+from collections.abc import Mapping
+from dataclasses import asdict
 from itertools import chain
 from typing import Any
 
-from agent_run.guidance_actions import action_command
-from agent_run.messages import text
-from agent_run.operator_gate import (
-    operator_gate_evidence,
-    operator_gate_subjects,
-)
+from agent_run.delivery_facts import current_delivery_identity, delivery_object_label
+from agent_run.execution_timing import aggregate_invocation_timing
+from agent_run.guidance_actions import next_action_fact, render_next_action
+from agent_run.history_facts import history_records
+from agent_run.messages import display_text, selected_language
+from agent_run.operator_action_facts import operator_action_facts
 from agent_run.presentation_helpers import (
-    delivery_object_label,
+    execution_duration,
     human_agent_role,
     human_delivery_object,
     human_next_action,
@@ -23,74 +22,44 @@ from agent_run.presentation_helpers import (
 )
 
 
-def operator_action_view(
-    state: dict[str, Any],
-    *,
-    current_identity: dict[str, object],
-    fallback_next_action: str,
-    language: str = "zh",
-    human: bool = False,
-) -> dict[str, Any] | None:
-    """Project one canonical Run-wide gate for public CLI consumers."""
+def operator_action_views(
+    state: dict[str, Any], *, language: str = "zh", human: bool = False,
+) -> list[dict[str, Any]]:
+    """Render every independent action from the shared read-only facts."""
+    current_identity = current_delivery_identity(state)
+    actions: list[dict[str, Any]] = []
+    for fact in operator_action_facts(state):
+        location, subject = fact["location"], fact["subject"]
+        actions.append({
+            **{key: value for key, value in fact.items() if key not in {"subject", "action"}},
+            "action": asdict(fact["action"]),
+            "type": _operator_action_label(fact["action_kind"]),
+            "run_paused": fact["scope"] == "global",
+            "object": delivery_object_label(
+                state, location, ticket_number=subject.get("ticket_number"),
+                include_parent_for_run=True,
+            ),
+            "trigger_invocation": (
+                _triggering_invocation(state, location, work_subject=fact["work_subject"], generation=fact["generation"])
+                if fact["action_kind"] == "human_blocker" else None
+            ),
+            "preserved": _preserved_results(subject, {} if location.startswith("ticket:") else current_identity),
+            "next_action": render_next_action(
+                fact["action"], state, language=language,
+                human=human or (fact["action"].kind == "command" and fact["action_kind"] not in {
+                    "abandonment_recovery", "requeue_required",
+                }),
+            ),
+        })
+    return actions
 
-    subjects = operator_gate_subjects(state)
-    if not subjects:
-        return None
-    location, subject = subjects[0] if len(subjects) == 1 else ("run", state)
-    evidence = operator_gate_evidence(state)
-    reason = (
-        evidence["reason"]
-        if evidence is not None and len(subjects) == 1
-        else subject.get("blocked_reason") or _diagnostic_code(state)
-    )
-    blockers = subject.get("human_blockers")
-    is_human_blocker = (
-        state.get("status") != "abandonment_pending"
-        and reason in {"agent_requires_human", "reviewer_requires_human"}
-        and isinstance(blockers, list)
-        and all(isinstance(item, str) for item in blockers)
-    )
-    action_kind = (
-        evidence["action_kind"]
-        if evidence is not None and len(subjects) == 1 and not is_human_blocker
-        else _operator_action_kind(state, reason, is_human_blocker)
-    )
-    phase = (
-        subject.get("human_blocker_phase")
-        if is_human_blocker
-        else (
-            evidence["phase"]
-            if evidence is not None and len(subjects) == 1
-            else subject.get("phase", state.get("status"))
-        )
-    )
-    reasons = (
-        [str(blocker) for blocker in blockers]
-        if is_human_blocker and isinstance(blockers, list)
-        else _operator_reasons(state, reason)
-    )
-    return {
-        "type": _operator_action_label(action_kind),
-        "object": delivery_object_label(
-            state,
-            location,
-            ticket_number=subject.get("ticket_number"),
-            include_parent_for_run=True,
-        ),
-        "phase": phase,
-        "reasons": reasons,
-        "trigger_invocation": (
-            _triggering_invocation(state, location) if is_human_blocker else None
-        ),
-        "preserved": _preserved_results(subject, current_identity),
-        "next_action": _operator_next_action(
-            state,
-            action_kind,
-            reason,
-            fallback_next_action=fallback_next_action,
-            language=language, human=human,
-        ),
-    }
+
+def operator_action_items(audit: dict[str, Any]) -> list[dict[str, Any]]:
+    actions = audit.get("operator_actions")
+    if isinstance(actions, list):
+        return [action for action in actions if isinstance(action, dict)]
+    action = audit.get("operator_action")
+    return [action] if isinstance(action, dict) else []
 
 
 def print_operator_action(
@@ -106,16 +75,42 @@ def print_operator_action(
     invocation = action.get("trigger_invocation")
     if isinstance(invocation, dict):
         print(
-            display_text('presentation.status.agent_that_triggered_the_blocker_v1_model_v3_reasoning_effort_v5_', v1=terminal_safe(_human_agent_role(invocation['role'])), v3=terminal_safe(invocation['model']), v5=terminal_safe(invocation['reasoning_effort']), v7=terminal_safe(invocation['duration_seconds']))
+            f"{display_text('presentation.status.agent_that_triggered_the_blocker')}: "
+            f"{human_trigger_invocation(invocation)}"
         )
     print(
         display_text('presentation.status.preserved_work_v1', v1=terminal_safe(human_preserved_results(action['preserved'])))
     )
-    print(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue'))
+    if action.get("run_paused", True):
+        print(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue'))
+    else:
+        print(display_text('presentation.status.local_operator_gate'))
     if action["type"] == "Review Budget Checkpoint":
         print(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t'))
     print(
         display_text('presentation.status.next_step_v1_36', v1=terminal_safe(human_next_action(action['next_action'], run_id=run_id)))
+    )
+
+
+def human_trigger_invocation(invocation: dict[str, Any]) -> str:
+    duration = invocation.get("duration_seconds")
+    if duration is not None and invocation.get("execution_timing_complete") is not False:
+        timing = display_text(
+            'presentation.status.blocker_round_duration', duration=execution_duration(duration)
+        )
+    else:
+        timing = display_text('presentation.status.timing_incomplete')
+        recorded = invocation.get("recorded_execution_seconds")
+        if recorded is not None:
+            timing += " · " + display_text(
+                'presentation.status.recorded_execution_time', v1=execution_duration(recorded)
+            )
+    return display_text(
+        'presentation.status.blocker_agent_summary',
+        role=terminal_safe(_human_agent_role(invocation.get("role"))),
+        model=terminal_safe(invocation.get("model")),
+        effort=terminal_safe(invocation.get("reasoning_effort")),
+        timing=timing,
     )
 
 
@@ -154,35 +149,6 @@ def human_preserved_results(value: object) -> str:
     return "；".join(parts)
 
 
-def _operator_action_kind(
-    state: dict[str, Any], reason: object, is_human_blocker: bool
-) -> str:
-    if is_human_blocker:
-        return "human_blocker"
-    if reason in {"modification_budget_exhausted", "review_budget_exhausted"}:
-        return "review_budget_checkpoint"
-    if reason in {
-        "acceptance_record_mismatch",
-        "candidate_or_acceptance_inconsistent",
-        "merged_result_mismatch",
-        "published_head_mismatch",
-        "unexpected_external_merge",
-    }:
-        return "deterministic_contradiction"
-    return {
-        "execution_failed": "execution_failure",
-        "deterministic_contradiction": "deterministic_contradiction",
-        "unsupported_scope_change": "deterministic_contradiction",
-        "supervision_timeout": "supervision_timeout",
-        "operator_stopped": "operator_stopped",
-        "requeue_required": "requeue_required",
-        "run_approval_pending": "final_approval",
-        "parent_approval_pending": "final_approval",
-        "publication_pending": "publication_retry_exhausted",
-        "abandonment_pending": "abandonment_recovery",
-    }.get(str(state.get("status")), "operator_action")
-
-
 def _operator_action_label(kind: str) -> str:
     return {
         "human_blocker": "Human Blocker",
@@ -198,44 +164,14 @@ def _operator_action_label(kind: str) -> str:
     }.get(kind, "Operator Action")
 
 
-def _operator_reasons(state: dict[str, Any], reason: object) -> list[str]:
-    diagnostics = state.get("diagnostics")
-    messages = (
-        [
-            str(item["message"])
-            for item in diagnostics
-            if isinstance(item, dict) and item.get("message")
-        ]
-        if isinstance(diagnostics, list)
-        else []
-    )
-    if messages:
-        return messages
-    if state.get("status") == "abandonment_pending":
-        return ["Run abandonment recovery is incomplete."]
-    return [str(reason or state.get("status"))]
-
-
-def _diagnostic_code(state: dict[str, Any]) -> str | None:
-    diagnostics = state.get("diagnostics")
-    if not isinstance(diagnostics, list) or len(diagnostics) != 1:
-        return None
-    diagnostic = diagnostics[0]
-    code = diagnostic.get("code") if isinstance(diagnostic, dict) else None
-    return code if isinstance(code, str) and code else None
-
-
 def _triggering_invocation(
-    state: dict[str, Any], location: str
+    state: dict[str, Any], location: str, *, work_subject: str, generation: object = None
 ) -> dict[str, Any] | None:
-    run_id = state.get("run_id")
-    expected_subject = {
-        "parent": f"parent-only:{run_id}",
-        "run_acceptance": f"run-acceptance:{run_id}",
-        "run_repair": f"run-repair:{run_id}",
-        "run_publication": f"run-publication:{run_id}",
-    }.get(location, location if location.startswith("ticket:") else None)
+    expected_subject = work_subject
     active = state.get("active_agent_invocation")
+    invocations = state.get("ticket_agent_invocations")
+    if location.startswith("ticket:") and isinstance(invocations, dict):
+        active = invocations.get(location.removeprefix("ticket:"), active)
     history = state.get("agent_invocation_history")
     history_candidates = (
         (item for item in reversed(history) if isinstance(item, dict))
@@ -253,32 +189,29 @@ def _triggering_invocation(
             and invocation.get("work_subject") != expected_subject
         ):
             continue
+        if generation is not None and invocation.get("generation") != generation:
+            continue
         semantic_attempt = invocation.get("semantic_attempt")
         role = (
             semantic_attempt.get("role")
             if isinstance(semantic_attempt, dict)
             else invocation.get("role")
         )
+        attempt_id = semantic_attempt.get("attempt_id") if isinstance(semantic_attempt, dict) else None
+        records = history_records(state, {"agent_invocations": history})
+        timing = next(
+            (record for record in records if attempt_id and record.get("attempt_id") == attempt_id),
+            aggregate_invocation_timing([invocation], complete=False),
+        )
         return {
             "role": role or "unknown",
             "model": invocation.get("model") or display_text("presentation.status.unbound"),
             "reasoning_effort": invocation.get("reasoning_effort") or display_text("presentation.status.unbound"),
-            "duration_seconds": _invocation_duration_seconds(invocation),
+            "duration_seconds": timing.get("execution_seconds"),
+            "execution_timing_complete": timing["execution_timing_complete"],
+            "recorded_execution_seconds": timing.get("recorded_execution_seconds"),
         }
     return None
-
-
-def _invocation_duration_seconds(invocation: dict[str, Any]) -> int | None:
-    started_at = invocation.get("started_at")
-    ended_at = invocation.get("ended_at")
-    if not isinstance(started_at, str) or not isinstance(ended_at, str):
-        return None
-    try:
-        started = datetime.fromisoformat(started_at)
-        ended = datetime.fromisoformat(ended_at)
-    except ValueError:
-        return None
-    return max(0, int((ended - started).total_seconds()))
 
 
 def _preserved_results(
@@ -299,50 +232,14 @@ def _preserved_results(
     return "；".join(results) if results else "当前状态与已有审计证据"
 
 
-def _operator_next_action(
-    state: dict[str, Any],
-    action_kind: str,
-    reason: object,
-    *,
-    fallback_next_action: str,
-    language: str = "zh",
-    human: bool = False,
-) -> str:
-    repository = state.get("repository")
-    parent = state.get("parent")
-    parent_number = parent.get("number") if isinstance(parent, dict) else None
-    if action_kind in {
-        "human_blocker",
-        "review_budget_checkpoint",
-        "execution_failure",
-        "supervision_timeout",
-        "operator_stopped",
-    } and isinstance(repository, str) and isinstance(parent_number, int):
-        return f"agent-run resume {parent_number} --repo {repository}"
-    if (
-        action_kind == "final_approval"
-        and isinstance(repository, str)
-        and isinstance(parent_number, int)
-    ):
-        return f"agent-run approve {parent_number} --repo {repository}"
-    if action_kind == "deterministic_contradiction":
-        run_id = state.get("run_id")
-        if state.get("status") == "unsupported_scope_change":
-            return fallback_next_action
-        if reason in {
-            "candidate_or_acceptance_inconsistent",
-            "foreign_run_pr",
-        }:
-            if isinstance(repository, str) and isinstance(parent_number, int):
-                return f"agent-run abandon {parent_number} --repo {repository}"
-            if isinstance(run_id, str):
-                return action_command(state, "abandon", run_id, human=human)
-        if isinstance(repository, str) and isinstance(parent_number, int):
-            key = "guidance.action.external_contradiction"
-            if human:
-                key += ".human"
-            return text(
-                key, language=language,
-                run=f"agent-run run {parent_number} --repo {repository}",
-            )
-    return fallback_next_action
+def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:
+    """Render the shared recovery decision using the public Parent selector."""
+    public_state = state if isinstance(state, dict) else dict(state)
+    language = selected_language(public_state) if language is None else language
+    fallback = render_next_action(
+        next_action_fact(public_state), public_state, language=language, human=True,
+    )
+    actions = operator_action_views(
+        public_state, language=language, human=True,
+    )
+    return "\n".join(dict.fromkeys(action["next_action"] for action in actions)) if actions else fallback

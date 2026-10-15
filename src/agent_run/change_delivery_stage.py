@@ -24,6 +24,14 @@ class ChangeDeliveryStage(Protocol):
     adapter: ChangeDeliveryAdapter
     publisher: ChangeDeliveryPublisher
 
+    def _ticket_stop_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
+
+    def _pause_ticket_if_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
+
+    def require_agent_work(self, role: str) -> None: ...
+
+    def release_agent_work(self) -> None: ...
+
     def save(self, state: dict[str, Any]) -> dict[str, Any]: ...
 
     def commit_required_checks_observation(
@@ -67,17 +75,6 @@ class ChangeDeliveryStage(Protocol):
 
     def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]: ...
 
-    def _invocation_events(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        request: dict[str, Any],
-        *,
-        role: str = "publication",
-        phase: str,
-        semantic_attempt: dict[str, Any],
-    ) -> Callable[..., None]: ...
-
     def _wait_for_initial_credential(
         self,
         state: dict[str, Any],
@@ -113,11 +110,11 @@ class ChangeDeliveryStage(Protocol):
         self, state: dict[str, Any], job: dict[str, Any], error: Exception
     ) -> bool: ...
 
-    def modification_budget_exhausted(self, job: dict[str, Any]) -> bool: ...
+    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
 
     def review_budget_policy(self) -> ReviewBudgetPolicy: ...
 
-    def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool: ...
+    def review_budget_exhausted_for_review(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
 
     def _checkpoint_budget(
         self,
@@ -128,7 +125,5 @@ class ChangeDeliveryStage(Protocol):
     ) -> None: ...
 
     def mark_development_attempt(
-        self, job: dict[str, Any], *, attempt_kind: str
+        self, state: dict[str, Any], job: dict[str, Any], *, attempt_kind: str
     ) -> int: ...
-
-    def mark_review_invocation(self, job: dict[str, Any]) -> int: ...

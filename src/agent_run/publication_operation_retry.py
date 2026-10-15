@@ -3,10 +3,24 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 
 MAX_PUBLICATION_OPERATION_ATTEMPTS = 5
+_RELATED_ATTEMPTS: ContextVar[Mapping[int, dict[str, Any]]] = ContextVar("related_publication_attempts", default={})
+
+
+@contextmanager
+def scoped_publication_attempts(owners: Mapping[int, dict[str, Any]]) -> Iterator[None]:
+    """Expose proved related records only during one work contract check."""
+    token = _RELATED_ATTEMPTS.set(owners)
+    try:
+        yield
+    finally:
+        _RELATED_ATTEMPTS.reset(token)
 
 
 def require_publication_operation_retry(
@@ -71,6 +85,12 @@ def publication_operation_attempt(
     if isinstance(pending, dict) and pending.get("role") == "publication":
         return pending
     current_ordinal = owner.get("publication_attempts")
+    related = _RELATED_ATTEMPTS.get().get(id(owner))
+    if related is not None and "semantic_attempt_history" not in owner:
+        if (related.get("role") == "publication" and related.get("status") == "completed"
+                and related.get("ordinal") == current_ordinal):
+            return related
+        return None
     history = owner.get("semantic_attempt_history")
     if isinstance(history, list):
         for attempt in reversed(history):

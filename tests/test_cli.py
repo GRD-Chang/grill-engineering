@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.cli import PROJECT_ROOT, failed_invocation, issue, load_only_run_state, run_cli, stdout_json
+from support.run_artifacts import _canonical_run_budget
+
 import json
 import os
 import shutil
@@ -16,39 +19,28 @@ import pytest
 import agent_run.cli as cli
 import agent_run.doctor as doctor
 from agent_run.agent_invocation import invocation_event_recorder
-from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
-from agent_run.codex import CodexProcessError
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_history import history_records
-from agent_run.delivery_status import _status_style, invocation_execution_seconds
+from agent_run.delivery_status import _status_style
+from agent_run.execution_timing import invocation_execution_seconds
 from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
+from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.operator_action_presentation import print_operator_action
 from agent_run.presentation_helpers import human_next_action
 from agent_run.requeue import RequeueError
-from agent_run.run_driver import DirectRunOperations, RunStep
-from agent_run.semantic_attempt import canonical_fingerprint
-from agent_run.state import FaultInjectingStateStore, StateStore
-from agent_run.worker_sandbox import WorkerSandboxError
-from conftest import seed_run, write_fixture
+from agent_run.object_state import save_owned
+from agent_run.state import StateStore
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state, managed_workspace, prepare_workspace
 
+from support.state import has_run, only_run_ref, read_run, run_refs, run_state_text, snapshot_run, write_run_fixture
 
-PROJECT_ROOT = Path(__file__).parents[1]
+
 _DOCTOR_TIMEOUT_TEST_LIMIT_SECONDS = 5
-
-
-def _canonical_run_budget() -> dict[str, object]:
-    return {
-        "window": 1,
-        "development_attempts": 0,
-        "reviewer_invocations": 0,
-        "final_ci_fix_used": False,
-        "review_artifacts": [],
-        "checkpoint_reason": None,
-    }
 
 
 def test_lifecycle_help_describes_operator_boundaries() -> None:
@@ -922,6 +914,7 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
             {
                 "expected_thread_id": None,
                 "thread_id": "developer-2",
+                "write_files": {"resumed.txt": "continued original Ticket\n"},
                 "human_blockers": ["Maintainer input is required."],
             }
         ],
@@ -945,8 +938,9 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
             run_cli(git_repo, fixture, command, run_id, "--json")
         )
         assert json_view["operator_action"]["type"] == "Execution Failure"
-        assert json_view["operator_action"]["object"] == "Ticket #2"
-        assert json_view["operator_action"]["phase"] == "active"
+        assert json_view["operator_action"]["object"] == "Delivery Run（Parent Issue #1）"
+        assert json_view["operator_action"]["work_subject"] == f"run:{run_id}"
+        assert json_view["operator_action"]["phase"] == "execution_failed"
         assert json_view["operator_action"]["next_action"] == (
             "agent-run resume 1 --repo example/project"
         )
@@ -997,22 +991,6 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         assert rejected.returncode == 2
         assert load_only_run_state(git_repo) == failed
 
-    for invalid_option in (
-        ("--message", "not valid for an Execution Failure"),
-        ("--new-thread",),
-    ):
-        invalid_resume = run_cli(
-            git_repo,
-            fixture,
-            "resume",
-            "1",
-            "--repo",
-            "example/project",
-            *invalid_option,
-        )
-        assert invalid_resume.returncode == 2
-        assert load_only_run_state(git_repo) == failed
-
     resumed = run_cli(
         git_repo,
         fixture,
@@ -1020,6 +998,9 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         "1",
         "--repo",
         "example/project",
+        "--message",
+        "Controller issue resolved; continue the original Ticket.",
+        "--new-thread",
         "--agent-fixture",
         str(agents),
     )
@@ -1028,6 +1009,21 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     resumed_state = load_only_run_state(git_repo)
     assert stdout_json(resumed)["status"] == "ready_for_human"
     assert resumed_state["status"] == "ready_for_human"
+    assert resumed_state["run_id"] == failed["run_id"]
+    assert resumed_state["accepted_parent_spec_revision"] == failed["accepted_parent_spec_revision"]
+    assert resumed_state["accepted_ticket_graph_revision"] == failed["accepted_ticket_graph_revision"]
+    job = resumed_state["ticket_jobs"]["2"]
+    assert job["human_response_history"][-1]["response"] == (
+        "Controller issue resolved; continue the original Ticket."
+    )
+    assert job["human_response_history"][-1]["generation"] == job["ticket_branch_generation"]
+    assert job["human_blockers"] == ["Maintainer input is required."]
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-2"
+    assert (checkout / "resumed.txt").read_text(encoding="utf-8") == "continued original Ticket\n"
+    invocation = resumed_state["active_agent_invocation"]
+    assert (invocation["role"], invocation["work_subject"]) == ("development", "ticket:2")
+    assert invocation["requested_thread_id"] is None
+    assert invocation["reported_thread_id"] == "developer-2"
     assert resumed_state["resume_audit"]["history"][-1]["kind"] == (
         "execution_failure"
     )
@@ -1037,7 +1033,10 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
 
     final_audit = load_only_run_state(git_repo)["resume_audit"]["history"][-1]
     assert final_audit["kind"] == "execution_failure"
-    assert isinstance(final_audit["successor_invocation_started_at"], str)
+    assert final_audit["new_thread"] is True
+    assert final_audit["human_response_supplied"] is True
+    assert final_audit["successor_invocation_started_at"] == invocation["started_at"]
+    assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get("mutations", []) == []
 
 
 def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
@@ -1098,7 +1097,7 @@ def test_invalid_policy_is_rejected_before_run_state_creation(
 def test_public_operator_docs_describe_the_v01_quickstart() -> None:
     reference = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8")
     for required in (
-        "./install.sh", "release tag", "agent-run doctor", "auth app configure",
+        "./install.sh", "release tag", "agent-run doctor", "--migrate-github-app",
         "--rollback", "--uninstall", "Linux", "./setup.sh", "独立克隆",
     ):
         assert required in reference
@@ -1117,10 +1116,12 @@ def test_public_operator_docs_describe_the_v01_quickstart() -> None:
         for required in (
             "./setup.sh", "./install.sh", "agent-run doctor --json",
             "--rollback", "--uninstall", "Linux", "gh auth login",
-            "agent-run auth status", "codex login status",
+            "gh auth status", "agent-run settings show", "settings show/configure",
+            "host", "PAT", "codex login status",
         ):
             assert required in install
-        assert "](agent-run.md#github-只读身份)" in install
+        assert "](agent-run.md#github-身份)" in install
+        assert "](user-defaults.md)" in install
         assert "](agent-run.md#权限边界)" in install
 
 
@@ -1243,7 +1244,7 @@ def test_doctor_classifies_bounded_openssl_probe_states(
     assert output["checks"]["openssl"]["status"] == expected_status
 
 
-def test_doctor_does_not_fallback_when_app_profile_is_invalid(
+def test_doctor_reports_legacy_app_migration_without_reading_or_writing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = tmp_path / "config" / "agent-run"
@@ -1261,11 +1262,33 @@ def test_doctor_does_not_fallback_when_app_profile_is_invalid(
 
     output_text = capsys.readouterr().out
     output = json.loads(output_text)
-    assert output["checks"]["worker_read_provider"] == {
-        "provider": "app",
-        "status": "invalid",
-    }
+    check = output["checks"]["worker_read_provider"]
+    assert check["provider"] == "app"
+    assert check["status"] == "migration_required"
+    assert "--migrate-github-app" in check["reason"]
+    assert profile.read_text() == "{not-json}\n"
+    assert not (config / "user-defaults.json").exists()
     assert "not-json" not in output_text
+
+
+@pytest.mark.parametrize("source", ["host", "pat"])
+def test_doctor_uses_unified_identity_and_ignores_old_app_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    legacy = config / "github-app.json"
+    legacy.write_text("invalid legacy configuration")
+    settings = config / "user-defaults.json"
+    settings.write_text(json.dumps({"github": {
+        "worker_source": source, "pat": {"env": "TEST_MISSING_PAT"},
+    }}))
+    original = settings.read_bytes()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.delenv("TEST_MISSING_PAT", raising=False)
+    assert doctor._provider_check() == {"provider": source, "status": "ok"}
+    assert settings.read_bytes() == original
+    assert legacy.read_text() == "invalid legacy configuration"
 
 
 @pytest.mark.parametrize(
@@ -1293,8 +1316,8 @@ def test_doctor_reports_invalid_app_identifiers_without_unbounded_conversion(
         "private_key_path": str(tmp_path / "secret-key.pem"),
     }
     profile[field] = value
-    profile_path = config / "github-app.json"
-    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    profile_path = config / "user-defaults.json"
+    profile_path.write_text(json.dumps({"github": {"worker_source": "app", "app": profile}}), encoding="utf-8")
     profile_path.chmod(0o600)
     home = tmp_path / "home"
     home.mkdir()
@@ -1320,7 +1343,7 @@ def test_doctor_reports_invalid_app_identifiers_without_unbounded_conversion(
         "path",
     } <= output["checks"].keys()
     assert output["checks"]["worker_read_provider"] == {
-        "provider": "app",
+        "provider": "unknown",
         "status": "invalid",
     }
     assert "command_failed" not in output_text
@@ -1430,17 +1453,17 @@ def test_doctor_reports_a_corrupt_app_key_as_invalid_provider(
     key.chmod(0o600)
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
-    (config / "github-app.json").write_text(
+    (config / "user-defaults.json").write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )
-    (config / "github-app.json").chmod(0o600)
+    (config / "user-defaults.json").chmod(0o600)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -1471,14 +1494,14 @@ def test_doctor_rejects_a_zero_exit_openssl_probe_without_a_signature(
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
     config.chmod(0o700)
-    profile = config / "github-app.json"
+    profile = config / "user-defaults.json"
     profile.write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )
@@ -1541,14 +1564,14 @@ def test_doctor_accepts_a_real_private_key_signature(
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
     config.chmod(0o700)
-    profile = config / "github-app.json"
+    profile = config / "user-defaults.json"
     profile.write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )
@@ -2546,6 +2569,7 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "status": "pending",
     }
     first = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "completed",
@@ -2554,6 +2578,7 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "semantic_attempt": deepcopy(attempt),
     }
     resumed = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "running",
@@ -2561,6 +2586,8 @@ def test_history_open_resumption_does_not_use_prior_end_as_record_end(
         "ended_at": None,
         "semantic_attempt": deepcopy(attempt),
     }
+    first["execution_segments"] = [{"started_at": first["started_at"], "ended_at": first.get("ended_at")}]
+    resumed["execution_segments"] = [{"started_at": resumed["started_at"], "ended_at": resumed.get("ended_at")}]
     job = {
         "ticket_number": 3,
         "semantic_attempt_history": [attempt],
@@ -2699,6 +2726,7 @@ def test_history_running_attempt_reports_current_elapsed_time() -> None:
         "status": "pending",
     }
     invocation = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "running",
@@ -2706,6 +2734,7 @@ def test_history_running_attempt_reports_current_elapsed_time() -> None:
         "ended_at": None,
         "semantic_attempt": deepcopy(attempt),
     }
+    invocation["execution_segments"] = [{"started_at": invocation["started_at"], "ended_at": invocation.get("ended_at")}]
     job = {
         "ticket_number": 3,
         "pending_semantic_attempt": attempt,
@@ -3053,7 +3082,8 @@ def test_timeline_projects_semantic_invocation_output_and_retry_counters(
 
     store.save_run("run-1", state)
     state["active_agent_invocation"]["attempt_count"] = 2
-    store.save_run("run-1", state)
+    state.setdefault("ticket_agent_invocations", {})["3"] = deepcopy(state["active_agent_invocation"])
+    save_owned(store, "run-1", state, fields={"active_agent_invocation", "ticket_agent_invocations"})
 
     timeline = store.load_run("run-1")["timeline"]
     assert [event["output_attempt"] for event in timeline] == [1, 2]
@@ -3064,6 +3094,7 @@ def test_timeline_projects_semantic_invocation_output_and_retry_counters(
         "ticket": 3,
         "worker": "发布工作代理",
         "phase": "publication_pending",
+        "attempt": 2,
         "semantic_attempt_id": "attempt-publication-2",
         "semantic_attempt_role": "publication",
         "semantic_attempt_ordinal": 2,
@@ -3717,290 +3748,6 @@ def test_production_run_defers_environment_capture_to_action_admission(
     assert not (git_repo / ".agent-run" / "task-control").exists()
 
 
-def issue(
-    number: int,
-    *,
-    state: str = "OPEN",
-    labels: list[str] | None = None,
-    blocked_by: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": f"Ticket {number}",
-        "body": f"Implement ticket {number}.",
-        "state": state,
-        "labels": labels if labels is not None else ["ready-for-agent"],
-        "blocked_by": blocked_by or [],
-    }
-
-
-def run_cli(
-    repo: Path,
-    fixture: Path | None,
-    *arguments: str,
-    extra_env: dict[str, str] | None = None,
-    machine_output: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    """Run the public CLI; structured legacy assertions opt into JSON by default.
-
-    Human-presentation tests must pass ``machine_output=False`` so a default
-    output regression cannot be hidden by this shared fixture.
-    """
-
-    environment = os.environ.copy()
-    source_path = str(PROJECT_ROOT / "src")
-    environment["PYTHONPATH"] = (
-        source_path
-        if not environment.get("PYTHONPATH")
-        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
-    )
-    if extra_env:
-        environment.update(extra_env)
-    command_arguments = list(arguments)
-    if (
-        machine_output
-        and command_arguments
-        and command_arguments[0]
-        in {
-            "run",
-            "resume",
-            "approve",
-            "revise",
-            "requeue",
-            "stop",
-            "abandon",
-            "configure",
-        }
-        and "--json" not in command_arguments
-    ):
-        command_arguments.append("--json")
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_run",
-            *command_arguments,
-            *(["--github-fixture", str(fixture)] if fixture is not None else []),
-        ],
-        cwd=repo,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
-def run_policy_cli(
-    repo: Path,
-    *arguments: str,
-    extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    source_path = str(PROJECT_ROOT / "src")
-    environment["PYTHONPATH"] = (
-        source_path
-        if not environment.get("PYTHONPATH")
-        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
-    )
-    if extra_env:
-        environment.update(extra_env)
-    return subprocess.run(
-        [sys.executable, "-m", "agent_run", "policy", *arguments],
-        cwd=repo,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
-def run_internal_stage(
-    repo: Path, fixture: Path, stage: str, run_id: str, *arguments: str
-) -> subprocess.CompletedProcess[str]:
-    """Exercise a legacy stage's engine seam without reviving its CLI command."""
-
-    agent_fixture = (
-        Path(arguments[arguments.index("--agent-fixture") + 1])
-        if "--agent-fixture" in arguments
-        else fixture
-    )
-    crash_after_save = (
-        int(arguments[arguments.index("--crash-after-save") + 1])
-        if "--crash-after-save" in arguments
-        else None
-    )
-    workspace = prepare_workspace(repo)
-    git = workspace.open()
-    states = (
-        FaultInjectingStateStore(
-            workspace.state_root, crash_after_save=crash_after_save
-        )
-        if crash_after_save is not None
-        else StateStore(workspace.state_root)
-    )
-    reader = FixtureGitHubReader(fixture)
-    controller = Controller(reader, git, states)
-    operations = DirectRunOperations(
-        controller=controller,
-        states=states,
-        git=git,
-        github_reader=reader,
-        publisher_factory=lambda: FixtureGitHubPublisher(fixture, git),
-        agents=FixtureAgentBackend(agent_fixture),
-    )
-    step = (
-        {
-            "deliver": RunStep.DELIVER,
-            "accept-run": RunStep.ACCEPT,
-            "publish-run": RunStep.PUBLISH,
-        }[stage]
-        if stage != "approve"
-        else None
-    )
-    current = states.load_current_run(run_id)
-    invocation = current.get("active_agent_invocation") if isinstance(current, dict) else None
-    if (
-        isinstance(current, dict)
-        and current.get("status") == "execution_failed"
-        and isinstance(invocation, dict)
-        and invocation.get("status") in {"failed", "completed"}
-    ):
-        controller.resume(run_id)
-    try:
-        state = (
-            operations.approve(run_id).state
-            if step is None
-            else operations.dispatch(step, run_id).state
-        )
-    except (
-        CodexProcessError,
-        GitHubReadError,
-        OSError,
-        ValueError,
-        WorkerSandboxError,
-    ) as error:
-        assert controller.record_execution_failure(run_id, str(error))
-        state = states.load_current_run(run_id)
-        assert state is not None
-    active_ticket = state.get("active_ticket_job")
-    output = {
-        "result": "resumed",
-        "run_id": state["run_id"],
-        "status": state["status"],
-        "run_branch": state.get("run_branch", state.get("parent_branch")),
-        "active_ticket": (
-            active_ticket.get("ticket_number")
-            if isinstance(active_ticket, dict)
-            else None
-        ),
-        "diagnostics": state.get("diagnostics", []),
-        "scope_change": state.get("unsupported_scope_change"),
-        "next_action": cli.cli_presentation._next_action(state),
-    }
-    return subprocess.CompletedProcess(
-        args=["internal-stage", stage, run_id],
-        returncode=(
-            0
-            if cli._lifecycle_result_succeeded(stage, state.get("status"))
-            else 2
-        ),
-        stdout=json.dumps(output, ensure_ascii=False),
-        stderr="",
-    )
-
-
-def git_fetch_failure_wrapper(
-    directory: Path, *, failures: int
-) -> tuple[Path, dict[str, str]]:
-    real_git = shutil.which("git")
-    assert real_git is not None
-    counter = directory / "git-fetch-failures"
-    counter.write_text(str(failures), encoding="utf-8")
-    wrapper = directory / "git"
-    wrapper.write_text(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"fetch\" ] && [ \"$(cat \"$AGENT_RUN_FETCH_COUNTER\")\" -gt 0 ]; then\n"
-        "  remaining=$(cat \"$AGENT_RUN_FETCH_COUNTER\")\n"
-        "  echo $((remaining - 1)) > \"$AGENT_RUN_FETCH_COUNTER\"\n"
-        "  echo 'dial tcp: i/o timeout' >&2\n"
-        "  exit 1\n"
-        "fi\n"
-        "exec \"$AGENT_RUN_REAL_GIT\" \"$@\"\n",
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o755)
-    return counter, {
-        "AGENT_RUN_FETCH_COUNTER": str(counter),
-        "AGENT_RUN_REAL_GIT": real_git,
-        "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}",
-    }
-
-
-def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
-    assert result.stdout, result.stderr
-    loaded: object = json.loads(result.stdout)
-    assert isinstance(loaded, dict)
-    return loaded
-
-
-def load_only_run_state(
-    repo: Path, *, extra_env: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    run_files = list((managed_state(repo, extra_env=extra_env) / "runs").glob("*.json"))
-    assert len(run_files) == 1
-    loaded: object = json.loads(run_files[0].read_text(encoding="utf-8"))
-    assert isinstance(loaded, dict)
-    return loaded
-
-
-def failed_invocation(
-    *,
-    work_subject: str,
-    role: str,
-    phase: str,
-    generation: int = 1,
-    status: str = "failed",
-) -> dict[str, Any]:
-    semantic_role = (
-        "development"
-        if role == "development"
-        else "reviewer" if role in {"fresh_acceptance", "reviewer"} else "publication"
-    )
-    boundary_fingerprint = canonical_fingerprint({})
-    identity = {
-        "role": semantic_role,
-        "work_subject": work_subject,
-        "generation": generation,
-        "currentness_boundary_fingerprint": boundary_fingerprint,
-        "ordinal": 1,
-        "budget_window": 1 if semantic_role in {"development", "reviewer"} else None,
-    }
-    semantic_attempt = {
-        "attempt_id": canonical_fingerprint(identity),
-        **identity,
-        "status": "pending",
-    }
-    return {
-        "work_subject": work_subject,
-        "generation": generation,
-        "role": role,
-        "phase": phase,
-        "mode": "fresh",
-        "input_fingerprint": "fixture",
-        "currentness_boundary": {},
-        "semantic_attempt": semantic_attempt,
-        "status": status,
-        "requested_thread_id": None,
-        "reported_thread_id": None,
-        "attempt_count": 1,
-        "started_at": "2026-08-13T00:00:00+00:00",
-        "ended_at": "2026-08-13T00:00:01+00:00",
-        "error": "fixture failure",
-        "return_code": 1,
-        "signal": None,
-    }
-
-
 def test_seed_run_creates_one_run_branch_and_is_idempotent(
     git_repo: Path,
 ) -> None:
@@ -4037,7 +3784,7 @@ def test_seed_run_creates_one_run_branch_and_is_idempotent(
         check=True,
     ).stdout.splitlines()
     assert branches == [state["run_branch"]]
-    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 1
+    assert len(run_refs(managed_state(git_repo))) == 1
 
 
 def test_seed_run_preserves_the_managed_run_branch_side_effect(
@@ -4060,17 +3807,21 @@ def test_seed_run_preserves_the_managed_run_branch_side_effect(
     assert not (git_repo / ".agent-run").exists()
 
 
-def test_run_repair_docs_describe_job_rotation_and_candidate_promotion() -> None:
+def test_run_repair_docs_describe_direct_delivery_and_exact_candidate_promotion() -> None:
     context = (PROJECT_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     operator_guide = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(
         encoding="utf-8"
     )
 
-    assert "一个 Cycle 可依次包含多个 Run Repair Job" in context
-    assert "轮转出后继 Job" in context
+    assert "程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准" in context
+    assert "修复保留身份、受管工作区、必要本地分支、候选与历史" in context
     assert "Candidate Run Acceptance → 严格 promotion" in operator_guide
-    assert "归档旧 Job/PR 并轮转新的 branch/PR" in operator_guide
-    assert "一个活跃 Run Repair Job 实现一个 Repair Cycle" not in context
+    assert "不创建内部修复 PR、调用内部 Publish 或等待内部 CI" in operator_guide
+    assert "未知推送先对账" in operator_guide
+    assert "权限或规则拒绝时保全修复成果与写入意图" in operator_guide
+    assert "一个 Cycle 可依次包含多个 Run Repair Job" not in context
+    assert "轮转出后继 Job" not in context
+    assert "归档旧 Job/PR 并轮转新的 branch/PR" not in operator_guide
     assert "Run Repair → fresh Run Acceptance → 新 PR" not in operator_guide
 
 
@@ -4182,13 +3933,10 @@ def test_status_ignores_user_directory_state_and_honors_explicit_state_dir(
     local_repo = tmp_path / "local-repo"
     local_repo.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=local_repo, check=True)
-    local_state_dir = local_repo / ".agent-run" / "runs"
-    local_state_dir.mkdir(parents=True)
+    local_state_dir = local_repo / ".agent-run"
     local_state = load_only_run_state(git_repo, extra_env=locator_env)
     local_state["diagnostics"] = [{"code": "local_priority", "message": "local"}]
-    (local_state_dir / f"{run_id}.json").write_text(
-        json.dumps(local_state), encoding="utf-8"
-    )
+    StateStore(local_state_dir).save_run(run_id, local_state)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
 
@@ -4201,7 +3949,7 @@ def test_status_ignores_user_directory_state_and_honors_explicit_state_dir(
         "status",
         run_id,
         "--state-dir",
-        str(local_state_dir.parent),
+        str(local_state_dir),
         "--json",
         extra_env=locator_env,
     )
@@ -4220,8 +3968,8 @@ def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
-    before = state_path.read_text(encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=locator_env))
+    before = run_state_text(state_ref)
     locator_path = locator_home / "agent-run" / "run-locator.json"
     locator_path.parent.mkdir(parents=True, exist_ok=True)
     locator_path.write_text(
@@ -4251,7 +3999,7 @@ def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
     assert output["status"] == "blocked"
     assert output["diagnostics"][0]["code"] == "run_locator_stale"
     assert "--state-dir" in output["diagnostics"][0]["message"]
-    assert state_path.read_text(encoding="utf-8") == before
+    assert run_state_text(state_ref) == before
 
 
 def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
@@ -4274,16 +4022,11 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
 
     assert stdout_json(missing)["diagnostics"][0]["code"] == "run_locator_missing"
     assert not locator_path.exists()
-    source_state = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json")).read_text(
-        encoding="utf-8"
-    )
+    source_state = read_run(only_run_ref(managed_state(git_repo, extra_env=locator_env)))
     first_state_dir = tmp_path / "first-state"
     second_state_dir = tmp_path / "second-state"
     for state_dir in (first_state_dir, second_state_dir):
-        (state_dir / "runs").mkdir(parents=True)
-        (state_dir / "runs" / f"{run_id}.json").write_text(
-            source_state, encoding="utf-8"
-        )
+        StateStore(state_dir).save_run(run_id, source_state)
     locator_path.parent.mkdir(parents=True, exist_ok=True)
     locator_path.write_text(
         json.dumps(
@@ -4337,8 +4080,8 @@ def test_lifecycle_commands_apply_the_same_preconditions_from_any_directory(
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
-    before = state_path.read_text(encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=locator_env))
+    before = run_state_text(state_ref)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     command_arguments = tuple(argument.format(run_id=run_id) for argument in arguments)
@@ -4352,7 +4095,7 @@ def test_lifecycle_commands_apply_the_same_preconditions_from_any_directory(
 
     assert result.returncode == 2
     assert stdout_json(result) == stdout_json(local)
-    assert state_path.read_text(encoding="utf-8") == before
+    assert run_state_text(state_ref) == before
 
 
 def test_status_and_history_select_the_unique_current_run_without_run_id(
@@ -4449,7 +4192,7 @@ def test_parent_selector_reuses_one_task_across_user_clones(
 
     assert result.returncode == 0
     assert stdout_json(result)["run_id"] == first_id == second_id
-    assert len(list((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))) == 1
+    assert len(run_refs(managed_state(git_repo, extra_env=locator_env))) == 1
 
 
 def test_repository_parent_selector_does_not_collide_on_same_issue_number(
@@ -4525,7 +4268,7 @@ def test_repository_parent_selector_ignores_unrelated_stale_locator(
     first_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    first_state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
+    first_state_ref = only_run_ref(managed_state(git_repo, extra_env=locator_env))
 
     other_repo = tmp_path / "other-repo"
     subprocess.run(["git", "clone", "--quiet", str(git_repo), str(other_repo)], check=True)
@@ -4540,10 +4283,11 @@ def test_repository_parent_selector_ignores_unrelated_stale_locator(
     second_id = stdout_json(
         seed_run(other_repo, other_fixture, "1", extra_env=locator_env)
     )["run_id"]
-    second_state_path = managed_state(other_repo, extra_env=locator_env) / "runs" / f"{second_id}.json"
-    second_state_path.unlink()
+    second_state_ref = (managed_state(other_repo, extra_env=locator_env), str(second_id))
+    for name in ("state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"):
+        (second_state_ref[0] / name).unlink(missing_ok=True)
     locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
-    before_first_state = first_state_path.read_text(encoding="utf-8")
+    before_first_state = run_state_text(first_state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -4591,9 +4335,9 @@ def test_repository_parent_selector_ignores_unrelated_stale_locator(
         assert unrelated.returncode == 2
         diagnostic = stdout_json(unrelated)["diagnostics"][0]
         assert diagnostic["code"] == "run_locator_stale"
-    assert first_state_path.read_text(encoding="utf-8") == before_first_state
+    assert run_state_text(first_state_ref) == before_first_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
-    assert not second_state_path.exists()
+    assert not has_run(second_state_ref)
 
 
 def test_runs_discovers_bounded_human_run_candidates(
@@ -4723,12 +4467,12 @@ def test_registered_state_dir_without_checkout_identity_is_unavailable(
             extra_env=locator_env,
         )
     )["run_id"]
-    state_path = custom_state_dir / "runs" / f"{run_id}.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_ref = (custom_state_dir, str(run_id))
+    state = read_run(state_ref)
     state.pop("checkout_identity", None)
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(state_ref, state)
     locator_path = locator_home / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     discovered = run_cli(
@@ -4760,7 +4504,7 @@ def test_registered_state_dir_without_checkout_identity_is_unavailable(
         assert result.returncode == 2
         diagnostic = stdout_json(result)["diagnostics"][0]
         assert diagnostic["code"] == "run_locator_stale"
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
 
 
@@ -4783,9 +4527,9 @@ def test_explicit_repository_run_without_origin_remains_selectable(
 
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
-    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=locator_env))
     locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     status = run_cli(
@@ -4804,7 +4548,7 @@ def test_explicit_repository_run_without_origin_remains_selectable(
     assert status.returncode == history.returncode == 0
     assert stdout_json(status)["run_id"] == run_id
     assert stdout_json(history)["run_id"] == run_id
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
 
 
@@ -4813,12 +4557,11 @@ def test_runs_with_unknown_custom_state_dir_marks_worktree_unavailable(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    source = managed_state(git_repo) / "runs" / f"{run_id}.json"
+    source_ref = (managed_state(git_repo), str(run_id))
     custom_state_dir = tmp_path / "custom-state"
-    custom_runs = custom_state_dir / "runs"
-    custom_runs.mkdir(parents=True)
-    shutil.copy2(source, custom_runs / source.name)
-    before = (custom_runs / source.name).read_text(encoding="utf-8")
+    StateStore(custom_state_dir).save_run(run_id, read_run(source_ref))
+    custom_run = (custom_state_dir, run_id)
+    before = snapshot_run(custom_run)
 
     discovered = run_cli(
         git_repo,
@@ -4834,7 +4577,7 @@ def test_runs_with_unknown_custom_state_dir_marks_worktree_unavailable(
     assert candidate["run_id"] == run_id
     assert candidate["repository_root"] == "unavailable"
     assert candidate["state_dir"] == str(custom_state_dir.resolve())
-    assert (custom_runs / source.name).read_text(encoding="utf-8") == before
+    assert snapshot_run(custom_run) == before
 
 
 def test_runs_with_nested_dot_agent_run_state_dir_marks_worktree_unavailable(
@@ -4842,12 +4585,11 @@ def test_runs_with_nested_dot_agent_run_state_dir_marks_worktree_unavailable(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    source = managed_state(git_repo) / "runs" / f"{run_id}.json"
+    source_ref = (managed_state(git_repo), str(run_id))
     custom_state_dir = git_repo / "nested" / ".agent-run"
-    custom_runs = custom_state_dir / "runs"
-    custom_runs.mkdir(parents=True)
-    shutil.copy2(source, custom_runs / source.name)
-    before = (custom_runs / source.name).read_text(encoding="utf-8")
+    StateStore(custom_state_dir).save_run(run_id, read_run(source_ref))
+    custom_run = (custom_state_dir, run_id)
+    before = snapshot_run(custom_run)
 
     discovered = run_cli(
         git_repo,
@@ -4863,7 +4605,7 @@ def test_runs_with_nested_dot_agent_run_state_dir_marks_worktree_unavailable(
     assert candidate["run_id"] == run_id
     assert candidate["repository_root"] == "unavailable"
     assert candidate["state_dir"] == str(custom_state_dir.resolve())
-    assert (custom_runs / source.name).read_text(encoding="utf-8") == before
+    assert snapshot_run(custom_run) == before
 
 
 def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inputs(
@@ -4888,9 +4630,9 @@ def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inp
             extra_env=locator_env,
         )
     )["run_id"]
-    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    state_ref = (custom_state_dir, str(run_id))
     locator_path = locator_home / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     original = tmp_path / "original"
@@ -4935,7 +4677,7 @@ def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inp
         assert result.returncode == 2
         diagnostic = stdout_json(result)["diagnostics"][0]
         assert diagnostic["code"] == "run_locator_stale"
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (git_repo / ".agent-run").exists()
 
@@ -4943,7 +4685,7 @@ def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inp
 def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
     git_repo: Path, tmp_path: Path
 ) -> None:
-    from cli_fixtures import run_agents
+    from support.cli_fixtures import run_agents
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     subprocess.run(
@@ -4964,8 +4706,8 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
             extra_env=locator_env,
         )
     )["run_id"]
-    state_path = custom_state_dir / "runs" / f"{run_id}.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_ref = (custom_state_dir, str(run_id))
+    state = read_run(state_ref)
     state.update(
         {
             "status": "supervision_timeout",
@@ -4973,9 +4715,9 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(state_ref, state)
     locator_path = locator_home / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     original = tmp_path / "original"
@@ -5048,9 +4790,9 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
         assert result.returncode == 2, result.stderr
         diagnostic = stdout_json(result)["diagnostics"][0]
         assert diagnostic["code"] == "run_locator_stale"
-        assert state_path.read_text(encoding="utf-8") == before_state
+        assert run_state_text(state_ref) == before_state
         assert locator_path.read_text(encoding="utf-8") == before_locator
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (git_repo / ".agent-run").exists()
 
@@ -5077,9 +4819,9 @@ def test_selector_reuses_the_managed_run_from_another_user_clone(
             extra_env=locator_env,
         )
     )["run_id"]
-    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    state_ref = (custom_state_dir, str(run_id))
     locator_path = locator_home / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     clone = tmp_path / "clone"
@@ -5103,7 +4845,7 @@ def test_selector_reuses_the_managed_run_from_another_user_clone(
         )
         assert result.returncode == 0, result.stderr
         assert stdout_json(result)["run_id"] == run_id
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (clone / ".agent-run").exists()
 
@@ -5111,7 +4853,7 @@ def test_selector_reuses_the_managed_run_from_another_user_clone(
 def test_resume_rejects_a_noncanonical_state_dir_from_another_clone(
     git_repo: Path, tmp_path: Path
 ) -> None:
-    from cli_fixtures import run_agents
+    from support.cli_fixtures import run_agents
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     subprocess.run(
@@ -5132,8 +4874,8 @@ def test_resume_rejects_a_noncanonical_state_dir_from_another_clone(
             extra_env=locator_env,
         )
     )["run_id"]
-    state_path = custom_state_dir / "runs" / f"{run_id}.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_ref = (custom_state_dir, str(run_id))
+    state = read_run(state_ref)
     state.update(
         {
             "status": "supervision_timeout",
@@ -5141,9 +4883,9 @@ def test_resume_rejects_a_noncanonical_state_dir_from_another_clone(
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(state_ref, state)
     locator_path = locator_home / "agent-run" / "run-locator.json"
-    before_state = state_path.read_text(encoding="utf-8")
+    before_state = run_state_text(state_ref)
     before_locator = locator_path.read_text(encoding="utf-8")
 
     clone = tmp_path / "clone"
@@ -5172,7 +4914,7 @@ def test_resume_rejects_a_noncanonical_state_dir_from_another_clone(
     diagnostic = stdout_json(result)["diagnostics"][0]
     assert diagnostic["code"] == "command_failed"
     assert "统一状态目录" in diagnostic["message"]
-    assert state_path.read_text(encoding="utf-8") == before_state
+    assert run_state_text(state_ref) == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (clone / ".agent-run").exists()
 
@@ -5193,8 +4935,8 @@ def test_parent_selector_fails_closed_with_all_ambiguous_candidates(
         git_repo, fixture, extra_env=locator_env, reuse_existing=False
     )
     second_id = stdout_json(second)["run_id"]
-    state_paths = sorted((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
-    before = [path.read_text(encoding="utf-8") for path in state_paths]
+    state_refs = run_refs(managed_state(git_repo, extra_env=locator_env))
+    before = [run_state_text(path) for path in state_refs]
 
     result = run_cli(
         git_repo,
@@ -5213,7 +4955,7 @@ def test_parent_selector_fails_closed_with_all_ambiguous_candidates(
         first_id,
         second_id,
     }
-    assert [path.read_text(encoding="utf-8") for path in state_paths] == before
+    assert [run_state_text(path) for path in state_refs] == before
 
 
 def test_parent_selector_reports_stale_index_candidates_without_mutation(
@@ -5225,8 +4967,8 @@ def test_parent_selector_reports_stale_index_candidates_without_mutation(
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
-    before = state_path.read_text(encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo, extra_env=locator_env))
+    before = run_state_text(state_ref)
     locator_path = locator_home / "agent-run" / "run-locator.json"
     locator = json.loads(locator_path.read_text(encoding="utf-8"))
     locator["entries"][0]["state_dir"] = str(tmp_path / "missing-state")
@@ -5251,7 +4993,7 @@ def test_parent_selector_reports_stale_index_candidates_without_mutation(
     assert diagnostic["code"] == "run_locator_stale"
     assert diagnostic["candidates"][0]["run_id"] == run_id
     assert diagnostic["candidates"][0]["state_dir"] == str(tmp_path / "missing-state")
-    assert state_path.read_text(encoding="utf-8") == before
+    assert run_state_text(state_ref) == before
 
 
 def test_resume_parent_selector_never_creates_a_run_when_no_recoverable_match(
@@ -5270,7 +5012,7 @@ def test_resume_parent_selector_never_creates_a_run_when_no_recoverable_match(
 def test_resume_parent_selector_reuses_one_existing_recoverable_run(
     git_repo: Path,
 ) -> None:
-    from cli_fixtures import run_agents
+    from support.cli_fixtures import run_agents
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     subprocess.run(
@@ -5280,7 +5022,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
     )
     agents = run_agents(git_repo / "agents.json")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
+    run_ref = only_run_ref(managed_state(git_repo))
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -5289,7 +5031,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
             "supervision_wait": {"resume_status": "waiting_external"},
         }
     )
-    run_file.write_text(json.dumps(state), encoding="utf-8")
+    write_run_fixture(run_ref, state)
 
     resumed = run_cli(
         git_repo,
@@ -5307,7 +5049,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
     resumed_state = load_only_run_state(git_repo)
     assert resumed_state["run_id"] == run_id
     assert resumed_state["resume_audit"]["total"] == 1
-    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 1
+    assert len(run_refs(managed_state(git_repo))) == 1
 
 
 def test_frontier_uses_native_dependencies_labels_state_and_parent_order(
@@ -5333,7 +5075,7 @@ def test_frontier_uses_native_dependencies_labels_state_and_parent_order(
     assert state["frontier"] == [10, 5, 2]
     assert state["active_ticket_job"] == {
         "ticket_number": 10,
-        "selection_reason": "first eligible ticket by parent sub-issue order, then issue number",
+        "selection_reason": "Ticket work queue, integration queue, then eligible ticket order",
     }
     tickets = state["ticket_graph"]["tickets"]
     assert tickets["9"]["eligibility"]["reason"] == "blocked_by_open_issues"
@@ -5384,8 +5126,8 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
     started = seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["schema_version"] = 1
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "run", "1")
@@ -5393,7 +5135,7 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
     assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
@@ -5405,8 +5147,8 @@ def test_status_and_history_show_incompatible_legacy_evidence(
     run_id = stdout_json(started)["run_id"]
     state = load_only_run_state(git_repo)
     state["schema_version"] = 1
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
@@ -5416,7 +5158,7 @@ def test_status_and_history_show_incompatible_legacy_evidence(
     assert output["run_id"] == run_id
     if command == "status":
         assert output["status"] == before["status"]
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
@@ -5431,15 +5173,15 @@ def test_status_and_history_reject_an_invalid_timeline_without_mutation(
         state.pop("timeline")
     else:
         state["timeline"] = timeline
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
@@ -5449,15 +5191,15 @@ def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["timeline"] = ["not an event"]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history", "resume"])
@@ -5468,8 +5210,8 @@ def test_cli_rejects_a_malformed_canonical_nested_state(
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["parent"].pop("number")
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
 
@@ -5477,8 +5219,8 @@ def test_cli_rejects_a_malformed_canonical_nested_state(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize(
@@ -5496,15 +5238,15 @@ def test_status_rejects_malformed_invocation_records(
     state = load_only_run_state(git_repo)
     state["status"] = "execution_failed"
     state[field] = value
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 def test_resume_rejects_unknown_invocation_role_without_mutation(
@@ -5517,15 +5259,15 @@ def test_resume_rejects_unknown_invocation_role_without_mutation(
     state["active_agent_invocation"] = failed_invocation(
         work_subject="ticket:2", role="unknown", phase="developing"
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 def test_resume_rejects_active_invocation_for_missing_ticket(
@@ -5538,15 +5280,15 @@ def test_resume_rejects_active_invocation_for_missing_ticket(
     state["active_agent_invocation"] = failed_invocation(
         work_subject="ticket:999", role="development", phase="developing"
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("owner", [None, {}, {"phase": "unknown"}])
@@ -5569,15 +5311,15 @@ def test_resume_rejects_final_publication_without_a_valid_owner(
             ),
         }
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history", "resume"])
@@ -5608,8 +5350,8 @@ def test_resume_rejects_an_incomplete_run_acceptance_owner(
             ),
         }
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
@@ -5617,7 +5359,7 @@ def test_resume_rejects_an_incomplete_run_acceptance_owner(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize(
@@ -5659,15 +5401,15 @@ def test_resume_rejects_an_owner_that_has_already_advanced(
         state["run_publication"] = owner
     else:
         state["run_acceptance"] = owner
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history", "resume"])
@@ -5700,8 +5442,8 @@ def test_change_resume_rejects_an_owner_that_has_already_advanced(
             ),
         }
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
@@ -5709,7 +5451,7 @@ def test_change_resume_rejects_an_owner_that_has_already_advanced(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
@@ -5729,6 +5471,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             },
             "active_agent_invocation": {
                 **failed_invocation(
@@ -5743,14 +5486,14 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
             },
         }
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 0
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> None:
@@ -5760,8 +5503,8 @@ def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> N
     state["status"] = "blocked"
     state["diagnostics"] = [{"code": "attacker", "message": "not canonical"}]
     state["parent"].pop("number")
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
@@ -5769,14 +5512,13 @@ def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> N
     assert result.returncode == 2
     output = stdout_json(result)
     assert output["status"] == "incompatible_run_state"
-    assert output["diagnostics"] == [
-        {
-            "code": "incompatible_run_state",
-            "message": "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
-            "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run",
-        }
-    ]
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    diagnostic, = output["diagnostics"]
+    assert diagnostic["code"] == "recovery_materials_missing"
+    assert run_id in diagnostic["message"]
+    assert "Parent" in diagnostic["message"] or "parent" in diagnostic["message"]
+    assert "agent-run resume" in diagnostic["message"]
+    assert "attacker" not in diagnostic["message"]
+    assert read_run(state_ref) == before
 
 
 def test_cli_rejects_malformed_human_blocker_without_mutation(git_repo: Path) -> None:
@@ -5793,15 +5535,15 @@ def test_cli_rejects_malformed_human_blocker_without_mutation(git_repo: Path) ->
             },
         }
     )
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 @pytest.mark.parametrize("command", ["status", "history", "resume"])
@@ -5813,8 +5555,8 @@ def test_cli_rejects_resolved_run_with_missing_observed_revisions(
     state = load_only_run_state(git_repo)
     state["parent"]["revision"] = None
     state["ticket_graph"]["revision"] = None
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_ref = only_run_ref(managed_state(git_repo))
+    write_run_fixture(state_ref, state)
     before = deepcopy(state)
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
 
@@ -5822,7 +5564,7 @@ def test_cli_rejects_resolved_run_with_missing_observed_revisions(
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+    assert read_run(state_ref) == before
 
 
 def test_status_prints_the_recovery_command_for_manual_boundaries(
@@ -5830,7 +5572,7 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    state_ref = only_run_ref(managed_state(git_repo))
     current = load_only_run_state(git_repo)
     cases = [
         (
@@ -5852,6 +5594,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "human_blockers": ["Need maintainer input."],
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(current["policy_snapshot"]),
                 },
             },
             "agent-run resume 1 --repo example/project",
@@ -5882,6 +5626,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "phase": "developing",
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ticket_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(state["policy_snapshot"]),
                     "pending_semantic_attempt": deepcopy(
                         invocation["semantic_attempt"]
                     ),
@@ -5895,6 +5641,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "phase": "developing",
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ticket_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 }
             )
             state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
@@ -5905,11 +5653,11 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "message": "Ticket requirements changed; run requeue",
                 }
             ]
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        write_run_fixture(state_ref, state)
 
         result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
-        assert result.returncode == 0
+        assert result.returncode == 0, result.stdout
         assert stdout_json(result)["next_action"] == expected_action
 
 
@@ -6182,13 +5930,13 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("waits", "expected"),
+    ("segments", "expected"),
     [
         (
             [
                 {
-                    "started_at": "2026-09-10T00:00:10+00:00",
-                    "ended_at": "2026-09-10T00:00:40+00:00",
+                    "started_at": "2026-09-10T00:00:30+00:00",
+                    "ended_at": "2026-09-10T00:01:40+00:00",
                 }
             ],
             70,
@@ -6196,12 +5944,12 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
         (
             [
                 {
-                    "started_at": "2026-09-10T00:00:10+00:00",
+                    "started_at": "2026-09-10T00:00:00+00:00",
                     "ended_at": "2026-09-10T00:00:20+00:00",
                 },
                 {
-                    "started_at": "2026-09-10T00:00:30+00:00",
-                    "ended_at": "2026-09-10T00:00:40+00:00",
+                    "started_at": "2026-09-10T00:00:40+00:00",
+                    "ended_at": "2026-09-10T00:01:40+00:00",
                 },
             ],
             80,
@@ -6212,8 +5960,8 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
         ),
     ],
 )
-def test_history_execution_seconds_excludes_only_trusted_recovery_waits(
-    waits: list[dict[str, str]], expected: int | None
+def test_history_execution_seconds_sums_only_trusted_worker_segments(
+    segments: list[dict[str, str]], expected: int | None
 ) -> None:
     attempt = {
         "attempt_id": "attempt-duration",
@@ -6226,12 +5974,13 @@ def test_history_execution_seconds_excludes_only_trusted_recovery_waits(
         "outcome": "candidate",
     }
     invocation = {
+        "reported_thread_id": "actual-thread",
         "work_subject": "ticket:3",
         "role": "development",
         "status": "completed",
         "started_at": "2026-09-10T00:00:00+00:00",
         "ended_at": "2026-09-10T00:01:40+00:00",
-        "recovery_wait_intervals": waits,
+        "execution_segments": segments,
         "semantic_attempt": deepcopy(attempt),
     }
     job = {
@@ -6589,11 +6338,13 @@ def test_successor_invocation_starts_with_own_recovery_wait_intervals() -> None:
 
     successor.update(
         {
+            "reported_thread_id": "actual-thread",
             "started_at": "2026-09-10T00:00:40+00:00",
             "ended_at": "2026-09-10T00:00:50+00:00",
             "status": "completed",
         }
     )
+    successor["execution_segments"] = [{"started_at": successor["started_at"], "ended_at": successor.get("ended_at")}]
     assert invocation_execution_seconds(successor) == 10
 
 
@@ -6847,9 +6598,9 @@ def test_human_recovery_guidance_translates_copy_without_parsing_it() -> None:
         "repository": "example/project", "parent": {"number": 42}, "language": "en",
     }
     english = next_action(state)
-    assert "Inspect why publication retries failed" in english
-    assert "agent-run abandon 42 --repo example/project" in english
-    assert "Inspect why publication retries failed" in str(human_next_action_for_state(state))
+    assert english == "agent-run resume 42 --repo example/project"
+    assert str(human_next_action_for_state(state)) == english
+    assert next_action({**state, "language": "zh"}) == english
     raw_evidence = "外部工具原始证据: user supplied details"
     assert pause_reason(raw_evidence, "en") == raw_evidence
     assert pause_reason("review_budget_exhausted", "en") == (

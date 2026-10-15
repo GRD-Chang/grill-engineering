@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Protocol
 
+from agent_run.run_repair_cycle import remove_repair_job
+
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -78,9 +80,14 @@ def ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
         _mapping(tickets.get(key), f"ticket {key}")
         acceptance = job.get("acceptance_record")
         if not isinstance(acceptance, dict):
+            authority = job.get("publication_authority")
+            receipt_key = (
+                "ci_repair_publication_receipt"
+                if authority == "ci_repair" else "fallback_publication_receipt"
+            )
             receipt = _mapping(
-                job.get("fallback_publication_receipt"),
-                f"completed ticket {key} fallback_publication_receipt",
+                job.get(receipt_key),
+                f"completed ticket {key} {receipt_key}",
             )
             reviewed_base_sha = receipt.get("base_sha")
             reviewed_candidate_tree = receipt.get("candidate_tree")
@@ -94,6 +101,11 @@ def ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
                 "effective_revision": job.get("effective_revision"),
                 "reviewed_base_sha": reviewed_base_sha,
                 "reviewed_candidate_tree": reviewed_candidate_tree,
+                **(
+                    {"ci_repair_publication_receipt": deepcopy(receipt)}
+                    if not isinstance(acceptance, dict) and job.get("publication_authority") == "ci_repair"
+                    else {}
+                ),
             }
         )
     return records
@@ -122,6 +134,28 @@ def ticket_fallback_records(state: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
             }
         )
+    return records
+
+
+def ticket_ci_repair_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose the narrow Ticket CI repair authority to the complete Run Reviewer."""
+
+    require_completed_ticket_integration_records(state)
+    jobs = _mapping(state.get("ticket_jobs"), "ticket_jobs")
+    records: list[dict[str, Any]] = []
+    for key, job in sorted(jobs.items(), key=lambda item: int(item[0])):
+        if not isinstance(job, dict) or job.get("publication_authority") != "ci_repair":
+            continue
+        receipt = job.get("ci_repair_publication_receipt")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"completed ticket {key} CI repair receipt is invalid")
+        records.append({
+            "ticket_number": int(key),
+            "integrated_sha": job.get("integrated_sha"),
+            "effective_revision": job.get("effective_revision"),
+            "receipt": deepcopy(receipt),
+            "integration_record": deepcopy(job.get("deterministic_integration_record")),
+        })
     return records
 
 
@@ -161,6 +195,7 @@ def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
         "acceptance_record",
         "acceptance_artifact",
         "reviewed_head_sha",
+        "pending_review_result",
         "reviewer_resume_thread_id",
         "reviewer_new_thread",
         "human_response_history",
@@ -238,7 +273,7 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
             work_subject=f"run-repair:{state['run_id']}",
             generation=int(repair_job.get("repair_generation", 1)),
         )
-    run.pop("repair_job", None)
+    remove_repair_job(run)
     run.pop("repair_request", None)
     state["active_agent_invocation"] = None
     state.pop("requeue_required", None)

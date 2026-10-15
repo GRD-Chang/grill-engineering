@@ -17,8 +17,10 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
 from agent_run.run_driver import DirectRunOperations, RunDriver
-from conftest import write_fixture
-from test_delivery import PassAgents, ScriptedPublisher, issue
+from support.seeding import write_fixture
+from support.delivery_agents import PassAgents, issue
+from support.delivery_publisher import ScriptedPublisher
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("failure_point", ["revision", "verify", "publish"])
@@ -52,7 +54,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
                 raise GitHubReadError("github_timeout", "GitHub command timed out")
             return super().verify_ticket_pr_before_publish(**kwargs)
 
-        def publish_branch(self, *args: Any, **kwargs: Any) -> None:
+        def publish_branch(self, *args: Any, **kwargs: Any) -> Any:
             if failure_point == "publish" and self.offline:
                 raise GitHubReadError("github_timeout", "GitHub command timed out")
             return super().publish_branch(*args, **kwargs)
@@ -65,6 +67,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
     waiting = engine.deliver(run_id)
     assert waiting["status"] == "waiting_external"
     job = deepcopy(waiting["active_ticket_job"])
+    original_wait = job.pop("external_wait")
     assert job["phase"] == "publishing"
     assert job["publication_sha"]
     assert waiting["diagnostics"][0]["code"] == "github_timeout"
@@ -75,9 +78,16 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
         now=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds)
     )
     while supervisor.before_retry(waiting):
-        states.save_run(run_id, waiting)
+        persist_run_fixture(states, run_id, waiting)
         waiting = engine.deliver(run_id)
-        assert waiting["active_ticket_job"] == job
+        retried_job = deepcopy(waiting["active_ticket_job"])
+        retried_wait = retried_job.pop("external_wait")
+        assert retried_job == job
+        assert retried_wait["status"] == "waiting_external"
+        assert retried_wait["supervision_window"]["deadline"] == deadline
+        assert retried_wait["supervision_window"]["identity"] == (
+            original_wait["supervision_window"]["identity"]
+        )
     assert now[0] == deadline
     assert waiting["status"] == "supervision_timeout"
     assert waiting["diagnostics"][0]["last_error"]["code"] == "github_timeout"
@@ -87,7 +97,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
 
     github.offline = False
     restore_supervision_wait(waiting)
-    states.save_run(run_id, waiting)
+    persist_run_fixture(states, run_id, waiting)
     completed = engine.deliver(run_id)
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["publication_sha"] == job["publication_sha"]
@@ -177,7 +187,24 @@ def test_publication_result_survives_read_timeout_before_local_commit(
 def test_push_response_loss_uses_remote_facts_before_retrying(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, readback: str,
 ) -> None:
-    reads = ["old", readback]
+    old_sha = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "publication"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    new_sha = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "foreign"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    foreign_sha = GitRepository(git_repo).resolve("HEAD")
+    reads = [old_sha, {
+        "old": old_sha,
+        "new": new_sha,
+        "foreign": foreign_sha,
+        "absent": "absent",
+        "unavailable": "unavailable",
+    }[readback]]
     writes: list[list[str]] = []
 
     def read(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -196,18 +223,19 @@ def test_push_response_loss_uses_remote_facts_before_retrying(
     monkeypatch.setattr("agent_run.github_publish.run_write_command", write)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     if readback == "new":
-        publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+        result = publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
+        assert result.disposition == "already_published"
     elif readback in {"foreign", "absent"}:
-        with pytest.raises(GitError, match="drifted"):
-            publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+        with pytest.raises(GitError, match="changed"):
+            publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
     else:
         with pytest.raises(GitHubReadError) as caught:
-            publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+            publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
         assert caught.value.code == (
             "github_write_failed" if readback == "old" else "github_read_failed"
         )
     assert len(writes) == 1
-    assert "--force-with-lease=refs/heads/ticket:old" in writes[0]
+    assert f"--force-with-lease=refs/heads/ticket:{old_sha}" in writes[0]
 
 
 @pytest.mark.parametrize("subject", ["change", "run"])
@@ -327,15 +355,18 @@ def test_driver_supervises_initial_branch_outage_before_shared_delivery_loop(
         assert now[0] == 0
         assert not agents.development_thread_ids
         return
-    assert paused["status"] == "supervision_timeout"
+    assert paused["status"] == "blocked"
     assert paused["diagnostics"][0]["last_error"]["code"] == "github_write_failed"
     assert now[0] == 600
     assert not agents.development_thread_ids
     assert not agents.publication_requests
     assert paused["active_ticket_job"]["ticket_number"] == 3
-    assert paused["active_ticket_job"]["phase"] == "developing"
+    assert paused["active_ticket_job"]["phase"] == "blocked"
+    assert paused["active_ticket_job"]["blocked_reason"] == "ticket_supervision_timeout"
+    assert paused["active_ticket_job"]["execution_resume_phase"] == "developing"
+    assert paused["active_ticket_job"]["review_budget"]["development_attempts"] == 0
     publisher.offline = False
-    controller.resume(run_id)
+    controller.resume(run_id, explicit_resume=True)
     completed = TicketDeliveryEngine(
         git=git, states=states, github=publisher, agents=agents
     ).deliver(run_id)

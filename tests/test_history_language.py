@@ -9,10 +9,9 @@ from typing import Any
 import pytest
 from rich.text import Text
 
-from support.workspace import managed_state
-
 from agent_run.cli import main
-from conftest import seed_run, write_fixture
+from support.cli import read_run_state_bytes, replace_only_run_state
+from support.seeding import seed_run, write_fixture
 
 
 class Terminal(StringIO):
@@ -48,16 +47,17 @@ def publication_events() -> list[dict[str, Any]]:
     ]
 
 
-def save_history(repo: Path, events: list[dict[str, Any]]) -> tuple[str, Path]:
+def save_history(
+    repo: Path, events: list[dict[str, Any]]
+) -> tuple[str, dict[str, Any]]:
     fixture = write_fixture(repo / "github.json", issues={})
     started = seed_run(repo, fixture, idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    path = managed_state(repo) / "runs" / f"{run_id}.json"
-    state = json.loads(path.read_text())
-    state["timeline"] = events
-    path.write_text(json.dumps(state))
-    return run_id, path
+    state = replace_only_run_state(
+        repo, lambda persisted: persisted.update(timeline=events)
+    )
+    return run_id, state
 
 
 def render(run_id: str, *arguments: str) -> str:
@@ -73,10 +73,10 @@ def test_history_groups_final_pr_preparation_without_hiding_checks_or_raw_events
 ) -> None:
     assert main(["settings", "configure", "--language", language, "--json"]) == 0
     events = publication_events()
-    run_id, path = save_history(git_repo, events)
+    run_id, _ = save_history(git_repo, events)
+    before_state_bytes = read_run_state_bytes(git_repo, run_id)
     # Personal changes affect future Runs, not this frozen Run.
     assert main(["settings", "configure", "--language", "en" if language == "zh" else "zh", "--json"]) == 0
-    before = path.read_bytes()
     monkeypatch.chdir(git_repo)
     # Exercise Rich even when the developer's shell requests plain output.
     monkeypatch.delenv("NO_COLOR", raising=False)
@@ -107,7 +107,7 @@ def test_history_groups_final_pr_preparation_without_hiding_checks_or_raw_events
                 assert "".join(description.split()) in visible_content
     audit = json.loads(render(run_id, "--json"))
     assert audit["timeline"] == events
-    assert path.read_bytes() == before
+    assert read_run_state_bytes(git_repo, run_id) == before_state_bytes
 
 
 @pytest.mark.parametrize("boundary", ["failure", "different_attempt", "unfinished"])
@@ -145,3 +145,32 @@ def test_abandoned_history_does_not_claim_successful_delivery(
     output = render(run_id, "--plain")
     assert "交付已放弃" in output
     assert "整体交付完成" not in output
+
+
+@pytest.mark.parametrize("prefix", ["新增 Ticket", "移除 Ticket"])
+def test_scope_change_localizes_generated_labels_without_rewriting_original_text(
+    prefix: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from copy import deepcopy
+    from agent_run.cli_presentation import _print_history
+
+    summary = f"{prefix} 是本次要求的原始说明"
+    blocker = f"{prefix} 是原始人工阻塞"
+    state = {
+        "language": "en", "run_id": "scope-run", "status": "unsupported_scope_change",
+        "timeline": [{
+            "at": "2026-09-21T00:00:00+00:00", "kind": "unsupported_scope_change",
+            "status": "unsupported_scope_change", "human_blockers": [blocker],
+            "graph_change_summary": {
+                "summary": summary, "added_tickets": [5], "removed_tickets": [6],
+            },
+        }],
+    }
+    before = deepcopy(state)
+    _print_history(state, as_json=False, plain=True, details=True)
+    output = capsys.readouterr().out
+    assert summary in output
+    assert blocker in output
+    assert "Added subtasks [5]" in output
+    assert "Removed subtasks [6]" in output
+    assert state == before

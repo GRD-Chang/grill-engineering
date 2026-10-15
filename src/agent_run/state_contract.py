@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.prompt_resources import validate_resources
+from agent_run.ci_recovery_budget import ci_limit_for_job, ensure_ci_recovery_budget
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     parent_only_budget_policy_for_job,
@@ -12,17 +15,20 @@ from agent_run.delivery_policy import (
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
+from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,
+    scoped_budget_validation,
 )
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
+from agent_run.integration_resync_budget import require_resync_budget
+from agent_run.integration_development_budget import integration_development_limit, require_integration_development_budget, semantic_attempt_budget
 from agent_run.operator_gate import (
     active_ticket_gate_mirror_is_consistent,
     operator_gate_identity_is_consistent,
-    operator_gate_subject_count,
     operator_gate_subjects,
 )
 from agent_run.required_checks_observation import (
@@ -31,14 +37,17 @@ from agent_run.required_checks_observation import (
 )
 from agent_run.state_errors import (
     IncompatibleRunStateError as IncompatibleRunStateError,
+    MissingRunMaterialsError,
 )
 from agent_run.ticket_phase import TicketPhase
+from agent_run.ticket_queue import requires_integration_seat
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
 )
 from agent_run.publication_operation_retry import (
     publication_operation_attempt,
     require_publication_operation_retry,
+    scoped_publication_attempts,
 )
 from agent_run.resume_audit_contract import (
     RESUME_AUDIT_EVENT_KEYS,
@@ -53,38 +62,68 @@ from agent_run.semantic_attempt import (
     require_semantic_attempt_record,
 )
 from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.sqlite_encoding import encode_json, object_path
+from agent_run.sqlite_job_history import FIELDS as JOB_ARCHIVES
+from agent_run.sqlite_timeline import TimelineScope, FIELDS as TIMELINE_FIELDS, limit as timeline_limit
+
+def require_current_work_state(
+    state: dict[str, Any], archived_histories: Mapping[str, tuple[int, int]],
+    related_attempts: Mapping[str, dict[str, Any]] | None = None,
+    timelines: Mapping[str, TimelineScope] | None = None,
+) -> None:
+    """Validate loaded facts; account for unloaded Job archives and Timeline.
+
+    StateStore supplies metadata from this consistent SQLite read, never a
+    prior authorization or an invented empty list. Complete Run checks retain
+    the original validator and inspect every archived material.
+    """
+    timelines = timelines or {}
+    for key, scope in timelines.items():
+        if (key not in TIMELINE_FIELDS or key in state or not isinstance(scope, TimelineScope)
+                or not 0 <= scope.count <= timeline_limit(key)):
+            raise IncompatibleRunStateError("invalid scoped Timeline field")
+    budget_owners = {}
+    for encoded, (size, count) in archived_histories.items():
+        path = object_path(encoded)
+        if not (len(path) == 2 and path[0] == "active_ticket_job" and path[1] in JOB_ARCHIVES
+                or len(path) == 3 and path[0] == "ticket_jobs" and isinstance(path[1], str) and path[2] in JOB_ARCHIVES):
+            raise IncompatibleRunStateError("invalid scoped Job archive identity")
+        owner: Any = state
+        for part in path[:-1]:
+            owner = owner.get(part) if isinstance(owner, dict) else None
+        if (not isinstance(owner, dict) or path[-1] in owner or type(size) is not int or size < 2
+                or type(count) is not int or count < 0):
+            raise IncompatibleRunStateError("scoped Job archive was loaded, modified or lost its owner")
+        if path[-1] == "review_budget_history":
+            budget_owners[id(owner)] = count
+    attempt_owners = {}
+    for encoded, attempt in (related_attempts or {}).items():
+        path = object_path(encoded)
+        related_owner: Any = state
+        for part in path:
+            related_owner = related_owner.get(part) if isinstance(related_owner, dict) else None
+        archive = encode_json((*path, "semantic_attempt_history"))
+        if (archive not in archived_histories or not isinstance(related_owner, dict)
+                or related_owner.get("publication_operation_retry") is None
+                or attempt.get("role") != "publication" or attempt.get("status") != "completed"
+                or attempt.get("ordinal") != related_owner.get("publication_attempts")):
+            raise IncompatibleRunStateError("invalid scoped Publication Attempt association")
+        attempt_owners[id(related_owner)] = attempt
+    with scoped_budget_validation(budget_owners), scoped_publication_attempts(attempt_owners):
+        if timelines:
+            _validate_current_run_state(state, timelines)
+        else:
+            require_current_run_state(state)
+
+
+_DEFAULT_WORK_VALIDATION = require_current_work_state
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
 _ACTIVE_RUN_REPAIR_PHASES = frozenset(
     {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-        "accepted",
-        "publishing",
-        "publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "escalating",
-        "merging",
-        "merged",
-        "blocked",
-    }
-)
-_INTEGRATED_REVALIDATION_MERGE_PHASES = frozenset(
-    {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-        "accepted",
-        "escalating",
-        "merged",
-        "blocked",
+        "developing", "repairing", "committing_candidate", "candidate",
+        "reviewing", "accepted", "escalating", "blocked",
     }
 )
 _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
@@ -105,16 +144,50 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
         "outcome",
     }
 )
-_INTEGRATED_REVALIDATION_MERGE_KEYS = frozenset(
-    {
-        "base_sha",
-        "default_base_sha",
-        "candidate_sha",
-        "publication_sha",
-    }
-)
-def require_current_run_state(state: dict[str, Any]) -> None:
+def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = False) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
+
+    if parent_scope:
+        # This is a validation scope, never a replacement authority record.
+        # Delivery evidence attached by a caller remains outside Parent writes.
+        from agent_run.object_state import _PARENT_EXCLUDED_FIELDS
+        state = {key: value for key, value in state.items() if key not in _PARENT_EXCLUDED_FIELDS}
+    _validate_current_run_state(state, {}, parent_scope=parent_scope)
+
+
+def _validate_current_run_state(
+    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+) -> None:
+    try:
+        _require_current_run_state(state, timelines, parent_scope=parent_scope)
+    except (ValueError, KeyError, TypeError) as error:
+        # Protocol identity must be explicit. This is diagnosis of damaged new
+        # Runs, never a legacy migration or permission to fill defaults.
+        if "schema_version" in state or any(
+            type(state.get(key)) is not type(expected) or state.get(key) != expected
+            for key, expected in (
+                ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
+                ("branch_authority_protocol", 3),
+                ("review_budget_protocol", 2),
+                ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
+                ("semantic_attempt_protocol", 1),
+                ("multi_ticket_protocol", 4),
+            )
+        ):
+            raise
+        detail = str(error)
+        if error.__cause__ is not None:
+            detail += f" ({error.__cause__})"
+        raise MissingRunMaterialsError(
+            f"Run {state.get('run_id', '<missing run_id>')}: 恢复状态材料缺损：{detail}；"
+            "请从可信备份补足对应字段及原工作身份、需求、基线、成果和历史，"
+            "不要猜测验收、批准或外部写入结果；补足后使用同一 agent-run resume 重新核验。"
+        ) from error
+
+
+def _require_current_run_state(
+    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+) -> None:
 
     try:
         validate_resources(state.get("prompt_resources"))
@@ -122,7 +195,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
             raise ValueError("Run language must be zh or en")
     except ValueError as error:
         raise IncompatibleRunStateError(
-            "Run 缺少或包含不兼容的语言或静态 Prompt 资源快照；不能恢复，请创建新 Run"
+            "Run 缺少或包含不兼容的 language / prompt_resources 语言或静态 Prompt 资源快照"
         ) from error
 
     if "schema_version" in state:
@@ -135,11 +208,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         )
     if type(state.get("branch_authority_protocol")) is not int or state.get(
         "branch_authority_protocol"
-    ) != 2:
+    ) != 3:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible branch authority protocol"
         )
-    if state.get("review_budget_protocol") != 1:
+    if state.get("review_budget_protocol") != 2:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Review Budget protocol"
         )
@@ -160,6 +233,10 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Semantic Agent Attempt protocol"
         )
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 4:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Multi Ticket protocol"
+        )
     for key, expected in (
         ("run_id", str),
         ("repository", str),
@@ -167,6 +244,8 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         ("base", dict),
         ("ticket_graph", dict),
         ("ticket_jobs", dict),
+        ("ticket_agent_invocations", dict),
+        ("ticket_pause_requests", dict),
         ("retired_ticket_generations", dict),
         ("pending_ticket_retirements", dict),
         ("frontier", list),
@@ -176,17 +255,36 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         ("diagnostics", list),
         ("status", str),
     ):
+        if key in timelines or parent_scope and key in {
+            "ticket_jobs", "ticket_agent_invocations", "ticket_pause_requests",
+            "retired_ticket_generations", "pending_ticket_retirements",
+        }:
+            continue
         if not isinstance(state.get(key), expected):
             raise IncompatibleRunStateError(
                 f"legacy state is missing canonical {key}"
             )
+    if "github_refresh_resume_status" in state and (
+        state["github_refresh_resume_status"] != "execution_failed"
+        or state.get("github_refresh_pending") is not True
+    ):
+        raise IncompatibleRunStateError("invalid GitHub refresh Resume source status")
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
-    if operator_gate_subject_count(state) > 1:
-        raise IncompatibleRunStateError(
-            "legacy state has multiple current Run-wide Operator Gates"
-        )
+    if not parent_scope:
+        _require_ticket_integration_queue(state)
+        from agent_run.ticket_work import require_queue
+
+        require_queue(state)
+        from agent_run.resume_intent import require_ticket_resume_receipts
+
+        require_ticket_resume_receipts(state)
+        _require_ticket_agent_invocations(state)
+    elif state.get("active_ticket_job") is not None:
+        raise IncompatibleRunStateError("Parent commit cannot own an active Ticket")
+    _require_run_branch_write_intent(state)
+    _require_run_gate_exclusivity(state)
     if (
         not operator_gate_identity_is_consistent(state)
         and not _operator_gate_identity_waits_for_subject_validation(state)
@@ -199,17 +297,26 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an inconsistent active Ticket gate mirror"
         )
-    require_completed_ticket_integration_records(state)
+    if not parent_scope:
+        require_completed_ticket_integration_records(state)
     _require_required_checks_observations(state)
+    _require_branch_publication_observations(state)
     _require_review_budget_windows(state)
+    _require_ci_recovery_budgets(state)
+    _require_integration_resync_budgets(state)
+    _require_parent_integration_records(state)
     active_ticket = state.get("active_ticket_job")
     if isinstance(active_ticket, dict):
         require_active_ticket_publication_authorization(active_ticket)
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
-    _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
+    from agent_run.review_attempt import require_pending_run_review
+
+    run_review = state.get("run_acceptance")
+    if isinstance(run_review, dict):
+        require_pending_run_review(run_review)
     _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
     _require_human_response_audit(state)
     if not operator_gate_identity_is_consistent(state):
@@ -219,7 +326,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         )
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
-    if not all(isinstance(event, dict) for event in state["timeline"]):
+    if "timeline" not in timelines and not all(isinstance(event, dict) for event in state["timeline"]):
         raise IncompatibleRunStateError("legacy state has an invalid timeline")
     from agent_run.state import (
         MAX_DIAGNOSTIC_ENTRIES,
@@ -227,18 +334,18 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         MAX_TIMELINE_EVENTS,
     )
 
-    if len(state["timeline"]) > MAX_TIMELINE_EVENTS:
+    if "timeline" not in timelines and len(state["timeline"]) > MAX_TIMELINE_EVENTS:
         raise IncompatibleRunStateError("legacy state has an oversized timeline")
     if len(state["diagnostics"]) > MAX_DIAGNOSTIC_ENTRIES:
         raise IncompatibleRunStateError("legacy state has oversized diagnostics")
     timeline_continuation = state.get("timeline_continuation", [])
-    if not isinstance(timeline_continuation, list) or not all(
+    if "timeline_continuation" not in timelines and (not isinstance(timeline_continuation, list) or not all(
         isinstance(event, dict) for event in timeline_continuation
-    ):
+    )):
         raise IncompatibleRunStateError(
             "legacy state has an invalid timeline_continuation"
         )
-    if len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
+    if "timeline_continuation" not in timelines and len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
         raise IncompatibleRunStateError(
             "legacy state has an oversized timeline_continuation"
         )
@@ -324,6 +431,60 @@ def _operator_gate_identity_waits_for_subject_validation(
     return False
 
 
+def _require_branch_publication_observations(state: dict[str, Any]) -> None:
+    jobs = [
+        job for job in state.get("ticket_jobs", {}).values() if isinstance(job, dict)
+    ]
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        jobs.append(parent)
+    run = state.get("run_acceptance")
+    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
+        jobs.append(run["repair_job"])
+    for job in jobs:
+        parent_sha = job.get("publication_parent_sha")
+        if parent_sha is not None and (not isinstance(parent_sha, str) or not parent_sha):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid publication parent SHA"
+            )
+        prior_published_sha = job.get("publication_prior_published_sha")
+        if prior_published_sha is not None and (
+            not isinstance(prior_published_sha, str) or not prior_published_sha
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid prior published SHA"
+            )
+        observation = job.get("branch_publication_observation")
+        if observation is None:
+            continue
+        if not isinstance(observation, dict) or set(observation) not in (
+            {"branch", "expected_sha", "observed_sha"},
+            {"branch", "expected_sha", "observed_sha", "head_sha", "disposition"},
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication observation"
+            )
+        valid_identity = all(
+            isinstance(observation.get(key), str) and observation[key]
+            for key in ("branch", "expected_sha")
+        )
+        observed_sha = observation.get("observed_sha")
+        if not valid_identity or (
+            observed_sha is not None and not isinstance(observed_sha, str)
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication observation"
+            )
+        if "disposition" in observation and (
+            observation["disposition"] not in {"published", "already_published"}
+            or not isinstance(observation.get("head_sha"), str)
+            or not observation["head_sha"]
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication result"
+            )
+
+
 def _require_required_checks_observations(state: dict[str, Any]) -> None:
     """Validate every persisted Required Checks Observation at its owner boundary."""
 
@@ -372,7 +533,22 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
         if required_checks_origin is not None:
             origin_pr_number = pr_number
             repair_trigger = owner.get("repair_trigger")
-            if isinstance(repair_trigger, dict) and type(
+            ci_budget = delivery_budget_owner(state, owner).get("ci_recovery")
+            ci_evidence = owner.get("ci_evidence")
+            current_ci_failure = (
+                isinstance(ci_budget, dict)
+                and isinstance(ci_evidence, dict)
+                and isinstance(required_checks_origin, dict)
+                and type(ci_budget.get("developments_used")) is int
+                and isinstance(ci_budget.get("failure_head"), str)
+                and required_checks_origin.get("head_sha") == ci_budget.get("failure_head")
+                and ci_evidence.get("pr_number") == required_checks_origin.get("pr_number")
+                and isinstance(ci_evidence.get("checks"), list)
+                and bool(ci_evidence["checks"])
+            )
+            if current_ci_failure:
+                origin_pr_number = required_checks_origin["pr_number"]
+            elif isinstance(repair_trigger, dict) and type(
                 repair_trigger.get("pr_number")
             ) is int:
                 origin_pr_number = repair_trigger["pr_number"]
@@ -381,6 +557,11 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
                 location=f"{location}.required_checks_origin",
                 expected_pr_number=(
                     origin_pr_number if type(origin_pr_number) is int else None
+                ),
+                expected_head_sha=(
+                    str(ci_budget["failure_head"])
+                    if current_ci_failure and isinstance(ci_budget, dict)
+                    else None
                 ),
                 allowed_results=frozenset({"fail"}),
             )
@@ -517,6 +698,36 @@ def _require_candidate_acceptance_histories(state: dict[str, Any]) -> None:
             )
 
 
+def _require_run_branch_write_intent(state: dict[str, Any]) -> None:
+    """A saved Parent write remains bound to the original reviewed result."""
+    run = state.get("run_acceptance")
+    job = run.get("repair_job") if isinstance(run, dict) else None
+    if not isinstance(job, dict):
+        return
+    if job.get("phase") in {
+        "publishing", "publication_pending", "waiting_checks", "waiting_merge",
+        "merging", "merged",
+    }:
+        raise IncompatibleRunStateError("Parent repair contains a retired internal PR phase")
+    retired_keys = {
+        "pr_number", "ticket_write_intent", "merge_intent", "repair_job_rotation",
+        "publication", "publication_commit_intent", "integrated_revalidation_merge",
+    }
+    if retired_keys.intersection(job):
+        raise IncompatibleRunStateError("Parent repair contains retired internal PR lifecycle facts")
+    intent = job.get("run_branch_write_intent")
+    if intent is None:
+        return
+    keys = {"branch", "base_sha", "candidate_sha", "default_base_sha"}
+    if (not isinstance(intent, dict) or set(intent) != keys
+            or not all(isinstance(intent[key], str) and intent[key] for key in keys)):
+        raise IncompatibleRunStateError("Parent Run Branch write intent is incomplete")
+    if (intent["branch"] != state.get("run_branch")
+            or any(intent[key] != job.get(key) for key in keys - {"branch"})
+            or not isinstance(job.get("acceptance_record"), dict)):
+        raise IncompatibleRunStateError("Parent Run Branch write intent differs from its reviewed candidate")
+
+
 def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
     acceptance = state.get("run_acceptance")
     if not isinstance(acceptance, dict):
@@ -530,38 +741,115 @@ def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
         )
 
 
-def _require_integrated_revalidation_merge(state: dict[str, Any]) -> None:
-    """Validate the persisted authority snapshot used after a merged repair drifts."""
-
+def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
+    subjects: list[tuple[str, dict[str, Any]]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        subjects.extend((f"ticket_jobs[{key}]", job) for key, job in jobs.items() if isinstance(job, dict))
+    for key in ("active_ticket_job", "parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            subjects.append((key, job))
     acceptance = state.get("run_acceptance")
-    if not isinstance(acceptance, dict):
-        return
-    repair = acceptance.get("repair_job")
-    if not isinstance(repair, dict) or "integrated_revalidation_merge" not in repair:
-        return
-    marker = repair["integrated_revalidation_merge"]
-    location = "run_acceptance.repair_job.integrated_revalidation_merge"
-    if not isinstance(marker, dict):
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} object"
-        )
-    if set(marker) != _INTEGRATED_REVALIDATION_MERGE_KEYS:
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} field set"
-        )
-    if repair.get("phase") not in _INTEGRATED_REVALIDATION_MERGE_PHASES:
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} phase"
-        )
-    if repair.get("repair_mode") != "squash":
-        raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} repair mode"
-        )
-    for key in _INTEGRATED_REVALIDATION_MERGE_KEYS:
-        value = marker[key]
-        if not isinstance(value, str) or not value.strip():
+    if isinstance(acceptance, dict):
+        scopes = acceptance.get("repair_integration_budgets", {})
+        if not isinstance(scopes, dict):
+            raise IncompatibleRunStateError("Run repair integration budget scopes are invalid")
+        for generation, scope in scopes.items():
+            if (
+                not isinstance(generation, str) or not generation.isdigit()
+                or int(generation) < 1 or str(int(generation)) != generation
+                or not isinstance(scope, dict)
+                or set(scope) - {"policy_snapshot", "integration_resync"}
+            ):
+                raise IncompatibleRunStateError("Run repair integration budget scope is invalid")
+            try:
+                _require_policy_snapshot_binding(scope.get("policy_snapshot"),
+                    acceptance.get("policy_snapshot"), "repair_integration_budgets")
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError("Run repair integration policy is invalid") from error
+            subjects.append((f"run_acceptance.repair_integration_budgets[{generation}]", scope))
+    for location, job in subjects:
+        development_budget = job.get("integration_development_budget")
+        if development_budget is not None:
+            try:
+                require_integration_development_budget(
+                    development_budget, policy_snapshot=job.get("policy_snapshot") or state.get("policy_snapshot"),
+                    expected_limit=integration_development_limit(job, job.get("policy_snapshot") or state.get("policy_snapshot")),
+                )
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError(
+                    f"incompatible_run_state: {location}.integration_development_budget is invalid"
+                ) from error
+        budget = job.get("integration_resync")
+        if budget is None:
+            continue
+        try:
+            require_resync_budget(
+                budget,
+                policy_snapshot=job.get("policy_snapshot") or state.get("policy_snapshot"),
+            )
+        except (TypeError, ValueError) as error:
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"incompatible_run_state: {location}.integration_resync is invalid"
+            ) from error
+
+
+def _require_ci_recovery_budgets(state: dict[str, Any]) -> None:
+    subjects: list[tuple[str, dict[str, Any], bool]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        subjects.extend(
+            (f"ticket_jobs[{key}]", job, True)
+            for key, job in jobs.items()
+            if isinstance(job, dict) and _looks_like_materialized_job(job)
+        )
+    for key in ("parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            subjects.append((key, job, False))
+    for location, job, is_ticket in subjects:
+        try:
+            limit = ci_limit_for_job(
+                job, state_snapshot=state.get("policy_snapshot")
+            )
+            ensure_ci_recovery_budget(
+                job, limit=limit,
+                is_ticket=is_ticket,
+            )
+        except (TypeError, ValueError) as error:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.ci_recovery is invalid"
+            ) from error
+
+
+def _require_parent_integration_records(state: dict[str, Any]) -> None:
+    for subject_key, record_key in (
+        ("parent_job", "parent_integration"),
+        ("run_acceptance", "run_integration"),
+    ):
+        subject = state.get(subject_key)
+        if not isinstance(subject, dict):
+            continue
+        record = subject.get(record_key)
+        if record is None:
+            continue
+        if not isinstance(record, dict) or set(record) != {
+            "candidate_sha", "candidate_tree", "source_sha", "target_sha",
+            "head_sha", "head_tree", "conflict_paths",
+        }:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {subject_key}.{record_key} is invalid"
+            )
+        if any(
+            not isinstance(record[key], str) or not record[key]
+            for key in record if key != "conflict_paths"
+        ) or not isinstance(record["conflict_paths"], list) or any(
+            not isinstance(path, str) or not path
+            for path in record["conflict_paths"]
+        ):
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {subject_key}.{record_key} is invalid"
             )
 
 
@@ -616,17 +904,13 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                 run_snapshot = value.get("policy_snapshot") or state.get(
                     "policy_snapshot"
                 )
-                run_budget = value.get("review_budget")
-                repair_budget = repair.get("review_budget")
-                if (
-                    isinstance(run_budget, dict)
-                    and isinstance(repair_budget, dict)
-                    and type(run_budget.get("window")) is int
-                    and type(repair_budget.get("window")) is int
-                    and run_budget["window"] != repair_budget["window"]
+                if any(
+                    field in repair
+                    for field in ("review_budget", "review_budget_history", "ci_recovery",
+                                  "integration_resync")
                 ):
                     raise IncompatibleRunStateError(
-                        "legacy state has mismatched Run Acceptance and Run Repair Budget Windows"
+                        "Run Repair must not persist delivery budgets"
                     )
                 if repair.get("publication_authority") == "fallback" or (
                     "fallback_publication_receipt" in repair
@@ -640,14 +924,11 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                         run_snapshot,
                         "run_acceptance.repair_job",
                     )
-                    repair_policy = run_repair_budget_policy_for_job(
-                        repair, state_snapshot=run_snapshot
-                    )
                 except (TypeError, ValueError) as error:
                     raise IncompatibleRunStateError(
                         "legacy state has an invalid run_acceptance.repair_job.policy_snapshot"
                     ) from error
-                subjects.append(("run_acceptance.repair_job", repair, repair_policy))
+
     for location, job, policy in subjects:
         try:
             ensure_budget(job, policy)
@@ -664,9 +945,11 @@ def _require_policy_snapshot_binding(
 
     if nested is None:
         raise ValueError(f"{location}.policy_snapshot is missing")
-    nested_snapshot = parse_policy_snapshot(nested).snapshot()
-    parent_snapshot = parse_policy_snapshot(parent).snapshot()
-    if nested_snapshot != parent_snapshot:
+    # Parsing normalizes all scalar fields; compare frozen values without
+    # allocating two new mutable snapshot dictionaries for each association.
+    nested_policy = parse_policy_snapshot(nested)
+    parent_policy = parse_policy_snapshot(parent)
+    if nested_policy != parent_policy:
         raise ValueError(f"{location}.policy_snapshot differs from its Run Snapshot")
 
 
@@ -710,7 +993,7 @@ def _require_human_blocker_containers(state: dict[str, Any]) -> None:
 def _human_blocker_subjects(state: dict[str, Any]) -> list[dict[str, Any]]:
     subjects: list[dict[str, Any]] = []
     subjects.extend(
-        job for job in state["ticket_jobs"].values() if isinstance(job, dict)
+        job for job in state.get("ticket_jobs", {}).values() if isinstance(job, dict)
     )
     for key in ("parent_job", "run_acceptance", "run_publication"):
         value = state.get(key)
@@ -750,6 +1033,180 @@ def _require_base(base: dict[str, Any]) -> None:
     for key in ("branch", "sha"):
         if not isinstance(base.get(key), str):
             raise IncompatibleRunStateError(f"legacy state has an invalid base.{key}")
+
+
+def _require_run_gate_exclusivity(state: dict[str, Any]) -> None:
+    global_gates = [
+        location
+        for location, subject in operator_gate_subjects(state)
+        if location in {"parent", "run_acceptance", "run_repair", "run_publication"}
+        and subject.get("phase")
+        in {"blocked", "ready_for_human", "publication_pending", "ready_for_approval"}
+    ]
+    if len(global_gates) > 1:
+        raise IncompatibleRunStateError(
+            "legacy state has multiple current Run-wide Operator Gates"
+        )
+    active = state.get("active_ticket_job")
+    if global_gates and isinstance(active, dict) and active.get("phase") not in {
+        "completed", "abandoned"
+    }:
+        raise IncompatibleRunStateError(
+            "legacy state has a Run-wide Operator Gate with an active Ticket Job"
+        )
+
+
+def _require_ticket_agent_invocations(state: dict[str, Any]) -> None:
+    for key, requested_at in state["ticket_pause_requests"].items():
+        if (
+            not isinstance(key, str)
+            or not key.isdecimal()
+            or key not in state["ticket_graph"]["tickets"]
+            or not isinstance(requested_at, str)
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket pause request"
+            )
+    invocations = state["ticket_agent_invocations"]
+    jobs = state["ticket_jobs"]
+    for job in jobs.values():
+        wait = job.get("external_wait") if isinstance(job, dict) else None
+        if wait is None:
+            continue
+        if (
+            not isinstance(wait, dict)
+            or wait.get("status") not in {"waiting_checks", "waiting_external", "waiting_merge"}
+            or not isinstance(wait.get("diagnostics"), list)
+            or not isinstance(wait.get("supervision_window"), dict)
+        ):
+            raise IncompatibleRunStateError("Ticket external wait has an invalid supervision record")
+        from agent_run.external_supervision import supervision_window_matches
+
+        if not supervision_window_matches(
+            {**state, **wait, "active_ticket_job": job}, wait["supervision_window"]
+        ):
+            raise IncompatibleRunStateError("Ticket external wait has a stale supervision identity")
+    for key, invocation in invocations.items():
+        if (
+            not isinstance(key, str)
+            or not key.isdecimal()
+            or key not in jobs
+            or not isinstance(invocation, dict)
+            or invocation.get("work_subject") != f"ticket:{key}"
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket Agent Invocation owner"
+            )
+        _require_invocation(
+            invocation, f"ticket_agent_invocations[{key}]", str(state["run_id"])
+        )
+        if invocation["status"] != "completed":
+            _require_active_invocation_identity(state, invocation)
+
+
+def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
+    """Bind the single integration seat and ordered waiters to Ticket Jobs."""
+
+    queue = state.get("ticket_integration_queue")
+    holder = state.get("ticket_integration_holder")
+    jobs = state["ticket_jobs"]
+    if not isinstance(queue, list) or "ticket_integration_holder" not in state:
+        raise IncompatibleRunStateError(
+            "legacy state is missing the Ticket integration queue"
+        )
+    if holder is not None and (type(holder) is not int or holder < 1):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid Ticket integration holder"
+        )
+
+    queued: set[int] = set()
+    previous: tuple[datetime, int] | None = None
+    for entry in queue:
+        if not isinstance(entry, dict) or set(entry) != {"ticket_number", "ready_at"}:
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration queue entry"
+            )
+        number = entry["ticket_number"]
+        ready_at = entry["ready_at"]
+        if type(number) is not int or number < 1 or not isinstance(ready_at, str):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration queue entry"
+            )
+        try:
+            instant = datetime.fromisoformat(ready_at)
+            if instant.tzinfo is None or instant.utcoffset() is None:
+                raise ValueError("ready_at must include a UTC offset")
+            order = (instant.astimezone(UTC), number)
+        except (ValueError, OverflowError) as error:
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration ready_at"
+            ) from error
+        if number in queued or (previous is not None and order <= previous):
+            raise IncompatibleRunStateError(
+                "legacy state has an unordered or duplicate Ticket integration queue"
+            )
+        job = jobs.get(str(number))
+        if (
+            not isinstance(job, dict)
+            or type(job.get("ticket_number")) is not int
+            or job["ticket_number"] != number
+            or job.get("phase") != "ready_for_integration"
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket integration queue/Job mismatch"
+            )
+        queued.add(number)
+        previous = order
+
+    if holder in queued:
+        raise IncompatibleRunStateError(
+            "legacy state has a Ticket in both integration seat and queue"
+        )
+    if holder is not None:
+        job = jobs.get(str(holder))
+        if (
+            not isinstance(job, dict)
+            or type(job.get("ticket_number")) is not int
+            or job["ticket_number"] != holder
+            or not requires_integration_seat(job)
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket integration holder/Job mismatch"
+            )
+
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        phase = job.get("phase")
+        number = job.get("ticket_number")
+        resume_phase = job.get("integration_resume_phase")
+        if resume_phase is not None and (
+            phase != "ready_for_integration"
+            or resume_phase not in {
+                "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged",
+            }
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration resume phase"
+            )
+        if phase == "ready_for_integration" and (
+            type(number) is not int or number not in queued
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an unqueued ready Ticket Job"
+            )
+        if requires_integration_seat(job) and phase not in {"candidate", "reviewing"} and number != holder:
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket Job outside its integration seat"
+            )
+
+    active = state.get("active_ticket_job")
+    if active is not None:
+        number = active.get("ticket_number") if isinstance(active, dict) else None
+        if type(number) is not int or number < 1 or jobs.get(str(number)) != active:
+            raise IncompatibleRunStateError(
+                "legacy state has an inconsistent active Ticket gate mirror"
+            )
 
 
 def _require_ticket_graph(graph: dict[str, Any]) -> None:
@@ -1003,17 +1460,17 @@ def _require_invocation(
     ):
         if not isinstance(invocation.get(key), str):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"run state has an invalid {location}.{key}"
             )
     if not isinstance(invocation.get("generation"), int) or isinstance(
         invocation.get("generation"), bool
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.generation"
+            f"run state has an invalid {location}.generation"
         )
     if not isinstance(invocation.get("currentness_boundary"), dict):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.currentness_boundary"
+            f"run state has an invalid {location}.currentness_boundary"
         )
     semantic_attempt = invocation.get("semantic_attempt")
     if not isinstance(semantic_attempt, dict):
@@ -1022,7 +1479,7 @@ def _require_invocation(
         )
     if invocation.get("status") not in {"running", "failed", "completed", "resuming"}:
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.status"
+            f"run state has an invalid {location}.status"
         )
     for key in ("ordinary_recovery_used", "recovery_waiting", "execution_interrupted"):
         if key in invocation and type(invocation[key]) is not bool:
@@ -1069,7 +1526,7 @@ def _require_invocation(
         or re.fullmatch(r"sha256:[0-9a-f]{64}", resume_id) is None
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.resume_id"
+            f"run state has an invalid {location}.resume_id"
         )
     resume_sequence = invocation.get("resume_sequence")
     if (resume_id is None and resume_sequence is not None) or (
@@ -1077,13 +1534,13 @@ def _require_invocation(
         and (type(resume_sequence) is not int or resume_sequence < 1)
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.resume_sequence"
+            f"run state has an invalid {location}.resume_sequence"
         )
     role = invocation["role"]
     phase = invocation["phase"]
     work_subject = invocation["work_subject"]
     allowed_phases = {
-        "development": {"developing", "repairing"},
+        "development": {"developing", "repairing", "integration_conflict", "run_integration_conflict"},
         "fresh_acceptance": {"reviewing"},
         "publication": {"publication"},
         "reviewer": {"run_acceptance"},
@@ -1091,7 +1548,7 @@ def _require_invocation(
     }
     if role not in allowed_phases or phase not in allowed_phases[role]:
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location} role or phase"
+            f"run state has an invalid {location} role or phase"
         )
     semantic_role = (
         "development"
@@ -1109,58 +1566,63 @@ def _require_invocation(
         )
     except (TypeError, ValueError) as error:
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.semantic_attempt: {error}"
+            f"run state has an invalid {location}.semantic_attempt: {error}"
         ) from error
     if semantic_role in {"development", "reviewer"}:
         if type(semantic_attempt.get("budget_window")) is not int:
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.semantic_attempt budget window"
+                f"run state has an invalid {location}.semantic_attempt budget window"
             )
     elif semantic_attempt.get("budget_window") is not None:
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.semantic_attempt budget window"
+            f"run state has an invalid {location}.semantic_attempt budget window"
         )
     if invocation["mode"] not in {"fresh", "resume", "new-thread"}:
-        raise IncompatibleRunStateError(f"legacy state has an invalid {location}.mode")
+        raise IncompatibleRunStateError(f"run state has an invalid {location}.mode")
     change_subject = (
         re.fullmatch(r"ticket:[1-9][0-9]*", work_subject) is not None
         or work_subject in {f"parent-only:{run_id}", f"run-repair:{run_id}"}
     )
     if (
         role in {"development", "fresh_acceptance", "publication"}
-        and not change_subject
+        and not (
+            change_subject and phase != "run_integration_conflict"
+            or role == "development"
+            and phase == "run_integration_conflict"
+            and work_subject == f"run-integration:{run_id}"
+        )
     ) or (
         role == "reviewer" and work_subject != f"run-acceptance:{run_id}"
     ) or (
         role == "final_publication" and work_subject != f"run-publication:{run_id}"
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.work_subject"
+            f"run state has an invalid {location}.work_subject"
         )
     if not isinstance(invocation.get("attempt_count"), int) or isinstance(
         invocation.get("attempt_count"), bool
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.attempt_count"
+            f"run state has an invalid {location}.attempt_count"
         )
     deadline_seconds = invocation.get("deadline_seconds")
     if deadline_seconds is not None and not _is_positive_finite_number(
         deadline_seconds
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.deadline_seconds"
+            f"run state has an invalid {location}.deadline_seconds"
         )
     deadline_at = invocation.get("deadline_at")
     if deadline_at is not None and (
         not isinstance(deadline_at, str) or not deadline_at.strip()
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.deadline_at"
+            f"run state has an invalid {location}.deadline_at"
         )
     for key in ("requested_thread_id", "reported_thread_id", "ended_at", "error"):
         if invocation.get(key) is not None and not isinstance(invocation.get(key), str):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"run state has an invalid {location}.{key}"
             )
     for key in ("return_code", "signal"):
         if invocation.get(key) is not None and (
@@ -1168,7 +1630,7 @@ def _require_invocation(
             or isinstance(invocation.get(key), bool)
         ):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"run state has an invalid {location}.{key}"
             )
     for key in (
         "binding_id",
@@ -1181,7 +1643,7 @@ def _require_invocation(
         value = invocation.get(key)
         if value is not None and (not isinstance(value, str) or not value):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"run state has an invalid {location}.{key}"
             )
     for key in ("binding_role", "profile_role", "invocation_role"):
         role_value = invocation.get(key)
@@ -1191,19 +1653,19 @@ def _require_invocation(
             "publication",
         }:
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.{key}"
+                f"run state has an invalid {location}.{key}"
             )
     revision = invocation.get("profile_revision")
     if revision is not None and (
         not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.profile_revision"
+            f"run state has an invalid {location}.profile_revision"
         )
     binding = invocation.get("thread_execution_binding")
     if binding is not None and not isinstance(binding, dict):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}.thread_execution_binding"
+            f"run state has an invalid {location}.thread_execution_binding"
         )
 
 
@@ -1224,9 +1686,9 @@ def _require_active_invocation_identity(
             or not _change_owner_phase_is_current(invocation, job)
         ):
             raise IncompatibleRunStateError(
-                "legacy state has a stale active Ticket Invocation"
+                f"run state has a stale active Ticket Invocation: {subject} owner, generation, phase or conflict context mismatch"
             )
-        _require_pending_invocation_attempt(job, invocation)
+        _require_pending_invocation_attempt(job, invocation, state=state)
         return
     if subject == f"parent-only:{run_id}":
         job = state.get("parent_job")
@@ -1238,37 +1700,45 @@ def _require_active_invocation_identity(
     elif subject == f"run-acceptance:{run_id}":
         acceptance = state.get("run_acceptance")
         current_generation = _reviewer_generation(acceptance, invocation["status"])
+    elif subject == f"run-integration:{run_id}":
+        acceptance = state.get("run_acceptance")
+        current_generation = (
+            acceptance.get("acceptance_generation")
+            if isinstance(acceptance, dict) else None
+        )
     elif subject == f"run-publication:{run_id}":
         acceptance = state.get("run_acceptance")
         publication = state.get("run_publication")
-        if not isinstance(publication, dict) or publication.get("phase") != "publishing":
+        if not isinstance(publication, dict) or not _paused_role_phase(publication, "run_publication", "publishing"):
             raise IncompatibleRunStateError(
-                "legacy state has an active Final Publication without a valid owner"
+                "run state has an active Final Publication without a valid owner"
             )
         current_generation = _final_publication_generation(acceptance)
     else:
-        raise IncompatibleRunStateError("legacy state has an invalid active Invocation")
+        raise IncompatibleRunStateError("run state has an invalid active Invocation")
     if (
         type(current_generation) is not int
         or current_generation != generation
         or subject in {f"parent-only:{run_id}", f"run-repair:{run_id}"}
         and not _change_owner_phase_is_current(invocation, job)
     ):
-        raise IncompatibleRunStateError("legacy state has a stale active Invocation")
-    if subject == f"run-acceptance:{run_id}":
+        raise IncompatibleRunStateError(
+            f"run state has a stale active Invocation: {subject} owner, generation, phase or conflict context mismatch"
+        )
+    if subject in {f"run-acceptance:{run_id}", f"run-integration:{run_id}"}:
         owner = state.get("run_acceptance")
     elif subject == f"run-publication:{run_id}":
         owner = state.get("run_publication")
     else:
         owner = job
-    _require_pending_invocation_attempt(owner, invocation)
+    _require_pending_invocation_attempt(owner, invocation, state=state)
 
 
 def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
     """Reject owner-local Attempt contradictions even without an active pointer."""
 
     run_id = str(state["run_id"])
-    owners: list[tuple[str, dict[str, Any], set[str], str, int]] = []
+    owners: list[tuple[str, dict[str, Any], set[str], str | dict[str, str], int]] = []
     jobs = state.get("ticket_jobs")
     if isinstance(jobs, dict):
         for key, value in jobs.items():
@@ -1313,8 +1783,11 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             (
                 "run_acceptance",
                 acceptance,
-                {"reviewer"},
-                f"run-acceptance:{run_id}",
+                {"reviewer", "development"},
+                {
+                    "reviewer": f"run-acceptance:{run_id}",
+                    "development": f"run-integration:{run_id}",
+                },
                 int(acceptance.get("acceptance_generation", 1)),
             )
         )
@@ -1324,7 +1797,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
                 (
                     "run_acceptance.repair_job",
                     repair,
-                    {"development", "reviewer", "publication"},
+                    {"development", "reviewer"},
                     f"run-repair:{run_id}",
                     int(repair.get("repair_generation", 1)),
                 )
@@ -1347,7 +1820,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
     retired = state.get("retired_semantic_attempt_owners", [])
     if not isinstance(retired, list) or len(retired) > 64:
         raise IncompatibleRunStateError(
-            "legacy state has invalid retired Semantic Agent Attempt owners"
+            "run state has invalid retired Semantic Agent Attempt owners"
         )
     for index, owner in enumerate(retired):
         if (
@@ -1359,13 +1832,13 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             or owner.get("pending_semantic_attempt") is not None
         ):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid retired Semantic Agent Attempt owner at index {index}"
+                f"run state has an invalid retired Semantic Agent Attempt owner at index {index}"
             )
         owners.append(
             (
                 f"retired_semantic_attempt_owners[{index}]",
                 owner,
-                {"development", "reviewer", "publication"},
+                {"development", "reviewer"},
                 f"run-repair:{run_id}",
                 int(owner["generation"]),
             )
@@ -1382,10 +1855,11 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
         if pending is not None:
             if not isinstance(pending, dict):
                 raise IncompatibleRunStateError(
-                    f"legacy state has an invalid {location}.pending_semantic_attempt"
+                    f"run state has an invalid {location}.pending_semantic_attempt"
                 )
             _require_owner_attempt(
                 pending,
+                state=state,
                 location=f"{location}.pending_semantic_attempt",
                 status="pending",
                 roles=roles,
@@ -1398,16 +1872,17 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
         history = owner.get("semantic_attempt_history", [])
         if not isinstance(history, list):
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid {location}.semantic_attempt_history"
+                f"run state has an invalid {location}.semantic_attempt_history"
             )
         for index, attempt in enumerate(history):
             if not isinstance(attempt, dict):
                 raise IncompatibleRunStateError(
-                    f"legacy state has an invalid {location}.semantic_attempt_history[{index}]"
+                    f"run state has an invalid {location}.semantic_attempt_history[{index}]"
                 )
             item_location = f"{location}.semantic_attempt_history[{index}]"
             _require_owner_attempt(
                 attempt,
+                state=state,
                 location=item_location,
                 status="completed",
                 roles=roles,
@@ -1417,21 +1892,46 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
                 require_current=False,
             )
             _require_unique_attempt_record(records_by_id, attempt, item_location)
+        if "semantic_attempt_history" not in owner:
+            related = publication_operation_attempt(owner)
+            if isinstance(related, dict) and related.get("status") == "completed":
+                _require_owner_attempt(
+                    related, state=state, location=f"{location}.related_publication_attempt",
+                    status="completed", roles=roles, work_subject=work_subject,
+                    maximum_generation=generation, owner=owner, require_current=False,
+                )
+                _require_unique_attempt_record(records_by_id, related, location)
 
 
 def _require_owner_publication_operation_retry(
     owner: dict[str, Any], *, location: str, publication_capable: bool
 ) -> None:
+    history = owner.get("publication_operation_retry_history", [])
+    if not isinstance(history, list):
+        raise IncompatibleRunStateError(
+            f"run state has invalid {location}.publication_operation_retry_history"
+        )
+    for index, entry in enumerate(history):
+        try:
+            prior = require_publication_operation_retry(
+                entry, location=f"{location}.publication_operation_retry_history[{index}]"
+            )
+        except ValueError as error:
+            raise IncompatibleRunStateError(f"run state has invalid {error}") from error
+        if prior["attempts"] != prior["limit"]:
+            raise IncompatibleRunStateError(
+                f"run state has non-exhausted {location}.publication_operation_retry_history"
+            )
     value = owner.get("publication_operation_retry")
     if value is None:
         if owner.get("phase") == "publication_pending":
             raise IncompatibleRunStateError(
-                f"legacy state has {location}.publication_pending without its Operation Retry"
+                f"run state has {location}.publication_pending without its Operation Retry"
             )
         return
     if not publication_capable:
         raise IncompatibleRunStateError(
-            f"legacy state has Publication Operation Retry on non-publication owner {location}"
+            f"run state has Publication Operation Retry on non-publication owner {location}"
         )
     try:
         retry = require_publication_operation_retry(
@@ -1439,27 +1939,27 @@ def _require_owner_publication_operation_retry(
             location=f"{location}.publication_operation_retry",
         )
     except ValueError as error:
-        raise IncompatibleRunStateError(f"legacy state has invalid {error}") from error
+        raise IncompatibleRunStateError(f"run state has invalid {error}") from error
     exhausted = retry["attempts"] == retry["limit"]
     phase = owner.get("phase")
     if phase == "publication_pending" and not exhausted:
         raise IncompatibleRunStateError(
-            f"legacy state has non-exhausted {location}.publication_pending"
+            f"run state has non-exhausted {location}.publication_pending"
         )
     if exhausted and phase not in {"publication_pending", "stale", "abandoned"}:
         raise IncompatibleRunStateError(
-            f"legacy state has exhausted {location}.publication_operation_retry outside a terminal boundary"
+            f"run state has exhausted {location}.publication_operation_retry outside a terminal boundary"
         )
     attempt = publication_operation_attempt(owner)
     if attempt is None:
         raise IncompatibleRunStateError(
-            f"legacy state has orphaned {location}.publication_operation_retry"
+            f"run state has orphaned {location}.publication_operation_retry"
         )
     if attempt.get("status") == "completed" and attempt.get(
         "publication_operation_retry"
     ) != retry:
         raise IncompatibleRunStateError(
-            f"legacy state has conflicting {location}.publication_operation_retry authority"
+            f"run state has conflicting {location}.publication_operation_retry authority"
         )
 
 
@@ -1469,22 +1969,23 @@ def _require_owner_attempt(
     location: str,
     status: str,
     roles: set[str],
-    work_subject: str,
+    work_subject: str | dict[str, str],
     maximum_generation: int,
     owner: dict[str, Any],
     require_current: bool,
+    state: dict[str, Any],
 ) -> None:
     try:
         require_semantic_attempt_record(attempt, expected_status=status)
     except ValueError as error:
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid {location}: {error}"
+            f"run state has an invalid {location}: {error}"
         ) from error
     attempt_retry = attempt.get("publication_operation_retry")
     if attempt_retry is not None:
         if status != "completed" or attempt.get("role") != "publication":
             raise IncompatibleRunStateError(
-                f"legacy state has misplaced Publication Operation Retry at {location}"
+                f"run state has misplaced Publication Operation Retry at {location}"
             )
         try:
             require_publication_operation_retry(
@@ -1493,26 +1994,29 @@ def _require_owner_attempt(
             )
         except ValueError as error:
             raise IncompatibleRunStateError(
-                f"legacy state has invalid {error}"
+                f"run state has invalid {error}"
             ) from error
     generation = int(attempt["generation"])
     if (
         attempt["role"] not in roles
-        or attempt["work_subject"] != work_subject
+        or attempt["work_subject"] != (
+            work_subject.get(str(attempt["role"]))
+            if isinstance(work_subject, dict) else work_subject
+        )
         or generation > maximum_generation
         or (require_current and generation != maximum_generation)
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an owner mismatch at {location}"
+            f"run state has an owner mismatch at {location}"
         )
     budget_window = attempt.get("budget_window")
     if attempt["role"] == "publication":
         if budget_window is not None:
             raise IncompatibleRunStateError(
-                f"legacy state has an invalid Publication Budget Window at {location}"
+                f"run state has an invalid Publication Budget Window at {location}"
             )
         return
-    budget = owner.get("review_budget")
+    budget = semantic_attempt_budget(delivery_budget_owner(state, owner), attempt)
     current_window = budget.get("window") if isinstance(budget, dict) else None
     if (
         type(current_window) is not int
@@ -1521,7 +2025,7 @@ def _require_owner_attempt(
         or (require_current and budget_window != current_window)
     ):
         raise IncompatibleRunStateError(
-            f"legacy state has an invalid Review Budget Window at {location}"
+            f"run state has an invalid Review Budget Window at {location}"
         )
 
 
@@ -1532,17 +2036,17 @@ def _require_unique_attempt_record(
     previous = records.get(attempt_id)
     if previous is not None and previous != attempt:
         raise IncompatibleRunStateError(
-            f"legacy state has conflicting Semantic Agent Attempt mirrors at {location}"
+            f"run state has conflicting Semantic Agent Attempt mirrors at {location}"
         )
     records[attempt_id] = attempt
 
 
 def _require_pending_invocation_attempt(
-    owner: object, invocation: dict[str, Any]
+    owner: object, invocation: dict[str, Any], *, state: dict[str, Any],
 ) -> None:
     if not isinstance(owner, dict):
         raise IncompatibleRunStateError(
-            "legacy state has an active Invocation without an Attempt owner"
+            "run state has an active Invocation without an Attempt owner"
         )
     pending = owner.get("pending_semantic_attempt")
     bound = invocation.get("semantic_attempt")
@@ -1552,14 +2056,14 @@ def _require_pending_invocation_attempt(
         or pending.get("attempt_id") != bound.get("attempt_id")
     ):
         raise IncompatibleRunStateError(
-            "legacy state has inconsistent pending Semantic Agent Attempt and active Invocation"
+            "run state has inconsistent pending Semantic Agent Attempt and active Invocation"
         )
     budget_window = pending.get("budget_window")
     if budget_window is not None:
-        budget = owner.get("review_budget")
+        budget = semantic_attempt_budget(delivery_budget_owner(state, owner), pending)
         if not isinstance(budget, dict) or budget.get("window") != budget_window:
             raise IncompatibleRunStateError(
-                "legacy state has a pending Semantic Agent Attempt in the wrong Budget Window"
+                "run state has a pending Semantic Agent Attempt in the wrong Budget Window"
             )
 
 
@@ -1623,9 +2127,21 @@ def _reviewer_generation(acceptance: object, invocation_status: str) -> int | No
     if type(validation_attempts) is not int or validation_attempts < 1:
         return None
     expected_phase = "pending" if invocation_status == "resuming" else "reviewing"
-    if acceptance.get("phase") != expected_phase:
+    if not _paused_role_phase(acceptance, "run_acceptance", expected_phase):
         return None
     return generation
+
+
+def _paused_role_phase(owner: dict[str, Any], location: str, expected: str) -> bool:
+    if owner.get("phase") == expected:
+        return True
+    if owner.get("phase") not in {"blocked", "ready_for_human"}:
+        return False
+    from agent_run.resume_work import continuation_phase
+    try:
+        return continuation_phase(location, owner) == expected
+    except ValueError:
+        return False
 
 
 def _final_publication_generation(acceptance: object) -> int | None:
@@ -1640,18 +2156,114 @@ def _change_owner_phase_is_current(
 ) -> bool:
     if not isinstance(job, dict):
         return False
+    if (
+        job.get("phase") in {"blocked", "ready_for_human"}
+        and invocation.get("status") in {"failed", "completed", "resuming"}
+    ):
+        from agent_run.resume_work import continuation_phase
+        location = "ticket" if invocation.get("work_subject", "").startswith("ticket:") else "parent"
+        try:
+            job = {**job, "phase": continuation_phase(location, job)}
+        except ValueError:
+            return False
+    if (
+        job.get("phase") == "ready_for_integration"
+        and job.get("integration_resume_phase") == "accepted"
+        and invocation.get("status") in {"failed", "completed", "resuming"}
+    ):
+        # A resumed Publication/conflict attempt retains its exact owner while
+        # waiting for the single integration seat; it cannot run in the queue.
+        job = {**job, "phase": "accepted"}
     role = invocation["role"]
     phase = invocation["phase"]
     if role == "development":
-        return isinstance(phase, str) and job.get("phase") == phase
+        if phase == "integration_conflict":
+            return _change_conflict_owner_is_current(invocation, job)
+        return isinstance(phase, str) and (
+            job.get("phase") == phase
+            or (
+                job.get("blocked_reason") == "ticket_execution_failed"
+                and job.get("execution_resume_phase") == phase
+            )
+        )
     if role == "fresh_acceptance":
-        return job.get("phase") == "reviewing"
+        return (
+            job.get("phase") == "reviewing"
+            or (
+                job.get("phase") == "candidate"
+                and invocation.get("status") in {"failed", "resuming"}
+            )
+        ) or (
+            job.get("blocked_reason") == "ticket_execution_failed"
+            and job.get("execution_resume_phase") == "reviewing"
+        )
     if role == "publication":
         # Publication generation begins while the accepted Candidate is still
         # intact.  ``publishing`` is written only after the Agent returned a
         # valid artifact and its commit was created.
-        return job.get("phase") == "accepted"
+        return job.get("phase") == "accepted" or (
+            job.get("blocked_reason") == "ticket_execution_failed"
+            and job.get("execution_resume_phase") == "accepted"
+        )
     return False
+
+
+def _change_conflict_owner_is_current(
+    invocation: dict[str, Any], job: dict[str, Any]
+) -> bool:
+    """A conflict call retains its accepted/candidate business owner phase."""
+    phase = job.get("phase")
+    if phase == "blocked" and job.get("blocked_reason") == "ticket_execution_failed":
+        phase = job.get("execution_resume_phase")
+    if phase not in {"accepted", "candidate"}:
+        return False
+    subject = invocation["work_subject"]
+    if phase == "candidate" and (
+        subject.startswith("ticket:") and job.get("attempt_kind") != "ci_repair"
+        or subject.startswith("parent-only:") and not isinstance(job.get("parent_integration"), dict)
+        or subject.startswith("run-repair:") and isinstance(job.get("integrated_sha"), str)
+    ):
+        return False
+    key = (
+        "integration_conflict" if subject.startswith("ticket:")
+        else "parent_integration_conflict" if subject.startswith("parent-only:")
+        else "run_repair_integration_conflict"
+    )
+    conflict = job.get(key)
+    boundary = invocation.get("currentness_boundary", {})
+    if not isinstance(conflict, dict) or not isinstance(boundary, dict):
+        return False
+    if (
+        not isinstance(job.get("candidate_sha"), str)
+        or conflict.get("candidate_sha") != job["candidate_sha"]
+        or boundary.get("candidate_sha") != job["candidate_sha"]
+        or boundary.get("base_sha") != job.get("base_sha")
+        or conflict.get("stage") not in {"source", "target", "git_check"}
+        or type(conflict.get("attempts")) is not int
+        or conflict["attempts"] != 1
+        or (conflict.get("stage") != "git_check" and conflict.get("merge_head_sha") != conflict.get(f"{conflict.get('stage')}_sha"))
+        or not isinstance(conflict.get("paths"), list)
+        or (conflict.get("stage") != "git_check" and not conflict["paths"])
+        or any(not isinstance(path, str) or not path for path in conflict["paths"])
+    ):
+        return False
+    if any(
+        boundary.get(field) != job.get(field)
+        for field in ("effective_revision", "parent_revision", "ticket_graph_revision",
+                      "default_base_sha", "repair_base_run_head_sha")
+    ):
+        return False
+    if conflict.get("stage") == "git_check":
+        if not isinstance(conflict.get("failure"), dict) or not conflict["failure"].get("error"):
+            return False
+        merge_head = conflict.get("merge_head_sha")
+        if merge_head is not None and (not isinstance(merge_head, str) or not merge_head):
+            return False
+    return all(
+        isinstance(conflict.get(field), str) and bool(conflict[field])
+        for field in (("source_sha", "target_sha", "head_sha") if conflict.get("stage") == "git_check"
+                      else ("source_sha", "target_sha", "head_sha", "merge_head_sha"))
+    )
 
 
 def _is_human_blocker(subject: dict[str, Any]) -> bool:

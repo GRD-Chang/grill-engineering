@@ -12,6 +12,7 @@ from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.git import GitRepository
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
+from support.state import persist_run_fixture
 
 
 def _git(root: Path, *args: str) -> str:
@@ -28,6 +29,7 @@ def _completed_ticket(git_repo: Path) -> tuple[GitRepository, StateStore, dict[s
     git.ensure_run_branch(branch, publication)
     job = {'ticket_number': 2, 'ticket_branch': branch, 'phase': 'completed', 'publication_sha': publication, 'integrated_sha': integrated}
     state = {'run_id': 'run-cleanup', 'status': 'completed', 'ticket_jobs': {'2': job}}
+    persist_run_fixture(states, str(state['run_id']), state)
     return git, states, state, job
 
 
@@ -452,3 +454,24 @@ def test_final_run_cleanup_accepts_its_native_detached_publication_checkout(git_
     assert result['delivery_cleanup']['status'] == 'completed'
     assert not checkout.exists()
     assert git.managed_branch_head(job['ticket_branch']) is None
+
+
+def test_ticket_closeout_does_not_attempt_another_ticket_cleanup(git_repo: Path) -> None:
+    git, states, state, job = _completed_ticket(git_repo)
+    other = 'agent-run/run-cleanup/ticket-3'
+    base = git.resolve('main')
+    checkout = states.root / 'worktrees' / 'run-cleanup' / 'ticket-3'
+    git.prepare_ticket_checkout(branch=other, base_sha=base, checkout=checkout)
+    (checkout / 'active-work.txt').write_text('work in progress\n')
+    item = {
+        'kind': 'ticket', 'branch': other, 'expected_head_sha': base,
+        'checkout': str(checkout), 'attempts': 0, 'status': 'pending',
+    }
+    state['delivery_cleanup'] = {'status': 'pending', 'items': {other: item}}
+    result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(state, job)
+    assert result['delivery_cleanup']['items'][other] == item
+    assert item['attempts'] == 0
+    assert (checkout / 'active-work.txt').read_text() == 'work in progress\n'
+    assert git.resolve(other) == base
+    assert result['delivery_cleanup']['items'][job['ticket_branch']]['status'] == 'completed'
+    assert result['delivery_cleanup']['status'] == 'cleanup_pending'

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import (
     Controller,
     _change_job_for_invocation,
@@ -22,8 +26,8 @@ from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.semantic_attempt import allocate_semantic_attempt
-from conftest import write_fixture
-from run_acceptance_test_support import _passing_artifact
+from support.seeding import write_fixture
+from support.state import persist_run_fixture
 
 
 def _canonical_budget() -> dict[str, Any]:
@@ -35,6 +39,21 @@ def _canonical_budget() -> dict[str, Any]:
         "review_artifacts": [],
         "checkpoint_reason": None,
     }
+
+
+def _with_canonical_ci_budgets(state: dict[str, Any]) -> None:
+    """Materialize the CI fields alongside hand-built invocation subjects."""
+
+    for owner in (*state.get("ticket_jobs", {}).values(), state.get("active_ticket_job"),
+                  ):
+        if isinstance(owner, dict):
+            owner.setdefault("ci_recovery", new_ticket_ci_recovery_budget())
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        parent.setdefault("ci_recovery", new_ci_recovery_budget())
+    run = state.get("run_acceptance")
+    if isinstance(run, dict):
+        run.setdefault("ci_recovery", new_ci_recovery_budget())
 
 
 def test_human_response_history_keeps_ordered_immutable_entries() -> None:
@@ -242,6 +261,7 @@ def _prepared_resume(
         active_ticket = state.get("active_ticket_job")
         if isinstance(active_ticket, dict):
             active_ticket.update(job)
+        state["ticket_integration_holder"] = 3
         role = "publication"
         work_subject = "ticket:3"
         attempt_owner = job
@@ -252,16 +272,14 @@ def _prepared_resume(
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "repair_job": {
-                "phase": "accepted",
+                "phase": "candidate",
                 "policy_snapshot": dict(state["policy_snapshot"]),
-                "review_budget": _canonical_budget(),
-                "review_budget_history": [],
                 "repair_generation": 2,
                 "repair_mode": "squash",
-                "publication_thread_id": "current-repair-thread",
+                "review_resume_thread_id": "current-repair-thread",
             }
         }
-        role = "publication"
+        role = "fresh_acceptance"
         work_subject = f"run-repair:{run_id}"
         attempt_owner = state["run_acceptance"]["repair_job"]
     elif subject_kind == "final_publication":
@@ -296,7 +314,8 @@ def _prepared_resume(
     invocation: dict[str, Any] = {
         "role": role,
         "work_subject": work_subject,
-        "phase": "run_publication" if role == "final_publication" else "publication",
+        "phase": ("run_publication" if role == "final_publication" else
+                  "reviewing" if role == "fresh_acceptance" else "publication"),
         "mode": "fresh",
         "input_fingerprint": "fixture",
         "currentness_boundary": {},
@@ -315,18 +334,20 @@ def _prepared_resume(
     if type(invocation_generation) is int:
         semantic_attempt = allocate_semantic_attempt(
             attempt_owner,
-            role="publication",
+            role="reviewer" if role == "fresh_acceptance" else "publication",
             work_subject=work_subject,
             generation=invocation_generation,
             currentness_boundary={},
             ordinal=1,
+            budget_window=1 if role == "fresh_acceptance" else None,
         )
         invocation["semantic_attempt"] = dict(semantic_attempt)
     state["active_agent_invocation"] = invocation
     state["agent_invocation_history"] = []
     state["status"] = "execution_failed"
     state["terminal_kind"] = "execution_failed"
-    store.save_run(run_id, state)
+    _with_canonical_ci_budgets(state)
+    persist_run_fixture(store, run_id, state)
     return controller, store, run_id
 
 
@@ -334,7 +355,7 @@ def _prepared_resume(
     "subject_kind", ["ticket", "run_repair", "final_publication"]
 )
 @pytest.mark.parametrize("new_thread", [False, True])
-def test_resume_fails_closed_for_stale_publication_generation(
+def test_resume_fails_closed_for_stale_agent_generation(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     subject_kind: str,
@@ -392,10 +413,18 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     state, _ = controller.start(1)
     run_id = str(state["run_id"])
     job = state["ticket_jobs"]["3"]
+    git = GitRepository(git_repo)
+    branch = f"agent-run/{run_id}/ticket-3"
+    checkout = store.root / "worktrees" / run_id / "ticket-3"
+    git.prepare_ticket_checkout(branch=branch, base_sha=git.resolve("HEAD"), checkout=checkout)
+    preserved = checkout / "credential-interrupted-work.txt"
+    preserved.write_text("development before credential failure\n")
     job.update(
         {
             "phase": "developing",
             "ticket_branch_generation": 1,
+            "ticket_branch": branch,
+            "managed_checkout_head": git.checkout_head(checkout),
             "development_thread_id": "development-thread",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
@@ -443,9 +472,10 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
             },
         }
     )
-    store.save_run(run_id, state)
+    _with_canonical_ci_budgets(state)
+    persist_run_fixture(store, run_id, state)
 
-    resumed, reused = controller.resume(run_id)
+    resumed, reused = controller.resume(run_id, explicit_resume=True, message="凭据已恢复，继续原开发。")
 
     assert reused
     assert resumed["status"] == "active"
@@ -453,6 +483,14 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     assert resumed["diagnostics"] == []
     assert resumed["active_agent_invocation"]["status"] == "resuming"
     assert resumed["ticket_jobs"]["3"]["development_failure_resume"] is True
+    assert resumed["ticket_jobs"]["3"]["pending_semantic_attempt"] == semantic_attempt
+    assert resumed["ticket_jobs"]["3"]["review_budget"] == job["review_budget"]
+    assert resumed["ticket_jobs"]["3"]["development_thread_id"] == "development-thread"
+    assert git.ticket_checkout_matches(checkout, branch)
+    assert git.checkout_head(checkout) == job["managed_checkout_head"]
+    assert preserved.read_text() == "development before credential failure\n"
+
+    assert resumed["ticket_jobs"]["3"]["human_response_history"][-1]["response"] == "凭据已恢复，继续原开发。"
 
 
 @pytest.mark.parametrize(
@@ -465,7 +503,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     ],
 )
 @pytest.mark.parametrize("new_thread", [False, True])
-def test_publication_failure_resume_marks_the_successor_mode(
+def test_agent_failure_resume_marks_the_successor_mode(
     git_repo: Path,
     subject_kind: str,
     invocation_generation: int,
@@ -486,10 +524,11 @@ def test_publication_failure_resume_marks_the_successor_mode(
         publication = resumed["ticket_jobs"]["3"]
     else:
         publication = resumed["parent_job"]
+    resume_key = "review_failure_resume" if subject_kind == "run_repair" else "publication_failure_resume"
     if new_thread:
-        assert "publication_failure_resume" not in publication
+        assert resume_key not in publication
     else:
-        assert publication["publication_failure_resume"] is True
+        assert publication[resume_key] is True
 
 
 _MISSING = object()
@@ -521,4 +560,24 @@ def test_parent_only_resume_rejects_invalid_generation_without_mutation(
         controller.resume(run_id, new_thread=new_thread)
 
     assert save_calls == []
+    assert store.load_run(run_id) == before
+
+
+def test_parent_repair_rejects_internal_publication_attempt(git_repo: Path) -> None:
+    controller, store, run_id = _prepared_resume(
+        git_repo, subject_kind="run_repair", invocation_generation=2,
+    )
+    state = store.load_run(run_id)
+    assert state is not None
+    job = state["run_acceptance"]["repair_job"]
+    job.pop("pending_semantic_attempt")
+    allocate_semantic_attempt(
+        job, role="publication", work_subject=f"run-repair:{run_id}",
+        generation=2, currentness_boundary={}, ordinal=1,
+    )
+    state["active_agent_invocation"] = None
+    persist_run_fixture(store, run_id, state)
+    before = store.load_run(run_id)
+    with pytest.raises(IncompatibleRunStateError, match="owner mismatch"):
+        controller.resume(run_id)
     assert store.load_run(run_id) == before

@@ -14,17 +14,22 @@ from support.workspace import managed_repo, managed_state
 
 from agent_run import cli as cli_module
 from agent_run.delivery_policy import policy_snapshot_for_state
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.executor_host import ExecutorSpec, HostObservation
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.git import Publisher
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey, payload_digest
-from cli_fixtures import run_agents
-from conftest import seed_run, write_fixture
-from test_cli import _canonical_run_budget, load_only_run_state
-from test_receipt_successors import _install_host
-from test_run_lifecycle import _isolated_environment
-from test_ticket_194_stop_abandon import _bind_running_executor
+from support.cli_fixtures import run_agents
+from support.seeding import seed_run, write_fixture
+from support.cli import load_only_run_state
+from support.run_artifacts import _canonical_run_budget
+from support.receipt_host import _install_host
+from support.lifecycle import _isolated_environment
+from support.control import _bind_running_executor
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -83,6 +88,8 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                     "parent": 1,
                     "policy": policy_snapshot_for_state(state),
                     "profile": {"preset": None, "overrides": {}},
+                    "github_identity": state["github_identity"],
+                    "runner_github_identity": state["runner_github_identity"],
                 }
             )
         if command in {"resume", "approve", "revise", "requeue"}:
@@ -99,6 +106,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                 "phase": "pending",
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             }
             state["requeue_required"] = {
                 "work_subject": f"parent-only:{run_id}",
@@ -115,15 +123,15 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             if receipt_case == "invalid":
                 # Syntactically valid evidence referring to a different Run.
                 receipt["run_id"] = "run-unrelated"
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         path = control.path_for(task)
         if control_case == "missing":
             path.unlink()
         else:
             path.write_text("not json", encoding="utf-8")
         control_before = path.read_bytes() if path.exists() else None
-        state_path = states.runs_directory / f"{run_id}.json"
-        state_before = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        state_before = snapshot_run(state_ref)
         fixture_before = fixture.read_bytes()
         agents_before = agents.read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, host_status or "unknown")
@@ -175,7 +183,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                     reconciled_state["diagnostics"][-1]["code"] == "session_interrupted"
                 )
             else:
-                assert state_path.read_bytes() == state_before
+                assert snapshot_run(state_ref) == state_before
             assert fixture.read_bytes() == fixture_before
             assert agents.read_bytes() == agents_before
             if not proven_exited:
@@ -222,10 +230,10 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             after = path.read_bytes() if path.exists() else None
             if attempt == 0:
                 after_first = after
-                state_after_first = state_path.read_bytes()
+                state_after_first = snapshot_run(state_ref)
             else:
                 assert after == after_first
-                assert state_path.read_bytes() == state_after_first
+                assert snapshot_run(state_ref) == state_after_first
     finally:
         if worker.poll() is None:
             worker.kill()
@@ -273,15 +281,15 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
         state["status"] = status
         state["terminal_kind"] = "operator_stopped" if command == "stop" else None
         state.pop("action_application_receipt", None)
-        states.save_run(run_id, state)
+        persist_run_fixture(states, run_id, state)
         path = control.path_for(task)
         if control_case == "missing":
             path.unlink()
         else:
             path.write_text("not json", encoding="utf-8")
         before_control = path.read_bytes() if path.exists() else None
-        state_path = states.runs_directory / f"{run_id}.json"
-        before_state = state_path.read_bytes()
+        state_ref = (states.root, str(run_id))
+        before_state = snapshot_run(state_ref)
         before_fixture = fixture.read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, "exited")
         monkeypatch.setattr(
@@ -318,7 +326,7 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
             assert prepared == []
             assert published == []
             assert worker.poll() is None
-            assert state_path.read_bytes() == before_state
+            assert snapshot_run(state_ref) == before_state
             assert fixture.read_bytes() == before_fixture
             assert (path.read_bytes() if path.exists() else None) == before_control
     finally:

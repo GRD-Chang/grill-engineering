@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,9 @@ from agent_run.run_locator import RunLocatorIndex
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import write_fixture
-from test_run_lifecycle import _file_snapshot, _isolated_environment
+from support.seeding import write_fixture
+from support.lifecycle import _file_snapshot, _isolated_environment
+from support.cli import modify_only_run_state, snapshot_run_states
 from support.inprocess_cli import invoke_cli_inprocess
 from support.published_run import prepare_published_run
 
@@ -51,7 +53,6 @@ def waiting_run(
         repository=state["repository"],
         parent_number=state["parent"]["number"],
     )
-    path = managed_state(git_repo) / "runs" / f"{run_id}.json"
     publication = state["run_publication"]
     publication["phase"] = "waiting_checks"
     publication["required_checks_evidence"] = {
@@ -69,7 +70,7 @@ def waiting_run(
     assert claim.action is not None and claim.action_id is not None
     control.bind_run(task, claim.action_id, run_id)
     prepare_action_application_receipt(state, claim.action)
-    path.write_text(json.dumps(state))
+    modify_only_run_state(git_repo, lambda persisted: persisted.update(state))
     control.record_application(
         task, action_id=claim.action_id, run_id=run_id,
         payload_digest=claim.action["payload_digest"],
@@ -103,6 +104,45 @@ def status_text(run_id: str, *, plain: bool) -> str:
     return Text.from_ansi(output.getvalue()).plain
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_queries_distinguish_draining_scheduler_from_live_executor(
+    waiting_run: tuple[Path, dict[str, Any]], language: str,
+) -> None:
+    repo, state = waiting_run
+    state["language"] = language
+    modify_only_run_state(repo, lambda persisted: persisted.update(language=language))
+    control = TaskControlStore(managed_state(repo))
+    task = TaskKey(managed_repo(repo), state["repository"], state["parent"]["number"])
+    record = control.load(task)
+    assert record is not None
+    executor = record["executor"]
+    assert control.close_ticket_resume_admission(
+        task, action_id=executor["action_id"], generation=executor["generation"],
+        run_id=state["run_id"], can_exit=lambda: True, failure="scheduler failed",
+    )
+    before = _workspace_snapshot(repo)
+    for command in ("status", "history"):
+        output = StringIO()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"], "--json"]) == 0
+        audit = json.loads(output.getvalue())
+        assert audit["executor_control"]["activity"] == "running"
+        progress = audit["progress"] if command == "status" else audit
+        assert progress["scheduler"] == {
+            "activity": "draining", "failure": "scheduler failed",
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"], "--plain"]) == 0
+        assert ("调度已停止" if language == "zh" else "Scheduling stopped") in output.getvalue()
+        output = TerminalOutput()
+        with redirect_stdout(output):
+            assert cli.main([command, state["run_id"]]) == 0
+        assert ("调度已停止" if language == "zh" else "Scheduling stopped") in Text.from_ansi(output.getvalue()).plain
+    assert ("调度已停止" if language == "zh" else "Scheduling stopped") in status_text(state["run_id"], plain=False)
+    assert _workspace_snapshot(repo) == before
+
+
 @pytest.mark.parametrize("plain", [True, False])
 def test_running_agent_status_does_not_offer_a_duplicate_run_command(
     waiting_run: tuple[Path, dict[str, Any]], plain: bool,
@@ -111,8 +151,6 @@ def test_running_agent_status_does_not_offer_a_duplicate_run_command(
     publication = state["run_publication"]
     publication["phase"] = "publishing"
     state["status"] = "run_publication_pending"
-    state.pop("supervision_window", None)
-    state.pop("supervision_wait", None)
     subject = f"run-publication:{state['run_id']}"
     generation = state["run_acceptance"]["acceptance_generation"]
     attempt = allocate_semantic_attempt(
@@ -126,9 +164,17 @@ def test_running_agent_status_does_not_offer_a_duplicate_run_command(
         "status": "running", "started_at": state["created_at"],
         "model": "gpt-5.6-luna", "reasoning_effort": "xhigh",
     }
-    path = managed_state(repo) / "runs" / f"{state['run_id']}.json"
-    path.write_text(json.dumps(state))
+    def persist_running_publication(persisted: dict[str, Any]) -> None:
+        persisted.update(state)
+        persisted.pop("supervision_window", None)
+        persisted.pop("supervision_wait", None)
+
+    modify_only_run_state(repo, persist_running_publication)
+    state = snapshot_run_states(repo)[state["run_id"]]
+    assert "supervision_window" not in state
+    assert "supervision_wait" not in state
     before = _workspace_snapshot(repo)
+    before_states = snapshot_run_states(repo)
     human = status_text(state["run_id"], plain=plain)
     assert "你暂时无需操作" in human
     assert "gpt-5.6-luna" in human and "xhigh" in human
@@ -141,6 +187,7 @@ def test_running_agent_status_does_not_offer_a_duplicate_run_command(
     assert audit["operator_action"] is None
     assert audit["next_action"] == "agent-run run 1"
     assert _workspace_snapshot(repo) == before
+    assert snapshot_run_states(repo) == before_states
 
 
 def test_waiting_status_shows_current_checks_without_restart_command(
@@ -172,6 +219,49 @@ def test_waiting_status_shows_current_checks_without_restart_command(
     assert audit["executor_control"]["activity"] == "running"
     assert _workspace_snapshot(repo) == before
     assert _file_snapshot(Path.home().parent) == before_user_state
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_multi_ticket_status_details_are_localized_and_read_only(
+    waiting_run: tuple[Path, dict[str, Any]], language: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A read-only query still projects live elapsed time. Hold the query clock
+    # constant so equality verifies query determinism rather than wall-clock speed.
+    queried_at = datetime.now(UTC)
+
+    class QueryClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return queried_at.astimezone(tz) if tz is not None else queried_at.replace(tzinfo=None)
+
+    monkeypatch.setattr("agent_run.execution_timing.datetime", QueryClock)
+    monkeypatch.setattr("agent_run.history_facts.datetime", QueryClock)
+    repo, state = waiting_run
+    state["language"] = language
+    state["multi_ticket_protocol"] = 4
+    modify_only_run_state(repo, lambda persisted: persisted.update(state))
+    before = _workspace_snapshot(repo)
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    audit = json.loads(output.getvalue())
+    assert audit["progress"]["ticket_progress"] == {"completed": 1, "total": 1}
+
+    label = "子任务明细" if language == "zh" else "Ticket details"
+    for plain in (True, False):
+        human = status_text(state["run_id"], plain=plain)
+        if plain:
+            assert ("等待合并前检查" if language == "zh" else "Waiting for pre-merge checks") in human
+        else:
+            assert label in human
+            assert "Ticket #3" in human
+
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    assert json.loads(output.getvalue()) == audit
+    assert _workspace_snapshot(repo) == before
 
 
 @pytest.mark.parametrize("host", ["not_running", "unknown"])
@@ -217,7 +307,7 @@ def test_timed_out_wait_shows_human_time_and_current_recovery_action(
         now=lambda: 1_010_000.0, sleeper=lambda _: pytest.fail("expired wait must not sleep"),
     )
     assert supervisor.before_retry(state) is False
-    (managed_state(repo) / "runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
+    modify_only_run_state(repo, lambda persisted: persisted.update(state))
     before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
@@ -233,7 +323,7 @@ def test_unconfigured_checks_are_not_shown_as_a_successful_ci_run(
 ) -> None:
     repo, state = waiting_run
     state["run_publication"]["required_checks_evidence"].update(result="none", checks=[])
-    (managed_state(repo) / "runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
+    modify_only_run_state(repo, lambda persisted: persisted.update(state))
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert "未配置合并前检查" in output
@@ -253,8 +343,7 @@ def test_credential_wait_explains_failure_without_raw_failure_class(
         now=lambda: 1_010_000.0, sleeper=lambda _: pytest.fail("expired wait must not sleep"),
     )
     assert supervisor.before_retry(state) is False
-    path = managed_state(repo) / "runs" / f"{state['run_id']}.json"
-    path.write_text(json.dumps(state))
+    modify_only_run_state(repo, lambda persisted: persisted.update(state))
     before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)

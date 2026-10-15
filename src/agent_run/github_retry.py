@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import random
-import os
-import signal
 import subprocess
-import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 from pathlib import Path
 
-from agent_run.git_output import git_environment
+from agent_run.runner_transport import runner_options
+from agent_run.bounded_command import capture_command
 
 
 MAX_READ_ATTEMPTS = 3
@@ -22,6 +21,7 @@ def run_read_command(
     *,
     cwd: Path | None = None,
     before_attempt: Callable[[], None] | None = None,
+    runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     last: subprocess.CompletedProcess[str] | None = None
     for attempt in range(MAX_READ_ATTEMPTS):
@@ -32,6 +32,7 @@ def run_read_command(
                 arguments,
                 cwd=cwd,
                 timeout=READ_TIMEOUT_SECONDS,
+                **runner_options(runner_identity),
             )
         except subprocess.TimeoutExpired as error:
             result = subprocess.CompletedProcess(
@@ -49,13 +50,15 @@ def run_read_command(
 
 
 def run_write_command(
-    arguments: list[str], *, cwd: Path | None = None
+    arguments: list[str], *, cwd: Path | None = None,
+    runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return _run_bounded_command(
             arguments,
             cwd=cwd,
             timeout=READ_TIMEOUT_SECONDS,
+            **runner_options(runner_identity),
         )
     except subprocess.TimeoutExpired as error:
         return subprocess.CompletedProcess(
@@ -73,89 +76,37 @@ def _text(value: bytes | str | None) -> str:
 
 
 def _run_bounded_command(
-    arguments: list[str], *, cwd: Path | None, timeout: int
+    arguments: list[str], *, cwd: Path | None, timeout: int,
+    runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    from agent_run.runner_transport import (
+        runner_environment, runner_git_environment, redact_transport_output,
+    )
+
+    environment = (runner_git_environment(runner_identity, cwd=cwd) if arguments[0] == "git"
+                   else runner_environment(runner_identity))
     process = subprocess.Popen(
         arguments,
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        env=git_environment(),
+        env=environment,
     )
-    stdout = bytearray()
-    stderr = bytearray()
-
-    stop_readers = threading.Event()
-
-    def drain(stream: object, destination: bytearray) -> None:
-        fileno = getattr(stream, "fileno", None)
-        if not callable(fileno):
-            return
-        try:
-            descriptor = fileno()
-            os.set_blocking(descriptor, False)
-            deadline: float | None = None
-            while True:
-                if stop_readers.is_set():
-                    # Drain buffered output, but escaped pipe holders cannot
-                    # extend cleanup indefinitely by keeping the pipe open.
-                    if deadline is None:
-                        deadline = time.monotonic() + 0.1
-                    if time.monotonic() >= deadline:
-                        return
-                try:
-                    chunk = os.read(descriptor, 64 * 1024)
-                except BlockingIOError:
-                    if deadline is not None:
-                        return
-                    stop_readers.wait(0.05)
-                    continue
-                if not chunk:
-                    return
-                destination.extend(chunk)
-                if len(destination) > MAX_COMMAND_OUTPUT_BYTES:
-                    del destination[:-MAX_COMMAND_OUTPUT_BYTES]
-        except OSError:
-            return
-
-    assert process.stdout is not None
-    assert process.stderr is not None
-    readers = (
-        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+    result = capture_command(
+        process, timeout=timeout, max_output=MAX_COMMAND_OUTPUT_BYTES
     )
-    timed_out = False
-    try:
-        for reader in readers:
-            reader.start()
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-    finally:
-        # A successful command may leave descendants holding the output pipes.
-        # Close the owned group on every path before waiting for EOF readers.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        stop_readers.set()
-        for reader in readers:
-            if reader.ident is not None:
-                reader.join()
-        process.stdout.close()
-        process.stderr.close()
-    if timed_out:
+    stdout = redact_transport_output(result.stdout.decode("utf-8", errors="replace"), environment)
+    stderr = redact_transport_output(result.stderr.decode("utf-8", errors="replace"), environment)
+    if result.timed_out:
+        # Match CompletedProcess[str]: timeout streams are decoded and redacted
+        # text too, so callers never need to log raw credential-bearing bytes.
         raise subprocess.TimeoutExpired(
-            arguments,
-            timeout,
-            output=bytes(stdout),
-            stderr=bytes(stderr),
+            arguments, timeout, output=stdout, stderr=stderr
         )
     return subprocess.CompletedProcess(
         arguments,
-        returncode,
-        bytes(stdout).decode("utf-8", errors="replace"),
-        bytes(stderr).decode("utf-8", errors="replace"),
+        result.returncode,
+        stdout,
+        stderr,
     )

@@ -37,4 +37,14 @@ v0.1 的公开安装入口是取得 Git 仓库源码，并在用户选择的 tag
 
 用户首次安装与后续重建都需要一份源码目录，并对自己选择的 Git revision 或本地修改负责。执行所选源码的安装器与 build backend 等同于授予该源码当前用户级代码执行权限；“只修改受管位置”的承诺只约束符合本项目合同的源码，不构成对不受信 fork 的 sandbox。项目只维护一个源码树和一套 Runner 版本；README 必须把 release tag 安装作为稳定使用路径，把 branch/fork 安装明确为开发者选择。安装器只管理自己的 XDG 安装目录、Active Runner 入口和唯一边界标记的 PATH 受管配置；同名非受管入口不覆盖、不备份，卸载时发现入口已被替换则保留用户内容并报告 operational error。宿主依赖缺失时返回准确错误，由用户自行安装，可选 `agent-run doctor` 只提供诊断。管理动作不协调已经运行的生命周期进程，因此清理或卸载旧 Snapshot 后不保证旧进程继续可用。
 
-本 ADR 明确修订 ADR 0001 的 Worker GitHub 凭据来源子决策：临时 adapter、绑定当前 Repository identity 的固定只读请求、凭据不进入 Worker 与 Publisher 唯一 Mutation Authority 的边界保持不变；写请求、认证请求和其他仓库请求必须在宿主执行前拒绝。默认 provider 改为宿主已登录的 `gh`，只有操作者显式配置时才使用专用只读 GitHub App。App profile 存在但损坏、私钥不可读、签名或权限校验失败时必须有界失败，不得静默回退；App 模式继续使用短期 installation token 的有界续签与过期读取重试。GitHub 读取身份与源码安装互不耦合。
+Worker 身份支持 host/PAT/App 原生 `gh`，统一由个人 `user-defaults.json` 和 `settings show/configure` 选择；无配置默认 host。PAT 只保存环境变量名或文件路径引用，二选一；App 保存 App ID、Installation ID 与私钥路径引用，私钥不主动下发 Worker。缺失、空值或不可读明确失败，不回退宿主身份。新 Run 固定非秘密来源、引用与范围，单次覆盖不改变个人默认；恢复从同一引用取得更新值，个人默认变化不改变已有 Run。查询不签发 token、不显示秘密值。Runner 程序端独立选择 host/PAT/App，默认 host，与 Worker 复用 PAT 引用和 App 定义。选择在首次克隆及 GitHub 读取前解析，贯穿 Controller、Publisher 和远端 Git；PAT/App 强制使用 HTTPS 与所选 token，不回退 SSH、宿主 token 或 credential helper。现有 Run 保存来源与引用，缺少绑定的旧 Run 拒绝恢复。程序端 App 的后续 GitHub API 与远端 Git 调用消费续签后的凭据，不依赖额外宿主登录。
+
+App 默认采用安装已授权的权限和仓库范围，不再固定七项 read；只读与当前仓库是独立收窄选项，不能扩大安装授权。Worker 收窄不改变程序端授权。不同范围的凭据实例与交付目录隔离，签发及续签复用不解析 gh 请求的凭据实现；同一 Agent 的后续原生 gh 子进程读取原子更新后的短期 token。旧代理、可执行文件挂载替换、socket 协议和命令白名单不再保留。
+
+Runner App 与 Worker 复用签发、校验及续签实现，程序端使用完整安装授权；后续 API 和 Git 调用取得当前有效凭据。临时续签失败有界重试，有效旧 token 可用；永久失败保留已有 Run 的进度与 Execution Failure，修复固定引用后公开 resume，不切换来源。停止、失败和取消回收凭据后台任务与临时资源。
+
+发布者身份支持个人用户和 App bot，不以个人用户接口作为所有来源的身份前提。评论、事件、写入意图和恢复读回继续校验绑定作者；未知写入结果按意图与远端事实对账，不盲目重试、不认领外部操作，准确 head、验收和正式批准门禁继续有效。
+
+旧独立 App 元数据通过 settings 明确写入路径原子迁入统一配置，保持 App 来源并采用新默认范围；显式新值优先、保留其他设置。查询只报告迁移状态，不写入或签发。迁移失败保留有效数据，成功后旧配置不再是新运行的持续来源；不删除私钥或活动执行器引用的材料。个人迁移不重解释旧活动 Run 的授权；缺少身份与范围绑定的旧 Run 明确不兼容并保留数据，不从个人默认猜测补齐。
+
+Worker host/PAT 不适用 App 收窄选项，错误组合明确诊断。GitHub 凭据授权不替代角色职责、权威 Git 保护、Controller 正式批准与 Publisher 发布权威。GitHub 身份与源码安装互不耦合。普通测试使用受控服务和工具替身验证配置、范围、续签、恢复及回收，不代表真实 gh 或 Git HTTP 兼容性已验证。

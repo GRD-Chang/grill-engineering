@@ -8,6 +8,9 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
+
 
 def semantic_attempt_subjects(
     state: dict[str, Any],
@@ -96,6 +99,7 @@ def allocate_semantic_attempt(
     currentness_boundary: dict[str, Any],
     ordinal: int,
     budget_window: int | None = None,
+    budget_owner: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Allocate an Attempt or return the current resumable identity."""
 
@@ -134,15 +138,43 @@ def allocate_semantic_attempt(
         **identity,
         "status": "pending",
     }
-    budget = subject.get("review_budget")
+    owner = budget_owner if budget_owner is not None else subject
+    integration_budget = owner.get("integration_development_budget")
+    integration_work = (
+        role == "development"
+        and (isinstance(subject.get("integration_conflict"), dict)
+             or isinstance(subject.get("parent_integration_conflict"), dict)
+             or subject.get("pending_attempt_kind") == "integration")
+        and isinstance(integration_budget, dict)
+    )
+    budget = integration_budget if integration_work else owner.get("review_budget")
     if budget_window is not None and isinstance(budget, dict):
         # Capture only the bounded counters that were visible when this
         # Attempt was allocated. History must not later substitute the
         # owner's newer cumulative budget for this historical fact.
+        attempt["budget_snapshot"] = (
+            {"window": budget_window, "integration_development_used": int(budget["used"]) + 1,
+             "integration_development_limit": budget.get("limit")}
+            if integration_work else {
+                "window": budget_window,
+                "development_attempts": budget.get("development_attempts"),
+                "reviewer_invocations": budget.get("reviewer_invocations"),
+            }
+        )
+    ci_budget = owner.get("ci_recovery")
+    ci_work = (
+        role in {"development", "reviewer"}
+        and (subject.get("pending_attempt_kind") == "ci_repair" if role == "development" else subject.get("attempt_kind") == "ci_repair")
+        and isinstance(ci_budget, dict) and "developments_used" in ci_budget
+    )
+    if ci_work and isinstance(ci_budget, dict):
+        from agent_run.ci_recovery_budget import ci_limit_for_job
+        ci_limit = ci_limit_for_job(subject)
         attempt["budget_snapshot"] = {
             "window": budget_window,
-            "development_attempts": budget.get("development_attempts"),
-            "reviewer_invocations": budget.get("reviewer_invocations"),
+            "ci_developments_used": ci_budget["developments_used"],
+            "ci_development_limit": ci_limit,
+            "ci_reviewer_invocations": ci_budget["reviewer_invocations"],
         }
     subject["pending_semantic_attempt"] = attempt
     history = subject.setdefault("semantic_attempt_history", [])
@@ -232,6 +264,11 @@ def require_semantic_attempt_record(
     }
     if attempt.get("attempt_id") != canonical_fingerprint(identity):
         raise ValueError("Semantic Agent Attempt identity is invalid")
+    if "returned_result" in attempt:
+        if expected_status != "pending":
+            raise ValueError("completed Semantic Attempt retains an Agent return")
+        from agent_run.agent_return import restore_agent_return
+        restore_agent_return(attempt["returned_result"], attempt)
     if expected_status == "completed" and (
         not isinstance(attempt.get("outcome"), str) or not attempt["outcome"]
     ):
@@ -266,6 +303,7 @@ def close_semantic_attempt(
     if pending is None or pending.get("attempt_id") != attempt.get("attempt_id"):
         raise ValueError("Semantic Agent Attempt closeout does not match pending work")
     completed = deepcopy(pending)
+    completed.pop("returned_result", None)
     completed.update({"status": "completed", "outcome": outcome})
     if isinstance(result, dict):
         # Keep only the small, human-facing result facts needed when the
@@ -350,11 +388,12 @@ def retire_semantic_attempt_owner(
     retired = state.setdefault("retired_semantic_attempt_owners", [])
     if not isinstance(retired, list):
         raise ValueError("retired_semantic_attempt_owners must be an array")
+    budget_owner = delivery_budget_owner(state, owner)
     archive = {
         "owner_kind": owner_kind,
         "work_subject": work_subject,
         "generation": generation,
-        "review_budget": deepcopy(owner.get("review_budget")),
+        "review_budget": deepcopy(budget_owner.get("review_budget")),
         "semantic_attempt_history": deepcopy(history),
     }
     reviewer_attempts = [
@@ -373,6 +412,8 @@ def retire_semantic_attempt_owner(
     # whole mutable Job or its private Agent request payload.
     for key in (
         "review_budget_history",
+        "ci_recovery",
+        "integration_development_budget",
         "development_summary",
         "acceptance_artifact",
         "acceptance_record",
@@ -391,7 +432,7 @@ def retire_semantic_attempt_owner(
         "effective_revision",
         "pr_number",
     ):
-        value = owner.get(key)
+        value = (budget_owner if key in {"review_budget_history", "ci_recovery", "integration_development_budget"} else owner).get(key)
         if value is not None:
             archive[key] = deepcopy(value)
     retired.append(archive)

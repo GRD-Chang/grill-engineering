@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from support.prompt_capture import (
+    PASS_EVIDENCE,
+    _capture_public_prompt,
+)
+
 import json
 import subprocess
 from pathlib import Path
@@ -12,88 +17,6 @@ from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.delivery_loop import TicketDeliveryAdapter
 
 
-PASS_EVIDENCE = {
-    "e2e": "操作或命令：运行候选公开流程；退出码：0；结果：候选通过端到端复验。",
-    "standards": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
-    "spec": "已核对的验收标准：请求中的全部验收标准；覆盖结论：候选完整覆盖。",
-}
-
-
-def _capture_public_prompt(
-    tmp_path: Path,
-    monkeypatch: Any,
-    method: str,
-    request: dict[str, Any],
-    *,
-    name: str,
-    worker_calls: list[tuple[list[str], dict[str, Any]]] | None = None,
-) -> str:
-    checkout = tmp_path / name
-    checkout.mkdir()
-    captured: list[str] = []
-    if method == "develop":
-        result: dict[str, Any] = {
-            "result_kind": "development",
-            "summary": "Implemented and verified.",
-            "human_blockers": None,
-        }
-    elif method == "review":
-        result = {
-            "checks": {
-                lane: {
-                    "status": "pass",
-                    "evidence": PASS_EVIDENCE[lane],
-                    "findings": [],
-                }
-                for lane in ("e2e", "standards", "spec")
-            }
-        }
-    else:
-        result = {
-            "result_kind": "publication",
-            "commit_message": "fix(agent): publish validated repair",
-            "pr_title": "fix(agent): publish validated repair",
-            "pr_body_markdown": (
-                "## What Problem This Solves\n\nA validated change is ready.\n\n"
-                "## Why This Change Was Made\n\nThe change follows the contract.\n\n"
-                "## User Impact\n\nThe requested behavior is available.\n\n"
-                "## Evidence\n\nIndependent validation passed."
-            ),
-            "human_blockers": None,
-        }
-
-    def fake_run(
-        arguments: list[str], **options: Any
-    ) -> subprocess.CompletedProcess[str]:
-        captured.append(str(options["prompt"]))
-        schema_index = arguments.index("--output-schema") + 1
-        options["captured_schema"] = json.loads(
-            Path(arguments[schema_index]).read_text(encoding="utf-8")
-        )
-        if worker_calls is not None:
-            worker_calls.append((arguments, options))
-        output_index = arguments.index("--output-last-message") + 1
-        Path(arguments[output_index]).write_text(
-            json.dumps(result, ensure_ascii=False), encoding="utf-8"
-        )
-        reported_thread = request.get("thread_id", "public-prompt-test")
-        return subprocess.CompletedProcess(
-            arguments,
-            0,
-            stdout=(
-                '{"type":"thread.started","thread_id":"'
-                + str(reported_thread)
-                + '"}\n'
-            ),
-            stderr="",
-        )
-
-    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
-    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
-    getattr(backend, method)({**request, "checkout": str(checkout)})
-    return captured[0]
-
-
 def test_publication_prompts_keep_human_blocker_semantics(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -104,12 +27,12 @@ def test_publication_prompts_keep_human_blocker_semantics(
         {"acceptance_scope": "ticket", "acceptance_artifact": {}},
         name="ticket-publication",
     )
-    run_repair = _capture_public_prompt(
+    parent_only = _capture_public_prompt(
         tmp_path,
         monkeypatch,
         "publication",
-        {"acceptance_scope": "run", "acceptance_artifact": {}},
-        name="run-repair-publication",
+        {"acceptance_scope": "parent_only", "acceptance_artifact": {}},
+        name="parent-only-publication",
     )
     final_run = _capture_public_prompt(
         tmp_path,
@@ -119,7 +42,7 @@ def test_publication_prompts_keep_human_blocker_semantics(
         name="final-run-publication",
     )
 
-    for prompt in (ticket, run_repair, final_run):
+    for prompt in (ticket, parent_only, final_run):
         assert "human_blocker" in prompt
         assert "commit_message" in prompt
         assert "pr_body_markdown" in prompt
@@ -312,7 +235,34 @@ def test_fallback_publication_prompt_receives_only_minimal_projection(
     assert "后续修改" in prompt
 
 
-def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
+def test_first_ticket_ci_repair_prompt_does_not_claim_new_review_or_ci(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "ci_repair_publication_context": {
+                "previous_published_head": "FAILED_HEAD",
+                "current_candidate_sha": "REPAIRED_CANDIDATE",
+                "failed_required_checks": {"summary": "CODE_FAILURE"},
+                "repair_delta": [{"path": "repair.py", "status": "modified"}],
+            },
+            "ci_repair_publication_receipt": {"secret": "PRIVATE_RECEIPT"},
+        },
+        name="ticket-ci-first-repair",
+    )
+    assert "FAILED_HEAD" in prompt
+    assert "REPAIRED_CANDIDATE" in prompt
+    assert "CODE_FAILURE" in prompt
+    assert "PRIVATE_RECEIPT" not in prompt
+    assert "尚未获得独立 Reviewer 验收" in prompt
+    assert "尚未取得新版本 CI 结果" in prompt
+
+
+def test_prompt_roles_distinguish_ticket_parent_review_and_final_run_publication(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ticket = _capture_public_prompt(
@@ -329,20 +279,20 @@ def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
         {"acceptance_scope": "parent_only"},
         name="parent-role",
     )
-    run_repair = _capture_public_prompt(
+    final_run = _capture_public_prompt(
         tmp_path,
         monkeypatch,
-        "publication",
-        {"acceptance_scope": "run", "acceptance_artifact": {}},
-        name="run-repair-role",
+        "run_publication",
+        {"acceptance_artifact": {}},
+        name="final-run-role",
     )
 
     assert "独立验收工程师" in ticket
     assert "具体任务的标题、正文和验收条件确定本次范围" in ticket
     assert "独立验收工程师" in parent
     assert "该需求的标题、正文和全部验收条件确定本次范围" in parent
-    assert "交付说明" in run_repair
-    assert "读取最终子任务及依赖" in run_repair
+    assert "交付说明" in final_run
+    assert "读取最终子任务及依赖" in final_run
 
 
 def test_development_prompt_keeps_role_specific_human_blocker_semantics(
@@ -753,7 +703,7 @@ def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
     assert prompts[0].replace("required-checks-ordinary", "CHECKOUT") == prompts[1].replace(
         "required-checks-final_ci_fix", "CHECKOUT"
     )
-    assert "下列检查失败对应当前提交" in prompts[0]
+    assert "准确失败版本的 CI 问题" in prompts[0]
     assert "EXACT_HEAD_CI_EVIDENCE" in prompts[0]
     assert "默认不再组织独立审查" in prompts[0]
 
@@ -899,8 +849,9 @@ def test_publication_prompt_does_not_turn_nonblocking_evidence_into_delivery(
     assert "延期范围和可选建议不是本次交付成果" in prompt
 
 
+@pytest.mark.parametrize("case_group", range(4))
 def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path, monkeypatch: Any, case_group: int
 ) -> None:
     checkout = tmp_path / "PRIVATE_CHECKOUT_SENTINEL"
     checkout.mkdir()
@@ -1177,15 +1128,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             },
             (parent_url, "ARTIFACT_SENTINEL"),
         ),
-        (
-            "run_repair_publication",
-            "publication",
-            {
-                "acceptance_scope": "run",
-                "acceptance_artifact": artifact,
-            },
-            (parent_url, "ARTIFACT_SENTINEL"),
-        ),
+        # Parent repair publishes through the final Run role below.
         (
             "final_run_publication",
             "run_publication",
@@ -1218,7 +1161,11 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     )
     prior_blockers = ["  PRIOR_BLOCKER_SENTINEL must remain verbatim.  "]
 
-    for name, method, role_request, required in cases:
+    # Keep every prompt/continuation pair, but let xdist schedule the matrix
+    # across workers instead of serializing the role matrix in one test item.
+    for index, (name, method, role_request, required) in enumerate(cases):
+        if index % 4 != case_group:
+            continue
         for with_human_context in (False, True):
             active_case = f"{name}_{'new_thread_blocker' if with_human_context else 'normal'}"
             active_method = method
@@ -1345,7 +1292,7 @@ def test_run_prompts_describe_run_scope_without_controller_private_records(
         name="run-acceptance",
     )
 
-    assert "下列检查失败对应当前提交" in checks_repair
+    assert "准确失败版本的 CI 问题" in checks_repair
     assert "多个子任务的整体结果" in checks_repair
     assert "具体任务的标题、正文和验收条件确定本次范围" not in checks_repair
     assert "Completion Record" not in run_acceptance
@@ -1828,7 +1775,7 @@ def test_role_continuations_use_short_role_specific_prompts(
     assert "CURRENT_BASE_SENTINEL" in review
     assert "CURRENT_HEAD_SENTINEL" in review
     assert "CURRENT_TREE_SENTINEL" in review
-    assert "OLD_ARTIFACT_SENTINEL" not in review
+    assert "OLD_ARTIFACT_SENTINEL" in review
     assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" not in review
     assert "交付说明" in publication
     assert "继续完成你负责的交付说明" in publication
@@ -1929,7 +1876,7 @@ def test_custom_methods_reach_actual_development_calls(
     assert str(tmp_path / "custom") in prompt
 
 
-@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("publication", "run"), ("run_publication", "run")])
+@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("run_publication", "run")])
 def test_custom_review_and_publication_methods_reach_actual_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, scope: str,
 ) -> None:
@@ -2020,7 +1967,7 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
         ),
         ("publication", {"acceptance_scope": "ticket", "acceptance_artifact": {}},
          "publication", ("publishing",)),
-        ("publication", {"acceptance_scope": "run", "acceptance_artifact": {}},
+        ("publication", {"acceptance_scope": "parent_only", "acceptance_artifact": {}},
          "publication", ("publishing",)),
         ("run_publication", {"acceptance_artifact": {}}, "publication", ("publishing",)),
     ],
@@ -2093,3 +2040,30 @@ def test_worker_output_schema_is_separate_from_prompt_examples(
     else:
         assert "human_blocker" in prompt
         assert "human_blockers" in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("mode", ["new-thread", "resume"])
+def test_actual_worker_integration_prompt_retains_scene_and_work_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, mode: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+    request = {
+        "_prompt_resources": resolve_resources(language=language),
+        "_invocation_mode": mode, "thread_id": "integration-thread",
+        "acceptance_scope": "ticket", "repair_source": "integration",
+        "task_issue_url": "https://github.com/example/project/issues/400",
+        "parent_issue_url": "https://github.com/example/project/issues/399",
+        "integration_evidence": '{"source_sha":"SOURCE_REVISION","target_sha":"TARGET_REVISION","failure":{"command":["git","diff","--cached","--check"],"stdout_json":"CSV_RAW_OUTPUT"}}',
+        "prior_human_blockers": ["Confirm retained data"],
+        "human_response_history": [{"human_blockers": ["Confirm retained data"], "response": "KEEP_CSV_DATA"}],
+    }
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="integration")
+    assert all(value in prompt for value in ("SOURCE_REVISION", "TARGET_REVISION", "CSV_RAW_OUTPUT", "KEEP_CSV_DATA"))
+    if language == "zh":
+        assert "不重新开发整套需求" in prompt
+        assert "程序随后重新执行实际 Git 检查" in prompt
+    else:
+        assert "do not redevelop the full requirements" in prompt
+        assert "program will rerun actual Git checks" in prompt
+    assert "acceptance_artifact" not in prompt and "ci_evidence" not in prompt

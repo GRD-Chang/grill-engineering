@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
 
 from agent_run.agents import HumanBlockerResult, PublicationResult
-from agent_run.agent_invocation import invocation_event_recorder
+from agent_run.agent_execution import execute_agent_work
 from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
-from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
+from agent_run.publication_evidence import publication_is_current
+from agent_run.git_publication_commit import observe_publication_commit
+from agent_run.git import GitError
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     canonical_fingerprint,
@@ -27,17 +29,39 @@ def _invalidate_stale_publication(
     state: dict[str, Any],
     job: dict[str, Any],
     checkout: Path,
+    *, delivery_is_stale: bool = True,
 ) -> None:
-    job.pop("pending_publication_result", None)
+    intent = job.get("publication_commit_intent")
     semantic_attempt = pending_semantic_attempt(job, role="publication")
+    if isinstance(intent, dict):
+        try:
+            present = observe_publication_commit(stage.git, checkout, intent)
+        except (GitError, OSError, TimeoutError) as error:
+            stage._block(state, job, "publication_intent_mismatch", str(error))
+            stage.save(state)
+            return
+        if semantic_attempt is None:
+            raise ValueError("Publication commit intent is missing its Semantic Attempt")
+        semantic_attempt["publication_commit_observation"] = {
+            "expected_sha": intent["expected_sha"],
+            "result": "present" if present else "absent",
+        }
+        job.pop("publication_commit_intent")
+    original_result = job.pop("pending_publication_result", None)
     if semantic_attempt is not None:
         close_semantic_attempt(
             job,
             semantic_attempt,
             outcome="currentness_invalidated",
+            result={"publication": original_result},
         )
         detach_active_invocation(state, semantic_attempt)
-    stage._invalidate_stale(state, job, checkout)
+    if delivery_is_stale:
+        stage._invalidate_stale(state, job, checkout)
+    else:
+        # Only the narrative's input/result binding changed. Keep the valid
+        # candidate, Review, CI purpose/evidence and published PR authority.
+        job.pop("publication", None)
     stage.save(state)
 
 
@@ -53,6 +77,13 @@ def publication(
             return
         pending_result = job.get("pending_publication_result")
         if isinstance(pending_result, dict):
+            if not publication_is_current(
+                job, pending_result, stage._invocation_boundary(job)
+            ):
+                _invalidate_stale_publication(
+                    stage, state, job, checkout, delivery_is_stale=False,
+                )
+                return
             publication = PublicationArtifact.from_stored(
                 pending_result,
                 primary_ticket=(
@@ -67,6 +98,7 @@ def publication(
                 ),
             )
             break
+        stage.require_agent_work("publication")
         semantic_attempt = pending_semantic_attempt(job, role="publication")
         if semantic_attempt is None:
             begin_publication_operation_attempt(job)
@@ -83,23 +115,18 @@ def publication(
             )
         stage.save(state)
         request = stage.adapter.publication_request(state, job, checkout)
-        request["_prompt_resources"] = state["prompt_resources"]
-        request["_invocation_event"] = stage._invocation_events(
-            state,
-            job,
-            request,
-            role="publication",
-            phase="publication",
-            semantic_attempt=semantic_attempt,
-        )
-        request["_currentness_check"] = lambda: stage._publication_is_current(
-            state, job
-        )
-        if job.get("publication_new_thread") is True:
-            request["_invocation_mode"] = "new-thread"
-        elif job.get("publication_failure_resume") is True:
-            request["_invocation_mode"] = "resume"
-        raw = stage.agents.publication(request)
+        try:
+            raw = cast(
+                PublicationResult | HumanBlockerResult | dict[str, Any],
+                execute_agent_work(
+                    state, job, request, semantic_attempt,
+                    agents=stage.agents, save=stage.save, phase="publication",
+                    boundary=stage._invocation_boundary(job),
+                    is_current=lambda: stage._publication_is_current(state, job),
+                ),
+            )
+        finally:
+            stage.release_agent_work()
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
         job.pop("publication_failure_resume", None)
         if isinstance(raw, HumanBlockerResult):
@@ -151,6 +178,13 @@ def publication(
     if not stage._publication_is_current(state, job):
         _invalidate_stale_publication(stage, state, job, checkout)
         return
+    if not publication_is_current(
+        job, job.get("pending_publication_result"), stage._invocation_boundary(job)
+    ):
+        _invalidate_stale_publication(
+            stage, state, job, checkout, delivery_is_stale=False,
+        )
+        return
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is None:
         raise ValueError("Publication closeout is missing its Semantic Attempt")
@@ -159,9 +193,19 @@ def publication(
         "pr_title": publication.pr_title,
         "pr_body_markdown": publication.pr_body_markdown,
     }
+    publication_parent = str(job.get("published_sha", job["base_sha"]))
+    if "publication_commit_intent" in job and not isinstance(
+        job["publication_commit_intent"], dict
+    ):
+        raise ValueError("Publication commit intent must be an object")
+    def save_commit_intent() -> None:
+        stage.save(state)
+
     sha = stage.publisher.create_publication_commit(
-        checkout, job, publication.commit_message
+        checkout, job, publication.commit_message,
+        save_intent=save_commit_intent,
     )
+    actual_parent = stage.git.commit_parents(sha)[0]
     close_semantic_attempt(
         job,
         semantic_attempt,
@@ -173,41 +217,17 @@ def publication(
         {
             "publication": publication_result,
             "publication_sha": sha,
+            "publication_parent_sha": actual_parent,
+            "publication_prior_published_sha": publication_parent,
             "phase": "publishing",
         }
     )
     job.pop("pending_publication_result", None)
+    job.pop("publication_commit_intent", None)
     job.pop("last_publication_error", None)
     stage.save(state)
     stage._reject_stale(
         state, job, checkout, "Publication was discarded after requirements changed"
-    )
-
-
-def invocation_events(
-    stage: ChangeDeliveryStage,
-    state: dict[str, Any],
-    job: dict[str, Any],
-    request: dict[str, Any],
-    *,
-    role: str = "publication",
-    phase: str,
-    semantic_attempt: dict[str, Any],
-) -> Callable[..., None]:
-    work_subject, generation = stage.adapter.invocation_identity(state, job)
-    boundary = stage._invocation_boundary(job)
-    invocation_deadline_seconds = invocation_deadline_for_state(state, role)
-    return invocation_event_recorder(
-        state,
-        role=role,
-        phase=phase,
-        work_subject=work_subject,
-        generation=generation,
-        invocation_input=request,
-        currentness_boundary=boundary,
-        semantic_attempt=semantic_attempt,
-        save=stage.save,
-        invocation_deadline_seconds=invocation_deadline_seconds,
     )
 
 
@@ -231,6 +251,12 @@ def invocation_boundary(
         boundary["ticket_completion_records_fingerprint"] = canonical_fingerprint(
             job["ticket_completion_records"]
         )
+    if "ticket_integration" in job:
+        boundary["ticket_integration_fingerprint"] = canonical_fingerprint(
+            job["ticket_integration"]
+        )
+    if "parent_integration" in job:
+        boundary["parent_integration_fingerprint"] = canonical_fingerprint(job["parent_integration"])
     return boundary
 
 

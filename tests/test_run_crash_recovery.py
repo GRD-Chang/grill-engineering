@@ -8,11 +8,13 @@ import pytest
 
 from support.workspace import managed_state
 
-from agent_run.state import StateStore
-from conftest import seed_run, write_fixture
+from agent_run.state import FaultInjectingStateStore, SimulatedProcessCrash, StateStore
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import passing_acceptance
+from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import passing_acceptance
+from support.cli_crash import run_cli_at_resume_boundary
+from support.state import persist_run_fixture
 
 
 def _ticket(
@@ -93,6 +95,7 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     job = state["ticket_jobs"]["2"]
     assert state["status"] == "run_approval_pending"
     assert job["phase"] == "completed"
+    assert state["ticket_work_queue"] == []
     assert job["validation_attempts"] >= 1
     record = job["acceptance_record"]
     assert record["reviewed_candidate_sha"] == job["candidate_sha"]
@@ -101,7 +104,6 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
     assert len(delivery["pull_requests"]) == 2
-    assert delivery["acceptance_records"] == []
     assert len(delivery["agent_run_status"]) == 2
     assert delivery["closed_issues"] == [2]
     assert [
@@ -205,7 +207,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
 
 
 def test_public_resume_recovers_completed_invocation_with_pending_attempt(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket()}
@@ -215,6 +217,21 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
     )
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
+    def crash_after_completed_invocation(store: FaultInjectingStateStore) -> None:
+        current = store.load_run(run_id)
+        invocation = (current or {}).get("active_agent_invocation") or {}
+        if (
+            not store.injected and invocation.get("status") == "completed"
+            and invocation.get("semantic_attempt", {}).get("status") == "pending"
+        ):
+            store.injected = True
+            raise SimulatedProcessCrash("completed Invocation before attempt settlement")
+
+    # Target the durable semantic boundary, independent of queue save counts.
+    monkeypatch.setattr(
+        FaultInjectingStateStore, "_after_run_saved", crash_after_completed_invocation,
+    )
+
     interrupted = run_internal_stage(
         git_repo,
         fixture,
@@ -223,7 +240,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
         "--agent-fixture",
         str(first_agents),
         "--crash-after-save",
-        "8",
+        "1",
     )
 
     assert interrupted.returncode == 2
@@ -298,15 +315,14 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
         reviewer="reviewer-recovery",
         expected_thread_id="developer-2",
     )
-    interrupted_authorization = run_cli(
+    interrupted_authorization = run_cli_at_resume_boundary(
         git_repo,
         fixture,
         "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
-        "--crash-after-save",
-        "1",
+        boundary="resume_authorized",
     )
     assert interrupted_authorization.returncode == 2
     after_first = load_only_run_state(git_repo)
@@ -314,6 +330,9 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     assert after_first["resume_audit"]["history"][0][
         "semantic_attempt_id"
     ] == attempt_id
+    assert after_first["resume_audit"]["history"][0].get("successor_invocation_started_at") is None
+    assert after_first["active_agent_invocation"]["started_at"] == failed_invocation["started_at"]
+    assert len(after_first["agent_invocation_history"]) == len(failed_state["agent_invocation_history"])
     # This is the durable shape left by an abrupt exit after Controller
     # authorization and before the successor Invocation reports ``started``.
     after_first["status"] = "active"
@@ -323,17 +342,16 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     for invocation in after_first["agent_invocation_history"]:
         if invocation.get("started_at") == started_at:
             invocation["status"] = "resuming"
-    StateStore(managed_state(git_repo)).save_run(run_id, after_first)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, after_first)
 
-    interrupted_again = run_cli(
+    interrupted_again = run_cli_at_resume_boundary(
         git_repo,
         fixture,
         "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
-        "--crash-after-save",
-        "1",
+        boundary="session_interrupted",
     )
     assert interrupted_again.returncode == 2
     after_second = load_only_run_state(git_repo)
@@ -430,6 +448,25 @@ def test_public_cli_recovers_after_external_response_loss(
         str(first_agents),
     )
 
+    if action in {"squash_merge", "sync_run_branch", "close"}:
+        # An uncertain merge/close keeps its intent and is reconciled inside
+        # this Executor. No Run-wide execution-failure gate is needed.
+        assert interrupted.returncode == 0, interrupted.stdout
+        assert load_only_run_state(git_repo)["ticket_jobs"]["2"]["phase"] == "completed"
+        resumed = run_cli(
+            git_repo, fixture, "run", "1", "--agent-fixture", str(first_agents),
+        )
+        assert resumed.returncode == 0, resumed.stdout
+        _assert_exactly_once_delivery(git_repo, fixture)
+        fixture_before = fixture.read_bytes()
+        repeated = run_cli(
+            git_repo, fixture, "run", "1", "--agent-fixture", str(first_agents),
+        )
+        assert stdout_json(repeated)["status"] == "run_approval_pending"
+        assert fixture.read_bytes() == fixture_before
+        _assert_exactly_once_delivery(git_repo, fixture)
+        return
+
     assert interrupted.returncode == 2
     interrupted_state = load_only_run_state(git_repo)
     active = interrupted_state.get("active_ticket_job")
@@ -455,7 +492,11 @@ def test_public_cli_recovers_after_external_response_loss(
         str(recovery_agents),
     )
     assert held.returncode == 2
-    assert stdout_json(held)["status"] == "execution_failed"
+    assert stdout_json(held)["status"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["2"]["phase"] == "blocked"
+    assert interrupted_state["ticket_jobs"]["2"]["blocked_reason"] == (
+        "ticket_execution_failed"
+    )
     assert load_only_run_state(git_repo) == interrupted_state
     assert fixture.read_text(encoding="utf-8") == fixture_before
 
@@ -480,11 +521,27 @@ def test_public_cli_recovers_after_external_response_loss(
 
     assert recovered.returncode == 0, recovered.stdout
     _assert_exactly_once_delivery(git_repo, fixture)
+    if action == "ensure_ticket_pr":
+        assert load_only_run_state(git_repo)["ticket_jobs"]["2"]["integration_resync"]["used"] == 0
 
 
 def test_abandon_recovers_ticket_after_close_response_loss(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from agent_run.github_fixture import FixtureGitHubPublisher
+    from agent_run.state import SimulatedProcessCrash
+
+    close = FixtureGitHubPublisher.close_primary_ticket
+
+    def crash_after_close(self: FixtureGitHubPublisher, **kwargs: Any) -> Any:
+        try:
+            return close(self, **kwargs)
+        except OSError as error:
+            # A real Executor loss still requires explicit recovery; ordinary
+            # response loss now reconciles automatically in the same Executor.
+            raise SimulatedProcessCrash(str(error)) from error
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "close_primary_ticket", crash_after_close)
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket()},
@@ -636,13 +693,17 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
 
     assert interrupted.returncode == 2
     interrupted_output = stdout_json(interrupted)
-    assert interrupted_output["status"] == "execution_failed"
+    assert interrupted_output["status"] == "blocked"
     interrupted_state = load_only_run_state(git_repo)
-    assert interrupted_state["status"] == "execution_failed"
-    assert interrupted_state["terminal_kind"] == "execution_failed"
+    assert interrupted_state["status"] == "blocked"
+    assert interrupted_state["terminal_kind"] is None
+    failed_job = interrupted_state["ticket_jobs"]["2"]
+    assert failed_job["phase"] == "blocked"
+    assert failed_job["blocked_reason"] == "ticket_execution_failed"
+    assert failed_job["execution_resume_phase"] == "developing"
     assert interrupted_state["diagnostics"] == [
         {
-            "code": "command_failed",
+            "code": "agent_invocation_failed",
             "message": "simulated Development Worker timeout",
         }
     ]
@@ -656,7 +717,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8"
     ) == "survives worker error\n"
     live = json.loads(fixture.read_text(encoding="utf-8"))
-    live["delivery"]["crash_after_ensure_ticket_branch_once"] = True
+    live["delivery"]["crash_after_publish_branch_once"] = True
     fixture.write_text(json.dumps(live), encoding="utf-8")
     recovery_agents = git_repo / "agents-recovery.json"
     recovery_agents.write_text(
@@ -680,6 +741,12 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
                         "Fresh review covered the preserved work.",
                     )
                 ],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer-recovered", "The complete Run passed."
+                    )
+                ],
+                "run_publications": [_publication()],
             }
         ),
         encoding="utf-8",
@@ -695,15 +762,15 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
     )
 
     assert publisher_interrupted.returncode == 2
-    assert stdout_json(publisher_interrupted)["status"] == "execution_failed"
+    assert stdout_json(publisher_interrupted)["status"] == "blocked"
     assert (checkout / "uncommitted.txt").read_text(
         encoding="utf-8"
     ) == "survives worker error\n"
 
-    recovered = run_internal_stage(
+    recovered = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
@@ -711,7 +778,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
 
     assert recovered.returncode == 0, recovered.stdout
     state = load_only_run_state(git_repo)
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert state["ticket_jobs"]["2"]["reviewer_thread_ids"] == [
         "reviewer-recovered"
     ]

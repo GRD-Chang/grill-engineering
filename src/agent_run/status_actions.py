@@ -1,17 +1,20 @@
 """Human status actions derived from existing controller and delivery facts."""
 from __future__ import annotations
 
+from agent_run.delivery_facts import current_work_subject, scheduler_progress
+
 from agent_run.messages import display_text
 
 from typing import Any
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending
-from agent_run.presentation_helpers import current_work_subject
 
 
 def controller_work(state: dict[str, Any], audit: dict[str, Any]) -> str | None:
     control = audit.get("executor_control")
     if not isinstance(control, dict) or control.get("activity") != "running":
+        return None
+    if scheduler_progress(control)["activity"] == "draining":
         return None
     invocation = audit.get("agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") in {"running", "resuming"}:
@@ -59,11 +62,11 @@ def delivery_result_lines(state: dict[str, Any]) -> list[str]:
 
 
 def status_timing(state: dict[str, Any], invocation: dict[str, Any] | None = None) -> dict[str, Any]:
-    from agent_run.cli_presentation import _semantic_attempt_history
-    from agent_run.delivery_history import history_records
+    from agent_run.attempt_projection import semantic_attempt_history
+    from agent_run.history_facts import history_records
     from agent_run.execution_timing import execution_totals
 
-    audit = {"semantic_agent_attempts": _semantic_attempt_history(state),
+    audit = {"semantic_agent_attempts": semantic_attempt_history(state),
              "agent_invocations": state.get("agent_invocation_history", [])}
     records = history_records(state, audit)
     totals = execution_totals(state, records, None)

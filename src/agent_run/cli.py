@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.operator_action_presentation import human_next_action_for_state
+
 import argparse
 import json
 import os
@@ -17,9 +19,16 @@ from agent_run.cli_messages import cli_message, personal_language, error_message
 from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
+from agent_run.runner_credentials import validate_runner_auth
+from agent_run.runner_identity import bind_runner_identity, frozen_runner_identity
+from agent_run.github_identity import (
+    GitHubIdentityError,
+    add_identity_options, identity_overrides, resolve_worker_identity, validate_worker_auth,
+    validate_identity_snapshot, resolve_runner_identity,
+)
 from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
-from agent_run.agent_invocation import record_session_interruption
+from agent_run.agent_invocation import interrupt_exited_invocations, record_session_interruption
 from agent_run.agent_profiles import (
     AgentProfileStore,
     ProfileOverrides,
@@ -28,24 +37,20 @@ from agent_run.agent_profiles import (
 )
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller, _validated_human_response
+from agent_run.object_state import ObjectStateStore, object_store
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import require_clean_run_worktrees
 from agent_run.delivery_policy import (
     DeliveryPolicy,
     DeliveryPolicyError,
-    DeliveryPolicyStore,
     parse_policy_snapshot,
     policy_snapshot_for_state,
     resolve_delivery_policy,
 )
-from agent_run.managed_workspace import workspace_for_root, workspace_state_root, validate_data_root
+from agent_run.managed_workspace import workspace_state_root, validate_data_root
 from agent_run.workspace_cli import open_workspace, selected_repository_root
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
-from agent_run.github_auth_profile import (
-    GitHubAuthProfileError,
-    GitHubAppProfileStore,
-)
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import MAX_READ_ATTEMPTS
@@ -53,6 +58,7 @@ from agent_run.operator_gate import (
     has_local_operator_gate,
     has_non_invocation_execution_failure,
     has_run_operator_gate,
+    operator_gate_subjects,
 )
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -90,6 +96,7 @@ from agent_run.run_driver import (
     RunOutcomeKind,
 )
 from agent_run.final_approval_operation import (
+    approval_failures,
     final_approval_busy_message,
     final_approval_cleanup_pending,
     final_approval_failure,
@@ -110,9 +117,11 @@ from agent_run.resume_intent import (
     bind_resume_intent,
     validate_resume_intent,
 )
+from agent_run.run_selection import (
+    load_exact_run, load_selected_state, read_state_directory, selector_records,
+    selector_error, validate_repository_name, selected_local_run_id,
+)
 from agent_run.run_locator import (
-    MAX_LOCATOR_ENTRIES,
-    LocatorEntry,
     RunLocatorError,
     RunLocatorIndex,
 )
@@ -126,9 +135,11 @@ from agent_run.state_contract import (
     human_blocker_subject_count,
     require_current_run_state,
 )
+from agent_run.state_errors import MissingRunMaterialsError
+from agent_run.resume_materials import require_resume_checkout
 from agent_run.task_control import (
     ActionBusyError,
-    TASK_CONTROL_PROTOCOL,
+    ActionReconciliationError,
     TaskControlError,
     TaskControlStore,
     TaskKey,
@@ -171,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar=(
             "{run,resume,requeue,approve,revise,stop,abandon,status,history,"
-            "runs,configure,settings,prompts,policy,auth,doctor}"
+            "runs,configure,settings,prompts,policy,doctor}"
         ),
     )
     run = subcommands.add_parser(
@@ -181,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(run)
     _add_profile_options(run)
     _add_policy_options(run)
+    add_identity_options(run, language=personal_language())
     run.add_argument("--json", action="store_true", dest="as_json")
     notification_options = run.add_mutually_exclusive_group()
     notification_options.add_argument("--notification-mode", choices=("concise", "detailed"), help=cli_message('cli.notifications_help'))
@@ -196,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(resume)
     _add_policy_options(resume, allow_thread_policy=False)
     resume.add_argument("--json", action="store_true", dest="as_json")
+    resume.add_argument("--ticket", type=_positive_integer, help=cli_message('cli.resume_ticket_help'))
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--new-thread",
@@ -247,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=cli_message('cli.selector_help'),
     )
     _add_common_options(stop)
+    stop.add_argument("--ticket", type=_positive_integer, help=cli_message('cli.stop_ticket_help'))
     stop.add_argument("--json", action="store_true", dest="as_json")
     abandon = subcommands.add_parser("abandon", help=cli_message('cli.abandon_help'))
     abandon.add_argument(
@@ -322,26 +336,6 @@ def build_parser() -> argparse.ArgumentParser:
         subcommands, _add_common_options, _add_policy_options, _add_profile_options
     )
     prompt_cli.add_parser(subcommands)
-    auth = subcommands.add_parser("auth", help=cli_message('cli.auth_help'))
-    auth_commands = auth.add_subparsers(
-        dest="auth_command", required=True, metavar="{status,app}"
-    )
-    auth_commands.add_parser("status", help=cli_message('cli.auth_status_help'))
-    auth_app = auth_commands.add_parser("app", help=cli_message('cli.auth_app_help'))
-    auth_app_commands = auth_app.add_subparsers(
-        dest="auth_app_command", required=True, metavar="{configure,remove}"
-    )
-    configure_app = auth_app_commands.add_parser(
-        "configure", help=cli_message('cli.auth_configure_help')
-    )
-    configure_app.add_argument("--app-id", required=True, help="GitHub App ID")
-    configure_app.add_argument(
-        "--installation-id", required=True, help="GitHub App Installation ID"
-    )
-    configure_app.add_argument(
-        "--private-key", required=True, help=cli_message('cli.private_key_help')
-    )
-    auth_app_commands.add_parser("remove", help=cli_message('cli.auth_remove_help'))
     doctor_command = subcommands.add_parser(
         "doctor", help=cli_message('cli.doctor_help')
     )
@@ -358,6 +352,8 @@ def _main_with_parser(
     parser: argparse.ArgumentParser, arguments: Sequence[str] | None = None
 ) -> int:
     with ExitStack() as resources:
+        from agent_run.runner_credentials import runner_credential_scope
+        resources.enter_context(runner_credential_scope())
         return _main_with_parser_resources(parser, arguments, resources)
 
 
@@ -394,8 +390,6 @@ def _main_with_parser_resources(
             if parsed.command == "run"
             else None
         )
-        if parsed.command == "auth":
-            return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
         if parsed.command == "prompts":
@@ -448,8 +442,18 @@ def _main_with_parser_resources(
                 bootstrap_host.check_readiness()
             except SystemdExecutionReadinessError as error:
                 raise ExecutionReadinessError(str(error)) from error
+        # A new clone has no Run to bind yet. Resolve credentials before any
+        # remote initialization; existing workspaces are opened locally first.
+        initial_runner_identity = None
+        if parsed.command == "run" and target_root is not None and not target_root.exists():
+            initial_runner_identity = resolve_runner_identity(
+                UserDefaultsStore().load().get("github"), identity_overrides(parsed),
+            )
+            if initial_runner_identity["source"] in {"pat", "app"}:
+                validate_runner_auth(initial_runner_identity)
         git = open_workspace(
-            parsed.repo, parsed.github_fixture, create=parsed.command == "run"
+            parsed.repo, parsed.github_fixture, create=parsed.command == "run",
+            runner_identity=initial_runner_identity,
         )
         state_root = workspace_state_root(git.root)
         if parsed.state_dir and Path(parsed.state_dir).resolve() != state_root.resolve():
@@ -489,6 +493,8 @@ def _main_with_parser_resources(
             "profile",
         }:
             _resolve_mutation_selection(parsed, git, states)
+        bind_runner_identity(parsed, states, git, github, initial_runner_identity)
+        controller.creation_runner_github_identity = dict(git.runner_identity) if git.runner_identity else None
         if parsed.command == "resume":
             selected_resume = cli_surface._load_local_run(states, parsed.run_id)
             resume_notifications = selected_resume.get("notifications")
@@ -496,6 +502,7 @@ def _main_with_parser_resources(
                 resume_feedback = ResumeFeedback(
                     states.root, selected_resume,
                     lambda: states.load_current_run(parsed.run_id),
+                    ticket_number=parsed.ticket,
                 )
                 resources.callback(resume_feedback.close)
             selected_parent = selected_resume.get("parent")
@@ -509,6 +516,31 @@ def _main_with_parser_resources(
             parsed.parent = selected_parent_number
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
+        if parsed.command == "stop" and parsed.ticket is not None:
+            from agent_run.ticket_pause import request_ticket_pause
+
+            paused = request_ticket_pause(states, parsed.run_id, parsed.ticket)
+            result = {
+                "run_id": paused["run_id"],
+                "status": paused["status"],
+                "ticket_number": parsed.ticket,
+                "pause_requested": str(parsed.ticket) in paused["ticket_pause_requests"],
+                "ticket_phase": paused["ticket_jobs"].get(str(parsed.ticket), {}).get("phase", "pending"),
+            }
+            if parsed.as_json:
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            else:
+                job = paused["ticket_jobs"].get(str(parsed.ticket), {})
+                message_key = (
+                    "cli.ticket_pause_requested" if result["pause_requested"]
+                    else "cli.ticket_paused" if job.get("blocked_reason") == "ticket_paused"
+                    else "cli.ticket_stop_unchanged"
+                )
+                print(text(
+                    message_key,
+                    language=selected_language(paused), ticket_number=parsed.ticket,
+                ))
+            return 0
         executor_binding = _executor_binding_from_environment()
         if resume_feedback is not None and executor_binding is not None:
             resume_feedback.identity = executor_binding[0]
@@ -704,6 +736,40 @@ def _main_with_parser_resources(
                     if (resume_feedback is not None and final_receipt_pending
                             and not has_unfinished_final_receipt(current, git.root)):
                         resume_feedback.progressed(current, "terminal_completion")
+                if parsed.ticket is not None and executor_binding is None:
+                    from agent_run.ticket_resume import active_ticket_resume
+
+                    accepted = active_ticket_resume(
+                        controller, TaskControlStore(states.root),
+                        _task_for_parent(parsed, github, git), executor_host,
+                        current, parsed.ticket,
+                        lambda state, previous: (
+                            _resume_payload_for_existing_action(parsed, previous, state)
+                            if previous is not None
+                            else _resume_action_payload(parsed, state)
+                        ),
+                    )
+                    if accepted is not None:
+                        accepted_state, repeated = accepted
+                        queue = accepted_state["ticket_work_queue"]
+                        waiting = [item["ticket_number"] for item in queue if item["lease_id"] is None]
+                        result = {
+                            "run_id": parsed.run_id, "ticket_number": parsed.ticket,
+                            "resume_accepted": True, "attached": repeated,
+                            "work_queue_position": (
+                                waiting.index(parsed.ticket) + 1 if parsed.ticket in waiting else None
+                            ),
+                            "resume_intent": accepted_state["ticket_jobs"][str(parsed.ticket)]["last_ticket_resume"]["payload"]["resume_intent"],
+                        }
+                        if parsed.as_json:
+                            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+                        else:
+                            print(text(
+                                "cli.ticket_resume_queued" if parsed.ticket in waiting
+                                else "cli.ticket_resume_accepted",
+                                language=selected_language(accepted_state), ticket_number=parsed.ticket,
+                            ))
+                        return 0
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
@@ -711,37 +777,9 @@ def _main_with_parser_resources(
                     not resume_attachable
                     and not final_receipt_pending
                     and not cli_surface._resume_is_ready(current)
+                    and not _targeted_resume_is_ready(current, parsed.ticket)
                 ):
                     _reject_if_task_action_pending(parsed, states, git)
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
-                if (
-                    not resume_attachable
-                    and parsed.message is not None
-                    and human_blocker_subject_count(current) != 1
-                ):
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
-                if current.get("status") == "supervision_timeout" and (
-                    parsed.new_thread or parsed.message is not None
-                ):
-                    if resume_feedback is not None:
-                        resume_feedback.failure("")
-                    cli_presentation._print_precondition_failure(
-                        current, as_json=parsed.as_json
-                    )
-                    return 2
-                if has_non_invocation_execution_failure(current) and (
-                    parsed.new_thread or parsed.message is not None
-                ):
                     if resume_feedback is not None:
                         resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
@@ -1045,6 +1083,8 @@ def _main_with_parser_resources(
             diagnostic_code = "executor_start_unknown"
         elif isinstance(error, TaskControlError):
             diagnostic_code = "task_control"
+        elif isinstance(error, MissingRunMaterialsError):
+            diagnostic_code = "recovery_materials_missing"
         elif incompatible_state:
             diagnostic_code = "incompatible_run_state"
         elif str(error).startswith("multiple unfinished Delivery Runs"):
@@ -1059,7 +1099,7 @@ def _main_with_parser_resources(
             )
             or isinstance(error, DirtyManagedCheckoutError)
             or diagnostic_code
-            in {"action_busy", "executor_start_unknown", "task_control"}
+            in {"action_busy", "executor_start_unknown", "task_control", "recovery_materials_missing"}
         ):
             diagnostic_message = bounded_error(str(error))
         elif diagnostic_code == "workspace_required":
@@ -1092,6 +1132,8 @@ def _main_with_parser_resources(
         diagnostic_next_action = (
             "请进入目标 Git 仓库目录后重试"
             if diagnostic_code == "workspace_required"
+            else "从可信备份补足诊断中的材料，保留原工作、历史及额度，再使用同一 agent-run resume；外部写入结果未知时先对账"
+            if diagnostic_code == "recovery_materials_missing"
             else "请排除上述原因；已有交付先运行 agent-run status 确认状态，再决定是否重试"
         )
         locator_diagnostic: dict[str, object] = {
@@ -1298,7 +1340,10 @@ def _print_lifecycle_result(
             if receipt.failure:
                 print(message("failure_reason", reason=receipt.failure))
         elif receipt.status in {"completed", "executor_active"}:
-            print(message("delivery_completed_action" if final_approval else "applied"))
+            print(message(
+                "approval_updating" if receipt.result_status == "updating"
+                else "delivery_completed_action" if final_approval else "applied"
+            ))
         else:
             print(message("approval_running" if final_approval else "applying"))
         if receipt.executor_status in {"exited", "absent"}:
@@ -1316,7 +1361,7 @@ def _print_lifecycle_result(
     else:
         print(message("delivery_incomplete", status=cli_presentation.human_delivery_status(
             status, language=language)))
-    print(message("next_action", action=cli_presentation.human_next_action_for_state(state)))
+    print(message("next_action", action=human_next_action_for_state(state)))
 
 
 def _print_interruption_result(
@@ -1346,7 +1391,7 @@ def _print_interruption_result(
     print(message("interrupted_delivery", status=cli_presentation.human_delivery_status(
         output.get("status"), language=language)))
     next_action = (
-        cli_presentation.human_next_action_for_state(state)
+        human_next_action_for_state(state)
         if isinstance(state, Mapping)
         else message("query_status")
     )
@@ -1361,6 +1406,7 @@ def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
         "kind": receipt.kind,
         "run_id": receipt.run_id,
         "status": receipt.status,
+        "result_status": receipt.result_status,
         "attached": receipt.attached,
         "executor_status": receipt.executor_status,
         "executor_generation": receipt.executor_generation,
@@ -1462,6 +1508,11 @@ def _preflight_run(
             f"{run_ids}"
         )
     current = unfinished[0] if unfinished else None
+    if current is not None and isinstance(states, ObjectStateStore):
+        # Public admission refreshes the whole current frontier. A sparse
+        # ordinary-control view omits completed siblings and cannot determine
+        # that the same settled Run Action is still at its approval boundary.
+        current = states.load_scheduler_current_run(str(current["run_id"]))
     if current is not None:
         require_current_run_state(current)
     return current
@@ -1526,21 +1577,37 @@ def _run_action_payload(
     }
 
 
+def _targeted_resume_is_ready(
+    current: Mapping[str, Any], ticket_number: int | None
+) -> bool:
+    if ticket_number is None:
+        return False
+    try:
+        bind_resume_intent(current, ticket_number=ticket_number)
+    except ResumeIntentError:
+        return False
+    return True
+
+
 def _resume_action_payload(
     parsed: argparse.Namespace,
     current: Mapping[str, Any],
 ) -> dict[str, Any]:
-    budget_checkpoint_resume = (
-        cli_surface._review_budget_checkpoint_count(dict(current)) == 1
-    )
+    intent = bind_resume_intent(current, ticket_number=parsed.ticket)
+    budget_checkpoint_resume = intent["authorization"] == "new_budget_window"
     explicit_policy = _policy_overrides(parsed)
     if explicit_policy and not budget_checkpoint_resume:
         raise DeliveryPolicyError(
             "ordinary resume does not accept Delivery Policy overrides; "
             "policy can change only when opening a new Budget Window"
         )
+    policy_owner = current
+    if parsed.ticket is not None:
+        job = current.get("ticket_jobs", {}).get(str(parsed.ticket))
+        if isinstance(job, Mapping) and isinstance(job.get("policy_snapshot"), Mapping):
+            policy_owner = job
     policy = resolve_delivery_policy(
-        user_defaults=parse_policy_snapshot(policy_snapshot_for_state(current)),
+        user_defaults=parse_policy_snapshot(policy_snapshot_for_state(policy_owner)),
         command_overrides=explicit_policy,
     )
     return {
@@ -1548,8 +1615,9 @@ def _resume_action_payload(
         "run_id": parsed.run_id,
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
+        "ticket_number": parsed.ticket,
         "resume_budget_checkpoint": budget_checkpoint_resume,
-        "resume_intent": bind_resume_intent(current),
+        "resume_intent": intent,
         "policy": policy.snapshot(),
     }
 
@@ -1564,6 +1632,7 @@ def _resume_payload_for_existing_action(
         "run_id": parsed.run_id,
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
+        "ticket_number": parsed.ticket,
     }
     semantic_match = all(
         existing_payload.get(key) == value for key, value in semantic_fields.items()
@@ -1640,6 +1709,7 @@ def _run_control_action(
 ) -> tuple[dict[str, Any], ActionReceipt | None]:
     """Submit Stop/Abandon and observe its independently hosted Executor."""
 
+    states = object_store(states)
     kind = parsed.command
     if kind not in {"stop", "abandon"}:
         raise TaskControlError("unsupported control action")
@@ -1884,6 +1954,7 @@ def _run_lifecycle(
     prepare_executor_session: Callable[[], None] | None = None,
     resume_feedback: ResumeFeedback | None = None,
 ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
+    states = object_store(states)
     if host is None:
         raise ExecutionReadinessError(
             error_message('cli.error.execution_readiness')
@@ -1897,12 +1968,17 @@ def _run_lifecycle(
     current = (
         _preflight_run(task, states)
         if action_kind == "run"
+        else states.load_scheduler_current_run(parsed.run_id)
+        if isinstance(states, ObjectStateStore)
         else states.load_current_run(parsed.run_id)
     )
     if action_kind != "run" and current is None:
         raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
     if current is not None:
+        frozen_worker_identity(current)
         controller._require_current_checkout(current)
+        if action_kind == "resume":
+            require_resume_checkout(current, states.root, git, ticket_number=parsed.ticket)
     try:
         existing_control = control.load(task)
     except TaskControlError:
@@ -2070,6 +2146,17 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["runner_github_identity"] = dict(git.runner_identity or {"source": "host"})
+                if payload["runner_github_identity"]["source"] in {"pat", "app"}:
+                    validate_runner_auth(payload["runner_github_identity"])
+                    # Authentication alone does not grant target-repository access.
+                    # Report startup access errors before admitting an Executor.
+                    github.repository()
+                payload["github_identity"] = resolve_worker_identity(
+                    document.get("github"), identity_overrides(parsed),
+                )
+                if parsed.github_fixture is None or payload["github_identity"]["source"] in {"pat", "app"}:
+                    validate_worker_auth(payload["github_identity"], repository=task.repository)
                 payload["language"] = defaults.language(document)
                 payload["notifications"] = notification_snapshot(
                     document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
@@ -2083,6 +2170,8 @@ def _run_lifecycle(
                 else:
                     policy = parse_policy_snapshot(policy_snapshot_for_state(current))
                     payload = _run_action_payload(parsed, policy, creation_profile)
+                    payload["github_identity"] = frozen_worker_identity(current)
+                    payload["runner_github_identity"] = frozen_runner_identity(current)
         else:
             if current is None:  # pragma: no cover - guarded above
                 raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
@@ -2228,6 +2317,10 @@ def _run_lifecycle(
                     validate_resume_state=lambda state: validate_resume_intent(
                         state, retry_intent
                     ),
+                    ticket_number=(
+                        payload.get("ticket_number")
+                        if type(payload.get("ticket_number")) is int else None
+                    ),
                 )
 
             resume_retry = retry_resume_refresh
@@ -2263,7 +2356,7 @@ def _run_lifecycle(
                         pid=pid,
                         process_start_token=token,
                     )
-                except TaskControlError:
+                except ActionReconciliationError:
                     # A Stop/Abandon fence may already have revoked this
                     # Executor.  The old Worker must not overwrite that fence.
                     return
@@ -2280,6 +2373,8 @@ def _run_lifecycle(
             use_current_state_once=action_kind == "resume",
             on_worker_started=worker_started,
             on_worker_finished=worker_finished,
+            worker_identity=(frozen_worker_identity(current) if current is not None
+                             else dict(payload["github_identity"])),
         )
         if resume_feedback is not None:
             driver.on_outcome = resume_feedback.progressed
@@ -2303,6 +2398,29 @@ def _run_lifecycle(
     )
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        try:
+            return select_run_with_credentials(action)
+        except GitHubIdentityError as error:
+            # Applying approve/resume can dispatch remote operations before
+            # DeliveryExecutor.execute owns failure recording. A renewal that
+            # expires here must preserve the same Run and mutation intent.
+            if current is None:
+                raise
+            failed_run_id = str(current["run_id"])
+            if not controller.record_execution_failure(
+                failed_run_id, str(error), runner_credential_failure=True,
+            ):
+                raise
+            failed = states.load_current_run(failed_run_id)
+            if failed is None:
+                raise
+            prepare_action_application_receipt(failed, action)
+            states.save_run(failed_run_id, failed)
+            return failed, True
+
+    def select_run_with_credentials(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        if git.runner_identity and git.runner_identity["source"] in {"pat", "app"}:
+            validate_runner_auth(git.runner_identity)
         if action_kind == "resume":
             action_payload = action.get("payload")
             if not isinstance(action_payload, Mapping):
@@ -2341,6 +2459,10 @@ def _run_lifecycle(
                 budget_policy=parse_policy_snapshot(policy_snapshot),
                 validate_resume_state=lambda state: validate_resume_intent(
                     state, bound_intent
+                ),
+                ticket_number=(
+                    action_payload.get("ticket_number")
+                    if type(action_payload.get("ticket_number")) is int else None
                 ),
                 prepare_state=lambda state: prepare_action_application_receipt(
                     state, action
@@ -2448,6 +2570,8 @@ def _run_lifecycle(
         frozen_policy = parse_policy_snapshot(run_payload.get("policy"))
         controller.delivery_policy_provider = lambda: frozen_policy
         controller.creation_language = str(run_payload.get("language", "zh"))
+        controller.creation_github_identity = validate_identity_snapshot(run_payload["github_identity"])
+        controller.creation_runner_github_identity = validate_identity_snapshot(run_payload["runner_github_identity"])
         def prepare_creation(state: dict[str, Any]) -> None:
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
@@ -2526,6 +2650,19 @@ def _run_lifecycle(
         return lifecycle.execute_claimed(
             action_id=executor_binding[0], generation=executor_binding[1]
         )
+    if (
+        current is not None
+        and (
+            (action_kind == "approve" and current.get("status") in {"parent_approval_pending", "run_approval_pending"})
+            or (action_kind == "resume" and has_final_approval(current))
+        )
+    ):
+        # Describe the automatic update before starting/attaching an Executor.
+        # stderr keeps JSON stdout intact and is flushed before any Git work;
+        # the eventual Action receipt reports whether updating actually began.
+        print(text(
+            "cli.approval_update_intent", language=str(current.get("language", "zh"))
+        ), file=sys.stderr, flush=True)
     return lifecycle.submit(
         LifecycleRequest(
             task=task,
@@ -2581,6 +2718,18 @@ def _control_state_root(control_record: Mapping[str, Any] | None) -> Path | None
     return state_root.resolve() if state_root.is_absolute() else None
 
 
+def frozen_worker_identity(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the frozen binding without consulting current personal defaults."""
+    if "github_identity" not in state:
+        raise IncompatibleRunStateError(
+            error_message("identity.run_missing")
+        )
+    try:
+        return validate_identity_snapshot(state["github_identity"])
+    except GitHubIdentityError as error:
+        raise IncompatibleRunStateError(error_message("identity.run_incompatible")) from error
+
+
 def _run_payload_for_existing_action(
     parsed: argparse.Namespace,
     existing_payload: dict[str, Any],
@@ -2598,6 +2747,30 @@ def _run_payload_for_existing_action(
     notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
     if "language" in existing_payload:
         notification_payload["language"] = existing_payload["language"]
+    identity = existing_payload.get("github_identity")
+    if isinstance(identity, dict):
+        github_options = identity_overrides(parsed)
+        if github_options:
+            selected = resolve_worker_identity(
+                {"worker_source": identity["source"], **({"pat": identity["pat"]} if "pat" in identity else {}),
+                 **({"app": identity["app_profile"], "app_read_only": identity["app_read_only"],
+                     "app_current_repository_only": identity["app_current_repository_only"]} if identity["source"] == "app" else {})},
+                github_options,
+            )
+            if selected != identity:
+                raise TaskControlError(error_message("identity.run_fixed"))
+        notification_payload["github_identity"] = dict(identity)
+    runner_identity = existing_payload.get("runner_github_identity")
+    if isinstance(runner_identity, dict):
+        selected_runner = resolve_runner_identity(
+            {"runner_source": runner_identity["source"],
+             **({"pat": runner_identity["pat"]} if "pat" in runner_identity else {}),
+             **({"app": runner_identity["app_profile"]} if "app_profile" in runner_identity else {})},
+            identity_overrides(parsed),
+        )
+        if selected_runner != runner_identity:
+            raise TaskControlError(error_message("identity.run_fixed"))
+        notification_payload["runner_github_identity"] = dict(runner_identity)
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
@@ -2659,6 +2832,9 @@ def _reconcile_resume_exit(
     """Explicit Resume may close an exactly identified externally stopped session."""
     if host is None or current.get("status") == "abandoned":
         return current
+    # Reject incompatible frozen authorization before Host/Run reconciliation
+    # can persist anything. The lifecycle repeats this check before execution.
+    frozen_worker_identity(current)
     task = _task_for_parent(parsed, github, git)
     control = TaskControlStore(workspace_state_root(git.root))
     try:
@@ -2674,17 +2850,9 @@ def _reconcile_resume_exit(
         isinstance(executor, Mapping)
         and isinstance(action, Mapping)
         and (
-            executor.get("status") in {"running", "starting"}
+            executor.get("status") in {"running", "starting", "exited", "absent"}
             or isinstance(executor.get("worker"), Mapping)
-            or (
-                # A previous reconciliation can commit the Host exit before
-                # the Run interruption save fails. Recheck its concrete process
-                # identity and finish that boundary on the next explicit Resume.
-                executor.get("status") in {"exited", "absent"}
-                and (not has_run_operator_gate(current) or is_final_approval_action(action, current))
-                and type(executor.get("pid")) is int
-                and isinstance(executor.get("process_start_token"), str)
-            )
+            or isinstance(executor.get("workers"), list)
         )
         and (
             action.get("status") in {"completed", "failed"}
@@ -2712,12 +2880,16 @@ def _reconcile_resume_exit(
     ):
         raise ExecutorStartUnknownError(observation.reason or error_message('cli.error.executor_exit_unknown'))
     validate_executor_exit(executor)
-    latest = states.load_current_run(str(current["run_id"]))
+    states = object_store(states)
+    assert isinstance(states, ObjectStateStore)
+    object_states = states
+    latest = getattr(states, "load_scheduler_current_run", states.load_current_run)(str(current["run_id"]))
     if latest is None or not (
         action_receipt_matches(latest, action) or _unbound_action_matches_run_receipt(latest, action)
     ):
         raise ExecutorStartUnknownError(error_message('cli.error.executor_changed'))
     current = latest
+    frozen_worker_identity(current)
     if current.get("status") in {"completed", "abandoned"} and not is_final_approval_action(action, current):
         return current
     if _unbound_action_matches_run_receipt(current, action) and is_final_approval_action(action, current):
@@ -2736,14 +2908,25 @@ def _reconcile_resume_exit(
     )
     if is_final_approval_action(action, current):
         return current
-    if not has_run_operator_gate(current):
-        control.fail_session_from_application_receipt(
+    if has_run_operator_gate(current):
+        # The failure gate is not exit proof. Close this generation's work
+        # before a successor can refresh stages or admit another invocation.
+        with states.commit_admission(), control.exited_executor_transaction(
             task, action_id=spec.action_id, generation=spec.generation,
             application_receipt=current["action_application_receipt"],
-            persist_run_failure=lambda: record_session_interruption(
-                current, save=lambda value: states.save_run(str(current["run_id"]), value)
-            ),
-        )
+        ):
+            with object_states.require_unchanged_run(str(current["run_id"]), current):
+                interrupt_exited_invocations(current, "controller_interrupted")
+                states.save_run(str(current["run_id"]), current)
+    else:
+        with states.commit_admission():
+            control.fail_session_from_application_receipt(
+                task, action_id=spec.action_id, generation=spec.generation,
+                application_receipt=current["action_application_receipt"],
+                persist_run_failure=lambda: record_session_interruption(
+                    current, save=lambda value: states.save_run(str(current["run_id"]), value)
+                ),
+            )
     return current
 
 
@@ -2905,12 +3088,15 @@ def _run_driver(
     on_worker_started: Callable[[int], None] | None = None,
     on_worker_finished: Callable[[int], None] | None = None,
     executor_host: ExecutorHost | None = None,
+    worker_identity: dict[str, Any] | None = None,
 ) -> RunDriver:
     agents = _agent_backend(
         parsed,
         profiles,
         on_worker_started=on_worker_started,
         on_worker_finished=on_worker_finished,
+        worker_identity=worker_identity,
+        runner_identity=dict(git.runner_identity) if git.runner_identity else None,
     )
     return RunDriver(
         operations=DirectRunOperations(
@@ -2941,12 +3127,16 @@ def _agent_backend(
     *,
     on_worker_started: Callable[[int], None] | None = None,
     on_worker_finished: Callable[[int], None] | None = None,
+    worker_identity: dict[str, Any] | None = None,
+    runner_identity: dict[str, Any] | None = None,
 ) -> ProfiledAgentBackend:
     fixture = getattr(parsed, "agent_fixture", None)
     backend = (
         FixtureAgentBackend(Path(fixture))
         if fixture
         else CodexCliBackend(
+            worker_identity=worker_identity,
+            runner_identity=runner_identity,
             on_worker_started=on_worker_started,
             on_worker_finished=on_worker_finished,
         )
@@ -2964,21 +3154,30 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
     parent = getattr(parsed, "parent", None)
     if run_id is not None:
         if parent is not None:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_invalid",
                 error_message('cli.error.selector_exclusive'),
                 [],
             )
-        return _load_exact_read_only_run(parsed, run_id)
+        state, exact_root, exact_state_root = load_exact_run(
+            run_id, repository=parsed.repo, state_dir=parsed.state_dir,
+            fixture=parsed.github_fixture,
+        )
+        return _with_executor_control(
+            state, repository_root=exact_root, state_root=exact_state_root
+        )
 
     if parent is None and parsed.repo:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_requires_parent",
             error_message('cli.error.selector_parent_required'),
             [],
         )
     selector_root = selected_repository_root(parsed.repo, parsed.github_fixture)
-    records = _selector_records(parsed, read_only=True)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture, read_only=True,
+    )
     public, state = _select_one_record(
         records,
         parent_number=parent,
@@ -3014,19 +3213,24 @@ def _resolve_mutation_selection(
     raw_selector = parsed.run_id
     if not isinstance(raw_selector, str):
         raise RunLocatorError("run_selector_invalid", error_message('cli.error.selector_required'))
-    if parsed.command == "resume" and raw_selector.isdecimal():
-        _resolve_resume_selection(parsed, git)
-        return
     if raw_selector.isdecimal():
         parent_number = int(raw_selector)
         if parent_number <= 0:
             raise RunLocatorError(
                 "run_selector_invalid", error_message('cli.error.parent_positive')
             )
+        # A failed Parent selector must never become a numeric Run ID in the
+        # outer error handler or authorize recording an execution failure.
         parsed.run_id = None
         parsed.parent = parent_number
+        if parsed.command == "resume":
+            _resolve_resume_selection(parsed, git, parent_number)
+            return
         _reject_local_repository_mismatch(parsed, git, parent_number)
-        records = _selector_records(parsed, current_root=git.root, local_only=True)
+        records = selector_records(
+            repository=parsed.repo, state_dir=parsed.state_dir,
+            fixture=parsed.github_fixture, current_root=git.root, local_only=True,
+        )
         ready_command = (
             parsed.command
             if parsed.command in {"approve", "revise", "requeue"}
@@ -3063,19 +3267,19 @@ def _resolve_mutation_selection(
                     parent_number=parent_number,
                     selection_error=selection_error,
                 )
-        parsed.run_id = _selected_local_run_id(
-            parsed, git, selected, command=parsed.command
+        parsed.run_id = selected_local_run_id(
+            selected, repository_root=git.root, state_dir=parsed.state_dir,
+            command=parsed.command,
         )
         return
 
-    state = states.load_current_run(raw_selector)
+    state = load_selected_state(states, raw_selector, repository=parsed.repo)
     if state is None:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_not_found",
             error_message('cli.error.selected_run_missing' ,value0=parsed.command),
             [],
         )
-    _validate_repository_selector(parsed, state, raw_selector)
     parent = state.get("parent")
     exact_parent_number = (
         parent.get("number") if isinstance(parent, Mapping) else None
@@ -3095,8 +3299,8 @@ def _reject_local_repository_mismatch(
     repository = parsed.repo
     if repository is None:
         return
-    _validate_repository_name(repository)
-    local_records = _read_state_directory(workspace_state_root(git.root), git.root)
+    validate_repository_name(repository)
+    local_records = read_state_directory(workspace_state_root(git.root), git.root)
     mismatches = [
         public
         for public, state in local_records
@@ -3105,7 +3309,7 @@ def _reject_local_repository_mismatch(
         and not same_repository(public.get("repository"), repository)
     ]
     if mismatches:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_repository_mismatch",
             error_message('cli.error.parent_repository_mismatch' ,value0=parent_number, value1=repository),
             mismatches,
@@ -3183,31 +3387,20 @@ def _select_attached_action_run(
 def _resolve_resume_selection(
     parsed: argparse.Namespace,
     git: GitRepository,
+    parent_number: int,
 ) -> None:
     """Resolve the Parent form of ``resume`` before any controller mutation."""
 
-    raw_selector = parsed.run_id
-    if not isinstance(raw_selector, str) or not raw_selector.isdecimal():
-        return
-    parent_number = int(raw_selector)
-    if parent_number <= 0:
-        raise RunLocatorError(
-            "run_selector_invalid", error_message('cli.error.parent_positive')
-        )
-
-    # The original argument is a Parent Issue, not a Run ID.  Clearing it
-    # while selecting is also important: the outer error path must not treat a
-    # failed selector as permission to mutate a Run whose ID happens to be
-    # numeric.
-    parsed.run_id = None
-    parsed.parent = parent_number
-    records = _selector_records(parsed, current_root=git.root, local_only=True)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture, current_root=git.root, local_only=True,
+    )
     try:
         selected, _state = _select_one_record(
             records,
             parent_number=parent_number,
             active_only=True,
-            recoverable_only=True,
+            recoverable_only=parsed.ticket is None,
             purpose="resume",
             current_root=git.root,
         )
@@ -3250,96 +3443,8 @@ def _resolve_resume_selection(
             )
         ):
             raise selection_error
-    parsed.run_id = _selected_local_run_id(parsed, git, selected, command="resume")
-
-
-def _selected_local_run_id(
-    parsed: argparse.Namespace,
-    git: GitRepository,
-    selected: dict[str, object],
-    *,
-    command: str,
-) -> str:
-    selected_run_id = selected.get("run_id")
-    if not isinstance(selected_run_id, str):  # pragma: no cover - candidate contract
-        raise ValueError("selected Delivery Run is missing its Run ID")
-    selected_root = selected.get("repository_root")
-    if (
-        not isinstance(selected_root, str)
-        or Path(selected_root).resolve() != git.root.resolve()
-    ):
-        raise _selector_error(
-            "run_selector_requires_checkout",
-            error_message('cli.error.workspace_mismatch' ,value0=command),
-            [selected],
-        )
-    selected_state_dir = selected.get("state_dir")
-    expected_state_dir = (
-        Path(parsed.state_dir).resolve()
-        if parsed.state_dir
-        else (workspace_state_root(git.root)).resolve()
-    )
-    if (
-        not isinstance(selected_state_dir, str)
-        or Path(selected_state_dir).resolve() != expected_state_dir
-    ):
-        raise _selector_error(
-            "run_selector_requires_state_dir",
-            error_message('cli.error.state_directory_mismatch' ,value0=command),
-            [selected],
-        )
-    return selected_run_id
-
-
-def _load_exact_read_only_run(
-    parsed: argparse.Namespace, run_id: str
-) -> dict[str, object]:
-    repository_root: Path | None = None
-    state_root: Path | None = None
-    if parsed.state_dir:
-        state_dir = Path(parsed.state_dir).resolve()
-        state_root = state_dir
-        states = StateStore(state_dir)
-        repository_root = _repository_root_for_state_dir(state_dir)
-        state = _load_read_only_state(states, run_id)
-        if state is not None and state.get("run_id") != run_id:
-            state = None
-    else:
-        try:
-            git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
-        except (GitError, RunLocatorError):
-            git = None
-        state = None
-        if git is not None:
-            state = _load_read_only_state(StateStore(workspace_state_root(git.root)), run_id)
-            if state is not None and state.get("run_id") != run_id:
-                state = None
-            elif state is not None:
-                repository_root = git.root
-                state_root = workspace_state_root(git.root)
-        if state is None:
-            locator = RunLocatorIndex.default()
-            state_dir = locator.resolve_state_dir(run_id)
-            state_root = state_dir
-            state = _load_read_only_state(StateStore(state_dir), run_id)
-            if state is None or state.get("run_id") != run_id:
-                raise RunLocatorError(
-                    "run_locator_stale",
-                    error_message('cli.error.locator_invalid_state' ,value0=run_id),
-                )
-            roots = {
-                Path(entry["repository_root"]).resolve()
-                for entry in locator.entries()
-                if entry["run_id"] == run_id
-                and Path(entry["state_dir"]).resolve() == state_dir.resolve()
-            }
-            if len(roots) == 1:
-                repository_root = next(iter(roots))
-    if state is None:  # pragma: no cover - exact loader raises before this point
-        raise ValueError(f"unknown Delivery Run: {run_id}")
-    _validate_repository_selector(parsed, state, run_id)
-    return _with_executor_control(
-        state, repository_root=repository_root, state_root=state_root
+    parsed.run_id = selected_local_run_id(
+        selected, repository_root=git.root, state_dir=parsed.state_dir, command="resume"
     )
 
 
@@ -3480,6 +3585,14 @@ def _with_executor_control(
                     reason = "executor_host_unknown"
         else:
             reason = "executor_binding_invalid"
+    final_failures = approval_failures(record, str(state["run_id"]))
+    current_approval_failure = (
+        final_failures[-1]
+        if final_failures and isinstance(action, Mapping)
+        and action.get("status") == "failed"
+        and final_failures[-1]["action_id"] == action.get("action_id")
+        else None
+    )
     projected["_executor_control"] = {
         "activity": activity,
         "action": (
@@ -3493,6 +3606,9 @@ def _with_executor_control(
                     "run_id",
                     "executor_generation",
                     "application_observed",
+                    "completed_at",
+                    "result_status",
+                    "failure",
                 )
             }
             if isinstance(action, Mapping)
@@ -3508,376 +3624,19 @@ def _with_executor_control(
                     "generation",
                     "pid",
                     "handshake_at",
+                    "ticket_resume_closed",
+                    "failure",
                 )
             }
             if isinstance(executor, Mapping)
             else None
         ),
+        "approval_failure": current_approval_failure,
+        "approval_failures": final_failures,
     }
     if reason is not None:
         projected["_executor_control"]["reason"] = reason
     return projected
-
-
-def _load_read_only_state(states: StateStore, run_id: str) -> dict[str, Any] | None:
-    state = states.load_run(run_id)
-    if state is None:
-        return None
-    try:
-        require_current_run_state(state)
-    except IncompatibleRunStateError:
-        if _is_legacy_run_state(state):
-            return state
-        raise
-    return state
-
-
-def _is_legacy_run_state(state: Mapping[str, Any]) -> bool:
-    return (
-        "schema_version" in state
-        or state.get("lifecycle_action_protocol") != TASK_CONTROL_PROTOCOL
-    )
-
-
-def _selector_records(
-    parsed: argparse.Namespace,
-    *,
-    current_root: Path | None = None,
-    read_only: bool = False,
-    local_only: bool = False,
-) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
-    """Load selector candidates from the bounded index or an explicit state dir."""
-
-    repository = parsed.repo
-    if repository is not None:
-        _validate_repository_name(repository)
-
-    if parsed.state_dir:
-        state_dir = Path(parsed.state_dir).resolve()
-        root = _repository_root_for_state_dir(state_dir)
-        records = _read_state_directory(state_dir, root, read_only=read_only)
-        if repository is not None:
-            records = [
-                record
-                for record in records
-                if same_repository(record[0].get("repository"), repository)
-                or record[0].get("repository") is None
-            ]
-        return records
-
-    if current_root is None:
-        current_root = selected_repository_root(repository, parsed.github_fixture)
-        if current_root is None and repository is None:
-            raise _selector_error(
-                "run_selector_context",
-                error_message('cli.error.repository_required'),
-                [],
-            )
-
-    locator = RunLocatorIndex.default()
-    entries = locator.entries()
-    if local_only and current_root is not None:
-        expected_root = current_root.resolve()
-        entries = [
-            entry
-            for entry in entries
-            if Path(entry["repository_root"]).resolve() == expected_root
-        ]
-    records = [_read_locator_entry(entry, read_only=read_only) for entry in entries]
-
-    # A current checkout is an already-known, bounded location.  It remains a
-    # useful fallback when an older/newly interrupted Run has not completed its
-    # locator registration, but it never replaces an indexed entry.
-    if current_root is not None and current_root.is_dir():
-        local_root = workspace_state_root(current_root.resolve())
-        indexed_runs = {
-            (entry["run_id"], Path(entry["state_dir"]).resolve())
-            for entry in entries
-        }
-        local_records = _read_state_directory(
-            local_root, current_root.resolve(), read_only=read_only
-        )
-        records.extend(
-            record
-            for record in local_records
-            if (
-                str(record[0]["run_id"]),
-                Path(str(record[0]["state_dir"])).resolve(),
-            )
-            not in indexed_runs
-        )
-        # Resolve local identity only after the bounded fallback is included.
-        # Otherwise an unregistered local Run can silently lose other clones.
-        if repository is None:
-            repository = workspace_for_root(current_root.resolve()).repository
-    if repository is not None:
-        records = [
-            record
-            for record in records
-            if (record[0].get("repository") is None or same_repository(record[0].get("repository"), repository))
-        ]
-    elif current_root is not None:
-        # With no Repository identity, only this checkout is a known target.
-        # Unreadable identities still need explicit disambiguation.
-        records = [
-            record for record in records
-            if record[0].get("repository_root") == str(current_root.resolve())
-            or record[1] is None
-        ]
-    return records
-
-
-def _repository_root_for_state_dir(state_dir: Path) -> Path | None:
-    """Resolve a state directory to a verified checkout when possible."""
-
-    if state_dir.name == "state":
-        root = state_dir.parent / "repository"
-        try:
-            if workspace_state_root(root) == state_dir:
-                return root
-        except (GitError, OSError):
-            pass
-
-    try:
-        entries = RunLocatorIndex.default().entries()
-    except RunLocatorError:
-        return None
-    roots = {
-        Path(entry["repository_root"]).resolve()
-        for entry in entries
-        if Path(entry["state_dir"]).resolve() == state_dir
-    }
-    if len(roots) != 1:
-        return None
-    recorded_root = next(iter(roots))
-    try:
-        root = GitRepository.discover(recorded_root).root
-    except (GitError, OSError):
-        return None
-    return root if root == recorded_root else None
-
-
-def _verified_locator_checkout(
-    entry: LocatorEntry,
-) -> tuple[GitRepository, str | None]:
-    workspace = workspace_for_root(Path(entry["repository_root"]).resolve())
-    return workspace.open(), workspace.repository
-
-
-def _read_state_directory(
-    state_dir: Path, repository_root: Path | None, *, read_only: bool = False
-) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
-    runs_directory = state_dir / "runs"
-    if not runs_directory.is_dir():
-        return []
-    paths: list[Path] = []
-    for path in runs_directory.glob("*.json"):
-        paths.append(path)
-        if len(paths) > MAX_LOCATOR_ENTRIES:
-            raise RunLocatorError(
-                "run_locator_invalid",
-                error_message('cli.error.too_many_runs' ,value0=MAX_LOCATOR_ENTRIES),
-            )
-    paths.sort(key=lambda path: path.name)
-    repository_root_value = (
-        str(repository_root.resolve()) if repository_root is not None else "unavailable"
-    )
-    records: list[tuple[dict[str, object], dict[str, Any] | None]] = []
-    for path in paths:
-        entry: LocatorEntry = {
-            "run_id": path.stem,
-            "repository_root": repository_root_value,
-            "state_dir": str(state_dir.resolve()),
-            "updated_at": "",
-        }
-        public, state = _read_locator_entry(
-            entry,
-            verify_checkout=repository_root is not None,
-            read_only=read_only,
-        )
-        records.append((public, state if repository_root is not None else None))
-    return records
-
-
-def _read_locator_entry(
-    entry: LocatorEntry,
-    *,
-    verify_checkout: bool = True,
-    read_only: bool = False,
-) -> tuple[dict[str, object], dict[str, Any] | None]:
-    run_id = entry["run_id"]
-    if Path(run_id).name != run_id:
-        return _candidate(entry, error=error_message("cli.error.unsafe_run_id")), None
-    state_dir = Path(entry["state_dir"])
-    state_path = state_dir / "runs" / f"{run_id}.json"
-    state: dict[str, Any] | None = None
-    state_error: str | None = None
-    if not state_path.is_file():
-        state_error = error_message("cli.error.state_missing")
-    else:
-        try:
-            # Identity must be checked before validating the lifecycle payload:
-            # a broken payload cannot hide a contradictory routing identity.
-            state = StateStore(state_dir).load_run(run_id)
-        except (OSError, ValueError) as error:
-            state_error = bounded_error(str(error))
-        if state is None:
-            if state_error is None:
-                state_error = error_message("cli.error.run_id_mismatch")
-        elif state.get("run_id") != run_id:
-            return _candidate(
-                entry,
-                error=error_message("cli.error.run_id_mismatch"),
-                identity_conflict=True,
-            ), None
-        if state is not None:
-            repository = state.get("repository")
-            parent = state.get("parent")
-            parent_number = parent.get("number") if isinstance(parent, dict) else None
-            if (
-                (
-                    repository is not None
-                    and (
-                        not isinstance(repository, str)
-                        or len(repository.split("/")) != 2
-                        or not all(repository.split("/"))
-                        or any(character.isspace() for character in repository)
-                    )
-                )
-                or (
-                    parent_number is not None
-                    and (type(parent_number) is not int or parent_number <= 0)
-                )
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_format"),
-                    identity_conflict=True,
-                ), None
-            if repository is None or parent_number is None:
-                state_error = error_message("cli.error.identity_missing")
-        if state is not None and "repository" in entry:
-            parent = state.get("parent")
-            if (
-                not same_repository(state.get("repository"), entry["repository"])
-                or not isinstance(parent, dict)
-                or parent.get("number") != entry["parent_number"]
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_mismatch"),
-                    identity_conflict=True,
-                ), None
-        if state is not None:
-            try:
-                require_current_run_state(state)
-            except IncompatibleRunStateError as error:
-                if not (read_only and _is_legacy_run_state(state)):
-                    state_error = bounded_error(str(error))
-    if state is None and state_error is not None:
-        if not verify_checkout:
-            return _candidate(entry, error=state_error), None
-        try:
-            _checkout, checkout_repository = _verified_locator_checkout(entry)
-        except (GitError, OSError) as error:
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
-                ),
-                None,
-            )
-        candidate = _candidate(entry, error=state_error)
-        if checkout_repository is not None:
-            if "repository" in entry and not same_repository(entry["repository"], checkout_repository):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.checkout_repository"),
-                    identity_conflict=True,
-                ), None
-            candidate["repository"] = checkout_repository
-        return candidate, None
-    if state is None:  # pragma: no cover - state errors return above
-        return _candidate(entry, error=error_message("cli.error.state_unreadable")), None
-    if verify_checkout:
-        try:
-            checkout, checkout_repository = _verified_locator_checkout(entry)
-        except (GitError, OSError) as error:
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    state=state,
-                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
-                ),
-                None,
-            )
-        state_repository = state.get("repository")
-        if checkout_repository is not None and not same_repository(state_repository, checkout_repository):
-            return _candidate(
-                entry,
-                state=state,
-                error=error_message("cli.error.checkout_run"),
-                identity_conflict=True,
-            ), None
-        checkout_identity = checkout.checkout_identity()
-        state_identity = state.get("checkout_identity")
-        if (
-            not isinstance(state_identity, str)
-            or checkout_identity is None
-            or checkout_identity != state_identity
-        ):
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    state=state,
-                    error=error_message("cli.error.checkout_identity"),
-                    identity_conflict=state_identity is not None,
-                ),
-                None,
-            )
-    return _candidate(entry, state=state, error=state_error), (
-        state if state_error is None else None
-    )
-
-
-def _candidate(
-    entry: LocatorEntry,
-    *,
-    state: dict[str, Any] | None = None,
-    error: str | None = None,
-    identity_conflict: bool = False,
-) -> dict[str, object]:
-    parent: object = entry.get("parent_number")
-    repository: object = entry.get("repository")
-    status: object = "unavailable"
-    started_at: object = None
-    if state is not None:
-        raw_parent = state.get("parent")
-        if isinstance(raw_parent, dict) and isinstance(raw_parent.get("number"), int):
-            parent = raw_parent["number"]
-        repository = state.get("repository")
-        status = state.get("status")
-        started_at = state.get("created_at", state.get("started_at"))
-    candidate: dict[str, object] = {
-        "parent": parent,
-        "repository": repository,
-        "repository_root": entry["repository_root"],
-        "run_id": entry["run_id"],
-        "started_at": started_at,
-        "state_dir": entry["state_dir"],
-        "status": status,
-    }
-    if error is not None:
-        candidate["error"] = error
-    if identity_conflict:
-        candidate.update(repository=None, parent=None, repository_root="unavailable")
-    return candidate
 
 
 def _select_one_record(
@@ -3899,7 +3658,7 @@ def _select_one_record(
     public_records = [record[0] for record in records]
     invalid = [public for public, state in records if state is None]
     if invalid:
-        raise _selector_error(
+        raise selector_error(
             "run_locator_stale",
             error_message('cli.error.invalid_candidates' ,value0=purpose),
             public_records,
@@ -3937,14 +3696,14 @@ def _select_one_record(
         other_matches = [match for match in matches if match not in local_matches]
         if local_matches:
             if other_matches:
-                raise _selector_error(
+                raise selector_error(
                     "run_selector_ambiguous",
                     error_message('cli.error.multiple_checkouts' ,value0=purpose),
                     [public for public, _state in matches],
                 )
             matches = local_matches
         elif other_matches:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_requires_checkout",
                 error_message('cli.error.other_checkout' ,value0=purpose),
                 [public for public, _state in other_matches],
@@ -3952,7 +3711,7 @@ def _select_one_record(
 
     if recoverable_only:
         if len(matches) > 1:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_ambiguous",
                 error_message('cli.error.multiple_runs' ,value0=purpose),
                 [public for public, _state in matches],
@@ -3965,7 +3724,7 @@ def _select_one_record(
                 and has_unfinished_final_receipt(state, current_root)
             ):
                 return public, state
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_not_recoverable",
                 error_message('cli.error.not_recoverable'),
                 [public],
@@ -3973,68 +3732,16 @@ def _select_one_record(
     elif len(matches) == 1:
         return matches[0]
     elif len(matches) > 1:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_ambiguous",
             error_message('cli.error.multiple_runs' ,value0=purpose),
             [public for public, _state in matches],
         )
-    raise _selector_error(
+    raise selector_error(
         "run_selector_not_found",
         error_message('cli.error.no_unique_run' ,value0=purpose),
         public_records,
     )
-
-
-def _selector_error(
-    code: str, message: str, candidates: list[dict[str, object]]
-) -> RunLocatorError:
-    details = message
-    if candidates:
-        details = error_message("cli.error.candidates", reason=message, candidates="\n".join(
-            _candidate_line(candidate) for candidate in candidates
-        ))
-    return RunLocatorError(code, details, candidates=candidates)
-
-
-def _candidate_line(candidate: dict[str, object]) -> str:
-    error = candidate.get("error")
-    error_detail = f" error={error}" if isinstance(error, str) else ""
-    return (
-        f"- repository={candidate.get('repository') or 'unknown'} "
-        f"Parent=#{candidate.get('parent') or 'unknown'} "
-        f"status={candidate.get('status') or 'unknown'} "
-        f"started_at={candidate.get('started_at') or 'unknown'} "
-        f"worktree={candidate.get('repository_root')} "
-        f"state_dir={candidate.get('state_dir')}{error_detail}"
-    )
-
-
-def _validate_repository_selector(
-    parsed: argparse.Namespace, state: dict[str, object], run_id: str
-) -> None:
-    repository = parsed.repo
-    if repository is not None:
-        _validate_repository_name(repository)
-        if not same_repository(state.get("repository"), repository):
-            parent = state.get("parent")
-            candidate = {
-                "parent": (
-                    parent.get("number")
-                    if isinstance(parent, Mapping)
-                    else None
-                ),
-                "repository": state.get("repository"),
-                "repository_root": "当前 checkout",
-                "run_id": run_id,
-                "started_at": state.get("created_at"),
-                "state_dir": parsed.state_dir or "Runner 统一状态目录",
-                "status": state.get("status"),
-            }
-            raise _selector_error(
-                "run_selector_repository_mismatch",
-                error_message('cli.error.repository_mismatch' ,value0=run_id, value1=repository),
-                [candidate],
-            )
 
 
 def _human_failure_reason(error: Exception, fallback: str, *, language: str = "zh") -> str:
@@ -4062,17 +3769,10 @@ def _human_failure_reason(error: Exception, fallback: str, *, language: str = "z
     }.get(error.code, "ambiguous_delivery"))
 
 
-def _validate_repository_name(repository: str) -> None:
-    owner, separator, name = repository.partition("/")
-    if not separator or not owner or not name or "/" in name:
-        raise RunLocatorError(
-            "run_selector_invalid_repository",
-            error_message('cli.error.repository_format'),
-        )
-
-
 def _list_runs(parsed: argparse.Namespace) -> int:
-    records = _selector_records(parsed)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir, fixture=parsed.github_fixture,
+    )
     parent = getattr(parsed, "parent", None)
     if parent is not None:
         records = [
@@ -4228,6 +3928,43 @@ def _add_policy_options(
         type=_positive_integer,
         help=cli_message('cli.ticket_rounds_help'),
     )
+    parser.add_argument(
+        "--ticket-development-workers",
+        dest=f"{dest_prefix}ticket_development_workers",
+        type=_positive_integer,
+        help=cli_message('cli.ticket_development_workers_help'),
+    )
+    parser.add_argument(
+        "--ticket-integration-development-limit",
+        dest=f"{dest_prefix}ticket_integration_development_limit",
+        type=_positive_integer,
+        help=cli_message("cli.ticket_integration_development_limit_help"),
+    )
+    parser.add_argument(
+        "--integration-resync-limit",
+        dest=f"{dest_prefix}integration_resync_limit",
+        type=_nonnegative_integer,
+        help=cli_message('cli.integration_resync_limit_help'),
+    )
+    parser.add_argument(
+        "--ticket-ci-development-limit",
+        dest=f"{dest_prefix}ticket_ci_development_limit",
+        type=_positive_integer,
+        help=cli_message("cli.ticket_ci_development_limit_help"),
+    )
+    parser.add_argument(
+        "--ticket-ci-review",
+        dest=f"{dest_prefix}ticket_ci_review",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=cli_message("cli.ticket_ci_review_help"),
+    )
+    parser.add_argument(
+        "--parent-ci-development-limit",
+        dest=f"{dest_prefix}parent_ci_development_limit",
+        type=_positive_integer,
+        help=cli_message('cli.parent_ci_development_limit_help'),
+    )
     for role, label in (
         ("development", "Development"),
         ("review", "Review"),
@@ -4249,6 +3986,12 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "ticket_development_workers",
+        "integration_resync_limit",
+        "ticket_integration_development_limit",
+        "ticket_ci_development_limit",
+        "ticket_ci_review",
+        "parent_ci_development_limit",
         "development_thread_policy",
     ):
         value = getattr(parsed, f"policy_{key}", None)
@@ -4269,9 +4012,9 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
 
 
 def _resolve_delivery_policy(parsed: argparse.Namespace) -> DeliveryPolicy:
-    store = DeliveryPolicyStore()
+    store = UserDefaultsStore()
     return resolve_delivery_policy(
-        user_defaults=store.load(),
+        user_defaults=store.load().get("policy"),
         command_overrides=_policy_overrides(parsed),
     )
 
@@ -4369,79 +4112,13 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
     return 0
 
 
-def _auth_command(parsed: argparse.Namespace) -> int:
-    try:
-        store = GitHubAppProfileStore()
-        if parsed.auth_command == "status":
-            configured = store.load() is not None
-            print(
-                json.dumps(
-                    {
-                        "app_profile": "configured"
-                        if configured
-                        else "not_configured",
-                        "provider": "app" if configured else "host",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 0
-        if parsed.auth_app_command == "configure":
-            store.configure(
-                app_id=parsed.app_id,
-                installation_id=parsed.installation_id,
-                private_key_path=parsed.private_key,
-            )
-            print(json.dumps({"provider": "app", "result": "configured"}, sort_keys=True))
-            return 0
-        if parsed.auth_app_command == "remove":
-            store.remove()
-            print(
-                json.dumps(
-                    {
-                        "app_profile": "not_configured",
-                        "provider": "host",
-                        "result": "removed",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 0
-        raise ValueError(error_message('cli.error.unknown_auth'))
-    except GitHubAuthProfileError as error:
-        print(
-            json.dumps(
-                {
-                    "result": "error",
-                    "status": "invalid_auth_profile",
-                    "diagnostics": [
-                        {
-                            "code": "github_auth_profile_invalid",
-                            "message": bounded_error(str(error)),
-                        }
-                    ],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return 2
-
-
 def _profile_state_root(parsed: argparse.Namespace) -> Path:
-    if parsed.state_dir:
-        return Path(parsed.state_dir).resolve()
-    try:
-        git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
-    except (GitError, RunLocatorError):
-        git = None
-    if git is not None:
-        local_root = workspace_state_root(git.root)
-        if StateStore(local_root).load_run(parsed.run_id) is not None:
-            return local_root
-    return RunLocatorIndex.default().resolve_state_dir(parsed.run_id)
+    _state, _repository_root, state_root = load_exact_run(
+        parsed.run_id, repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture,
+    )
+    assert state_root is not None  # An exact Run always has a persisted location.
+    return state_root
 
 
 def _positive_integer(value: str) -> int:
@@ -4451,6 +4128,16 @@ def _positive_integer(value: str) -> int:
         raise argparse.ArgumentTypeError(cli_message("cli.positive_integer")) from error
     if number <= 0:
         raise argparse.ArgumentTypeError(cli_message("cli.positive_integer"))
+    return number
+
+
+def _nonnegative_integer(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(cli_message("cli.nonnegative_integer")) from error
+    if number < 0:
+        raise argparse.ArgumentTypeError(cli_message("cli.nonnegative_integer"))
     return number
 
 

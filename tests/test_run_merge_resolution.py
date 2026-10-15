@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+
 import json
 from pathlib import Path
 import subprocess
@@ -8,23 +10,26 @@ import pytest
 
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.git import GitError
+from agent_run.state_errors import MissingRunMaterialsError
 from agent_run.github_fixture import FixtureGitHubPublisher
 
-from run_merge_resolution_faults import (
+from support.merge_faults import (
     CandidateSaveCrashGit,
     CleanReprepareCrashGit,
     FindingSnapshotCrashGit,
     FindingReplayCrashGit,
     FindingReplaySaveCrashGit,
 )
-from run_merge_resolution_fixture import (
+from support.merge_resolution import (
     MergeResolutionFixture,
     _git_output,
 )
 from support.workspace import prepare_workspace
-from conftest import seed_idle_control
-from test_cli import run_cli
-from run_acceptance_test_support import _passing_artifact
+from support.seeding import seed_idle_control
+from support.cli import run_cli
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def test_merge_resolution_creates_exact_two_parent_candidate(git_repo: Path) -> None:
@@ -118,8 +123,9 @@ def test_merge_resolution_candidate_finding_reuses_repair_cycle(
     fixture.assert_completed(result)
 
 
+@pytest.mark.parametrize("tampered_intent", [False, True], ids=["original-intent", "wrong-intent"])
 def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
-    git_repo: Path,
+    git_repo: Path, tampered_intent: bool,
 ) -> None:
     fixture = MergeResolutionFixture(git_repo, "candidate_save_crash")
     crashing_git = CandidateSaveCrashGit(git_repo)
@@ -130,9 +136,36 @@ def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
             FixtureGitHubPublisher(fixture.fixture, crashing_git),
             fixture.default_head,
         ).accept(str(fixture.state["run_id"]))
+    run_id = str(fixture.state["run_id"])
+    interrupted = fixture.states.load_current_run(run_id)
+    assert interrupted is not None
+    job = interrupted["run_acceptance"]["repair_job"]
+    checkout = Path(job["repair_checkout"])
+    committed = fixture.git.checkout_head(checkout)
+    attempt_id = job["pending_semantic_attempt"]["attempt_id"]
+    calls_before = len(fixture.agents.development_requests)
+    used = interrupted["run_acceptance"]["review_budget"]["development_attempts"]
+    if tampered_intent:
+        job["candidate_commit_intent"]["token"] = "unrelated-intent"
+        persist_run_fixture(fixture.states, run_id, interrupted)
+        state_ref = (fixture.states.root, str(run_id))
+        before = snapshot_run(state_ref)
+        with pytest.raises(MissingRunMaterialsError, match="HEAD 不符"):
+            fixture.accept()
+        assert snapshot_run(state_ref) == before
+        assert fixture.git.checkout_head(checkout) == committed
+        assert len(fixture.agents.development_requests) == calls_before
+        assert fixture.agents.review_requests == []
+        return
     result = fixture.accept()
 
     fixture.assert_completed(result)
+    assert result["run_acceptance"]["candidate_sha"] == committed
+    assert len(fixture.agents.development_requests) == calls_before
+    assert result["run_acceptance"]["review_budget"]["development_attempts"] == used
+    retired = result["retired_semantic_attempt_owners"][-1]
+    attempts = retired["semantic_attempt_history"]
+    assert sum(attempt["attempt_id"] == attempt_id for attempt in attempts) == 1
 
 
 @pytest.mark.parametrize(
@@ -153,10 +186,10 @@ def test_merge_resolution_candidate_validation_default_drift_reprepares_boundary
     fixture.assert_completed(resumed)
 
 
-def test_merge_resolution_publication_default_drift_reprepares_boundary(
+def test_merge_resolution_run_branch_write_default_drift_reprepares_boundary(
     git_repo: Path,
 ) -> None:
-    fixture = MergeResolutionFixture(git_repo, "publication_default_drift")
+    fixture = MergeResolutionFixture(git_repo, "run_branch_write_default_drift")
 
     interrupted = fixture.accept()
     fixture.assert_reprepare_pending(interrupted)
@@ -451,13 +484,6 @@ def test_merge_resolution_staged_development_interruption_resumes_same_thread(
                         "thread_id": "integration-repair-developer",
                         "summary": "Recovered the staged conflict resolution.",
                         "expected_files": {"shared.txt": "resolved\n"},
-                    }
-                ],
-                "publications": [
-                    {
-                        **fixture.agents.publication({}),
-                        "expected_thread_id": "integration-repair-developer",
-                        "thread_id": "integration-repair-developer",
                     }
                 ],
                 "run_reviews": [

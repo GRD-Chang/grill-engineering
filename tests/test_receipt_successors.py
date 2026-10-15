@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from support.receipt_host import (
+    _install_host,
+)
+
 import json
-from collections.abc import Callable, Mapping
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -13,101 +15,25 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 import agent_run.cli as cli_module
-import agent_run.workspace_cli as workspace_cli
-from agent_run.executor_host import (
-    ExecutorSpec,
-    ExecutorStartUnknownError,
-    HostObservation,
-)
-from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state_contract import require_current_run_state
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey, payload_digest
-from conftest import seed_run, write_fixture
-from test_cli import _canonical_run_budget, load_only_run_state
+from support.seeding import seed_run, write_fixture
+from support.cli import load_only_run_state
+from support.run_artifacts import _canonical_run_budget
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.fixture(autouse=True)
 def isolated_environment(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from test_run_lifecycle import _isolated_environment
+    from support.lifecycle import _isolated_environment
 
     for key, value in _isolated_environment(git_repo.parent / "home-env").items():
         monkeypatch.setenv(key, value)
-
-
-def _install_host(
-    git_repo: Path,
-    fixture: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    host_status: str,
-    *,
-    launch_unknown: bool = True,
-) -> cli_module.FakeExecutorHost:
-    class UsageLease:
-        def fileno(self) -> int:
-            return 1
-
-    class ReceiptHost(cli_module.FakeExecutorHost):
-        def __init__(self) -> None:
-            super().__init__(start_outcome="unknown" if launch_unknown else "accepted")
-            self.observed: list[ExecutorSpec] = []
-
-        def check_readiness(self) -> None:
-            pass
-
-        def prepare_environment(self, _arguments: object) -> None:
-            pass
-
-        def observe(
-            self, spec: ExecutorSpec, _control: TaskControlStore
-        ) -> HostObservation:
-            self.observed.append(spec)
-            return HostObservation(
-                host_status,  # type: ignore[arg-type]
-                spec.generation,
-                None,
-                False,
-                runner_binding="0" * 16 if host_status == "exited" else None,
-            )
-
-        def ensure(
-            self,
-            spec: ExecutorSpec,
-            control: TaskControlStore,
-            execute: Callable[[], Mapping[str, Any]] | None = None,
-            recover: bool = False,
-        ) -> HostObservation:
-            # The matrix loses the successor launch response after admission.
-            # The smoke tests run the real Executor callback to completion.
-            result = super().ensure(spec, control, execute=execute, recover=recover)
-            if launch_unknown:
-                raise ExecutorStartUnknownError("successor launch response lost")
-            return result
-
-    host = ReceiptHost()
-    monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo.parent / "runtime"))
-    monkeypatch.setattr(
-        cli_module, "runner_usage_lease", lambda _path: nullcontext(UsageLease())
-    )
-    monkeypatch.setattr(cli_module, "_running_active_runner", lambda: True)
-    monkeypatch.setattr(cli_module, "SystemdUserExecutorHost", lambda **_options: host)
-    monkeypatch.setattr(
-        cli_module,
-        "GhGitHubReader",
-        lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
-    )
-    monkeypatch.setattr(
-        workspace_cli, "GhGitHubReader",
-        lambda **_options: FixtureGitHubReader(fixture),
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "GhGitHubPublisher",
-        lambda _repo, git: FixtureGitHubPublisher(fixture, git),
-    )
-    return host
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
@@ -154,6 +80,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
                 "phase": "pending",
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             }
             state["requeue_required"] = {
                 "work_subject": f"parent-only:{run_id}",
@@ -167,7 +94,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
                 }
             ]
     require_current_run_state(state)
-    StateStore(state_root).save_run(run_id, state)
+    persist_run_fixture(StateStore(state_root), run_id, state)
     old_generation = receipt["executor_generation"]
     control_path = control.path_for(task)
     if control_case == "missing":
@@ -179,8 +106,8 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
     arguments = [command, run_id, "--repo", "example/project", "--json"]
     if command == "revise":
         arguments.extend(["--message", "apply this exact revision"])
-    state_path = state_root / "runs" / f"{run_id}.json"
-    state_before = state_path.read_bytes()
+    state_ref = (state_root, str(run_id))
+    state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     control_before = control_path.read_bytes() if control_path.exists() else None
 
@@ -189,7 +116,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         cli_module.main(["run", "1", "--repo", "example/project", "--json"])
         capsys.readouterr()
         assert host.start_count == 0
-        assert state_path.read_bytes() == state_before
+        assert snapshot_run(state_ref) == state_before
         # A read-only refusal may leave the missing/corrupt evidence intact.
         assert (
             control_path.read_bytes() if control_path.exists() else None
@@ -202,7 +129,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         spec.action_id == receipt["action_id"] and spec.generation == old_generation
         for spec in host.observed
     )
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert fixture.read_bytes() == fixture_before
     repaired = control.load(task)
     assert repaired is not None
@@ -217,7 +144,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         assert host.start_count == 0
         assert len(host.observed) == 2
         assert control_path.read_bytes() == before_retry
-        assert state_path.read_bytes() == state_before
+        assert snapshot_run(state_ref) == state_before
         assert fixture.read_bytes() == fixture_before
         return
 
@@ -249,7 +176,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
     capsys.readouterr()
     assert host.start_count == (1 if intent == "successor" else 0)
     assert control_path.read_bytes() == before_retry
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert fixture.read_bytes() == fixture_before
 
 
@@ -260,10 +187,10 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    from cli_fixtures import run_agents
-    from test_cli import run_cli
-    from test_cli_delivery import ticket
-    from test_ticket_192_cli_actions import _parent_agents, _revision_agents
+    from support.cli_fixtures import run_agents
+    from support.cli import run_cli
+    from support.cli_payloads import ticket
+    from support.cli_actions import _parent_agents, _revision_agents
 
     fixture = write_fixture(
         git_repo / "github.json", issues={} if command == "requeue" else {"3": ticket()}
@@ -322,16 +249,23 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
     )
     repaired = control.load(task)
     assert repaired is not None
-    assert (
-        len(
-            [
-                entry
-                for entry in repaired["action_history"]
-                if entry["action"]["action_id"] == receipt["action_id"]
-            ]
-        )
-        == 1
+    predecessors = [
+        entry for entry in repaired["action_history"]
+        if entry["action"]["action_id"] == receipt["action_id"]
+    ]
+    assert len(predecessors) == 1
+    predecessor = predecessors[0]
+    assert predecessor["action"]["status"] == (
+        "failed" if command == "requeue" else "completed"
     )
+    for field in ("action_id", "kind", "payload_digest", "run_id", "executor_generation"):
+        assert predecessor["action"][field] == receipt[field]
+    assert predecessor["executor"]["status"] == "exited"
+    assert predecessor["executor"]["runner_binding"] == "0" * 16
+    if command == "requeue":
+        assert predecessor["action"]["kind"] == "approve"
+        assert predecessor["action"]["result_status"] == "requeue_required"
+        assert predecessor["action"]["failure"]
     # A repeat after successor application only returns its receipt when the
     # resulting state no longer grants this same command a new intent.
     if command != "revise":
@@ -363,7 +297,7 @@ def test_original_retry_unknown_then_different_successor_reconciles_again(
     original = control.claim_action(task, kind=original_command, payload=payload)
     prepare_action_application_receipt(state, original.action)
     state.update({"status": "run_approval_pending", "terminal_kind": None})
-    StateStore(managed_state(git_repo)).save_run(run_id, state)
+    persist_run_fixture(StateStore(managed_state(git_repo)), run_id, state)
     control.path_for(task).unlink()
     first_host = _install_host(git_repo, fixture, monkeypatch, "unknown")
     arguments = [original_command, run_id, "--repo", "example/project", "--json"]

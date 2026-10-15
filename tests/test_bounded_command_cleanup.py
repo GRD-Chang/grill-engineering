@@ -106,7 +106,8 @@ try:
                           if helper == 'github' else _run_bounded(arguments, max_output=1024))
             except subprocess.TimeoutExpired as error:
                 assert helper == 'github' and outcome == 'timeout'
-                assert b'normal output' in error.stdout and b'error tail' in error.stderr
+                assert isinstance(error.stdout, str) and isinstance(error.stderr, str)
+                assert 'normal output' in error.stdout and 'error tail' in error.stderr
             except RuntimeError as error:
                 assert outcome in {'exception', 'reader_start_failure'}
                 assert str(error) == ("can't start new thread" if outcome == 'reader_start_failure'

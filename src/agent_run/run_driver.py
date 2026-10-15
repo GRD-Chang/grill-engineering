@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Literal, Protocol
@@ -15,6 +16,7 @@ from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.external_supervision import (
     ExternalSupervisor,
+    supervision_scope,
     clear_supervision_window,
     is_github_refresh_wait,
     is_supervised_wait,
@@ -25,6 +27,7 @@ from agent_run.external_supervision import (
 from agent_run.final_approval_operation import (
     final_approval_cleanup_pending, has_final_approval,
 )
+from agent_run.executor_admission import failure_recorded
 from agent_run.executor_host import ExecutorHost
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -33,9 +36,12 @@ from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
-from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.run_publication_approval import prepare_run_approval
+from agent_run.object_state import ObjectStateStore, object_store, save_owned
+from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError
 
 
@@ -57,6 +63,7 @@ class RunStep(str, Enum):
     ACCEPT = "accept-run"
     PUBLISH = "publish-run"
     REQUEUE = "requeue"
+    REFRESH = "refresh"
 
 
 @dataclass(frozen=True)
@@ -91,7 +98,9 @@ class RunController(Protocol):
 
     def finalize_requeue(self, run_id: str) -> dict[str, Any]: ...
 
-    def record_execution_failure(self, run_id: str, message: str) -> bool: ...
+    def record_execution_failure(
+        self, run_id: str, message: str, *, runner_credential_failure: bool = False,
+    ) -> bool: ...
 
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
@@ -176,7 +185,7 @@ class DirectRunOperations:
         executor_host: ExecutorHost | None = None,
     ) -> None:
         self.controller: Any = controller
-        self.states = states
+        self.states = object_store(states)
         self.before_external_step = before_external_step
         self.resume_pending_refresh = resume_pending_refresh
         self.use_current_state_once = use_current_state_once
@@ -285,14 +294,13 @@ class DirectRunOperations:
 
     def deliver(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.DELIVER:
+            return selected
         if refreshed.get("status") == "completed" and has_final_approval(refreshed):
             return self.classify(DeliveryCleanupEngine(
                 git=self.git, states=self.states, github=self.publisher
             ).resume(run_id))
-        if self._cannot_advance(refreshed) and not (
-            refreshed.get("status") == "parent_approval_pending" and has_final_approval(refreshed)
-        ):
-            return self.classify(refreshed)
         refreshed = DeliveryCleanupEngine(
             git=self.git, states=self.states, github=self.publisher
         ).resume(run_id)
@@ -360,20 +368,9 @@ class DirectRunOperations:
                     state=refreshed,
                     next_step=None,
                 )
-        acceptance = refreshed.get("run_acceptance")
-        repair_wait = (
-            isinstance(acceptance, dict)
-            and acceptance.get("phase") == "repairing"
-            and isinstance(acceptance.get("repair_job"), dict)
-            and refreshed.get("status")
-            in {"waiting_checks", "waiting_external", "waiting_merge"}
-        )
-        if self._cannot_advance(refreshed) or (
-            refreshed.get("status")
-            not in {"run_acceptance_pending", "run_publication_pending"}
-            and not repair_wait
-        ):
-            return self.classify(refreshed)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.ACCEPT:
+            return selected
         return self._accept_current_run(run_id)
 
     def _accept_current_run(self, run_id: str) -> RunOutcome:
@@ -395,27 +392,14 @@ class DirectRunOperations:
 
     def publish(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed) and not (
-            refreshed.get("status") == "run_approval_pending" and has_final_approval(refreshed)
-        ):
-            return self.classify(refreshed)
+        selected = self.classify(refreshed)
+        if selected.next_step is not RunStep.PUBLISH:
+            return selected
         publication = refreshed.get("run_publication")
         if (
             isinstance(publication, dict)
             and publication.get("phase") == "publication_pending"
         ):
-            return self.classify(refreshed)
-        eligible = refreshed.get("status") == "run_publication_pending" or (
-            isinstance(publication, dict)
-            and refreshed.get("status")
-            in {
-                "publication_pending",
-                "waiting_checks",
-                "waiting_external",
-                "run_approval_pending",
-            }
-        )
-        if not eligible:
             return self.classify(refreshed)
         repository = self.github_reader.repository()
         publication_engine = RunPublicationEngine(
@@ -471,13 +455,23 @@ class DirectRunOperations:
         *,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> RunOutcome:
+        current = self.states.load_current_run(run_id)
+        if current is not None and current.get("status") == "run_approval_pending":
+            prepare_run_approval(current)
+            if prepare_state is not None:
+                prepare_state(current)
+            self.states.save_run(run_id, current)
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed) and refreshed.get("status") not in {
+        selected = self.classify(refreshed)
+        if refreshed.get("status") not in {
             "run_approval_pending",
             "parent_approval_pending",
             "parent_closeout_pending",
         }:
-            return self.classify(refreshed)
+            if prepare_state is not None and selected.kind is not RunOutcomeKind.EXTERNAL_WAIT:
+                prepare_state(refreshed)
+                self.states.save_run(run_id, refreshed)
+            return selected
         if refreshed.get("delivery_type") == "parent_only":
             parent = ParentDeliveryEngine(
                 git=self.git,
@@ -591,6 +585,9 @@ class DirectRunOperations:
             return self.accept(run_id)
         if step is RunStep.PUBLISH:
             return self.publish(run_id)
+        if step is RunStep.REFRESH:
+            refreshed, _ = self._refresh(run_id)
+            return self.classify(refreshed)
         return self.requeue(run_id)
 
     @staticmethod
@@ -610,7 +607,7 @@ class DirectRunOperations:
             kind = RunOutcomeKind.TERMINAL_COMPLETION
         elif status == "abandoned":
             kind = RunOutcomeKind.TERMINAL_ABANDONMENT
-        elif _is_currentness_human_blocker(state) or status in {
+        elif has_run_operator_gate(state) or _is_currentness_human_blocker(state) or status in {
             "ready_for_human",
             "run_approval_pending",
             "parent_approval_pending",
@@ -622,15 +619,6 @@ class DirectRunOperations:
         else:
             kind = RunOutcomeKind.PROGRESS
         return RunOutcome(kind=kind, state=state, next_step=_next_step(state))
-
-    @staticmethod
-    def _cannot_advance(state: dict[str, Any]) -> bool:
-        return (
-            state.get("status") in {"completed", "abandoned"}
-            or has_run_operator_gate(state)
-            or is_github_refresh_wait(state)
-            or _is_currentness_human_blocker(state)
-        )
 
 
 class RunDriver:
@@ -644,11 +632,26 @@ class RunDriver:
         supervisor: ExternalSupervisor,
     ) -> None:
         self.operations = operations
-        self.states = states
+        self.states = object_store(states)
         self.supervisor = supervisor
         self.on_outcome: Callable[[dict[str, Any], str], None] | None = None
 
     def advance(
+        self,
+        state: dict[str, Any],
+        *,
+        control_operation: ControlRunOperation | None = None,
+    ) -> dict[str, Any]:
+        while True:
+            try:
+                return self._advance(state, control_operation=control_operation)
+            except ConcurrentRunStateError:
+                latest = self.states.load_current_run(str(state["run_id"]))
+                if latest is None:
+                    raise
+                state = latest
+
+    def _advance(
         self,
         state: dict[str, Any],
         *,
@@ -669,7 +672,8 @@ class RunDriver:
                     return state
                 progress_marker_before_dispatch = _progress_marker(state)
                 try:
-                    outcome = self.operations.dispatch(step, run_id)
+                    with supervision_scope(self.supervisor):
+                        outcome = self.operations.dispatch(step, run_id)
                 except GitHubReadError as error:
                     if is_proven_github_state_contradiction(error.code):
                         raise
@@ -705,9 +709,10 @@ class RunDriver:
                     return failed
                 if self.on_outcome is not None:
                     self.on_outcome(state, outcome.kind.value)
+                expected_wait = self._wait_facts(state)
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
                     if clear_supervision_window(state):
-                        self.states.save_run(run_id, state)
+                        self._save_wait(run_id, state, expected_wait)
                     if outcome.kind in {
                         RunOutcomeKind.HUMAN_GATE,
                         RunOutcomeKind.EXECUTION_FAILURE,
@@ -718,24 +723,29 @@ class RunDriver:
                     }:
                         return state
                     continue
-                previous_window = state.get("supervision_window")
+                previous_window = deepcopy(state.get("supervision_window"))
                 self._before_external_step()
                 self.supervisor.observe(state)
                 if state.get("supervision_window") != previous_window:
-                    self.states.save_run(run_id, state)
+                    self._save_wait(run_id, state, expected_wait)
                 marker = _external_wait_marker(state)
                 credential_wait = isinstance(state.get("credential_availability"), dict)
                 if credential_wait or marker == previous_marker:
                     self._before_external_step()
                     if not self.supervisor.before_retry(
                         state,
-                        persist_before_sleep=lambda: self.states.save_run(run_id, state),
+                        persist_before_sleep=lambda: self._save_wait(run_id, state, expected_wait),
                     ):
-                        self.states.save_run(run_id, state)
+                        if self._pause_ticket_supervision(run_id, state):
+                            state, _ = self.operations.controller.resume(run_id)
+                            outcome = self.operations.classify(state)
+                            previous_marker = None
+                            continue
+                        self._save_wait(run_id, state, expected_wait)
                         return state
                     # Persist each throttled retry so concurrent status/history
                     # reads observe the same durable wait contract.
-                    self.states.save_run(run_id, state)
+                    self._save_wait(run_id, state, expected_wait)
                 previous_marker = marker
                 self._before_external_step()
                 wait = public_supervision_snapshot(state, now=self.supervisor.now())
@@ -752,39 +762,84 @@ class RunDriver:
                         f"next_action={wait['next_action']}",
                         file=sys.stderr,
                     )
-        except GitHubReadError as error:
-            if is_proven_github_state_contradiction(error.code):
-                recorded = self.operations.controller.record_deterministic_contradiction(
-                    run_id, error.code, error.message
-                )
-            else:
-                recorded = self.operations.controller.record_execution_failure(
-                    run_id, str(error)
-                )
-            if not recorded:
+        except SimulatedProcessCrash:
+            raise
+        except (TaskControlBusyError, ConcurrentRunStateError):
+            # Do not replay a Driver operation after bounded lock acquisition.
+            raise
+        except (GitHubReadError, RunnerCredentialError, CodexProcessError, OSError, ValueError) as error:
+            if not self.record_failure(run_id, error):
                 raise
             failed = self.states.load_current_run(run_id)
-            if failed is None:  # pragma: no cover - Controller just wrote it
+            if failed is None:
                 raise
             return failed
 
-        except SimulatedProcessCrash:
-            # Fault injection models an abrupt Executor exit.  Do not convert
-            # it into a normal Run execution failure: the Host must retain the
-            # unresolved ownership record for the next command to reconcile.
-            raise
-        except TaskControlBusyError:
-            # Short Task Control contention is not an execution failure.  The
-            # state store retries its own commit boundary; any remaining
-            # contention must reach the caller without changing Run status.
-            raise
-        except (CodexProcessError, OSError, ValueError) as error:
-            if not self.operations.controller.record_execution_failure(run_id, str(error)):
-                raise
-            failed = self.states.load_current_run(run_id)
-            if failed is None:  # pragma: no cover - Controller just wrote it
-                raise
-            return failed
+    def record_failure(self, run_id: str, error: BaseException) -> bool:
+        """Use the same business classification before and after worker drain."""
+        if failure_recorded(error):
+            return True
+        if isinstance(error, GitHubReadError) and is_proven_github_state_contradiction(error.code):
+            return bool(self.operations.controller.record_deterministic_contradiction(
+                run_id, error.code, error.message,
+            ))
+        if isinstance(error, RunnerCredentialError):
+            return bool(self.operations.controller.record_execution_failure(
+                run_id, str(error), runner_credential_failure=True,
+            ))
+        return bool(self.operations.controller.record_execution_failure(run_id, str(error)))
+
+    def _pause_ticket_supervision(self, run_id: str, state: dict[str, Any]) -> bool:
+        job = state.get("active_ticket_job")
+        if (
+            not isinstance(job, dict) or state.get("multi_ticket_protocol") != 4
+            or state.get("github_refresh_pending")
+            or job.get("phase") in {"blocked", "completed"}
+        ):
+            return False
+        owned = job.get("external_wait")
+        window = owned.get("supervision_window") if isinstance(owned, dict) else None
+        expired = state.get("supervision_wait")
+        if (
+            not isinstance(window, dict) or not isinstance(expired, dict)
+            or window.get("identity") != expired.get("identity")
+            or window.get("deadline") != expired.get("deadline")
+        ):
+            return False
+        from agent_run.ticket_state import TicketState
+        from agent_run.ticket_supervision import pause_ticket_supervision
+
+        scoped = TicketState(self.states, run_id, int(job["ticket_number"]))
+        current = scoped.load_current_run(run_id)
+        if current is None or current["active_ticket_job"] != job:
+            raise TaskControlBusyError("Ticket changed before supervision timeout")
+        current["supervision_wait"] = state["supervision_wait"]
+        current["diagnostics"] = state["diagnostics"]
+        pause_ticket_supervision(scoped, current)
+        return True
+
+    @staticmethod
+    def _wait_facts(state: dict[str, Any]) -> dict[str, Any]:
+        return deepcopy({key: state.get(key) for key in (
+            "status", "terminal_kind", "diagnostics", "supervision_window",
+            "supervision_wait", "credential_availability", "action_application_receipt",
+            "operator_stop", "requeue_required", "accepted_parent_spec_revision",
+            "accepted_ticket_graph_revision",
+            "active_ticket_job", "active_agent_invocation",
+        )})
+
+    def _save_wait(
+        self, run_id: str, state: dict[str, Any], expected: dict[str, Any],
+    ) -> None:
+        if isinstance(self.states, ObjectStateStore):
+            save_owned(self.states, run_id, state,
+                       fields={"status", "terminal_kind", "diagnostics", "supervision_window",
+                               "supervision_wait", "credential_availability"}, expected=expected,
+                       ticket_wait=True)
+        else:
+            self.states.save_run(run_id, state)
+        expected.clear()
+        expected.update(self._wait_facts(state))
 
     def _before_external_step(self) -> None:
         fence = getattr(self.operations, "before_external_step", None)
@@ -796,6 +851,8 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
     status = str(state.get("status"))
+    if is_github_refresh_wait(state):
+        return RunStep.REFRESH
     if has_final_approval(state):
         if status == "run_approval_pending":
             return RunStep.PUBLISH
@@ -803,6 +860,8 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
             return RunStep.DELIVER
         if status == "completed" and final_approval_cleanup_pending(state):
             return RunStep.DELIVER
+    if status in {"completed", "abandoned"} or has_run_operator_gate(state) or _is_currentness_human_blocker(state):
+        return None
     if _has_pending_stale_dirty_checkout(state):
         return RunStep.ACCEPT
     if status in {
@@ -916,8 +975,7 @@ def _external_wait_marker(state: dict[str, Any]) -> tuple[object, ...]:
         repair.get("phase") if isinstance(repair, dict) else None,
         repair.get("modification_attempts") if isinstance(repair, dict) else None,
         repair.get("validation_attempts") if isinstance(repair, dict) else None,
-        repair.get("publication_attempts") if isinstance(repair, dict) else None,
-        repair.get("pr_number") if isinstance(repair, dict) else None,
+        repair.get("run_branch_write_intent") if isinstance(repair, dict) else None,
         publication.get("phase") if isinstance(publication, dict) else None,
         publication.get("publication_attempts") if isinstance(publication, dict) else None,
         publication.get("pr_number") if isinstance(publication, dict) else None,

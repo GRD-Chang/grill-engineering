@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+from support.run_scenarios import _accepted_run
+
 import subprocess
 import json
 from copy import deepcopy
@@ -9,6 +12,8 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run import cli_presentation
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
@@ -20,27 +25,80 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 
-from run_acceptance_test_support import _passing_artifact
 from support.inprocess_cli import invoke_cli_inprocess
+from support.lifecycle import _file_snapshot
 from support.workspace import prepare_workspace
-from test_cli import run_internal_stage, run_cli, stdout_json
+from support.cli import run_internal_stage, run_cli, stdout_json
 
-from run_publication_test_support import (
-    CountingNarrativeRefreshPublisher,
-    DelayedChecksRunPublisher,
-    HumanThenRunPublicationAgents,
-    InterruptedFinalRefPublisher,
-    RunPublicationAgents,
-    UnknownNarrativeWritePublisher,
-    WaitingThenInterruptedChecksPublisher,
-    _accepted_run,
-)
+from support.run_publication import CountingNarrativeRefreshPublisher, DelayedChecksRunPublisher, HumanThenRunPublicationAgents, InterruptedFinalRefPublisher, RunPublicationAgents, UnknownNarrativeWritePublisher, WaitingThenInterruptedChecksPublisher
+from support.run_publication import InvocationRunPublicationAgents
+from support.state import persist_run_fixture
 
-def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
+
+def _assert_program_continuation(state: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    cli_presentation._print_status(state, as_json=True)
+    status = json.loads(capsys.readouterr().out)
+    assert status["worker"] is None
+    recent_agent = status["progress"]["current_agent"]
+    assert recent_agent is None or recent_agent["is_active"] is False
+    event = next(event for event in reversed(state["timeline"]) if event["kind"] == "run_publication")
+    assert event.get("worker") is None
+    assert event.get("thread_id") is None
+    assert state["run_publication"]["thread_id"]  # Retained historical output.
+
+
+def test_repairable_final_run_ci_failure_opens_independent_recovery_round(
     git_repo: Path,
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
-    agents = RunPublicationAgents()
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher._save()
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+
+    failed = engine.publish(str(state["run_id"]))
+
+    run = failed["run_acceptance"]
+    assert failed["status"] == "run_acceptance_pending"
+    assert run["phase"] == "repairing"
+    assert run["repair_request"]["repair_source"] == "required_checks"
+    assert run["ci_recovery"]["window"] == 1
+    assert run["ci_recovery"]["developments_used"] == 0
+    assert run["review_budget"]["development_attempts"] == 0
+
+
+def test_repairable_final_run_ci_failure_after_approval_opens_recovery_round(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    published = engine.publish(str(state["run_id"]))
+    assert published["status"] == "run_approval_pending"
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher.data["delivery"]["check_position"] = 0
+    publisher._save()
+
+    failed = engine.approve(str(state["run_id"]))
+
+    assert failed["status"] == "run_acceptance_pending"
+    run = failed["run_acceptance"]
+    assert run["repair_request"]["repair_source"] == "required_checks"
+    assert run["ci_recovery"]["window"] == 1
+    assert run["ci_recovery"]["failure_head"] == git.resolve(str(state["run_branch"]))
+    assert run["ci_recovery"]["developments_used"] == 0
+    assert states.load_current_run(str(state["run_id"])) == failed
+
+
+def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = InvocationRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -53,6 +111,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     published = engine.publish(str(state["run_id"]))
 
     assert published["status"] == "run_approval_pending"
+    _assert_program_continuation(published, capsys)
     final = published["run_publication"]
     assert final["phase"] == "ready_for_approval"
     assert len(agents.requests) == 1
@@ -77,6 +136,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     completed = engine.approve(str(state["run_id"]))
 
     assert completed["status"] == "completed"
+    _assert_program_continuation(completed, capsys)
     merged = publisher.live_pull_request(int(final["pr_number"]))
     assert merged["state"] == "MERGED"
     assert merged["integrated_parents"] == [
@@ -88,11 +148,11 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert publisher.data["parent"]["state"] == "CLOSED"
 
 def test_final_pr_read_lag_waits_without_recreating_publication(
-    git_repo: Path,
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     state, states, git, _publisher = _accepted_run(git_repo)
     publisher = DelayedChecksRunPublisher(git_repo / "github.json", git)
-    agents = RunPublicationAgents()
+    agents = InvocationRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -105,6 +165,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     waiting = engine.publish(str(state["run_id"]))
 
     assert waiting["status"] == "waiting_external"
+    _assert_program_continuation(waiting, capsys)
     assert waiting["run_publication"]["phase"] == "waiting_external"
     assert waiting["diagnostics"][0]["waiting_for"] == (
         "Run PR #1 Required Checks observation"
@@ -114,6 +175,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     resumed = engine.publish(str(state["run_id"]))
 
     assert resumed["status"] == "run_approval_pending"
+    _assert_program_continuation(resumed, capsys)
     assert len(agents.requests) == 1
 
 def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
@@ -249,7 +311,7 @@ def test_first_unknown_required_checks_observation_does_not_create_operation_ret
     publication_attempts[-1]["publication_operation_retry"] = dict(
         waiting["run_publication"]["publication_operation_retry"]
     )
-    states.save_run(str(state["run_id"]), waiting)
+    persist_run_fixture(states, str(state["run_id"]), waiting)
     publisher.data["delivery"]["required_checks"] = ["none"]
     resumed = engine.publish(str(state["run_id"]))
 
@@ -347,7 +409,11 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
     initial["run_publication"]["phase"] = "waiting_external"
     initial["status"] = "waiting_external"
     initial["terminal_kind"] = "waiting_external"
-    states.save_run(str(state["run_id"]), initial)
+    publisher.data["delivery"]["pull_requests"][0].update(
+        title="Previous title", body="Previous body",
+    )
+    publisher._save()
+    persist_run_fixture(states, str(state["run_id"]), initial)
     uncertain_publisher = UnknownNarrativeWritePublisher(
         git_repo / "github.json", git
     )
@@ -391,6 +457,7 @@ def test_final_publication_human_resume_clears_current_blocker(
     with pytest.raises(IncompatibleRunStateError, match="Human Blocker phase"):
         require_current_run_state(malformed)
     assert publisher.data["delivery"]["pull_requests"] == []
+    before_queries = _file_snapshot(workspace.repository_root.parent)
     for command in ("status", "history"):
         view = invoke_cli_inprocess(
             repo,
@@ -402,16 +469,18 @@ def test_final_publication_human_resume_clears_current_blocker(
         assert "类型: 需要人工处理" in view.stdout
         assert "对象: 整体交付" in view.stdout
         if command == "status":
-            assert "阶段:       等待人工处理" in view.stdout
+            assert "阶段:       待发布" in view.stdout
         assert (
             "原因: GitHub denied access; tried gh issue view; grant Issue read access."
             in view.stdout
         )
         assert (
             "触发阻塞的 Agent: 发布 Agent；模型 publication-model；"
-            "推理强度 high；本轮时长: 0 秒"
+            "推理强度 high；耗时记录不完整"
             in view.stdout
         )
+        assert "本轮时长: 0 秒" not in view.stdout
+        assert "None 秒" not in view.stdout
         assert (
             "下一步: agent-run resume 1 --repo example/project"
             in view.stdout
@@ -428,9 +497,11 @@ def test_final_publication_human_resume_clears_current_blocker(
     assert any(
         event.get("worker") == "运行发布工作代理"
         and event.get("thread_id") == "blocked-publication-thread"
+        and event.get("phase") == "pending"
         and event.get("human_blockers")
         for event in history["timeline"]
     )
+    assert _file_snapshot(workspace.repository_root.parent) == before_queries
 
     resumed, _ = Controller(
         FixtureGitHubReader(repo / "github.json"), git, states
@@ -472,7 +543,7 @@ def test_final_publication_human_resume_clears_current_blocker(
 def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     state["ticket_jobs"]["2"]["pr_number"] = 42
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -614,12 +685,14 @@ def test_run_publication_record_response_loss_is_read_back_without_duplicate(
     assert len(publisher.data["delivery"]["run_publication_records"]) == 1
 
 
-def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None:
+def test_parent_closeout_recovers_without_a_second_merge(
+    git_repo: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=InvocationRunPublicationAgents(),
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
@@ -634,6 +707,10 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert pending is not None
     assert pending["run_publication"]["phase"] == "merged"
     assert pending["status"] == "parent_closeout_pending"
+    _assert_program_continuation(pending, capsys)
+    step = engine.advance(str(state["run_id"]))
+    assert step.kind == DeliveryStepKind.WAITING
+    assert step.reason == "parent_closeout_pending"
     assert (
         publisher.live_pull_request(int(published["run_publication"]["pr_number"]))[
             "state"
@@ -694,7 +771,7 @@ def test_final_run_closeout_records_its_actual_delivery_type(git_repo: Path) -> 
     assert comment["action"] == "parent_completion_comment"
     assert comment["delivery_type"] == "Final Run"
 
-def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) -> None:
+def test_approve_hands_default_branch_drift_to_integration_without_merging(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(
         git=git,
@@ -714,6 +791,8 @@ def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) ->
         capture_output=True,
     )
 
+    publisher.data["default_head_sha"] = git.resolve("main")
+    publisher._save()
     result = RunPublicationEngine(
         git=git,
         states=states,
@@ -829,37 +908,3 @@ def test_abandon_recovers_lost_final_run_pr_close_response(
         for mutation in publisher.data["delivery"]["mutations"]
         if mutation["action"] == "close_final_run_pr"
     ] == close_mutations
-
-
-def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    class LostMergeResponse(FixtureGitHubPublisher):
-        def normal_merge(self, **authority: Any) -> str:
-            super().normal_merge(**authority)
-            raise OSError("merge applied before response")
-
-    publisher = LostMergeResponse(git_repo / "github.json", git)
-    engine = RunPublicationEngine(
-        git=git, states=states, agents=RunPublicationAgents(), github=publisher,
-        default_branch="main", default_head_sha=git.resolve("main"),
-    )
-    run_id = str(state["run_id"])
-    engine.publish(run_id)
-    waiting = engine.approve(run_id)
-    assert waiting["status"] == "waiting_external"
-    pending = states.load_current_run(run_id)
-    assert pending is not None
-    original_grant = pending["run_publication"]["approval_grant"]
-    assert original_grant["base_sha"] != git.resolve("main")
-
-    resumed = RunPublicationEngine(
-        git=git, states=states, agents=RunPublicationAgents(),
-        github=FixtureGitHubPublisher(git_repo / "github.json", git),
-        default_branch="main", default_head_sha=git.resolve("main"),
-    ).approve(run_id)
-    assert resumed["status"] == "completed"
-    assert resumed["run_publication"]["approval_grant"] == original_grant
-    assert resumed["run_publication"]["merge_intent"]["attempts"] == 1

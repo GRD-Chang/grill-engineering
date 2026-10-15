@@ -1,6 +1,34 @@
 """开发与定向修复的内部双语指令；条件选择留在组装函数。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'development/run-integration-scope': {
+        'zh': """本轮负责完整 Run 的组合问题，范围包含完整 Parent 需求、全部 Ticket 集合与实际完成事实、累计变更和当前预期合并结果。保留已完成子任务的应交付成果，不重开子任务或重新开发整套需求。按当前 Findings 和原始证据修复组合及其直接影响；程序随后执行集成检查和适用的整体验收。""",
+        'en': """This round owns problems in the complete Run combination: the full Parent requirements, all Tickets and their actual completion facts, accumulated changes and the current expected merge result. Preserve deliverables of completed Tickets without reopening them or redeveloping the entire requirement. Repair the combination and direct effects using current Findings and original evidence; the program then performs integration checks and applicable overall acceptance.""",
+    },
+    'development/repair-run-integration': {
+        'zh': """本轮负责完整 Run 的集成问题：完整 Parent 需求、Ticket 集合及实际完成事实、累计变更与当前组合均属于核验范围。按准确 source/target、Candidate、HEAD/MERGE_HEAD、当前现场和失败操作的原始输出调查并修复，保留双方应交付成果。只整理工作树；程序集成、提交和复做 Git 检查。原需求用于约束本次处理，不重开已完成 Ticket，不重新开发整套需求。人工消息、新会话与继续执行均保持这一工作性质。
+
+{0}（完整原始证据；stdout_json/stderr_json 可 JSON 解码恢复原始输出）：
+{1}""",
+        'en': """This round owns integration problems for the complete Run: full Parent requirements, the Ticket set and actual completion facts, accumulated changes and current combination. Investigate and repair the exact source/target, Candidate, HEAD/MERGE_HEAD, editable scene and original failing-operation output, preserving deliverables from both sides. Prepare only the working tree; the program integrates, commits and repeats Git checks. Original requirements constrain this repair; do not reopen completed Tickets or redevelop the whole requirement. Human messages, new sessions and continuation retain this work scope.
+
+{0} (complete original evidence; JSON-decode stdout_json/stderr_json to restore original output):
+{1}""",
+    },
+    'development/repair-integration': {
+        'zh': """你负责当前交付对象的本地集成处理。下面记录准确源/目标版本、工作区现场及程序实际失败证据。调查并处理失败及直接影响，保留原任务、本地候选、源分支与目标分支应交付的成果。原需求用于约束本次处理，不重新开发整套需求。
+
+保持现场中的 Git 历史与合并元数据，只整理文件内容并验证受影响功能；不要自行暂存、commit、merge、reset、rebase、push 或执行 GitHub 写入。不得削弱有效检查来制造通过。程序随后重新执行实际 Git 检查、提交及集成；你的成功说明不能替代这些结果。新会话或人工消息仍继续这项集成工作。
+
+{0}（完整原始证据）：
+{1}""",
+        'en': """You are responsible for local integration of the current delivery object. The following records exact source and target revisions, the checkout scene and actual program failure evidence. Investigate and resolve the failure and direct effects while preserving deliverable contributions from the original task, local candidate, source branch and target branch. Original requirements constrain this work; do not redevelop the full requirements.
+
+Preserve Git history and merge metadata. Prepare file contents and validate affected functionality; do not stage, commit, merge, reset, rebase, push or perform GitHub writes. Do not weaken valid checks to manufacture a pass. The program will rerun actual Git checks, commit and integration; your success summary cannot replace these results. A new session or human message continues this integration work.
+
+{0} (complete original evidence):
+{1}""",
+    },
     'development/resume': {
         'zh': """你是负责本次开发的开发工程师。继续完成你负责的开发任务，保留当前工作树中的进展。以当前需求、工作树、仍有效的原始证据和实际验证为准，完成剩余工作及直接回归验证，整理交付文件。
 
@@ -92,11 +120,11 @@ Continue addressing problems that can be resolved within your responsibilities."
 {1}""",
     },
     'development/repair-required-checks': {
-        'zh': """下列检查失败对应当前提交，并已被确定为可修改代码解决的问题。修复根因，保持有效测试、断言与检查意图，不得删除有效测试、放宽断言或绕过检查。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。
+        'zh': """你负责调查并处理下列准确失败版本的 CI 问题。根据检查结果及可取得的原始日志调查根因，不预设只能修改代码解决。原需求只约束本次定向修复，不重新开发整套需求。核验修复效果和直接影响的回归，保持有效测试、断言与检查意图，不得删除有效测试、放宽断言或绕过检查来制造通过。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。证据不足或确需人提供权限、凭据或外部操作时，按开发结果格式说明具体缺口。
 
 {0}（完整原始证据）：
 {1}""",
-        'en': """The following failed checks correspond to the current commit and have been identified as problems that code changes can resolve. Fix the root cause while preserving valid tests, assertions and check intent; do not delete valid tests, weaken assertions or bypass checks. If you cannot reproduce locally, state what you verified and what still needs remote checks to establish. Do not claim remote checks passed.
+        'en': """You are responsible for investigating and addressing CI problems at the exact failed revision below. Investigate the root cause using check results and available original logs; do not presume code changes are the only solution. Original requirements constrain this directed repair; do not redevelop the full requirements. Verify the repair and directly affected regressions while preserving valid tests, assertions and check intent. Do not delete valid tests, weaken assertions or bypass checks to manufacture a pass. If you cannot reproduce locally, state what you verified and what still needs remote checks to establish. Do not claim remote checks passed. If evidence is insufficient or a human must provide permissions, credentials or an external action, describe the specific gap in the development result.
 
 {0} (complete original evidence):
 {1}""",

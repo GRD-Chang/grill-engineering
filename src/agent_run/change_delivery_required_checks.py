@@ -6,9 +6,16 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.ci_recovery_budget import (
+    ci_limit_for_job,
+    observe_repairable_ci_failure,
+)
 from agent_run.change_delivery_fallback import (
     preserve_required_checks_publication_authorization,
+    previous_publication_authorization,
 )
 from agent_run.external_supervision import (
     clear_supervision_window,
@@ -18,15 +25,15 @@ from agent_run.external_supervision import (
 )
 from agent_run.github import GitHubReadError
 from agent_run.required_checks import (
-    is_explicitly_repairable_code_failure,
-    supervise_unrepairable_check_failure,
+    supervise_check_evidence_mismatch,
 )
-from agent_run.review_budget import can_start_development, ensure_budget
 from agent_run.required_checks_observation import (
     clear_required_checks_observation,
     failure_evidence_matches_observation,
     read_required_checks_observation,
+    required_checks_observation_is_current,
 )
+from agent_run.ticket_integration import delivery_base_sha
 
 
 def _clear_required_checks_read_retry(job: dict[str, Any]) -> None:
@@ -42,8 +49,47 @@ def _set_required_checks_repair_evidence(
     """Keep the failed PR/head as immutable provenance for Change Delivery."""
 
     job["ci_evidence"] = deepcopy(evidence)
-    if not isinstance(job.get("required_checks_origin"), dict):
-        job["required_checks_origin"] = deepcopy(evidence)
+    observation = job.get("required_checks_evidence")
+    if not isinstance(observation, dict):
+        raise ValueError("CI repair is missing its failed Required Checks observation")
+    job["required_checks_origin"] = deepcopy(observation)
+
+
+def _route_repairable_ci_failure(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    evidence: dict[str, Any],
+) -> bool:
+    limit = ci_limit_for_job(job)
+    decision = observe_repairable_ci_failure(
+        delivery_budget_owner(state, job),
+        head_sha=str(job["publication_sha"]),
+        limit=limit,
+        is_ticket=stage.contract.label.startswith("ticket-"),
+    )
+    budget = delivery_budget_owner(state, job)["ci_recovery"]
+    if (
+        stage.contract.label.startswith("ticket-")
+        and not budget["review_required"]
+    ):
+        authorization = previous_publication_authorization(job)
+        if authorization is None:
+            raise ValueError("Ticket CI repair is missing its previous publication authorization")
+        budget["previous_publication_authorization"] = authorization
+    _set_required_checks_repair_evidence(job, evidence)
+    job["repair_source"] = "required_checks"
+    job["final_ci_fix_failure_head"] = str(job["publication_sha"])
+    if decision == "repair":
+        job["phase"] = "repairing"
+        job["next_attempt_kind"] = "ci_repair"
+    else:
+        job["phase"] = "escalating"
+        job["escalation_code"] = "ci_development_budget_exhausted"
+        job.pop("next_attempt_kind", None)
+    should_yield = _resume_change_delivery_after_evidence(stage, state, job)
+    stage.save(state)
+    return should_yield
 
 
 def _resume_change_delivery_after_evidence(
@@ -58,7 +104,9 @@ def _resume_change_delivery_after_evidence(
 
 
 def _expected_publication_base_sha(job: dict[str, Any]) -> str | None:
-    if job.get("publication_authority") == "fallback":
+    if isinstance(job.get("ticket_integration"), dict):
+        return delivery_base_sha(job)
+    if job.get("publication_authority") in {"fallback", "ci_repair"}:
         value = job.get("base_sha")
     else:
         acceptance = job.get("acceptance_record")
@@ -148,6 +196,11 @@ def _verify_live_publication_identity(
     if not isinstance(live, dict) or not _live_publication_identity_matches(
         stage, state, job, live
     ):
+        if stage.contract.label == "parent-only" and isinstance(live, dict):
+            from agent_run.parent_only_integration import reconcile_parent_integration
+
+            if not reconcile_parent_integration(stage, state, job, live=live):
+                return job.get("phase") != "accepted"
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -179,6 +232,19 @@ def observe_required_checks(
             expected_head_sha=str(job["publication_sha"]),
         )
     except (GitHubReadError, OSError, TimeoutError) as error:
+        if (
+            isinstance(error, GitHubReadError)
+            and error.code == "change_pr_head_drift"
+            and stage.contract.label == "parent-only"
+        ):
+            # A check snapshot can race an allowed source append. Re-read the
+            # complete identity and apply the same append-only integration gate
+            # used for drift observed before/after the check read.
+            outcome = _verify_live_publication_identity(
+                stage, state, job, pr_number, checks
+            )
+            if outcome is not None:
+                return outcome, checks
         if isinstance(error, GitHubReadError) and error.code in {
             "change_pr_head_drift",
             "change_pr_identity_mismatch",
@@ -221,6 +287,13 @@ def observe_required_checks(
             "published_head_mismatch",
             "Required Checks snapshot contradicted its check buckets",
         ), checks
+    if not required_checks_observation_is_current(
+        observation, pr_number=pr_number, head_sha=str(job["publication_sha"])
+    ):
+        return stage._block(
+            state, job, "published_head_mismatch",
+            "Required Checks observation no longer applies to the published PR",
+        ), checks
     checks = str(observation["result"])
     live_identity_outcome = _verify_live_publication_identity(
         stage, state, job, pr_number, checks
@@ -257,6 +330,18 @@ def observe_required_checks(
             code="github_checks_observation_unknown",
             message="GitHub Required Checks returned an unknown state",
             waiting_for=f"Change PR #{pr_number} Required Checks observation",
+        )
+        ensure_supervision_window(state)
+        stage.commit_required_checks_observation(state, job, pr_number)
+        return True, checks
+    if checks == "fail" and stage.contract.label.startswith("ticket-") and any(
+        check.get("bucket") == "pending" for check in observation["checks"]
+    ):
+        job["phase"] = "waiting_checks"
+        wait_for_github_convergence(
+            state, code="github_checks_observation_pending",
+            message="GitHub Required Checks still contain pending checks",
+            waiting_for=f"Change PR #{pr_number} Required Checks completion",
         )
         ensure_supervision_window(state)
         stage.commit_required_checks_observation(state, job, pr_number)
@@ -307,24 +392,9 @@ def observe_required_checks(
                 "head_sha": str(job["publication_sha"]),
                 "result": "fail",
             }
-            if stage.modification_budget_exhausted(job):
-                job.update(
-                    {
-                        "phase": "escalating",
-                        "escalation_code": "modification_budget_exhausted",
-                    }
-                )
-            else:
-                job.update(
-                    {
-                        "phase": "repairing",
-                        "repair_source": "required_checks",
-                    }
-                )
-            _set_required_checks_repair_evidence(job, evidence)
-            should_yield = _resume_change_delivery_after_evidence(stage, state, job)
-            stage.save(state)
-            return should_yield, checks
+            return _route_repairable_ci_failure(
+                stage, state, job, evidence
+            ), checks
         try:
             evidence = stage.github.required_check_evidence(
                 pr_number, expected_head_sha=str(job["publication_sha"])
@@ -365,52 +435,19 @@ def observe_required_checks(
             evidence,
             pr_number=pr_number,
             head_sha=str(job["publication_sha"]),
-        ) or not is_explicitly_repairable_code_failure(evidence):
+        ):
             job["ci_evidence"] = canonical_evidence
-            supervise_unrepairable_check_failure(
+            supervise_check_evidence_mismatch(
                 state,
                 job,
                 phase="waiting_checks",
-                waiting_for=f"Change PR #{pr_number} Required Check repairability",
+                waiting_for=f"Change PR #{pr_number} Required Check failure evidence",
             )
             stage.save(state)
             return True, checks
-        policy = stage.review_budget_policy()
-        if stage.modification_budget_exhausted(job) and can_start_development(
-            job, policy, attempt_kind="final_ci_fix"
-        ):
-            budget = ensure_budget(job, policy)
-            job.update(
-                {
-                    "phase": "repairing",
-                    "repair_source": "required_checks",
-                    "next_attempt_kind": "final_ci_fix",
-                    "final_ci_fix_failure_head": str(job["publication_sha"]),
-                    "final_ci_fix_used_before_attempt": budget[
-                        "final_ci_fix_used"
-                    ],
-                }
-            )
-        elif stage.modification_budget_exhausted(job):
-            job.update(
-                {
-                    "phase": "escalating",
-                    "escalation_code": "modification_budget_exhausted",
-                    "repair_source": "required_checks",
-                }
-            )
-        else:
-            job.update(
-                {
-                    "phase": "repairing",
-                    "repair_source": "required_checks",
-                    "next_attempt_kind": "ordinary",
-                }
-            )
-        _set_required_checks_repair_evidence(job, canonical_evidence)
-        should_yield = _resume_change_delivery_after_evidence(stage, state, job)
-        stage.save(state)
-        return should_yield, checks
+        return _route_repairable_ci_failure(
+            stage, state, job, canonical_evidence
+        ), checks
     if checks not in {"none", "pass"}:
         raise ValueError(f"unknown Required Checks state: {checks}")
     clear_supervision_window(state)

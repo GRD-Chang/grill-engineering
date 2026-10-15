@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
 
 CHECKS_HISTORY_FIELDS = (
     "history_work_subject",
@@ -48,7 +50,8 @@ def checks_timeline_facts(
     facts: dict[str, Any] = {}
     if not isinstance(subject, dict):
         return facts
-    if type(marker.get("pr_number")) is int:
+    if (type(marker.get("pr_number")) is int
+            or isinstance(subject.get("run_branch_write_intent"), dict)):
         facts.update(_subject_scope(state, subject, marker))
     observation = subject.get("required_checks_evidence")
     if (
@@ -69,9 +72,11 @@ def checks_timeline_facts(
         and window.get("started_at") is not None
     ):
         facts["checks_wait_identity"] = _digest([window["identity"], window["started_at"]])
-    intent = subject.get("write_intent")
+    intent = subject.get("write_intent") or subject.get("ticket_write_intent")
     if isinstance(intent, dict):
         facts["github_write_action"] = intent.get("action")
+    elif isinstance(subject.get("run_branch_write_intent"), dict):
+        facts["github_write_action"] = "update_run_branch"
     if state.get("status") in {"waiting_external", "supervision_timeout"}:
         diagnostics = state.get("diagnostics")
         if isinstance(diagnostics, list) and diagnostics and isinstance(diagnostics[0], dict):
@@ -125,7 +130,7 @@ def _subject_scope(
     else:
         work_subject = f"parent-only:{run_id}"
         generation = subject.get("parent_generation")
-    budget = budget_owner.get("review_budget")
+    budget = delivery_budget_owner(state, budget_owner).get("review_budget")
     return {
         "history_work_subject": work_subject,
         "history_generation": generation,

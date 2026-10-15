@@ -9,6 +9,8 @@ import pytest
 
 from agent_run.runner_lease import (
     RunnerLeaseBusy,
+    RunnerLeaseError,
+    retain_lease_for_systemd_exit,
     runner_management_lease,
     runner_usage_lease,
 )
@@ -80,3 +82,12 @@ def test_parent_to_executor_usage_handoff_has_no_management_gap(
             with pytest.raises(RunnerLeaseBusy):
                 with runner_management_lease(lock):
                     raise AssertionError("management lease must not interleave")
+
+
+def test_unavailable_systemd_does_not_silently_accept_an_exit_lease(tmp_path: Path) -> None:
+    lock = tmp_path / "runner.lock"
+    with runner_usage_lease(lock) as lease:
+        with pytest.raises(RunnerLeaseError, match="无法将退出通知"):
+            retain_lease_for_systemd_exit(lease, str(tmp_path / "missing-socket"))
+    with runner_management_lease(lock):
+        pass

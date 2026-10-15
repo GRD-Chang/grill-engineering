@@ -106,7 +106,7 @@ def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_suppli
     assert "snapshot" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("failure", ["invalid_utf8", "broken_symlink", "fifo", "missing_builtin", "empty"])
+@pytest.mark.parametrize("failure", ["invalid_utf8", "broken_symlink", "fifo", "missing_builtin", "empty", "oversized"])
 def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypatch, failure: str) -> None:
     from agent_run.cli import main
 
@@ -117,6 +117,8 @@ def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypat
         method.write_bytes(b"\xff")
     elif failure == "empty":
         method.write_text(" \n", encoding="utf-8")
+    elif failure == "oversized":
+        method.write_bytes(b"x" * (512 * 1024 + 1))
     elif failure == "fifo":
         os.mkfifo(method)
     elif failure == "broken_symlink":
@@ -126,6 +128,36 @@ def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypat
     assert main(["prompts", "diff", "--json"]) != 0
     output = capsys.readouterr().out
     assert "Cannot read prompt resource" in output
+
+
+def test_help_and_explicit_preview_survive_invalid_personal_config(tmp_path: Path) -> None:
+    from agent_run.user_defaults import UserDefaultsStore
+
+    store = UserDefaultsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text('{"language":"invalid"}', encoding="utf-8")
+    before = (store.path.read_bytes(), store.path.stat().st_mtime_ns)
+    help_result = cli("--help")
+    assert help_result.returncode == 0, help_result.stderr
+    assert "用法:" in help_result.stdout
+    request = {"language": "en", "task_issue_url": "https://example.invalid/2"}
+    request_file = tmp_path / "request.json"
+    request_file.write_text(json.dumps(request))
+    preview = cli("preview", "--request", str(request_file), "--role", "development", "--json")
+    assert preview.returncode == 0, preview.stdout + preview.stderr
+    assert "builtin/en/methods/development.md" in preview.stdout
+    assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+
+    request["_prompt_resources"] = prompt_resources.builtin_resources("en")
+    request_file.write_text(json.dumps(request))
+    directory = prompt_resources.personal_method_directory("en")
+    directory.mkdir(parents=True)
+    (directory / "development.md").write_bytes(b"\xff")
+    frozen = cli("preview", "--request", str(request_file), "--role", "development", "--json")
+    assert frozen.returncode == 0, frozen.stdout + frozen.stderr
+    assert json.loads(frozen.stdout)["prompt"] == json.loads(preview.stdout)["prompt"]
+    assert set(json.loads(frozen.stdout)["sources"].values()) == {"request_snapshot"}
+    assert (store.path.read_bytes(), store.path.stat().st_mtime_ns) == before
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

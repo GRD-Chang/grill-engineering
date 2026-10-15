@@ -4,8 +4,8 @@ from typing import Any
 
 
 PUBLICATION_PENDING_MESSAGE = (
-    "Publication Operation Retry was exhausted and cannot be reset by resume; "
-    "inspect the persisted failure and abandon the Run if it cannot be recovered"
+    "Publication Operation Retry was exhausted; inspect the persisted failure and "
+    "explicitly resume to renew its retry window and reconcile the original write intent"
 )
 
 

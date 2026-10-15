@@ -4,8 +4,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.run_repair_cycle import remove_repair_job
+
 from agent_run.agents import AgentBackend
+from agent_run.review_evidence import accepted_review_matches, run_review_identity
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.ci_recovery_budget import (
+    ci_limit_for_job,
+    observe_repairable_ci_failure,
+)
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.external_supervision import (
     ensure_supervision_window,
@@ -23,14 +30,22 @@ from agent_run.run_currentness import (
     ticket_completion_records,
 )
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.publication_operation_retry import (
     record_publication_operation_failure,
 )
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.required_checks import (
+    supervise_check_evidence_mismatch,
+)
 from agent_run.required_checks_observation import (
     clear_required_checks_observation,
+    failure_evidence_matches_observation,
     read_required_checks_observation,
+    required_checks_observation_is_current,
 )
+from agent_run.run_publication_update import reconcile_publication_update, wait_for_merge_readback
+from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 
 
 class RunPublicationShared:
@@ -48,7 +63,7 @@ class RunPublicationShared:
         currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.agents = agents
         self.github = github
         self.default_branch = default_branch
@@ -73,22 +88,20 @@ class RunPublicationShared:
         if not isinstance(record, dict) or run.get("phase") != "accepted":
             return False
         run_head = self.git.resolve(str(state["run_branch"]))
-        return (
-            record.get("reviewed_head_sha") == run_head
-            and record.get("reviewed_default_base_sha") == self.default_head_sha
-            and record.get("expected_merge_tree")
-            == self.git.expected_merge_tree(
-                default_head_sha=self.default_head_sha, run_head_sha=run_head
-            )
-            and record.get("parent_revision") == self._mapping(state, "parent").get("revision")
-            and record.get("ticket_graph_revision")
-            == self._mapping(state, "ticket_graph").get("revision")
-            and record.get("ticket_completion_records")
-            == ticket_completion_records(state)
+        return accepted_review_matches(
+            record,
+            run_review_identity(state, self.git, self.default_head_sha, run_head),
+            run.get("acceptance_artifact"),
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
-        invalidate_run_acceptance(state)
+        if not reconcile_run_pr_write(
+            state, self.github, self._save,
+            current_head_sha=self.git.resolve(str(state["run_branch"])),
+        ):
+            return state
+        if state["run_acceptance"].get("phase") != "pending":
+            invalidate_run_acceptance(state)
         state.update(
             {
                 "status": "run_acceptance_pending",
@@ -105,7 +118,6 @@ class RunPublicationShared:
         repair_source: str,
         human_feedback: str | None = None,
         ci_evidence: dict[str, Any] | None = None,
-        merge_conflict_evidence: str | None = None,
     ) -> dict[str, Any]:
         run = self._mapping(state, "run_acceptance")
         request: dict[str, Any] = {"repair_source": repair_source}
@@ -114,10 +126,8 @@ class RunPublicationShared:
             run["modification_attempts"] = 0
         if ci_evidence is not None:
             request["ci_evidence"] = ci_evidence
-        if merge_conflict_evidence is not None:
-            request["merge_conflict_evidence"] = merge_conflict_evidence
         run.update({"phase": "repairing", "repair_request": request})
-        run.pop("repair_job", None)
+        remove_repair_job(run)
         publication = state.get("run_publication")
         if isinstance(publication, dict) and publication.get("phase") not in {
             "merged",
@@ -134,6 +144,86 @@ class RunPublicationShared:
             }
         )
         return state
+
+    def _route_required_checks(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist repair/wait/pause, or let the caller continue on passing checks.
+
+        Publication and approval retain their own authorization and write
+        boundaries. Both use this decision after an exact-head observation;
+        evidence reads and the pre-repair identity read must precede charging.
+        """
+        checks = observation["result"]
+        if checks == "fail":
+            self._save(state)
+            evidence = self._required_check_evidence(
+                state, publication, pr_number, run_head
+            )
+            if evidence is None:
+                return state
+            if not self._revalidate_final_run_pr_before_repair(
+                state, publication, pr_number, run_head
+            ):
+                return state
+            if not (
+                failure_evidence_matches_observation(
+                    observation, evidence, pr_number=pr_number, head_sha=run_head
+                )
+            ):
+                supervise_check_evidence_mismatch(
+                    state, publication, phase="waiting_external",
+                    waiting_for=f"Run PR #{pr_number} Required Check failure evidence",
+                )
+                return self._save(state)
+            run = self._mapping(state, "run_acceptance")
+            limit = ci_limit_for_job(run)
+            decision = observe_repairable_ci_failure(
+                run, head_sha=run_head, limit=limit, is_ticket=False,
+            )
+            run["ci_failed_evidence"] = evidence
+            if decision == "repair":
+                self._queue_repair(
+                    state, repair_source="required_checks", ci_evidence=evidence
+                )
+            else:
+                reason = "ci_development_budget_exhausted"
+                run.update({"phase": "ready_for_human", "blocked_reason": reason})
+                publication["phase"] = "stale"
+                publication.pop("approval_grant", None)
+                state.update({
+                    "status": "ready_for_human",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{
+                        "code": reason,
+                        "message": "Run CI recovery budget is exhausted; resume is required",
+                    }],
+                })
+        elif checks == "pending":
+            publication["phase"] = "waiting_checks"
+            state.update({
+                "status": "waiting_checks", "terminal_kind": "waiting_checks",
+                "diagnostics": [],
+            })
+            ensure_supervision_window(state)
+        elif checks == "unknown":
+            publication["required_checks_observation_status"] = "unknown"
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+        else:
+            return None
+        return self._save(state)
 
     def _required_check_evidence(
         self,
@@ -214,7 +304,15 @@ class RunPublicationShared:
 
         try:
             live = self.github.live_pull_request(pr_number)
+            if live.get("state") == "MERGED" and isinstance(publication.get("merge_intent"), dict):
+                wait_for_merge_readback(self, state, "Final Run merged during authority revalidation")
+                return False
+            if live.get("state") == "OPEN" and not reconcile_publication_update(self, state, live):
+                return False
         except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and error.code == "foreign_run_pr":
+                self._invalidate_for_fresh_acceptance(state)
+                return False
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(
                 error.code
             ):
@@ -273,6 +371,13 @@ class RunPublicationShared:
                 "change_pr_identity_mismatch",
                 "change_pr_head_drift",
             }:
+                # A head change during the snapshot read may be an admissible
+                # append. Reconcile PR/ref authority before retiring the grant
+                # so its durable update handoff survives the checks race.
+                if error.code == "change_pr_head_drift" and not self._revalidate_final_run_pr_before_merge(
+                    state, publication, pr_number, expected_head_sha,
+                ):
+                    return None
                 self._invalidate_for_fresh_acceptance(state)
                 return None
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(
@@ -299,6 +404,11 @@ class RunPublicationShared:
             ensure_supervision_window(state)
             self._save(state)
             return None
+        if not required_checks_observation_is_current(
+            observation, pr_number=pr_number, head_sha=expected_head_sha
+        ):
+            self._invalidate_for_fresh_acceptance(state)
+            return None
         prior_observation_status = publication.get(
             "required_checks_observation_status"
         )
@@ -319,7 +429,6 @@ class RunPublicationShared:
         if not record_publication_operation_failure(publication, error):
             return False
         publication["phase"] = "publication_pending"
-        publication.pop("write_intent", None)
         state.update(
             {
                 "status": "publication_pending",
@@ -504,6 +613,7 @@ class RunPublicationShared:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        state.update(self.states.load_delivery_evidence(run_id))  # type: ignore[attr-defined]
         return state
 
     @staticmethod

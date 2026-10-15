@@ -6,8 +6,21 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.delivery_budget import delivery_budget_owner
+
+from agent_run.attempt_projection import (
+    current_semantic_attempt,
+    semantic_attempt_history,
+    history_attempt_view,
+    public_invocation_view,
+)
+from agent_run.delivery_facts import active_ticket_job, current_delivery_identity, current_work_subject
+from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.work_facts import work_attempt, work_phase, work_role
+
 from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.ci_recovery_budget import ci_limit_for_job
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     run_repair_budget_policy_for_job,
@@ -25,13 +38,16 @@ from agent_run.delivery_progress import (
 )
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.operator_action_presentation import (
-    operator_action_view,
+    operator_action_views,
+    human_next_action_for_state,
     print_operator_action as _print_operator_action,
 )
-from agent_run.presentation_helpers import current_work_subject, human_next_action, human_status_term
+from agent_run.presentation_helpers import (
+    human_next_action,
+    human_status_term,
+)
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
-from agent_run.semantic_attempt import semantic_attempt_subjects
 
 
 def public_action_receipt(
@@ -58,6 +74,8 @@ def public_action_receipt(
         "applying": "in_progress",
         "failed": "failed",
     }.get(receipt.status, "in_progress")
+    if receipt.status == "completed" and receipt.result_status == "updating":
+        status = "updating"
     return {
         "repository": repository,
         "parent": parent_view,
@@ -70,7 +88,7 @@ def public_action_receipt(
 def _print_precondition_failure(
     state: dict[str, object], *, as_json: bool = False
 ) -> None:
-    active = _active_ticket_job(state)
+    active = active_ticket_job(state)
     diagnostics = state.get("diagnostics")
     current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
     diagnostic = {
@@ -117,12 +135,12 @@ def _print_status(
 ) -> None:
     with presentation_language("zh" if as_json else selected_language(state)):
         _print_notification_warning(state, as_json=as_json)
-        active = _active_ticket_job(state)
+        active = active_ticket_job(state)
         active_ticket = active.get("ticket_number") if active else None
         worker = _current_worker(state)
         run_repair = _run_repair_status(state)
         review_budget = _public_review_budget(state)
-        current_identity = _current_delivery_identity(state)
+        current_identity = current_delivery_identity(state)
         invocation = state.get("active_agent_invocation")
         active_invocation = (
             invocation
@@ -130,10 +148,11 @@ def _print_status(
             and invocation.get("status") in {"running", "failed", "resuming"}
             else None
         )
-        semantic_attempt = _current_semantic_attempt(state, active_invocation)
+        semantic_attempt = current_semantic_attempt(state, active_invocation)
         delivery_cleanup = _public_delivery_cleanup(state)
         latest_resume = latest_resume_audit(state)
-        operator_action = _operator_action_view(state)
+        operator_actions = operator_action_views(state, language=display_language())
+        operator_action = operator_actions[0] if operator_actions else None
         output = {
             "notifications": state.get("_notifications", {}),
             "run_id": state.get("run_id"),
@@ -147,6 +166,9 @@ def _print_status(
             "candidate_sha": current_identity.get("candidate_sha"),
             "pr_number": current_identity.get("pr_number"),
             "review_budget": review_budget,
+            "integration_resync": _public_integration_resync(state),
+            "integration_development": _public_integration_development(state),
+            "ci_recovery": _public_ci_recovery(state),
             "elapsed_seconds": run_elapsed_seconds(state),
             "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
             "next_action": (
@@ -155,12 +177,13 @@ def _print_status(
                 else _next_action(state)
             ),
             "operator_action": operator_action,
+            "operator_actions": operator_actions,
             "diagnostics": state.get("diagnostics", []),
             "scope_change": state.get("unsupported_scope_change"),
             "abandonment": state.get("run_abandonment"),
-            "agent_invocation": _public_invocation_view(active_invocation),
+            "agent_invocation": public_invocation_view(active_invocation),
             "semantic_agent_attempt": (
-                _history_attempt_view(semantic_attempt, include_history_facts=False)
+                history_attempt_view(semantic_attempt, include_history_facts=False)
                 if isinstance(semantic_attempt, dict)
                 else None
             ),
@@ -222,8 +245,8 @@ def _print_history(
         invocations = state.get("agent_invocation_history", [])
         if not isinstance(invocations, list):
             raise ValueError("agent_invocation_history must be an array")
-        semantic_attempts = _semantic_attempt_history(state)
-        human_semantic_attempts = _semantic_attempt_history(
+        semantic_attempts = semantic_attempt_history(state)
+        human_semantic_attempts = semantic_attempt_history(
             state, include_history_facts=True
         )
         operation_retries = _publication_operation_retries(state)
@@ -232,7 +255,8 @@ def _print_history(
         agent_resumes = public_resume_audit.get("history", [])
         if not isinstance(agent_resumes, list):
             raise ValueError("resume_audit.history must be an array")
-        operator_action = _operator_action_view(state)
+        operator_actions = operator_action_views(state, language=display_language())
+        operator_action = operator_actions[0] if operator_actions else None
         output = {
             "notifications": state.get("_notifications", {}),
             "run_id": state.get("run_id"),
@@ -244,9 +268,10 @@ def _print_history(
                 else _next_action(state)
             ),
             "operator_action": operator_action,
+            "operator_actions": operator_actions,
             "abandonment": state.get("run_abandonment"),
             "agent_invocations": [
-                _public_invocation_view(invocation)
+                public_invocation_view(invocation)
                 if isinstance(invocation, dict)
                 else invocation
                 for invocation in invocations
@@ -308,94 +333,6 @@ def _use_rich_status(plain: bool) -> bool:
         return False
     isatty = getattr(sys.stdout, "isatty", None)
     return bool(callable(isatty) and isatty())
-
-
-def _current_semantic_attempt(
-    state: dict[str, object], invocation: dict[str, object] | None
-) -> dict[str, object] | None:
-    invocation_attempt = (
-        invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
-    )
-    invocation_attempt_id = (
-        invocation_attempt.get("attempt_id")
-        if isinstance(invocation_attempt, dict)
-        else None
-    )
-    pending_attempts = [
-        pending
-        for subject in semantic_attempt_subjects(state)
-        if isinstance((pending := subject.get("pending_semantic_attempt")), dict)
-    ]
-    if invocation_attempt_id is not None:
-        for attempt in pending_attempts:
-            if attempt.get("attempt_id") == invocation_attempt_id:
-                return attempt
-    return pending_attempts[0] if pending_attempts else None
-
-
-def _semantic_attempt_history(
-    state: dict[str, object], *, include_history_facts: bool = False
-) -> list[dict[str, object]]:
-    attempts: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for subject in semantic_attempt_subjects(state):
-        history = subject.get("semantic_attempt_history")
-        values = history if isinstance(history, list) else []
-        pending = subject.get("pending_semantic_attempt")
-        if isinstance(pending, dict):
-            values = [*values, pending]
-        for attempt in values:
-            if not isinstance(attempt, dict):
-                continue
-            attempt_id = attempt.get("attempt_id")
-            if not isinstance(attempt_id, str) or attempt_id in seen:
-                continue
-            seen.add(attempt_id)
-            attempts.append(_history_attempt_view(attempt, include_history_facts))
-    # The durable state keeps Attempts on their owning subject.  Accept the
-    # compact top-level projection as a read-only legacy/test input as well;
-    # this does not change the JSON contract emitted by history.
-    projected = state.get("semantic_agent_attempts")
-    if isinstance(projected, list):
-        for attempt in projected:
-            if not isinstance(attempt, dict):
-                continue
-            attempt_id = attempt.get("attempt_id")
-            if not isinstance(attempt_id, str) or attempt_id in seen:
-                continue
-            seen.add(attempt_id)
-            attempts.append(_history_attempt_view(attempt, include_history_facts))
-    return attempts
-
-
-def _history_attempt_view(
-    attempt: dict[str, object], include_history_facts: bool
-) -> dict[str, object]:
-    view = dict(attempt)
-    if not include_history_facts:
-        # These bounded facts are for the human history projection only.  The
-        # machine-readable history keeps the existing Attempt shape.
-        view.pop("development_summary", None)
-        view.pop("publication", None)
-        view.pop("budget_snapshot", None)
-        view.pop("history_facts", None)
-    return view
-
-
-def _public_invocation_view(
-    invocation: dict[str, object] | None,
-) -> dict[str, object] | None:
-    """Keep private bounded Attempt facts out of machine-facing CLI JSON."""
-
-    if invocation is None:
-        return None
-    view = dict(invocation)
-    semantic_attempt = view.get("semantic_attempt")
-    if isinstance(semantic_attempt, dict):
-        view["semantic_attempt"] = _history_attempt_view(
-            semantic_attempt, include_history_facts=False
-        )
-    return view
 
 
 def _output_attempt(
@@ -508,7 +445,7 @@ def _publication_operation_retries(
 def _current_publication_operation_retry(
     state: dict[str, object],
 ) -> dict[str, object] | None:
-    current_attempt = _current_semantic_attempt(state, None)
+    current_attempt = current_semantic_attempt(state, None)
     current_id = current_attempt.get("attempt_id") if current_attempt else None
     for subject in semantic_attempt_subjects(state):
         pending = subject.get("pending_semantic_attempt")
@@ -567,39 +504,23 @@ def _next_action(state: dict[str, Any]) -> str:
     return render_next_action(next_action_fact(state), state)
 
 
-def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
-    return operator_action_view(
-        state,
-        current_identity=_current_delivery_identity(state),
-        fallback_next_action=_next_action(state),
-    )
-
-
 def human_delivery_status(value: object, *, language: str = "zh") -> object:
     """Render the same delivery terminology used by status and history."""
 
     return human_status_term(value, language=language)
 
 
-def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:
-    """Render the shared recovery decision using the public Parent selector."""
-    public_state = state if isinstance(state, dict) else dict(state)
-    language = selected_language(public_state) if language is None else language
-    fallback = render_next_action(
-        next_action_fact(public_state), public_state, language=language, human=True,
-    )
-    operator_action = operator_action_view(
-        public_state, current_identity=_current_delivery_identity(public_state),
-        fallback_next_action=fallback, language=language, human=True,
-    )
-    return operator_action["next_action"] if operator_action is not None else fallback
-
-
 def _print_human_operator_action(
     state: Mapping[str, Any], action: dict[str, Any]
 ) -> None:
     human_action = dict(action)
-    human_action["next_action"] = human_next_action_for_state(state)
+    from agent_run.guidance_actions import NextAction
+
+    decision = action.get("action")
+    if isinstance(decision, dict):
+        human_action["next_action"] = render_next_action(
+            NextAction(**decision), dict(state), language=selected_language(dict(state)), human=True,
+        )
     _print_operator_action(human_action)
 
 
@@ -608,16 +529,25 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
     if current is None:
         return None
     location, subject = current
-    if location == "run_publication" and subject.get("phase") == "publishing":
+    role = work_role(subject, location=location)
+    if location == "run_publication" and role == "publication":
         return {
             "role": "运行发布工作代理",
-            "attempt": subject.get("publication_attempts"),
+            "attempt": work_attempt(subject, role),
             "thread_id": subject.get("thread_id"),
-            "phase": subject.get("phase"),
+            "phase": work_phase(subject),
         }
     if location == "run_repair":
         return _worker_from_job(subject, run_repair=True)
-    if location == "run_acceptance" and subject.get("phase") == "reviewing":
+    if (location == "run_acceptance" and isinstance(subject.get("run_integration_conflict"), dict)
+            and role == "development"):
+        return {
+            "role": "运行集成开发工作代理",
+            "attempt": work_attempt(subject, role),
+            "thread_id": subject.get("development_thread_id"),
+            "phase": "integration",
+        }
+    if location == "run_acceptance" and role == "reviewer":
         reviewer_ids = subject.get("reviewer_thread_ids")
         thread_id = (
             reviewer_ids[-1]
@@ -626,9 +556,9 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
         )
         return {
             "role": "运行验收工作代理",
-            "attempt": subject.get("validation_attempts"),
+            "attempt": work_attempt(subject, role),
             "thread_id": thread_id,
-            "phase": subject.get("phase"),
+            "phase": work_phase(subject),
         }
     if location.startswith("ticket:") or location == "parent":
         return _worker_from_job(subject)
@@ -638,97 +568,41 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
 def _current_phase(state: dict[str, object]) -> object:
     current = current_work_subject(state)
     if current is not None:
-        return current[1].get("phase")
+        return work_phase(current[1])
     return state.get("status")
-
-
-def _active_ticket_job(state: dict[str, object]) -> dict[str, object] | None:
-    active = state.get("active_ticket_job")
-    if not isinstance(active, dict):
-        return None
-    if active.get("phase") in {"merged", "completed", "abandoned"}:
-        return None
-    return active
-
-
-def _current_delivery_identity(state: dict[str, object]) -> dict[str, object]:
-    """Return the Candidate/PR boundary operators need for diagnosis."""
-
-    active = _active_ticket_job(state)
-    if active is not None:
-        return {
-            "candidate_sha": active.get("candidate_sha"),
-            "pr_number": active.get("pr_number"),
-        }
-    parent = state.get("parent_job")
-    if isinstance(parent, dict) and parent.get("phase") not in {
-        "completed",
-        "merged",
-        "abandoned",
-    }:
-        return {
-            "candidate_sha": parent.get("candidate_sha"),
-            "pr_number": parent.get("pr_number"),
-        }
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict):
-            return {
-                "candidate_sha": repair.get("candidate_sha"),
-                "pr_number": repair.get("pr_number"),
-            }
-        candidate = acceptance.get("reviewed_head_sha") or acceptance.get(
-            "candidate_sha"
-        )
-        publication = state.get("run_publication")
-        pr_number = publication.get("pr_number") if isinstance(publication, dict) else None
-        if candidate is not None or pr_number is not None:
-            return {"candidate_sha": candidate, "pr_number": pr_number}
-    publication = state.get("run_publication")
-    if isinstance(publication, dict):
-        record = publication.get("record")
-        return {
-            "candidate_sha": (
-                record.get("run_head_sha")
-                if isinstance(record, dict)
-                else publication.get("head_sha")
-            ),
-            "pr_number": publication.get("pr_number"),
-        }
-    return {"candidate_sha": None, "pr_number": None}
 
 
 def _worker_from_job(
     job: dict[str, object], *, run_repair: bool = False
 ) -> dict[str, object] | None:
-    phase = str(job.get("phase"))
+    phase = work_phase(job)
+    role = work_role(job)
     review_role = "运行修复验收工作代理" if run_repair else "独立验收工作代理"
     publication_role = "运行修复发布工作代理" if run_repair else "发布工作代理"
     development_role = "运行修复开发工作代理" if run_repair else "开发工作代理"
-    if phase in {"reviewing", "validating"}:
+    if role == "reviewer":
         reviewer_ids = job.get("reviewer_thread_ids")
         thread_id = reviewer_ids[-1] if isinstance(reviewer_ids, list) and reviewer_ids else None
         return {
             "role": review_role,
-            "attempt": job.get("validation_attempts"),
+            "attempt": work_attempt(job, role),
             "thread_id": thread_id,
             "phase": phase,
         }
-    if phase in {"publishing", "publication_pending"}:
+    if role == "publication":
         return {
             "role": publication_role,
-            "attempt": job.get("publication_attempts"),
+            "attempt": work_attempt(job, role),
             "thread_id": job.get("publication_thread_id"),
             "phase": phase,
         }
-    if phase in {"developing", "repairing"}:
+    if role == "development":
         return {
             "role": development_role,
-            "attempt": job.get("pending_attempt", job.get("modification_attempts")),
+            "attempt": work_attempt(job, role),
             "thread_id": (
                 None
-                if isinstance(job.get("pending_attempt"), int)
+                if job.get("phase") in {"developing", "repairing"} and isinstance(job.get("pending_attempt"), int)
                 else job.get("development_thread_id")
             ),
             "phase": phase,
@@ -748,6 +622,12 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         job, state_snapshot=state.get("policy_snapshot")
     )
     candidate_validation_status = _candidate_validation_status(job)
+    ordinary_budget = delivery_budget_owner(state, job).get("review_budget")
+    ordinary_modifications = (
+        ordinary_budget.get("development_attempts", 0)
+        if isinstance(ordinary_budget, dict)
+        else 0
+    )
     return {
         # Keep ``generation`` and ``phase`` as compatibility aliases while
         # exposing each lifecycle dimension under an unambiguous public name.
@@ -760,12 +640,87 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "candidate_validation_phase": candidate_validation_status,
         "candidate_validation_status": candidate_validation_status,
         "cycle_status": cycle.get("status"),
-        "code_modification_attempts": cycle.get("code_modification_attempts", 0),
+        "code_modification_attempts": ordinary_modifications,
         "code_modification_limit": policy.development_limit,
         "validation_attempts": cycle.get("validation_attempts", 0),
         "candidate_sha": job.get("candidate_sha"),
+        "run_branch_write_intent": job.get("run_branch_write_intent"),
         "development_thread_id": cycle.get("development_thread_id"),
         "worktree": cycle.get("worktree"),
+    }
+
+
+def _public_integration_development(state: dict[str, object]) -> dict[str, object] | None:
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    budget = current[1].get("integration_development_budget")
+    if not isinstance(budget, dict):
+        return None
+    return {key: budget.get(key) for key in ("window", "used", "limit", "renewals")}
+
+
+def _public_integration_resync(state: dict[str, object]) -> dict[str, object] | None:
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    subject = current[1]
+    owner = delivery_budget_owner(state, subject)
+    if owner is not subject:
+        budgets = owner.get("repair_integration_budgets")
+        scope = budgets.get(str(subject.get("repair_generation"))) if isinstance(budgets, dict) else None
+        budget = scope.get("integration_resync") if isinstance(scope, dict) else None
+    else:
+        budget = subject.get("integration_resync")
+    if not isinstance(budget, dict):
+        return None
+    return {key: budget.get(key) for key in ("generation", "window", "used", "limit", "open")}
+
+
+def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location == "run_publication":
+        acceptance = state.get("run_acceptance")
+        if not isinstance(acceptance, dict):
+            return None
+        subject = acceptance
+    budget = delivery_budget_owner(state, subject).get("ci_recovery")
+    if not isinstance(budget, dict):
+        return None
+    limit = ci_limit_for_job(subject)
+    failure_head = budget.get("failure_head")
+    evidence = subject.get("ci_evidence") or subject.get("ci_failed_evidence")
+    if not isinstance(evidence, dict) or evidence.get("head_sha") != failure_head:
+        evidence = subject.get("required_checks_origin")
+    raw_checks = (
+        evidence.get("checks")
+        if isinstance(evidence, dict) and evidence.get("head_sha") == failure_head
+        else None
+    )
+    failed_checks = []
+    if isinstance(raw_checks, list):
+        failed_checks = [
+            {
+                key: check[key]
+                for key in ("workflow", "name", "link", "repairability")
+                if check.get(key) is not None
+            }
+            for check in raw_checks
+            if isinstance(check, dict) and check.get("bucket") == "fail"
+        ]
+    return {
+        "window": budget.get("window"),
+        "developments_used": budget.get("developments_used"),
+        "development_limit": limit,
+        "review_required": budget.get("review_required"),
+        "checkpoint_reason": budget.get("checkpoint_reason"),
+        "failure_head": failure_head,
+        "failed_checks": failed_checks,
+        "history": budget.get("history"),
+        "reviewer_invocations": budget.get("reviewer_invocations"),
     }
 
 
@@ -793,7 +748,7 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
         policy = run_repair_budget_policy_for_job(
             subject, state_snapshot=state.get("policy_snapshot")
         )
-    budget = subject.get("review_budget")
+    budget = delivery_budget_owner(state, subject).get("review_budget")
     if not isinstance(budget, dict):
         return None
     return {
@@ -805,8 +760,8 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
         "final_ci_fix_used": budget.get("final_ci_fix_used"),
         "final_ci_fix_limit": policy.final_ci_fix_limit,
         "checkpoint_reason": budget.get("checkpoint_reason"),
-        "candidate_sha": _current_delivery_identity(state).get("candidate_sha"),
-        "pr_number": _current_delivery_identity(state).get("pr_number"),
+        "candidate_sha": current_delivery_identity(state).get("candidate_sha"),
+        "pr_number": current_delivery_identity(state).get("pr_number"),
     }
 
 
@@ -852,7 +807,11 @@ def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> N
         return
     reason = notifications.get("unavailable_reason")
     pending = notifications.get("pending", [])
+    unconfirmed = len(pending) + sum(
+        not item.get("cancelled") and (item.get("exhausted") or item.get("outcome") in {"failed", "unknown"})
+        for item in notifications.get("records", [])
+    )
     if reason:
         print(text("presentation.notification.unavailable", language=selected_language(state), reason=reason))
-    if pending:
-        print(text("presentation.notification.pending", language=selected_language(state), count=len(pending)))
+    if unconfirmed:
+        print(text("presentation.notification.pending", language=selected_language(state), count=unconfirmed))

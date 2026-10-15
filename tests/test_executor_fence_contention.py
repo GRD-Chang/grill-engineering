@@ -10,10 +10,10 @@ import pytest
 
 from support.workspace import managed_repo, managed_state
 
-from conftest import seed_run, write_fixture
-from test_run_lifecycle import _isolated_environment
-from test_receipt_successors import _install_host
-from test_ticket_194_stop_abandon import _bind_running_executor
+from support.seeding import seed_run, write_fixture
+from support.lifecycle import _isolated_environment
+from support.receipt_host import _install_host
+from support.control import _bind_running_executor
 from agent_run import cli
 from agent_run import git as git_module
 from agent_run import task_control as control_module
@@ -27,6 +27,10 @@ from agent_run.task_control import (
     TaskControlBusyError,
     TaskControlStore,
 )
+from agent_run.object_state import save_owned
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("revocation", ["none", "stop", "generation"])
@@ -46,7 +50,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
     # Only a terminal Run now takes the read-only Stop preflight. Keep the
     # real ownership-lock contention and subsequent fence revocation unchanged.
     state.update(status="completed", terminal_kind="completed")
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control, task, worker = _bind_running_executor(git_repo, run_id)
     try:
         record = control.load(task)
@@ -75,7 +79,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         )
         head = GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo))
         (managed_repo(git_repo) / "README.md").write_text("candidate\n")
-        before_state = (states.runs_directory / f"{run_id}.json").read_bytes()
+        before_state = snapshot_run((states.root, str(run_id)))
         before_control = control.path_for(task).read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, "running")
         monkeypatch.setattr(
@@ -154,7 +158,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
                     )
                 release_preflight.set()
                 assert stop.result(timeout=5) == 0
-                assert (states.runs_directory / f"{run_id}.json").read_bytes() == before_state
+                assert snapshot_run((states.root, str(run_id))) == before_state
                 assert control.path_for(task).read_bytes() == before_control
                 if revocation == "stop":
                     control.claim_control_action(
@@ -181,14 +185,12 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         assert dispatched == (["commit"] if revocation == "none" else [])
         if revocation == "none":
             assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) != head
-            states.save_run(run_id, {**state, "status": "completed"})
+            save_owned(states, run_id, {**state, "status": "completed"}, fields={'status'})
         else:
             assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) == head
             with pytest.raises(ActionReconciliationError):
-                states.save_run(run_id, {**state, "status": "completed"})
-            assert (
-                states.runs_directory / f"{run_id}.json"
-            ).read_bytes() == before_state
+                save_owned(states, run_id, {**state, "status": "completed"}, fields={'status'})
+            assert snapshot_run((states.root, str(run_id))) == before_state
     finally:
         if worker.poll() is None:
             worker.kill()

@@ -12,6 +12,9 @@ from agent_run.delivery_history import (
 )
 
 
+from agent_run.history_facts import history_records as semantic_history_records
+
+
 OLD_FINDING = "旧候选仍泄漏内部状态，必须修复。"
 
 
@@ -77,9 +80,9 @@ def repair_history() -> tuple[dict[str, Any], dict[str, Any]]:
         "repository": "example/project",
         "parent": {"number": 1, "title": "History regression"},
         "run_acceptance": {
+            "review_budget": {"window": 1, "review_artifacts": artifacts},
             "repair_job": {
                 "semantic_attempt_history": attempts,
-                "review_budget": {"window": 1, "review_artifacts": artifacts},
             }
         },
     }
@@ -152,7 +155,7 @@ def test_repair_history_does_not_borrow_unproven_review_results(
 ) -> None:
     state, audit = repair_history
     latest = audit["agent_invocations"][-1]
-    budget = state["run_acceptance"]["repair_job"]["review_budget"]
+    budget = state["run_acceptance"]["review_budget"]
     if identity_gap == "missing_reviewer":
         latest.pop("reported_thread_id")
     elif identity_gap == "missing_candidate":
@@ -171,10 +174,10 @@ def test_repair_history_does_not_borrow_unproven_review_results(
         )
         budget["review_artifacts"].append(conflicting)
 
-    record = history_records(state, audit)[-1]
+    record = semantic_history_records(state, audit)[-1]
     assert record["acceptance_artifact"] is None
     assert record["findings"] == []
-    assert record["status_text"] not in ("验收通过", "验收未通过")
+    assert record["status_code"] not in ("review_passed", "review_failed")
     event = history_progress_view(state, audit)["events"][-1]
     assert event["details"] == []
     assert event["status"] == "completed"

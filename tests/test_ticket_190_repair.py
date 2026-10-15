@@ -6,7 +6,6 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -18,10 +17,13 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from cli_run_supervision_support import _parent_only_agents
-from conftest import write_fixture
+from agent_run.object_state import save_owned
+from support.cli_supervision import _parent_only_agents
+from support.seeding import write_fixture
 from support.workspace import managed_workspace
-from test_cli_delivery import ticket
+from support.cli_payloads import ticket
+
+from support.state import only_run_ref, read_run, run_refs, snapshot_run
 
 
 def _isolated_environment(root: Path) -> dict[str, str]:
@@ -64,49 +66,83 @@ import threading
 
 role = os.environ.get("TICKET_190_ROLE")
 
-if role == "first":
-    original_transaction = TaskControlStore._executor_current_transaction
+if role == "replacement":
+    original_locked = TaskControlStore._locked
+    transactions = threading.Lock()
+    started = Path(os.environ["TICKET_190_AGENT_STARTED"])
+    parked = Path(os.environ["TICKET_190_EXECUTOR_PARKED"])
+    release = Path(os.environ["TICKET_190_AGENT_RELEASE"])
 
     @contextmanager
-    def observed_transaction(self, task, *, action_id, generation, run_id=None):
-        agent_release = os.environ.get("TICKET_190_AGENT_RELEASE")
-        holder = os.environ.get("TICKET_190_HOLDER")
-        attempted = os.environ.get("TICKET_190_ATTEMPTED")
-        busy = os.environ.get("TICKET_190_BUSY")
-        if (
-            agent_release
-            and holder
-            and attempted
-            and Path(agent_release).exists()
-            and Path(holder).exists()
-            and not Path(attempted).exists()
-        ):
-            Path(attempted).touch()
-        try:
-            with original_transaction(
-                self,
-                task,
-                action_id=action_id,
-                generation=generation,
-                run_id=run_id,
-            ):
+    def parked_transaction(self, task, *, wait=False, **kwargs):
+        # Drain every prior transaction before acknowledging the barrier.
+        # Wait outside the real file lock; preserve all ownership validation.
+        with transactions:
+            if started.exists() and not release.exists():
+                parked.touch()
+                deadline = time.monotonic() + 10
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Executor replacement barrier timed out")
+                    time.sleep(0.001)
+            with original_locked(self, task, wait=wait, **kwargs):
                 yield
-        except TaskControlBusyError:
-            if busy:
+
+    TaskControlStore._locked = parked_transaction
+
+    def establish_replacement_barrier():
+        deadline = time.monotonic() + 10
+        while not started.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Agent did not reach replacement barrier")
+            time.sleep(0.001)
+        workspace = ManagedWorkspace.for_repository("example/project")
+        store = TaskControlStore(workspace.state_root)
+        task = TaskKey(workspace.repository_root, "example/project", 1)
+        # Request the barrier explicitly: an idle scheduler has no reason to
+        # enter Task Control after a no-op queue seed. This read-only lock
+        # request drains preceding transactions without writing Run facts.
+        with store._locked(task, wait=True):
+            pass
+
+    threading.Thread(target=establish_replacement_barrier, daemon=False).start()
+
+elif role == "first":
+    import fcntl
+    original_flock = fcntl.flock
+
+    def observed_flock(fd, flags):
+        try:
+            return original_flock(fd, flags)
+        except BlockingIOError:
+            agent_release = os.environ.get("TICKET_190_AGENT_RELEASE")
+            holder = os.environ.get("TICKET_190_HOLDER")
+            attempted = os.environ.get("TICKET_190_ATTEMPTED")
+            busy = os.environ.get("TICKET_190_BUSY")
+            if (agent_release and holder and attempted and busy
+                    and Path(agent_release).exists() and Path(holder).exists()):
+                Path(attempted).touch()
                 Path(busy).touch()
             raise
 
-    TaskControlStore._executor_current_transaction = observed_transaction
+    fcntl.flock = observed_flock
 
 elif role == "second":
     original_locked = TaskControlStore._locked
-    hold_state = {"used": False}
+    hold_state = {"used": False, "initial_contention": False}
 
-    def held_lock(self, task):
-        manager = original_locked(self, task)
+    def held_lock(self, task, *, wait=False, **kwargs):
+        manager = original_locked(self, task, wait=wait, **kwargs)
 
         @contextmanager
         def hold_once():
+            if not hold_state["initial_contention"]:
+                hold_state["initial_contention"] = True
+                # Force the startup race once using the real nonblocking lock.
+                # A second open must contend even within the same process.
+                with original_locked(self, task):
+                    with manager:
+                        raise AssertionError("Task Control lock admitted a competing holder")
             with manager:
                 marker = os.environ.get("TICKET_190_HOLDER")
                 release = os.environ.get("TICKET_190_HOLDER_RELEASE")
@@ -141,8 +177,19 @@ elif role == "second":
                 raise RuntimeError("same-parent Executor did not become active")
             time.sleep(0.001)
         try:
-            with store._locked(task):
-                pass
+            # The live Executor can still commit scheduler/heartbeat state
+            # while its Agent is parked. Establish the fixture's holder before
+            # releasing that Agent; short startup contention is not the state
+            # commit retry that this test is meant to exercise.
+            while True:
+                try:
+                    with store._locked(task):
+                        pass
+                    break
+                except TaskControlBusyError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.001)
         except BaseException as error:
             error_path = os.environ.get("TICKET_190_HOLDER_ERROR")
             if error_path:
@@ -161,6 +208,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     agents = _parent_only_agents(git_repo / "agents.json")
     started = tmp_path / "agent-started"
     release = tmp_path / "agent-release"
+    parked = tmp_path / "executor-parked"
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["invocation_gate"] = {
         "role": "development",
@@ -169,8 +217,18 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         "timeout_seconds": 30,
     }
     agents.write_text(json.dumps(data), encoding="utf-8")
+    sitecustomize = tmp_path / "sitecustomize"
+    sitecustomize.mkdir()
+    _write_competition_sitecustomize(sitecustomize / "sitecustomize.py")
     environment = _isolated_environment(tmp_path / "generation")
-    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    source_path = str(Path(__file__).resolve().parents[1] / "src")
+    environment.update({
+        "PYTHONPATH": f"{sitecustomize}{os.pathsep}{source_path}",
+        "TICKET_190_ROLE": "replacement",
+        "TICKET_190_AGENT_STARTED": str(started),
+        "TICKET_190_EXECUTOR_PARKED": str(parked),
+        "TICKET_190_AGENT_RELEASE": str(release),
+    })
     workspace = managed_workspace(git_repo, extra_env=environment)
     command = [
         sys.executable,
@@ -193,14 +251,17 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     )
     try:
         _wait_for_marker(process, started)
-        state_path = next((workspace.state_root / "runs").glob("*.json"))
+        # The Agent barrier alone leaves the continuous scheduler running.
+        # Replace ownership only after all old Task Control work is parked.
+        _wait_for_marker(process, parked)
+        state_ref = only_run_ref(workspace.state_root)
         control = TaskControlStore(workspace.state_root)
         task = TaskKey(workspace.repository_root, "example/project", 1)
         control_path = next((workspace.state_root / "task-control").glob("*.json"))
         record = json.loads(control_path.read_text(encoding="utf-8"))
         action_id = record["action"]["action_id"]
         generation = record["executor"]["generation"]
-        state_before_release = state_path.read_bytes()
+        state_before_release = snapshot_run(state_ref)
         fixture_before_release = fixture.read_bytes()
         agents_before_release = agents.read_bytes()
         git_status_before_release = {
@@ -234,7 +295,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         release.touch()
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode == 2, f"{stdout}\n{stderr}"
-        assert state_path.read_bytes() == state_before_release
+        assert snapshot_run(state_ref) == state_before_release
         assert fixture.read_bytes() == fixture_before_release
         assert agents.read_bytes() == agents_before_release
         assert {
@@ -373,13 +434,13 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
         assert second.returncode == 0, f"{second_stdout}\n{second_stderr}"
         assert not holder_error.exists()
 
-        run_files = list((workspace.state_root / "runs").glob("*.json"))
+        run_records = run_refs(workspace.state_root)
         control_files = list(
             (workspace.state_root / "task-control").glob("*.json")
         )
-        assert len(run_files) == 1
+        assert len(run_records) == 1
         assert len(control_files) == 1
-        state = json.loads(run_files[0].read_text(encoding="utf-8"))
+        state = read_run(run_records[0])
         record = json.loads(control_files[0].read_text(encoding="utf-8"))
         assert state["status"] not in {"completed", "abandoned"}
         assert state["status"] != "execution_failed"
@@ -404,7 +465,7 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
 
 
 def test_state_commit_retries_task_control_busy_without_failing_run(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = TaskKey(tmp_path / "checkout", "example/project", 156)
     control = TaskControlStore(tmp_path / "control")
@@ -439,27 +500,27 @@ def test_state_commit_retries_task_control_busy_without_failing_run(
     retry_attempts: list[int] = []
     release_errors: list[BaseException] = []
 
-    def transaction() -> object:
-        @contextmanager
-        def current_transaction() -> object:
-            try:
-                with control._executor_current_transaction(
-                    task,
-                    action_id=claim.action_id,
-                    generation=reservation.generation,
-                    run_id="run-1",
-                ):
-                    yield
-            except TaskControlBusyError:
-                retry_attempts.append(len(retry_attempts) + 1)
-                busy_observed.set()
-                if len(retry_attempts) >= 9:
-                    ninth_attempt.set()
-                raise
+    from agent_run import task_control as control_module
+    real_flock = control_module.fcntl.flock
 
-        return current_transaction()
+    def observe_acquisition(fd: int, flags: int) -> None:
+        try:
+            real_flock(fd, flags)
+        except BlockingIOError:
+            retry_attempts.append(len(retry_attempts) + 1)
+            busy_observed.set()
+            if len(retry_attempts) >= 9:
+                ninth_attempt.set()
+            raise
 
-    states._set_write_guard(lambda: None, transaction=transaction)
+    monkeypatch.setattr(control_module.fcntl, "flock", observe_acquisition)
+    states._set_write_guard(
+        lambda: None,
+        transaction=lambda: control._executor_current_transaction(
+            task, action_id=claim.action_id, generation=reservation.generation,
+            run_id="run-1",
+        ),
+    )
 
     def hold_task_control() -> None:
         with control._locked(task):
@@ -473,7 +534,7 @@ def test_state_commit_retries_task_control_busy_without_failing_run(
 
     def write_state() -> None:
         try:
-            states.save_run("run-1", {"run_id": "run-1", "status": "continued"})
+            save_owned(states, "run-1", {"run_id": "run-1", "status": "continued"}, fields={'status'})
         except BaseException as error:  # pragma: no cover - diagnostic propagation
             writer_errors.append(error)
 

@@ -1,0 +1,181 @@
+"""Public query/resume boundaries for persisted Change Job conflict calls."""
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from agent_run.agents import DevelopmentResult
+from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend
+from agent_run.executor_host import FakeExecutorHost
+from agent_run.git import GitRepository
+from agent_run.run_driver import RunDriver
+from agent_run.state import StateStore
+from agent_run.task_control import TaskControlStore, TaskKey
+from support.conflict_invocations import prepared_conflict, run_conflict
+from support.inprocess_cli import invoke_cli_inprocess
+from support.seeding import seed_idle_control
+from support.workspace import prepare_workspace
+
+from support.state import include_in_state_snapshot
+
+
+def _job(state: dict[str, Any], kind: str) -> dict[str, Any]:
+    if kind == "ticket":
+        return state["ticket_jobs"]["3"]
+    if kind == "parent_only":
+        return state["parent_job"]
+    return state["run_acceptance"]["repair_job"]
+
+
+def _query(repo: Path, store: StateStore, run_id: str, status: str) -> None:
+    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file() and include_in_state_snapshot(path)}
+    for command in ("status", "history"):
+        result = invoke_cli_inprocess(repo, None, command, run_id, "--state-dir", str(store.root), "--json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        if command == "history" or status != "completed":
+            assert "integration_conflict" in result.stdout
+            assert status in result.stdout
+    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file() and include_in_state_snapshot(path)} == before
+
+
+@pytest.mark.parametrize("kind", ["ticket", "parent_only", "run_repair"])
+def test_public_resume_preserves_conflict_attempt_and_queries(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, store, job, stage = prepared_conflict(repo, kind, state_root=workspace.state_root)
+    git = GitRepository(repo)
+    name, branch_key = {
+        "ticket": ("ticket-3", "ticket_branch"),
+        "parent_only": ("parent", "parent_branch"),
+        "run_repair": ("run-repair", "repair_branch"),
+    }[kind]
+    branch = f"agent-run/{name}"
+    checkout = store.root / "worktrees" / state["run_id"] / name
+    git.prepare_ticket_checkout(branch=branch, base_sha=job["candidate_sha"], checkout=checkout)
+    job.update({branch_key: branch, "managed_checkout_head": git.checkout_head(checkout)})
+    job["policy_snapshot"] = dict(state["policy_snapshot"])
+    stage.save(state)
+    fixture = repo / "github.json"
+    run_id = state["run_id"]
+    seed_idle_control(TaskControlStore(store.root), TaskKey(repo, state["repository"], 1), run_id)
+    profiles = AgentProfileStore(store.root)
+    profiles.initialize(run_id)
+    owner = state["run_acceptance"] if kind == "run_repair" else job
+    budget = deepcopy(owner["review_budget"])
+    if kind == "run_repair":
+        budget["development_attempts"] += 1
+    ci_budget = deepcopy(owner["ci_recovery"])
+    candidate = job["candidate_sha"]
+    preserved = checkout / "conflict-work.txt"
+    preserved.write_text("work already completed\n")
+
+    def fail(request: dict[str, Any]) -> DevelopmentResult:
+        event = request["_invocation_event"]
+        event("started", requested_thread_id="conflict-thread", attempt_count=1)
+        event("thread_started", reported_thread_id="conflict-thread")
+        _query(repo, store, run_id, "running")
+        event("failed", error="controlled conflict interruption", return_code=1)
+        _query(repo, store, run_id, "failed")
+        raise InterruptedError("controlled conflict interruption")
+
+    stage.agents = ProfiledAgentBackend(SimpleNamespace(develop=fail), profiles, run_id=run_id)
+    with pytest.raises(InterruptedError):
+        run_conflict(stage, state, job, checkout)
+    failed = StateStore(store.root).load_current_run(run_id)
+    assert failed is not None
+    failed_invocation = deepcopy(failed["active_agent_invocation"])
+    assert failed_invocation["status"] == "failed"
+    attempt = deepcopy(job["pending_semantic_attempt"])
+    integration_budget = deepcopy(job.get("integration_development_budget"))
+    if kind != "run_repair":
+        assert integration_budget is not None and integration_budget["used"] == 1
+    binding = deepcopy(state["active_agent_invocation"]["thread_execution_binding"])
+    assert binding["thread_id"] == "conflict-thread"
+    acceptance = deepcopy(job.get("acceptance_record"))
+    # Keep the public admission, command intent and Controller refresh real;
+    # stop the Driver at dispatch so this matrix does not run full delivery.
+    import agent_run.cli as cli
+    monkeypatch.setattr(cli, "FakeExecutorHost", lambda **kwargs: FakeExecutorHost())
+    monkeypatch.setattr(RunDriver, "advance", lambda self, current, **kwargs: current)
+    result = invoke_cli_inprocess(repo, fixture, "resume", run_id, "--state-dir", str(store.root), "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    resumed = StateStore(store.root).load_current_run(run_id)
+    assert resumed is not None
+    resumed_job = _job(resumed, kind)
+    resumed_owner = resumed["run_acceptance"] if kind == "run_repair" else resumed_job
+    if kind == "ticket":
+        resumed["active_ticket_job"] = resumed_job
+    resuming_invocation = deepcopy(resumed["active_agent_invocation"])
+    assert resuming_invocation["status"] == "resuming"
+    assert resuming_invocation["started_at"] == failed_invocation["started_at"]
+    resume_event = deepcopy(resumed["resume_audit"]["history"][-1])
+    assert resuming_invocation["semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
+    assert resumed["active_agent_invocation"]["thread_execution_binding"] == binding
+    _query(repo, store, run_id, "resuming")
+    assert resumed_job["pending_semantic_attempt"] == attempt
+    assert resumed_job.get("integration_development_budget") == integration_budget
+    assert resumed_job["candidate_sha"] == candidate
+    assert resumed_job.get("acceptance_record") == acceptance
+    assert resumed_owner["review_budget"] == budget
+    assert resumed_owner["ci_recovery"] == ci_budget
+    assert resumed_job["development_thread_id"] == "conflict-thread"
+    assert preserved.read_text() == "work already completed\n"
+
+    def complete(request: dict[str, Any]) -> DevelopmentResult:
+        assert request["thread_id"] == "conflict-thread"
+        assert request["_invocation_mode"] == "resume"
+        event = request["_invocation_event"]
+        event("started", requested_thread_id="conflict-thread", attempt_count=1)
+        assert resumed["active_agent_invocation"]["semantic_attempt"] == attempt
+        assert resumed["active_agent_invocation"]["thread_execution_binding"] == binding
+        event("completed", reported_thread_id="conflict-thread")
+        _query(repo, store, run_id, "completed")
+        return DevelopmentResult(thread_id="conflict-thread", summary="Conflict resolved")
+
+    stage.agents = ProfiledAgentBackend(SimpleNamespace(develop=complete), profiles, run_id=run_id)
+    assert run_conflict(stage, resumed, resumed_job, checkout)
+    assert "pending_semantic_attempt" not in resumed_job
+    assert resumed_owner["review_budget"] == budget
+    assert resumed_owner["ci_recovery"] == ci_budget
+    assert resumed_job.get("integration_development_budget") == integration_budget
+    assert resumed_job["semantic_attempt_history"][-1]["attempt_id"] == attempt["attempt_id"]
+    if kind == "parent_only":
+        assert stage.conflict_key not in resumed_job
+        record = resumed_job["parent_integration"]
+        assert record["candidate_sha"] == candidate
+        assert record["source_sha"] == record["target_sha"] == record["head_sha"] == candidate
+        persisted = StateStore(store.root).load_current_run(run_id)
+        assert persisted is not None
+        assert persisted["parent_job"] == resumed_job
+        assert persisted["active_agent_invocation"] == resumed["active_agent_invocation"]
+        assert persisted["status"] == resumed["status"]
+    else:
+        resumed_job.pop(stage.conflict_key)
+    stage.save(resumed)
+    persisted = StateStore(store.root).load_current_run(run_id)
+    assert persisted is not None
+    assert _job(persisted, kind) == resumed_job
+    active = persisted["active_agent_invocation"]
+    assert active == resumed["active_agent_invocation"]
+    assert active["status"] == "completed"
+    assert active["started_at"] != failed_invocation["started_at"]
+    history = {
+        (item["work_subject"], item["started_at"]): item
+        for item in persisted["agent_invocation_history"]
+    }
+    assert history[(failed_invocation["work_subject"], failed_invocation["started_at"])] == failed_invocation
+    assert history[(active["work_subject"], active["started_at"])] == active
+    assert active["work_subject"] == failed_invocation["work_subject"]
+    assert active["predecessor_invocation_started_at"] == failed_invocation["started_at"]
+    assert active["resume_id"] == resume_event["resume_id"]
+    for invocation in (failed_invocation, active):
+        assert invocation["semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
+        assert invocation["thread_execution_binding"] == binding
+        assert invocation["reported_thread_id"] == "conflict-thread"
+    _query(repo, store, run_id, "completed")

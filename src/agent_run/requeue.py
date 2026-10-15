@@ -12,6 +12,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.run_repair_cycle import remove_repair_job
+
 
 class RequeueError(ValueError):
     """Raised when an operator asks to requeue an ineligible Run."""
@@ -47,6 +49,9 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(jobs, dict):
             raise RequeueError("ticket_jobs must be an object")
         jobs.pop(ticket, None)
+        invocations = state.get("ticket_agent_invocations")
+        if isinstance(invocations, dict):
+            invocations.pop(ticket, None)
         state["active_ticket_job"] = None
         next_status = "active"
     elif subject.startswith("parent-only:"):
@@ -54,11 +59,13 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         state.pop("parent_job", None)
         next_status = "parent_delivery_pending"
     else:
-        container.pop("repair_job", None)
+        remove_repair_job(container)
         container["phase"] = "pending"
         next_status = "run_acceptance_pending"
 
-    state["active_agent_invocation"] = None
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict) or invocation.get("work_subject") == subject:
+        state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     state.update(
         {

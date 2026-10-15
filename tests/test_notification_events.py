@@ -2,21 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from support.notification import state_with_round
+
 import pytest
 
 from agent_run.notification_cards import card
-from agent_run.notification_events import events, recovery_event
-
-
-def state_with_round(role: str = "development", outcome: str = "candidate") -> dict[str, Any]:
-    attempt = {"attempt_id": "a1", "role": role, "work_subject": "run:r",
-               "ordinal": 1, "generation": 1, "status": "completed", "outcome": outcome,
-               "development_summary": "已实现输入校验"}
-    return {"language": "zh", "run_id": "r", "repository": "o/repo", "parent": {"number": 241, "title": "飞书通知"},
-            "status": "run_review_pending", "semantic_agent_attempts": [attempt],
-            "agent_invocation_history": [{"semantic_attempt": attempt.copy(), "status": "completed", "reported_thread_id": "thread-1",
-                                          "started_at": "2026-01-01T00:00:00+00:00",
-                                          "ended_at": "2026-01-01T00:00:09+00:00"}]}
+from agent_run.notification_events import events, recovery_events
 
 
 def test_semantic_round_identity_survives_resumption_and_wording_changes() -> None:
@@ -65,7 +56,7 @@ def test_boundary_colors_and_recovery_use_current_state(status: str, color: str)
     state.update(status=status, human_blockers=[])
     event = events(state)[-1]
     assert event["current"] and event["color"] == color
-    summary = recovery_event(state, missed)
+    summary = recovery_events(state, missed)[-1]
     assert "旧凭据" not in summary["summary"]
     assert summary["color"] == color
 
@@ -210,6 +201,7 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
                    'outcome': {'development': 'candidate', 'review': 'acceptance_artifact', 'publication': 'publication_artifact'}[role]}
         state['semantic_agent_attempts'].append(attempt)
         state['agent_invocation_history'].append({'semantic_attempt': attempt.copy(), 'status': 'completed', 'reported_thread_id': 'thread-1',
+            'execution_segments': [{'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'}],
             'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'})
     state.update(status='run_approval_pending', run_publication={'pr_number': 9})
     detailed = events(state)
@@ -229,18 +221,38 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
     assert len({event['id'] for event in detailed + events(state)}) == 14
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_ticket_completion_waits_for_completed_phase(language: str) -> None:
+    state = state_with_round()
+    state["language"] = language
+    state["ticket_graph"] = {"tickets": {"2": {"title": "Ticket 2"}}}
+    state["ticket_jobs"] = {"2": {"phase": "merged", "generation": 1}}
+    state["notifications"] = {"mode": "concise"}
+
+    assert not any(event["kind"] == "ticket_completed" for event in events(state))
+
+    state["ticket_jobs"]["2"]["phase"] = "completed"
+    completion = next(event for event in events(state) if event["kind"] == "ticket_completed")
+    assert completion["title"] == ("子任务完成：Ticket 2" if language == "zh" else "Ticket completed: Ticket 2")
+    assert completion["summary"] == ("子任务已完成 1/1" if language == "zh" else "Tickets completed: 1/1")
+
+
 def test_round_resume_timing_and_missing_data_are_not_fabricated() -> None:
     state = state_with_round()
     invocation = state['agent_invocation_history'][0]
     state['agent_invocation_history'].append({**invocation, 'resume_id': 'r2',
+        'execution_segments': [{'started_at': '2026-01-01T01:00:00+00:00', 'ended_at': '2026-01-01T01:07:55+00:00'}],
         'started_at': '2026-01-01T01:00:00+00:00', 'ended_at': '2026-01-01T01:07:55+00:00'})
     ended = events(state)[-1]
     assert ended['duration_seconds'] == 484
     assert '8 分 4 秒' in str(card(ended))
     state['agent_invocation_history'][0].pop('ended_at')
+    state['agent_invocation_history'][0]['execution_segments'][0].pop('ended_at')
     ended = events(state)[-1]
     assert ended['duration_seconds'] is None
-    assert '耗时' not in str(card(ended))
+    assert '耗时记录不完整' in str(card(ended))
+    assert '已记录执行时长' in str(card(ended))
+    assert ended['recorded_execution_seconds'] == 475
 
 
 def test_latest_recovery_keeps_mode_and_omits_resolved_todo() -> None:
@@ -249,9 +261,9 @@ def test_latest_recovery_keeps_mode_and_omits_resolved_todo() -> None:
     state.update(status='ready_for_human', human_blockers=['旧待办'])
     pending = [events(state)[-1]]
     state.update(status='run_review_pending', human_blockers=[])
-    assert recovery_event(state, pending) is None
+    assert recovery_events(state, pending) == []
     state['status'] = 'completed'
-    recovered = recovery_event(state, pending)
+    recovered = recovery_events(state, pending)[-1]
     assert recovered and recovered['title'] == '任务已完成'
     assert '恢复' not in str(card(recovered))
     assert '旧待办' not in str(card(recovered))
@@ -265,6 +277,7 @@ def test_boundary_times_use_business_event_and_omit_incomplete_totals() -> None:
     assert result['total_seconds'] == 9
     assert result['elapsed_seconds'] == 600
     state['agent_invocation_history'][0].pop('ended_at')
+    state['agent_invocation_history'][0]['execution_segments'][0].pop('ended_at')
     result = events(state)[-1]
     assert 'total_seconds' not in result
     assert result['elapsed_seconds'] == 600
@@ -287,7 +300,7 @@ def test_ticket_total_omits_incomplete_unassociated_execution() -> None:
 @pytest.mark.parametrize("status", ["blocked", "unsupported_scope_change", "deterministic_contradiction", "requeue_required", "publication_pending", "abandonment_pending"])
 def test_concise_preserves_other_human_boundaries(status: str) -> None:
     state = state_with_round()
-    state.update(status=status, blocked_reason="需要核对外部分支", notifications={"mode": "concise"})
+    state.update(status=status, terminal_kind="waiting_human", blocked_reason="需要核对外部分支", notifications={"mode": "concise"})
     boundary = events(state)[-1]
     assert boundary["kind"] == "boundary"
     assert boundary["current"] is True
@@ -331,12 +344,13 @@ def test_ticket_todo_uses_current_object_even_with_older_pr(mode: str, status: s
     state = state_with_round()
     state.update(status=status, notifications={"mode": mode},
                  ticket_graph={"tickets": {"3": {"title": "子任务原始标题 2026-09-15"}}},
-                 active_ticket_job={"ticket_number": 3, "phase": "blocked", "human_blockers": ["当前子任务问题"]},
-                 ticket_jobs={"2": {"phase": "blocked", "human_blockers": ["旧任务问题"]}},
+                 active_ticket_job={"ticket_number": 3, "phase": "blocked", "blocked_reason": "agent_requires_human", "human_blockers": ["当前子任务问题"]},
+                 ticket_jobs={"2": {"phase": "blocked", "blocked_reason": "agent_requires_human", "human_blockers": ["旧任务问题"]}},
                  run_publication={"pr_number": 9, "phase": "completed"})
-    pending = next(event for event in events(state) if event.get("current"))
-    recovered = recovery_event(state, [pending])
-    assert recovered is not None
+    pending = next(event for event in events(state) if event.get("work_subject") == "ticket:3")
+    recovered_events = recovery_events(state, [pending])
+    assert any(event.get("work_subject") == "ticket:2" for event in recovered_events)
+    recovered = next(event for event in recovered_events if event.get("work_subject") == "ticket:3")
     for notification in (pending, recovered):
         assert notification["task_number"] == 3
         assert notification["task_title"] == "子任务原始标题 2026-09-15"
@@ -344,7 +358,7 @@ def test_ticket_todo_uses_current_object_even_with_older_pr(mode: str, status: s
         assert "当前子任务问题" in notification["summary"]
         assert "旧任务问题" not in notification["summary"]
     state["active_ticket_job"]["ticket_number"] = 4
-    changed = next(event for event in events(state) if event.get("current"))
+    changed = next(event for event in events(state) if event.get("work_subject") == "ticket:4")
     assert changed["id"] != pending["id"]
     assert changed["task_number"] == 4
     assert changed["task_title"] == ""
@@ -355,7 +369,7 @@ def test_overall_todo_does_not_borrow_completed_ticket_identity(mode: str) -> No
     state = state_with_round()
     state.update(status="ready_for_human", notifications={"mode": mode},
                  active_ticket_job={"ticket_number": 3, "phase": "completed"},
-                 run_acceptance={"phase": "blocked", "human_blockers": ["整体验收问题"]},
+                 run_acceptance={"phase": "blocked", "blocked_reason": "reviewer_requires_human", "human_blockers": ["整体验收问题"]},
                  run_publication={"pr_number": 9, "phase": "completed"})
     notification = next(event for event in events(state) if event.get("current"))
     assert notification["task_number"] == state["parent"]["number"]
@@ -424,24 +438,73 @@ def test_card_localizes_labels_and_preserves_external_text(language: str) -> Non
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
-def test_concise_ticket_start_requires_invocation_and_survives_rework(language: str) -> None:
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_concise_start_requires_invocation_and_survives_rework(language: str, parent_only: bool) -> None:
     state = state_with_round()
-    state.update(language=language, notifications={"mode": "concise"})
+    state.update(language=language, notifications={"mode": "concise"},
+                 delivery_type="parent_only" if parent_only else "ticket_run")
+    kind = "parent_started" if parent_only else "ticket_started"
     attempt = state["semantic_agent_attempts"][0]
-    attempt.update(work_subject="ticket:2", started_at="2026-01-01T00:00:00+00:00")
+    attempt.update(work_subject="parent-only:r" if parent_only else "ticket:2", started_at="2026-01-01T00:00:00+00:00")
     state["ticket_graph"] = {"tickets": {"2": {"title": "Actual ticket"}}}
     invocation = state["agent_invocation_history"].pop()
     invocation["semantic_attempt"] = attempt.copy()
-    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    assert not any(event["kind"] == kind for event in events(state))
     state["agent_invocation_history"].append({key: value for key, value in invocation.items() if key != "reported_thread_id"})
-    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    assert not any(event["kind"] == kind for event in events(state))
     state["agent_invocation_history"][-1]["reported_thread_id"] = "actual-thread"
-    started = next(event for event in events(state) if event["kind"] == "ticket_started")
-    assert started["task_title"] == "Actual ticket"
+    started = next(event for event in events(state) if event["kind"] == kind)
+    assert started["task_title"] == (state["parent"]["title"] if parent_only else "Actual ticket")
     assert started["language"] == language
-    later = {**invocation, "semantic_attempt": {**attempt, "attempt_id": "rework", "ordinal": 2}}
-    state["agent_invocation_history"].append(later)
-    assert [event["id"] for event in events(state) if event["kind"] == "ticket_started"] == [started["id"]]
+    # Same-round continuation, replacement Thread and internal rework all
+    # retain the first milestone, even when the old history is compacted.
+    for identity, ordinal in (("a1", 1), ("rework", 2)):
+        later = {**invocation, "reported_thread_id": "replacement-thread",
+                 "started_at": "2026-01-01T01:00:00+00:00",
+                 "semantic_attempt": {**attempt, "attempt_id": identity, "ordinal": ordinal}}
+        state["agent_invocation_history"] = [later]
+        assert [event["id"] for event in events(state) if event["kind"] == kind] == [started["id"]]
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+def test_parent_start_and_approval_update_recover_only_while_current(
+    language: str, mode: str,
+) -> None:
+    state = state_with_round()
+    state.update(language=language, notifications={"mode": mode},
+                 delivery_type="parent_only", status="parent_delivery_pending",
+                 parent_job={"phase": "developing"}, _executor_control={"activity": "running"})
+    attempt = state["semantic_agent_attempts"][0]
+    attempt.update(work_subject="parent-only:r", status="pending", outcome=None)
+    invocation = state["agent_invocation_history"][0]
+    invocation.update(semantic_attempt=attempt.copy(), status="running", ended_at=None)
+    invocation["execution_segments"][0].pop("ended_at")
+    state["active_agent_invocation"] = invocation
+    projected = events(state)
+    assert projected[0]["title"] == ("任务已创建" if language == "zh" else "Task created")
+    started, = [event for event in projected if event["kind"] == "parent_started"]
+    assert recovery_events(state, [started]) == [started]
+
+    attempt.update(status="completed", outcome="candidate")
+    invocation.update(status="completed", ended_at="2026-01-01T00:00:09+00:00")
+    invocation["execution_segments"][0]["ended_at"] = invocation["ended_at"]
+    state.pop("active_agent_invocation")
+    job = state["parent_job"]
+    job.update(phase="accepted", approval_update={
+        "granted_at": "2026-01-01T01:00:00+00:00", "previous_head_sha": "a" * 40,
+        "previous_base_sha": "b" * 40, "source_sha": "a" * 40, "target_sha": "c" * 40,
+    })
+    update, = [event for event in events(state) if event["kind"] == "approval_update"]
+    assert ("需要重新批准" if language == "zh" else "Fresh approval is required") in update["summary"]
+    assert recovery_events(state, [started, update]) == [update]
+
+    job["phase"] = "ready_for_approval"
+    state["status"] = "parent_approval_pending"
+    recovered = recovery_events(state, [update])
+    assert recovered and all(event["kind"] == "boundary" for event in recovered)
+    job["approval_grant"] = {"granted_at": "2026-01-01T02:00:00+00:00"}
+    assert not any(event["kind"] == "approval_update" for event in events(state))
 
 
 def _formal_review_state(parent_only: bool = False) -> dict[str, Any]:
@@ -475,6 +538,43 @@ def test_formal_pass_and_approval_are_independent(parent_only: bool, language: s
     assert after[-1]["kind"] == "boundary"
     state["notifications"]["mode"] = "detailed"
     assert not any(event["kind"] == "stage_end" for event in events(state))
+
+
+@pytest.mark.parametrize("parent_only", [False, True])
+@pytest.mark.parametrize("history", ["complete", "partial", "missing_invocations", "missing_all", "unrelated"])
+def test_formal_pass_always_explains_timing_integrity(parent_only: bool, history: str) -> None:
+    state = _formal_review_state(parent_only)
+    if history == "partial":
+        state["agent_invocation_history"].append({
+            **state["agent_invocation_history"][0],
+            "execution_segments": [{"started_at": "2026-01-01T01:00:00+00:00", "ended_at": None}],
+            "started_at": "2026-01-01T01:00:00+00:00", "ended_at": None,
+        })
+    elif history in {"missing_invocations", "missing_all"}:
+        state["agent_invocation_history"] = []
+        if history == "missing_all":
+            state["semantic_agent_attempts"] = []
+    elif history == "unrelated":
+        unrelated = state_with_round()
+        for key in ("agent_invocation_history", "semantic_agent_attempts"):
+            state[key] = unrelated[key]
+    passed = next(event for event in events(state) if event["kind"] == "acceptance_passed")
+    content = card(passed)["body"]["elements"][0]["content"]
+    if history == "complete":
+        assert passed["execution_timing_complete"] is True
+        assert passed["duration_seconds"] == 9
+        assert "**本轮执行耗时**：9 秒" in content
+        assert "耗时记录不完整" not in content
+    else:
+        assert passed["execution_timing_complete"] is False
+        assert passed.get("duration_seconds") is None
+        assert "耗时记录不完整" in content
+        if history == "partial":
+            assert passed["recorded_execution_seconds"] == 9
+            assert "**已记录执行时长**：9 秒" in content
+        else:
+            assert passed.get("recorded_execution_seconds") is None
+            assert "已记录执行时长" not in content
 
 
 @pytest.mark.parametrize("invalid", ["stale", "missing_lane", "no_checks", "failed_without_findings", "unpromoted", "local_only", "missing_findings", "parent_revision", "graph_revision"])
@@ -603,8 +703,34 @@ def test_completion_omits_total_when_resume_proves_missing_execution(role: str) 
         assert "execution_seconds" not in completed["effort"][role]
     # Restoring the actual missing segment makes the full total provable.
     earlier = {**state["agent_invocation_history"][0],
+               "execution_segments": [{"started_at": "2025-12-31T23:00:00+00:00", "ended_at": "2025-12-31T23:00:05+00:00"}],
                "started_at": "2025-12-31T23:00:00+00:00",
                "ended_at": "2025-12-31T23:00:05+00:00"}
     state["agent_invocation_history"].insert(0, earlier)
     completed = next(event for event in events(state) if event["kind"] == "ticket_completed")
     assert completed["total_seconds"] == 14
+
+@pytest.mark.parametrize(("role", "outcome"), [
+    ("development", "candidate"), ("review", "acceptance_artifact"),
+    ("publication", "publication_artifact"),
+])
+@pytest.mark.parametrize("status", ["active", "ready_for_human", "execution_failed", "completed"])
+def test_notification_facts_match_complete_history_details(
+    role: str, outcome: str, status: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run import notification_events
+
+    state = state_with_round(role, outcome)
+    state.update(status=status, human_blockers=["original blocker"] if status == "ready_for_human" else [])
+    if role == "review":
+        state["semantic_agent_attempts"][0]["acceptance_artifact"] = {
+            "checks": {"spec": {"status": "fail", "findings": ["original finding"]}}}
+    projected = events(state)
+    records = notification_events.history_records
+
+    def complete(*args: Any, **kwargs: Any) -> Any:
+        kwargs["presentation_details"] = True
+        return records(*args, **kwargs)
+
+    monkeypatch.setattr(notification_events, "history_records", complete)
+    assert events(state) == projected

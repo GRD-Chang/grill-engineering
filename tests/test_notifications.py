@@ -19,8 +19,13 @@ def state(status: str = "starting", language: str = "zh") -> dict[str, Any]:
 def language(request: pytest.FixtureRequest) -> str:
     return str(request.param)
 
+
+@pytest.fixture(autouse=True)
+def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agent_run.notification_outbox.RETRY_DELAY_SECONDS", 0)
+
 def test_disabled_has_no_sender_or_outbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected(*args: Any) -> None:
+    def unexpected(*args: Any, **kwargs: Any) -> None:
         pytest.fail("disabled notification invoked transport")
     monkeypatch.setattr("agent_run.notifications.send", unexpected)
     current = state()
@@ -33,7 +38,7 @@ def test_disabled_has_no_sender_or_outbox(tmp_path: Path, monkeypatch: pytest.Mo
 
 def test_delivery_deduplicates_and_notifies_a_new_blocker_occurrence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str) -> None:
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, card: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, card: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(card)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -55,9 +60,10 @@ def test_delivery_deduplicates_and_notifies_a_new_blocker_occurrence(tmp_path: P
 
 
 def test_slow_send_does_not_block_observation_and_close_cancels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agent_run.notifications.CLOSE_TIMEOUT_SECONDS", 0.05)
     entered = threading.Event()
     stopped = threading.Event()
-    def slow(config: Any, card: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def slow(config: Any, card: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert cancel.wait(5)
         stopped.set()
@@ -71,12 +77,13 @@ def test_slow_send_does_not_block_observation_and_close_cancels(tmp_path: Path, 
     finally:
         sender.close()
     assert stopped.is_set()
-    assert any(item["outcome"] == "unknown" for item in read_notifications(tmp_path, "run-test")["pending"])
+    assert any(item["outcome"] == "unknown" and item["attempt_history"][-1]["cancelled"]
+               for item in read_notifications(tmp_path, "run-test")["records"])
 
 
 def test_failure_retry_is_bounded_and_recovery_uses_current_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str) -> None:
     calls: list[dict[str, Any]] = []
-    def failed(config: Any, card: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def failed(config: Any, card: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(card)
         return {"outcome": "failed", "reason": "offline"}
     monkeypatch.setattr("agent_run.notifications.send", failed)
@@ -85,8 +92,9 @@ def test_failure_retry_is_bounded_and_recovery_uses_current_state(tmp_path: Path
     sender = Notifications(tmp_path, current)
     sender.close()
     assert len(calls) == 6
-    assert all(item["attempts"] == 3 for item in read_notifications(tmp_path, "run-test")["pending"])
-    def sent(config: Any, card: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    assert all(item["attempts"] == 3 and item["exhausted"]
+               for item in read_notifications(tmp_path, "run-test")["records"])
+    def sent(config: Any, card: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(card)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -99,7 +107,7 @@ def test_failure_retry_is_bounded_and_recovery_uses_current_state(tmp_path: Path
 
 def test_unknown_delivery_is_not_replayed_after_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str) -> None:
     calls = []
-    def unknown(*args: Any) -> dict[str, Any]:
+    def unknown(*args: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(1)
         return {"outcome": "unknown", "reason": "lost response"}
     monkeypatch.setattr("agent_run.notifications.send", unknown)
@@ -108,12 +116,12 @@ def test_unknown_delivery_is_not_replayed_after_restart(tmp_path: Path, monkeypa
     sender = Notifications(tmp_path, state(language=language))
     sender.close()
     assert calls == [1]
-    assert read_notifications(tmp_path, "run-test")["pending"][0]["outcome"] == "unknown"
+    assert read_notifications(tmp_path, "run-test")["records"][0]["outcome"] == "unknown"
 
 
-def test_explicit_recovery_retries_a_single_failed_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_explicit_recovery_does_not_renew_exhausted_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[int] = []
-    def failed(*args: Any) -> dict[str, Any]:
+    def failed(*args: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(1)
         return {"outcome": "failed", "reason": "offline"}
     monkeypatch.setattr("agent_run.notifications.send", failed)
@@ -122,16 +130,16 @@ def test_explicit_recovery_retries_a_single_failed_delivery(tmp_path: Path, monk
     assert len(calls) == 3
     sender = Notifications(tmp_path, state())
     sender.close()
-    assert len(calls) == 6
+    assert len(calls) == 3
 
 
 def test_notification_receipts_are_bounded_without_replaying_visible_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
-    def sent(config: Any, card: Any, identity: str, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, card: Any, identity: str, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(identity)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
-    monkeypatch.setattr("agent_run.notifications.MAX_RECORDS", 3)
+    monkeypatch.setattr("agent_run.notification_outbox.MAX_RECORDS", 3)
     current = state()
     for _ in range(5):
         sender = Notifications(tmp_path, current)
@@ -145,7 +153,7 @@ def test_notification_receipts_are_bounded_without_replaying_visible_history(tmp
 def test_overlapping_control_sender_does_not_duplicate_inflight_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     entered, release = threading.Event(), threading.Event()
     calls: list[str] = []
-    def sent(config: Any, card: Any, identity: str, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, card: Any, identity: str, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(identity)
         entered.set()
         assert release.wait(4)
@@ -167,7 +175,7 @@ def test_overlapping_control_sender_does_not_duplicate_inflight_delivery(tmp_pat
 
 def test_repeated_unchanged_observations_do_not_retry_failed_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str) -> None:
     calls: list[int] = []
-    def failed(*args: Any) -> dict[str, Any]:
+    def failed(*args: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(1)
         return {"outcome": "failed", "reason": "offline"}
     monkeypatch.setattr("agent_run.notifications.send", failed)
@@ -191,16 +199,18 @@ def test_recovered_ticket_todo_sends_the_ticket_card(
     current["active_ticket_job"] = {
         "ticket_number": 3, "phase": "blocked", "human_blockers": ["测试账号不可用"],
     }
-    monkeypatch.setattr("agent_run.notifications.send", lambda *args: {
-        "outcome": "failed", "reason": "offline",
-    })
+    def interrupted(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
+        cancel.set()
+        return {"outcome": "failed", "reason": "cancelled before sending"}
+
+    monkeypatch.setattr("agent_run.notifications.send", interrupted)
     sender = Notifications(tmp_path, current)
     sender.close()
     assert read_notifications(tmp_path, "run-test")["pending"]
 
     delivered: list[dict[str, Any]] = []
 
-    def sent(config: Any, card: dict[str, Any], identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, card: dict[str, Any], identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         delivered.append(card)
         return {"outcome": "success", "reason": None}
 
@@ -224,7 +234,7 @@ def test_resume_result_replaces_fault_and_survives_observer_restart(
     outcome: str, status: str, title: str,
 ) -> None:
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -253,7 +263,7 @@ def test_resume_request_and_unproven_success_never_send_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -267,29 +277,32 @@ def test_resume_request_and_unproven_success_never_send_success(
         sender.observe(current)
     sender.close()
     assert len(calls) == 1
-    assert calls[0]["header"]["title"]["content"] == "任务已开始"
+    assert calls[0]["header"]["title"]["content"] == "任务已创建"
 
 
-def test_first_ticket_start_is_not_replayed_after_history_rolls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_first_start_is_not_replayed_after_history_rolls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_only: bool,
 ) -> None:
-    from test_notification_events import state_with_round
+    from support.notification import state_with_round
 
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
     current = state_with_round()
+    current["delivery_type"] = "parent_only" if parent_only else "ticket_run"
     current["notifications"] = {**state()["notifications"], "mode": "concise"}
     current["ticket_graph"] = {"tickets": {"3": {"title": "Feature"}}}
     attempt = current["semantic_agent_attempts"][0]
-    attempt["work_subject"] = "ticket:3"
+    attempt["work_subject"] = "parent-only:r" if parent_only else "ticket:3"
     invocation = current["agent_invocation_history"][0]
     invocation["semantic_attempt"] = attempt.copy()
     sender = Notifications(tmp_path, current)
     sender.close()
     first = len(calls)
+    assert first == 2  # Created and actual development.
     current.update(semantic_agent_attempts=[], agent_invocation_history=[])
     sender = Notifications(tmp_path, current)
     sender.close()
@@ -304,10 +317,10 @@ def test_first_ticket_start_is_not_replayed_after_history_rolls(
 def test_resume_fault_does_not_reappear_as_detailed_round_result_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from test_notification_events import state_with_round
+    from support.notification import state_with_round
 
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -333,7 +346,7 @@ def test_resume_result_identity_survives_absent_transient_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
-    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any, **kwargs: Any) -> dict[str, Any]:
         calls.append(rendered)
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr("agent_run.notifications.send", sent)
@@ -349,3 +362,54 @@ def test_resume_result_identity_survives_absent_transient_projection(
     sender = Notifications(tmp_path, current)
     sender.close()
     assert len(calls) == 2  # Run start and the same actual Resume result once.
+
+
+@pytest.mark.parametrize("outcome,status,title", [
+    ("human_action", "ready_for_human", "人工恢复后需要你处理"),
+    ("failed", "execution_failed", "人工恢复失败"),
+])
+@pytest.mark.parametrize("delivery_outcome", ["success", "unknown"])
+def test_same_resume_result_is_not_resent_when_boundary_reenters_during_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    outcome: str, status: str, title: str, delivery_outcome: str,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def sent(_config: Any, rendered: Any, _identity: Any, _cancel: Any, **_kwargs: Any) -> dict[str, Any]:
+        observed_title = rendered["header"]["title"]["content"]
+        calls.append(observed_title)
+        if observed_title == title:
+            entered.set()
+            assert release.wait(5), "Resume transport barrier was not released"
+            if calls.count(title) == 1:
+                return {"outcome": delivery_outcome, "reason": "response lost" if delivery_outcome == "unknown" else None}
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state(status)
+    current["_manual_resume_result"] = {
+        "id": "same-action", "outcome": outcome, "evidence": "controller_boundary",
+    }
+    sender = Notifications(tmp_path, current)
+    try:
+        assert entered.wait(3), calls
+        # 发送中的同一恢复结果可以跨越暂时没有门禁的观察；重新出现的
+        # current 槽位不能为同一个 Resume outcome 创建新的发送预算。
+        sender.observe(state("running"))
+        sender.observe(current)
+    finally:
+        release.set()
+        sender.close()
+    assert calls.count(title) == 1, calls
+    document = read_notifications(tmp_path, "run-test")
+    assert document["resume_results"] == [f"same-action:{outcome}"]
+    assert document["pending"] == []
+    delivered = [record for record in document["records"] if record["kind"] == "boundary"]
+    assert len(delivered) == 1 and delivered[0]["outcome"] == delivery_outcome
+    assert delivered[0]["attempts"] == 1
+    assert delivered[0]["attempt_history"][0]["outcome"] == delivery_outcome
+    current["_manual_resume_result"]["id"] = "next-action"
+    restarted = Notifications(tmp_path, current)
+    restarted.close()
+    assert calls.count(title) == 2, "A new explicit Resume owns a new result"

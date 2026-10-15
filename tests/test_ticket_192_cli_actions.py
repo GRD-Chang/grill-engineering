@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from support.cli_actions import (
+    _parent_agents,
+    _revision_agents,
+)
+
 import json
 import subprocess
 from pathlib import Path
@@ -13,10 +18,18 @@ from agent_run.cli import (
     build_parser,
 )
 from agent_run.state import StateStore
-from cli_fixtures import run_agents
-from conftest import seed_run, write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance, publication, ticket
+from support.cli_fixtures import run_agents
+from support.seeding import seed_run, write_fixture
+from support.cli import (
+    load_only_run_state,
+    read_run_state_bytes,
+    run_cli,
+    snapshot_run_states,
+    stdout_json,
+)
+from support.cli_payloads import publication, ticket
+
+from support.state import include_in_state_snapshot, run_refs
 
 
 def test_public_parser_exposes_only_run_as_the_ordinary_entrypoint() -> None:
@@ -56,53 +69,6 @@ def test_run_scoped_configure_accepts_parent_or_exact_run_selector() -> None:
 
     assert parsed.run_id == "1"
     assert parsed.as_json is True
-
-
-def _parent_agents(path: Path) -> Path:
-    path.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer",
-                        "summary": "Implemented the Parent delivery.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [passing_acceptance("parent-reviewer", "passed")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
-def _revision_agents(path: Path) -> Path:
-    template_path = path.with_name("revision-template.json")
-    template = run_agents(template_path)
-    template_data = json.loads(template.read_text(encoding="utf-8"))
-    label = path.stem
-    data = {
-        "developments": [
-            {
-                "expected_thread_id": None,
-                "thread_id": f"{label}-developer",
-                "summary": "Applied the requested Run revision.",
-                "write_files": {"run-revision.txt": f"{label}\n"},
-            }
-        ],
-        "publications": [publication()],
-        "reviews": [],
-        "run_reviews": [
-            passing_acceptance(f"{label}-reviewer", "The revision passed.")
-        ],
-        "run_publications": [dict(template_data["run_publications"][0])],
-    }
-    path.write_text(json.dumps(data), encoding="utf-8")
-    template.unlink()
-    return path
 
 
 def _human_cli(
@@ -278,7 +244,13 @@ def test_revise_parent_intent_creates_a_successor_at_the_next_human_boundary(
     assert current["status"] == "run_approval_pending"
     assert current["run_acceptance"]["repair_generation"] == 2
     assert current["run_acceptance"]["modification_attempts"] == attempts_before == 1
-    assert len(current["agent_invocation_history"]) == invocation_count_before + 4
+    successor_invocations = current["agent_invocation_history"][invocation_count_before:]
+    assert [(item["work_subject"], item["role"]) for item in successor_invocations] == [
+        (f"run-repair:{run_id}", "development"),
+        (f"run-repair:{run_id}", "fresh_acceptance"),
+        (f"run-publication:{run_id}", "final_publication"),
+    ]
+    assert all(item["status"] == "completed" for item in successor_invocations)
     control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     control = json.loads(control_path.read_text(encoding="utf-8"))
     assert control["action"]["action_id"] == repeated_output["action_audit"]["action_id"]
@@ -468,17 +440,16 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = str(stdout_json(seed_run(git_repo, fixture))["run_id"])
     state_root = managed_state(git_repo)
-    state_path = state_root / "runs" / f"{run_id}.json"
     profile_path = state_root / "profiles" / f"{run_id}.json"
     profile_before = json.loads(profile_path.read_bytes())
-    state_before = state_path.read_bytes()
+    state_before = read_run_state_bytes(git_repo, run_id)
     task_control = state_root / "task-control"
     control_before = {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
     }
     tree_before = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
-        for path in state_root.rglob("*")
+        for path in state_root.rglob("*") if include_in_state_snapshot(path)
     }
 
     configured = _human_cli(
@@ -488,13 +459,13 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     assert configured.returncode == 0, configured.stdout
     assert "配置状态: 已保存" in configured.stdout
     assert run_id not in configured.stdout
-    assert state_path.read_bytes() == state_before
+    assert read_run_state_bytes(git_repo, run_id) == state_before
     assert {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
     } == control_before
     tree_after = {
         path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
-        for path in state_root.rglob("*")
+        for path in state_root.rglob("*") if include_in_state_snapshot(path)
     }
     profile_relative = profile_path.relative_to(state_root)
     assert tree_after.keys() == tree_before.keys()
@@ -599,7 +570,7 @@ def test_parent_mutation_selector_never_guesses_a_missing_run(
 
     assert result.returncode == 2
     assert stdout_json(result)["diagnostics"][0]["code"] == "run_selector_not_found"
-    assert not (managed_state(git_repo) / "runs").exists()
+    assert not run_refs(managed_state(git_repo))
 
 
 def test_parent_mutation_selector_reports_missing_repository_and_ambiguity(
@@ -646,4 +617,4 @@ def test_parent_mutation_selector_reports_missing_repository_and_ambiguity(
     assert str(git_repo) not in human_ambiguous.stdout
     assert "state_dir" not in human_ambiguous.stdout
     assert "repository_root" not in human_ambiguous.stdout
-    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 2
+    assert len(snapshot_run_states(git_repo)) == 2

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -9,9 +10,26 @@ import pytest
 
 from agent_run.cli import main
 from agent_run.run_locator import RunLocatorIndex
-from conftest import seed_run, write_fixture
-from test_cli import run_cli, stdout_json
+from agent_run.run_selection import read_state_directory
+from agent_run.state import StateStore
+from agent_run.state_errors import IncompatibleRunStateError
+from support.seeding import seed_run, write_fixture
+from support.cli import run_cli, stdout_json
 from support.workspace import managed_repo, managed_state
+
+from support.state import include_in_state_snapshot, read_run, snapshot_run, write_run_fixture
+
+
+def test_discovery_reports_incompatible_sqlite_protocol_without_writes(tmp_path: Path) -> None:
+    states = StateStore(tmp_path)
+    states.save_run("run-1", {"version": 1})
+    database = tmp_path / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE schema_meta SET value = 'sqlite-run-objects-v1'")
+    before = database.read_bytes()
+    with pytest.raises(IncompatibleRunStateError, match="protocol"):
+        read_state_directory(tmp_path, None)
+    assert database.read_bytes() == before
 
 
 def test_empty_checkout_without_origin_does_not_list_another_repository(
@@ -38,12 +56,15 @@ def test_readable_legacy_state_with_unknown_parent_requires_disambiguation(
     fixture = write_fixture(git_repo / "github.json", issues={})
     target = stdout_json(seed_run(git_repo, fixture))["run_id"]
     state_dir = managed_state(git_repo)
-    target_state = json.loads((state_dir / "runs" / f"{target}.json").read_text())
+    target_state = read_run((state_dir, target))
     legacy = {
         "run_id": "legacy-unknown-parent", "repository": "example/project",
         "schema_version": 1, "checkout_identity": target_state["checkout_identity"],
     }
+    (state_dir / "runs").mkdir()
     (state_dir / "runs" / "legacy-unknown-parent.json").write_text(json.dumps(legacy))
+    with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
+        StateStore(state_dir).load_run("legacy-unknown-parent")
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(git_repo)
     directory = ["--state-dir", str(state_dir)] if explicit_directory else []
@@ -76,8 +97,8 @@ def test_repository_parent_queries_ignore_a_deleted_unrelated_checkout(
     shutil.rmtree(other)
     locator = tmp_path / "locator" / "agent-run" / "run-locator.json"
     before = locator.read_bytes()
-    state = managed_state(git_repo, extra_env=locator_env) / "runs" / f"{target}.json"
-    state_before = state.read_bytes()
+    state = (managed_state(git_repo, extra_env=locator_env), target)
+    state_before = snapshot_run(state)
 
     for command, cwd, selector in (
         ("status", git_repo, ["--parent", "1"]),
@@ -89,7 +110,7 @@ def test_repository_parent_queries_ignore_a_deleted_unrelated_checkout(
         if command != "runs":
             assert stdout_json(result)["run_id"] == target
     assert locator.read_bytes() == before
-    assert state.read_bytes() == state_before
+    assert snapshot_run(state) == state_before
 
 
 def test_parent_query_excludes_a_known_other_parent_with_missing_state(
@@ -118,32 +139,32 @@ def test_selector_rejects_conflicting_locator_and_state_identity(
     locator["entries"][0]["parent_number"] = 2
     locator_path.write_text(json.dumps(locator))
     before = locator_path.read_bytes()
-    state_path = managed_state(git_repo) / "runs" / f"{target}.json"
+    state_ref = (managed_state(git_repo), target)
     if malformed_state:
-        state = json.loads(state_path.read_text())
+        state = read_run(state_ref)
         state.pop("timeline")
-        state_path.write_text(json.dumps(state))
-    state_before = state_path.read_bytes()
+        write_run_fixture(state_ref, state)
+    state_before = snapshot_run(state_ref)
     monkeypatch.chdir(git_repo)
     assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
     output = json.loads(capsys.readouterr().out)
     assert output["diagnostics"][0]["code"] == "run_locator_stale"
     assert "不一致" in output["diagnostics"][0]["message"]
     assert locator_path.read_bytes() == before
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
 
 
 @pytest.mark.parametrize("explicit_directory", [False, True])
-def test_other_parent_legacy_state_in_the_same_directory_does_not_block_queries(
+def test_other_parent_legacy_json_is_rejected_without_guessing_its_identity(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     explicit_directory: bool,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     target = stdout_json(seed_run(git_repo, fixture))["run_id"]
     state_dir = managed_state(git_repo)
+    (state_dir / "runs").mkdir()
     legacy = state_dir / "runs" / "legacy-run.json"
-    # Historical identity is sufficient for exclusion; it is not a current
-    # lifecycle payload and has no checkout identity or registration to repair.
+    # Unsupported JSON is never read to infer its Parent identity.
     legacy.write_text(json.dumps({
         "run_id": "legacy-run", "repository": "example/project",
         "parent": {"number": 2}, "schema_version": 1,
@@ -151,13 +172,16 @@ def test_other_parent_legacy_state_in_the_same_directory_does_not_block_queries(
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(git_repo)
     directory = ["--state-dir", str(state_dir)] if explicit_directory else []
-    for command in ("status", "history", "runs"):
-        assert main([command, "--repo", "example/project", "--parent", "1", *directory, "--json"]) == 0
-        output = json.loads(capsys.readouterr().out)
-        if command == "runs":
-            assert [candidate["run_id"] for candidate in output["runs"]] == [target]
-        else:
-            assert output["run_id"] == target
+    with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
+        StateStore(state_dir).load_run("legacy-run")
+    for command in ("status", "history"):
+        assert main([command, "--repo", "example/project", "--parent", "1", *directory, "--json"]) == 2
+        assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_stale"
+        assert main([command, target, *directory, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["run_id"] == target
+    assert main(["runs", "--repo", "example/project", "--parent", "1", *directory, "--json"]) == 0
+    candidates = json.loads(capsys.readouterr().out)["runs"]
+    assert any(item["run_id"] == "legacy-run" and "error" in item for item in candidates)
     assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
 
 
@@ -177,10 +201,16 @@ def test_unknown_or_potentially_matching_records_fail_closed_but_exact_id_works(
     if unavailable == "old-deleted-checkout":
         entry["repository_root"] = str(git_repo / "deleted-checkout")
     if unavailable == "matching-corrupt":
-        (managed_state(git_repo) / "runs" / "unavailable-run.json").write_text("{")
+        corrupt_root = git_repo / "corrupt-state"
+        corrupt_root.mkdir()
+        (corrupt_root / "state.sqlite3").write_bytes(b"broken SQLite database")
+        entry["state_dir"] = str(corrupt_root)
     locator["entries"].append(entry)
     locator_path.write_text(json.dumps(locator))
-    before = _snapshot(managed_state(git_repo), locator_path.parent)
+    snapshot_roots = [managed_state(git_repo), locator_path.parent]
+    if unavailable == "matching-corrupt":
+        snapshot_roots.append(corrupt_root)
+    before = _snapshot(*snapshot_roots)
     monkeypatch.chdir(git_repo)
     for command in ("status", "history"):
         assert main([command, "--repo", "example/project", "--parent", "1", "--json"]) == 2
@@ -192,7 +222,7 @@ def test_unknown_or_potentially_matching_records_fail_closed_but_exact_id_works(
     assert main(["runs", "--repo", "example/project", "--parent", "1", "--json"]) == 0
     candidates = json.loads(capsys.readouterr().out)["runs"]
     assert any(item["run_id"] == "unavailable-run" and "error" in item for item in candidates)
-    assert _snapshot(managed_state(git_repo), locator_path.parent) == before
+    assert _snapshot(*snapshot_roots) == before
 
 
 @pytest.mark.parametrize("contradiction", ["checkout-repository", "checkout-identity", "run-id", "invalid-parent", "invalid-repository"])
@@ -218,7 +248,10 @@ def test_unregistered_legacy_identity_cannot_hide_conflicts_as_an_unrelated_pare
     else:
         legacy["repository"] = "invalid"
     state_dir = managed_state(git_repo)
+    (state_dir / "runs").mkdir()
     (state_dir / "runs" / "legacy-run.json").write_text(json.dumps(legacy))
+    with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
+        StateStore(state_dir).load_run("legacy-run")
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(git_repo)
     assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
@@ -229,7 +262,7 @@ def test_unregistered_legacy_identity_cannot_hide_conflicts_as_an_unrelated_pare
 def _snapshot(*roots: Path) -> dict[Path, tuple[bytes, int]]:
     return {
         path: (path.read_bytes(), path.stat().st_mtime_ns)
-        for root in roots for path in root.rglob("*") if path.is_file()
+        for root in roots for path in root.rglob("*") if path.is_file() and include_in_state_snapshot(path)
     }
 
 
@@ -289,3 +322,54 @@ def test_explicit_state_directory_does_not_disambiguate_multiple_matching_runs(
         assert diagnostic["code"] == "run_selector_ambiguous"
         assert {item["run_id"] for item in diagnostic["candidates"]} == {first, second}
     assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
+
+
+def test_exact_mutations_reject_a_state_record_for_another_run_without_writes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    target = stdout_json(seed_run(git_repo, fixture))["run_id"]
+    state_dir = managed_state(git_repo)
+    # The payload is valid, but its persisted record key selects a different Run.
+    alias = "wrong-run"
+    write_run_fixture((state_dir, alias), read_run((state_dir, target)))
+    before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
+    monkeypatch.chdir(git_repo)
+
+    for command in ("resume", "stop", "abandon"):
+        assert main([
+            command, alias, "--github-fixture", str(fixture), "--json",
+        ]) == 2
+        diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
+        assert diagnostic["code"] == "run_selector_not_found"
+        assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
+
+
+def test_snapshot_keeps_durable_sqlite_files_and_ignores_coordination_files(tmp_path: Path) -> None:
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    database = root / "state.sqlite3"
+    wal = root / "state.sqlite3-wal"
+    shm = root / "state.sqlite3-shm"
+    other = root / "other.sqlite3-wal"
+    other_shm = root / "other.sqlite3-shm"
+    directory = root / "nested" / "state.sqlite3-shm"
+    directory.mkdir(parents=True)
+    assert include_in_state_snapshot(directory)
+    other_shm.write_bytes(b"unrelated file")
+    database.write_bytes(b"database")
+    wal.write_bytes(b"")
+    shm.write_bytes(b"coordination index")
+    other.write_bytes(b"")
+
+    before = _snapshot(root)
+    assert set(before) == {database, other, other_shm}
+    assert before[database] == (b"database", database.stat().st_mtime_ns)
+    shm.write_bytes(b"updated coordination index")
+    assert _snapshot(root) == before
+
+    wal.write_bytes(b"committed data")
+    after = _snapshot(root)
+    assert set(after) == {database, wal, other, other_shm}
+    assert after[wal] == (b"committed data", wal.stat().st_mtime_ns)
+    assert after[database] == before[database]

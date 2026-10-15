@@ -12,8 +12,20 @@ from agent_run.required_checks_observation import (
     clear_required_checks_observation,
     read_required_checks_observation,
     require_required_checks_observation,
+    required_checks_observation_is_current,
     validate_legacy_required_checks_projection,
 )
+
+
+@pytest.mark.parametrize("pr_number,head_sha", [(17, "head"), (18, "head"), (17, "other")])
+def test_running_gate_requires_the_observed_pr_and_head(pr_number: int, head_sha: str) -> None:
+    observation = {"pr_number": 17, "head_sha": "head", "result": "none", "checks": []}
+    assert required_checks_observation_is_current(
+        observation, pr_number=pr_number, head_sha=head_sha,
+    ) is (pr_number == 17 and head_sha == "head")
+    assert not required_checks_observation_is_current(
+        observation, pr_number=17, head_sha="head", allowed_results={"pass"},
+    )
 
 
 @pytest.mark.parametrize("result", ["none", "pass", "pending", "unknown", "fail"])

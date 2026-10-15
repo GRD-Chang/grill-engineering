@@ -2,6 +2,9 @@ from __future__ import annotations
 
 """Bounded supervision of eventually-consistent GitHub lifecycle state."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -28,6 +31,7 @@ _PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
         "github_invalid_response",
         "change_pr_identity_mismatch",
         "change_pr_head_drift",
+        "parent_close_external_conflict",
     }
 )
 
@@ -43,7 +47,16 @@ def waiting_boundary(state: dict[str, Any]) -> WaitingBoundary | None:
     """Return the current externally-converging boundary, if any."""
 
     status = state.get("status")
-    if status == "waiting_checks":
+    window = state.get("supervision_window")
+    # A transient read is still an observation of the same checks. Alternating
+    # pending/error results must not buy a fresh window on every poll.
+    checks_read_failed = (
+        status == "waiting_external"
+        and isinstance(window, dict)
+        and window.get("kind") == "required_checks"
+        and _phase(state) == "waiting_checks"
+    )
+    if status == "waiting_checks" or checks_read_failed:
         return WaitingBoundary(
             kind="required_checks",
             budget_seconds=CHECKS_BUDGET_SECONDS,
@@ -58,19 +71,36 @@ def waiting_boundary(state: dict[str, Any]) -> WaitingBoundary | None:
     return None
 
 
+_current_supervisor: ContextVar[ExternalSupervisor | None] = ContextVar("external_supervisor", default=None)
+
+
+@contextmanager
+def supervision_scope(supervisor: ExternalSupervisor) -> Iterator[None]:
+    """Share the Driver's clock with nested delivery and its bounded workers."""
+    token = _current_supervisor.set(supervisor)
+    try:
+        yield
+    finally:
+        _current_supervisor.reset(token)
+
+
 class ExternalSupervisor:
     """Own a single foreground waiting window without creating a daemon."""
 
     def __init__(
         self,
         *,
-        now: Callable[[], float] = monotonic,
-        sleeper: Callable[[float], None] = sleep,
-        poll_interval_seconds: int = POLL_INTERVAL_SECONDS,
+        now: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        poll_interval_seconds: int | None = None,
     ) -> None:
-        self.now = now
-        self.sleeper = sleeper
-        self.poll_interval_seconds = poll_interval_seconds
+        inherited = _current_supervisor.get()
+        self.now: Callable[[], float] = now or (inherited.now if inherited else monotonic)
+        self.sleeper: Callable[[float], None] = sleeper or (inherited.sleeper if inherited else sleep)
+        self.poll_interval_seconds: int = (
+            poll_interval_seconds if poll_interval_seconds is not None
+            else inherited.poll_interval_seconds if inherited else POLL_INTERVAL_SECONDS
+        )
 
     def before_retry(
         self,
@@ -86,9 +116,12 @@ class ExternalSupervisor:
         window = self.observe(state)
         if window is None:  # pragma: no cover - guarded by waiting_boundary above
             return True
+        next_retry_at = window.get("next_retry_at")
         prior_retries = window.get("retry_count")
-        retries = (prior_retries if isinstance(prior_retries, int) else 0) + 1
-        window["retry_count"] = retries
+        retries = prior_retries if isinstance(prior_retries, int) else 0
+        if not isinstance(next_retry_at, (int, float)):
+            retries += 1
+            window["retry_count"] = retries
         observation = _last_external_error(state)
         window["latest_observation"] = observation
         availability = state.get("credential_availability")
@@ -99,19 +132,63 @@ class ExternalSupervisor:
             raise ValueError("supervision window is missing its deadline")
         remaining = deadline - self.now()
         if remaining > 0:
-            delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), remaining)
+            # A Ticket observer may already have planned the next retry.
+            # Hand that same deadline to the Driver without charging twice.
+            planned_delay = (
+                max(0.0, next_retry_at - self.now())
+                if isinstance(next_retry_at, (int, float))
+                else _retry_delay_seconds(retries, self.poll_interval_seconds)
+            )
+            delay = min(planned_delay, remaining)
             # Persist the intended delay before sleeping, including crash recovery.
             window["last_retry_delay_seconds"] = delay
             if persist_before_sleep is not None:
                 persist_before_sleep()
             remaining = deadline - self.now()
-            if remaining > 0:
+            if isinstance(next_retry_at, (int, float)):
+                delay = max(0.0, next_retry_at - self.now())
+            if remaining > 0 and delay > 0:
                 self.sleeper(min(delay, remaining))
             if self.now() < deadline:
                 return True
 
         self._expire(state, boundary, window)
         return False
+
+    def retry_due(self, state: dict[str, Any]) -> bool:
+        """Plan a bounded retry without sleeping in a multi-Ticket observer.
+
+        The deadline and next observation are durable, so selection changes or
+        rereading the Run cannot restart a Ticket's waiting budget.
+        """
+        boundary = waiting_boundary(state)
+        if boundary is None:
+            return True
+        window = self.observe(state)
+        assert window is not None
+        now = self.now()
+        deadline = window["deadline"]
+        if not isinstance(deadline, (int, float)):
+            raise ValueError("supervision window is missing its deadline")
+        if now >= deadline:
+            self._expire(state, boundary, window)
+            return False
+        due = window.get("next_retry_at")
+        if isinstance(due, (int, float)) and now < due:
+            return False
+        previous = window.get("retry_count")
+        retries = (previous if isinstance(previous, int) else 0) + 1
+        availability = state.get("credential_availability")
+        if isinstance(availability, dict) and boundary.kind == "github_convergence":
+            availability["retry_count"] = retries
+        delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), deadline - now)
+        window.update({
+            "retry_count": retries,
+            "last_retry_delay_seconds": delay,
+            "next_retry_at": now + delay,
+            "latest_observation": _last_external_error(state),
+        })
+        return True
 
     def _expire(
         self, state: dict[str, Any], boundary: WaitingBoundary, window: dict[str, object]
@@ -235,8 +312,9 @@ def is_github_refresh_wait(state: dict[str, Any]) -> bool:
 def wait_for_github_convergence(
     state: dict[str, Any], *, code: str, message: str, waiting_for: str
 ) -> None:
-    """Persist a recoverable 10-minute GitHub convergence boundary."""
+    """Persist a bounded read wait, retaining any active checks deadline."""
 
+    state.pop("github_refresh_resume_status", None)
     state.update(
         {
             "status": "waiting_external",
@@ -265,7 +343,7 @@ def ensure_supervision_window(
     boundary = waiting_boundary(state)
     if boundary is None:
         return None
-    return _supervision_window(state, boundary, now=(now or monotonic)())
+    return _supervision_window(state, boundary, now=(now or ExternalSupervisor().now)())
 
 
 def supervision_window_matches(
@@ -331,10 +409,19 @@ def wait_for_github_refresh(
 ) -> None:
     """Persist a failed Controller refresh without suppressing later retries."""
 
+    # Keep the actual global pause across observation-only GitHub failures.
+    # Local Ticket gates must not become the target of the same Run Resume.
+    resume_status = None
+    if state.get("status") == "execution_failed":
+        resume_status = "execution_failed"
+    elif state.get("status") == "waiting_external" and is_github_refresh_wait(state):
+        resume_status = state.get("github_refresh_resume_status")
     wait_for_github_convergence(
         state, code=code, message=message, waiting_for=waiting_for
     )
     state["github_refresh_pending"] = True
+    if resume_status == "execution_failed":
+        state["github_refresh_resume_status"] = resume_status
     ensure_supervision_window(state)
 
 
@@ -349,8 +436,8 @@ def _waiting_object(state: dict[str, Any]) -> str:
         return f"Ticket PR #{active['pr_number']} 的 GitHub 对账"
     acceptance = state.get("run_acceptance")
     repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-    if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
-        return f"Run Repair PR #{repair['pr_number']} 的 GitHub 对账"
+    if isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+        return "Parent 修复 Run Branch 写入对账"
     publication = state.get("run_publication")
     if isinstance(publication, dict) and isinstance(publication.get("pr_number"), int):
         return f"Run PR #{publication['pr_number']} 的 GitHub 对账"
@@ -512,6 +599,12 @@ def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def _run_recovery_action(state: dict[str, Any]) -> str | None:
     run_id = state.get("run_id")
+    job = state.get("active_ticket_job")
+    if (
+        isinstance(job, dict) and job.get("blocked_reason") == "ticket_supervision_timeout"
+        and type(job.get("ticket_number")) is int and isinstance(run_id, str)
+    ):
+        return f"agent-run resume {run_id} --ticket {job['ticket_number']}"
     if (state.get("status") == "supervision_timeout" or has_final_approval(state)) and isinstance(run_id, str):
         return f"agent-run resume {run_id}"
     parent = state.get("parent")

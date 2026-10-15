@@ -3,13 +3,15 @@ from __future__ import annotations
 """Ticket-specific contract for the shared Change Delivery Engine."""
 
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
+from agent_run.review_context import candidate_review_identity
+from agent_run.review_evidence import accepted_review_matches
 from agent_run.commit_messages import commit_messages_match
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
-    MAX_MODIFICATION_ATTEMPTS,
     ChangeDeliveryAdapter,
     ChangeDeliveryEngine,
     ChangeDeliveryPublisher,
@@ -30,9 +32,11 @@ from agent_run.external_supervision import (
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
+from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
 from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
-from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.delivery_evidence import clear_stale_delivery_evidence
+from agent_run.ticket_integration import delivery_base_sha, delivery_candidate_sha
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
@@ -124,8 +128,9 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "parent": _parent(state),
             "ticket": _ticket(state, job),
             "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
+            "base_sha": delivery_base_sha(job),
+            "candidate_sha": delivery_candidate_sha(job),
+            "ticket_integration": job.get("ticket_integration"),
             "checkout": str(checkout),
             "thread_id": select_publication_thread(
                 job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
@@ -134,6 +139,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         if job.get("publication_authority") == "fallback":
             request["fallback_publication_context"] = fallback_publication_context(
                 _mapping(job, "fallback_publication_receipt")
+            )
+        elif job.get("publication_authority") == "ci_repair":
+            from agent_run.change_delivery_fallback import ci_repair_publication_context
+
+            request["ci_repair_publication_context"] = ci_repair_publication_context(
+                _mapping(job, "ci_repair_publication_receipt")
             )
         else:
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
@@ -149,12 +160,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         if isinstance(existing_pr, int):
             request["existing_pr"] = self.github.publication_context(existing_pr)
         if (
-            job.get("publication_authority") != "fallback"
+            job.get("publication_authority") not in {"fallback", "ci_repair"}
             and job.get("repair_source") == "acceptance"
         ):
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         elif (
-            job.get("publication_authority") != "fallback"
+            job.get("publication_authority") not in {"fallback", "ci_repair"}
             and job.get("repair_source") == "required_checks"
         ):
             request["ci_evidence"] = _mapping(job, "ci_evidence")
@@ -163,6 +174,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def review_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
+        review_base = str(job["base_sha"])
         request = {
             "acceptance_scope": "ticket",
             "parent_issue_url": _parent(state)["url"],
@@ -171,15 +183,9 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "repository": str(state["repository"]),
             "parent": _parent(state),
             "ticket": _ticket(state, job),
-            "base_sha": job["base_sha"],
+            "base_sha": review_base,
             "candidate_sha": job["candidate_sha"],
-            "current_review_identity": {
-                "reviewed_base_sha": str(job["base_sha"]),
-                "reviewed_candidate_sha": str(job["candidate_sha"]),
-                "reviewed_candidate_tree": self.git.resolve(
-                    f"{job['candidate_sha']}^{{tree}}"
-                ),
-            },
+            "current_review_identity": candidate_review_identity(job, self.git),
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
             "thread_id": (
@@ -212,15 +218,14 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "acceptance_scope": "change_job",
-            "reviewed_base_sha": str(job["base_sha"]),
-            "reviewed_candidate_sha": str(job["candidate_sha"]),
-            "reviewed_candidate_tree": self.git.resolve(
-                f"{job['candidate_sha']}^{{tree}}"
-            ),
-            "effective_revision": str(job["effective_revision"]),
+            **(review_context["facts"]["current_review_identity"] if review_context is not None
+               else candidate_review_identity(job, self.git)),
+            "effective_revision": str(review_context["binding"]["effective_revision"]
+                                      if review_context is not None else job["effective_revision"]),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }
@@ -228,12 +233,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
-        return (
-            acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
-            and acceptance.get("reviewed_candidate_tree")
-            == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
-            and acceptance.get("effective_revision") == job.get("effective_revision")
+        return accepted_review_matches(
+            acceptance,
+            {"acceptance_scope": "change_job",
+             **candidate_review_identity(job, self.git),
+             "effective_revision": job.get("effective_revision")},
+            job.get("acceptance_artifact"),
         )
 
     def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
@@ -298,13 +303,21 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
         )
 
     def create_publication_commit(
-        self, checkout: Path, job: dict[str, Any], message: str
+        self, checkout: Path, job: dict[str, Any], message: str,
+        *, save_intent: Callable[[], None],
     ) -> str:
         return self.owner.git.create_publication_commit(
             checkout,
-            candidate_sha=str(job["candidate_sha"]),
-            base_sha=str(job["base_sha"]),
+            candidate_sha=delivery_candidate_sha(job),
+            base_sha=delivery_base_sha(job),
+            published_sha=(
+                job["ticket_integration"]["source_sha"]
+                if isinstance(job.get("ticket_integration"), dict)
+                else job.get("published_sha")
+            ),
             message=message,
+            publication_intent=job.setdefault("publication_commit_intent", {}),
+            save_intent=save_intent,
         )
 
     def prepare_validation(
@@ -319,15 +332,18 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
         state: dict[str, Any],
         job: dict[str, Any],
         publication: dict[str, Any],
+        *, save_intent: Callable[[], None],
     ) -> int:
         return self.owner.github.ensure_ticket_pr(
             branch=str(job["ticket_branch"]),
             base_branch=str(state["run_branch"]),
+            write_intent=job["ticket_write_intent"],
+            save_intent=save_intent,
             title=str(publication["pr_title"]),
             body=self.owner._render_ticket_pr_body(state, job, publication),
             primary_ticket=int(job["ticket_number"]),
             expected_head_sha=str(job["publication_sha"]),
-            expected_base_sha=str(job["base_sha"]),
+            expected_base_sha=delivery_base_sha(job),
         )
 
     def live_pull_request(
@@ -377,11 +393,13 @@ class TicketDeliveryLoop:
         states: StateStore,
         github: GitHubPublisher,
         agents: AgentBackend,
+        development_only: bool = False,
     ) -> None:
         self.git = git
         self.states = states
         self.github = github
         self.agents = agents
+        self.development_only = development_only
         self.adapter = TicketDeliveryAdapter(git, github)
         self.publisher = TicketDeliveryPublisher(self)
 
@@ -393,6 +411,12 @@ class TicketDeliveryLoop:
     def _engine(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> ChangeDeliveryEngine:
+        from agent_run.ticket_state import TicketState
+
+        if not isinstance(self.states, TicketState):
+            scoped = TicketState(self.states, str(state["run_id"]), int(job["ticket_number"]))
+            scoped.load_current_run(str(state["run_id"]))
+            self.states = scoped  # type: ignore[assignment]
         return ChangeDeliveryEngine(
             git=self.git,
             github=self.github,
@@ -408,34 +432,14 @@ class TicketDeliveryLoop:
             adapter=self.adapter,
             publisher=self.publisher,
             state_store=ChangeDeliveryStateStore(self.states, str(state["run_id"])),
+            development_only=self.development_only,
         )
 
     def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         self.git.reset_checkout_to_base(checkout, str(state["run_branch"]))
-        clear_required_checks_observation(job)
-        for key in (
-            "candidate_sha",
-            "publication",
-            "publication_sha",
-            "acceptance_artifact",
-            "acceptance_record",
-            "publication_attempts",
-            "publication_thread_id",
-            "publication_operation_retry",
-            "last_publication_error",
-            "repair_source",
-            "ci_evidence",
-            "required_checks_origin",
-            "publication_authority",
-            "fallback_publication_receipt",
-            "deterministic_integration_record",
-            "next_attempt_kind",
-            "last_review_candidate_sha",
-            "final_ci_fix_failure_head",
-        ):
-            job.pop(key, None)
+        clear_stale_delivery_evidence(job)
         job.update(
             {
                 "base_sha": self.git.resolve(str(state["run_branch"])),
@@ -465,7 +469,7 @@ class TicketDeliveryLoop:
             or not commit_messages_match(
                 live.get("integrated_message"), publication.get("commit_message")
             )
-            or live.get("integrated_parents") != [job.get("base_sha")]
+            or live.get("integrated_parents") != [delivery_base_sha(job)]
         ):
             return self._block(
                 state,
@@ -642,6 +646,9 @@ class TicketDeliveryLoop:
         )
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            reconcile_ticket_slot(state, active)
         sync_active_ticket_job(state)
         self.states.save_run(str(state["run_id"]), state)
         return state

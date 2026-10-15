@@ -2,8 +2,10 @@ from __future__ import annotations
 
 """Change branch authority and optional linked-branch presentation."""
 
+from dataclasses import asdict
 from typing import Any, Callable
 
+from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.delivery_protocol import GitHubPublisher
 
 
@@ -111,23 +113,34 @@ def ensure_change_branch_authority(
         pass
     elif pending.get("action") != "publish_ticket_ref":
         raise ValueError("Change ref has an unknown write intent")
-    if ticket_number is None:
-        github.ensure_change_branch(
-            branch=branch,
-            base_branch=base_branch,
-            expected_base_sha=authority["base_sha"],
-            expected_remote_sha=expected_remote_sha,
-            recovery_remote_sha=recovery_remote_sha,
-        )
-    else:
-        github.ensure_ticket_branch(
-            ticket_number=ticket_number,
-            branch=branch,
-            base_branch=base_branch,
-            expected_base_sha=authority["base_sha"],
-            expected_remote_sha=expected_remote_sha,
-            recovery_remote_sha=recovery_remote_sha,
-        )
+    try:
+        if ticket_number is None:
+            github.ensure_change_branch(
+                branch=branch,
+                base_branch=base_branch,
+                expected_base_sha=authority["base_sha"],
+                expected_remote_sha=expected_remote_sha,
+                recovery_remote_sha=recovery_remote_sha,
+            )
+        else:
+            github.ensure_ticket_branch(
+                ticket_number=ticket_number,
+                branch=branch,
+                base_branch=base_branch,
+                expected_base_sha=authority["base_sha"],
+                expected_remote_sha=expected_remote_sha,
+                recovery_remote_sha=recovery_remote_sha,
+            )
+    except RemoteBranchChanged as error:
+        job["branch_publication_observation"] = asdict(error.observation)
+        job.update({"phase": "blocked", "blocked_reason": "remote_source_changed"})
+        state["status"] = "blocked"
+        state["diagnostics"] = [{
+            "code": "remote_source_changed",
+            "message": "Remote source branch changed; local Candidate preserved",
+        }]
+        save(state)
+        return
     if created_intent or pending_action == "ensure_change_branch":
         job.pop("ticket_write_intent", None)
         save(state)

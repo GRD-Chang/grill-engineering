@@ -1,6 +1,6 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度、开发会话策略及 Worker / Runner GitHub 身份。无需自定义时无需创建文件，直接使用内置默认。
 
 运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
@@ -17,15 +17,89 @@ agent-run settings show --run <完整Run-ID> --json
 查询个人默认返回文件位置、实际来源、稀疏设置、完整解析值及逐字段来源。Run 查询返回保存的策略、有效 Profile Revision 和不可变 Thread bindings，不读取个人默认，不写文件，不查询凭据。支持既有 `--repo` / `--state-dir` 定位规则。
 保存结果包含 `changed`、保存后的解析值及 `notice`：**仅影响之后创建的新 Run，已有 Run 保持原设置**。`--json` 成功输出为单个 JSON 对象；失败沿用 CLI 的结构化诊断或参数错误。
 
+## GitHub 身份
+
+`github` 与其他偏好共用同一文件。Worker 与 Runner 独立选择来源，共享同一个 `pat` 引用及 `app` 元数据定义。Worker 支持 host/PAT/App 原生 `gh`；无配置默认 host，已有独立 App 元数据需要显式迁移，不能静默切换个人身份。显式统一配置优先。Runner 程序端支持 host/PAT/App，默认 host，统一覆盖首次读取与克隆、Controller、Publisher 读写及远端 Git fetch/push/分支清理，不单独配置 Controller 或 Publisher。
+
+```json
+{
+  "github": {
+    "worker_source": "host",
+    "runner_source": "pat",
+    "pat": {"env": "DELIVERY_GITHUB_PAT"}
+  }
+}
+```
+
+也可将 `pat` 改为 `{"file":"/secure/delivery-pat"}`。环境变量名和文件路径二选一，不填写 token 本身；缺失、空值、不可读、两种引用同时出现均明确失败，不回退 host。引用可在选择 host 时保留，只有选择 PAT 时消费。Worker host/PAT 不适用 App 收窄选项，不会被程序伪装成只读；实际 GitHub 能力由凭据授权决定。
+
+```bash
+agent-run settings configure --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
+agent-run settings configure --worker-github-source pat --github-pat-file /secure/delivery-pat
+agent-run settings configure --worker-github-source host
+agent-run settings configure --runner-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
+agent-run settings show --json
+agent-run run 330 --runner-github-source pat
+agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
+```
+
+`run` 覆盖只作用于新 Run，不改个人默认。使用环境引用时，启动及恢复命令的环境须包含该变量，后台执行器继承所需环境。Run 固定非秘密来源和引用，秘密值不进入快照或普通输出；修改个人默认不改变已有 Run。文件引用适合在相同路径更换 token；环境引用则在恢复前重新导出同名变量。已有 Run 因凭据不可用暂停时，保留进度与诊断，修复原引用后公开 `resume`，不切换来源、不重置正式批准边界。
+
+`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看该 Run 固定配置；旧 Run 未保存程序端身份时该项显示未设置，不从当前默认推测。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
+
+### App 配置与迁移
+
+```json
+{
+  "github": {
+    "worker_source": "app",
+    "runner_source": "app",
+    "app": {
+      "app_id": "123",
+      "installation_id": "456",
+      "private_key_path": "/secure/agent-run-app.pem"
+    },
+    "app_read_only": false,
+    "app_current_repository_only": false
+  }
+}
+```
+
+```bash
+agent-run settings configure --worker-github-source app --github-app-id 123 --github-installation-id 456 --github-private-key-path /secure/agent-run-app.pem
+agent-run settings configure --runner-github-source app
+agent-run settings configure --github-app-read-only --github-app-current-repository-only
+agent-run run 330 --runner-github-source app
+agent-run run 330 --worker-github-source app --no-github-app-read-only --no-github-app-current-repository-only
+agent-run settings configure --migrate-github-app
+```
+
+App 参数三项一起设置；只保存私钥文件引用，不保存私钥内容。默认省略签发请求中的权限与仓库限制，使用安装已授权的范围。`app_read_only` 将安装已授权限收窄到可用只读权限，`app_current_repository_only` 只选当前目标仓库；两者独立，不能扩大安装授权，不再要求固定七项 read。收窄只作用于 Worker，不改变程序端身份或权限。Worker 选择 host/PAT 时不能启用 App 收窄选项。两端选择同一 App 无需重复填写参数；Runner 始终使用安装已授权的完整权限和仓库范围，与 Worker 的收窄 token 分别获取及续签，不串用凭据。权限不足时明确失败，不自动修改安装授权。
+
+旧独立 App 元数据用 `settings configure --migrate-github-app` 显式迁移：保留 App 来源，采用新默认权限与仓库范围，显式新配置优先，不覆盖其他设置。写入原子化，失败保留有效数据；`settings show` 只报告迁移状态，不写文件、不签发 token。成功后统一配置是新运行的唯一来源。旧文件和私钥保留，避免删除活动执行器引用的材料。旧 `auth app` 命令已移除，统一使用 settings。
+
+每次 Invocation 的 App 短期 token 写入隔离的 `GH_CONFIG_DIR/hosts.yml`，续签原子替换文件。同一 Agent 正常继承环境的后续原生 gh 子进程读取更新值，不通过命令代理、不依靠启动时一次性 token 环境注入。临时失败有界重试，有效旧 token 可继续使用；不可恢复失效进入 Execution Failure，保留进度，修复同一身份与引用后公开 `resume`。停止、失败和取消回收续签线程、签名子进程与临时凭据目录。
+
+Runner App 复用相同的签发与续签实现，后续 Controller、Publisher GitHub 请求及远端 Git 调用取得当前有效 token。程序端 PAT/App 使用任务级 HTTPS 认证，不回退宿主 SSH、token 或 Git credential helper，不修改全局登录或 Git 配置。尚未建立 Run 时失败返回启动诊断；已有 Run 的不可恢复凭据故障保留进度与 Execution Failure，修复固定引用后显式 `resume`。
+
+发布者核验区分个人用户与 App bot 操作身份；App 通过签名请求读取自身元数据、核对 App ID，再使用其 `<slug>[bot]` 作者身份。评论、事件和写入意图仍绑定发布者，恢复时核对固定身份与远端事实；更换私钥或续签 token 不授权更换 App 来源。写入结果未知时先对账，不盲目重放，不认领外部操作，也不取消准确 head、验收与正式批准门禁。
+
+个人配置迁移不修改旧活动 Run 的授权。缺少新身份或范围绑定、无法安全恢复的 Run 明确报告不兼容并保留数据；不能根据新默认补齐。工具替身测试仅验证上述传递与生命周期逻辑，不代表真实 gh 兼容性已验证。
+
 ## 轮数
 
 | JSON `policy` 字段 / 同名连字符 CLI 选项 | 内置默认 | 范围与含义 |
 | --- | --- | --- |
-| `ticket_review_rounds` / `--ticket-review-rounds` | 3 | 正整数 N；普通开发最多 N+1，审核最多 N，另有一次有条件的 Final CI-fix |
+| `ticket_review_rounds` / `--ticket-review-rounds` | 3 | 正整数 N；普通需求开发最多 N+1 次，审核最多 N 次；CI 恢复使用独立额度 |
 | `parent_only_paired_rounds` / `--parent-only-paired-rounds` | 10 | 正整数 N；开发与审核各最多 N 次配对 |
-| `run_repair_rounds` / `--run-repair-rounds` | 10 | 正整数 N；先审核一次，最多 N 次修复开发，合计最多 N+1 次审核 |
+| `run_repair_rounds` / `--run-repair-rounds` | 3 | 正整数 N；Parent-only 的 Git 与集成 Findings 共用累计 N 次 Development，远端追加不重置，resume 仅续期耗尽额度；多 Ticket Parent 保留既有集成窗口 |
+| `ticket_integration_development_limit` / `--ticket-integration-development-limit` | 3 | 正整数；Ticket 集成 Development 累计额度，包含冲突处理。中断续接不重复扣费，显式 resume 追加对应额度并保留累计用量 |
+| `integration_resync_limit` / `--integration-resync-limit` | 3 | 非负整数；首次集成后，同一交付对象最多自动重新同步的次数。仅外部源/目标分支新快照计数 |
+| `ticket_ci_development_limit` / `--ticket-ci-development-limit` | 3 | 正整数；同一 Ticket 的 CI Development 与 Review Findings 修改共用累计额度，独立于初始开发及集成 |
+| `ticket_ci_review` / `--ticket-ci-review` / `--no-ticket-ci-review` | false | 布尔值；所有 Ticket CI 修复轮次统一采用此审核策略，不影响初始 Ticket Review 或 Parent 验收 |
+| `parent_ci_development_limit` / `--parent-ci-development-limit` | 3 | 正整数 N；两种 Parent 的 CI Development 与 Review Findings 修改共用累计上限，跨修复工作、最终 PR 与失败版本不重置 |
 
-Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback；Final CI-fix 只处理适用 CI 失败。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
+Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback。Ticket CI 默认关闭 Review，开启后所有轮次均审核；未经审核的修复不记录 Acceptance。失败版本、提交和 PR 更新不重置累计 CI 开发额度；重复观察不扣费，同语义工作中断续接不重复计数。额度耗尽后显式 resume 只续期 CI 额度，重复请求不重复续期，历史保留。两种 Parent 共用累计 CI 开发额度，始终要求当前完整成果的 Review；修复工作与最终 PR 不分别开户。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
 
 ## 开发会话策略
 
@@ -145,7 +219,7 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 
-账号凭据由 `auth` 管理，项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录；这些内容均不合并到个人默认文件。
+GitHub 身份在个人默认文件中仅保存非秘密配置和凭据引用，秘密值保留在引用的环境变量或文件中；Codex 账号凭据由 `auth` 管理。项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录。
 
 发送、恢复与本地记录的边界见[飞书进度通知](notifications.md)。
 

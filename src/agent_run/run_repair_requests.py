@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-"""Run Repair worker request construction and PR narrative framing."""
+"""Parent repair Development and Review requests."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_run.agent_invocation import select_publication_thread
+from agent_run.delivery_budget import delivery_budget_owner
+
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
-    MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     latest_reviewer_thread,
 )
 from agent_run.delivery_protocol import GitHubPublisher
@@ -52,7 +54,9 @@ class RunRepairRequests:
             "development_summary": job.get("development_summary"),
         }
         source = str(request["repair_source"])
-        if source == "git_integrity":
+        if source == "integration":
+            request["integration_evidence"] = str(job["integration_evidence"])
+        elif source == "git_integrity":
             request["git_integrity_evidence"] = _mapping(
                 job, "git_integrity_evidence"
             )
@@ -69,29 +73,14 @@ class RunRepairRequests:
             request["human_feedback"] = str(job["human_feedback"])
         elif source == "merge_conflict":
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
-        _add_human_resume_fields(request, job)
-        return request
-
-    def publication(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "run",
-            "parent_issue_url": _issue_url(
-                state, int(_mapping(state, "parent")["number"])
-            ),
-            "repository": str(state["repository"]),
-            "parent": _mapping(state, "parent"),
-            "ticket_graph": _mapping(state, "ticket_graph"),
-            "ticket_completion_records": ticket_completion_records(state),
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "checkout": str(checkout),
-            "thread_id": select_publication_thread(
-                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
-            ),
-            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
-        }
+        integration = job.get("run_repair_integration")
+        if isinstance(integration, dict) and source == "acceptance" and job.get("pending_attempt_kind") != "ci_repair":
+            request["repair_source"] = "integration"
+            request["work_source"] = "integration"
+            request["integration_evidence"] = json.dumps({
+                "run_repair_integration": integration,
+                "acceptance_artifact": request.get("acceptance_artifact"),
+            }, ensure_ascii=False, sort_keys=True)
         _add_human_resume_fields(request, job)
         return request
 
@@ -101,6 +90,12 @@ class RunRepairRequests:
         request: dict[str, Any] = {
             "acceptance_scope": "run",
             "candidate_acceptance": True,
+            "run_review_facts": {
+                "parent_revision": state["parent"]["revision"],
+                "ticket_graph_revision": state["ticket_graph"]["revision"],
+                "ticket_set": state["ticket_graph"]["ordered_ticket_numbers"],
+                "ticket_completion_records": ticket_completion_records(state),
+            },
             "repair_scope": "run_repair",
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])
@@ -127,6 +122,10 @@ class RunRepairRequests:
                 else None
             ),
         }
+        integration = job.get("run_repair_integration")
+        if isinstance(integration, dict) and job.get("attempt_kind") != "ci_repair":
+            request["work_source"] = "integration"
+            request["run_integration_record"] = integration
         _add_human_resume_fields(request, job)
         fallbacks = ticket_fallback_records(state)
         if fallbacks:
@@ -134,24 +133,33 @@ class RunRepairRequests:
         integrations = ticket_integration_records(state)
         if integrations:
             request["ticket_integration_records"] = integrations
-        previous = previous_review_context(job)
+        baseline = job.get("previous_parent_acceptance_record")
+        if isinstance(baseline, dict) and (
+            baseline.get("acceptance_scope") == "run"
+            and baseline.get("parent_revision") == state["parent"]["revision"]
+            and baseline.get("ticket_graph_revision") == state["ticket_graph"]["revision"]
+            and baseline.get("ticket_completion_records") == ticket_completion_records(state)
+            and all(isinstance(baseline.get(field), str) and baseline[field].strip()
+                    for field in ("reviewer_thread_id", "reviewed_default_base_sha", "expected_merge_tree"))
+            and isinstance(baseline.get("reviewed_head_sha", baseline.get("reviewed_candidate_sha")), str)
+        ):
+            try:
+                accepted = AcceptanceArtifact.parse(baseline.get("artifact")).is_accepted
+            except ValueError:
+                accepted = False
+            if accepted:
+                request["parent_acceptance_baseline"] = baseline
+                request["previous_acceptance_artifact"] = baseline["artifact"]
+                request["previous_review_identity"] = {
+                    "run_head_sha": baseline.get("reviewed_head_sha", baseline.get("reviewed_candidate_sha")),
+                    "default_base_sha": baseline.get("reviewed_default_base_sha"),
+                    "expected_merge_tree": baseline.get("expected_merge_tree"),
+                }
+        previous = previous_review_context(delivery_budget_owner(state, job))
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]
         return request
-
-    @staticmethod
-    def render_pr_body(
-        state: dict[str, Any], publication: dict[str, Any]
-    ) -> str:
-        parent = _mapping(state, "parent")
-        narrative = str(publication["pr_body_markdown"]).strip()
-        return (
-            f"Parent Issue: #{int(parent['number'])}\n"
-            "Delivery Type: Run Repair\n\n"
-            f"{narrative}"
-        )
-
 
 def _add_human_resume_fields(
     request: dict[str, Any], job: dict[str, Any]

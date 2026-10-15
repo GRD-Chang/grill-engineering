@@ -2,12 +2,8 @@ from __future__ import annotations
 
 """Repair Cycle state, counters, and terminal transitions."""
 
-from copy import deepcopy
 from typing import Any
 
-from agent_run.delivery_policy import run_repair_budget_policy_for_job
-from agent_run.review_budget import ensure_budget
-from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 _ACTIVE_CHECKOUT_PHASES = frozenset(
@@ -18,11 +14,6 @@ _ACTIVE_CHECKOUT_PHASES = frozenset(
         "candidate",
         "reviewing",
         "accepted",
-        "publishing",
-        "publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "merging",
     }
 )
 
@@ -49,8 +40,16 @@ def repair_checkout_is_active(job: dict[str, Any]) -> bool:
     phase = job.get("phase")
     return phase in _ACTIVE_CHECKOUT_PHASES or (
         phase == "blocked"
-        and job.get("blocked_reason") == "agent_requires_human"
-        and job.get("human_blocker_phase") in {"developing", "repairing"}
+        and (job.get("blocked_reason") in {"ci_investigation_paused", "run_branch_write_failed", "run_branch_write_unknown"} or (
+            job.get("blocked_reason") == "agent_requires_human"
+            and (
+                job.get("human_blocker_phase") in {"developing", "repairing"}
+                or (
+                    job.get("human_blocker_phase") == "accepted"
+                    and isinstance(job.get("run_repair_integration_conflict"), dict)
+                )
+            )
+        ))
     )
 
 
@@ -74,49 +73,6 @@ def pause_human_blocked_repair_cycle(
 def sync_repair_cycle_counters(
     run: dict[str, Any], job: dict[str, Any]
 ) -> None:
-    run_snapshot = run.get("policy_snapshot")
-    job_snapshot = job.get("policy_snapshot")
-    if not isinstance(run_snapshot, dict) or not isinstance(job_snapshot, dict):
-        raise ValueError(
-            "Run Acceptance and Run Repair Policy Snapshots are required"
-        )
-    if run_snapshot != job_snapshot:
-        raise ValueError("Run Acceptance and Run Repair Policy Snapshots differ")
-    policy = run_repair_budget_policy_for_job(
-        run, state_snapshot=job_snapshot
-    )
-    run_budget = ensure_budget(run, policy)
-    job_budget = ensure_budget(job, policy)
-    if run_budget["window"] != job_budget["window"]:
-        raise ValueError("Run Acceptance and Run Repair Budget Windows differ")
-    # The Run Budget Window owns both the top-level Acceptance and active
-    # Repair projections. Keep Development usage shared just like Reviewer
-    # usage so a Job rotation cannot reopen capacity.
-    if job_budget["development_attempts"] < run_budget["development_attempts"]:
-        job_budget["development_attempts"] = run_budget["development_attempts"]
-    run_budget["development_attempts"] = max(
-        run_budget["development_attempts"], job_budget["development_attempts"]
-    )
-    # A Run Review Budget Window spans the top-level Reviewer and every Run
-    # Repair Reviewer.  Seed/raise the active repair projection from the
-    # durable Run count so a rotated Repair Job cannot reopen old capacity.
-    if job_budget["reviewer_invocations"] < run_budget["reviewer_invocations"]:
-        job_budget["reviewer_invocations"] = run_budget["reviewer_invocations"]
-    run_budget["reviewer_invocations"] = max(
-        run_budget["reviewer_invocations"], job_budget["reviewer_invocations"]
-    )
-    merged_artifacts = _merge_review_artifacts(
-        run_budget["review_artifacts"],
-        job_budget["review_artifacts"],
-        limit=policy.review_limit,
-    )
-    run_budget["review_artifacts"] = deepcopy(merged_artifacts)
-    job_budget["review_artifacts"] = deepcopy(merged_artifacts)
-    checkpoint_reason = (
-        run_budget["checkpoint_reason"] or job_budget["checkpoint_reason"]
-    )
-    run_budget["checkpoint_reason"] = checkpoint_reason
-    job_budget["checkpoint_reason"] = checkpoint_reason
     cycle = run.get("repair_cycle")
     if not isinstance(cycle, dict):
         return
@@ -138,116 +94,14 @@ def sync_repair_cycle_counters(
     run["modification_attempts"] = modifications
 
 
-def _merge_review_artifacts(
-    run_artifacts: list[dict[str, Any]],
-    job_artifacts: list[dict[str, Any]],
-    *,
-    limit: int,
-) -> list[dict[str, Any]]:
-    """Keep one ordered, bounded view of Run and active Repair artifacts."""
-
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for artifact in [*run_artifacts, *job_artifacts]:
-        reviewer = str(artifact.get("reviewer_thread_id", ""))
-        candidate = str(artifact.get("candidate_sha", ""))
-        identity = artifact.get("review_identity")
-        identity_key = repr(identity) if isinstance(identity, dict) else ""
-        key = (reviewer, candidate, identity_key)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(deepcopy(artifact))
-    return merged[-limit:]
-
-
-def rotate_repair_job(
-    run: dict[str, Any],
-    job: dict[str, Any],
-    *,
-    candidate_sha: str,
-    base_sha: str,
-    repair_branch: str,
-    repair_job_attempt: int,
-    modification_attempt: int,
-    repair_checkout: str,
-) -> dict[str, Any]:
-    """Replace an integrated Job while preserving its active Repair Cycle."""
-
-    completed_repairs = run.setdefault("completed_repair_jobs", [])
-    if not isinstance(completed_repairs, list):
-        raise ValueError("completed_repair_jobs must be a list")
-    completed = {
-        "phase": "completed",
-        "repair_branch": job["repair_branch"],
-        "publication_sha": job["publication_sha"],
-        "pr_number": job["pr_number"],
-        "integrated_sha": job["integrated_sha"],
-        "candidate_sha": job["candidate_sha"],
-        "acceptance_state": "revalidation_finding",
-    }
-    origin = job.get("required_checks_origin")
-    if isinstance(origin, dict):
-        completed["ci_evidence"] = deepcopy(origin)
-    completed_repairs.append(completed)
-    del completed_repairs[:-32]
-
-    rotated = dict(job)
-    clear_required_checks_observation(rotated)
-    trigger = rotated.get("repair_trigger")
-    if isinstance(trigger, dict):
-        trigger = dict(trigger)
-        trigger["head_sha"] = base_sha
-        rotated["repair_trigger"] = trigger
-    for key in (
-        "acceptance_record",
-        "publication",
-        "publication_sha",
-        "published_sha",
-        "integrated_sha",
-        "integrated_publication_sha",
-        "pr_number",
-        "merge_intent",
-        "merge_reconciliation_history",
-        "ticket_write_intent",
-        "linked_branch_display",
-        "pending_attempt",
-        "integrated_revalidation_merge",
-        "deterministic_integration_record",
-    ):
-        rotated.pop(key, None)
-    rotated.update(
-        {
-            "phase": "candidate",
-            "repair_attempt": int(job["repair_attempt"]) + 1,
-            "repair_job_attempt": repair_job_attempt,
-            "repair_branch": repair_branch,
-            "base_sha": base_sha,
-            "repair_base_run_head_sha": base_sha,
-            "candidate_sha": candidate_sha,
-            "repair_source": "acceptance",
-            "repair_input_artifact": _mapping(job, "acceptance_artifact"),
-            "modification_attempts": modification_attempt,
-            "code_modification_attempts": modification_attempt,
-            "publication_attempts": 0,
-            "repair_checkout": repair_checkout,
-            "repair_job_rotation": {
-                "current_branch": str(job["repair_branch"]),
-                "next_branch": repair_branch,
-                "candidate_sha": candidate_sha,
-            },
-        }
-    )
-    run["repair_job"] = rotated
-    sync_repair_cycle_counters(run, rotated)
-    return rotated
-
-
 def escalate_repair(
     state: dict[str, Any], run: dict[str, Any], job: dict[str, Any], code: str
 ) -> None:
     job["blocked_reason"] = code
-    if code == "modification_budget_exhausted":
+    if code in {
+        "modification_budget_exhausted",
+        "ci_development_budget_exhausted",
+    }:
         cycle = run.get("repair_cycle")
         if isinstance(cycle, dict):
             cycle.update({"status": "budget_exhausted", "ended_reason": code})
@@ -268,3 +122,8 @@ def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be an object")
     return value
+
+
+def remove_repair_job(run: dict[str, Any]) -> None:
+    """Remove repair work while retaining the Parent's fixed budgets."""
+    run.pop("repair_job", None)

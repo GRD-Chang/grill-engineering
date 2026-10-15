@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
+from agent_run.branch_publication import (
+    BranchPublicationResult,
+    RemoteBranchChanged,
+    RemoteBranchObservation,
+)
+from agent_run.pr_write import admit_pr_write
 from agent_run.github import (
     GitHubReadError,
     MergeOutcomeUnknownError,
     _merge_identity_matches,
 )
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
-from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
 
 
@@ -95,7 +100,9 @@ class FixtureGitHubReader:
         return self._delivery_graph_once(parent_number)
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
-        delivery = _mapping(self._load(), "delivery")
+        current = self._load()
+        delivery = _mapping(current, "delivery")
+        repository = _string(current, "repository")
         pulls = delivery.get("pull_requests")
         if not isinstance(pulls, list):
             raise GitHubReadError("invalid_fixture", "delivery.pull_requests must be an array")
@@ -112,8 +119,11 @@ class FixtureGitHubReader:
                     base_sha = self.repository().default_head_sha
                 result: dict[str, Any] = {
                     "state": pull.get("state"), "head_sha": head,
+                    "head_branch": pull.get("head_ref", branch),
+                    "head_repository": pull.get("head_repository", repository),
                     "base_branch": base_branch,
                     "base_sha": base_sha,
+                    "base_repository": pull.get("base_repository", repository),
                     "integrated_sha": pull.get("integrated_sha"),
                 }
                 integrated = pull.get("integrated_sha")
@@ -217,11 +227,34 @@ class FixtureGitHubPublisher:
         delivery.setdefault("published_branches", {})
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
-        delivery.setdefault("acceptance_records", [])
         delivery.setdefault("agent_run_status", [])
         delivery.setdefault("run_publication_records", [])
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
+
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]:
+        if source_branch == target_branch:
+            raise GitError("source and target branch must differ")
+        current: object = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            raise GitHubReadError("invalid_fixture", "fixture root must be an object")
+        delivery = current.get("delivery", {})
+        if not isinstance(delivery, dict):
+            raise GitHubReadError("invalid_fixture", "fixture delivery must be an object")
+        published = _mapping(delivery, "published_branches") if "published_branches" in delivery else {}
+        source = published.get(source_branch)
+        target = published.get(target_branch)
+        if target is None and target_branch == current.get("default_branch"):
+            target = current.get("default_head_sha")
+        if source is not None and not isinstance(source, str):
+            raise GitHubReadError("invalid_fixture", "source branch head must be a SHA")
+        if not isinstance(target, str):
+            raise GitHubReadError(
+                "missing_target_branch", f"target branch {target_branch!r} is missing"
+            )
+        return source, target
 
     def ensure_run_branch(self, branch: str, base_sha: str) -> None:
         self.git.ensure_run_branch(branch, base_sha)
@@ -267,6 +300,10 @@ class FixtureGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
+        if is_managed_delivery_branch(base_branch):
+            self._ensure_managed_base_ref(
+                base_branch, expected_base_sha, allow_append=True
+            )
         published = _mutable_mapping(self._delivery(), "published_branches")
         current = published.get(branch)
         if current is None:
@@ -274,7 +311,12 @@ class FixtureGitHubPublisher:
                 raise ValueError("fixture Ticket ref is missing after publication")
             published[branch] = expected_base_sha
         elif current not in {expected_remote_sha, recovery_remote_sha}:
-            raise ValueError("fixture Ticket ref has a foreign identity")
+            if not isinstance(current, str) or not self.git.is_ancestor(
+                expected_remote_sha, current
+            ):
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, current)
+                )
         self._save()
         self._crash_once("ensure_ticket_branch")
 
@@ -311,7 +353,9 @@ class FixtureGitHubPublisher:
         recovery_remote_sha: str,
     ) -> None:
         if is_managed_delivery_branch(base_branch):
-            self._ensure_managed_base_ref(base_branch, expected_base_sha)
+            self._ensure_managed_base_ref(
+                base_branch, expected_base_sha, allow_append=True
+            )
         published = _mutable_mapping(self._delivery(), "published_branches")
         current = published.get(branch)
         if current is None:
@@ -319,37 +363,12 @@ class FixtureGitHubPublisher:
                 raise ValueError("fixture Change ref is missing after publication")
             published[branch] = expected_base_sha
         elif current not in {expected_remote_sha, recovery_remote_sha}:
-            raise ValueError("fixture Change ref has a foreign identity")
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, current)
+            )
         self._save()
         self._crash_once("ensure_change_branch")
         self._crash_once("ensure_ticket_branch")
-
-    def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
-        published = _mutable_mapping(self._delivery(), "published_branches")
-        published.setdefault(branch, self.git.resolve(base_branch))
-        self._save()
-
-    def ensure_run_repair_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
-    ) -> int:
-        pulls = _mutable_list(self._delivery(), "pull_requests")
-        matching = [
-            pr for pr in pulls if isinstance(pr, dict)
-            and pr.get("branch") == branch and pr.get("base_branch") == base_branch
-        ]
-        if len(matching) > 1:
-            raise ValueError("fixture contains duplicate Run Repair PRs")
-        if matching:
-            pull = matching[0]
-        else:
-            pull = {
-                "number": len(pulls) + 1, "branch": branch,
-                "base_branch": base_branch, "state": "OPEN", "scope": "run_repair",
-            }
-            pulls.append(pull)
-        pull.update({"title": title, "body": body})
-        self._save()
-        return int(pull["number"])
 
     def ensure_run_pr(
         self,
@@ -369,7 +388,7 @@ class FixtureGitHubPublisher:
             and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
-            raise ValueError("fixture contains duplicate final Run PRs")
+            raise GitHubReadError("ambiguous_run_pr", "fixture contains duplicate final Run PRs")
         if matching:
             pull = matching[0]
             self._require_final_run_pr_identity(
@@ -422,13 +441,19 @@ class FixtureGitHubPublisher:
             == expected_head_sha
         )
 
-    def _ensure_managed_base_ref(self, branch: str, expected_sha: str) -> None:
+    def _ensure_managed_base_ref(
+        self, branch: str, expected_sha: str, *, allow_append: bool = False
+    ) -> None:
         """Fixture equivalent of expected-absent Run/Parent ref authority."""
         published = _mutable_mapping(self._delivery(), "published_branches")
         remote_sha = published.get(branch)
         if remote_sha == expected_sha:
             return
         if remote_sha is not None:
+            if allow_append and isinstance(remote_sha, str) and self.git.is_ancestor(
+                expected_sha, remote_sha
+            ):
+                return
             raise ValueError("fixture Run ref has a foreign identity")
         races = self._delivery().get("expected_absent_ref_races")
         if isinstance(races, list) and (branch in races or "*" in races):
@@ -455,13 +480,17 @@ class FixtureGitHubPublisher:
             if isinstance(pr, dict)
             and pr.get("branch") == branch
             and pr.get("scope") == "final_run"
-            and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate final Run PRs")
         if not matching:
             return None
         pull = matching[0]
+        if pull.get("state") in {"CLOSED", "MERGED"}:
+            raise GitHubReadError(
+                "final_run_pr_closed",
+                f"Final Run PR #{pull['number']} is {pull['state']}; cannot create a replacement",
+            )
         self._require_final_run_pr_identity(
             pull,
             branch=branch,
@@ -600,7 +629,9 @@ class FixtureGitHubPublisher:
             )
         if not live["mergeable"]:
             raise ValueError("fixture final merge does not match expected open head")
-        base = self.git.resolve(str(pull["base_branch"]))
+        base_branch = str(pull["base_branch"])
+        published_branches = _mutable_mapping(self._delivery(), "published_branches")
+        base = str(live["base_sha"])
         result = subprocess.run(
             ["git", "merge-tree", "--write-tree", base, expected_head_sha],
             cwd=self.git.root,
@@ -624,11 +655,13 @@ class FixtureGitHubPublisher:
         if merged.returncode != 0:
             raise ValueError(merged.stderr.strip() or "fixture final merge failed")
         integrated = merged.stdout.strip()
-        subprocess.run(
-            ["git", "update-ref", f"refs/heads/{pull['base_branch']}", integrated, base],
-            cwd=self.git.root,
-            check=True,
-        )
+        if self.git.managed_branch_head(base_branch) == base:
+            subprocess.run(
+                ["git", "update-ref", f"refs/heads/{base_branch}", integrated, base],
+                cwd=self.git.root,
+                check=True,
+            )
+        published_branches[base_branch] = integrated
         pull.update({"state": "MERGED", "integrated_sha": integrated})
         readback_identity_error = self._delivery().get(
             "normal_merge_readback_identity_error"
@@ -655,6 +688,8 @@ class FixtureGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
         delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         parent = _mutable_mapping(self.data, "parent")
         if _integer(parent, "number") != parent_number:
@@ -728,12 +763,27 @@ class FixtureGitHubPublisher:
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
+    ) -> BranchPublicationResult:
         published = _mutable_mapping(self._delivery(), "published_branches")
-        if published.get(branch) == head_sha:
-            return
-        if published.get(branch) != expected_remote_sha:
-            raise ValueError("fixture remote ticket branch drifted")
+        observation = RemoteBranchObservation(
+            branch, expected_remote_sha, published.get(branch)
+        )
+        outcomes = self._delivery().get("publish_branch_outcomes")
+        outcome = outcomes.pop(0) if isinstance(outcomes, list) and outcomes else None
+        if outcome in {"foreign", "cas_race"}:
+            published[branch] = "foreign"
+            self._save()
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, "foreign")
+            )
+        if outcome not in {None, "lost_response"}:
+            raise ValueError("fixture publish_branch outcome is invalid")
+        if not self.git.is_ancestor(expected_remote_sha, head_sha):
+            raise GitError("publication head does not descend from the observed source head")
+        if observation.observed_sha == head_sha:
+            return BranchPublicationResult(observation, head_sha, "already_published")
+        if not observation.matches_expected:
+            raise RemoteBranchChanged(observation)
         published[branch] = head_sha
         for pull in _mutable_list(self._delivery(), "pull_requests"):
             if (
@@ -743,8 +793,11 @@ class FixtureGitHubPublisher:
             ):
                 pull["head_sha"] = head_sha
         self._save()
+        if outcome == "lost_response":
+            raise OSError("fixture lost branch publication response")
         self._inject_revision_drift("publish_branch")
         self._crash_once("publish_branch")
+        return BranchPublicationResult(observation, head_sha, "published")
 
     def verify_ticket_pr_before_publish(
         self,
@@ -765,6 +818,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Ticket PRs")
+        if not matching and any(
+            isinstance(pull, dict)
+            and pull.get("branch") == branch
+            and pull.get("state") != "OPEN"
+            for pull in _mutable_list(self._delivery(), "pull_requests")
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (
@@ -802,6 +865,8 @@ class FixtureGitHubPublisher:
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         pulls = _mutable_list(self._delivery(), "pull_requests")
         matching = [
@@ -811,6 +876,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Change PRs")
+        if not matching and any(
+            isinstance(pull, dict)
+            and pull.get("branch") == branch
+            and pull.get("state") != "OPEN"
+            for pull in pulls
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (
@@ -824,6 +899,10 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Change PR has a foreign identity")
         else:
+            admit_pr_write(
+                intent=write_intent, save_intent=save_intent, number=None, prior=None,
+                target={"title": title, "body": body},
+            )
             pull = {
                 "number": len(pulls) + 1,
                 "branch": branch,
@@ -832,18 +911,33 @@ class FixtureGitHubPublisher:
                 "head_sha": expected_head_sha,
                 "base_sha": expected_base_sha,
                 "scope": (
-                    "run_repair"
-                    if branch.startswith("agent-run-repair/")
-                    else "parent_only" if branch.endswith("/parent") else "ticket"
+                    "parent_only" if branch.endswith("/parent") else "ticket"
                 ),
             }
             pulls.append(pull)
+        if matching:
+            should_write = admit_pr_write(
+                intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
+                prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
+                target={"title": title, "body": body},
+            )
+            if not should_write:
+                return int(pull["number"])
         pull.update({"title": title, "body": body})
         self._save()
         self._inject_revision_drift("ensure_ticket_pr")
         self._crash_once("ensure_change_pr")
         self._crash_once("ensure_ticket_pr")
         return int(pull["number"])
+
+    def find_change_pr_number(self, *, branch: str) -> int | None:
+        pulls = [
+            pull for pull in _mutable_list(self._delivery(), "pull_requests")
+            if isinstance(pull, dict) and pull.get("branch") == branch
+        ]
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_change_pr", "Original Change PR lookup is ambiguous")
+        return int(pulls[0]["number"]) if pulls else None
 
     def ensure_ticket_pr(
         self,
@@ -855,6 +949,8 @@ class FixtureGitHubPublisher:
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         pulls = _mutable_list(self._delivery(), "pull_requests")
         matching = [
@@ -866,6 +962,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Ticket PRs")
+        if not matching and any(
+            isinstance(pr, dict)
+            and pr.get("branch") == branch
+            and pr.get("state") != "OPEN"
+            for pr in pulls
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (
@@ -876,6 +982,10 @@ class FixtureGitHubPublisher:
             ):
                 raise ValueError("fixture Ticket PR has a foreign identity")
         else:
+            admit_pr_write(
+                intent=write_intent, save_intent=save_intent, number=None, prior=None,
+                target={"title": title, "body": body},
+            )
             pull = {
                 "number": len(pulls) + 1,
                 "branch": branch,
@@ -886,6 +996,14 @@ class FixtureGitHubPublisher:
                 "base_sha": expected_base_sha,
             }
             pulls.append(pull)
+        if matching:
+            should_write = admit_pr_write(
+                intent=write_intent, save_intent=save_intent, number=int(pull["number"]),
+                prior={"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))},
+                target={"title": title, "body": body},
+            )
+            if not should_write:
+                return int(pull["number"])
         pull.update({"title": title, "body": body})
         self._save()
         self._inject_revision_drift("ensure_ticket_pr")
@@ -1091,11 +1209,7 @@ class FixtureGitHubPublisher:
             normalized_checks = [
                 _fixture_check_for_head(check, actual_head_sha) for check in checks
             ]
-            evidence["checks"] = annotate_configured_code_failures(
-                normalized_checks,
-                self.git.root,
-                expected_head_sha=expected_head_sha,
-            )
+            evidence["checks"] = normalized_checks
         return evidence
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
@@ -1153,13 +1267,14 @@ class FixtureGitHubPublisher:
             raise ValueError(f"{failure_key} failure type is invalid")
         published = _mutable_mapping(self._delivery(), "published_branches")
         live_head = published.get(str(pull["branch"])) or pull.get("head_sha")
+        live_base = published.get(str(pull["base_branch"]))
         override = self._delivery().get("live_head_override")
         result = {
             "head_branch": pull.get("head_ref", pull["branch"]),
             "head_sha": override if isinstance(override, str) else live_head,
             "head_repository": pull.get("head_repository", self.data["repository"]),
             "base_branch": pull["base_branch"],
-            "base_sha": self.git.resolve(str(pull["base_branch"])),
+            "base_sha": live_base if isinstance(live_base, str) else self.git.resolve(str(pull["base_branch"])),
             "base_repository": pull.get("base_repository", self.data["repository"]),
             "mergeable": bool(self._delivery().get("mergeable", True)),
             "state": reported_state,
@@ -1211,25 +1326,9 @@ class FixtureGitHubPublisher:
             "foreign_run_pr", "fixture Final Run PR has a foreign identity"
         )
 
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool:
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]:
         pull = self._pull(pr_number)
-        return pull.get("title") == title and pull.get("body") == body
-
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
-        records = _mutable_list(self._delivery(), "acceptance_records")
-        replacement = {"pr_number": pr_number, **record}
-        for position, existing in enumerate(records):
-            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
-                records[position] = replacement
-                break
-        else:
-            records.append(replacement)
-        self._save()
-        self._crash_once("record_acceptance")
+        return {"title": str(pull.get("title", "")), "body": str(pull.get("body", ""))}
 
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]
@@ -1310,7 +1409,10 @@ class FixtureGitHubPublisher:
             if outcome == "unknown":
                 raise MergeOutcomeUnknownError("fixture squash merge response is unknown")
         tree = self.git.resolve(f"{expected_head_sha}^{{tree}}")
-        parent = self.git.resolve(run_branch)
+        local_before = self.git.resolve(run_branch)
+        parent = str(live["base_sha"])
+        if not self.git.is_ancestor(local_before, parent):
+            raise ValueError("fixture Run ref diverged from the PR base")
         result = subprocess.run(
             [
                 "git",
@@ -1337,7 +1439,7 @@ class FixtureGitHubPublisher:
                 "update-ref",
                 f"refs/heads/{run_branch}",
                 integrated,
-                parent,
+                local_before,
             ],
             cwd=self.git.root,
             check=True,
@@ -1354,6 +1456,16 @@ class FixtureGitHubPublisher:
     ) -> None:
         published = _mutable_mapping(self._delivery(), "published_branches")
         published[run_branch] = integrated_sha
+        # An open PR tracks its base branch as that branch advances. Keep the
+        # fixture's stored identity aligned with the live Git ref after a
+        # different Ticket wins the shared integration seat.
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if (
+                isinstance(pull, dict)
+                and pull.get("state") == "OPEN"
+                and pull.get("base_branch") == run_branch
+            ):
+                pull["base_sha"] = integrated_sha
         if self.git.resolve(run_branch) == integrated_sha:
             self._save()
             self._crash_once("sync_run_branch")
@@ -1679,7 +1791,6 @@ class FixtureGitHubPublisher:
     ) -> str:
         reader = FixtureGitHubReader(self.path)
         graph = reader.delivery_graph(parent_number)
-        self.data = reader.data
         return effective_revision_from_graph(graph, ticket_number)
 
     def _delivery(self) -> dict[str, Any]:
@@ -1813,6 +1924,9 @@ class FixtureGitHubPublisher:
             check=True,
         )
         self.data["default_head_sha"] = created
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if isinstance(pull, dict) and pull.get("base_branch") == base_branch:
+                pull["base_sha"] = created
         self._save()
 
 

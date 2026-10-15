@@ -12,6 +12,7 @@ from agent_run.git import (
     is_managed_delivery_branch,
 )
 from agent_run.state import StateStore
+from agent_run.object_state import ObjectStateStore, object_store, save_owned
 
 
 MAX_AUTOMATIC_ATTEMPTS = 3
@@ -28,7 +29,7 @@ class DeliveryCleanupEngine:
         github: GitHubPublisher | None = None,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states)
         self.github = github
 
     def complete_ticket(
@@ -45,7 +46,7 @@ class DeliveryCleanupEngine:
             expected_head_sha=self._completed_source_head(job),
             checkout=self._worktree(state, f"ticket-{self._integer(job, 'ticket_number')}")
         )
-        return self._attempt(state)
+        return self._attempt(state, only_branch=str(job["ticket_branch"]))
 
     def complete_run_repair(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -66,9 +67,8 @@ class DeliveryCleanupEngine:
     def complete_run_repairs(
         self, state: dict[str, Any], jobs: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Retire every Job identity used by one completed Repair Cycle."""
+        """Retire completed Parent repair work without remote branch writes."""
 
-        # Rotated Jobs reuse one checkout; retire its final owner first.
         for job in reversed(jobs):
             if job.get("phase") != "completed" or not isinstance(
                 job.get("integrated_sha"), str
@@ -120,7 +120,10 @@ class DeliveryCleanupEngine:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         if state.get("status") == "abandoned":
             return state
-        self._schedule_completed_items(state)
+        # Completion may commit before its cleanup registration. Reconcile all
+        # completed owners at this boundary, independently of active selection.
+        evidence = self.states.load_delivery_evidence(run_id) if isinstance(self.states, ObjectStateStore) else state
+        self._schedule_completed_items(state, ticket_jobs=evidence.get("ticket_jobs", {}))
         if not isinstance(state.get("delivery_cleanup"), dict):
             return state
         return self._attempt(state)
@@ -165,8 +168,10 @@ class DeliveryCleanupEngine:
         )
         cleanup.update({"status": "cleanup_pending", "last_error": reason})
 
-    def _schedule_completed_items(self, state: dict[str, Any]) -> None:
-        jobs = state.get("ticket_jobs", {})
+    def _schedule_completed_items(
+        self, state: dict[str, Any], *, ticket_jobs: object | None = None,
+    ) -> None:
+        jobs = state.get("ticket_jobs", {}) if ticket_jobs is None else ticket_jobs
         if isinstance(jobs, dict):
             for job in jobs.values():
                 if (
@@ -256,15 +261,17 @@ class DeliveryCleanupEngine:
             },
         )
 
-    def _attempt(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _attempt(self, state: dict[str, Any], *, only_branch: str | None = None) -> dict[str, Any]:
         cleanup = self._cleanup(state)
         items = self._mapping(cleanup, "items")
-        self.states.save_run(str(state["run_id"]), state)
+        self._save_cleanup(state)
         last_error: str | None = None
         for item in items.values():
             if not isinstance(item, dict) or item.get("status") == "completed":
                 continue
             branch = self._string(item, "branch")
+            if only_branch is not None and branch != only_branch:
+                continue
             checkout = Path(self._string(item, "checkout"))
             if not is_managed_delivery_branch(branch):
                 error = f"refusing to delete unmanaged branch {branch!r}"
@@ -290,7 +297,7 @@ class DeliveryCleanupEngine:
                         if self.github is not None
                         else None
                     )
-                    if callable(remote_delete):
+                    if item.get("kind") != "run_repair" and callable(remote_delete):
                         remote_delete(branch, expected_head_sha=expected_remote_head)
                     self._remove_empty_directories(checkout)
                 except (OSError, RuntimeError) as error:
@@ -312,8 +319,16 @@ class DeliveryCleanupEngine:
             cleanup["last_error"] = last_error or "cleanup is pending"
         else:
             cleanup.pop("last_error", None)
-        self.states.save_run(str(state["run_id"]), state)
+        self._save_cleanup(state)
         return state
+
+    def _save_cleanup(self, state: dict[str, Any]) -> None:
+        if isinstance(self.states, ObjectStateStore):
+            save_owned(self.states, str(state["run_id"]), state, fields={"delivery_cleanup"})
+        else:
+            # Ticket lanes already merge exactly their cleanup branch with the
+            # current Ticket transaction and retain the integration seat.
+            self.states.save_run(str(state["run_id"]), state)
 
     def _remove_empty_directories(self, checkout: Path) -> None:
         for directory in (checkout.parent, checkout.parent.parent):

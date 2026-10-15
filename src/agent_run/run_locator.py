@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 from agent_run.paths import app_data_root
+from agent_run.state import StateStore
 
 MAX_LOCATOR_ENTRIES = 32
 
@@ -122,7 +123,7 @@ class RunLocatorIndex:
                 ),
             )
         state_dir = Path(next(iter(state_dirs)))
-        if not (state_dir / "runs" / f"{run_id}.json").is_file():
+        if not StateStore(state_dir).has_run(run_id):
             raise RunLocatorError(
                 "run_locator_stale",
                 _locator_message(

@@ -13,6 +13,9 @@ from agent_run.ticket_acceptance_contract import (
 from agent_run.ticket_fallback_contract import (
     _require_fallback_integration_authorization,
 )
+from agent_run.ticket_ci_repair_contract import (
+    require_ci_repair_publication_authorization,
+)
 
 
 def require_completed_ticket_integration_records(state: dict[str, Any]) -> None:
@@ -50,9 +53,9 @@ def _require_deterministic_integration_record(
     completed_job: dict[str, Any],
 ) -> None:
     source = record.get("source")
-    if source not in {"accepted", "fallback"}:
+    if source not in {"accepted", "fallback", "ci_repair"}:
         raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.source must be accepted or fallback"
+            f"incompatible_run_state: {location}.source is invalid"
         )
     for key in (
         "base_sha",
@@ -141,19 +144,71 @@ def _require_deterministic_integration_record(
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.pr/head is invalid"
         )
-    evidence_key = (
-        "acceptance_record" if source == "accepted" else "fallback_receipt"
-    )
+    evidence_key = {
+        "accepted": "acceptance_record",
+        "fallback": "fallback_receipt",
+        "ci_repair": "ci_repair_publication_receipt",
+    }[source]
     authorization = record.get(evidence_key)
     if not isinstance(authorization, dict) or not authorization:
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.{evidence_key} is invalid"
         )
+    ticket_integration = record.get("ticket_integration")
+    if not isinstance(ticket_integration, dict) or set(ticket_integration) != {
+        "base_sha", "candidate_sha", "candidate_tree", "source_sha", "target_sha",
+        "head_sha", "head_tree", "conflict_paths",
+    }:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.ticket_integration is invalid"
+        )
+    promoted_ci_integration = (
+        source in {"accepted", "ci_repair"}
+        and completed_job.get("attempt_kind") == "ci_repair"
+        and ticket_integration.get("head_sha") == record["candidate_sha"]
+        and ticket_integration.get("head_tree") == record["candidate_tree"]
+        and record["candidate_sha"] == completed_job.get("candidate_sha")
+    )
+    if (
+        ticket_integration != completed_job.get("ticket_integration")
+        or not (promoted_ci_integration or (
+            ticket_integration["candidate_sha"] == record["candidate_sha"]
+            and ticket_integration["candidate_tree"] == record["candidate_tree"]
+        ))
+        or ticket_integration["target_sha"] != record["base_sha"]
+        or ticket_integration["head_tree"] != record["integrated_tree"]
+        or not isinstance(ticket_integration["conflict_paths"], list)
+        or not all(isinstance(path, str) and path for path in ticket_integration["conflict_paths"])
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.ticket_integration does not match delivery"
+        )
+    original_record = dict(record)
+    original_record["base_sha"] = ticket_integration["base_sha"]
     if source == "accepted":
         require_completed_accepted_ticket_authorization(
-            completed_job, authorization, record, location
+            completed_job, authorization, original_record, location
+        )
+    elif source == "fallback":
+        _require_fallback_integration_authorization(
+            authorization, original_record, location
         )
     else:
-        _require_fallback_integration_authorization(
-            authorization, record, location
+        if (
+            completed_job.get("publication_authority") != "ci_repair"
+            or completed_job.get("ci_repair_publication_receipt") != authorization
+            or record["candidate_sha"] != completed_job.get("candidate_sha")
+            or record["candidate_tree"] != authorization.get("candidate_tree")
+            or record["publication_sha"] != completed_job.get("publication_sha")
+            or record["required_checks_evidence"] != completed_job.get("required_checks_evidence")
+        ):
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.ci_repair_publication_receipt is not bound to the completed Ticket"
+            )
+        require_ci_repair_publication_authorization(
+            authorization,
+            completed_job,
+            location=location,
+            candidate_tree=record["candidate_tree"],
+            require_publication_facts=True,
         )

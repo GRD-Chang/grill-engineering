@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import fcntl
 import os
+import array
+import select
+import socket
 import sys
 import time
 from contextlib import contextmanager
@@ -32,6 +35,36 @@ class RunnerLease:
 
     def fileno(self) -> int:
         return self.file.fileno()
+
+
+def retain_lease_for_systemd_exit(lease: RunnerLease, notify_socket: str) -> None:
+    """Keep the shared open-file lease in the manager through ExecStopPost.
+
+    SCM_RIGHTS preserves the same flock even after SIGKILL. The barrier proves
+    the manager processed the store request before business execution starts.
+    The unit's default fd-store lifetime releases it when shutdown completes.
+    """
+    address = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            channel.settimeout(5)
+            channel.connect(address)
+            channel.sendmsg([b"FDSTORE=1\nFDNAME=runner-exit-lease\nFDPOLL=0"],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [lease.fileno()]))])
+            channel.sendmsg([b"BARRIER=1"],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [write_fd]))])
+        os.close(write_fd)
+        write_fd = -1
+        ready, _, _ = select.select([read_fd], [], [], 5)
+        if not ready or os.read(read_fd, 1) != b"":
+            raise RunnerLeaseError("systemd 未确认退出通知的 Runner 租约")
+    except OSError as error:
+        raise RunnerLeaseError("无法将退出通知的 Runner 租约交给 systemd") from error
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 def default_runner_lock_path(environment: dict[str, str] | None = None) -> Path:

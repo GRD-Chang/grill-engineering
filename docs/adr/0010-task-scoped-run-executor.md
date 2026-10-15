@@ -4,6 +4,16 @@ status: accepted
 
 # 每个 Delivery Task 由操作系统托管一个短生命周期 Executor
 
+后续有限修订：启用通知时，systemd 在 Executor 结束后运行有界 `ExecStopPost`，只记录准确退出与通知事实并复用现有 outbox。它不自动 Resume、不写业务状态、不推断 Publisher 结果；正常退出与已替换代次不报崩溃。为退出投递，systemd 从一次性载体取得私有、至多 1 MiB 的环境副本，随服务回收；原载体仍遵守三十秒清理边界。无常驻观察进程，通知关闭不增加钩子或环境副本。检测与投递上限及不可用边界见[通知合同](../notifications.md#executor-意外退出)。其余执行、授权和 Runner 租约合同不变。
+
+启用退出通知的 Executor 通过 systemd 原生 FDSTORE/BARRIER 连续交接现有共享租约，宿主最多保存一个描述符直到服务及退出处理结束；该关闭阶段仍拒绝 Runner 管理操作。租约不暴露给 Worker，无额外保活进程；宿主回收后立即释放，不固定历史 Snapshot。
+
+退出钩子的凭据副本仍属于 Runner 控制面。所有 Worker（含 Host/PAT 身份）必须在文件系统中屏蔽 systemd 的凭据及临时凭据目录；仅删除环境变量或设置当前用户只读权限不足以隔离同 UID 进程。屏蔽覆盖标准运行目录、继承的自定义目录及宿主实际传入的目录，包含其他服务和代次的副本。Executor 保留原生凭据路径只用于建立 Worker 屏蔽，不允许启动终端快照覆盖该路径，也不向 Worker 传递这一内部变量；退出钩子在 Worker 隔离之外读取副本。
+
+通知关闭时也保留宿主原生用户运行目录。启动 Worker 前，在该目录及继承的运行目录中预建 `credentials` 和 `systemd/temporary-credentials` 空目录，并准备继承的凭据目录；无法准备时拒绝启动，不跳过屏蔽。随后出现的服务凭据仍被同一挂载屏蔽覆盖。这些固定运行目录不含新快照，不随单个 Worker 删除或替换，由用户运行目录生命周期回收；已有目录的权限不变。不为此创建系统级 `/run` 目录、钩子、守护进程或通知请求。
+
+后续需求修订：[ADR 0019](0019-ticket-work-concurrency-and-supervision.md) 允许其他 Ticket 执行期间接受定向 Resume；已授权工作可等待并发名额，单 Ticket 故障或监督超时不结束仍有独立工作的 Executor。定向 Stop 只暂停目标 Ticket，不形成 Run 级停止；下文停止并结束 Executor 的规则仅适用于 Run 级 Stop。定向恢复、单票故障隔离与监督超时已实施，单票立即 Stop 仍待后续实现；这些修订仅取代相关局部操作的准入和退出限制，不建立通用 Lifecycle Action 队列，也不改变同一任务最多一个 Executor 的约束。
+
 后续修订：[ADR 0013](0013-runner-owned-delivery-workspace.md) 将 Local Delivery Workspace 改为 Runner 独立克隆，并将同一 Repository/Parent 的唯一性收敛到本机当前用户。下文以用户仓库根区分任务、要求维护者自行协调不同 clone 的规则由该 ADR 取代；Executor、Action 与任务级短锁合同继续适用。
 
 后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 仍存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并明确失联状态的耗时展示。Executor 自身消失后不自动重放、等待显式恢复的规则继续适用。
@@ -29,6 +39,8 @@ Executor Host 是平台无关 Interface，负责按准确 Local Delivery Workspa
 关闭启动终端不结束 Executor。linger 仅提供退出最后一个登录会话后的 Logout Persistence，是可选能力，不由安装器自动启用。systemd 不自动 restart Executor，主机重启也不自动重放 Delivery Run。Executor 在 Human Gate、Operator Stop、Execution Failure、Supervision Timeout Pause、`completed` 或 `abandoned` 后退出；没有自动工作时不存在 agent-run 后台进程。
 
 Task Control Record 使用任务级短锁，Run state 与共享索引也只在读取、验证、原子提交期间持锁。任何 Agent、Git、GitHub、Publisher、sleep 或外部监督都不得在共享状态锁内运行。Executor 是当前 Delivery Task 的唯一业务写者；每次 Agent、Git 或 Publisher 副作用前必须短事务重验 ownership、generation、currentness 与 Stop/Abandon 控制栅栏，既防止旧快照覆盖，也防止已经失去授权的 Executor继续产生外部副作用。Stop/Abandon 栅栏后只允许已在途的单个 Publisher operation 完成或进入对账，不能继续后续链式 mutation。
+
+内部已授权操作遇到任务控制锁短暂占用时，在统一的有限期限内等待锁；取得锁后重新读取并验证执行身份。等待只重试获取锁，不重放事务体、通知回调或外部写入。外部新 Action 的非阻塞准入保持不变。持续抢锁失败与 ownership 已失效分别处理：可保存的单票故障局部暂停；无法继续保证共享执行安全时，关闭准入、保存准确故障并通过既有通知入口反馈，再完成退出收尾。
 
 每个 Executor Session 使用启动它的 lifecycle 命令所在终端的用户环境快照，使项目 PATH、虚拟环境、代理、自定义 SDK 与本机工具保持一致。快照通过仅当前用户可读、大小有界、绑定准确 Action/generation 且只能消费一次的临时载体传递，不进入 Run state、history、unit metadata 或日志；握手、确定失败、冲突收口、Host 证明退出或不长于握手窗口的截止时间都会删除载体，迟到 generation 不能消费。Worker 从该环境派生项目能力，但 agent-run 自有 Publisher 凭证、控制 capability、Task Control、Runner 管理和 lifecycle mutation 入口必须被机制性遮蔽；这是 ADR 0001 trusted-yolo 合同的窄控制面例外，不是通用文件系统 sandbox。
 

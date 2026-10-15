@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agent_invocation import canonical_fingerprint
+from agent_run.review_evidence import candidate_run_review_identity, review_record_matches
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitError, GitRepository
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import uses_merge_resolution
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state_contract import require_candidate_acceptance_history
 
 
@@ -39,11 +41,13 @@ class CandidateRunAcceptance:
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
+        *, review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        default_base = str(job["default_base_sha"])
-        candidate_sha = str(job["candidate_sha"])
+        source = {**job, **review_context["binding"]} if review_context is not None else job
+        default_base = str(source["default_base_sha"])
+        candidate_sha = str(source["candidate_sha"])
         candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
-        self._require_merge_resolution_parents(job, candidate_sha)
+        self._require_merge_resolution_parents(source, candidate_sha)
         expected_merge_tree = self.git.expected_merge_tree(
             default_head_sha=default_base,
             run_head_sha=candidate_sha,
@@ -51,17 +55,17 @@ class CandidateRunAcceptance:
         record = {
             "acceptance_scope": "run",
             "acceptance_state": "candidate",
-            "reviewed_base_sha": job["base_sha"],
+            "reviewed_base_sha": source["base_sha"],
             "reviewed_default_base_sha": default_base,
             "reviewed_candidate_sha": candidate_sha,
             "reviewed_candidate_tree": candidate_tree,
-            "repair_base_run_head_sha": job["base_sha"],
+            "repair_base_run_head_sha": source["base_sha"],
             "expected_merge_tree": expected_merge_tree,
-            "parent_revision": job["parent_revision"],
-            "ticket_graph_revision": job["ticket_graph_revision"],
-            "ticket_completion_records": deepcopy(job["ticket_completion_records"]),
+            "parent_revision": source["parent_revision"],
+            "ticket_graph_revision": source["ticket_graph_revision"],
+            "ticket_completion_records": deepcopy(source["ticket_completion_records"]),
             "reviewer_thread_id": reviewer_thread_id,
-            "repair_source": job["repair_source"],
+            "repair_source": source["repair_source"],
             "artifact": deepcopy(artifact),
         }
         history = require_candidate_acceptance_history(
@@ -76,20 +80,20 @@ class CandidateRunAcceptance:
         }[artifact_outcome]
         entry = {
             "candidate_sha": candidate_sha,
-            "repair_base_run_head_sha": str(job["base_sha"]),
+            "repair_base_run_head_sha": str(source["base_sha"]),
             "default_base_sha": default_base,
             "candidate_tree": candidate_tree,
             "expected_merge_tree": expected_merge_tree,
-            "parent_revision": job["parent_revision"],
-            "ticket_graph_revision": job["ticket_graph_revision"],
+            "parent_revision": source["parent_revision"],
+            "ticket_graph_revision": source["ticket_graph_revision"],
             "ticket_completion_records_fingerprint": canonical_fingerprint(
-                job["ticket_completion_records"]
+                source["ticket_completion_records"]
             ),
             "reviewer_thread_id": reviewer_thread_id,
             "development_thread_id": job.get("development_thread_id"),
             "pr_number": job.get("pr_number"),
             "integrated_sha": job.get("integrated_sha"),
-            "repair_source": job["repair_source"],
+            "repair_source": source["repair_source"],
             "outcome": history_outcome,
         }
         require_candidate_acceptance_history(
@@ -106,26 +110,16 @@ class CandidateRunAcceptance:
         if not isinstance(default_base, str) or not isinstance(candidate_sha, str):
             return False
         try:
-            candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
             self._require_merge_resolution_parents(job, candidate_sha)
-            expected_merge_tree = self.git.expected_merge_tree(
-                default_head_sha=default_base,
-                run_head_sha=candidate_sha,
-            )
+            identity = candidate_run_review_identity(state, job, self.git)
         except (GitError, ValueError):
             return False
         return (
-            acceptance.get("acceptance_scope") == "run"
-            and acceptance.get("acceptance_state") == "candidate"
-            and acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_default_base_sha") == default_base
-            and acceptance.get("repair_base_run_head_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_candidate_sha") == candidate_sha
-            and acceptance.get("reviewed_candidate_tree") == candidate_tree
-            and acceptance.get("expected_merge_tree") == expected_merge_tree
+            review_record_matches(acceptance, identity)
             and self._default_head(state) == default_base
-            and self.git.resolve(str(state["run_branch"]))
-            in {job.get("base_sha"), job.get("integrated_sha")}
+            and repair_run_branch_is_current(
+                self.git, job, self.git.resolve(str(state["run_branch"]))
+            )
         )
 
     def promotion_record(
@@ -138,7 +132,6 @@ class CandidateRunAcceptance:
             artifact = AcceptanceArtifact.parse(record.get("artifact"))
             default_base = str(job["default_base_sha"])
             candidate_sha = str(job["candidate_sha"])
-            repair_base = str(job["base_sha"])
             candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
             integrated_tree = self.git.resolve(f"{integrated}^{{tree}}")
             run_tree = self.git.resolve(f"{state['run_branch']}^{{tree}}")
@@ -151,21 +144,14 @@ class CandidateRunAcceptance:
                 run_head_sha=integrated,
             )
             self._require_merge_resolution_parents(job, candidate_sha)
+            identity = candidate_run_review_identity(state, job, self.git)
         except (GitError, KeyError, TypeError, ValueError):
             return None
-        parent_revision = _mapping(state, "parent").get("revision")
-        graph_revision = _mapping(state, "ticket_graph").get("revision")
-        completions = ticket_completion_records(state)
         if (
-            not artifact.is_accepted
-            or record.get("acceptance_scope") != "run"
-            or record.get("acceptance_state") != "candidate"
-            or record.get("reviewed_base_sha") != repair_base
-            or record.get("repair_base_run_head_sha") != repair_base
-            or record.get("reviewed_default_base_sha") != default_base
-            or record.get("reviewed_candidate_sha") != candidate_sha
-            or record.get("reviewed_candidate_tree") != candidate_tree
-            or record.get("expected_merge_tree") != candidate_expected_merge_tree
+            integrated != candidate_sha
+            or not self.git.is_ancestor(str(job["base_sha"]), candidate_sha)
+            or not artifact.is_accepted
+            or not review_record_matches(record, identity)
             or expected_merge_tree != candidate_expected_merge_tree
             or self._default_head(state) != default_base
             or self.git.resolve(str(state["run_branch"])) != integrated
@@ -175,9 +161,6 @@ class CandidateRunAcceptance:
                 uses_merge_resolution(job)
                 and not self.git.is_ancestor(default_base, integrated)
             )
-            or record.get("parent_revision") != parent_revision
-            or record.get("ticket_graph_revision") != graph_revision
-            or record.get("ticket_completion_records") != completions
         ):
             return None
         promoted = dict(record)
@@ -197,9 +180,11 @@ class CandidateRunAcceptance:
     ) -> None:
         if not uses_merge_resolution(job):
             return
-        expected = [str(job["base_sha"]), str(job["default_base_sha"])]
-        if self.git.commit_parents(candidate_sha) != expected:
-            raise GitError("Merge-resolution Candidate parents do not match its boundary")
+        if not (
+            self.git.is_ancestor(str(job["base_sha"]), candidate_sha)
+            and self.git.is_ancestor(str(job["default_base_sha"]), candidate_sha)
+        ):
+            raise GitError("Merge-resolution Candidate lacks a required boundary ancestor")
 
     def _default_head(self, state: dict[str, Any]) -> str:
         return self.default_head_sha or str(_mapping(state, "base")["sha"])

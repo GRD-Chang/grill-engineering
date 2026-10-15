@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.run_scenarios import _accepted_run
+
 import json
 from pathlib import Path
 from typing import Any
@@ -9,9 +11,9 @@ from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import seed_idle_control, seed_run
+from support.seeding import seed_idle_control, seed_run
 from support.workspace import managed_repo, managed_state, prepare_workspace
-from run_publication_test_support import InvocationRunPublicationAgents, _accepted_run
+from support.run_publication import InvocationRunPublicationAgents
 
 
 def prepare_accepted_run(
@@ -34,7 +36,7 @@ def prepare_accepted_run(
     integration = state["ticket_jobs"][str(ticket_number)]["deterministic_integration_record"]
     pulls = data["delivery"].setdefault("pull_requests", [])
     # FixtureGitHubPublisher allocates len(pulls) + 1. Preserve the historical
-    # Ticket PR so Final and Repair PRs cannot reuse its integration identity.
+    # Ticket PR so the Final PR cannot reuse its integration identity.
     assert integration["pr_number"] == integration["pr"]["number"] == len(pulls) + 1
     pulls.append({
         **integration["pr"],

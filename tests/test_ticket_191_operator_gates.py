@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_artifacts import _canonical_run_budget, _repair_artifact
+from support.run_scenarios import _completed_run
+
 import json
 from copy import deepcopy
 from contextlib import nullcontext
@@ -10,24 +13,24 @@ import pytest
 from support.workspace import managed_repo, managed_state, prepare_workspace
 
 import agent_run.cli as cli_module
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_retry import MAX_READ_ATTEMPTS
 from agent_run.state import StateStore
-from cli_run_supervision_support import _parent_only_agents
-from conftest import seed_run, write_fixture
-from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
-from test_cli_delivery import final_run_agents, parent_round_agents, ticket
-from test_ticket_191_resume import (
+from support.cli_supervision import _parent_only_agents
+from support.seeding import seed_run, write_fixture
+from support.cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
+from support.cli_payloads import final_run_agents, parent_round_agents, ticket
+from support.resume import (
     _assert_production_run_rejects_before_readiness,
     _establish_ordinary_run_boundary,
     _tree_snapshot,
 )
-from run_acceptance_test_support import (
-    _canonical_run_budget,
-    _completed_run,
-    _repair_artifact,
-)
+
+from support.state import only_run_ref, snapshot_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize(
@@ -87,6 +90,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": budget,
         "review_budget_history": [],
+        "ci_recovery": new_ticket_ci_recovery_budget() if subject_location == "ticket" else new_ci_recovery_budget(),
     }
     if subject_location == "ticket":
         job = state["ticket_jobs"]["2"]
@@ -115,7 +119,10 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
                     "phase": "ready_for_human",
                     "repair_generation": 1,
                     "repair_job": {
-                        **subject,
+                        **{
+                            key: value for key, value in subject.items()
+                            if key not in {"review_budget", "review_budget_history", "ci_recovery"}
+                        },
                         "repair_mode": "squash",
                         "repair_source": "acceptance",
                         "acceptance_artifact": _repair_artifact(),
@@ -127,7 +134,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
             )
         state["run_acceptance"] = acceptance
     state.update({"status": "blocked", "terminal_kind": "waiting_human"})
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
     fixture = managed_repo(git_repo) / "github.json"
@@ -171,6 +178,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
+        "ci_recovery": new_ticket_ci_recovery_budget() if subject_location == "ticket" else new_ci_recovery_budget(),
     }
     subject["review_budget"]["checkpoint_reason"] = "review_budget_exhausted"
     if subject_location == "ticket":
@@ -210,7 +218,10 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
             "development_thread_history": [],
             "repair_generation": 1,
             "repair_job": {
-                **subject,
+                **{
+                    key: value for key, value in subject.items()
+                    if key not in {"review_budget", "review_budget_history", "ci_recovery"}
+                },
                 "repair_mode": "squash",
                 "repair_source": "acceptance",
                 "acceptance_artifact": _repair_artifact(),
@@ -229,7 +240,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
     state.update(
         {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
     )
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
     fixture = managed_repo(git_repo) / "github.json"
@@ -296,7 +307,7 @@ def test_production_run_locates_configured_data_root_gate_before_readiness(
     state.update(
         {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
     )
-    StateStore(state_root).save_run(str(state["run_id"]), state)
+    persist_run_fixture(StateStore(state_root), str(state["run_id"]), state)
 
     _assert_production_run_rejects_before_readiness(
         git_repo,
@@ -378,9 +389,9 @@ def _assert_run_preserves_boundary(
     run_arguments: tuple[str, ...],
 ) -> None:
     state_root = managed_state(git_repo)
-    state_path = next((state_root / "runs").glob("*.json"))
+    state_ref = only_run_ref(state_root)
     control_path = next((state_root / "task-control").glob("*.json"))
-    state_before = state_path.read_bytes()
+    state_before = snapshot_run(state_ref)
     control_before = control_path.read_bytes()
     control_document_before = json.loads(control_before)
     tree_before = _tree_snapshot(state_root)
@@ -404,7 +415,7 @@ def _assert_run_preserves_boundary(
 
     assert rejected.returncode == 2, rejected.stderr
     assert stdout_json(rejected)["status"] == expected_status
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert control_path.read_bytes() == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert fixture.read_bytes() == fixture_before
@@ -448,7 +459,7 @@ def test_ordinary_run_preserves_parent_budget_checkpoint(
     if blocked_reason == "modification_budget_exhausted":
         state["parent_job"]["blocked_reason"] = blocked_reason
         state["parent_job"]["review_budget"]["checkpoint_reason"] = blocked_reason
-        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
+        persist_run_fixture(StateStore(managed_state(git_repo)), str(state["run_id"]), state)
 
     # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
     for run_arguments in (
@@ -484,9 +495,9 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     state_root = managed_state(git_repo)
-    state_path = next((state_root / "runs").glob("*.json"))
+    state_ref = only_run_ref(state_root)
     control_path = next((state_root / "task-control").glob("*.json"))
-    state_before = state_path.read_bytes()
+    state_before = snapshot_run(state_ref)
     control_before = control_path.read_bytes()
     tree_before = _tree_snapshot(state_root)
     unused_agents = _parent_only_agents(git_repo / "unused-agents.json")
@@ -502,7 +513,7 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
 
     assert waiting.returncode == 0, waiting.stderr
     assert stdout_json(waiting)["status"] == "waiting_external"
-    assert state_path.read_bytes() == state_before
+    assert snapshot_run(state_ref) == state_before
     assert control_path.read_bytes() == control_before
     assert _tree_snapshot(state_root) == tree_before
     assert json.loads(fixture.read_text(encoding="utf-8"))[
@@ -583,7 +594,7 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
         state.update(
             {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
         )
-        states.save_run(str(state["run_id"]), state)
+        persist_run_fixture(states, str(state["run_id"]), state)
         fixture = managed_repo(git_repo) / "github.json"
 
     state_root = managed_state(git_repo)
@@ -675,12 +686,13 @@ def test_ordinary_run_preserves_requeue_required_boundary(
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
+            "ci_recovery": new_ticket_ci_recovery_budget(),
             "effective_revision": "stale-revision",
             "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
     )
     state["ticket_jobs"] = {"3": job}
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     stale = run_cli(git_repo, fixture, "run", "1")
     assert stale.returncode == 2, stale.stderr
     assert stdout_json(stale)["status"] == "requeue_required"

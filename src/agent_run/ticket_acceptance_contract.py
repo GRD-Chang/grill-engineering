@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_run.review_evidence import review_record_matches
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.review_budget import ensure_budget
@@ -21,7 +22,7 @@ def _require_accepted_integration_authorization(
         "reviewed_candidate_tree": record["candidate_tree"],
         "effective_revision": record["effective_revision"],
     }
-    if any(authorization.get(key) != value for key, value in expected.items()):
+    if not review_record_matches(authorization, expected):
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.acceptance_record boundary is invalid"
         )
@@ -80,6 +81,9 @@ def _require_accepted_ticket_review_authorization(
     location: str,
 ) -> None:
     _require_accepted_integration_authorization(authorization, record, location)
+    if job.get("attempt_kind") == "ci_repair":
+        _require_ci_reviewer_authorization(authorization, job, location)
+        return
     try:
         budget = ensure_budget(job, ticket_budget_policy_for_job(job))
     except (KeyError, TypeError, ValueError) as error:
@@ -136,4 +140,49 @@ def _require_accepted_ticket_review_authorization(
     if not matching:
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.accepted publication is not bound to a matching Review Artifact"
+        )
+
+
+def _require_ci_reviewer_authorization(
+    authorization: dict[str, Any], job: dict[str, Any], location: str
+) -> None:
+    """A reviewed CI round uses its own real Reviewer record and quota."""
+
+    recovery = job.get("ci_recovery")
+    if not isinstance(recovery, dict) or (
+        recovery.get("review_required") is not True
+        or recovery.get("repair_pending") is not True
+        or type(recovery.get("developments_used")) is not int
+        or recovery["developments_used"] < 1
+        or not isinstance(recovery.get("failure_head"), str)
+        or not recovery["failure_head"]
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.CI Reviewer authority is outside a reviewed recovery round"
+        )
+    count = recovery.get("reviewer_invocations")
+    artifacts = recovery.get("review_artifacts")
+    if (
+        type(count) is not int
+        or count < 1
+        or not isinstance(artifacts, list)
+        or not 1 <= len(artifacts) <= count
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.CI Reviewer invocation and Artifact counts differ"
+        )
+    expected = {
+        "reviewer_thread_id": authorization.get("reviewer_thread_id"),
+        "candidate_sha": authorization.get("reviewed_candidate_sha"),
+        "reviewed_base_sha": authorization.get("reviewed_base_sha"),
+        "review_identity": {
+            "reviewed_base_sha": authorization.get("reviewed_base_sha"),
+            "reviewed_candidate_sha": authorization.get("reviewed_candidate_sha"),
+            "reviewed_candidate_tree": authorization.get("reviewed_candidate_tree"),
+        },
+        "artifact": authorization.get("artifact"),
+    }
+    if artifacts[-1] != expected:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.accepted publication is not bound to the latest CI Review Artifact"
         )

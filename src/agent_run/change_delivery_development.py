@@ -3,18 +3,26 @@ from __future__ import annotations
 """Development and Candidate commit stage for Change Delivery."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
-from agent_run.agents import HumanBlockerResult
-from agent_run.artifacts import clear_current_human_blocker
+from agent_run.delivery_budget import delivery_budget_owner
+
+from agent_run.agents import DevelopmentResult, HumanBlockerResult
+from agent_run.agent_execution import execute_agent_work, select_development_thread
+from agent_run.artifacts import AcceptanceArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.ci_recovery_budget import (
+    ci_limit_for_job,
+    ci_repair_budget_context,
+    refund_ci_repair_without_candidate,
+    observe_repairable_ci_failure,
+)
 from agent_run.change_delivery_fallback import (
     preserve_required_checks_publication_authorization,
 )
 from agent_run.change_delivery_threads import (
     record_development_thread as _record_development_thread,
-    select_development_thread,
     require_development_thread,
 )
 from agent_run.credential_availability import (
@@ -22,9 +30,11 @@ from agent_run.credential_availability import (
     resume_initial_credential_wait,
     wait_for_initial_credential as wait_for_initial_credential_state,
 )
+from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git_errors import GitError, GitIntegrityError
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_budget import repair_budget_context
+from agent_run.integration_development_budget import acquire_integration_development
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -58,8 +68,8 @@ def develop(
         isinstance(pending, int)
         and pending > int(job.get("modification_attempts", 0))
     )
-    if not pending_resume:
-        stage.mark_development_attempt(job, attempt_kind=attempt_kind)
+    if not pending_resume and attempt_kind != "integration":
+        stage.mark_development_attempt(state, job, attempt_kind=attempt_kind)
     # Persist the actual Worker attempt before invoking Codex.  This
     # makes a foreground status query truthful even while Codex is still
     # running, and leaves an observable recovery boundary on interruption.
@@ -73,7 +83,8 @@ def develop(
     else:
         job["managed_checkout_head"] = stage.git.checkout_head(checkout)
     work_subject, generation = stage.adapter.invocation_identity(state, job)
-    budget = job.get("review_budget")
+    owner = delivery_budget_owner(state, job)
+    budget = owner.get("integration_development_budget" if attempt_kind == "integration" else "review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Development is missing its Review Budget Window")
     new_semantic_attempt = pending_semantic_attempt(job, role="development") is None
@@ -84,8 +95,16 @@ def develop(
         generation=generation,
         currentness_boundary=stage._invocation_boundary(job),
         ordinal=attempt,
-        budget_window=int(budget["window"]),
+        budget_owner=owner,
+        budget_window=int(
+            delivery_budget_owner(state, job)["ci_recovery"]["window"]
+            if attempt_kind == "ci_repair"
+            else budget["window"]
+        ),
     )
+    if attempt_kind == "integration":
+        acquire_integration_development(job, attempt_id=semantic_attempt["attempt_id"],
+            policy_snapshot=job["policy_snapshot"])
     select_development_thread(state, job, new_attempt=new_semantic_attempt)
     intent = job.get("candidate_commit_intent")
     if not (
@@ -103,25 +122,38 @@ def develop(
         }
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
-    request["_prompt_resources"] = state["prompt_resources"]
-    if request.get("repair_source") is not None:
-        request["review_budget_context"] = repair_budget_context(
-            job, stage.review_budget_policy()
+    if attempt_kind == "ci_repair":
+        request["attempt_kind"] = "ci_repair"
+        request["work_source"] = "ci"
+        request["ci_evidence"] = job.get("ci_evidence")
+        request["ci_failure_context"] = job.get("required_checks_origin")
+    if request.get("repair_source") is not None and attempt_kind != "integration":
+        if attempt_kind == "ci_repair" and (
+            not stage.contract.label.startswith("ticket-")
+            or delivery_budget_owner(state, job)["ci_recovery"]["review_required"]
+        ):
+            limit = ci_limit_for_job(job)
+            request["review_budget_context"] = ci_repair_budget_context(
+                delivery_budget_owner(state, job),
+                limit=limit,
+                is_ticket=stage.contract.label.startswith("ticket-"),
+            )
+        elif attempt_kind != "ci_repair":
+            request["review_budget_context"] = repair_budget_context(
+                delivery_budget_owner(state, job), stage.review_budget_policy()
+            )
+    try:
+        result = cast(
+            DevelopmentResult | HumanBlockerResult,
+            execute_agent_work(
+                state, job, request, semantic_attempt,
+                agents=stage.agents, save=stage.save, phase=str(job["phase"]),
+                boundary=stage._invocation_boundary(job),
+                is_current=lambda: stage._agent_is_current(state, job),
+            ),
         )
-    request["_invocation_event"] = stage._invocation_events(
-        state,
-        job,
-        request,
-        role="development",
-        phase=str(job["phase"]),
-        semantic_attempt=semantic_attempt,
-    )
-    request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
-    if job.get("development_new_thread") is True:
-        request["_invocation_mode"] = "new-thread"
-    elif job.get("development_failure_resume") is True:
-        request["_invocation_mode"] = "resume"
-    result = stage.agents.develop(request)
+    finally:
+        stage.release_agent_work()
     require_development_thread(
         job, result.thread_id, requested_thread=request.get("thread_id")
     )
@@ -169,6 +201,7 @@ def wait_for_initial_credential(
         resume_status=str(state.get("status", "active")),
         http_status=http_status,
     )
+    ensure_supervision_window(state)
     stage.save(state)
 
 
@@ -248,9 +281,36 @@ def commit_candidate(
                 outcome="no_code_changes",
                 result=_development_attempt_result(job),
             )
+        if job.get("pending_attempt_kind") == "ci_repair":
+            job["modification_attempts"] = attempt
+            limit = ci_limit_for_job(job)
+            refund_ci_repair_without_candidate(
+                delivery_budget_owner(state, job),
+                limit=limit,
+                is_ticket=stage.contract.label.startswith("ticket-"),
+            )
+        ticket_ci = job.get("pending_attempt_kind") == "ci_repair"
         job.pop("controller_candidate_reprepare", None)
         job.pop("pending_attempt", None)
+        job.pop("pending_attempt_kind", None)
         job.pop("candidate_commit_intent", None)
+        if ticket_ci:
+            # The completed investigation stays charged. Explicit resume starts
+            # new CI work, never reopens the closed semantic attempt.
+            job["attempt_kind"] = "ci_repair"
+            job["next_attempt_kind"] = "ci_repair"
+            decision = observe_repairable_ci_failure(
+                delivery_budget_owner(state, job), head_sha=delivery_budget_owner(state, job)["ci_recovery"]["failure_head"],
+                limit=limit, is_ticket=stage.contract.label.startswith("ticket-"),
+            )
+            if decision != "exhausted":
+                job["phase"] = "repairing"
+                job["pause_resume_phase"] = "repairing"
+            return stage._block(
+                state, job,
+                "ci_development_budget_exhausted" if decision == "exhausted" else "ci_investigation_paused",
+                "CI investigation produced no code changes; explicit resume is required",
+            )
         return stage._block(
             state,
             job,
@@ -269,6 +329,13 @@ def commit_candidate(
         }
     )
     job.pop("next_attempt_kind", None)
+    if job["attempt_kind"] == "integration":
+        # Integration findings go back to Git checks before any next review.
+        job["phase"] = "accepted"
+        if isinstance(job.get("acceptance_record"), dict) and AcceptanceArtifact.parse(job["acceptance_record"].get("artifact")).is_accepted:
+            job["previous_parent_acceptance_record"] = job["acceptance_record"]
+        job.pop("acceptance_record", None)
+        job.pop("approval_grant", None)
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
     semantic_attempt = pending_semantic_attempt(job, role="development")
@@ -296,6 +363,8 @@ def _route_git_integrity_repair(
 ) -> bool:
     """Return an integrity finding to the same Development Thread."""
 
+    integration_work = job.get("pending_attempt_kind") == "integration"
+
     expected_head = evidence.get("expected_head") or job.get("managed_checkout_head")
     if not isinstance(expected_head, str) or not expected_head:
         raise GitError("Git Integrity Repair is missing its legal checkout boundary")
@@ -315,22 +384,30 @@ def _route_git_integrity_repair(
 
     evidence["recovery_head"] = expected_head
     evidence["recovery_action"] = "controller_reset_and_clean"
+    ticket_ci_work = job.get("pending_attempt_kind") == "ci_repair"
     job["git_integrity_evidence"] = evidence
     job["repair_source"] = "git_integrity"
-    job.pop("ci_evidence", None)
+    if not ticket_ci_work and stage.contract.label.startswith("ticket-"):
+        job.pop("ci_evidence", None)
     clear_required_checks_observation(job)
-    job.pop("final_ci_fix_failure_head", None)
+    if not ticket_ci_work and stage.contract.label.startswith("ticket-"):
+        job.pop("final_ci_fix_failure_head", None)
     job["phase"] = "repairing"
     job["managed_checkout_head"] = expected_head
     job["modification_attempts"] = int(job["pending_attempt"])
     job["code_modification_attempts"] = int(job["pending_attempt"])
-    job["attempt_kind"] = "ordinary"
+    job["attempt_kind"] = "ci_repair" if ticket_ci_work else "ordinary"
     job.pop("candidate_sha", None)
     job.pop("acceptance_record", None)
     job.pop("acceptance_artifact", None)
     job.pop("pending_attempt", None)
     job.pop("pending_attempt_kind", None)
-    job.pop("next_attempt_kind", None)
+    if ticket_ci_work:
+        job["next_attempt_kind"] = "ci_repair"
+    elif integration_work:
+        job["next_attempt_kind"] = "integration"
+    else:
+        job.pop("next_attempt_kind", None)
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
     semantic_attempt = pending_semantic_attempt(job, role="development")

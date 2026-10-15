@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.delivery_facts import current_work_subject, scheduler_progress
+
 from agent_run.messages import display_text
 
 from dataclasses import dataclass
@@ -7,7 +9,10 @@ from math import isfinite
 from typing import Any, TypeGuard
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending
-from agent_run.presentation_helpers import current_work_subject, human_pause_reason, unknown_execution_guidance
+from agent_run.presentation_helpers import (
+    human_pause_reason,
+    unknown_execution_guidance,
+)
 
 
 @dataclass(frozen=True)
@@ -17,6 +22,12 @@ class WaitingPresentation:
     guidance: str
     show_command: bool
     details: tuple[tuple[str, str], ...]
+
+
+def scheduler_notice(scheduler: object) -> str | None:
+    if isinstance(scheduler, dict) and scheduler.get("activity") == "draining":
+        return display_text('presentation.status.scheduler_draining')
+    return None
 
 
 def cleanup_instruction(state: dict[str, Any]) -> str | None:
@@ -33,17 +44,18 @@ def waiting_presentation(
 ) -> WaitingPresentation | None:
     """Describe the current external wait without inferring Agent activity."""
     status = state.get("status")
+    selected = current_work_subject(state)
+    subject = selected[1] if selected is not None else {}
+    ticket_timeout = status == "blocked" and subject.get("blocked_reason") == "ticket_supervision_timeout"
     if status not in {
         "waiting_checks", "waiting_external", "waiting_merge", "supervision_timeout",
-    }:
+    } and not ticket_timeout:
         return None
     raw = state.get("supervision_wait") or state.get("supervision_window")
     window = raw if isinstance(raw, dict) else {}
     snapshot = audit.get("supervision")
     wait = snapshot if isinstance(snapshot, dict) else {}
     checks = status == "waiting_checks" or window.get("kind") == "required_checks"
-    selected = current_work_subject(state)
-    subject = selected[1] if selected is not None else {}
     number = subject.get("pr_number")
     target = f"PR #{number}" if type(number) is int else "GitHub"
     work = (
@@ -56,8 +68,11 @@ def waiting_presentation(
         work = display_text('presentation.status.waiting_for_working_credentials_to_become_available')
     control = audit.get("executor_control")
     activity = control.get("activity") if isinstance(control, dict) else "unknown"
-    timed_out = status == "supervision_timeout"
-    if timed_out:
+    timed_out = status == "supervision_timeout" or ticket_timeout
+    if scheduler_progress(control)["activity"] == "draining":
+        description = display_text('presentation.status.scheduler_draining')
+        guidance = display_text('presentation.status.scheduler_resume_after_exit')
+    elif timed_out:
         description = display_text('presentation.status.automatic_waiting_timed_out_for_this_round')
         guidance = display_text('presentation.status.run_the_following_command_to_resume_waiting')
     elif activity == "running":

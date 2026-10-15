@@ -9,6 +9,10 @@ import pytest
 from support.workspace import managed_state
 
 from agent_run.delivery_history import history_records
+from agent_run.object_state import save_owned
+from support.cli import replace_only_run_state
+
+from support.state import include_in_state_snapshot
 
 
 def check_event(minute: int, result: str = "pending", **changes: Any) -> dict[str, Any]:
@@ -93,7 +97,7 @@ def test_state_store_retains_future_check_identity_without_repeating_details(tmp
     }
     store.save_run("run-example", state)
     state["run_publication"]["required_checks_observed_at"] = "2026-09-12T04:04:00+00:00"
-    store.save_run("run-example", state)
+    save_owned(store, "run-example", state, fields={"run_publication"})
     persisted = store.load_run("run-example")
     first, second = persisted["timeline"]
     assert first["required_checks_head_sha"] == "accepted-head"
@@ -102,7 +106,7 @@ def test_state_store_retains_future_check_identity_without_repeating_details(tmp
     assert first["required_checks_evidence"]["checks"][0]["name"] == "unit"
     assert "required_checks_evidence" not in second
     state["run_publication"]["required_checks_evidence"]["checks"][0]["link"] = "https://github.com/o/r/actions/runs/1/job/3"
-    store.save_run("run-example", state)
+    save_owned(store, "run-example", state, fields={"run_publication"})
     timeline = store.load_run("run-example")["timeline"]
     assert timeline[-1]["required_checks_run_identity"] != first["required_checks_run_identity"]
     records = history_records(state, {"timeline": timeline})
@@ -195,7 +199,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
 
     from rich.text import Text
     from agent_run.cli import main
-    from conftest import seed_run, write_fixture
+    from support.seeding import seed_run, write_fixture
 
     class Terminal(StringIO):
         def isatty(self) -> bool:
@@ -205,17 +209,14 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
     started = seed_run(git_repo, fixture, idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    state_path = managed_state(git_repo) / "runs" / f"{run_id}.json"
-    state = json.loads(state_path.read_text())
     events = [check_event(0), check_event(4), check_event(13, "pass")]
     events[-1]["required_checks_evidence"] = {"checks": [{
         "name": "quality", "bucket": "pass", "link": "https://github.com/o/r/actions/runs/1/job/2",
     }]}
-    state["timeline"] = events
-    state_path.write_text(json.dumps(state))
+    replace_only_run_state(git_repo, lambda state: state.update(timeline=events))
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "120")
-    before = {path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*") if path.is_file()}
+    before = {path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*") if path.is_file() and include_in_state_snapshot(path)}
     for arguments in (["--plain"], ["--plain", "--details"], [], ["--details"]):
         output = Terminal()
         with redirect_stdout(output):
@@ -258,7 +259,6 @@ def test_approval_waits_keep_generation_budget_and_revocation_boundaries(changed
 @pytest.mark.parametrize("owner,expected_subject", [
     ("active_ticket_job", "ticket:3"),
     ("parent_job", "parent-only:run-example"),
-    ("repair_job", "run-repair:run-example"),
     ("run_publication", "run-publication:run-example"),
 ])
 def test_persisted_waits_bind_the_actual_owner_generation_and_budget(
@@ -293,30 +293,34 @@ def test_persisted_waits_bind_the_actual_owner_generation_and_budget(
     assert event["required_checks_head_sha"] == "head-1"
 
 
-def test_active_repair_checks_do_not_inherit_a_stale_publication_owner(tmp_path: Path) -> None:
+def test_pending_repair_write_does_not_inherit_stale_final_pr_checks(tmp_path: Path) -> None:
     from agent_run.state import StateStore
 
-    stale_publication = {
-        "phase": "stale", "pr_number": 236,
-        "required_checks_evidence": {"pr_number": 236, "head_sha": "stale-head", "result": "pass", "checks": []},
-    }
-    repair = {
-        "phase": "waiting_checks", "repair_generation": 2, "pr_number": 237,
-        "review_budget": {"window": 3},
-        "required_checks_evidence": {"pr_number": 237, "head_sha": "repair-head", "result": "pending", "checks": []},
-    }
     state = {
-        "run_id": "run-example", "status": "waiting_checks",
-        "run_publication": stale_publication,
+        "run_id": "run-example", "status": "ready_for_human",
+        "run_publication": {
+            "phase": "stale", "pr_number": 236,
+            "required_checks_evidence": {
+                "pr_number": 236, "head_sha": "stale-head", "result": "pass", "checks": [],
+            },
+        },
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 1,
-            "review_budget": {"window": 3}, "repair_job": repair,
+            "review_budget": {"window": 3},
+            "repair_job": {
+                "phase": "blocked", "blocked_reason": "run_branch_write_failed",
+                "repair_generation": 2, "candidate_sha": "repair-head",
+                "run_branch_write_intent": {"candidate_sha": "repair-head"},
+            },
         },
     }
     store = StateStore(tmp_path)
     store.save_run("run-example", state)
     event = store.load_run("run-example")["timeline"][-1]
-    assert event["pr_number"] == 237
-    assert event["required_checks_head_sha"] == "repair-head"
+    assert event.get("pr_number") is None
+    assert event.get("required_checks_head_sha") is None
+    assert event["github_write_action"] == "update_run_branch"
+    assert event["commit_sha"] == "repair-head"
     assert event["history_work_subject"] == "run-repair:run-example"
     assert event["history_generation"] == 2
+    assert event["history_budget_window"] == 3

@@ -2,18 +2,14 @@ from __future__ import annotations
 
 """User-level Delivery Policy resolution and immutable Run snapshots."""
 
-import fcntl
-import json
 import math
-import os
 import re
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from functools import lru_cache
 
 from agent_run.messages import error_message
-from typing import Any
+from typing import Any, cast
 
 from agent_run.review_budget import (
     PARENT_ONLY_POLICY,
@@ -23,17 +19,33 @@ from agent_run.review_budget import (
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 3
+DELIVERY_POLICY_PROTOCOL = 9
 _POLICY_KEYS = frozenset(
     {
+        "ticket_development_workers",
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "integration_resync_limit",
+        "ticket_integration_development_limit",
+        "ticket_ci_development_limit",
+        "ticket_ci_review",
+        "parent_ci_development_limit",
         "development_thread_policy",
         "invocation_deadlines",
     }
 )
 _DEADLINE_KEYS = frozenset({"development", "review", "publication"})
+_LEGACY_POLICY_KEYS = _POLICY_KEYS - {"development_thread_policy"}
+_POLICY_SCALAR_FIELDS = (
+    "parent_only_paired_rounds", "run_repair_rounds", "ticket_review_rounds",
+    "ticket_development_workers", "integration_resync_limit",
+    "ticket_integration_development_limit", "ticket_ci_development_limit",
+    "ticket_ci_review", "parent_ci_development_limit", "development_thread_policy",
+)
+_DEADLINE_FIELDS = ("development", "review", "publication")
+_PolicyScalar = bool | int | float | str
+_PolicyCacheKey = tuple[tuple[type[object], _PolicyScalar], ...]
 _DURATION_PATTERN = re.compile(
     r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([smhd]?)\s*$", re.IGNORECASE
 )
@@ -49,8 +61,14 @@ class DeliveryPolicy:
     """Complete policy values captured by one Delivery Run/window."""
 
     ticket_review_rounds: int = 3
+    ticket_development_workers: int = 3
+    integration_resync_limit: int = 3
+    ticket_integration_development_limit: int = 3
+    ticket_ci_development_limit: int = 3
+    ticket_ci_review: bool = False
+    parent_ci_development_limit: int = 3
     parent_only_paired_rounds: int = 10
-    run_repair_rounds: int = 10
+    run_repair_rounds: int = 3
     development_deadline_seconds: float = 5 * 60 * 60
     review_deadline_seconds: float = 2 * 60 * 60
     publication_deadline_seconds: float = 60 * 60
@@ -64,6 +82,20 @@ class DeliveryPolicy:
             "ticket_review_rounds",
             _positive_integer(self.ticket_review_rounds, "ticket_review_rounds"),
         )
+        object.__setattr__(
+            self,
+            "ticket_development_workers",
+            _positive_integer(self.ticket_development_workers, "ticket_development_workers"),
+        )
+        object.__setattr__(
+            self,
+            "integration_resync_limit",
+            _nonnegative_integer(self.integration_resync_limit, "integration_resync_limit"),
+        )
+        if type(self.ticket_ci_review) is not bool:
+            raise DeliveryPolicyError("ticket_ci_review must be boolean")
+        for field in ("parent_ci_development_limit", "ticket_integration_development_limit", "ticket_ci_development_limit"):
+            object.__setattr__(self, field, _positive_integer(getattr(self, field), field))
         object.__setattr__(
             self,
             "parent_only_paired_rounds",
@@ -92,6 +124,12 @@ class DeliveryPolicy:
             "parent_only_paired_rounds": self.parent_only_paired_rounds,
             "run_repair_rounds": self.run_repair_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
+            "ticket_development_workers": self.ticket_development_workers,
+            "integration_resync_limit": self.integration_resync_limit,
+            "ticket_integration_development_limit": self.ticket_integration_development_limit,
+            "ticket_ci_development_limit": self.ticket_ci_development_limit,
+            "ticket_ci_review": self.ticket_ci_review,
+            "parent_ci_development_limit": self.parent_ci_development_limit,
             "development_thread_policy": self.development_thread_policy,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -170,6 +208,12 @@ def normalize_policy_overrides(
         "run_repair_rounds": "run_repair_rounds",
         "ticket_review_rounds": "ticket_review_rounds",
         "ticket_review_round": "ticket_review_rounds",
+        "ticket_development_workers": "ticket_development_workers",
+        "integration_resync_limit": "integration_resync_limit",
+        "ticket_integration_development_limit": "ticket_integration_development_limit",
+        "ticket_ci_development_limit": "ticket_ci_development_limit",
+        "ticket_ci_review": "ticket_ci_review",
+        "parent_ci_development_limit": "parent_ci_development_limit",
     }
     flat_deadline_aliases = {
         role: {
@@ -217,21 +261,59 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
     """Parse the complete canonical state snapshot without applying defaults."""
 
     if not isinstance(value, Mapping) or set(value) not in (
-        _POLICY_KEYS, _POLICY_KEYS - {"development_thread_policy"}
+        _POLICY_KEYS, _LEGACY_POLICY_KEYS
     ):
         raise DeliveryPolicyError("Policy Snapshot has an invalid field set")
     deadlines = value.get("invocation_deadlines")
     if not isinstance(deadlines, Mapping) or set(deadlines) != _DEADLINE_KEYS:
         raise DeliveryPolicyError("Policy Snapshot deadlines have an invalid field set")
-    return _policy_from_values(
-        {
-            "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
-            "run_repair_rounds": value.get("run_repair_rounds"),
-            "ticket_review_rounds": value.get("ticket_review_rounds"),
-            "development_thread_policy": value.get("development_thread_policy", "reuse"),
-            "invocation_deadlines": dict(deadlines),
-        }
+    key = _policy_cache_key(value, deadlines)
+    if key is not None:
+        return _cached_policy(key)
+    return _policy_with_deadlines(value, deadlines)
+
+
+def _policy_cache_key(
+    values: Mapping[str, Any], deadlines: Mapping[str, Any],
+) -> _PolicyCacheKey | None:
+    # Custom mappings/values retain their original access and validation path.
+    # Bound retained scalar sizes as well as the number of successful entries.
+    if type(values) is not dict or type(deadlines) is not dict:
+        return None
+    if any(type(field) is not str for field in values) or any(
+        type(field) is not str for field in deadlines
+    ):
+        return None
+    scalars = tuple(values.get(field, "reuse") for field in _POLICY_SCALAR_FIELDS) + tuple(
+        deadlines[field] for field in _DEADLINE_FIELDS
     )
+    key: list[tuple[type[object], _PolicyScalar]] = []
+    for scalar in scalars:
+        scalar_type = type(scalar)
+        if scalar_type is str:
+            if len(scalar) > 128:
+                return None
+        elif scalar_type is int:
+            if scalar.bit_length() > 64:
+                return None
+        elif scalar_type is float:
+            if not math.isfinite(scalar):
+                return None
+        elif scalar_type is not bool:
+            return None
+        key.append((scalar_type, scalar))
+    # Python compares bool/int/float values equal; retain each exact type.
+    return tuple(key)
+
+
+@lru_cache(maxsize=128)
+def _cached_policy(key: _PolicyCacheKey) -> DeliveryPolicy:
+    scalar_count = len(_POLICY_SCALAR_FIELDS)
+    values = dict(zip(_POLICY_SCALAR_FIELDS, (scalar for _, scalar in key[:scalar_count])))
+    deadlines = dict(zip(_DEADLINE_FIELDS, (scalar for _, scalar in key[scalar_count:])))
+    # lru_cache retains only successful immutable results, never exceptions or
+    # the caller's mutable snapshot. Shape checks still run before every hit.
+    return _policy_with_deadlines(values, deadlines)
 
 
 def policy_snapshot_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -331,7 +413,8 @@ def parent_only_budget_policy_for_job(
         # persisted State contract rejects a missing Run Policy Snapshot.
         return PARENT_ONLY_POLICY
     try:
-        return parent_only_budget_policy(parse_policy_snapshot(raw))
+        policy = parse_policy_snapshot(raw)
+        return parent_only_budget_policy(policy)
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Parent-only Policy Snapshot: {error}") from error
 
@@ -352,114 +435,6 @@ def run_repair_budget_policy_for_job(
         return run_repair_budget_policy(parse_policy_snapshot(raw))
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Run Policy Snapshot: {error}") from error
-
-
-class DeliveryPolicyStore:
-    """Atomically persist sparse user defaults outside repository state."""
-
-    _DIRECTORY_NAME = "agent-run"
-    _FILE_NAME = "delivery-policy.json"
-    _LOCK_FILE_NAME = ".delivery-policy.lock"
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._unified_defaults = path is None
-        self.path = path or self.default_path()
-
-    @classmethod
-    def default_path(cls) -> Path:
-        config_home = os.environ.get("XDG_CONFIG_HOME")
-        if config_home:
-            root = Path(config_home).expanduser()
-            if not root.is_absolute():
-                raise DeliveryPolicyError(error_message('policy.error.config_directory', audit="XDG_CONFIG_HOME 必须是绝对路径"))
-        else:
-            root = Path.home() / ".config"
-        return root / cls._DIRECTORY_NAME / cls._FILE_NAME
-
-    def load(self) -> dict[str, Any] | None:
-        if self._unified_defaults:
-            from agent_run.user_defaults import UserDefaultsStore
-
-            return UserDefaultsStore().load().get("policy")
-        if not self.path.exists():
-            return None
-        try:
-            value: object = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise DeliveryPolicyError(error_message('policy.error.parse_file', audit="用户级 Delivery Policy 无法解析")) from error
-        if not isinstance(value, Mapping):
-            raise DeliveryPolicyError(error_message('policy.error.file_object', audit="用户级 Delivery Policy 必须是对象"))
-        return normalize_policy_overrides(value)
-
-    def configure(self, overrides: Mapping[str, Any]) -> DeliveryPolicy:
-        if self._unified_defaults:
-            from agent_run.user_defaults import UserDefaultsStore
-
-            result = UserDefaultsStore().configure(policy=overrides)
-            return parse_policy_snapshot(result["policy"])
-        supplied = normalize_policy_overrides(overrides)
-        if not supplied:
-            raise DeliveryPolicyError(error_message('policy.error.option_required', audit="policy configure requires an explicit option"))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.path.parent / self._LOCK_FILE_NAME
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            os.fchmod(lock_file.fileno(), 0o600)
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                current = self.load() or {}
-                merged = dict(current)
-                current_deadlines = current.get("invocation_deadlines", {})
-                supplied_deadlines = supplied.get("invocation_deadlines", {})
-                if current_deadlines or supplied_deadlines:
-                    merged["invocation_deadlines"] = {
-                        **(
-                            dict(current_deadlines)
-                            if isinstance(current_deadlines, Mapping)
-                            else {}
-                        ),
-                        **(
-                            dict(supplied_deadlines)
-                            if isinstance(supplied_deadlines, Mapping)
-                            else {}
-                        ),
-                    }
-                for key, value in supplied.items():
-                    if key != "invocation_deadlines":
-                        merged[key] = value
-                policy = resolve_delivery_policy(user_defaults=merged)
-                self._write(normalize_policy_overrides(merged))
-                return policy
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-    def _write(self, document: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.path.parent,
-            prefix=".delivery-policy.",
-            suffix=".tmp",
-            text=True,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                descriptor = -1
-                json.dump(document, temporary_file, ensure_ascii=False, sort_keys=True)
-                temporary_file.write("\n")
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, self.path)
-            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        except BaseException:
-            if descriptor != -1:
-                os.close(descriptor)
-            temporary_path.unlink(missing_ok=True)
-            raise
 
 
 def _merge_policy_values(
@@ -487,32 +462,41 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
         raise DeliveryPolicyError(
             "invocation_deadlines is missing: " + ", ".join(sorted(required))
         )
+    return _policy_with_deadlines(values, deadlines)
+
+
+def _policy_with_deadlines(
+    values: Mapping[str, Any], deadlines: Mapping[str, Any],
+) -> DeliveryPolicy:
+    """Construct after the caller has checked its required deadline fields."""
     return DeliveryPolicy(
         development_thread_policy=values.get("development_thread_policy", "reuse"),
-        parent_only_paired_rounds=_positive_integer(
-            values.get("parent_only_paired_rounds"), "parent_only_paired_rounds"
-        ),
-        run_repair_rounds=_positive_integer(
-            values.get("run_repair_rounds"), "run_repair_rounds"
-        ),
-        ticket_review_rounds=_positive_integer(
-            values.get("ticket_review_rounds"), "ticket_review_rounds"
-        ),
-        development_deadline_seconds=_positive_duration(
-            deadlines["development"], "development deadline"
-        ),
-        review_deadline_seconds=_positive_duration(
-            deadlines["review"], "review deadline"
-        ),
-        publication_deadline_seconds=_positive_duration(
-            deadlines["publication"], "publication deadline"
-        ),
+        # The immutable policy's constructor validates and normalizes these
+        # exact values. Do not repeat every check before __post_init__.
+        parent_only_paired_rounds=cast(int, values.get("parent_only_paired_rounds")),
+        run_repair_rounds=cast(int, values.get("run_repair_rounds")),
+        ticket_review_rounds=cast(int, values.get("ticket_review_rounds")),
+        ticket_development_workers=cast(int, values.get("ticket_development_workers")),
+        ticket_integration_development_limit=cast(int, values.get("ticket_integration_development_limit")),
+        integration_resync_limit=cast(int, values.get("integration_resync_limit")),
+        ticket_ci_development_limit=cast(int, values.get("ticket_ci_development_limit")),
+        ticket_ci_review=cast(bool, values.get("ticket_ci_review")),
+        parent_ci_development_limit=cast(int, values.get("parent_ci_development_limit")),
+        development_deadline_seconds=deadlines["development"],
+        review_deadline_seconds=deadlines["review"],
+        publication_deadline_seconds=deadlines["publication"],
     )
 
 
 def _positive_integer(value: Any, name: str) -> int:
     if type(value) is not int or value <= 0:
         raise DeliveryPolicyError(error_message('policy.error.positive_integer', audit=f"{name} must be a positive integer", name=name))
+    return value
+
+
+def _nonnegative_integer(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise DeliveryPolicyError(f"{name} must be a non-negative integer")
     return value
 
 

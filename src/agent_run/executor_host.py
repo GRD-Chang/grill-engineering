@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from agent_run.state import SimulatedProcessCrash
-from agent_run.task_control import TaskControlError, TaskControlStore, TaskKey
+from agent_run.task_control import (
+    TaskControlError, TaskControlStore, TaskKey, _executor_workers,
+)
 
 HostStatus = Literal[
     "absent",
@@ -713,28 +715,38 @@ def _terminate_control_target(
 ) -> None:
     """Terminate only the process identity captured by a Stop/Abandon fence.
 
-    A Worker is a separate process group and is always preferred.  When the
+    Workers are separate process groups and are always preferred.  When the
     Executor is in external supervision or Publisher work, no Worker exists;
     then the exact Executor process is terminated so the fenced session ends
     without waiting for another polling boundary.
     """
 
-    worker = target_executor.get("worker")
-    if isinstance(worker, Mapping):
+    live_workers: list[tuple[int, str]] = []
+    for worker in _target_workers(target_executor):
         pid = worker.get("pid")
         token = worker.get("process_start_token")
         if type(pid) is not int or not isinstance(token, str) or not token:
             raise ExecutorStartUnknownError("Worker ownership 无法确认；不会终止进程")
         status = _process_binding_status(pid, token)
         if status == "matches":
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _wait_for_process_exit(pid, token, timeout=timeout)
-            return
+            live_workers.append((pid, token))
         if status == "unknown":
             raise ExecutorStartUnknownError("Worker ownership 无法确认；不会终止进程")
+    for pid, _ in live_workers:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    first_error: ExecutorStartUnknownError | None = None
+    for pid, token in live_workers:
+        try:
+            _wait_for_process_exit(pid, token, timeout=timeout)
+        except ExecutorStartUnknownError as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
+    if live_workers:
+        return
 
     pid = target_executor.get("pid")
     token = target_executor.get("process_start_token")
@@ -760,14 +772,19 @@ def _terminate_control_target(
     _wait_for_process_exit(pid, token, timeout=timeout)
 
 
+def _target_workers(target_executor: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    try:
+        return _executor_workers(target_executor)
+    except TaskControlError as error:
+        raise ExecutorStartUnknownError("Worker ownership 无法确认") from error
+
+
 def validate_executor_exit(target_executor: Mapping[str, Any]) -> None:
     """Require independent process proof before admitting an explicit Resume."""
-    for label, process in (
-        ("Worker", target_executor.get("worker")),
+    for label, process in [
+        *(("Worker", worker) for worker in _target_workers(target_executor)),
         ("Executor", target_executor),
-    ):
-        if process is None and label == "Worker":
-            continue
+    ]:
         if not isinstance(process, Mapping):
             raise ExecutorStartUnknownError(f"{label} ownership 无法确认")
         pid, token = process.get("pid"), process.get("process_start_token")
@@ -783,18 +800,18 @@ def validate_executor_exit(target_executor: Mapping[str, Any]) -> None:
 def validate_control_target(target_executor: Mapping[str, Any]) -> None:
     """Fail closed unless the Worker or Executor target has exact live identity."""
 
-    worker = target_executor.get("worker")
-    if isinstance(worker, Mapping):
+    live_worker = False
+    for worker in _target_workers(target_executor):
         worker_pid = worker.get("pid")
         worker_token = worker.get("process_start_token")
-        if type(worker_pid) is int and isinstance(worker_token, str) and worker_token:
-            status = _process_binding_status(worker_pid, worker_token)
-            if status == "matches":
-                return
-            if status == "unknown":
-                raise ExecutorStartUnknownError(
-                    "Worker ownership 无法确认；不会提交控制栅栏"
-                )
+        if type(worker_pid) is not int or not isinstance(worker_token, str) or not worker_token:
+            raise ExecutorStartUnknownError("Worker ownership 无法确认；不会提交控制栅栏")
+        status = _process_binding_status(worker_pid, worker_token)
+        if status == "unknown":
+            raise ExecutorStartUnknownError("Worker ownership 无法确认；不会提交控制栅栏")
+        live_worker |= status == "matches"
+    if live_worker:
+        return
     pid = target_executor.get("pid")
     token = target_executor.get("process_start_token")
     if type(pid) is not int or not isinstance(token, str) or not token:

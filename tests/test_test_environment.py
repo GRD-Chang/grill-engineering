@@ -9,6 +9,10 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
+from support.environment import _assert_python_and_git_environment
+
 
 _GIT_LOCATION_VARIABLES = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
@@ -16,21 +20,25 @@ _GIT_LOCATION_VARIABLES = (
 )
 
 
-def _assert_python_and_git_environment() -> None:
-    python_directory = Path(sys.executable).parent
-    assert Path(os.environ["PATH"].split(os.pathsep)[0]) == python_directory
-    executable, prefix, version = json.loads(subprocess.check_output(
-        ["env", "python3", "-c",
-         "import json, sys; print(json.dumps([sys.executable, sys.prefix, list(sys.version_info)]))"],
-        text=True,
-    ))
-    assert Path(executable).parent == python_directory
-    assert prefix == sys.prefix
-    assert version == list(sys.version_info)
-    assert not set(_GIT_LOCATION_VARIABLES).intersection(os.environ)
-    assert {
-        key: value for key, value in os.environ.items() if key.startswith("GIT_CONFIG")
-    } == {"GIT_CONFIG_NOSYSTEM": "1"}
+@pytest.mark.parametrize("dont_write_bytecode", [False, True])
+def test_importing_installer_build_seam_preserves_interpreter_policy(
+    dont_write_bytecode: bool,
+) -> None:
+    project = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project / "src"), str(project / "tests")]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c",
+         f"import sys; sys.dont_write_bytecode = {dont_write_bytecode!r}; "
+         "before = (sys.dont_write_bytecode, sys.path.copy()); "
+         "from support.fast_runner_installer import build_candidate; "
+         "assert (sys.dont_write_bytecode, sys.path) == before"],
+        env=environment, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
 
 
 def test_pytest_isolates_each_case_and_cli_from_host_state(tmp_path: Path) -> None:
@@ -45,9 +53,9 @@ import subprocess
 from pathlib import Path
 import pytest
 from agent_run.run_locator import RunLocatorIndex
-from conftest import seed_run, write_fixture
-from test_cli import run_cli, stdout_json
-from test_test_environment import _assert_python_and_git_environment
+from support.seeding import seed_run, write_fixture
+from support.cli import run_cli, stdout_json
+from support.environment import _assert_python_and_git_environment
 
 @pytest.mark.parametrize("case", ["first", "second"])
 def test_case(git_repo, tmp_path, monkeypatch, case):

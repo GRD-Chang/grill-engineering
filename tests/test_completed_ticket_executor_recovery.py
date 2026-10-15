@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_scenarios import _completed_run
+from support.state import persist_run_fixture
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -12,7 +15,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_lifecycle import LifecycleRequest, RunLifecycle, prepare_action_application_receipt
 from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlStore, TaskKey
-from run_acceptance_test_support import _completed_run
+from agent_run.object_state import save_owned
 
 
 def test_completed_ticket_survives_exited_executor_and_can_continue(git_repo: Path) -> None:
@@ -22,7 +25,7 @@ def test_completed_ticket_survives_exited_executor_and_can_continue(git_repo: Pa
     state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
     require_current_run_state(state)
     run_id = str(state["run_id"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     task = TaskKey(git_repo, "example/project", 1)
     control = TaskControlStore(states.root)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
@@ -37,7 +40,7 @@ def test_completed_ticket_survives_exited_executor_and_can_continue(git_repo: Pa
         record = control.load(task)
         assert record is not None
         prepare_action_application_receipt(state, record["action"])
-        states.save_run(run_id, state)
+        save_owned(states, run_id, state, fields={'action_application_receipt'})
         control.record_application(
             task, action_id=spec.action_id, run_id=run_id, generation=1,
             payload_digest=record["action"]["payload_digest"],
@@ -53,7 +56,7 @@ def test_completed_ticket_survives_exited_executor_and_can_continue(git_repo: Pa
     def continue_run(action: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         current, resumed = controller.resume(run_id)
         prepare_action_application_receipt(current, action)
-        states.save_run(run_id, current)
+        save_owned(states, run_id, current, fields={'action_application_receipt'})
         return current, resumed
 
     lifecycle = RunLifecycle(

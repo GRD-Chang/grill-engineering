@@ -13,6 +13,7 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import human_next_action_for_state
 from agent_run.git import GitRepository
 from agent_run.review_budget import new_budget
@@ -28,8 +29,11 @@ from agent_run.systemd_executor_host import (
     SystemdUserExecutorHost,
 )
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
-from conftest import seed_run, write_fixture
-from test_run_lifecycle import _file_snapshot, _isolated_environment
+from support.seeding import seed_run, write_fixture
+from support.lifecycle import _file_snapshot, _isolated_environment
+
+from support.state import snapshot_runs
+from support.state import persist_run_fixture
 
 
 @pytest.fixture
@@ -62,6 +66,7 @@ def completed_action(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": {**new_budget(), "development_attempts": 1},
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
     }
     checkout = states.root / "worktrees" / run_id / "parent"
     GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(
@@ -97,7 +102,7 @@ def completed_action(
     record = control.load(task)
     assert record is not None
     prepare_action_application_receipt(state, record["action"])
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     control.record_application(
         task, action_id=spec.action_id, run_id=run_id, generation=spec.generation,
         payload_digest=record["action"]["payload_digest"],
@@ -163,12 +168,12 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
     assert record["executor"]["generation"] == spec.generation
     assert record["executor"]["runner_binding"] == initial["executor"]["runner_binding"]
     control_before = control.path_for(spec.task).read_bytes()
-    states_before = _file_snapshot(states.root / "runs")
+    states_before = snapshot_runs(states.root)
     host.inspect(spec, control)
     again, _, _ = lifecycle.submit(request)
     assert again == result
     assert control.path_for(spec.task).read_bytes() == control_before
-    assert _file_snapshot(states.root / "runs") == states_before
+    assert snapshot_runs(states.root) == states_before
     assert _file_snapshot(states.root / "worktrees") == worktrees
     assert fixture.read_bytes() == fixture_before
     assert transport.start_count == 1
@@ -183,8 +188,8 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     final = states.load_current_run(spec.run_id)
     final["status"] = final_status
     final["terminal_kind"] = "completed" if final_status == "completed" else "waiting_human"
-    states.save_run(spec.run_id, final)
-    state_before = _file_snapshot(states.root / "runs")
+    persist_run_fixture(states, spec.run_id, final)
+    state_before = snapshot_runs(states.root)
     action_before = control.load(spec.task)["action"]
     transport.unit = replace(transport.unit, status="exited", pid=None)
     assert host.inspect(spec, control).status == "exited"
@@ -194,7 +199,7 @@ def test_systemd_completed_action_normal_boundary_is_preserved(
     )
     assert result["status"] == final_status and receipt.status == "completed"
     assert control.load(spec.task)["action"] == action_before
-    assert _file_snapshot(states.root / "runs") == state_before
+    assert snapshot_runs(states.root) == state_before
     assert transport.start_count == 1
 
 
@@ -208,7 +213,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
     elif native_status == "conflict":
         transport.unit = replace(transport.unit, description="another Executor")
     control_before = control.path_for(spec.task).read_bytes()
-    state_before = _file_snapshot(states.root / "runs")
+    state_before = snapshot_runs(states.root)
     lifecycle = _lifecycle(states, control, spec, host)
     request = LifecycleRequest(task=spec.task, kind="run", payload={"parent": 1})
     if native_status == "running":
@@ -218,7 +223,7 @@ def test_systemd_completed_action_without_exit_proof_is_not_closed(
         with pytest.raises(ExecutorStartUnknownError):
             lifecycle.submit(request)
     assert control.path_for(spec.task).read_bytes() == control_before
-    assert _file_snapshot(states.root / "runs") == state_before
+    assert snapshot_runs(states.root) == state_before
     assert transport.start_count == 1
 
 

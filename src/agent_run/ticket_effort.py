@@ -3,17 +3,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.delivery_history import _role_family
-from agent_run.delivery_status import invocation_execution_seconds
-from agent_run.execution_timing import invocation_links_complete
+from agent_run.delivery_facts import role_family
+from agent_run.execution_timing import aggregate_invocation_timing, invocation_links_complete
 
 
 def ticket_effort(
     state: dict[str, Any], records: list[dict[str, Any]], work_subject: str,
 ) -> dict[str, dict[str, Any]]:
-    """Count semantic identities, assigning each Invocation to its real config.
+    """Keep proven rounds and configuration participation when timing is partial.
 
-    Unknown timing does not erase proven rounds or configuration participation.
     A configuration participating in a resumed round counts that round once;
     consequently its count must not be added to other configurations' counts.
     """
@@ -24,63 +22,65 @@ def ticket_effort(
     raw = [invocation for invocation in state.get("agent_invocation_history", [])
            if (invocation.get("work_subject")
                or (invocation.get("semantic_attempt") or {}).get("work_subject")) == work_subject]
-    # Unknown-role work cannot safely be assigned to either role, even if
-    # History retains it as an unclassified record.
     unclassified = any(
-        not ((invocation.get("semantic_attempt") or {}).get("role")
-             or invocation.get("role") or invocation.get("invocation_role"))
+        not role_family(str((invocation.get("semantic_attempt") or {}).get("role")
+                            or invocation.get("role") or invocation.get("invocation_role")))
         for invocation in raw
     )
-    # Timeline truncation does not truncate either durable Attempt owners or
-    # Invocation history. Their independently provable aggregates survive.
     for role in ("development", "review"):
-        selected = [record for record in subject_records if _role_family(str(record.get("role"))) == role]
-        if not selected:
-            continue
+        selected = [record for record in subject_records if role_family(str(record.get("role"))) == role]
         known = [invocation for record in selected for invocation in record.get("invocations", [])]
-        # An unassociated invocation could be another round or configuration.
-        # Publication uses a Development binding too, so classify by semantic
-        # role rather than the thread's binding_role.
         missing = [invocation for invocation in raw if invocation not in known
-                   and _role_family(str((invocation.get("semantic_attempt") or {}).get("role")
-                                        or invocation.get("role") or invocation.get("invocation_role"))) == role]
-        ids = [record.get("attempt_id") for record in selected]
-        if unclassified or missing or any(not isinstance(identity, str) or not identity for identity in ids):
+                   and role_family(str((invocation.get("semantic_attempt") or {}).get("role")
+                                       or invocation.get("role") or invocation.get("invocation_role"))) == role]
+        if not selected and not missing:
             continue
-        unique = {record["attempt_id"]: record for record in selected}
-        facts: dict[str, Any] = {"rounds": len(unique), "shared_rounds": False}
-        result[role] = facts
-        invocations = [(identity, invocation) for identity, record in unique.items()
-                       for invocation in record.get("invocations", [])]
-        complete = (all(record.get("invocations") for record in unique.values())
+        unique = {record["attempt_id"]: record for record in selected if record.get("attempt_id")}
+        associations_complete = not unclassified and not missing and len(unique) == len(selected)
+        complete = (associations_complete and all(record.get("invocations") for record in selected)
                     and invocation_links_complete(state, selected))
-        durations = [invocation_execution_seconds(invocation) for _, invocation in invocations]
-        if complete and all(value is not None for value in durations):
-            facts["execution_seconds"] = sum(value for value in durations if value is not None)
-        configs: dict[tuple[str, str], dict[str, Any]] = {}
-        participation: dict[str, set[tuple[str, str]]] = {}
-        for (identity, invocation), duration in zip(invocations, durations):
-            model, effort = invocation.get("model"), invocation.get("reasoning_effort")
-            if not isinstance(model, str) or not model or not isinstance(effort, str) or not effort:
-                complete = False
+        facts: dict[str, Any] = {"shared_rounds": False}
+        if unique:
+            facts.update(rounds=len(unique), rounds_complete=associations_complete)
+        result[role] = facts
+        # Unassociated invocations still prove time/configuration, but cannot
+        # prove a full role total or be assigned an invented semantic round.
+        invocations = [(record.get("attempt_id"), invocation) for record in selected
+                       for invocation in record.get("invocations", [])]
+        invocations.extend((None, invocation) for invocation in missing)
+        facts.update({key: value for key, value in aggregate_invocation_timing(
+            [invocation for _, invocation in invocations], complete=complete,
+        ).items() if value is not None})
+        configs: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+        participation: dict[str, set[tuple[str | None, str | None]]] = {}
+        bindings_complete = True
+        for identity, invocation in invocations:
+            model = invocation.get("model")
+            effort = invocation.get("reasoning_effort")
+            model = model if isinstance(model, str) and model else None
+            effort = effort if isinstance(effort, str) and effort else None
+            if model is None or effort is None:
+                bindings_complete = False
+            if model is None and effort is None:
                 continue
             key = (model, effort)
-            group = configs.setdefault(key, {"ids": set(), "durations": []})
-            group["ids"].add(identity)
-            group["durations"].append(duration)
-            participation.setdefault(identity, set()).add(key)
-        # Missing binding might belong to any group: do not present partial
-        # groups as exhaustive. The role's independently proven time survives.
-        if not complete:
-            continue
+            group = configs.setdefault(key, {"ids": set(), "invocations": []})
+            if identity:
+                group["ids"].add(identity)
+                participation.setdefault(identity, set()).add(key)
+            group["invocations"].append(invocation)
         facts["shared_rounds"] = any(len(keys) > 1 for keys in participation.values())
         configurations: list[dict[str, Any]] = []
         for (model, effort), group in configs.items():
-            configuration: dict[str, Any] = {
-                "model": model, "reasoning_effort": effort, "rounds": len(group["ids"]),
-            }
-            if all(value is not None for value in group["durations"]):
-                configuration["execution_seconds"] = sum(group["durations"])
+            configuration: dict[str, Any] = {"model": model, "reasoning_effort": effort}
+            if group["ids"]:
+                configuration.update(rounds=len(group["ids"]),
+                                     rounds_complete=associations_complete and bindings_complete)
+            configuration.update({key: value for key, value in aggregate_invocation_timing(
+                group["invocations"], complete=complete and bindings_complete,
+            ).items() if value is not None})
             configurations.append(configuration)
-        facts["configurations"] = configurations
+        if configurations:
+            facts["configurations"] = configurations
+            facts["configurations_complete"] = complete and bindings_complete
     return result

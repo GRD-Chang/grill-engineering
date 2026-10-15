@@ -20,11 +20,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  quality:
-    name: quality
-    # Ubuntu 24.04 AppArmor blocks bwrap user namespaces on hosted runners.
+  selection:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      product: ${{ steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,7 +43,7 @@ jobs:
             code:
               - '**'
               - '!*.md'
-              - '!docs/**/*.{md,png,jpg,jpeg,svg,gif,webp}'
+              - '!docs/**/*.{md,html,png,jpg,jpeg,svg,gif,webp}'
 
       - name: Report lightweight validation
         if: steps.changes.outcome == 'success' && steps.changes.outputs.code == 'false'
@@ -56,39 +56,88 @@ jobs:
             echo '仅文档或文档图片变更，跳过依赖安装、测试与类型检查。' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  product-tests:
+    needs: selection
+    if: needs.selection.outputs.product == 'true'
+    # 两个独立 runner；每个仍使用两个 worker，保留有界退出保障。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Set up Python
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11.16"
 
       - name: Install system dependencies
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+
+      - name: Install product and development tools
+        run: make test-bootstrap
+
+      - name: Run tests
+        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=${{ matrix.shard }}'
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-diagnostics-shard-${{ matrix.shard }}
+          path: .test-results/
+          include-hidden-files: true
+          retention-days: 7
+
+  quality:
+    name: quality
+    needs: [selection, product-tests]
+    # 显式汇总 skipped/failed/cancelled，避免依赖失败导致必需检查被跳过。
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify selection
+        env:
+          SELECTION_RESULT: ${{ needs.selection.result }}
+        run: test "$SELECTION_RESULT" = success
+
+      - name: Set up Python
+        if: needs.selection.outputs.product == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11.16"
+
+      - name: Install system dependencies
+        if: needs.selection.outputs.product == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes bubblewrap
 
       - name: Install project and development tools
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
+        if: needs.selection.outputs.product == 'true'
         run: make test-bootstrap
 
       - name: Smoke test installed CLI
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
+        if: needs.selection.outputs.product == 'true'
         run: agent-run --help
 
       - name: Run tests
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
-        run: make test-report TEST_WORKERS=2
+        if: needs.selection.outputs.product == 'true'
+        env:
+          PRODUCT_RESULT: ${{ needs.product-tests.result }}
+        run: test "$PRODUCT_RESULT" = success
 
       - name: Run type checks
-        if: steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false'
+        if: needs.selection.outputs.product == 'true'
         run: python -m mypy src/agent_run
-
-      - name: Upload test diagnostics
-        if: always() && (steps.changes.outcome != 'success' || steps.changes.outputs.code != 'false')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: test-diagnostics
-          path: .test-results/
-          include-hidden-files: true
-          retention-days: 7

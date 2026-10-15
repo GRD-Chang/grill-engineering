@@ -21,6 +21,10 @@ from agent_run.delivery_policy import (
     normalize_policy_overrides,
     resolve_delivery_policy,
 )
+from agent_run.github_identity import (
+    GitHubIdentityError, describe_identity, normalize_github_config, resolve_worker_identity, resolve_runner_identity,
+)
+from agent_run.github_auth_profile import GitHubAppProfileStore
 from agent_run.paths import app_config_root
 from agent_run.messages import DEFAULT_LANGUAGE, ErrorMessage, error_message, text, validate_language
 
@@ -97,7 +101,7 @@ def _notifications(raw: object) -> dict[str, Any]:
 def _document(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise UserDefaultsError(error_message("defaults.document_object"))
-    unknown = set(raw) - {"policy", "profile", "notifications", "language"}
+    unknown = set(raw) - {"policy", "profile", "notifications", "language", "github"}
     if unknown:
         raise UserDefaultsError(error_message("defaults.document_unknown", keys=sorted(unknown)))
     result: dict[str, Any] = {}
@@ -115,6 +119,11 @@ def _document(raw: object) -> dict[str, Any]:
             raise UserDefaultsError(error_message("defaults.policy_error", reason=reason)) from error
     if "profile" in raw:
         result["profile"] = _profile(raw["profile"])
+    if "github" in raw:
+        try:
+            result["github"] = normalize_github_config(raw["github"])
+        except GitHubIdentityError as error:
+            raise UserDefaultsError(error.args[0]) from error
     if "notifications" in raw:
         result["notifications"] = raw["notifications"]
     return result
@@ -163,6 +172,20 @@ class UserDefaultsStore:
         loaded = self.load() if document is None else _document(document)
         return validate_language(loaded.get("language", DEFAULT_LANGUAGE))
 
+    def _github_description(self, document: dict[str, Any]) -> dict[str, Any]:
+        config = document.get("github", {})
+        legacy = self.path.with_name("github-app.json")
+        if "worker_source" not in config and legacy.exists():
+            return {"worker": {"source": "app"}, "runner": resolve_runner_identity(config),
+                    "migration": "required", "legacy_path": str(legacy),
+                    "notice": text("identity.migration_required", language=self.language(document))}
+        result = describe_identity(
+            resolve_worker_identity(config, app_profile_path=legacy), self.language(document),
+            resolve_runner_identity(config),
+        )
+        result["migration"] = "legacy-ignored" if legacy.exists() else "not-needed"
+        return result
+
     def _describe(self, document: dict[str, Any], source: str) -> dict[str, Any]:
         profile = document.get("profile", {})
         resolved = resolve_profiles(
@@ -195,6 +218,7 @@ class UserDefaultsStore:
             "defaults": document,
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,
+            "github": self._github_description(document),
             "notifications": notification_snapshot(document.get("notifications")),
             "language": self.language(document),
             "language_source": source if "language" in document else "builtin",
@@ -210,9 +234,13 @@ class UserDefaultsStore:
     def configure(self, *, policy: Mapping[str, Any] | None = None,
                   profile: Mapping[str, Any] | None = None,
                   notifications: Mapping[str, Any] | None = None,
-                  language: str | None = None) -> dict[str, Any]:
+                  github: Mapping[str, Any] | None = None,
+                  language: str | None = None,
+                  migrate_github_app: bool = False) -> dict[str, Any]:
         supplied = _document({**({"policy": policy} if policy is not None else {}),
                               **({"profile": profile} if profile is not None else {})})
+        if github:
+            supplied["github"] = normalize_github_config(github)
         if language is not None:
             try:
                 supplied["language"] = validate_language(language)
@@ -220,7 +248,7 @@ class UserDefaultsStore:
                 raise UserDefaultsError(text("settings.invalid_language", language=self.language())) from error
         if notifications is not None:
             supplied["notifications"] = _notifications(notifications)
-        if not any(supplied.values()):
+        if not any(supplied.values()) and not migrate_github_app:
             raise UserDefaultsError(error_message(
                 "defaults.configure_option", audit="configure requires an explicit option"
             ))
@@ -231,6 +259,21 @@ class UserDefaultsStore:
             try:
                 current = self.load()
                 merged = dict(current)
+                if migrate_github_app:
+                    legacy = GitHubAppProfileStore(self.path.with_name("github-app.json"))
+                    # Explicit new metadata/source win; legacy materials remain for active executors.
+                    prior_github = current.get("github", {})
+                    migrated: dict[str, Any] = {"worker_source": "app", "app_read_only": False,
+                                                "app_current_repository_only": False}
+                    explicit_github = {**prior_github, **supplied.get("github", {})}
+                    if "app" not in explicit_github and explicit_github.get("worker_source", "app") == "app":
+                        app = legacy.load()
+                        if app is None:
+                            raise GitHubIdentityError(error_message("identity.app_missing"))
+                        migrated["app"] = {"app_id": app.app_id, "installation_id": app.installation_id,
+                                           "private_key_path": str(app.private_key_path)}
+                    merged["github"] = {**migrated, **prior_github}
+
                 if "language" in supplied:
                     merged["language"] = supplied["language"]
                 if "policy" in supplied:
@@ -247,9 +290,14 @@ class UserDefaultsStore:
                     if not isinstance(prior_notifications, Mapping):
                         prior_notifications = {}
                     merged["notifications"] = _notifications({**prior_notifications, **supplied["notifications"]})
+                if "github" in supplied:
+                    merged["github"] = {**merged.get("github", {}), **supplied["github"]}
+                if "github" in merged:
+                    resolve_worker_identity(merged["github"], app_profile_path=self.path.with_name("github-app.json"))
+                    resolve_runner_identity(merged["github"])
                 merged = _document(merged)
-                self._write(merged)
                 result = self._describe(merged, "user-defaults")
+                self._write(merged)
                 result["result"] = "configured"
                 result["changed"] = supplied
                 return result

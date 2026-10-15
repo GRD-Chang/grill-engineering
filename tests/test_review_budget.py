@@ -6,6 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.controller import _resume_review_budget_window
+from agent_run.ci_recovery_budget import (
+    mark_ci_repair,
+    new_ci_recovery_budget,
+    observe_repairable_ci_failure,
+)
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_policy import (
     DeliveryPolicy,
     parent_only_budget_policy,
@@ -24,6 +30,7 @@ from agent_run.review_budget import (
     reset_budget,
     reviewer_budget_context,
 )
+from agent_run.run_repair_cycle import remove_repair_job
 from agent_run.change_delivery_required_checks import observe_required_checks
 
 
@@ -136,10 +143,10 @@ def test_reset_budget_opens_numbered_window_without_old_attempts() -> None:
     assert "fallback_publication_receipt" not in job
 
 
-def test_run_policy_allows_ten_developments_and_eleven_reviews() -> None:
+def test_run_policy_allows_three_developments_and_four_reviews() -> None:
     job = _job_with_budget()
 
-    for _ in range(11):
+    for _ in range(4):
         mark_review(job, RUN_POLICY)
     assert not can_start_review(job, RUN_POLICY)
     assert can_start_development(job, RUN_POLICY)
@@ -377,198 +384,119 @@ def test_ticket_budget_resume_opens_new_window_and_preserves_repair_evidence() -
     ] == 3
 
 
-def test_run_repair_review_counts_share_the_run_window() -> None:
+def test_run_repair_uses_fixed_parent_budget_after_reload_and_completion() -> None:
+    import json
+
+    from agent_run.delivery_budget import delivery_budget_owner
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
-    policy_snapshot = DeliveryPolicy().snapshot()
-    run: dict[str, object] = {
-        "policy_snapshot": policy_snapshot,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 0,
-            "reviewer_invocations": 4,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-        "repair_cycle": {"generation": 1},
-    }
-    job: dict[str, object] = {
-        "policy_snapshot": policy_snapshot,
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 0,
-            "reviewer_invocations": 4,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-    }
-    mark_review(job, RUN_POLICY)
+    run = _job_with_budget(policy_snapshot=DeliveryPolicy().snapshot())
+    job = {"phase": "reviewing", "policy_snapshot": DeliveryPolicy().snapshot()}
+    run.update({"repair_job": job, "repair_cycle": {"generation": 1}})
+    run["review_budget"]["reviewer_invocations"] = 3
+    state = json.loads(json.dumps({"run_acceptance": run}))
+    run = state["run_acceptance"]
+    job = run["repair_job"]
+    owner = delivery_budget_owner(state, job)
+    assert owner is run
+    mark_review(owner, RUN_POLICY)
     sync_repair_cycle_counters(run, job)
-    assert run["review_budget"]["reviewer_invocations"] == 5
+    assert run["review_budget"]["reviewer_invocations"] == 4
+    assert not can_start_review(run, RUN_POLICY)
+    assert "review_budget" not in job
+    assert "review_budget_history" not in job
+    budget = run["review_budget"]
+    history = run["review_budget_history"]
+    remove_repair_job(run)
+    assert run["review_budget"] is budget
+    assert run["review_budget_history"] is history
+    assert "repair_job" not in run
+    assert not can_start_review(run, RUN_POLICY)
 
 
-def test_run_repair_sync_uses_frozen_limits_for_both_budget_projections() -> None:
+def test_run_repair_budget_uses_frozen_limits_and_retains_one_history() -> None:
+    from agent_run.delivery_policy import run_repair_budget_policy
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
     policy = DeliveryPolicy(run_repair_rounds=2)
-    run: dict[str, object] = {
-        "policy_snapshot": policy.snapshot(),
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 1,
-            "reviewer_invocations": 2,
-            "final_ci_fix_used": False,
-            "review_artifacts": [
-                {"review_identity": {"attempt_id": "r1"}},
-                {"review_identity": {"attempt_id": "r2"}},
-            ],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-        "repair_cycle": {"generation": 1},
-    }
-    job: dict[str, object] = {
-        "policy_snapshot": policy.snapshot(),
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 2,
-            "reviewer_invocations": 3,
-            "final_ci_fix_used": False,
-            "review_artifacts": [
-                {"review_identity": {"attempt_id": "r2"}},
-                {"review_identity": {"attempt_id": "r3"}},
-            ],
-            "checkpoint_reason": "review_budget_exhausted",
-        },
-        "review_budget_history": [],
-    }
-
-    sync_repair_cycle_counters(run, job)
-
-    assert run["review_budget"] == job["review_budget"]
-    assert run["review_budget"]["development_attempts"] == 2
-    assert run["review_budget"]["reviewer_invocations"] == 3
-    assert len(run["review_budget"]["review_artifacts"]) == 3
-    assert run["review_budget"]["checkpoint_reason"] == "review_budget_exhausted"
-
-
-def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> None:
-    evidence = {
-        "pr_number": 11,
-        "checks": [
-            {
-                "bucket": "fail",
-                "state": "FAILURE",
-                "name": "tests",
-                "workflow": "ci",
-                "link": "https://example.invalid/check",
-                "repairability": "code_failure",
-            }
+    run = _job_with_budget(policy_snapshot=policy.snapshot())
+    run["review_budget"].update({
+        "development_attempts": 2,
+        "reviewer_invocations": 3,
+        "review_artifacts": [
+            {"review_identity": {"attempt_id": f"r{ordinal}"}}
+            for ordinal in range(1, 4)
         ],
-    }
-    job: dict[str, object] = {
-        "phase": "waiting_checks",
-        "base_sha": "base-head",
-        "publication_sha": "candidate-head",
-        "acceptance_record": {"reviewed_base_sha": "base-head"},
-        "modification_attempts": 4,
-        "validation_attempts": 2,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 4,
-            "reviewer_invocations": 2,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-    }
-    repair_resumes: list[tuple[dict[str, object], dict[str, object]]] = []
+        "checkpoint_reason": "review_budget_exhausted",
+    })
+    job = {"phase": "blocked", "policy_snapshot": policy.snapshot()}
+    run.update({"repair_job": job, "repair_cycle": {"generation": 1}, "validation_attempts": 1})
+    sync_repair_cycle_counters(run, job)
+    budget_policy = run_repair_budget_policy(policy)
+    assert not can_start_development(run, budget_policy)
+    assert not can_start_review(run, budget_policy)
+    reset_budget(run, budget_policy)
+    assert run["validation_attempts"] == 0
+    assert run["review_budget"]["window"] == 2
+    assert len(run["review_budget_history"]) == 1
+    archived = run["review_budget_history"][0]["review_budget"]
+    assert archived["development_attempts"] == 2
+    assert archived["reviewer_invocations"] == 3
+    assert len(archived["review_artifacts"]) == 3
+    assert archived["checkpoint_reason"] == "review_budget_exhausted"
+    assert "review_budget_history" not in job
 
-    def resume_after_required_checks_failure(
-        state: dict[str, object], repair_job: dict[str, object]
-    ) -> bool:
-        repair_resumes.append((state, repair_job))
-        state.update(
-            {"status": "adapter_resumed", "terminal_kind": None, "diagnostics": []}
-        )
-        return False
 
-    stage = SimpleNamespace(
-        contract=SimpleNamespace(
-            label="ticket-1", branch="ticket-1", base_branch="run-1"
-        ),
-        github=SimpleNamespace(
-            required_checks_snapshot=lambda _pr, expected_head_sha: {
-                "pr_number": 11,
-                "head_sha": expected_head_sha,
-                "result": "fail",
-                "checks": [dict(check) for check in evidence["checks"]],
-            },
-            required_check_evidence=lambda _pr, expected_head_sha: evidence,
-        ),
-        publisher=SimpleNamespace(
-            live_pull_request=lambda _state, _job, _pr: {
-                "state": "OPEN",
-                "head_branch": "ticket-1",
-                "head_sha": "candidate-head",
-                "head_repository": "example/project",
-                "base_branch": "run-1",
-                "base_sha": "base-head",
-                "base_repository": "example/project",
-            }
-        ),
-        adapter=SimpleNamespace(
-            classify_required_check_failures=True,
-            resume_after_required_checks_failure=(
-                resume_after_required_checks_failure
-            ),
-        ),
-        modification_budget_exhausted=lambda _job: True,
-        review_budget_policy=lambda: TICKET_POLICY,
-        _record_agent_run_status=lambda *_args, **_kwargs: None,
-        _record_publication_operation_failure_in_memory=(
-            lambda _state, owner, failure: record_publication_operation_failure(
-                owner, failure
-            )
-        ),
-        _reject_stale=lambda *_args, **_kwargs: None,
-        commit_required_checks_observation=lambda state, _job, _pr: state,
-        save=lambda state: state,
+def test_delivery_budgets_keep_ticket_parent_and_repair_identity_separate() -> None:
+    from copy import deepcopy
+
+    from agent_run.delivery_budget import delivery_budget_owner
+
+    ticket = _job_with_budget()
+    other_ticket = _job_with_budget()
+    parent = _job_with_budget()
+    repair = {"phase": "repairing"}
+    run = _job_with_budget(repair_job=repair)
+    state = {"ticket_jobs": {"2": ticket, "3": other_ticket},
+             "parent_job": parent, "run_acceptance": run}
+    before = deepcopy(state)
+    for subject in (ticket, other_ticket, parent, run):
+        assert delivery_budget_owner(state, subject) is subject
+    assert delivery_budget_owner(state, repair) is run
+    # A distinct record with the same content is not the active repair work.
+    unrelated = deepcopy(repair)
+    assert delivery_budget_owner(state, unrelated) is unrelated
+    assert state == before
+    mark_development(delivery_budget_owner(state, repair), RUN_POLICY, attempt_kind="ordinary")
+    assert run["review_budget"]["development_attempts"] == 1
+    assert ticket["review_budget"]["development_attempts"] == 0
+    assert other_ticket["review_budget"]["development_attempts"] == 0
+    assert parent["review_budget"]["development_attempts"] == 0
+    assert "review_budget" not in repair
+
+
+def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -> None:
+    job = _job_with_budget(
+        policy_snapshot=DeliveryPolicy().snapshot(),
+        ci_recovery=new_ticket_ci_recovery_budget(),
     )
+    budget = job["review_budget"]
+    budget["development_attempts"] = TICKET_POLICY.development_limit
+    budget["reviewer_invocations"] = TICKET_POLICY.review_limit
+    assert not can_start_development(job, TICKET_POLICY)
+    assert not can_start_review(job, TICKET_POLICY)
 
-    state: dict[str, object] = {
-        "status": "active",
-        "repository": "example/project",
-    }
-    outcome, checks = observe_required_checks(
-        stage,
-        state,
-        job,
-        Path("."),
-        11,
-    )
-
-    assert outcome is False
-    assert checks == "fail"
-    assert job["phase"] == "repairing"
-    assert job["next_attempt_kind"] == "final_ci_fix"
-    assert job["final_ci_fix_failure_head"] == "candidate-head"
-    assert repair_resumes == [(state, job)]
-    assert state == {
-        "status": "adapter_resumed",
-        "repository": "example/project",
-        "terminal_kind": None,
-        "diagnostics": [],
-    }
+    assert observe_repairable_ci_failure(
+        job, head_sha="candidate-head", limit=3,
+        is_ticket=True,
+    ) == "repair"
+    assert mark_ci_repair(
+        job, limit=3, is_ticket=True,
+    ) == 1
+    assert job["ci_recovery"]["window"] == 1
+    assert job["ci_recovery"]["developments_used"] == 1
+    assert budget["development_attempts"] == TICKET_POLICY.development_limit
+    assert budget["reviewer_invocations"] == TICKET_POLICY.review_limit
 
 
 @pytest.mark.parametrize(

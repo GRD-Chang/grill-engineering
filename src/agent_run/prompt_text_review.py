@@ -1,6 +1,66 @@
 """独立验收的双语对象说明、证据边界与输出语义。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'review/context-ranges': {
+        'zh': """本次固定审核快照的需求与范围事实（原始证据在下方用途段落给出，均取自同一快照）：
+{0}
+
+full_range 是交付基线至当前候选的完整范围；focus_range 是本轮优先核验的变化，不能代替完整交付责任。has_complete_baseline 为 false 时先建立完整基线。facts 保留有效需求、原始 Findings、失败证据及当前组合；Ticket 的 parent 仅提供背景，不扩大具体任务范围。集成改变基线时按新基线核验最终组合，并检查原始集成变化。CI Review 聚焦原失败、修复与直接回归；两种 Parent 仍对当前整体形成结论。你自主决定检查深度，按具体风险扩大核验范围。""",
+        'en': """Requirements and ranges from the fixed review snapshot (original evidence appears in the purpose-specific sections below, from the same snapshot):
+{0}
+
+full_range covers the delivery base through the current candidate; focus_range identifies priority changes and does not replace full delivery responsibility. Establish a complete baseline when has_complete_baseline is false. facts retain effective requirements, original Findings, failure evidence and the current combination; a Ticket's parent is background only and does not expand its task. When integration changes the base, check the final combination against the new base and inspect the original integration changes. CI Review focuses on the original failure, repairs and direct regressions; both Parent types still conclude on the entire current result. Decide inspection depth independently and expand validation for concrete risks.""",
+    },
+    'review/run-ci-object': {
+        'zh': """本次验收对象：
+当前工作区是 CI 修复与默认分支合并后的未提交整体预览，HEAD 留在默认分支基准是正常情况；检查工作树中的当前整体结果。CI 修复提交差异从失败证据绑定的版本到下方 repair_candidate_sha 比较；该提交差异用于定向核验，不替代整体预览。整体开发基准与实际合并基准可能不同，实际合并基准从当前工作区的只读 Git 取得。""",
+        'en': """Current acceptance review object:
+The workspace is an uncommitted preview of the CI repair merged with the default branch. HEAD remaining at the default-branch base is normal; inspect the entire current result in the working tree. Compare the CI repair commit delta from the revision bound by the failure evidence to repair_candidate_sha below; this delta supports targeted verification and does not replace the integrated preview. The overall development base and actual merge base may differ. Obtain the actual merge base using read-only Git in the workspace.""",
+    },
+    'review/ci-object': {
+        'zh': """当前工作区包含待审核的 CI 修复提交。下列身份用于准确绑定成果；审查差异以 CI 失败证据中的 head_sha 到当前 reviewed_candidate_sha 为准，原开发基线只提供需求与历史约束，不要求重复审查其全部累计改动。""",
+        'en': """The checkout contains the CI repair commit under review. The identities below bind the exact result; review the delta from head_sha in the CI failure evidence to the current reviewed_candidate_sha. The original development base provides requirement and historical constraints, without requiring a repeated review of all cumulative changes.""",
+    },
+    'review/ci-initial-baseline': {
+        'zh': """本次 CI 修复尚无上轮 CI Review 结果。依据准确失败证据、当前修复差异及直接回归，独立建立本次 CI 修复的审查结论。""",
+        'en': """There is no previous CI Review result for this repair. Establish an independent conclusion for this CI repair using the exact failure evidence, current repair delta and direct regressions.""",
+    },
+    'review/ci-repair': {
+        'zh': """你负责当前 Ticket 的 CI 修复审核。本轮完整审查和验证范围是这项 CI 修复及其直接回归；按实际风险选测，无需固定运行完整测试，发现具体风险时扩大验证。原需求用于约束本次修复；围绕准确失败版本、失败检查及可取得的原始日志，独立核验根因处理、修复证据和直接影响的回归，不重新审核整套需求。不得通过削弱有效测试、断言或检查伪造通过；开发自述和旧版本检查不能证明当前成果通过。已有 Findings、人工回复或新会话仍属于这项 CI 修复。
+
+CI 失败（完整原始证据）：
+{}""",
+        'en': """You are responsible for reviewing the current Ticket's CI repair. The complete review and validation scope of this round is this CI repair and its direct regressions. Select tests based on actual risk; a full suite is not mandatory each round, but expand validation when a concrete risk requires it. Original requirements constrain this repair. Independently verify root-cause handling, repair evidence and directly affected regressions against the exact failed revision, failed checks and available original logs; do not review the full requirements again. Do not weaken valid tests, assertions or checks to manufacture a pass. Developer claims and checks on an older revision do not prove the current result passed. Findings, human replies and new sessions remain part of this CI repair.
+
+CI failure (complete original evidence):
+{}""",
+    },
+    'review/parent-ci-baseline': {
+        'zh': """已有完整 Parent 验收基线（准确对象及原始结果）：
+{}
+基线用于复用旧验证证据；独立核验本次变化并对当前整体成果形成结论，旧结果不能直接授权新成果。""",
+        'en': """Existing complete Parent acceptance baseline (exact identities and original result):
+{}
+Reuse prior validation evidence from this baseline; independently verify current changes and conclude on the entire current result. The old result cannot authorize a new result directly.""",
+    },
+    'review/parent-ci-repair': {
+        'zh': """你负责当前完整 Parent 成果的 CI 修复审核。围绕准确失败版本、失败检查、原始日志和直接回归定向核验；原需求约束本次修复，不重新开发已完成 Ticket。已有适用完整 Parent 验收基线时，复用其验证证据并增量核验变化，但必须对当前完整 Parent 需求及整体成果形成结论；没有适用完整基线时建立完整基线，具体风险需要时扩大验证。不得削弱有效检查伪造通过。Review Findings、人工回复和新会话仍保留原始 CI 证据及当前整体责任。
+
+CI 失败（完整原始证据）：
+{}""",
+        'en': """You are responsible for CI repair review of the complete current Parent result. Verify the exact failed revision, failed checks, original logs and direct regressions. Original requirements constrain this repair; do not redevelop completed Tickets. With an applicable complete Parent acceptance baseline, reuse its validation evidence and verify changes incrementally, while concluding on the complete current Parent requirements and result. Without an applicable complete baseline, establish one; expand validation when concrete risks require it. Do not weaken valid checks to manufacture a pass. Review Findings, human replies and new sessions retain the original CI evidence and overall responsibility.
+
+CI failure (complete original evidence):
+{}""",
+    },
+    'review/parent-integration': {
+        'zh': """你负责当前完整 Parent 成果的集成验收。下面是准确源版本、目标版本、本地候选、最终组合及冲突路径。核验双方应交付成果、新组合风险和直接回归，对当前整体需求形成完整结论。已有适用完整基线时可以复用其证据并增量核验；没有适用基线时建立完整基线。相同 tree 不能代替范围、需求版本、基线和成果身份核验。
+准确集成事实：
+{0}""",
+        'en': """You are responsible for integration acceptance of the complete current Parent result. The following records exact source, target, local candidate, final combination and conflict paths. Verify deliverable contributions, combination risks and direct regressions, and form a complete conclusion for the current requirements. With an applicable complete baseline, reuse its evidence and verify changes incrementally; otherwise establish a complete baseline. An identical tree does not replace scope, requirement revision, baseline and result identity checks.
+Exact integration facts:
+{0}""",
+    },
     'review/read-only-validation': {
         'zh': """整个工作区保持只读；你可以启动服务、操作浏览器和创建测试数据，
 构建缓存、运行数据、日志和浏览器产物等需要写入的内容使用工作区外仅服务本轮的可定位临时路径。
@@ -24,6 +84,10 @@ Before finishing, stop services and browsers started during this task and remove
 {}
 
 These records help locate risks; they do not replace independent acceptance review of the current integrated result.""",
+    },
+    'review/run-complete-scope': {
+        'zh': """本轮对完整 Parent 需求、全部 Ticket 集合与实际完成事实、累计变化和当前准确预期合并结果形成整体结论；Ticket 的跳过记录不是 Parent 验收豁免。首次审查必须建立完整验收基线。后续有基线时可复用旧验证证据，增量核验变更、组合及直接回归，但仍对当前完整成果负责；无适用基线时重新建立完整基线。""",
+        'en': """Conclude on the full Parent requirements, all Tickets and actual completion facts, accumulated changes and the current exact expected merge result. Skipped Ticket reviews do not exempt Parent acceptance. The first review must establish a complete acceptance baseline. Later reviews with an applicable baseline may reuse prior validation evidence and incrementally verify changes, combinations and direct regressions, while still concluding on the entire current result; without an applicable baseline, establish a complete baseline.""",
     },
     'review/initial-baseline': {
         'zh': """按当前需求和代码检查本次完整范围，独立建立验收结论。""",

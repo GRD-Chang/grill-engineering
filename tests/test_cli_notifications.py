@@ -17,14 +17,16 @@ from support.workspace import managed_state
 from support.inprocess_cli import invoke_cli_inprocess
 
 from agent_run.notification_cards import card
-from agent_run.notification_events import events, recovery_event
+from agent_run.notification_events import events, recovery_events
 from agent_run.notifications import read_notifications
 from agent_run.presentation_helpers import human_status_term
 from agent_run.user_defaults import UserDefaultsStore
-from cli_fixtures import run_agents
-from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance, repair_acceptance, ticket
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import parent_publication, passing_acceptance, repair_acceptance, ticket
+
+from support.state import snapshot_runs
 
 
 @pytest.mark.parametrize("language,drain,scope,mode", [
@@ -42,12 +44,15 @@ def test_cli_delivery_sends_cards_and_queries_never_send(
     binary.mkdir()
     messages = tmp_path / "messages.jsonl"
     tool = binary / "lark-cli"
-    tool.write_text(f"#!{sys.executable}\n" + '''import json, sys, socket, os
+    tool.write_text(f"#!{sys.executable}\n" + '''import json, sys, socket, os, time
 from pathlib import Path
 args = sys.argv[1:]
 if "whoami" in args:
     print(json.dumps({"profile":"test", "appId":"cli_test", "identity":"bot", "available":True}))
 else:
+    time.sleep(float(os.environ.get("NOTIFICATION_TEST_DELAY", "0")))
+    with Path(os.environ["NOTIFICATION_TEST_PROCESSES"]).open("a") as stream:
+        stream.write(json.dumps([os.getpid(), os.getppid()])+"\\n")
     with Path(''' + repr(str(messages)) + ''').open("a") as stream:
         stream.write(json.dumps(json.loads(args[args.index("--content")+1]), ensure_ascii=False)+"\\n")
     if os.environ.get("NOTIFICATION_TEST_PORT"):
@@ -107,57 +112,71 @@ from agent_run.cli import main
 original_close = notifications.Notifications.close
 original_send = notifications.send
 original_observe = notifications.Notifications.observe
-# Synchronize only the isolated fast transport. This makes selected business
-# events inspectable without assuming production exit drains every message.
+real_delivery_titles = set()
+# Capture lifecycle assertions without waiting for transport under the
+# StateStore/Task Control transaction that invokes this observer.
 def observe(self, *args, **kwargs):
     state = args[0]
     for event in notifications.events(state):
-        if not kwargs.get('recovering') and event['kind'] == 'ticket_started' and event['id'] not in self.document.get('seen', []):
+        if event['kind'] in {'run_start', 'ticket_completed', 'boundary'}:
+            real_delivery_titles.add(event['title'])
+        if not kwargs.get('recovering') and event['kind'] in {'ticket_started', 'parent_started'} and event['id'] not in self.document.get('seen', []):
             active = state.get('active_agent_invocation') or {}
             assert active.get('reported_thread_id') and active.get('status') == 'running', active
     original_observe(self, *args, **kwargs)
-    if not os.environ.get('NOTIFICATION_TEST_PORT') and self.enabled and self.thread is not None:
-        with self.condition:
-            assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
 notifications.Notifications.observe = observe
+# Detailed-stage combinations are asserted against persisted lifecycle facts.
+# Keep the start, completed-ticket effort and approval/completion cards on the
+# real executable transport; concise mode still delivers every card for its
+# sequence/deduplication assertions, and cancellation keeps its real sender.
+if os.environ.get('NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT'):
+    def representative_send(config, card, *args, **kwargs):
+        if card['header']['title']['content'] in real_delivery_titles:
+            return original_send(config, card, *args, **kwargs)
+        return {'outcome': 'success', 'reason': None}
+    notifications.send = representative_send
 release_sender = threading.Event()
 port = os.environ.get('NOTIFICATION_TEST_PORT')
 if port:
-    def send(*args):
+    notifications.CLOSE_TIMEOUT_SECONDS = 0.05
+    def send(*args, **kwargs):
         release_sender.wait()
-        return original_send(*args)
+        return original_send(*args, **kwargs)
     notifications.send = send
-
-def close(self):
-    try:
-        if self.thread is not None:
-            if port:
+    def close(self):
+        try:
+            if self.thread is not None:
                 release_sender.set()
                 with socket.create_connection(('127.0.0.1', int(port)), timeout=15) as ready:
                     ready.sendall(b'C')
                     assert ready.recv(1) == b'1', 'close readiness not acknowledged'
-            else:
-                with self.condition:
-                    settled = lambda: bool(self.document.get('records')) or any(
-                        item['outcome'] in {'failed', 'unknown'} for item in self.document.get('pending', []))
-                    assert self.condition.wait_for(settled, timeout=15), 'representative send did not settle'
-                    assert self.document.get('records'), self.document
-    finally:
-        release_sender.set()
-        original_close(self)
-notifications.Notifications.close = close
+        finally:
+            release_sender.set()
+            original_close(self)
+    notifications.Notifications.close = close
 raise SystemExit(main(sys.argv[1:]))
 """
         source = str(Path(__file__).resolve().parents[1] / "src")
         environment = {**os.environ, "PYTHONPATH": source + os.pathsep + os.environ.get("PYTHONPATH", "")}
+        processes = tmp_path / f"{arguments[0]}-processes.jsonl"
+        environment["NOTIFICATION_TEST_PROCESSES"] = str(processes)
 
         def execute() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-c", script, *arguments, "--json", "--github-fixture", str(fixture)],
                 cwd=git_repo, env=environment, capture_output=True, text=True, check=False,
             )
+            assert processes.exists(), result.stdout + result.stderr
+            for line in processes.read_text().splitlines():
+                assert all(not Path(f"/proc/{pid}").exists() for pid in json.loads(line))
+            return result
 
         if drain:
+            if mode == "concise" and scope == "ticket":
+                # Exercise slow real transport without extending state-lock timeouts.
+                environment["NOTIFICATION_TEST_DELAY"] = "0.4"
+            if mode == "detailed":
+                environment["NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT"] = "1"
             return execute()
         # Business preparation is outside the cancellation window. Both the
         # close boundary and the real CLI must report ready before we release
@@ -192,20 +211,19 @@ raise SystemExit(main(sys.argv[1:]))
     current = load_only_run_state(git_repo)
     assert current["notifications"]["profile"] == "test"
     # A representative real request proves Executor/transport integration.
-    # Complete card combinations use the actual persisted lifecycle facts;
-    # production close is allowed to leave later notifications unsent.
+    # Complete card combinations use the actual persisted lifecycle facts.
     delivered = [json.loads(line) for line in messages.read_text().splitlines()]
     assert delivered and all(item["schema"] == "2.0" for item in delivered)
     assert current["language"] == language
     def localized(zh: str, en: str) -> str:
         return zh if language == "zh" else en
 
-    assert delivered[0]["header"]["title"]["content"] == localized("任务已开始", "Task started")
-    assert localized("开始时间", "Started at") in str(delivered[0])
+    assert delivered[0]["header"]["title"]["content"] == localized("任务已创建", "Task created")
+    assert localized("创建时间", "Created at") in str(delivered[0])
     assert localized("打开 Issue", "Open Issue") in str(delivered[0])
     cards = [card(event) for event in events(current)]
     titles = [item["header"]["title"]["content"] for item in cards]
-    assert localized("任务已开始", "Task started") in titles
+    assert localized("任务已创建", "Task created") in titles
     if mode == "detailed":
         assert sum(event["kind"] == "ticket_started" for event in events(current)) == 1
         development_starts = [event for event in events(current)
@@ -220,6 +238,7 @@ raise SystemExit(main(sys.argv[1:]))
         kinds = [event["kind"] for event in projected]
         assert kinds.count("acceptance_passed") == 1
         assert kinds.count("ticket_started") == (1 if scope == "ticket" else 0)
+        assert kinds.count("parent_started") == (1 if scope == "parent" else 0)
         assert kinds.count("acceptance_started") == (1 if scope == "ticket" else 0)
         assert kinds.count("acceptance_repair") == (1 if scope == "ticket" else 0)
         assert "stage_start" not in kinds and "stage_end" not in kinds
@@ -235,7 +254,7 @@ raise SystemExit(main(sys.argv[1:]))
         if scope == "ticket":
             assert current["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
         else:
-            assert len(delivered_titles) == 3  # Start, formal pass, approval; repairs stay quiet.
+            assert len(delivered_titles) == 4  # Created, actual development, formal pass, approval.
     assert not any("最终 PR" in value and "已创建" in value for value in titles), titles
     assert any(localized("请批准合并 PR", "Please approve merging PR") in value for value in titles)
     approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith(localized("请批准合并 PR", "Please approve merging PR")))
@@ -246,9 +265,12 @@ raise SystemExit(main(sys.argv[1:]))
     assert journal["seen"]
     if drain:
         assert any(record["outcome"] == "success" for record in journal["records"])
+        assert not journal["pending"]
     else:
-        assert any(item["outcome"] == "unknown" for item in journal["pending"])
-        assert any(item["outcome"] == "pending" for item in journal["pending"])
+        interrupted, = [item for item in journal["records"] if item["outcome"] == "unknown"]
+        assert interrupted["attempts"] == 1
+        assert interrupted["attempt_history"][-1]["cancelled"] is True
+        assert any(item["outcome"] == "pending" and item["attempts"] == 0 for item in journal["pending"])
     for result, expected in (
         ("none", localized("未配置合并前检查", "No pre-merge checks configured")), ("pass", localized(human_status_term("pass"), "Passed")),
         ("pending", localized(human_status_term("pending"), "Pending")), ("fail", localized(human_status_term("fail"), "Failed")),
@@ -266,6 +288,7 @@ raise SystemExit(main(sys.argv[1:]))
         path.relative_to(state_root): path.read_bytes()
         for path in state_root.rglob("*.json")
     }
+    runs_before = snapshot_runs(state_root)
     for command in ("status", "history"):
         queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
         assert queried.returncode == 0, queried.stderr
@@ -294,8 +317,9 @@ raise SystemExit(main(sys.argv[1:]))
                 assert facts["rounds"] == expected_rounds
                 role_invocations = [item for item in invocations
                                     if item["role"] == ("fresh_acceptance" if role == "review" else role)]
-                seconds = sum(int((datetime.fromisoformat(item["ended_at"])
-                                   - datetime.fromisoformat(item["started_at"])).total_seconds())
+                seconds = sum(int(sum((datetime.fromisoformat(segment["ended_at"])
+                                       - datetime.fromisoformat(segment["started_at"])).total_seconds()
+                                      for segment in item["execution_segments"]))
                               for item in role_invocations)
                 assert facts["execution_seconds"] == seconds
                 assert label in rendered
@@ -310,8 +334,9 @@ raise SystemExit(main(sys.argv[1:]))
                 assert configuration["reasoning_effort"] in rendered
             assert any(item["role"] == "publication" for item in invocations)
             assert completion["total_seconds"] == sum(
-                int((datetime.fromisoformat(item["ended_at"])
-                     - datetime.fromisoformat(item["started_at"])).total_seconds())
+                int(sum((datetime.fromisoformat(segment["ended_at"])
+                         - datetime.fromisoformat(segment["started_at"])).total_seconds()
+                        for segment in item["execution_segments"]))
                 for item in invocations)
         arguments = ("--plain", "--details") if command == "history" else ("--plain",)
         human = invoke_cli_inprocess(git_repo, fixture, command, output["run_id"], *arguments)
@@ -322,6 +347,7 @@ raise SystemExit(main(sys.argv[1:]))
         path.relative_to(state_root): path.read_bytes()
         for path in state_root.rglob("*.json")
     } == durable_before
+    assert snapshot_runs(state_root) == runs_before
     assert (messages.read_bytes() if messages.exists() else b"") == before
     assert read_notifications(managed_state(git_repo), output["run_id"]) == journal
     # Approval reuses the immutable Run configuration even after defaults change.
@@ -371,7 +397,7 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
         snapshot = deepcopy(state)
         snapshot["notifications"]["mode"] = mode
         pending = next(event for event in events(snapshot) if event.get("current"))
-        recovered = recovery_event(snapshot, [pending])
+        recovered = recovery_events(snapshot, [pending])[-1]
         assert recovered is not None
         for notification in (pending, recovered):
             assert notification["task_number"] == expected_number

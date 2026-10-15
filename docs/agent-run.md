@@ -78,17 +78,17 @@ Delivery Policy 的取值优先级是内置默认值、用户级默认值、单�
 
 ```bash
 agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 10 --review-deadline 2h
+agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --parent-ci-development-limit 3 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 
 Ticket 的语义 Review 轮数为 `N` 时，普通 Development 为 `N+1` 次、Reviewer 为 `N` 次；默认
-为 `4/3`，最后一次普通 Development 不再进入 Review，并保留有条件的一次 Final CI-fix。
+为 `4/3`，最后一次普通 Development 不再进入 Review。可修复 CI 失败使用独立额度。
 Parent-only 的配对轮数为 `N` 时，Development 与 Reviewer 都最多执行 `N` 次并严格配对；默认
 为 `10/10`，Reviewer 失败不会转入 Ticket Fallback，而是在当前窗口耗尽后等待显式 Resume。
 Run Repair 的修复轮数为 `N` 时，首次整体 Reviewer 加最多 `N` 次 Development 和 `N+1` 次
-Reviewer；默认准确执行 `D10/R11`。第 `N+1` 次 Reviewer 仍有 Finding 时进入 Review Budget
-Checkpoint，不使用 Final CI-fix 或未经 Reviewer 验收的 Publication Authority。
+Reviewer；普通 Parent 集成窗口默认为 `D3/R4`。第 `N+1` 次 Reviewer 仍有 Finding 时进入 Review Budget
+Checkpoint，不使用未经 Reviewer 验收的 Publication Authority。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
 改变已有 Run，包括之后获准开启的新预算窗口；只有检查点 Resume 的显式覆盖可修改新窗口策略。缺少或不完整 Snapshot 的旧状态会 fail closed。
@@ -103,26 +103,29 @@ agent-run requeue <parent-issue> --repo OWNER/REPO
 agent-run approve <parent-issue> --repo OWNER/REPO
 agent-run revise <parent-issue> --message '未经改写的维护者反馈' --repo OWNER/REPO
 agent-run stop <parent-issue> --repo OWNER/REPO
+agent-run stop <parent-issue> --ticket <ticket-number> --repo OWNER/REPO
 agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 ```
 
-### GitHub 只读身份
+### GitHub 身份
 
-没有 App profile 时，Worker GitHub Read Broker 默认使用宿主已经登录的 `gh`，不会启动登录、刷新或
-读取 `gh auth token`。需要独立最小权限身份时，一次性保存 App 元数据和仓库外私钥路径：
+Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端独立选择 host/PAT/App，默认 host，复用同一 PAT 引用和 App 定义。
+
+程序端 PAT/App 在首次克隆前校验；克隆、Controller 查询、Publisher 写入和读回、Git fetch/push 与远端分支清理均使用该选择。远端 Git 使用任务级 HTTPS 凭据，不修改全局登录或 Git 配置。`--runner-github-source` 仅覆盖新 Run；已有 Run 固定来源与引用，修复原引用后通过 `resume` 恢复。建立 Run 前失败只报告启动错误；已有 Run 保留进度与执行失败诊断。结果未知的写入继续按已有意图、准确 head 和发布者身份读回核验，不因凭据恢复而绕过批准或盲目重放写入。App 使用其 bot 操作身份核验评论、事件及发布结果，不要求 installation token 通过个人用户身份接口，也不删除作者校验；外部操作不能仅因内容相似被认领为本次正式发布。
+
+Parent-only 与 Final Run 收尾前保存绑定 Run、PR、合并 SHA 和发布者的关闭意图及派发状态。评论与关闭请求分别在发送前保存派发状态；评论结果未知且暂不可见时只等待读回，不重复发送。恢复时同时核对完成评论与意图之后的关闭事件；只有本地已记录关闭派发且匹配发布者的关闭事件可完成收尾，同一 App 的其他调用方关闭也不能替代本地派发证据。其他作者关闭或后续重新打开属于冲突；事件尚不可见时保持待对账，不重发已派发的关闭操作。缺少可核验关闭意图的旧完成评论不能单独证明本次发布已关闭 Parent。
+
+App 元数据与其他个人设置共同保存在 `user-defaults.json`；私钥只引用文件，由程序端签发短期 token，不主动下发私钥。App 默认采用安装已授权的权限和仓库范围；只读和当前仓库是仅作用于 Worker 的独立选项。Runner 使用完整安装授权，同一 App 定义下的两端 token 按调用上下文和范围隔离。示例：
 
 ```bash
-agent-run auth status
-agent-run auth app configure \
-  --app-id <app-id> \
-  --installation-id <installation-id> \
-  --private-key /secure/agent-run-app.pem
-agent-run auth app remove
+agent-run settings configure --worker-github-source app --github-app-id 123 --github-installation-id 456 --github-private-key-path /secure/agent-run-app.pem
+agent-run settings configure --runner-github-source app
+agent-run settings configure --github-app-read-only
+agent-run settings configure --migrate-github-app
+agent-run settings show
 ```
 
-配置文件位于 XDG 用户配置目录，只保存 App ID、Installation ID 和解析后的私钥绝对路径；私钥内容与
-短期 installation token 不会复制或落盘。App profile 存在但损坏或私钥不可用时会 fail closed，不会回退
-到宿主 `gh`。`auth` 命令可以从任意目录执行，不经过 Git discovery 或生命周期门禁。
+旧独立 App 配置需要显式迁入统一配置，保持 App 来源并采用新默认范围；查询不隐式迁移。迁移保留其他设置，显式新配置优先，失败保留有效数据，不删除活动执行器引用的旧材料。缺少新身份与范围绑定的旧 Run 明确拒绝恢复并保留数据，不从个人默认猜测补齐。配置或认证失败不回退宿主身份。
 
 ### 顶层 Codex 执行配置
 
@@ -154,17 +157,10 @@ Revision、绑定来源及其他内部身份只由 `status --json` 的 Machine A
 显示当前没有运行中的 Agent；`history --json` 保留每次启动的完整审计事实，包括仍在运行中的
 Invocation。
 
-会触发代码修复的 Required Check 必须由 GitHub Actions job API 准确绑定当前 PR head，且失败
-只发生在仓库 `pyproject.toml` 显式列出的稳定 `workflow::name::step`；缺少或矛盾的
-job/step 事实、runner/network 等平台步骤失败和未配置 step 都会 fail closed 地留在 Controller 监督：
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
+Required Check 真实失败绑定当前 PR/head 的 Observation 与失败明细后，交给 Development 调查。
+Actions job 的准确 head、完成状态与原始日志提供证据，不再读取仓库的 `code-failure-steps` 白名单。
+平台、取消或未知类别的真实失败也可调查；pending、unknown、身份不匹配和证据尚未收敛继续有界监督。
+两种 Parent 必须取得当前整体 Review，成果改变重新验证 CI 与人工批准。
 
 `status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
 外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
@@ -196,12 +192,19 @@ ADR 0011 的边界内自动同 Thread 续接：普通异常最多一次，准确
 Prompt，只补充继续同一次语义工作仍然需要的动态证据；`--new-thread` 只替换
 Invocation/Thread，不替换 Semantic Attempt，并使用当前角色和任务模式的完整标准 Prompt 新开 Thread。
 模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算窗口或后继流程；Reviewer 与定向 Repair
-只接收从现有预算投影的简短审查次数。`--message` 只允许用于当前 Human Blocker；它 trim
-后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
-和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
+只接收从现有预算投影的简短审查次数。`--message` 可补充任意当前恢复工作的人工处理结果；它 trim
+后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development、
+Review 和 Publish 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
-`resume` 恢复当前 failed 或 Human Blocker Invocation，也可以从 `supervision_timeout` 为同一等待身份开启新窗口；后者不接受 `--new-thread` 或 `--message`，不会创建 Worker、PR 或 merge。Ticket 与 Parent-only Change Job 的
+`resume` 继续原对象的未完成工作，不以暂停 reason 白名单决定是否永久拒绝。程序复核原需求与任务图，
+再按暂停前阶段、准确 pending Attempt 或已有 Candidate/Acceptance 进入对应后继；已完成角色成果由确定操作消费，
+不机械重新调用 Agent。Ticket、Parent-only、Run Repair、Run Acceptance 与 Final Publication 共用该准入。
+Run 级 Executor 恢复的消息按现有工作 FIFO、集成队列与名额选中的工作绑定，并进入该对象的实际 Agent 请求；
+其他 Ticket 的局部暂停不接收这条消息。回复局部暂停的 Ticket 时使用 `--ticket` 指定对象。
+缺少阶段或必要成果时，诊断列出需要补足/核验的事实，保留现场与同一入口；未知外部结果仍须先对账。
+`supervision_timeout` 为同一等待身份开启新窗口；message 保存在该工作上下文中，后续需要 Agent 时传递，
+纯等待恢复不创建 Worker。`--new-thread` 仅适用于已有 Agent 工作身份。Ticket 与 Parent-only Change Job 的
 preflight 若发现 requirements 或 base/head 已 stale，绝不启动 Codex，而是进入
 `requeue_required`。此状态下只允许 `status`、`history`、`requeue` 与 `abandon`。Run Repair 的
 Parent、Graph、Ticket Completion 或 Run Branch 边界发生漂移时，不创建 replacement generation；
@@ -227,12 +230,14 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
 | `run` | 新 Run、正常可推进状态或不存在当前 Work Subject 的 Run-wide Operator Gate 的纯监督超时暂停 | 提交或附着普通 Lifecycle Action；准确的 Executor 握手后可返回，由独立 Run Executor Session 持续监督 checks 与 GitHub 读取/对账，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker、`operator_stopped`，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
+| `resume` | 原目标未变的受支持 Run 中，唯一暂停对象或准确中断/待完成工作；未知 reason 保留入口 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场；message 进入对应角色 Prompt，缺事实时明确暂停 | 普通继续保留领域 attempt 与额度；额度耗尽的显式继续仅续期对应窗口并留存历史，重复请求不重复续期；不替代最终批准 |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
-| `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
+| `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR；两种 Parent 发现允许接纳的远端追加时先提示并自动更新、复验，再等待新批准 | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate；更新启动不表示交付完成 |
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
 | `stop` | 任意已知、未终止且有活动 Executor 的 Run | 原子撤销旧 Executor 写入权，定向终止其 Worker 进程组，并把 Run 置为可显式恢复的 `operator_stopped` | 不把 Stop 记为失败，不删除 checkout、Thread、Attempt 或 Artifact；确认无活动 Executor 及重复 Stop 都严格只读 |
+| `resume --ticket` | 指定 Ticket 位于合法局部暂停；可与其他 Ticket 的执行并存 | 复核需求、暂停授权和原 Executor；恢复意图及 FIFO 位置落盘后返回，名额可用时原 Executor 自动继续 | 返回成功只表示已接受；不新启 Executor，不插队，不重置有效预算；重复请求保持队位，最终批准和全局门禁仍有效 |
+| `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录停止意图，立即中断准确归属该票的 Agent，取消未启动的工作排队；确认进程退出后释放名额，其他 Ticket 与 CI 监督继续 | 保留工作区、Attempt、适用 Thread 与独立预算门禁；在途写入先对账，状态展示等待收口原因；用 `resume --ticket` 显式继续 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
 Task Control 缺失或损坏时，下一次生命周期命令先按准确 Run receipt、Host ownership、Runner binding
@@ -281,7 +286,7 @@ agent-run resume <parent-issue> \
 ```
 
 `--message` 会 trim 校验为非空、限制为 8 KiB，并按顺序绑定当前 Job Generation；它会进入后续
-Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不触发 Requeue，也不能替代
+Development、Review 与 Publish 的对应工作上下文。它不修改 Issue、不触发 Requeue，也不能替代
 `revise --message` 的 Run 级反馈。若 Resume preflight 发现 stale，命令不会运行 Codex，而是返回
 `requeue_required`；此时只能先查看状态/历史，再由维护者显式 Requeue：
 
@@ -298,8 +303,11 @@ Run-wide Operator Gate 时，
 同一 Parent 的显式 `run` 也可开启新窗口；否则必须先执行该门禁要求的专用动作。两条超时恢复路径
 均不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 读取失败 check 的名称、workflow、描述和链接，并读取其
-Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
-被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
+Actions job 的当前 head、状态及可取得的原始日志。准确失败不要求先被程序分类为代码可修：
+Ticket 和两种 Parent 共用开发循环，由 Development 定向调查失败与直接影响；Parent 的 Reviewer
+基于适用完整基线增量核验并对当前整体负责。pending、unknown 和证据尚未收敛继续有界监督。
+同一 Parent 的修复工作、最终 PR、后继提交和目标追加共用累计 CI 开发额度，默认 3 次；
+耗尽后显式 resume 仅续期该额度并保留历史，修复后的当前成果须重新通过准确 CI 和人工批准。
 
 新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、Runner 独立仓库根、state 目录及 Repository/Parent 路由身份，最多保留
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
@@ -335,8 +343,8 @@ Completion Record、
 Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
 Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改先形成不可变 repair Candidate，由全新的 Candidate Run Acceptance Reviewer 按完整 Parent 范围
-检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后仍须经过 repair PR Publication、
-Required Checks、Published-Head Gate 与实际合入；Controller 只在 Candidate tree、repair base、实际 Run tree、
+检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后由程序核验准确源与默认分支必要祖先关系，并直接更新 Run Branch，
+不创建内部修复 PR、调用内部 Publish 或等待内部 CI。Controller 只在 Candidate tree、repair base、实际 Run tree、
 default head、Parent/Graph revision 和 Ticket Completion records 全部精确匹配时提升该结论。若仅 default head
 前进，Controller 在原 Repair Cycle 重新预演并验收最新组合；其余权威边界失配才废弃 Candidate，并进入新的
 Run Acceptance Generation。
@@ -344,7 +352,7 @@ Run Acceptance Generation。
 Reviewer Thread，但仍创建新的 Validation Checkout，并以角色化短 Prompt 提供准确验收对象、适用的
 当前失败或 blocker 证据以及维护者最新回复。
 无代码变化不消耗预算，配置的 `N` 次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
-通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。`run` 随后推进
+通过只进入 `run_publication_pending`，尚未完成最终 PR 发布或默认分支合入。`run` 随后推进
 正常 Run Publication Attempt：由新的、只读的 Run Publication Codex 根据
 Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；同一 Publication Agent 因
 `execution_failed` 或 Human Blocker 继续当前对象时复用对应 Run Publication Thread，并只补充当前必要
@@ -353,7 +361,12 @@ Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type
 Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
 Publication Agent 返回合法叙事时 Semantic Attempt 即完成；之后 GitHub 写入、读取与对账失败只增加
 独立且有界的 Publication Operation Retry。该重试耗尽后进入硬 `publication_pending` 边界，`resume`
-不会清零、绕过或重新生成叙事。
+显式继续只开启该耗尽操作的新有界窗口，保留旧窗口历史、原成果、发布文案及未解决的写入意图，
+不重置开发、集成或 CI 额度，不替代最终批准。重启先核实准确 Git/远端结果：成功写入不重复，
+原边界仍有效且操作未发生时才继续；无法核实的结果保持有界等待和具体缺口。
+Ticket 的未知推送/PR 结果在暂停期间仍保留集成席位，其他 Ticket 可以继续开发，
+只能在对账确定后接纳新的集成交付。Publication Commit 在 Git 对象写入前保存准确对象意图，
+恢复时直接核验对象并安装原提交，避免重复生成提交。详见 [正式写入对账合同](adr/0022-publication-write-reconciliation.md)。
 Required Checks 全部通过（或没有配置）后状态才变为
 `run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
 commit。合并结果与已验收的预期 merge tree 一致后，Publisher 记录可重试的 Parent
@@ -361,11 +374,15 @@ closeout 审计评论并显式关闭 Parent Issue。
 
 `approve` 每次都会重新读取 Parent/Graph revision、Run Branch、默认分支、PR head、Fresh
 Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移重新验收准确最新组合，
-真实 merge conflict 与最终 PR Required Checks 失败会排入同一个有界 Run Repair 引擎。Run Repair 遵循
+默认分支或任务分支的追加先进入共同集成流程，真实冲突按原始 Git 证据解决且不扣需求或集成问题修复额度。
+新组合仍先完成整体 Run Acceptance；其 Findings 与最终 PR Required Checks 失败进入已有有界 Run Repair。Run Repair 遵循
 Repair → Candidate Run Acceptance → 严格 promotion 的路径；若 promotion 的 Candidate、repair base、实际
 Run tree、Parent、Graph 或 Completion 任一非 default 绑定失配，才回退到 fresh Run Acceptance。若只有
-default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；已集成 Job 在 revalidation 中又收到 Finding 时，
-Controller 保留 Repair Thread、Integration-repair Worktree 与计数，归档旧 Job/PR 并轮转新的 branch/PR。
+default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；准确写入后的成果在重新验收中又收到 Finding 时，
+Controller 保留原修复工作身份、Repair Thread、受管 Worktree、本地分支与累计计数，继续当前 Parent 开发和集成循环。
+
+两种 Parent 的 `approve` 先在终端说明自动更新规则：若默认分支或原任务分支新增可接纳的提交，将自动更新与复验，并重新请求批准。确认存在这类变化后，会向已启用的飞书提交更新通知，无需再次确认。旧批准段结束后，同一 Run 自动同步；真实冲突携原始证据交给修复，再完成 Reviewer 与适用检查，更新原 PR。此时可用 `stop` 和 `resume`，保留成果及有效预算历史。`action.status=updating` / `action_audit.result_status=updating` 仅表示更新已启动；新组合通过后仍需再次 `approve`，这次最终合并及必要收尾仍不可取消。通知不可用不阻止更新；需求或图谱变化仍按原门禁处理，身份、权限或非追加历史仍暂停处理。resync 额度耗尽时暂停并通知；显式 `resume` 只续期该额度，不重置需求、集成验收或 CI 的有效预算。
+
 `revise` 原样保存维护者反馈、重置一个新的 `N` 次实际变更预算，并进入同一 Candidate/promotion 语义。`abandon` 先把
 `abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
 带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期
@@ -399,43 +416,15 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 ## 权限边界
 
-没有 App profile 时，Controller 在现有 allowlist 校验后直接使用宿主 `gh` 执行固定只读请求；它不调用
-`gh auth login`、`gh auth refresh` 或 `gh auth token`。存在有效 App profile 时，Controller 使用专属
-GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短期 installation token。创建请求只申请
-`actions: read`、`checks: read`、
-`contents: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和
-`statuses: read`，且只接受 GitHub 在同一响应中返回完全一致 permissions 的 token。这些只读
-权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
-statuses，确认 Hosted CI 结果。
-不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
-Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个受 Run 保存的角色调用时限约束的 Worker 通过仅在本次 invocation 存活的
-普通 `gh` 命令入口按读取请求获取宿主身份或短期 token；Worker 不需要知道该入口背后的 adapter、socket、PATH 或挂载机制。Execution Guard
-只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），将其中当前存在且可执行的 `gh` 解析为去重的 canonical target，并由 bubblewrap
-在 Worker mount namespace 内把同一个 invocation-local adapter 只读绑定到这些 target。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；
-bubblewrap 的原子挂载就是启动保障，不增加 sandbox launcher、`samefile`、私有 probe 或持久状态。它不扫描 PATH 外文件，也不拦截 shell alias/function
-或 Agent 主动取得的替代客户端；任一绑定失败都在 Codex 启动前以 `worker_gh_binding_failed` 执行失败结束。Controller 位于该 namespace 外，
-继续使用原始真实 `gh` 或专用 GitHub App；宿主 token、App 私钥和 Publisher 凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
-请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
-Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
-续签并重试该读取一次；续签使用十分钟有界退避，耗尽后以
-`worker_credential_renewal_failed` 的可恢复诊断保留 checkout 与 Thread，供 `resume` 创建
-新 Worker。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
-使用真实 Git CLI 与上述受限的临时 `gh` adapter。Controller 只向 Brief 提供适用的 Parent/Ticket URL 和
-不可重建的原始失败证据；Revision、SHA、Run/Thread/Attempt 等身份只留在确定性账本中。
-Development、Publication 与 Fresh Validation Codex 使用 Git/`gh` 自行读取 diff、
-历史、Issue 和 PR 事实。
+Worker host/PAT/App 使用原生 `gh`，不挂载替换入口、不经过命令代理或本地 allowlist。host 复用宿主认证；PAT 使用所选引用的当前值。它们的 GitHub 能力由用户凭据决定，需要较小权限时由用户在 GitHub 收窄权限。Worker 得到选定身份需要的凭据，程序不会主动向其注入独立 Runner 秘密；host 身份可能与程序端相同。凭据秘密值不进入 Run 快照、普通输出和诊断。
 
-外层 bubblewrap 不是通用安全沙箱。它保留宿主和 checkout 的正常读写，只把权威
-literal `.git`、resolved gitdir 与 common-dir 挂载为只读，并隐藏 Publisher GitHub
-凭证、SSH agent 与交互式凭据入口。启动 Worker 前还会检查 local Git config 的全部
-remote URL 和 push URL；带 userinfo 的 HTTP(S) URL 会以固定脱敏错误拒绝，普通 HTTPS、
-SSH、scp-like 与本地 remote 保持可用，权威 config 不会被改写。这个边界用于防止可信
-Worker 误写权威历史，不承诺抵抗恶意进程、主动搜索其他宿主凭据、宿主污染或数据外泄。
-Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Artifact，
-但发布动作只能由 Publisher 执行。
+App 在程序端签发并自动续签，短期 token 通过每次 Invocation 隔离的 `GH_CONFIG_DIR/hosts.yml` 原子更新；同一 Agent 正常继承环境的后续 gh 子进程读取新 token，无需重建会话。不同权限和仓库范围的凭据实例隔离；不再替换 gh、解析命令或运行 socket 代理。临时续签失败有界重试，有效旧 token 可继续使用；失效后进入 Execution Failure。App 私钥不主动提供给 Worker。Runner 选择 App 时复用签发及续签实现，使用独立凭据实例；后续 GitHub API 与远端 Git 调用消费当前有效 token。程序端使用安装授权的完整范围，不继承 Worker 的只读或当前仓库收窄；权限不足明确失败，不自动扩大授权。
 
-普通测试使用 fake broker、fake `gh` 和本地 bubblewrap，不调用真实 Codex。真实 Codex command-tool
-compatibility acceptance 只允许显式 opt-in，不进入普通 pytest、每轮 Development 或常规 CI。
+Codex 使用 YOLO，可读写宿主文件系统、联网及使用真实 Git CLI。外层 bubblewrap 继续只读保护权威 Git metadata 和 Runner 控制状态；启动前拒绝 local Git config 中含 userinfo 的 HTTP(S) remote URL，并返回固定脱敏错误，不改写 config。这不是通用安全沙箱，不承诺防御恶意进程、主动搜索宿主凭据、宿主污染或数据外泄。
+
+GitHub 写能力不替代角色职责：开发只整理文件，审查不改交付内容，Publication Agent 只生成文案；不得自行提交、正式发布、自我批准或关闭任务。Controller 保留验收、Currentness、正式批准和完成判断，正式发布由 Publisher 程序执行。Controller 向 Agent 提供适用的需求 URL 与原始失败证据，Agent 使用 Git/gh 自行读取事实。
+
+已有 Run 的凭据故障保留进度和诊断，修复同一凭据引用后显式 `resume`，不隐式换来源、不归为代码 Finding。停止、失败和正常退出释放本轮临时资源。普通测试通过 gh、Codex 和服务替身验证配置、凭据传递与恢复；替身通过不代表真实外部工具兼容性已经验证。
 
 Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证；当前角色 Prompt 的
 风险相称验证、预检与只修改工作树边界优先于该通用 skill 的完整测试、Review 或 commit 建议。Development
@@ -475,12 +464,10 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
 每个 Ticket Review Budget Window 默认最多允许四次普通 Development Attempt 和三次 Reviewer
-Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。普通 Development 耗尽后，
-只有已发布 Ticket PR 首次出现由准确 CI Evidence 证明可修复的 Required Checks 失败时，才额外允许一次
-Final CI-fix。Development Attempt 在首次
+Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。准确 Required Checks 失败回到同一开发循环，不要求先分类为代码可修。Ticket 使用独立累计 CI Development 额度 `ticket_ci_development_limit`（默认 3），新失败版本与 PR 更新不重置；`ticket_ci_review` 默认关闭，开启时所有轮次一致审核。免审以绑定准确旧发布授权、失败证据和新候选的收据更新原 PR，不生成 Acceptance。CI 工作完成后再集成，集成不增加 Review。Development Attempt 在首次
 分配时占用预算；进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 只继续同一
-Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗尽且仍需修改时进入
-`modification_budget_exhausted`，维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
+Semantic Agent Attempt，不重复计数。普通需求预算耗尽且仍需修改时进入
+`modification_budget_exhausted`；Ticket CI 累计额度耗尽产生 `ci_development_budget_exhausted`，仅显式 resume 续期对应 CI 窗口。维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
 额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
 ## Source Runner 安装
@@ -542,7 +529,7 @@ agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
 `agent-run doctor` 是可选、只读的诊断入口，不要求当前目录是 Git 仓库。它报告 Python 版本、Git、Codex、
-宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker read provider；JSON
+宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker GitHub 身份；JSON
 输出只包含 Python 版本、路径、状态、provider 和布尔值等非敏感信息。缺少依赖只报告问题，不安装软件、不
 修复 PATH、不触发生命周期，也不修改 shell、auth profile、Run locator、Delivery Run、Thread、PR、
 branch 或运行数据。
@@ -554,11 +541,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
-没有 App profile 时 Worker read provider 默认是 host `gh`；`agent-run auth status`、
-`agent-run auth app configure --app-id <id> --installation-id <id> --private-key /secure/app.pem` 和
-`agent-run auth app remove` 是可选的公开配置路径。status 不显示 token 或私钥，remove 不删除用户的
-私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
-凭据隔离约束，Publisher 仍使用宿主写身份。
+Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端可独立选择 host/PAT/App，默认 host。
 
 首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
@@ -599,3 +582,13 @@ Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer�
 `unsupported_scope_change`，不更新 active。进程在两张 Ticket 之间退出或失败时，下一次
 `run` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
 动作不会重复。没有可执行 Ticket 时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。
+
+### Ticket 集成 Development 循环
+
+Ticket 原开发—审核与规定上限后的末轮跳过保持原合同；取得有效审查或 fallback 凭据后进行本地集成，集成不另调用 Review。Git 合并、整理后的检查或提交失败携具体操作、准确 source/target/candidate、HEAD/MERGE_HEAD 和原始输出回到 Development；处理后程序重新检查、提交及集成，随后普通 PR/CI 合入 Run Branch。Agent 自述不能作为 Git 成功证据。
+
+`--ticket-integration-development-limit` 默认 3，为独立累计额度，包含冲突工作。新失败和远端追加不清零，重复读状态及同一 Semantic Attempt 的中断续接不额外扣费。耗尽时 `integration_development_exhausted` 保留工作树，`resume <run-id> --ticket <number>` 只追加对应集成额度并保留历史，不重置需求、CI 或 resync 额度；重复恢复不重复授权。`--new-thread` 使用完整集成 Prompt，`--message` 继续进入同一工作来源。普通未知原因恢复不续期其他额度，也不解除其他 Ticket 的人工门禁。
+
+status/history 区分需求开发与集成开发累计用量、额度窗口及语义工作。Git 机械操作限时 30 秒，超时保留现场和输出；工作使用原共享 Ticket Agent 名额与 FIFO，集成交付继续单席，正常 CI 等待不占 Agent 名额。新状态不迁移旧 Run。详见 [ADR 0020](adr/0020-ticket-integration-development-loop.md)。
+
+新 Run 使用 `branch_authority_protocol=3`。旧 Run 明确拒绝继续，不自动迁移、兼容读取或删除既有成果。完整 Parent 的直接 Run Branch 更新仍受实际运行凭据和仓库规则约束；权限或规则拒绝时保全修复成果与写入意图，说明缺口并暂停，由维护者处理后通过 `resume` 继续。未知推送先对账，不通过强推、重置、改规则或内部修复 PR 兜底。

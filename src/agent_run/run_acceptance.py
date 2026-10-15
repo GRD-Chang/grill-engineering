@@ -1,23 +1,21 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from agent_run.agents import AgentBackend
-from agent_run.agent_invocation import (
-    fail_interrupted_invocation,
-    invocation_event_recorder,
-)
-from agent_run.artifacts import (
-    AcceptanceArtifact,
-    append_human_blocker_history,
-    clear_current_human_blocker,
-)
+from agent_run.review_context import prepare_review_context, run_acceptance_record
+from agent_run.review_evidence import review_record_matches, run_review_identity
+
+from agent_run.agents import AgentBackend, ReviewResult
+from agent_run.agent_execution import execute_agent_work
+from agent_run.agent_return import restore_agent_return
+from agent_run.development_review import advance_development_review, after_review, ReviewDecision
+from agent_run.run_development_review import RunDevelopmentReview
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import latest_reviewer_thread
-from agent_run.delivery_policy import (
-    invocation_deadline_for_state,
-    run_repair_budget_policy_for_job,
-)
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -33,7 +31,13 @@ from agent_run.run_currentness import (
     run_currentness_boundary,
     ticket_completion_records,
     ticket_fallback_records,
+    ticket_ci_repair_records,
     ticket_integration_records,
+)
+from agent_run.run_parent_integration import (
+    prepare_run_parent_integration,
+    run_integration_record_is_valid,
+    run_integration_remote_is_current,
 )
 from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_repair_lifecycle import RunRepairLifecycle
@@ -41,21 +45,25 @@ from agent_run.run_repair_promotion import RunRepairPromotion
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_thread_identity import prior_thread_identities
+from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 from agent_run.state import StateStore
+from agent_run.object_state import object_store
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
-from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
+from agent_run.review_attempt import (
+    begin_review, consume_review_result, finish_review_result, remember_review,
+    review_ordinal,
+)
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,
-    mark_review,
     new_budget,
     previous_review_context,
     reviewer_budget_context,
 )
 from agent_run.semantic_attempt import (
-    allocate_semantic_attempt,
     close_semantic_attempt,
     detach_active_invocation,
     pending_semantic_attempt,
@@ -85,7 +93,7 @@ class RunAcceptanceEngine:
         currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
-        self.states = states
+        self.states = object_store(states, parent_scope=True)
         self.agents = agents
         self.default_head_sha = default_head_sha
         self.github = github
@@ -97,17 +105,38 @@ class RunAcceptanceEngine:
             RunRepairRequests(git, github) if github is not None else None
         )
         self.repair_currentness = (
-            RunRepairCurrentness(git, github, states)
+            RunRepairCurrentness(git, github, self.states)
             if github is not None
             else None
         )
-        self._repair_lifecycle = RunRepairLifecycle(self)
         self._repair_promotion = RunRepairPromotion(self)
+        self._repair_lifecycle = RunRepairLifecycle(self, self._repair_promotion)
 
     def accept(self, run_id: str) -> dict[str, Any]:
+        self._accept(run_id)
+        state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        return state
+
+    def _accept(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        state.update(self.states.load_delivery_evidence(run_id))  # type: ignore[attr-defined]
+        run = state.get("run_acceptance")
+        repair = run.get("repair_job") if isinstance(run, dict) else None
+        if isinstance(run, dict) and isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+            # Resolve the original remote write before graph/currentness
+            # refresh or integration can replace its authority or charge it
+            # as an external source update.
+            self._repair(state, run)
+            return self._save(state)
+        if not reconcile_run_pr_write(
+            state, self.github, self._save,
+            current_head_sha=self.git.resolve(str(state["run_branch"])),
+        ):
+            return state
         if not self._refresh_run_currentness(state):
             return self._save(state)
         if not self._all_tickets_completed(state):
@@ -115,103 +144,43 @@ class RunAcceptanceEngine:
         run = self._run_state(state)
         budget_policy = self._run_budget_policy(state, run)
         ensure_budget(run, budget_policy)
-        self._invalidate_stale_acceptance(state, run)
-        while True:
-            phase = str(run["phase"])
-            if phase == "reviewing":
-                # A process can die after persisting the attempt marker but
-                # before the reviewer returns. No verdict exists yet, so a
-                # later command must start a fresh attempt rather than get
-                # stuck on an in-flight transient state.
-                if fail_interrupted_invocation(
-                    state, role="reviewer", save=self._save
-                ):
-                    return state
-                run["phase"] = "pending"
-                self._save(state)
-                continue
-            if phase == "accepted":
-                state["status"] = "run_publication_pending"
-                state["terminal_kind"] = "run_acceptance_passed"
-                state["diagnostics"] = []
+        pending = pending_semantic_attempt(run, role="reviewer")
+        if pending is not None and "returned_result" in pending and "pending_review_result" not in run:
+            # Recover the dispatched snapshot before preparing any new Git
+            # boundary. The saved result may already be stale, but was paid for.
+            review = cast(ReviewResult, restore_agent_return(pending["returned_result"], pending))
+            self._retain_review_return(state, run, review, self._mapping(pending, "review_context"))
+        # A returned Reviewer still owns its pending Semantic Attempt. Finish
+        # or invalidate that result before integration can allocate conflict
+        # work, renew a window, or persist a different pause phase.
+        if "pending_review_result" not in run:
+            if not prepare_run_parent_integration(self, state, run):
                 return self._save(state)
-            if phase == "ready_for_human":
-                state["status"] = "ready_for_human"
-                state["terminal_kind"] = "waiting_human"
-                return self._save(state)
-            if phase == "repairing":
-                repair = self._repair(state, run)
-                if repair == "waiting":
-                    return self._save(state)
-                if repair == "stale":
-                    run["phase"] = "pending"
-                    run.pop("acceptance_record", None)
-                    run.pop("acceptance_artifact", None)
-                    # A discarded Repair establishes the fresh Acceptance
-                    # boundary; it does not reuse this invocation to run it.
-                    return self._save(state)
-                if repair == "no_code_changes":
-                    run["phase"] = "ready_for_human"
-                    run["blocked_reason"] = "no_code_changes"
-                    state["diagnostics"] = [
-                        {
-                            "code": "no_code_changes",
-                            "message": "Run Repair produced no code changes",
-                        }
-                    ]
-                    continue
-                if repair == "blocked":
-                    run["phase"] = "ready_for_human"
-                    continue
-                if repair == "promoted":
-                    # The Candidate Acceptance has already been promoted
-                    # to the integrated Run boundary.  Run Publication is
-                    # the next phase; do not ask a second full Run
-                    # Reviewer to repeat the same three lanes.
-                    return self._save(state)
-                run["phase"] = "pending"
-                run.pop("acceptance_record", None)
-                run.pop("acceptance_artifact", None)
-                self._save(state)
-                continue
-            if phase != "pending":
-                raise ValueError(f"unknown Run Acceptance phase: {phase}")
-            budget = ensure_budget(run, budget_policy)
-            if (
-                pending_semantic_attempt(run, role="reviewer") is None
-                and int(budget["reviewer_invocations"]) >= budget_policy.review_limit
-            ):
-                run["phase"] = "ready_for_human"
-                run["blocked_reason"] = "review_budget_exhausted"
-                budget["checkpoint_reason"] = "review_budget_exhausted"
-                state.update(
-                    {
-                        "status": "ready_for_human",
-                        "terminal_kind": "waiting_human",
-                        "diagnostics": [
-                            {
-                                "code": "review_budget_exhausted",
-                                "message": "Run Acceptance review budget is exhausted; resume is required",
-                            }
-                        ],
-                    }
-                )
-                return self._save(state)
-            if not self._review(state, run):
-                return self._save(state)
+            self._invalidate_stale_acceptance(state, run)
+        acceptance_already_complete = run["phase"] == "accepted"
+        advance_development_review(RunDevelopmentReview(self, state, run))
+        if run["phase"] == "accepted" and (
+            not acceptance_already_complete or state.get("status") == "run_acceptance_pending"
+        ):
+            # Reusing an applicable completed review must retain the current
+            # Publication/approval gate; only Acceptance's own handoff advances
+            # the Run to publication work.
+            state.update({"status": "run_publication_pending",
+                          "terminal_kind": "run_acceptance_passed", "diagnostics": []})
+        elif run["phase"] == "ready_for_human":
+            state.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
+        return self._save(state)
 
     def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         budget_policy = self._run_budget_policy(state, run)
+        if isinstance(run.get("run_integration"), dict) and not run_integration_record_is_valid(self, state):
+            raise ValueError("Run Acceptance requires the current integrated Run Branch")
         resume_initial_credential_wait(
             state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
         )
         run_head = self.git.resolve(str(state["run_branch"]))
         pending_attempt = pending_semantic_attempt(run, role="reviewer")
-        validation_attempt = (
-            int(pending_attempt["ordinal"])
-            if pending_attempt is not None
-            else int(run.get("validation_attempts", 0)) + 1
-        )
+        validation_attempt = review_ordinal(run)
         checkout = self._validation_checkout(state, validation_attempt)
         try:
             default_head = self._default_head(state)
@@ -249,15 +218,11 @@ class RunAcceptanceEngine:
                 reviewed_default_base_sha=default_head,
                 expected_merge_tree=expected_merge_tree,
             )
-            if pending_attempt is None:
-                run["validation_attempts"] = validation_attempt
-            semantic_attempt = allocate_semantic_attempt(
+            semantic_attempt = begin_review(
                 run,
-                role="reviewer",
                 work_subject=f"run-acceptance:{state['run_id']}",
                 generation=int(run["acceptance_generation"]),
-                currentness_boundary=boundary,
-                ordinal=validation_attempt,
+                boundary=boundary,
                 budget_window=int(ensure_budget(run, budget_policy)["window"]),
             )
             request["review_budget_context"] = reviewer_budget_context(
@@ -267,30 +232,31 @@ class RunAcceptanceEngine:
                     semantic_attempt.get("budget_consumed") is True
                 ),
             )
-            if semantic_attempt.get("budget_consumed") is True:
-                request.pop("previous_acceptance_artifact", None)
-                request.pop("previous_review_identity", None)
+            context = prepare_review_context(request, semantic_attempt, run, self.git, state)
             run["phase"] = "reviewing"
-            self._save(state)
-            if run.get("reviewer_new_thread") is True:
-                request["_invocation_mode"] = "new-thread"
-            invocation_deadline_seconds = invocation_deadline_for_state(
-                state, "reviewer"
-            )
-            request["_invocation_event"] = invocation_event_recorder(
-                state,
-                role="reviewer",
-                phase="run_acceptance",
-                work_subject=f"run-acceptance:{state['run_id']}",
-                generation=int(run["acceptance_generation"]),
-                invocation_input=request,
-                currentness_boundary=boundary,
-                semantic_attempt=semantic_attempt,
-                save=self._save,
-                invocation_deadline_seconds=invocation_deadline_seconds,
-            )
-            request["_currentness_check"] = lambda: (
+
+            def save_review(current: dict[str, Any]) -> dict[str, Any]:
+                # Public Resume leaves the predecessor Invocation resuming
+                # with a pending owner until the backend records its successor;
+                # backend recovery waits have the same pending relationship.
+                # Persist their phase transition together, without inventing
+                # a started Invocation or changing the paid Attempt.
+                active = current.get("active_agent_invocation")
+                bound = active.get("semantic_attempt") if isinstance(active, dict) else None
+                if (
+                    run.get("phase") in {"pending", "reviewing"}
+                    and isinstance(active, dict)
+                    and isinstance(bound, dict)
+                    and bound.get("attempt_id") == semantic_attempt["attempt_id"]
+                ):
+                    run["phase"] = "pending" if active["status"] == "resuming" else "reviewing"
+                return self._save(current)
+
+            save_review(state)
+            is_current = lambda: (
                 self._refresh_run_currentness(state)
+                and
+                (not isinstance(run.get("run_integration"), dict) or run_integration_remote_is_current(self, state))
                 and
                 self.git.resolve(str(state["run_branch"])) == run_head
                 and self._default_head(state) == default_head
@@ -302,7 +268,11 @@ class RunAcceptanceEngine:
                 == request["ticket_completion_records"]
             )
             try:
-                review = self.agents.review(request)
+                review = cast(ReviewResult, execute_agent_work(
+                    state, run, request, semantic_attempt,
+                    agents=self.agents, save=save_review, phase="run_acceptance",
+                    boundary=boundary, is_current=is_current,
+                ))
             except InitialCredentialUnavailable as error:
                 # This reviewer has not started: keep the same Acceptance
                 # generation and make the next Driver pass retry only its
@@ -323,120 +293,100 @@ class RunAcceptanceEngine:
             clear_initial_credential_wait(
                 state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
             )
-            # Only a returned Artifact that passes the strict schema parser
-            # consumes a Reviewer invocation.  Count it before currentness
-            # re-checking because the Reviewer did complete a valid audit even
-            # when a live boundary refresh discards that verdict.
-            artifact = AcceptanceArtifact.parse(review.artifact)
-            if semantic_attempt.get("budget_consumed") is not True:
-                mark_review(run, budget_policy)
-                semantic_attempt["budget_consumed"] = True
-            # The reviewer has already consumed this identity even if a live
-            # authority refresh discards its verdict.  Keep it unavailable to
-            # the fresh Acceptance that follows a drift.
-            self._record_reviewer(state, run, review.thread_id)
-            if not request["_currentness_check"]():
-                close_semantic_attempt(
-                    run, semantic_attempt, outcome="currentness_invalidated"
-                )
-                detach_active_invocation(state, semantic_attempt)
-                run["phase"] = "pending"
-                self._save(state)
-                return False
+            self._retain_review_return(state, run, review, context)
         finally:
             self.git.remove_worktree(checkout)
-        run.pop("reviewer_new_thread", None)
+        return self._complete_review(state, run)
+
+    def _retain_review_return(
+        self, state: dict[str, Any], run: dict[str, Any],
+        review: ReviewResult, context: dict[str, Any],
+    ) -> None:
+        # Count a valid audit exactly once, even if live authority later
+        # invalidates its verdict. This context belongs to the original call.
+        policy = self._run_budget_policy(state, run)
+        artifact = consume_review_result(run, policy, review.artifact)
+        run["pending_review_result"] = {
+            "record": run_acceptance_record(context, review.thread_id, artifact.raw),
+            "human_blocker_resume": bool(run.get("prior_human_blockers")),
+        }
+        run["phase"] = "reviewing"
+        self._record_reviewer(state, run, review.thread_id)
+
+    def _complete_review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
+        pending = self._mapping(run, "pending_review_result")
+        record = self._mapping(pending, "record")
+        artifact = AcceptanceArtifact.parse(record["artifact"])
+        semantic_attempt = pending_semantic_attempt(run, role="reviewer")
+        if semantic_attempt is None:
+            raise ValueError("Run Reviewer closeout is missing its Semantic Attempt")
+        run_head = str(record["reviewed_head_sha"])
+        default_head = str(record["reviewed_default_base_sha"])
+        expected_merge_tree = str(record["expected_merge_tree"])
+        budget_policy = self._run_budget_policy(state, run)
         budget = ensure_budget(run, budget_policy)
-        review_record = {
-            "reviewer_thread_id": review.thread_id,
+        remember_review(budget, {
+            "reviewer_thread_id": record["reviewer_thread_id"],
             "candidate_sha": run_head,
             "reviewed_base_sha": default_head,
             "expected_merge_tree": expected_merge_tree,
             "review_identity": {
-                "default_base_sha": default_head,
-                "run_head_sha": run_head,
+                "default_base_sha": default_head, "run_head_sha": run_head,
                 "expected_merge_tree": expected_merge_tree,
             },
             "artifact": artifact.raw,
-        }
-        # Human recovery finishes the same Reviewer round and candidate.
-        # Keep one authoritative artifact, as Ticket/Parent review does;
-        # the original blocker remains in human_blocker_history.
-        prior_index = next((
-            index for index in range(len(budget["review_artifacts"]) - 1, -1, -1)
-            if all(budget["review_artifacts"][index].get(key) == review_record[key]
-                   for key in ("reviewer_thread_id", "candidate_sha", "review_identity"))
-            and AcceptanceArtifact.parse(budget["review_artifacts"][index]["artifact"]).requires_human
-        ), None)
-        if prior_index is None:
-            budget["review_artifacts"].append(review_record)
-        else:
-            budget["review_artifacts"][prior_index] = review_record
-        del budget["review_artifacts"][:-budget_policy.review_limit]
-        record = self._acceptance_record(
-            state,
-            run_head,
-            expected_merge_tree,
-            review.thread_id,
-            artifact.raw,
+        }, limit=budget_policy.review_limit,
+            human_blocker_resume=pending.get("human_blocker_resume") is True)
+        refreshed = self._refresh_run_currentness(state)
+        integration = run.get("run_integration")
+        integration_current = not isinstance(integration, dict) or (
+            run_integration_record_is_valid(self, state)
+            and run_integration_remote_is_current(self, state)
         )
-        run.update(
-            {
-                "reviewed_head_sha": run_head,
-                "acceptance_artifact": artifact.raw,
-                "acceptance_record": record,
-            }
-        )
-        if artifact.is_accepted:
-            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
-            clear_current_human_blocker(run)
-            run["phase"] = "accepted"
-        elif artifact.requires_human:
-            append_human_blocker_history(
-                run, phase="pending", blockers=artifact.blocker_evidence
+        if (
+            refreshed and integration_current and isinstance(integration, dict)
+            and self.default_head_sha is None
+        ):
+            # A new Engine can resume a previously integrated default boundary
+            # without rebuilding its checkout. Live refs above prove it still
+            # applies; an explicitly refreshed head is never overwritten.
+            self.default_head_sha = str(integration["target_sha"])
+            self.candidate_acceptance.update_default_head(self.default_head_sha)
+        if not (
+            refreshed and integration_current
+            # Different refs invalidate the old audit before Git previews a
+            # potentially conflicting new merge. Matching refs still require
+            # the complete evidence identity, including its expected tree.
+            and self.git.resolve(str(state["run_branch"])) == run_head
+            and self._default_head(state) == default_head
+            and review_record_matches(
+                record, run_review_identity(
+                    state, self.git, self._default_head(state),
+                    self.git.resolve(str(state["run_branch"])),
+                ),
             )
-            run.update(
-                {
-                    "phase": "ready_for_human",
-                    "blocked_reason": "reviewer_requires_human",
-                    "human_blockers": list(artifact.blocker_evidence),
-                    "human_blocker_phase": "pending",
-                }
-            )
-            state.update(
-                {
-                    "status": "ready_for_human",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [
-                        {"code": "reviewer_requires_human", "message": blocker}
-                        for blocker in artifact.blocker_evidence
-                    ],
-                }
-            )
-        else:
-            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
-            clear_current_human_blocker(run)
-            budget = ensure_budget(run, budget_policy)
-            if int(budget["reviewer_invocations"]) >= budget_policy.review_limit:
-                run["phase"] = "ready_for_human"
-                run["blocked_reason"] = "review_budget_exhausted"
-                budget["checkpoint_reason"] = "review_budget_exhausted"
-                state.update(
-                    {
-                        "status": "ready_for_human",
-                        "terminal_kind": "waiting_human",
-                        "diagnostics": [
-                            {
-                                "code": "review_budget_exhausted",
-                                "message": "Run Acceptance review budget is exhausted; resume is required",
-                            }
-                        ],
-                    }
-                )
-            else:
-                run["phase"] = "repairing"
+        ):
+            close_semantic_attempt(run, semantic_attempt, outcome="currentness_invalidated")
+            detach_active_invocation(state, semantic_attempt)
+            run.pop("pending_review_result", None)
+            run["phase"] = "pending"
+            self._save(state)
+            return False
+        run.update({"reviewed_head_sha": run_head,
+                    "acceptance_artifact": artifact.raw, "acceptance_record": record})
         if not artifact.requires_human:
             self._record_final_pr_status(state, artifact.raw, run_head)
+        finish_review_result(
+            state, run, artifact, resume_phase="pending", blocked_phase="ready_for_human",
+        )
+        decision = after_review(run, budget_policy, artifact)
+        if artifact.is_accepted:
+            run["phase"] = "accepted"
+        elif not artifact.requires_human:
+            if decision in {ReviewDecision.REVIEW_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
+                RunDevelopmentReview(self, state, run).checkpoint(decision.value)
+            else:
+                run["phase"] = "repairing"
         self._save(state)
         return True
 
@@ -490,30 +440,10 @@ class RunAcceptanceEngine:
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
         return self._repair_lifecycle._repair(state, run)
 
-    def _invalidate_stale_repair(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        self._repair_promotion._invalidate_stale_repair(state, job, checkout)
-
-    def _complete_integration_reprepare(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        self._repair_promotion._complete_integration_reprepare(state, job, checkout)
-
-    def _render_run_repair_pr_body(
-        self, state: dict[str, Any], publication: dict[str, Any]
-    ) -> str:
-        return self._repair_lifecycle._render_run_repair_pr_body(state, publication)
-
     def _prepare_repair_validation(
         self, checkout: Path, job: dict[str, Any], validation: Path
     ) -> None:
         self._repair_lifecycle._prepare_repair_validation(checkout, job, validation)
-
-    def _after_repair_merge(
-        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
-    ) -> bool:
-        return self._repair_promotion._after_repair_merge(state, job, live)
 
     def _escalate_repair(
         self, state: dict[str, Any], job: dict[str, Any], code: str
@@ -540,6 +470,7 @@ class RunAcceptanceEngine:
             "candidate_acceptance_history": [],
             "review_budget": new_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
         if isinstance(state.get("policy_snapshot"), dict):
             run["policy_snapshot"] = dict(state["policy_snapshot"])
@@ -566,15 +497,8 @@ class RunAcceptanceEngine:
         if not isinstance(record, dict):
             return
         current_head = self.git.resolve(str(state["run_branch"]))
-        parent = self._mapping(state, "parent")
-        graph = self._mapping(state, "ticket_graph")
-        if (
-            record.get("reviewed_head_sha") == current_head
-            and record.get("reviewed_default_base_sha") == self._default_head(state)
-            and record.get("parent_revision") == parent.get("revision")
-            and record.get("ticket_graph_revision") == graph.get("revision")
-            and record.get("ticket_completion_records")
-            == ticket_completion_records(state)
+        if review_record_matches(
+            record, run_review_identity(state, self.git, self._default_head(state), current_head),
         ):
             return
         invalidate_run_acceptance(state)
@@ -590,15 +514,20 @@ class RunAcceptanceEngine:
     ) -> dict[str, Any]:
         request = {
             "acceptance_scope": "run",
-            "_prompt_resources": state["prompt_resources"],
             "parent_issue_url": self._issue_url(
                 state, int(self._mapping(state, "parent")["number"])
             ),
             "run_id": state["run_id"],
             "repository": str(state["repository"]),
             "parent": dict(self._mapping(state, "parent")),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
+            "ticket_graph": deepcopy(self._mapping(state, "ticket_graph")),
             "ticket_completion_records": ticket_completion_records(state),
+            "run_review_facts": {
+                "parent_revision": state["parent"]["revision"],
+                "ticket_graph_revision": state["ticket_graph"]["revision"],
+                "ticket_set": state["ticket_graph"]["ordered_ticket_numbers"],
+                "ticket_completion_records": ticket_completion_records(state),
+            },
             "base_sha": default_head,
             "run_head_sha": run_head,
             "current_review_identity": {
@@ -641,10 +570,20 @@ class RunAcceptanceEngine:
         fallbacks = ticket_fallback_records(state)
         if fallbacks:
             request["fallback_ticket_records"] = fallbacks
+        ci_repairs = ticket_ci_repair_records(state)
+        if ci_repairs:
+            request["ci_repair_ticket_records"] = ci_repairs
         integrations = ticket_integration_records(state)
         if integrations:
             request["ticket_integration_records"] = integrations
+        run_integration = run.get("run_integration")
+        if isinstance(run_integration, dict):
+            request["run_integration_record"] = dict(run_integration)
         previous = previous_review_context(run)
+        if previous is None:
+            history = run.get("review_budget_history")
+            if isinstance(history, list) and history and isinstance(history[-1], dict):
+                previous = previous_review_context(history[-1])
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]
@@ -654,27 +593,6 @@ class RunAcceptanceEngine:
         self, state: dict[str, Any], job: dict[str, Any], integrated: str
     ) -> dict[str, Any] | None:
         return self.candidate_acceptance.promotion_record(state, job, integrated)
-
-    def _acceptance_record(
-        self,
-        state: dict[str, Any],
-        run_head: str,
-        expected_merge_tree: str,
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "run",
-            "reviewed_base_sha": self._default_head(state),
-            "reviewed_default_base_sha": self._default_head(state),
-            "reviewed_head_sha": run_head,
-            "expected_merge_tree": expected_merge_tree,
-            "parent_revision": self._mapping(state, "parent")["revision"],
-            "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": ticket_completion_records(state),
-            "reviewer_thread_id": reviewer_thread_id,
-            "artifact": artifact,
-        }
 
     def _record_reviewer(
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str

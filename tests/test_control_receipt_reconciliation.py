@@ -11,9 +11,12 @@ from agent_run import cli as cli_module
 from agent_run.executor_host import ExecutorSpec, FakeExecutorHost, HostObservation
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore
-from conftest import seed_run, write_fixture
-from test_run_lifecycle import _isolated_environment, ticket
-from test_ticket_194_stop_abandon import _bind_running_executor
+from support.seeding import seed_run, write_fixture
+from support.lifecycle import _isolated_environment
+from support.cli_payloads import ticket
+from support.control import _bind_running_executor
+
+from support.state import snapshot_run
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
@@ -39,8 +42,8 @@ def test_control_command_reconciles_receipt_before_admission(
     assert previous is not None
     action_id = previous["action"]["action_id"]
     generation = previous["executor"]["generation"]
-    state_path = states.runs_directory / f"{run_id}.json"
-    state_before = state_path.read_bytes()
+    state_ref = (states.root, str(run_id))
+    state_before = snapshot_run(state_ref)
     fixture_before = fixture.read_bytes()
     path = control.path_for(task)
     if control_case == "missing":
@@ -88,7 +91,7 @@ def test_control_command_reconciles_receipt_before_admission(
                 assert worker.poll() is None
                 assert repaired["action"]["action_id"] == action_id
                 assert repaired["next_generation"] == generation + 1
-                assert state_path.read_bytes() == state_before
+                assert snapshot_run(state_ref) == state_before
                 assert fixture.read_bytes() == fixture_before
                 assert host.observe_count == attempt + 1
             else:
@@ -126,7 +129,7 @@ def test_control_receipt_crash_before_business_effect_preserves_the_intent(
     control_case: str,
     kind: str,
 ) -> None:
-    from test_ticket_194_stop_abandon import _ControlReceiptHost
+    from support.control import _ControlReceiptHost
 
     for key, value in _isolated_environment(git_repo.parent / "user-env").items():
         monkeypatch.setenv(key, value)

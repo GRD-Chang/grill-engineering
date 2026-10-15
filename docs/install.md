@@ -85,13 +85,14 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 ### GitHub 认证：默认无需配置 App
 
-默认使用本机已登录的 `gh`。发布操作需要该账号能推送代码、创建和合并 PR、更新 Issue；
-Worker 的 GitHub 请求由程序限制为只读，不向 Worker 提供发布凭据。
-已有有效登录直接复用，缺失时用 `gh auth login` 登录，再核对目标仓库权限。
+程序端与 Worker 均可在 `settings show/configure` 独立选择 host、PAT 或 App，无配置时默认 host。两端共享凭据定义，程序端选择统一覆盖读取、克隆、发布及远端 Git，该身份须有交付所需权限。已有 App 配置的迁移见个人运行配置。
 
-只有需要为 Worker 单独配置只读身份时，才配置 GitHub App；App 不替代发布操作所需的宿主 gh 登录。
-先用 `agent-run auth status` 查看当前身份来源。已有 App 配置时会使用 App，配置损坏不会自动回退到 gh。
-App 所需只读权限和配置命令见[GitHub App 配置](agent-run.md#github-只读身份)及[权限边界](agent-run.md#权限边界)。
+选择 host 时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对宿主登录状态。程序端选择 PAT 或 App 时无需额外宿主登录；只给 Worker 选择凭据不会改变程序端来源。
+
+host/PAT/App Worker 使用原生 `gh`，不经过本地命令白名单，GitHub 能力由凭据决定。角色仍不得自行正式发布或自我批准，Controller 批准和 Publisher 职责保持不变。PAT 只引用一个环境变量名或文件路径，秘密值不进入 Run 快照。Run 固定来源与引用，修改默认值不影响已有 Run；凭据故障后修复同一引用，再显式 resume，不回退 host。
+
+App 元数据统一由 settings 管理，默认采用安装授权范围；Worker 可独立收窄为只读和当前仓库，程序端仍使用安装已授权的完整范围。两端复用签发、续签逻辑，但凭据实例隔离；更新对后续原生 gh 和程序端 API/Git 调用生效。配置见 [GitHub 身份](agent-run.md#github-身份)和[个人运行配置](user-defaults.md)；查询不签发凭据、不显示秘密值。
+凭据能力与交付职责的区别见[权限边界](agent-run.md#权限边界)。
 
 执行 `agent-run doctor --json` 和 `agent-run settings show`，核对环境及所选模型、推理强度和运行额度。
 配置调整见[个人运行配置](user-defaults.md)；模型实际可调用性由执行验证。
@@ -112,19 +113,11 @@ App 所需只读权限和配置命令见[GitHub App 配置](agent-run.md#github-
 
 ### CI 自动修复
 
-需要让 Runner 自动修复 CI 中的代码失败时，在目标 `pyproject.toml` 声明允许修复的步骤：
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
-
-名称须匹配实际 `workflow::job显示名::step`。只有当前 PR head 的已完成 Actions job 明确失败，
-且所有失败步骤都在声明内，才触发代码修复。检查未触发、仍在等待、取消、证据不明或平台故障继续按监督流程处理。
-该配置不创建必需检查，也不改变验收或修复额度；运行规则见[运行说明](agent-run.md)。
+CI 修复使用当前准确 PR/head 的失败 Observation、job 事实与可取得的原始日志，
+不再要求在 `pyproject.toml` 配置 `code-failure-steps` 白名单。Development 定向调查真实失败，
+平台或未知类别同样可以调查；pending、unknown 或证据不匹配继续有界监督。
+Parent Review 始终必需，成果改变须重验 CI 和人工批准。累计额度在
+[个人运行配置](user-defaults.md)设置，运行规则见[运行说明](agent-run.md)。
 
 ## 更新、回滚与卸载
 

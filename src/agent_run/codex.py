@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import math
 import os
 import re
 import threading
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,11 +39,14 @@ from agent_run.publication_prompts import (
     publication_prompt,
 )
 from agent_run.reviewer_prompts import review_continuation_prompt, review_prompt
+from agent_run.github_identity import (
+    GitHubIdentityError, native_github_environment, validate_worker_auth, validate_identity_snapshot,
+)
 from agent_run.github_auth import _GitHubAppCredentialProvider
 from agent_run.github import _repository_hint_from_origin
 from agent_run.github_auth_profile import (
+    GitHubAppProfile,
     GitHubAppProfileStore,
-    load_github_app_profile,
 )
 from agent_run.error_safety import bounded_error
 from agent_run.execution_binding import emit_execution_binding
@@ -49,20 +54,20 @@ from agent_run.executor_environment import ensure_executor_runtime_directory
 from agent_run.paths import app_data_root
 from agent_run.worker_sandbox import (
     WorkerDeadlineExceeded,
+    WorkerExitUnknownError,
     WorkerSandboxError,
     bubblewrap_command,
-    create_gh_access_adapter,
     run_worker_process,
-    _worker_gh_targets,
-    worker_credential_environment,
+    worker_environment,
+    native_worker_environment,
 )
-from agent_run.worker_credentials import (
+from agent_run.credential_lifecycle import (
     CredentialProvider,
-    HostGitHubReadChannel,
     InitialCredentialUnavailable,
-    WorkerCredentialChannel,
     WorkerCredentialError,
 )
+
+from agent_run.worker_credentials import NativeCredentialDelivery
 
 
 class CodexProcessError(RuntimeError):
@@ -106,7 +111,7 @@ _MAX_FINAL_OUTPUT_BYTES = 1024 * 1024
 
 
 class CodexCliBackend:
-    """Runs untrusted role-scoped agents without Publisher GitHub credentials."""
+    """Run role-scoped agents with their selected Worker GitHub identity."""
 
     emits_execution_binding = True
 
@@ -115,11 +120,15 @@ class CodexCliBackend:
         executable: str = "codex",
         credential_provider: CredentialProvider | None = None,
         *,
+        worker_identity: dict[str, Any] | None = None,
+        runner_identity: dict[str, Any] | None = None,
         on_worker_started: Callable[[int], None] | None = None,
         on_worker_finished: Callable[[int], None] | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
+        self.worker_identity = worker_identity
+        self.runner_identity = runner_identity
         self.on_worker_started = on_worker_started
         self.on_worker_finished = on_worker_finished
 
@@ -312,6 +321,8 @@ class CodexCliBackend:
     ) -> tuple[str, str]:
         """Run one Invocation with at most two same-Thread output repairs."""
 
+        from agent_run.worker_control import check_worker_control
+
         event = request.get("_invocation_event")
         event_deadline_seconds = getattr(event, "deadline_seconds", None)
         deadline_seconds = _invocation_timeout_seconds(
@@ -340,6 +351,7 @@ class CodexCliBackend:
         currentness = request.get("_currentness_check")
         printed_steps: set[int] = set()
         role_prompt = prompt
+        invocation_attempted = False
 
         def remember_thread(value: str) -> None:
             nonlocal current_thread
@@ -351,11 +363,13 @@ class CodexCliBackend:
             current_thread = value
 
         while attempt <= 3:
+            check_worker_control()
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before Invocation"
                 )
-                notify("failed", attempt_count=attempt - 1, error=str(stale))
+                notify("failed", attempt_count=attempt - 1, error=str(stale),
+                       execution_not_started=not invocation_attempted)
                 raise stale
             notify("output_step", output_attempt=attempt, validation_error=validation_error)
             remaining = deadline_at - time.monotonic()
@@ -369,6 +383,7 @@ class CodexCliBackend:
                     error=str(deadline_error),
                     return_code=None,
                     signal=None,
+                    execution_not_started=not invocation_attempted,
                 )
                 raise deadline_error
             attempt_prompt = role_prompt
@@ -405,6 +420,7 @@ class CodexCliBackend:
                     timeout=remaining,
                     deadline_at_monotonic=deadline_at,
                     on_thread=remember_thread,
+                    on_execution=notify,
                     validate_final_output=lambda value: validate(
                         _json_object(value, output_name)
                     ),
@@ -416,6 +432,7 @@ class CodexCliBackend:
                     not isinstance(error, _CodexInvocationDeadlineError)
                     or error.process_started
                 )
+                invocation_attempted = invocation_attempted or process_started
                 if isinstance(error, _CodexInvocationDeadlineError):
                     error = CodexProcessError(
                         f"{output_name} exceeded its Invocation Deadline",
@@ -451,6 +468,7 @@ class CodexCliBackend:
                     notify("recovery_waiting", **facts)
                     if capacity:
                         for _ in range(30):
+                            check_worker_control()
                             if not recovery_allowed():
                                 raise CodexProcessError(
                                     "Execution recovery authorization changed",
@@ -468,6 +486,7 @@ class CodexCliBackend:
                     continue
                 failure_facts: dict[str, object] = {
                     "attempt_count": attempt if process_started else attempt - 1,
+                    "execution_not_started": not invocation_attempted,
                     "error": _bounded_error(str(error)),
                     "return_code": getattr(error, "return_code", None),
                     "signal": getattr(error, "signal_number", None),
@@ -475,8 +494,19 @@ class CodexCliBackend:
                 if process_started:
                     failure_facts["execution_interrupted"] = not getattr(error, "completed_output", False)
                     failure_facts["machine_error"] = getattr(error, "machine_error", None)
-                notify("failed", **failure_facts)
+                try:
+                    notify("failed", **failure_facts)
+                except BaseException as diagnostic_error:
+                    if not isinstance(error, WorkerExitUnknownError):
+                        raise
+                    gap = bounded_error(
+                        f"Worker failure diagnostic recording failed; durable failure unknown: {diagnostic_error}"
+                    )
+                    error.add_note(gap)
+                    logging.getLogger(__name__).error("%s", gap)
+                    raise error from diagnostic_error
                 raise error
+            invocation_attempted = True
             if current_thread is not None and reported_thread != current_thread:
                 mismatch = CodexProcessError(
                     "Codex resume reported a different Thread ID", recoverable=False
@@ -549,6 +579,7 @@ class CodexCliBackend:
         timeout: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
         deadline_at_monotonic: float | None = None,
         on_thread: Callable[[str], None] | None = None,
+        on_execution: Callable[..., None] | None = None,
         validate_final_output: Callable[[str], object] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
@@ -610,65 +641,61 @@ class CodexCliBackend:
             codex_arguments.extend(
                 ["--output-last-message", str(output_path), "-"]
             )
+            credential_exhausted = threading.Event()
             try:
-                adapter_directory = temporary / "gh-adapter"
-                environment = worker_credential_environment(
-                    temporary / "gh", adapter_directory
-                )
-                gh_targets = _worker_gh_targets(environment, cwd=checkout)
-                real_gh_path = _controller_gh_target(
-                    gh_targets, checkout=checkout, temporary=temporary
-                )
-                if real_gh_path is None:
-                    raise WorkerSandboxError("gh is required for Worker GitHub reads")
-                real_gh = str(real_gh_path)
-                profile = (
-                    load_github_app_profile()
-                    if self.credential_provider is None
-                    else None
-                )
-                if self.credential_provider is None:
-                    repository = repository or _repository_hint_from_origin(checkout)
-                else:
-                    repository = None
-                if self.credential_provider is None and repository is None:
-                    raise WorkerSandboxError(
-                        "当前 GitHub repository identity 不可确定，已拒绝 Worker GitHub read"
+                profile = None
+                identity = validate_identity_snapshot(self.worker_identity or {"source": "host"})
+                if identity["source"] == "app":
+                    app = identity["app_profile"]
+                    profile = GitHubAppProfile(
+                        app_id=app["app_id"], installation_id=app["installation_id"],
+                        private_key_path=Path(app["private_key_path"]),
                     )
-                hidden_paths = _worker_hidden_paths(profile, checkout=checkout)
+                app_access = self.credential_provider is not None or profile is not None
+                if app_access:
+                    environment = worker_environment(temporary / "gh", "")
+                    environment.pop("GH_TOKEN", None)
+                    if identity.get("app_current_repository_only"):
+                        repository = repository or _repository_hint_from_origin(checkout)
+                        if repository is None:
+                            raise WorkerSandboxError("当前 GitHub repository identity 不可确定")
+                else:
+                    if self.worker_identity is not None:
+                        validate_worker_auth(identity)
+                    environment = native_worker_environment(
+                        native_github_environment(identity), temporary / "gh",
+                        host=identity["source"] == "host",
+                    )
+                # Native GH_TOKEN has already been resolved for the Worker.
+                # Do not also inject the Runner's custom PAT reference value.
+                runner_env = (self.runner_identity or {}).get("pat", {}).get("env")
+                if runner_env and runner_env not in {
+                    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                }:
+                    environment.pop(runner_env, None)
+                hidden_paths = _worker_hidden_paths(
+                    profile, checkout=checkout, hide_host_credentials=app_access
+                )
                 if repository is not None:
                     environment["GH_REPO"] = repository
-                credential_exhausted = threading.Event()
                 credential_failure: list[str] = []
                 def report_credential_exhausted(message: str) -> None:
                     credential_failure.append(message)
                     credential_exhausted.set()
 
-                if self.credential_provider is not None:
-                    channel: HostGitHubReadChannel | WorkerCredentialChannel = WorkerCredentialChannel(
-                        self.credential_provider,
-                        gh_executable=real_gh,
-                        gh_environment=environment,
-                        repository=repository,
-                        on_exhausted=report_credential_exhausted,
+                provider = self.credential_provider
+                if provider is None and profile is not None:
+                    provider = _GitHubAppCredentialProvider(
+                        profile, read_only=identity["app_read_only"],
+                        repository=repository if identity["app_current_repository_only"] else None,
                     )
-                elif profile is None:
-                    channel = HostGitHubReadChannel(
-                        gh_executable=real_gh,
-                        gh_environment=dict(os.environ),
-                        repository=repository,
-                    )
-                else:
-                    channel = WorkerCredentialChannel(
-                        _GitHubAppCredentialProvider(profile),
-                        gh_executable=real_gh,
-                        gh_environment=environment,
-                        repository=repository,
-                        on_exhausted=report_credential_exhausted,
-                    )
-                with channel as credentials:
+                delivery = (NativeCredentialDelivery(
+                    provider, temporary / "gh", on_exhausted=report_credential_exhausted,
+                ) if provider is not None else None)
+                with delivery if delivery is not None else nullcontext() as credentials:
                     try:
-                        credentials.start(temporary / "credential.sock")
+                        if credentials is not None:
+                            credentials.start()
                     except WorkerCredentialError as error:
                         if _is_retryable_initial_credential_error(error):
                             raise InitialCredentialUnavailable(
@@ -676,9 +703,6 @@ class CodexCliBackend:
                                 http_status=error.http_status,
                             ) from error
                         raise
-                    create_gh_access_adapter(
-                        adapter_directory, temporary / "credential.sock", environment
-                    )
                     arguments = bubblewrap_command(
                         codex_arguments,
                         checkout=checkout,
@@ -686,8 +710,7 @@ class CodexCliBackend:
                         writable_checkout=writable_checkout,
                         environment=environment,
                         hidden_paths=hidden_paths,
-                        gh_adapter=adapter_directory / "gh",
-                        gh_targets=gh_targets,
+                        inherit_host_auth=not app_access and identity["source"] == "host",
                     )
                     worker_timeout = timeout
                     if deadline_at_monotonic is not None:
@@ -720,6 +743,7 @@ class CodexCliBackend:
                             expected=thread_id, callback=report_thread
                         )
                     worker_pid: int | None = None
+                    worker_exit_unknown = False
 
                     def worker_started(pid: int) -> None:
                         nonlocal worker_pid
@@ -727,15 +751,46 @@ class CodexCliBackend:
                         if self.on_worker_started is not None:
                             self.on_worker_started(pid)
 
+                    def worker_released() -> None:
+                        if on_execution is not None:
+                            on_execution("execution_started")
+
                     if "on_process_started" in inspect.signature(
                         run_worker_process
                     ).parameters:
                         worker_options["on_process_started"] = worker_started
+                    if "on_process_released" in inspect.signature(
+                        run_worker_process
+                    ).parameters:
+                        worker_options["on_process_released"] = worker_released
                     try:
-                        result = run_worker_process(arguments, **worker_options)
+                        try:
+                            result = run_worker_process(arguments, **worker_options)
+                        except WorkerExitUnknownError:
+                            worker_exit_unknown = True
+                            raise
+                        finally:
+                            # Ordinary returns/failures follow process reap;
+                            # unknown exit retains ownership for host checks.
+                            if on_execution is not None and not worker_exit_unknown:
+                                on_execution("execution_finished")
+                        if not app_access and self.worker_identity is not None:
+                            # Validate the credential consumed by this invocation, not a
+                            # replacement that appeared at the reference while it ran.
+                            consumed_identity = (
+                                {"source": "pat", "pat": {"env": "GH_TOKEN"}}
+                                if identity["source"] == "pat" else identity
+                            )
+                            validate_worker_auth(consumed_identity, environment=environment)
                     finally:
-                        if worker_pid is not None and self.on_worker_finished is not None:
+                        if worker_pid is not None and self.on_worker_finished is not None and not worker_exit_unknown:
                             self.on_worker_finished(worker_pid)
+                if credential_exhausted.is_set():
+                    raise WorkerSandboxError(credential_failure[0])
+            except GitHubIdentityError as error:
+                raise CodexProcessError(
+                    str(error), machine_error="credential_unavailable"
+                ) from error
             except InitialCredentialUnavailable:
                 raise
             except WorkerDeadlineExceeded as error:
@@ -745,8 +800,13 @@ class CodexCliBackend:
                 raise _CodexInvocationDeadlineError(
                     str(error), process_started=True
                 ) from error
+            except WorkerExitUnknownError:
+                raise
             except WorkerSandboxError as error:
-                raise CodexProcessError(str(error), recoverable=False) from error
+                raise CodexProcessError(
+                    str(error), recoverable=False,
+                    machine_error="credential_unavailable" if credential_exhausted.is_set() else None,
+                ) from error
             except WorkerCredentialError as error:
                 raise CodexProcessError(str(error), recoverable=False) from error
             result_thread = _thread_id(result.stdout)
@@ -762,16 +822,6 @@ class CodexCliBackend:
                     return completed
             if result.returncode != 0:
                 message = _terminal_error(result.stdout, result.stderr)
-                binding_failed = _looks_like_worker_gh_binding_failure(
-                    result.stdout,
-                    result.stderr,
-                    gh_targets=gh_targets,
-                    gh_adapter=adapter_directory / "gh",
-                )
-                if binding_failed:
-                    message = (
-                        "worker_gh_binding_failed: Codex worker did not start"
-                    )
                 signal_number = -result.returncode if result.returncode < 0 else None
                 capacity_failure, machine_error = _failure_diagnostic(result.stdout)
                 if thread_id is not None:
@@ -779,7 +829,7 @@ class CodexCliBackend:
                         message,
                         return_code=result.returncode,
                         signal_number=signal_number,
-                        recoverable=not binding_failed,
+                        recoverable=True,
                         capacity_failure=capacity_failure,
                         machine_error=machine_error,
                     )
@@ -787,7 +837,7 @@ class CodexCliBackend:
                     message,
                     return_code=result.returncode,
                     signal_number=signal_number,
-                    recoverable=not binding_failed,
+                    recoverable=True,
                     capacity_failure=capacity_failure,
                     machine_error=machine_error,
                 )
@@ -825,53 +875,6 @@ class CodexCliBackend:
             return decoded, actual_thread
 
 
-def _looks_like_worker_gh_binding_failure(
-    stdout: str,
-    stderr: str,
-    *,
-    gh_targets: tuple[Path, ...],
-    gh_adapter: Path,
-) -> bool:
-    """Classify bubblewrap mount failures before the Codex payload starts."""
-
-    if stdout.strip():
-        return False
-    message = stderr.lstrip().casefold()
-    if not message.startswith("bwrap:"):
-        return False
-    if not any(
-        marker in message
-        for marker in (
-            "can't bind",
-            "cannot bind",
-            "bind mount",
-            "can't open source",
-            "cannot open source",
-            "can't create file at",
-            "cannot create file at",
-            "can't mkdir parents for",
-            "cannot mkdir parents for",
-        )
-    ):
-        return False
-    return any(
-        str(path).casefold() in message
-        for path in (*gh_targets, gh_adapter)
-    )
-
-
-def _controller_gh_target(
-    targets: tuple[Path, ...], *, checkout: Path, temporary: Path
-) -> Path | None:
-    """Select a host-owned target, never a Worker-writable path."""
-
-    worker_writable_roots = (checkout.resolve(), temporary.resolve())
-    for target in targets:
-        if not any(target.is_relative_to(root) for root in worker_writable_roots):
-            return target
-    return None
-
-
 def _thread_id(output: str) -> str | None:
     for line in output.splitlines():
         try:
@@ -894,20 +897,7 @@ def _is_retryable_initial_credential_error(error: WorkerCredentialError) -> bool
     deterministic execution error into an endless wait.
     """
 
-    permanent_markers = (
-        "empty token",
-        "invalid credential",
-        "exact permissions",
-        "github app id, installation id, and private key are required",
-        "token response is invalid",
-        "token response has no",
-        "token response has an invalid expiry",
-        "token response has an expired token",
-        "could not sign github app jwt",
-        "openssl is required",
-    )
-    message = str(error).lower()
-    return not any(marker in message for marker in permanent_markers)
+    return "invalid credential" not in str(error).lower()
 
 
 def _failure_diagnostic(stdout: str) -> tuple[bool, str | None]:
@@ -1088,10 +1078,10 @@ def _human_blocker_output(value: str, name: str) -> tuple[str, ...] | None:
 
 
 def _worker_hidden_paths(
-    profile: object, *, checkout: Path | None = None
+    profile: object, *, checkout: Path | None = None, hide_host_credentials: bool = True
 ) -> tuple[Path, ...]:
     paths: list[Path] = []
-    for variable in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
+    for variable in (("GH_CONFIG_DIR", "XDG_CONFIG_HOME") if hide_host_credentials else ()):
         value = os.environ.get(variable)
         if value:
             paths.append(Path(value))
@@ -1105,6 +1095,35 @@ def _worker_hidden_paths(
         os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
     ).expanduser()
     paths.extend((runtime_home / "bus", runtime_home / "systemd" / "private"))
+    # LoadCredential keeps a second copy after the startup carrier is consumed.
+    # Existing system-manager paths are hidden as well as user-manager paths.
+    for root in {Path("/run"), Path(f"/run/user/{os.geteuid()}"), runtime_home}:
+        paths.extend((root / "credentials", root / "systemd" / "temporary-credentials"))
+    runtime_roots = {runtime_home}
+    native_runtime = os.environ.get("AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY")
+    if native_runtime:
+        runtime_roots.add(Path(native_runtime))
+    native_credentials = os.environ.get("AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY")
+    if native_credentials:
+        runtime_roots.add(Path(native_credentials).parent.parent)
+    credential_directories = {
+        root / suffix for root in runtime_roots
+        for suffix in ("credentials", "systemd/temporary-credentials")
+    }
+    inherited_credentials = os.environ.get("CREDENTIALS_DIRECTORY")
+    if inherited_credentials:
+        credential_directories.add(Path(inherited_credentials))
+    # Prepare stable, empty mountpoints even when this Run disables notices.
+    # Otherwise a later user service can create a previously skipped directory
+    # visible through the Worker's root bind. Keep these fixed runtime dirs;
+    # removing/replacing them while Workers live would invalidate their masks.
+    for directory in credential_directories:
+        try:
+            resolved_directory = directory.expanduser().resolve()
+            resolved_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except (OSError, RuntimeError) as error:
+            raise WorkerSandboxError("无法准备 Worker 凭据隔离目录") from error
+        paths.append(resolved_directory)
     if checkout is not None:
         resolved_checkout = checkout.resolve()
         state_roots: set[Path] = set()
@@ -1118,9 +1137,15 @@ def _worker_hidden_paths(
         if configured_root:
             state_roots.add(Path(configured_root).expanduser())
         for root in state_roots:
+            # Cover the database and sidecars created after Worker startup.
+            # bubblewrap reopens only this Invocation's checkout/Git paths.
+            paths.append(root)
             paths.extend(
                 root / child
-                for child in ("runs", "task-control", "profiles", ".lock")
+                for child in (
+                    "runs", "task-control", "profiles", ".lock",
+                    "state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm",
+                )
             )
     return tuple(paths)
 

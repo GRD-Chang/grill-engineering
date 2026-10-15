@@ -9,16 +9,50 @@ creating a second orchestration path.
 """
 
 from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Mapping, TypedDict, cast
 
 from agent_run.required_checks_observation import clear_required_checks_observation
 
+_ARCHIVED_WINDOWS: ContextVar[Mapping[int, int]] = ContextVar("archived_budget_windows", default={})
+
+
+@contextmanager
+def scoped_budget_validation(owners: Mapping[int, int]) -> Iterator[None]:
+    """Limit archive metadata to the exact owners in one work validator call."""
+    token = _ARCHIVED_WINDOWS.set(owners)
+    try:
+        yield
+    finally:
+        _ARCHIVED_WINDOWS.reset(token)
+
+
+def archived_budget_windows(owner: dict[str, Any]) -> int | None:
+    """Return an exemption only inside the current explicit work validator."""
+    return _ARCHIVED_WINDOWS.get().get(id(owner))
+
+
+@contextmanager
+def scoped_budget_alias(source: dict[str, Any], target: dict[str, Any]) -> Iterator[None]:
+    """Keep a CI receipt's temporary mirror bound to the same current budget."""
+    windows = archived_budget_windows(source)
+    if windows is None:
+        yield
+        return
+    if ("review_budget_history" in target or target.get("review_budget") != source.get("review_budget")
+            or target.get("policy_snapshot") != source.get("policy_snapshot")):
+        raise ValueError("scoped budget alias differs from its proved owner")
+    with scoped_budget_validation({**_ARCHIVED_WINDOWS.get(), id(target): windows}):
+        yield
+
 
 TICKET_DEVELOPMENT_LIMIT = 4
 TICKET_REVIEW_LIMIT = 3
 FINAL_CI_FIX_LIMIT = 1
-RUN_REVIEW_LIMIT = 11
+RUN_REVIEW_LIMIT = 4
 MAX_REVIEW_ARTIFACTS = RUN_REVIEW_LIMIT
 _REVIEW_BUDGET_KEYS = frozenset(
     {
@@ -81,7 +115,7 @@ TICKET_POLICY = ReviewBudgetPolicy(
     budget_scope="ticket",
 )
 RUN_POLICY = ReviewBudgetPolicy(
-    development_limit=10,
+    development_limit=3,
     review_limit=RUN_REVIEW_LIMIT,
     budget_scope="run",
 )
@@ -109,6 +143,9 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     to infer a new budget from legacy counters.
     """
 
+    archived = _ARCHIVED_WINDOWS.get().get(id(job))
+    if archived is not None:
+        return require_current_budget(job, policy, archived_windows=archived)
     if "review_budget" not in job:
         raise ValueError("missing canonical review_budget")
     raw = job["review_budget"]
@@ -122,6 +159,26 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     ):
         raise ValueError("missing canonical review_budget_history")
     _validate_budget_history(history, budget["window"], policy)
+    return budget
+
+
+def require_current_budget(
+    job: dict[str, Any], policy: ReviewBudgetPolicy, *, archived_windows: int,
+) -> ReviewBudget:
+    """Validate current facts when SQLite proved an unloaded sibling archive.
+
+    The archive's full contents remain subject to ensure_budget at complete
+    query/write boundaries. A scoped work view never synthesizes old windows.
+    """
+    if "review_budget_history" in job:
+        raise ValueError("scoped budget validation requires an unloaded archive")
+    raw = job.get("review_budget")
+    if not isinstance(raw, dict):
+        raise ValueError("review_budget must be an object")
+    budget = cast(ReviewBudget, raw)
+    _validate_budget_projection(budget, "review_budget", policy)
+    if type(archived_windows) is not int or archived_windows != budget["window"] - 1:
+        raise ValueError("review_budget_history must contain exactly one snapshot per prior window")
     return budget
 
 
@@ -286,15 +343,37 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     history.append(snapshot)
     next_window = int(current["window"]) + 1
     job["review_budget"] = new_budget(window=next_window)
-    clear_required_checks_observation(job)
-    job["modification_attempts"] = 0
-    job["validation_attempts"] = 0
-    job.pop("last_review_candidate_sha", None)
-    job.pop("publication_authority", None)
-    job.pop("fallback_publication_receipt", None)
-    job.pop("deterministic_integration_record", None)
-    job.pop("final_ci_fix_failure_head", None)
+    # Archive once on the delivery object and reset its live repair progress.
+    repair = job.get("repair_job")
+    for progress in ([job, repair] if isinstance(repair, dict) else [job]):
+        clear_required_checks_observation(progress)
+        progress["modification_attempts"] = 0
+        progress["validation_attempts"] = 0
+        for key in (
+            "last_review_candidate_sha", "publication_authority",
+            "fallback_publication_receipt", "deterministic_integration_record",
+            "final_ci_fix_failure_head",
+        ):
+            progress.pop(key, None)
     return cast(ReviewBudget, job["review_budget"])
+
+
+def renew_run_budget(job: dict[str, Any], policy: ReviewBudgetPolicy, *, reason: str) -> None:
+    """Renew only the exhausted Parent allowance; preserve the other work facts."""
+    if reason not in {"modification_budget_exhausted", "review_budget_exhausted"}:
+        raise ValueError("unknown Parent allowance renewal")
+    current = deepcopy(ensure_budget(job, policy))
+    job["review_budget_history"].append(deepcopy({
+        key: value for key, value in job.items() if key != "review_budget_history"
+    }))
+    current["window"] += 1
+    current["checkpoint_reason"] = None
+    if reason == "modification_budget_exhausted":
+        current["development_attempts"] = 0
+    else:
+        current["reviewer_invocations"] = 0
+        current["review_artifacts"] = []
+    job["review_budget"] = current
 
 
 def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -305,12 +384,25 @@ def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
     review entry is therefore the only safe source for Reviewer 2+ context.
     """
 
-    budget = job.get("review_budget")
+    owner = job
+    budget = owner.get("review_budget")
     if not isinstance(budget, dict):
         return None
     artifacts = budget.get("review_artifacts")
     if not isinstance(artifacts, list) or not artifacts:
-        return None
+        if not any(type(owner.get(key)) is int for key in ("acceptance_generation", "repair_generation")):
+            return None
+        # Full Run Review retains its last exact baseline after an explicit
+        # allowance renewal. Ticket/Parent-only windows keep their old rule.
+        history = owner.get("review_budget_history")
+        for snapshot in reversed(history if isinstance(history, list) else []):
+            old_budget = snapshot.get("review_budget") if isinstance(snapshot, dict) else None
+            previous = old_budget.get("review_artifacts") if isinstance(old_budget, dict) else None
+            if isinstance(previous, list) and previous:
+                artifacts = previous
+                break
+        else:
+            return None
     latest = artifacts[-1]
     if not isinstance(latest, dict):
         return None
@@ -331,12 +423,12 @@ def budget_checkpoint_subjects(
 
     subjects: list[tuple[str, dict[str, Any]]] = []
     active = state.get("active_ticket_job")
-    if isinstance(active, dict) and _is_budget_checkpoint(active):
-        subjects.append(("ticket", active))
-    elif isinstance(state.get("ticket_jobs"), dict):
+    if isinstance(state.get("ticket_jobs"), dict):
         for value in state["ticket_jobs"].values():
             if isinstance(value, dict) and _is_budget_checkpoint(value):
                 subjects.append(("ticket", value))
+    elif isinstance(active, dict) and _is_budget_checkpoint(active):
+        subjects.append(("ticket", active))
     parent = state.get("parent_job")
     if isinstance(parent, dict) and _is_budget_checkpoint(parent):
         subjects.append(("parent", parent))

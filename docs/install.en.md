@@ -84,13 +84,14 @@ Read the target repository's `AGENTS.md` and confirm that the required content h
 
 ### GitHub authentication: no App required by default
 
-By default, Runner uses the host's authenticated `gh`. That account needs permission to push code, create and merge PRs, and update Issues.
-Worker GitHub requests are restricted to read-only operations by the program; publication credentials are not exposed to Workers.
-Reuse a valid login, or run `gh auth login` and verify access to the target repository.
+Runner currently uses the host's authenticated `gh` for reading, cloning and publishing. That identity needs the permissions required by the delivery workflow. Workers default to host when no source is configured; select host or a PAT reference through `settings show/configure`. Explicit selection takes priority over an existing App profile.
 
-Configure a GitHub App only when a separate read-only identity is needed for Workers. It does not replace the host gh login used for publication.
-Run `agent-run auth status` to inspect the current identity source. An existing App profile selects App authentication; a broken profile does not silently fall back to gh.
-For permissions and commands, read [GitHub App configuration](agent-run.md#github-只读身份) and [permission boundaries](agent-run.md#权限边界).
+If the host is not logged in, the operator should run `gh auth login`, then verify the login with `gh auth status`. Selecting a PAT for Workers does not replace the host authentication required by Runner.
+
+Host/PAT Workers use native `gh` without a local command allowlist. Credentials determine GitHub capabilities; role instructions still prohibit self-publication or self-approval, and Controller approval and Publisher responsibilities remain unchanged. PAT values are read from exactly one environment-variable or file reference, never stored in Run snapshots. A Run freezes its source and reference; updating defaults does not change an existing Run. Repair the same reference and explicitly resume after a credential failure; there is no fallback to host.
+
+Existing App users retain the current read-only proxy and renewal behavior during this transition. App native access and Runner PAT/App selection are not implemented in this stage. See [GitHub identity](agent-run.md#github-身份) and [personal settings](user-defaults.md) for configuration. Queries do not issue credentials or display secrets.
+See [permission boundaries](agent-run.md#权限边界) for the distinction between credential capabilities and delivery responsibilities.
 
 Run `agent-run doctor --json` and `agent-run settings show` to check the environment, selected models, reasoning effort, and run limits.
 For changes, read [user defaults](user-defaults.md). Model availability is established by actual execution.
@@ -113,19 +114,7 @@ and check the saved settings. These settings apply to new tasks; check actual de
 
 ### Automatic CI repair
 
-To allow Runner to repair code failures in CI, declare the eligible steps in the target repository's `pyproject.toml`:
-
-```toml
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-```
-
-Names must match the actual `workflow::job display name::step`. Code repair requires a completed, failed Actions job for the current PR head, with every failed step declared above.
-Missing, pending, canceled, ambiguous, or platform-related failures remain under supervision.
-This configuration does not create required checks or change acceptance or repair limits. See the [operation reference](agent-run.md).
+CI repair uses exact PR/head failure observations and available job facts and logs. It no longer requires a `code-failure-steps` allowlist in `pyproject.toml`; Development investigates real failures, including platform or unknown categories. Pending, unknown, or mismatched evidence remains under bounded supervision. Parent review stays mandatory and changed results require fresh CI and human approval. Configure the cumulative allowances in [user defaults](user-defaults.md); see the [operation reference](agent-run.md).
 
 ## Update, rollback, and uninstall
 

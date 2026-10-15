@@ -14,7 +14,10 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.cli_presentation import _print_precondition_failure
-from agent_run.operator_gate import has_non_invocation_execution_failure
+from agent_run.operator_gate import (
+    has_non_invocation_execution_failure,
+    operator_gate_subjects,
+)
 from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.semantic_attempt import (
     invocation_is_explicitly_resumable,
@@ -53,6 +56,11 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
 
     status = state.get("status")
+    from agent_run.resume_work import paused_work
+    if len(paused_work(state)) == 1:
+        return True
+    if status == "deterministic_contradiction":
+        return True  # Re-read authority; continuing never assumes an external result.
     if status == "operator_stopped":
         return isinstance(state.get("operator_stop"), dict)
     if status == "supervision_timeout":
@@ -67,9 +75,18 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
     if has_non_invocation_execution_failure(state):
         return True
+    gates = operator_gate_subjects(state)
+    if status in {"blocked", "progress_exhausted"} and len(gates) == 1:
+        location, subject = gates[0]
+        if location.startswith("ticket:") and subject.get("blocked_reason") in {
+            "ticket_execution_failed", "ticket_supervision_timeout", "ticket_paused",
+            "ci_investigation_paused",
+        }:
+            return True
     return (
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1
+        or _recovery_checkpoint_is_ready(state)
     )
 
 
@@ -101,6 +118,20 @@ def _resume_is_publication_recovery(state: dict[str, object]) -> bool:
 
 def _review_budget_checkpoint_count(state: dict[str, object]) -> int:
     return len(budget_checkpoint_subjects(state))
+
+
+def _recovery_checkpoint_is_ready(state: dict[str, object]) -> bool:
+    gates = operator_gate_subjects(state)
+    return (
+        len(gates) == 1
+        and gates[0][1].get("blocked_reason") in {
+            "ci_development_budget_exhausted",
+            "integration_development_exhausted",
+            "integration_resync_exhausted",
+        }
+        and not budget_checkpoint_subjects(state)
+        and human_blocker_subject_count(state) == 0
+    )
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:

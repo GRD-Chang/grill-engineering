@@ -13,6 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 from agent_run.messages import error_message
 from agent_run.git import GitRepository
@@ -105,6 +106,7 @@ class ManagedWorkspace:
 
     def ensure(
         self, remote_url: str | None = None, *, identity: dict[str, str] | None = None,
+        runner_identity: Mapping[str, Any] | None = None,
     ) -> GitRepository:
         """Create once; never reset, fetch or modify an existing checkout."""
         _check_owned_path(self.root)
@@ -126,12 +128,14 @@ class ManagedWorkspace:
             staging = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-", dir=self.root.parent))
             try:
                 checkout = staging / "repository"
+                if remote_url is None and runner_identity and runner_identity.get("source") in {"pat", "app"}:
+                    remote_url = f"https://github.com/{self.repository}.git"
                 command = (
                     ["git", "clone", "--no-local", "--quiet", "--", remote_url, str(checkout)]
                     if remote_url is not None else
                     ["gh", "repo", "clone", self.repository, str(checkout), "--", "--no-local", "--quiet"]
                 )
-                _command(command, staging, timeout=_CLONE_TIMEOUT_SECONDS)
+                _command(command, staging, timeout=_CLONE_TIMEOUT_SECONDS, runner_identity=runner_identity)
                 for key, value in (identity or {}).items():
                     if key not in {"user.name", "user.email"}:
                         raise ManagedWorkspaceError(error_message("workspace.error.unsupported_config"))
@@ -216,8 +220,13 @@ def validate_data_root() -> None:
     raise ManagedWorkspaceError(error_message("workspace.error.data_in_repository"))
 
 
-def _command(arguments: list[str], cwd: Path, *, timeout: float = 30) -> str:
-    environment = git_environment()
+def _command(
+    arguments: list[str], cwd: Path, *, timeout: float = 30,
+    runner_identity: Mapping[str, Any] | None = None,
+) -> str:
+    from agent_run.runner_transport import runner_git_environment
+
+    environment = runner_git_environment(runner_identity, cwd=cwd) if runner_identity else git_environment()
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GH_PROMPT_DISABLED"] = "1"
     try:

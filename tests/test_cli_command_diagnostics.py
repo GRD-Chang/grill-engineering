@@ -14,7 +14,10 @@ from agent_run.cli import main
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
+
+from support.state import snapshot_run
+from support.state import persist_run_fixture
 
 
 def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path) -> None:
@@ -67,9 +70,9 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
     current = states.find_unfinished_runs('example/project', 1)[0]
     current['status'] = 'execution_failed'
     current['diagnostics'] = [{'code': 'old_failure', 'message': 'old usage limit'}]
-    states.save_run(current['run_id'], current)
-    state_path = states.runs_directory / f"{current['run_id']}.json"
-    before = state_path.read_bytes()
+    persist_run_fixture(states, current['run_id'], current)
+    state_ref = (states.root, str(current['run_id']))
+    before = snapshot_run(state_ref)
     monkeypatch.chdir(git_repo)
     monkeypatch.setattr('agent_run.cli._running_active_runner', lambda: False)
 
@@ -78,7 +81,7 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
     output = json.loads(capsys.readouterr().out)
     assert output['diagnostics'][0]['code'] == 'execution_readiness'
     assert 'old usage limit' not in json.dumps(output)
-    assert state_path.read_bytes() == before
+    assert snapshot_run(state_ref) == before
 
 
 @pytest.mark.parametrize('as_json', [False, True])

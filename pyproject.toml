@@ -37,11 +37,5 @@ python_version = "3.11"
 strict = true
 packages = ["agent_run"]
 
-[tool.agent-run.required-checks]
-code-failure-steps = [
-  "CI::quality::Run tests",
-  "CI::quality::Run type checks",
-]
-
 [tool.setuptools.package-data]
 agent_run = ["resources/**/*.md", "resources/**/*.json"]

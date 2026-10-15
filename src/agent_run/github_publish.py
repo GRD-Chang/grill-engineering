@@ -4,10 +4,18 @@ import json
 import re
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from agent_run.runner_transport import runner_options
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
+from agent_run.branch_publication import (
+    BranchPublicationResult,
+    RemoteBranchChanged,
+    RemoteBranchObservation,
+)
+from agent_run.pr_write import admit_pr_write, observe_pr_write
 from agent_run.github import (
     GhGitHubReader,
     GitHubReadError,
@@ -16,9 +24,7 @@ from agent_run.github import (
 )
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
-from agent_run.required_checks import annotate_configured_code_failures
 
-_ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
 _AGENT_RUN_STATUS_MARKER = "<!-- agent-run:agent-run-status -->"
 
@@ -45,13 +51,38 @@ class GhGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
+        # Run Repair may follow a confirmed append to its managed Run target.
+        # The helper verifies ancestry before reusing that target ref.
+        self._ensure_change_branch(
+            branch=branch,
+            base_branch=base_branch,
+            expected_base_sha=expected_base_sha,
+            expected_remote_sha=expected_remote_sha,
+            recovery_remote_sha=recovery_remote_sha,
+            allow_managed_base_append=True,
+        )
+
+    def _ensure_change_branch(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
+        allow_managed_base_append: bool,
+    ) -> None:
         if is_managed_delivery_branch(base_branch):
-            self._ensure_remote_run_branch(base_branch, expected_base_sha)
+            self._ensure_remote_run_branch(
+                base_branch, expected_base_sha, allow_append=allow_managed_base_append
+            )
         remote_sha = self._remote_branch_sha(branch)
         if remote_sha in {expected_remote_sha, recovery_remote_sha}:
             return
         if remote_sha is not None:
-            raise GitError("Change ref has a foreign identity")
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, remote_sha)
+            )
         if expected_remote_sha != expected_base_sha:
             raise GitError("Change ref is missing after publication")
         created = self._write_command(
@@ -68,7 +99,9 @@ class GhGitHubPublisher:
             if observed == expected_base_sha:
                 return
             if observed is not None:
-                raise GitError("Change ref has a foreign identity")
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, observed)
+                )
             raise GitHubReadError(
                 "github_write_failed", created.stderr.strip() or "could not create Change ref"
             )
@@ -110,13 +143,22 @@ class GhGitHubPublisher:
         recovery_remote_sha: str,
     ) -> None:
         del ticket_number
-        self.ensure_change_branch(
-            branch=branch,
-            base_branch=base_branch,
-            expected_base_sha=expected_base_sha,
-            expected_remote_sha=expected_remote_sha,
-            recovery_remote_sha=recovery_remote_sha,
-        )
+        try:
+            self._ensure_change_branch(
+                branch=branch,
+                base_branch=base_branch,
+                expected_base_sha=expected_base_sha,
+                expected_remote_sha=expected_remote_sha,
+                recovery_remote_sha=recovery_remote_sha,
+                allow_managed_base_append=True,
+            )
+        except RemoteBranchChanged as error:
+            observed = error.observation.observed_sha
+            if observed is None:
+                raise
+            self.git.fetch_remote_commit(branch, observed)
+            if not self.git.is_ancestor(expected_remote_sha, observed):
+                raise
 
     def link_issue_branch_display(
         self, *, issue_number: int, branch: str, head_sha: str
@@ -161,12 +203,6 @@ class GhGitHubPublisher:
 
     def ensure_parent_branch(self, **authority: str) -> None:
         self.ensure_change_branch(**authority)
-
-    def ensure_run_repair_branch(self, **authority: str) -> None:
-        self.ensure_change_branch(**authority)
-
-    def ensure_run_repair_pr(self, **authority: str) -> int:
-        return self.ensure_change_pr(**authority)
 
     def ensure_final_run_ref(self, *, branch: str, expected_head_sha: str) -> None:
         self._ensure_remote_run_branch(branch, expected_head_sha)
@@ -264,7 +300,9 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
             "--state",
-            "open",
+            "all",
+            "--limit",
+            "2",
             "--head",
             branch,
             "--json",
@@ -274,13 +312,19 @@ class GhGitHubPublisher:
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
             raise GitHubReadError(
-                "ambiguous_run_pr", "more than one open final Run PR exists"
+                "ambiguous_run_pr", "more than one final Run PR exists"
             )
         if not pulls:
             return None
         pr_number = _integer(_mapping(pulls[0]), "number")
+        live = self.live_pull_request(pr_number)
+        if live.get("state") in {"CLOSED", "MERGED"}:
+            raise GitHubReadError(
+                "final_run_pr_closed",
+                f"Final Run PR #{pr_number} is {live['state']}; cannot create a replacement",
+            )
         self._require_final_run_pr_identity(
-            self.live_pull_request(pr_number),
+            live,
             branch=branch,
             expected_head_sha=expected_head_sha,
             expected_base_branch=expected_base_branch,
@@ -288,7 +332,7 @@ class GhGitHubPublisher:
         )
         return pr_number
 
-    def ensure_parent_pr(self, **authority: str) -> int:
+    def ensure_parent_pr(self, **authority: Any) -> int:
         return self.ensure_change_pr(**authority)
 
     def abandon_parent_pr(self, pr_number: int) -> bool:
@@ -369,91 +413,27 @@ class GhGitHubPublisher:
         )
 
     def close_parent_issue(
-        self,
-        *,
-        parent_number: int,
-        run_id: str,
-        pr_number: int,
-        integrated_sha: str,
-        delivery_type: str,
+        self, *, parent_number: int, run_id: str, pr_number: int,
+        integrated_sha: str, delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
+        from agent_run.parent_close import close_parent
+
+        def write(operation: str, body: str | None) -> None:
+            arguments = ["issue", operation, str(parent_number), "--repo", self.repository]
+            if body is not None:
+                arguments.extend(["--body", body])
+            self._require(*arguments)
+
+        close_parent(
+            parent_number=parent_number, run_id=run_id, pr_number=pr_number,
+            integrated_sha=integrated_sha, delivery_type=delivery_type,
+            actor=self._publisher_login(),
+            read_issue=lambda: self._issue_with_comments(parent_number),
+            read_events=lambda: self._ticket_transitions(parent_number), write=write,
+            close_intent=close_intent, record_intent=record_intent,
         )
-        marker = f"<!-- agent-run:{run_id}:parent-completed -->"
-        body = (
-            f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
-            f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
-            "is verified on the default branch."
-        )
-        comments = issue.get("comments")
-        marker_comments = (
-            [
-                _mapping(comment)
-                for comment in comments
-                if marker in str(_mapping(comment).get("body", ""))
-            ]
-            if isinstance(comments, list)
-            else []
-        )
-        if marker_comments and not any(
-            comment.get("body") == body for comment in marker_comments
-        ):
-            raise GitHubReadError(
-                "github_write_outcome_unknown",
-                "Parent Issue completion marker body does not match the intent",
-            )
-        already_recorded = bool(marker_comments)
-        if not already_recorded:
-            self._require(
-                "issue",
-                "comment",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--body",
-                body,
-            )
-        if issue.get("state") != "CLOSED":
-            self._require(
-                "issue",
-                "close",
-                str(parent_number),
-                "--repo",
-                self.repository,
-            )
-        observed = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
-        observed_comments = observed.get("comments")
-        if (
-            observed.get("state") != "CLOSED"
-            or not isinstance(observed_comments, list)
-            or not any(
-                _mapping(comment).get("body") == body
-                for comment in observed_comments
-            )
-        ):
-            raise GitHubReadError(
-                "github_write_outcome_unknown",
-                "Parent Issue close remote readback did not match the intent",
-            )
 
     def abandon_run_pr(self, pr_number: int) -> None:
         live = self.live_pull_request(pr_number)
@@ -467,7 +447,9 @@ class GhGitHubPublisher:
         self._require("pr", "close", str(pr_number), "--repo", self.repository)
         return True
 
-    def _ensure_remote_run_branch(self, branch: str, expected_sha: str) -> None:
+    def _ensure_remote_run_branch(
+        self, branch: str, expected_sha: str, *, allow_append: bool = False
+    ) -> None:
         """Create or recover one Run/Parent ref by its durable exact SHA.
 
         A same-named ref is not ownership evidence: it is usable only when its
@@ -477,6 +459,10 @@ class GhGitHubPublisher:
         if remote_sha == expected_sha:
             return
         if remote_sha is not None:
+            if allow_append:
+                self.git.fetch_remote_commit(branch, remote_sha)
+                if self.git.is_ancestor(expected_sha, remote_sha):
+                    return
             raise GitError("Run ref has a foreign identity")
         pushed = self._write_command(
             [
@@ -505,12 +491,17 @@ class GhGitHubPublisher:
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
-        current_remote_sha = self._remote_branch_sha(branch)
+    ) -> BranchPublicationResult:
+        observation = RemoteBranchObservation(
+            branch, expected_remote_sha, self._remote_branch_sha(branch)
+        )
+        current_remote_sha = observation.observed_sha
+        if not self.git.is_ancestor(expected_remote_sha, head_sha):
+            raise GitError("publication head does not descend from the observed source head")
         if current_remote_sha == head_sha:
-            return
-        if current_remote_sha != expected_remote_sha:
-            raise GitError("remote ticket branch drifted")
+            return BranchPublicationResult(observation, head_sha, "already_published")
+        if not observation.matches_expected:
+            raise RemoteBranchChanged(observation)
         arguments = [
             "git",
             "push",
@@ -522,15 +513,21 @@ class GhGitHubPublisher:
         if pushed.returncode != 0:
             observed = self._remote_branch_sha(branch)
             if observed == head_sha:
-                return
+                return BranchPublicationResult(observation, head_sha, "already_published")
             if observed != expected_remote_sha:
-                raise GitError("remote ticket branch drifted")
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, observed)
+                )
             raise GitHubReadError(
                 "github_write_failed",
                 pushed.stderr.strip() or "could not publish ticket branch",
             )
-        if self._remote_branch_sha(branch) != head_sha:
-            raise GitError("Ticket ref publication readback did not match intent")
+        observed = self._remote_branch_sha(branch)
+        if observed != head_sha:
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, head_sha, observed)
+            )
+        return BranchPublicationResult(observation, head_sha, "published")
 
     def verify_change_pr_before_publish(
         self,
@@ -541,6 +538,11 @@ class GhGitHubPublisher:
         expected_base_sha: str,
     ) -> None:
         pulls = self._change_prs(branch)
+        if not pulls and self._change_prs(branch, state="all"):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if len(pulls) > 1:
             raise GitHubReadError(
                 "ambiguous_change_pr", "more than one open Change PR exists"
@@ -578,8 +580,32 @@ class GhGitHubPublisher:
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
+        authority = {
+            "branch": branch, "head_sha": expected_head_sha,
+            "base_branch": base_branch, "base_sha": expected_base_sha,
+        }
+        if write_intent is not None and "target_narrative" in write_intent:
+            observed = observe_pr_write(
+                github=self, repository=self.repository, authority=authority,
+                intent=write_intent,
+            )
+            if observed.completed:
+                admit_pr_write(
+                    intent=write_intent, save_intent=save_intent, number=observed.number,
+                    prior=write_intent["target_narrative"],
+                    target={"title": title, "body": body},
+                )
+                assert observed.number is not None
+                return observed.number
         pulls = self._change_prs(branch)
+        if not pulls and self._change_prs(branch, state="all"):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if len(pulls) > 1:
             raise GitHubReadError(
                 "ambiguous_change_pr", "more than one open Change PR exists"
@@ -594,7 +620,19 @@ class GhGitHubPublisher:
                 expected_head_sha=expected_head_sha,
                 expected_base_sha=expected_base_sha,
             )
-            if existing.get("title") != title or existing.get("body") != body:
+            if write_intent is not None and (
+                not isinstance(existing.get("title"), str)
+                or not isinstance(existing.get("body"), str)
+            ):
+                raise GitHubReadError(
+                    "github_invalid_response", "Change PR narrative snapshot is missing",
+                )
+            should_write = admit_pr_write(
+                intent=write_intent, save_intent=save_intent, number=number,
+                prior={"title": existing.get("title", ""), "body": existing.get("body", "")},
+                target={"title": title, "body": body},
+            )
+            if should_write:
                 self._require(
                     "pr",
                     "edit",
@@ -606,6 +644,8 @@ class GhGitHubPublisher:
                     "--body",
                     body,
                 )
+            if write_intent is not None:
+                return self._confirm_pr_write(authority, write_intent)
             refreshed = self._change_prs(branch)
             if len(refreshed) != 1:
                 raise GitHubReadError(
@@ -613,6 +653,11 @@ class GhGitHubPublisher:
                     "Change PR refresh did not produce one exact PR",
                 )
             current = _mapping(refreshed[0])
+            if _integer(current, "number") != number:
+                raise GitHubReadError(
+                    "change_pr_identity_mismatch",
+                    "Change PR readback replaced the original PR identity",
+                )
             self._require_change_pr_identity(
                 current,
                 branch=branch,
@@ -626,6 +671,10 @@ class GhGitHubPublisher:
                     "Change PR narrative readback did not match publication artifact",
                 )
             return number
+        admit_pr_write(
+            intent=write_intent, save_intent=save_intent, number=None, prior=None,
+            target={"title": title, "body": body},
+        )
         self._require(
             "pr",
             "create",
@@ -640,6 +689,8 @@ class GhGitHubPublisher:
             "--body",
             body,
         )
+        if write_intent is not None:
+            return self._confirm_pr_write(authority, write_intent)
         recovered = self._change_prs(branch)
         if len(recovered) != 1:
             raise GitHubReadError(
@@ -656,19 +707,42 @@ class GhGitHubPublisher:
         )
         return _integer(created, "number")
 
+    def _confirm_pr_write(
+        self, authority: dict[str, str], intent: dict[str, Any],
+    ) -> int:
+        observed = observe_pr_write(
+            github=self, repository=self.repository, authority=authority, intent=intent,
+        )
+        if not observed.completed or observed.number is None:
+            raise GitHubReadError(
+                "github_write_failed", "PR narrative readback still matches the saved prior value",
+            )
+        return observed.number
+
+    def find_change_pr_number(self, *, branch: str) -> int | None:
+        pulls = self._change_prs(branch, state="all")
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_change_pr", "Original Change PR lookup is ambiguous")
+        return _integer(_mapping(pulls[0]), "number") if pulls else None
+
     def ensure_ticket_pr(
-        self,
-        *,
-        primary_ticket: int,
-        **authority: str,
+        self, *, primary_ticket: int, branch: str, base_branch: str,
+        title: str, body: str, expected_head_sha: str, expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int:
         del primary_ticket
-        return self.ensure_change_pr(**authority)
+        return self.ensure_change_pr(
+            branch=branch, base_branch=base_branch, title=title, body=body,
+            expected_head_sha=expected_head_sha, expected_base_sha=expected_base_sha,
+            write_intent=write_intent, save_intent=save_intent,
+        )
 
     def _remote_branch_sha(self, branch: str) -> str | None:
         remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
+            **runner_options(self.git.runner_identity),
         )
         if remote.returncode != 0:
             raise GitHubReadError(
@@ -676,7 +750,49 @@ class GhGitHubPublisher:
             )
         return remote.stdout.split()[0] if remote.stdout.strip() else None
 
-    def _change_prs(self, branch: str) -> list[object]:
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]:
+        """Observe source and target refs in one live remote read.
+
+        The source may not exist before first publication. The target must
+        exist. Exact ref names are checked because ls-remote accepts patterns.
+        """
+        if source_branch == target_branch:
+            raise GitError("source and target branch must differ")
+        refs: dict[str, str | None] = {
+            f"refs/heads/{source_branch}": None,
+            f"refs/heads/{target_branch}": None,
+        }
+        remote = run_read_command(
+            ["git", "ls-remote", "--heads", "origin", *refs],
+            cwd=self.git.root,
+            **runner_options(self.git.runner_identity),
+        )
+        if remote.returncode != 0:
+            raise GitHubReadError(
+                "github_read_failed",
+                remote.stderr.strip() or "could not read live branch heads",
+            )
+        for line in remote.stdout.splitlines():
+            sha, separator, ref = line.partition("\t")
+            if (
+                separator
+                and ref in refs
+                and refs[ref] is None
+                and re.fullmatch(r"[0-9a-f]{40,64}", sha)
+            ):
+                refs[ref] = sha
+            else:
+                raise GitHubReadError("github_invalid_response", "invalid live branch head")
+        target = refs[f"refs/heads/{target_branch}"]
+        if target is None:
+            raise GitHubReadError(
+                "missing_target_branch", f"target branch {target_branch!r} is missing"
+            )
+        return refs[f"refs/heads/{source_branch}"], target
+
+    def _change_prs(self, branch: str, *, state: str = "open") -> list[object]:
         owner = self.repository.split("/", 1)[0]
         pulls = self._json(
             "api",
@@ -684,11 +800,11 @@ class GhGitHubPublisher:
             "--method",
             "GET",
             "-f",
-            "state=open",
+            f"state={state}",
             "-f",
             f"head={owner}:{branch}",
             "-f",
-            "per_page=2",
+            "per_page=100" if state == "all" else "per_page=2",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
@@ -820,13 +936,24 @@ class GhGitHubPublisher:
                         "github_invalid_response",
                         "Actions job response does not match the requested job",
                     )
+                if job.get("head_sha") != expected_head_sha or job.get("status") != "completed":
+                    raise GitHubReadError(
+                        "github_check_evidence_observation_pending",
+                        "Actions job evidence is not completed at the expected failed head",
+                    )
                 check["job"] = dict(job)
+                # Logs supplement exact job facts; unavailable logs must not
+                # erase a real failure or pretend its investigation passed.
+                try:
+                    logs = self._run("api", f"repos/{self.repository}/actions/jobs/{job_id}/logs")
+                    if logs.returncode == 0:
+                        check["logs"] = logs.stdout[:65536]
+                        check["logs_truncated"] = len(logs.stdout) > 65536
+                    else:
+                        check["logs_unavailable"] = logs.stderr[:4096] or f"gh exited {logs.returncode}"
+                except (GitHubReadError, OSError, TimeoutError) as error:
+                    check["logs_unavailable"] = str(error)[:4096]
             failed.append(check)
-        failed = annotate_configured_code_failures(
-            failed,
-            self.git.root,
-            expected_head_sha=expected_head_sha,
-        )
         return {"pr_number": pr_number, "checks": failed}
 
     def _checks(self, pr_number: int, fields: str) -> list[object]:
@@ -1116,30 +1243,15 @@ class GhGitHubPublisher:
             "foreign_run_pr", "Final Run PR does not match durable identity"
         )
 
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool:
-        value = self._json(
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]:
+        value = _mapping(self._json(
             "pr", "view", str(pr_number), "--repo", self.repository,
             "--json", "title,body",
-        )
-        data = _mapping(value)
-        return data.get("title") == title and data.get("body") == body
-
-    def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
-        body = (
-            f"{_ACCEPTANCE_MARKER}\n"
-            "## Fresh Acceptance Record\n\n"
-            "```json\n"
-            f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n"
-            "```"
-        )
-        self._record_marker_comment(
-            pr_number=pr_number,
-            marker=_ACCEPTANCE_MARKER,
-            body=body,
-            label="Acceptance record",
-        )
+        ))
+        title, body = value.get("title"), value.get("body")
+        if not isinstance(title, str) or not isinstance(body, str):
+            raise GitHubReadError("github_invalid_response", "PR narrative must contain title and body")
+        return {"title": title, "body": body}
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)
@@ -1155,7 +1267,10 @@ class GhGitHubPublisher:
     ) -> None:
         """Apply one marker-owned comment and prove its exact remote body."""
 
+        publisher_login = self._publisher_login()
         comments = self._marker_comments(pr_number)
+        comments = [comment for comment in comments
+                    if _mapping(comment.get("user", {})).get("login") == publisher_login]
         existing = next(
             (comment for comment in comments if marker in str(comment.get("body", ""))),
             None,
@@ -1179,7 +1294,9 @@ class GhGitHubPublisher:
                 f"body={body}",
             )
         if not any(
-            comment.get("body") == body for comment in self._marker_comments(pr_number)
+            comment.get("body") == body
+            and _mapping(comment.get("user", {})).get("login") == publisher_login
+            for comment in self._marker_comments(pr_number)
         ):
             raise GitHubReadError(
                 "github_write_outcome_unknown",
@@ -1219,10 +1336,7 @@ class GhGitHubPublisher:
             "--slurp",
         )
         events = _flatten_pages(events, "events")
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str) or not viewer_login:
-            return False
+        viewer_login = self._publisher_login()
         if not self.has_supersession_close_intent(pr_number, generation, close_nonce):
             return False
         lifecycle_events = [
@@ -1251,10 +1365,7 @@ class GhGitHubPublisher:
             "--paginate",
             "--slurp",
         )
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str):
-            return False
+        viewer_login = self._publisher_login()
         comments = _flatten_pages(comments, "comments")
         return any(
             _supersession_status_matches(
@@ -1275,10 +1386,7 @@ class GhGitHubPublisher:
             "--paginate",
             "--slurp",
         )
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str):
-            return False
+        viewer_login = self._publisher_login()
         comments = _flatten_pages(comments, "comments")
         record = (
             f"{_AGENT_RUN_STATUS_MARKER}\n"
@@ -1355,17 +1463,7 @@ class GhGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
     ) -> dict[str, Any] | None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
         intent_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         close_intent = (
@@ -1423,17 +1521,7 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
-            intent_issue = _mapping(
-                self._json(
-                    "issue",
-                    "view",
-                    str(ticket_number),
-                    "--repo",
-                    self.repository,
-                    "--json",
-                    "state,comments,updatedAt",
-                )
-            )
+            intent_issue = self._issue_with_comments(ticket_number)
             intent = self._publisher_close_intent(
                 intent_issue,
                 close_intent,
@@ -1491,6 +1579,12 @@ class GhGitHubPublisher:
         )
         if prepared is None:
             return prepared
+        if ((self.git.runner_identity or {}).get("source") == "app"
+                and prepared.get("actor") != self._publisher_login()):
+            raise GitHubReadError(
+                "ticket_close_external_conflict",
+                "prepared Ticket close belongs to a different Publisher identity",
+            )
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if prepared.get("intent_binding") != expected_binding:
             raise GitHubReadError(
@@ -1509,17 +1603,7 @@ class GhGitHubPublisher:
                     "recorded Ticket close is no longer current",
                 )
             return ownership
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         if issue.get("state") == "CLOSED":
             ownership = self._ticket_close_ownership(
                 ticket_number=ticket_number,
@@ -1602,17 +1686,7 @@ class GhGitHubPublisher:
         recorded_ownership: dict[str, Any] | None,
         require_recovery_currentness: bool = False,
     ) -> dict[str, Any] | None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         transitions = self._ticket_transitions(ticket_number)
         if not transitions:
             if (
@@ -1880,7 +1954,37 @@ class GhGitHubPublisher:
             "intent_binding": intent_binding,
         }
 
+    def _issue_with_comments(self, number: int) -> dict[str, Any]:
+        app = (self.git.runner_identity or {}).get("source") == "app"
+        issue = _mapping(self._json(
+            "issue", "view", str(number), "--repo", self.repository, "--json",
+            "state,updatedAt" if app else "state,comments,updatedAt",
+        ))
+        if app:
+            # GraphQL Bot.login is a bare slug and can collide with a User login.
+            # REST comments expose the unambiguous slug[bot] author also used by
+            # REST transition events. Never normalize an arbitrary bare login.
+            issue["comments"] = [
+                {"body": comment.get("body"), "author": comment.get("user"),
+                 "createdAt": comment.get("created_at")}
+                for comment in self._marker_comments(number)
+            ]
+        return issue
+
     def _publisher_login(self) -> str:
+        selected = self.git.runner_identity or {"source": "host"}
+        if selected.get("source") == "app":
+            from agent_run.github_auth import GitHubCredentialError, resolve_app_login
+            from agent_run.github_auth_profile import GitHubAppProfile
+
+            profile = selected["app_profile"]
+            try:
+                return resolve_app_login(GitHubAppProfile(
+                    profile["app_id"], profile["installation_id"],
+                    Path(profile["private_key_path"]),
+                ))
+            except GitHubCredentialError as error:
+                raise GitHubReadError("github_auth_failed", str(error)) from None
         identity = _mapping(self._json("api", "user"))
         login = identity.get("login")
         if not isinstance(login, str) or not login:
@@ -1898,23 +2002,19 @@ class GhGitHubPublisher:
         integrated_sha: str,
         expected_ownership: dict[str, Any],
     ) -> bool:
+        if ((self.git.runner_identity or {}).get("source") == "app"
+                and expected_ownership.get("actor") != self._publisher_login()):
+            raise GitHubReadError(
+                "ticket_close_external_conflict",
+                "prepared Ticket close belongs to a different Publisher identity",
+            )
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if expected_ownership.get("intent_binding") != expected_binding:
             raise GitHubReadError(
                 "ticket_close_reconciliation_pending",
                 "recorded Ticket close belongs to a different PR generation",
             )
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
         comments = issue.get("comments")
         publisher_login = expected_ownership.get("actor")
@@ -2038,7 +2138,9 @@ class GhGitHubPublisher:
         ticket_number: int,
         expected_revision: str,
     ) -> str:
-        graph = GhGitHubReader(self.repository).delivery_graph(parent_number)
+        graph = GhGitHubReader(
+            self.repository, runner_identity=self.git.runner_identity,
+        ).delivery_graph(parent_number)
         return effective_revision_from_graph(graph, ticket_number)
 
     def _commit_metadata(self, sha: str) -> dict[str, Any]:
@@ -2110,20 +2212,26 @@ class GhGitHubPublisher:
     ) -> subprocess.CompletedProcess[str]:
         command = ["gh", *arguments]
         if retry if retry is not None else _is_read_command(arguments):
-            return run_read_command(command, cwd=self.git.root)
+            return run_read_command(
+                command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+            )
         if (
             arguments[:1] == ("api",)
             and "--method" in arguments
             and arguments[arguments.index("--method") + 1 :][:1] == ("GET",)
         ):
             # Explicit GET keeps its existing single-dispatch readback behavior.
-            return run_write_command(command, cwd=self.git.root)
+            return run_write_command(
+                command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+            )
         return self._write_command(command)
 
     def _write_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         if self._write_guard is not None:
             self._write_guard()
-        return run_write_command(command, cwd=self.git.root)
+        return run_write_command(
+            command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+        )
 
 
 def _mapping(value: object) -> dict[str, Any]:

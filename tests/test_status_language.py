@@ -13,8 +13,9 @@ from rich.text import Text
 from agent_run import cli
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
+from support.state import persist_run_fixture
 from support.workspace import prepare_workspace
-from test_run_lifecycle import _file_snapshot
+from support.lifecycle import _file_snapshot
 
 
 class TerminalOutput(StringIO):
@@ -24,7 +25,7 @@ class TerminalOutput(StringIO):
 
 def _save_run(repo: Path, state: dict[str, Any]) -> Path:
     workspace = prepare_workspace(repo)
-    StateStore(workspace.state_root).save_run(state["run_id"], state)
+    persist_run_fixture(StateStore(workspace.state_root), state["run_id"], state)
     RunLocatorIndex.default().register(
         run_id=state["run_id"],
         repository_root=workspace.repository_root,
@@ -91,13 +92,90 @@ def test_delivery_progress_preserves_audit(
     progress = json.loads(audit_output.getvalue())["progress"]
     assert set(progress) == {
         "repository", "parent", "status", "phase", "current_object",
-        "ticket_progress", "round_progress", "run_repair", "elapsed_seconds",
-        "current_agent", "execution_activity", "findings", "conclusion", "next_action",
+        "ticket_progress", "round_progress", "integration_resync", "integration_development", "ci_recovery",
+        "run_repair", "elapsed_seconds",
+        "current_agent", "execution_activity", "scheduler", "findings", "conclusion", "next_action",
     }
     assert progress["ticket_progress"] == {
         "completed": completed, "total": 2 if completed else 0,
     }
     assert _file_snapshot(root) == before
+
+
+def test_multi_ticket_status_reports_local_work_and_integration_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agent_run.delivery_facts import multi_ticket_progress, ticket_progress
+    from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
+    from agent_run.messages import presentation_language
+
+    state = {
+        "multi_ticket_protocol": 4,
+        "policy_snapshot": {
+            "ticket_development_workers": 2,
+            "ticket_review_rounds": 3,
+            "parent_ci_development_limit": 3,
+            "integration_resync_limit": 3,
+        },
+        "ticket_graph": {"tickets": {
+            "2": {"blocked_by": []},
+            "3": {"blocked_by": [{"number": 2, "state": "OPEN"}]},
+            "4": {"blocked_by": []},
+        }},
+        "ticket_jobs": {
+            "2": {"phase": "merged", "review_budget": {
+                "development_attempts": 2, "reviewer_invocations": 1,
+            }},
+            "4": {"phase": "ready_for_integration", "review_budget": {
+                "development_attempts": 1, "reviewer_invocations": 1,
+            }},
+        },
+        "ticket_integration_queue": [
+            {"ticket_number": 4, "ready_at": "2026-09-24T00:01:00+00:00"},
+        ],
+        "ticket_integration_holder": 2,
+    }
+    state.update({"run_id": "r", "repository": "example/project", "parent": {"number": 1}, "status": "active"})
+    before = json.dumps(state, sort_keys=True)
+    assert ticket_progress(state) == {"completed": 0, "total": 3}
+    progress = multi_ticket_progress(state)
+    assert progress is not None
+    assert progress["work_concurrency_limit"] == 2
+    assert progress["integration_holder"] == 2
+    assert progress["integration_queue"] == state["ticket_integration_queue"]
+    assert progress["tickets"][0]["holds_integration"] is True
+    assert progress["tickets"][0]["usage"]["development_limit"] == 4
+    assert progress["tickets"][0]["usage"]["review_limit"] == 3
+    assert progress["tickets"][1]["blocked_by"] == [2]
+    assert progress["tickets"][1]["blocked_reason"] == "waiting_for_dependencies"
+    assert progress["tickets"][2]["queue_position"] == 1
+    status_view = status_progress_view(state, {"status": "active", "phase": "ready_for_integration"})
+    assert status_view["multi_ticket"] == progress
+    assert "队列第 1 位" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
+    assert "开发 2/4" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
+    with presentation_language("en"):
+        assert "Executor: unknown" in _multi_ticket_lines({"multi_ticket": progress})
+    assert json.dumps(state, sort_keys=True) == before
+    assert capsys.readouterr().out == ""
+
+
+def test_multi_ticket_status_does_not_offer_unsupported_resume() -> None:
+    from agent_run.delivery_facts import multi_ticket_progress
+
+    state = {
+        "multi_ticket_protocol": 4,
+        "repository": "example/project", "parent": {"number": 1},
+        "ticket_graph": {"tickets": {"2": {"blocked_by": []}}},
+        "ticket_jobs": {"2": {
+            "ticket_number": 2, "phase": "blocked",
+            "blocked_reason": "integration_history_rewritten",
+        }},
+        "ticket_integration_queue": [], "ticket_integration_holder": None,
+    }
+
+    progress = multi_ticket_progress(state)
+    assert progress is not None
+    assert progress["tickets"][0]["recovery_action"] is None
 
 
 @pytest.mark.parametrize("plain", [True, False])
@@ -203,8 +281,8 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
 
 
 @pytest.mark.parametrize(("status", "command"), [
-    ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "run"),
-    ("publication_pending", "abandon"),
+    ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "resume"),
+    ("publication_pending", "resume"),
 ])
 def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, status: str, command: str,
@@ -225,6 +303,11 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     with redirect_stdout(audit_output):
         assert cli.main(["status", state["run_id"], "--json"]) == 0
     assert "agent-run abandon 1 --repo" not in json.loads(audit_output.getvalue())["next_action"]
+    if status == "deterministic_contradiction":
+        guidance = json.loads(audit_output.getvalue())["next_action"]
+        assert "agent-run resume" in guidance
+        assert "agent-run run" not in guidance
+        assert "agent-run run" not in output.getvalue()
     assert _file_snapshot(root) == before
 
 
@@ -238,14 +321,14 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
         "parent": {"number": 1}, "status": "ready_for_human", "diagnostics": [],
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 31,
+            "review_budget": {"window": 4, "development_attempts": 2,
+                              "reviewer_invocations": 1, "final_ci_fix_used": False},
             "repair_cycle": {"generation": 72, "status": "active", "code_modification_attempts": 2},
             "repair_job": {
                 "repair_generation": 99, "phase": "blocked", "candidate_sha": "private-candidate-sha",
                 "blocked_reason": "agent_requires_human", "human_blocker_phase": "reviewing",
                 "human_blockers": ["等待人工处理 / 原始 evidence"],
                 "repair_checkout": "/preserved/development",
-                "review_budget": {"window": 4, "development_attempts": 2,
-                                  "reviewer_invocations": 1, "final_ci_fix_used": False},
             },
         },
         "agent_invocation_history": [{
@@ -268,7 +351,7 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
     human = Text.from_ansi(output.getvalue()).plain
     readable = " ".join(human.replace("│", " ").split())
     expected_terms = (
-        "整体修复", "代码修改 2 / 10", "当前版本验收", "需要人工处理", "验收中",
+        "整体修复", "代码修改 2 / 3", "当前版本验收", "需要人工处理", "验收中",
         "review-model", "high", "等待人工处理 / 原始 evidence",
         "当前代码版本已保存", "开发工作区已保留", "整项任务已暂停，其他子任务也不会继续",
         "agent-run resume 1 --repo example/project",
@@ -326,4 +409,37 @@ def test_missing_run_language_is_reported_without_guessing_or_writing(
     with redirect_stdout(output):
         assert cli.main(["status", state["run_id"], "--plain"]) == 2
     assert "language" in output.getvalue()
+    assert _file_snapshot(root) == before
+
+
+@pytest.mark.parametrize("plain", [True, False])
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_ticket_ci_status_reports_cumulative_budget_without_fake_acceptance(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool, language: str,
+) -> None:
+    from agent_run.delivery_policy import default_delivery_policy
+    from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
+    budget = new_ticket_ci_recovery_budget()
+    budget.update(developments_used=2, failure_head="failed-head")
+    job = {"ticket_number": 2, "phase": "repairing", "policy_snapshot": default_delivery_policy().snapshot(),
+           "ci_recovery": budget, "ci_evidence": {"head_sha": "failed-head", "checks": []}}
+    state = {"run_id": "ticket-ci-status", "schema_version": 1, "language": language,
+             "repository": "example/project", "parent": {"number": 1}, "status": "active",
+             "active_ticket_job": job, "diagnostics": []}
+    root = _save_run(git_repo, state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
+    human = Text.from_ansi(output.getvalue()).plain
+    assert ("累计开发 2/3" if language == "zh" else "cumulative development 2/3") in human
+    assert ("本候选未经独立验收" if language == "zh" else "this candidate has no independent acceptance") in human
+    audit_output = StringIO()
+    with redirect_stdout(audit_output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    audit = json.loads(audit_output.getvalue())
+    assert audit["ci_recovery"]["developments_used"] == 2
+    assert audit["ci_recovery"]["development_limit"] == 3
+    assert "outer_window" not in audit["ci_recovery"]
     assert _file_snapshot(root) == before

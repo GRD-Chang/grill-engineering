@@ -4,7 +4,11 @@ import threading
 import time
 from pathlib import Path
 
-from agent_run.worker_credentials import ReadCredential, WorkerCredentialChannel
+
+from agent_run.credential_lifecycle import (
+    ReadCredential,
+    RenewableCredential,
+)
 
 
 def test_close_during_retry_joins_renewal_without_another_backoff(
@@ -25,9 +29,9 @@ def test_close_during_retry_joins_renewal_without_another_backoff(
             nonlocal clock_offset
             self.calls += 1
             if self.calls == 1:
-                return ReadCredential("reader", clock() + 1)
+                return ReadCredential("reader", clock() + 60)
             if self.calls == 2:
-                # Expire the credential, then enter the real renewal retry path.
+                # Enter retry while the old credential is still valid.
                 clock_offset += 2
                 raise OSError("temporary issuer outage")
             retry_started.set()
@@ -38,20 +42,18 @@ def test_close_during_retry_joins_renewal_without_another_backoff(
         def cancel(self) -> None:
             release_retry.set()
 
-    credentials = WorkerCredentialChannel(
-        CancellableProvider(), clock=clock, renewal_margin=10
+    credentials = RenewableCredential(
+        CancellableProvider(), on_update=lambda _: None, clock=clock, renewal_margin=100
     )
-    socket_path = tmp_path / "credential.sock"
     renewal_thread: threading.Thread | None = None
     try:
-        credentials.start(socket_path)
+        credentials.start()
         renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
         assert retry_started.wait(timeout=5)
         credentials.close()
 
         assert renewal_thread is not None
         assert not renewal_thread.is_alive()
-        assert not socket_path.exists()
     finally:
         release_retry.set()
         credentials.close()

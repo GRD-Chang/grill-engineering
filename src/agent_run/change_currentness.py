@@ -7,6 +7,8 @@ from typing import Any, Protocol
 from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_repair_integration import repair_run_branch_is_current
+from agent_run.parent_integration import parent_integration_record_is_valid
 
 
 class PullRequestReader(Protocol):
@@ -30,16 +32,23 @@ def stale_change_job_reason(
         )
         if job.get("effective_revision") != expected:
             return "ticket_requirements_changed"
-        run_branch = state.get("run_branch")
-        if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-            return "ticket_base_changed"
+        # Ticket Development and original Review keep their fixed base.
+        # A newer Run Branch is integrated at the delivery boundary.
         return None
     if subject.startswith("parent-only:"):
         if job.get("effective_revision") != parent.get("revision"):
             return "parent_requirements_changed"
         base = _mapping(state, "base")
-        branch = base.get("branch")
-        if not isinstance(branch, str) or job.get("base_sha") != git.resolve(branch):
+        fixed_base = base.get("sha")
+        job_base = job.get("base_sha")
+        if not isinstance(fixed_base, str) or not isinstance(job_base, str):
+            return "parent_base_changed"
+        try:
+            if not git.is_ancestor(fixed_base, job_base):
+                return "parent_base_changed"
+        except (GitError, ValueError):
+            return "parent_base_changed"
+        if job_base != fixed_base and not parent_integration_record_is_valid(git, job):
             return "parent_base_changed"
         return None
     if job.get("parent_revision") != parent.get("revision"):
@@ -50,7 +59,7 @@ def stale_change_job_reason(
         return "run_repair_ticket_completion_changed"
     run_branch = state.get("run_branch")
     if isinstance(run_branch, str):
-        if job.get("base_sha") != git.resolve(run_branch):
+        if not repair_run_branch_is_current(git, job, git.resolve(run_branch)):
             return "run_repair_base_changed"
     return None
 
@@ -80,50 +89,6 @@ def unknown_pr_mutation(
     if not isinstance(pr_number, int):
         return None
     live = github.live_pull_request(pr_number)
-    if (
-        subject.startswith("run-repair:")
-        and live.get("state") == "MERGED"
-        and isinstance(job.get("integrated_revalidation_merge"), dict)
-    ):
-        marker = _mapping(job, "integrated_revalidation_merge")
-        integrated = job.get("integrated_sha")
-        published_base = marker.get("base_sha")
-        published_default = marker.get("default_base_sha")
-        published_candidate = marker.get("candidate_sha")
-        published_head = marker.get("publication_sha")
-        try:
-            published_head_tree = git.resolve(f"{published_head}^{{tree}}")
-            integrated_tree = git.resolve(f"{integrated}^{{tree}}")
-            local_facts_match = (
-                git.commit_parents(str(published_candidate))
-                == [published_base, published_default]
-                and git.commit_parents(str(published_head))
-                == [published_base, published_default]
-                and git.commit_parents(str(integrated))
-                == [published_base, published_head]
-                and git.is_ancestor(str(published_default), str(integrated))
-            )
-        except (GitError, ValueError):
-            published_head_tree = None
-            integrated_tree = None
-            local_facts_match = False
-        if live.get("head_sha") != published_head:
-            return "change_pr_head_changed_externally"
-        if live.get("base_branch") != state.get("run_branch"):
-            return "change_pr_base_changed_externally"
-        if not isinstance(integrated, str) or live.get("integrated_sha") != integrated:
-            return "change_pr_integrated_sha_changed_externally"
-        if live.get("base_sha") != integrated:
-            return "change_pr_base_changed_externally"
-        if live.get("head_tree") != published_head_tree:
-            return "change_pr_head_tree_changed_externally"
-        if live.get("integrated_tree") != integrated_tree:
-            return "change_pr_integrated_tree_changed_externally"
-        if live.get("integrated_parents") != [published_base, published_head]:
-            return "change_pr_integrated_parents_changed_externally"
-        if not local_facts_match:
-            return "change_pr_integrated_authority_changed_externally"
-        return None
     if live.get("state") != "OPEN":
         return "change_pr_closed_or_merged_externally"
     known_heads = {job.get("publication_sha")}
@@ -132,7 +97,7 @@ def unknown_pr_mutation(
         "reviewing", "accepted", "publication_pending", "publishing",
     } and isinstance(job.get("published_sha"), str):
         known_heads.add(job["published_sha"])
-    if live.get("head_sha") not in known_heads:
+    if not subject.startswith("ticket:") and live.get("head_sha") not in known_heads:
         return "change_pr_head_changed_externally"
     expected_base_branch = (
         state.get("run_branch")
@@ -143,12 +108,30 @@ def unknown_pr_mutation(
         return "change_pr_base_unknown"
     if live.get("base_branch") != expected_base_branch:
         return "change_pr_base_changed_externally"
-    if live.get("base_sha") != git.resolve(expected_base_branch):
-        return "change_pr_base_changed_externally"
+    if subject.startswith("parent-only:"):
+        expected_base = job.get("base_sha")
+        observed_base = live.get("base_sha")
+        try:
+            target_is_append_only = (
+                isinstance(expected_base, str)
+                and isinstance(observed_base, str)
+                and git.is_ancestor(expected_base, observed_base)
+            )
+        except (GitError, ValueError):
+            target_is_append_only = False
+        if not target_is_append_only:
+            return "change_pr_base_changed_externally"
+    elif not subject.startswith("ticket:"):
+        local_base = git.resolve(expected_base_branch)
+        expected_base = local_base
+        if live.get("base_sha") != expected_base:
+            return "change_pr_base_changed_externally"
     return None
 
 
-def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
+def candidate_or_acceptance_is_inconsistent(
+    job: dict[str, Any], *, budget_owner: dict[str, Any] | None = None,
+) -> bool:
     """Whether a persisted acceptance cannot be bound to its candidate."""
     candidate = job.get("candidate_sha")
     record = job.get("acceptance_record")
@@ -171,11 +154,17 @@ def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
             "committing_candidate",
             "candidate",
             "reviewing",
+            "ready_for_integration",
         }
+        or (
+            job.get("phase") == "ready_for_integration"
+            and job.get("attempt_kind") != "ci_repair"
+        )
         or reviewed_candidate != job.get("last_review_candidate_sha")
     ):
         return True
-    budget = job.get("review_budget")
+    owner = budget_owner if budget_owner is not None else job
+    budget = owner.get("ci_recovery" if job.get("attempt_kind") == "ci_repair" else "review_budget")
     artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
     latest = artifacts[-1] if isinstance(artifacts, list) and artifacts else None
     return not (

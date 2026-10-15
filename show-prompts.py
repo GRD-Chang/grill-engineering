@@ -75,6 +75,7 @@ def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:
         ("required_checks", "CI 失败", "ci_evidence",
          {"head_sha": "<示例候选SHA>", "failure": "【示例】需求对应的回归检查失败。"}),
         ("human_revision", "维护者修订", "human_feedback", "【示例】请按确认的需求补齐错误提示。"),
+        ("integration", "Ticket 集成处理", "integration_evidence", "【示例】git diff --cached --check 失败；保留 source/target、HEAD/MERGE_HEAD 和原始输出。"),
         ("merge_conflict", "合并冲突", "merge_conflict_evidence", "【示例】当前工作树的配置文件存在冲突。"),
     ]
     for source, title, field, evidence in sources:

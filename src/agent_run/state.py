@@ -1,25 +1,28 @@
 from __future__ import annotations
 
+from agent_run.delivery_facts import current_work_subject
+from agent_run.work_facts import work_attempt, work_phase, work_role
+
 import fcntl
 import json
+import logging
 import os
-import tempfile
 import threading
-import time
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
-from agent_run.models import same_repository
-from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
-from agent_run.presentation_helpers import current_work_subject
-from agent_run.task_control import TaskControlBusyError
+from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.state_commits import coordinator_for
+from agent_run.state_errors import IncompatibleRunStateError
 
 
 MAX_TIMELINE_EVENTS = 256
@@ -27,21 +30,11 @@ MAX_TIMELINE_CONTINUATION_EVENTS = 256
 MAX_DIAGNOSTIC_ENTRIES = 32
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
 MAX_RUN_STATE_BYTES = 4 * 1024 * 1024
-# Bound transient Task Control contention without relying on scheduler yield
-# counts; the interval stays short while the total wait remains finite.
-_STATE_COMMIT_RETRY_WINDOW_SECONDS = 0.25
-_STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
 _T = TypeVar("_T")
 
 
-def _load_bounded_json(path: Path) -> object:
-    with path.open("rb") as source:
-        encoded = source.read(MAX_RUN_STATE_BYTES + 1)
-    if len(encoded) > MAX_RUN_STATE_BYTES:
-        raise ValueError(
-            f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit: {path}"
-        )
-    return json.loads(encoded.decode("utf-8"))
+class ConcurrentRunStateError(RuntimeError):
+    """A Run changed after a Controller read its refresh baseline."""
 
 
 class SimulatedProcessCrash(OSError):
@@ -57,6 +50,10 @@ class StateStore:
         self._write_guard: Callable[[], None] | None = None
         self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
+        self._repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+        self._coordinator = coordinator_for(root)
+        self._commit_context = threading.local()
+        self._validated_read: tuple[object, weakref.ReferenceType[object]] | None = None
 
     def _set_write_guard(
         self,
@@ -93,9 +90,89 @@ class StateStore:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        """Create a new Run; existing work must use an object commit."""
         self._commit_run(
-            lambda: self._save_run_and_notify_unlocked(run_id, state)
+            lambda: self._create_run_and_notify_unlocked(run_id, state),
         )
+
+    def load_work_run(
+        self, run_id: str, ticket_number: int | None = None, *, thin_timeline: bool = False,
+    ) -> dict[str, Any] | None:
+        """Read current work and only the Invocation history it references."""
+        self._reject_legacy_run(run_id)
+        state = self._repository.load_work(run_id, ticket_number, thin_timeline=thin_timeline)
+        if state is not None:
+            from agent_run.state_contract import require_current_work_state
+            from agent_run.state_errors import MissingRunMaterialsError
+
+            try:
+                require_current_work_state(state, self._repository.work_archives(), self._repository.work_attempts(),
+                                           self._repository.work_timelines())
+            except MissingRunMaterialsError as error:
+                raise MissingRunMaterialsError(f"{self._repository.path} Run {run_id}: {error}") from error
+        return state
+
+    def validate_work_projection(self, state: dict[str, Any]) -> None:
+        """Complete-StateStore consumers retain the complete Run contract."""
+        from agent_run.state_contract import require_current_run_state
+
+        require_current_run_state(state)
+
+    def _load_work_for_update(
+        self, run_id: str, ticket_number: int | None = None, *, thin_timeline: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read and validate before returning an isolated transaction baseline.
+
+        No caller can mutate the loaded projection between its default read
+        and this source loan. Custom readers/validators keep exact comparison.
+        Neither baseline bypasses the later ownership or authorization checks.
+        """
+        from agent_run import state_contract
+
+        state = self.load_work_run(run_id, ticket_number, thin_timeline=thin_timeline)
+        if state is None:
+            return None
+        ordinary = (
+            getattr(self.load_work_run, "__func__", None) is _DEFAULT_LOAD_WORK_RUN
+            and getattr(self._repository.load_work, "__func__", None) is _DEFAULT_REPOSITORY_LOAD_WORK
+            and state_contract.require_current_work_state is state_contract._DEFAULT_WORK_VALIDATION
+        )
+        baseline = (self._repository.current_work_baseline(run_id) if ordinary
+                    else self._repository.work_baseline(run_id, state))
+        return state, baseline
+
+    def ticket_pause_requested(self, run_id: str, ticket_number: int) -> bool:
+        """Read a Ticket Stop observation; commits independently recheck it."""
+        self._reject_legacy_run(run_id)
+        return self._repository.ticket_pause_requested(run_id, ticket_number)
+
+    @contextmanager
+    def work_session(self) -> Iterator[None]:
+        """Share scoped connections while every read retains its own snapshot."""
+        with self._repository.work_session():
+            yield
+
+    def has_ticket_supervision_work(self, run_id: str) -> bool:
+        """Precheck whether supervision needs a complete work observation."""
+        self._reject_legacy_run(run_id)
+        return self._repository.has_ticket_supervision_work(run_id)
+
+    def _save_work_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any], baseline: dict[str, Any],
+        *, ticket_number: int | None = None,
+    ) -> dict[str, Any]:
+        from agent_run.state_work import save_work
+
+        durable = save_work(self._repository, run_id, state, baseline, ticket_number)
+        notifications = self._commit_context.notifications
+        # Existing observers consume a complete Run. Resolve their query only
+        # after admission, Control and database locks have all been released;
+        # it is never reused as the work commit's authorization or baseline.
+        notifications.append(
+            (lambda: self.load_current_run(run_id))
+            if self.run_saved_observer is not None else None
+        )
+        return durable
 
     @contextmanager
     def _write_boundary(self) -> Iterator[None]:
@@ -108,47 +185,65 @@ class StateStore:
             yield
 
     def _commit_run(self, operation: Callable[[], _T]) -> _T:
-        retry_deadline = (
-            time.monotonic() + _STATE_COMMIT_RETRY_WINDOW_SECONDS
-        )
-        while True:
+        # Queue before acquiring Control/Run locks. Never replay a transaction.
+        with self.commit_admission():
+            notifications = self._commit_context.notifications
+            checkpoint = len(notifications)
             try:
-                # Acquire Task Control before Run state.  Every retry leaves
-                # both short-transaction contexts before trying again.
-                with self._write_boundary():
-                    with self.locked():
-                        return operation()
-            except TaskControlBusyError:
-                remaining = retry_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                # Release the StateStore lock before retrying the short
-                # Task Control transaction.  Use a bounded interval rather
-                # than a fixed number of scheduler yields so a legal,
-                # millisecond-scale transaction can finish.
-                time.sleep(
-                    min(_STATE_COMMIT_RETRY_INTERVAL_SECONDS, remaining)
-                )
+                with self._write_boundary(), self.locked(), self._repository.atomic():
+                    return operation()
+            except BaseException:
+                del notifications[checkpoint:]
+                # Object projections may have advanced inside a nested save.
+                # An outer rollback invalidates those provisional baselines.
+                for attribute in ("_object_store_adapter", "_parent_object_store_adapter"):
+                    adapter = getattr(self, attribute, None)
+                    if adapter is not None:
+                        adapter.invalidate_baseline()
+                raise
+
+    @contextmanager
+    def commit_admission(self) -> Iterator[None]:
+        """Acquire a FIFO seat before callers enter a compound Control boundary.
+
+        Nested saves on this StateStore reuse the seat. Notifications wait until its outer scope
+        has released all Control and database locks, and never fail the save.
+        """
+        nested = getattr(self._commit_context, "notifications", None) is not None
+        notifications: list[dict[str, Any] | Callable[[], dict[str, Any] | None] | None] = []
+        try:
+            with self._coordinator.admitted():
+                if not nested:
+                    self._commit_context.notifications = notifications
+                try:
+                    yield
+                finally:
+                    if not nested:
+                        self._commit_context.notifications = None
+        finally:
+            if not nested:
+                for saved in notifications:
+                    self._after_run_saved()
+                    if saved is not None and self.run_saved_observer is not None:
+                        try:
+                            observed = saved() if callable(saved) else saved
+                            if observed is not None:
+                                self.run_saved_observer(observed)
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Run observer failed after durable commit", exc_info=True,
+                            )
 
     def create_run_if_absent(
         self, run_id: str, state: dict[str, Any]
     ) -> tuple[dict[str, Any], bool]:
         """Atomically create one Run or return the existing Run."""
 
-        custom_save = self._custom_save_run()
-        if custom_save is not None:
-            with self.locked():
-                existing = self.load_run(run_id)
-                if existing is not None:
-                    return existing, False
-                custom_save(run_id, state)
-                return deepcopy(state), True
-
         def create() -> tuple[dict[str, Any], bool]:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            self._save_run_and_notify_unlocked(run_id, state)
+            self._create_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
@@ -161,20 +256,6 @@ class StateStore:
         state: dict[str, Any],
     ) -> tuple[dict[str, Any], bool]:
         """Atomically reuse an unfinished Parent Run or create one."""
-
-        custom_save = self._custom_save_run()
-        if custom_save is not None:
-            with self.locked():
-                unfinished = self.find_unfinished_runs(repository, parent_number)
-                if len(unfinished) > 1:
-                    run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
-                    raise ValueError(
-                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
-                        f"{run_ids}"
-                    )
-                if unfinished:
-                    return unfinished[0], False
-                return self.create_run_if_absent(run_id, state)
 
         def create() -> tuple[dict[str, Any], bool]:
             unfinished = self.find_unfinished_runs(repository, parent_number)
@@ -189,157 +270,245 @@ class StateStore:
             existing = self.load_run(run_id)
             if existing is not None:
                 return existing, False
-            self._save_run_and_notify_unlocked(run_id, state)
+            self._create_run_and_notify_unlocked(run_id, state)
             return deepcopy(state), True
 
         return self._commit_run(create)
 
-    def _custom_save_run(self) -> Callable[[str, dict[str, Any]], None] | None:
-        instance_method = self.__dict__.get("save_run")
-        if callable(instance_method):
-            return cast(Callable[[str, dict[str, Any]], None], instance_method)
-        class_method = getattr(type(self), "save_run", None)
-        if class_method is not StateStore.save_run:
-            return self.save_run
-        return None
-
-    def _save_run_and_notify_unlocked(
+    def _create_run_and_notify_unlocked(
         self, run_id: str, state: dict[str, Any]
     ) -> None:
-        self._save_run_unlocked(run_id, state)
-        self._after_run_saved()
-        if self.run_saved_observer is not None:
-            self.run_saved_observer(state)
+        durable = self._create_run_unlocked(run_id, state)
+        notifications = getattr(self._commit_context, "notifications", None)
+        if notifications is None:
+            raise RuntimeError("Run save requires commit admission")
+        if self.run_saved_observer is None:
+            notifications.append(None)
+        else:
+            # The caller receives timeline fields; observers own a separate view.
+            for field in ("timeline", "timeline_continuation"):
+                if field in durable:
+                    durable[field] = deepcopy(durable[field])
+            notifications.append(durable)
 
     def _after_run_saved(self) -> None:
         """Hook for durable-write fault injection."""
 
-    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
-        self.runs_directory.mkdir(parents=True, exist_ok=True)
-        destination = self.runs_directory / f"{run_id}.json"
-        previous = self.load_run(run_id)
+    def _create_run_unlocked(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        self._reject_legacy_run(run_id)
+        if self._repository.has(run_id):
+            raise ValueError("Run already exists; use an object commit")
+        invocations = state.get("ticket_agent_invocations")
+        active_job = state.get("active_ticket_job")
+        active_invocation = state.get("active_agent_invocation")
+        if (
+            isinstance(invocations, dict)
+            and isinstance(active_job, dict)
+            and type(active_job.get("ticket_number")) is int
+            and isinstance(active_invocation, dict)
+            and active_invocation.get("work_subject")
+            == f"ticket:{active_job['ticket_number']}"
+        ):
+            invocations[str(active_job["ticket_number"])] = deepcopy(active_invocation)
+        from agent_run.ticket_state import capture_ticket_wait
+
+        capture_ticket_wait(state)
+        if "ticket_work_queue" in state:
+            from agent_run.ticket_work import reconcile
+
+            reconcile(state)
         durable_state = _sanitize_durable_errors(state)
+        from agent_run.state_retention import compact_invocation_details
+
+        compact_invocation_details(durable_state)
+        if "agent_invocation_history" in durable_state:
+            state["agent_invocation_history"] = deepcopy(durable_state["agent_invocation_history"])
         if "run_id" in durable_state:
-            _append_timeline_event(durable_state, previous)
+            _append_timeline_event(durable_state, None)
             state["timeline"] = durable_state["timeline"]
             if durable_state.get("timeline_at_capacity") is True:
                 state["timeline_at_capacity"] = True
             continuation = durable_state.get("timeline_continuation")
             if isinstance(continuation, list):
                 state["timeline_continuation"] = continuation
-        serialized = (
-            json.dumps(
-                durable_state,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
+        self._repository.save(run_id, durable_state)
+        return durable_state
+
+    def _reject_legacy_run(self, run_id: str | None = None) -> None:
+        legacy = (self.runs_directory / f"{run_id}.json" if run_id is not None
+                  else next(self.runs_directory.glob("*.json"), None))
+        if legacy is not None and legacy.is_file():
+            raise IncompatibleRunStateError(
+                f"incompatible legacy JSON Run: {legacy}; no migration is performed"
             )
-            + "\n"
-        )
-        if len(serialized.encode("utf-8")) > MAX_RUN_STATE_BYTES:
-            raise ValueError(
-                f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit"
-            )
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.runs_directory,
-            prefix=f".{run_id}.",
-            suffix=".tmp",
-            text=True,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                temporary_file.write(serialized)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, destination)
-            self._sync_directory(self.runs_directory)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
-        path = self.runs_directory / f"{run_id}.json"
-        if not path.exists():
-            return None
-        loaded = _load_bounded_json(path)
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Invalid run state: {path}")
-        return loaded
+        self._reject_legacy_run(run_id)
+        return self._repository.load(run_id)
+
+    def has_run(self, run_id: str) -> bool:
+        """Locate persisted records, including unsupported legacy identities."""
+        return (self.runs_directory / f"{run_id}.json").is_file() or self._repository.has(run_id)
+
+    def list_run_ids(self, *, limit: int | None = None) -> list[str]:
+        """Discover SQLite and legacy identities without reading old records."""
+        if limit is not None and limit < 0:
+            raise ValueError("Run ID listing limit must not be negative")
+        run_ids = set(self._repository.list_ids(limit=limit))
+        for path in self.runs_directory.glob("*.json"):
+            run_ids.add(path.stem)
+            if limit is not None and len(run_ids) > limit:
+                raise ValueError("Run ID listing exceeds the requested limit")
+        return sorted(run_ids)
 
     def load_current_run(self, run_id: str) -> dict[str, Any] | None:
         """Load only the one supported persisted Run contract."""
 
         state = self.load_run(run_id)
-        if state is not None:
-            from agent_run.state_contract import require_current_run_state
+        if state is None:
+            self._validated_read = None
+            return None
+        from agent_run.state_contract import require_current_run_state
 
-            require_current_run_state(state)
+        token = self._repository.read_token()
+        ordinary = (
+            getattr(self.load_run, "__func__", None) is _DEFAULT_LOAD_RUN
+            and getattr(self._validate_current_run, "__func__", None) is _DEFAULT_VALIDATE_CURRENT_RUN
+        )
+        cached = self._validated_read
+        if not (ordinary and token is not None and cached is not None
+                and cached[0] is require_current_run_state and cached[1]() is token):
+            self._validate_current_run(run_id, state)
+        # Only SQLite's immutable, content-proven baseline identifies this
+        # pure validation. Never retain/recognize the caller's mutable dict.
+        self._validated_read = ((require_current_run_state, weakref.ref(token))
+                                if ordinary and token is not None else None)
         return state
 
+    @contextmanager
+    def current_run_reader(
+        self, run_id: str, *, work_only: bool = False, thin_timeline: bool = False,
+    ) -> Iterator[Callable[[], dict[str, Any] | None]]:
+        """Retain one read-only scheduling view while SQLite reports no commit.
+
+        The caller must not mutate this polling projection. Ordinary loads
+        and all commit paths still read independent mutable views. The watcher
+        holds no transaction between polls and closes on every scope exit.
+        """
+        from agent_run.sqlite_watcher import SQLiteWatcher
+
+        previous: dict[str, Any] | None = None
+        previous_version: tuple[int, int] | None = None
+        retained = False
+        previous_limit = self._repository.max_bytes
+        with SQLiteWatcher(self._repository.path) as watcher:
+            def read() -> dict[str, Any] | None:
+                nonlocal previous, previous_version, retained, previous_limit
+                watcher.require_active()
+                self._reject_legacy_run(run_id)
+                if self._repository.in_transaction:
+                    return self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
+                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
+                version = watcher.version()
+                if (retained and version == previous_version
+                        and previous_limit == self._repository.max_bytes):
+                    return previous
+                with self._repository.use_reader(watcher.connection):
+                    current = self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
+                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
+                # Sampled before reading: a concurrent commit during the read
+                # can only cause an extra refresh, never label old facts new.
+                previous_version = version
+                previous_limit = self._repository.max_bytes
+                size = None
+                if (work_only and getattr(self.load_work_run, "__func__", None) is _DEFAULT_LOAD_WORK_RUN
+                        and getattr(self._repository.load_work, "__func__", None) is _DEFAULT_REPOSITORY_LOAD_WORK):
+                    # The default work read already computed this exact view's
+                    # logical size, with current source/material proofs. Reuse
+                    # only its scalar result, not a prior budget or Run size.
+                    size = getattr(self._repository._local, "work_projection_bytes", None)
+                retained = current is None or (
+                    size if size is not None else self._repository._check_size(current)
+                ) <= 512 * 1024
+                previous = current if retained else None
+                return current
+
+            yield read
+
+    def _validate_current_run(self, run_id: str, state: dict[str, Any]) -> None:
+        from agent_run.state_contract import require_current_run_state
+        from agent_run.state_errors import MissingRunMaterialsError
+
+        try:
+            require_current_run_state(state)
+        except MissingRunMaterialsError as error:
+            raise MissingRunMaterialsError(
+                f"{self._repository.path} Run {run_id}: {error}"
+            ) from error
+
     def find_run(self, repository: str, parent_number: int) -> dict[str, Any] | None:
-        if not self.runs_directory.exists():
-            return None
-        matches: list[dict[str, Any]] = []
-        for path in self.runs_directory.glob("*.json"):
-            loaded = _load_bounded_json(path)
-            if not isinstance(loaded, dict):
-                continue
-            parent = loaded.get("parent")
-            if (
-                same_repository(loaded.get("repository"), repository)
-                and isinstance(parent, dict)
-                and parent.get("number") == parent_number
-            ):
-                matches.append(loaded)
-        if not matches:
-            return None
-        return max(matches, key=lambda state: str(state.get("created_at", "")))
+        matches = self._find_runs(repository, parent_number, unfinished_only=False)
+        return max(matches, key=lambda state: str(state.get("created_at", ""))) if matches else None
 
     def find_unfinished_runs(
-        self, repository: str, parent_number: int
+        self, repository: str, parent_number: int,
     ) -> list[dict[str, Any]]:
-        if not self.runs_directory.exists():
-            return []
-        runs: list[dict[str, Any]] = []
-        for path in self.runs_directory.glob("*.json"):
-            loaded = _load_bounded_json(path)
-            if not isinstance(loaded, dict):
-                continue
-            parent = loaded.get("parent")
-            if (
-                same_repository(loaded.get("repository"), repository)
-                and isinstance(parent, dict)
-                and parent.get("number") == parent_number
-                and loaded.get("status") not in {"completed", "abandoned"}
-            ):
-                runs.append(loaded)
-        return sorted(runs, key=lambda state: str(state.get("created_at", "")))
+        return self._find_runs(repository, parent_number, unfinished_only=True)
 
-    @staticmethod
-    def _sync_directory(directory: Path) -> None:
-        descriptor = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    def _find_runs(
+        self, repository: str, parent_number: int, *, unfinished_only: bool,
+    ) -> list[dict[str, Any]]:
+        # Unknown old JSON may belong to this Parent. Refuse before new work,
+        # without reading, migrating or overwriting any legacy record.
+        self._reject_legacy_run()
+        result = []
+        for run_id in self._repository.find_ids(
+            repository, parent_number, unfinished_only=unfinished_only,
+        ):
+            state = self.load_run(run_id)
+            if state is not None:
+                result.append(state)
+        return sorted(result, key=lambda state: str(state.get("created_at", "")))
 
 
-def _append_timeline_event(
-    state: dict[str, Any], previous: dict[str, Any] | None
-) -> None:
+# Preserve custom read/validation hooks, including class-level replacements.
+_DEFAULT_LOAD_WORK_RUN = StateStore.load_work_run
+_DEFAULT_REPOSITORY_LOAD_WORK = SQLiteStateRepository.load_work
+_DEFAULT_LOAD_RUN = StateStore.load_run
+_DEFAULT_VALIDATE_CURRENT_RUN = StateStore._validate_current_run
+
+
+def _timeline_change(
+    state: dict[str, Any], previous: dict[str, Any] | None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
     marker = _timeline_marker(state)
     marker.update(checks_timeline_facts(state, marker))
-    marker.update(_execution_timeline_projection(state))
+    marker.update(_execution_timeline_projection(state, marker))
     marker["result"] = _timeline_result(state)
     previous_marker: dict[str, object] | None = None
     if previous is not None:
         previous_marker = _timeline_marker(previous)
         previous_marker.update(checks_timeline_facts(previous, previous_marker))
-        previous_marker.update(_execution_timeline_projection(previous))
+        previous_marker.update(_execution_timeline_projection(previous, previous_marker))
         previous_marker["result"] = _timeline_result(previous)
         if marker == previous_marker:
-            return
+            return None, previous_marker
+    return marker, previous_marker
+
+
+def _timeline_capacity_event(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "at": datetime.now(UTC).isoformat(), "kind": "timeline_capacity",
+        "status": str(state.get("status", "unknown")), "result": "capacity_reached",
+    }
+
+
+def _append_timeline_event(
+    state: dict[str, Any], previous: dict[str, Any] | None
+) -> None:
+    marker, previous_marker = _timeline_change(state, previous)
+    if marker is None:
+        return
     timeline = state.setdefault("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
@@ -347,14 +516,7 @@ def _append_timeline_event(
         _append_timeline_continuation(state, marker, previous_marker)
         return
     if len(timeline) >= MAX_TIMELINE_EVENTS - 1:
-        timeline.append(
-            {
-                "at": datetime.now(UTC).isoformat(),
-                "kind": "timeline_capacity",
-                "status": str(state.get("status", "unknown")),
-                "result": "capacity_reached",
-            }
-        )
+        timeline.append(_timeline_capacity_event(state))
         state["timeline_at_capacity"] = True
         _append_timeline_continuation(state, marker, previous_marker)
         return
@@ -458,29 +620,37 @@ def _timeline_event(
     return event
 
 
-def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
-    """Project independent Agent counters without storing unbounded payloads."""
-
+def _execution_timeline_projection(
+    state: dict[str, Any], marker: dict[str, object],
+) -> dict[str, object]:
+    """Project counters for the same work owner as the timeline marker."""
     projection: dict[str, object] = {}
+    subject_key = {
+        "ticket_phase": "active_ticket_job", "parent_phase": "parent_job",
+        "run_acceptance": "run_acceptance", "run_publication": "run_publication",
+    }.get(str(marker.get("kind")))
+    subject = state.get(subject_key) if subject_key is not None else None
+    if (marker.get("kind") == "run_acceptance" and isinstance(subject, dict)
+            and isinstance(subject.get("repair_job"), dict)):
+        subject = subject["repair_job"]
+    pending = subject.get("pending_semantic_attempt") if isinstance(subject, dict) else None
+    attempt = pending if isinstance(pending, dict) else None
     invocation = state.get("active_agent_invocation")
-    invocation_attempt = (
-        invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    bound = invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    if marker.get("kind") == "run_status" and isinstance(bound, dict):
+        # Transitional Run statuses have no stage owner in their marker.
+        # Keep the actual Invocation continuation without mixing stage facts.
+        subject = next((owner for owner in semantic_attempt_subjects(state)
+                        if isinstance(owner.get("pending_semantic_attempt"), dict)
+                        and owner["pending_semantic_attempt"].get("attempt_id") == bound.get("attempt_id")), None)
+        attempt = subject["pending_semantic_attempt"] if subject is not None else bound
+    invocation_matches = (
+        attempt is not None and isinstance(bound, dict) and isinstance(invocation, dict)
+        and isinstance(attempt.get("attempt_id"), str)
+        and bound.get("attempt_id") == attempt["attempt_id"]
+        and bound.get("work_subject") == attempt.get("work_subject")
+        and invocation.get("work_subject", bound.get("work_subject")) == attempt.get("work_subject")
     )
-    attempt = invocation_attempt if isinstance(invocation_attempt, dict) else None
-    subjects = semantic_attempt_subjects(state)
-    invocation_attempt_id = attempt.get("attempt_id") if attempt is not None else None
-    selected_subject: dict[str, Any] | None = None
-    for subject in subjects:
-        pending = subject.get("pending_semantic_attempt")
-        if not isinstance(pending, dict):
-            continue
-        if (
-            invocation_attempt_id is None
-            or pending.get("attempt_id") == invocation_attempt_id
-        ):
-            attempt = pending
-            selected_subject = subject
-            break
     if attempt is not None:
         projection.update(
             {
@@ -490,7 +660,7 @@ def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
                 "budget_window": attempt.get("budget_window"),
             }
         )
-    if isinstance(invocation, dict):
+    if invocation_matches and isinstance(invocation, dict):
         projection.update(
             {
                 "agent_invocation_started_at": invocation.get("started_at"),
@@ -498,17 +668,14 @@ def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
                 "output_attempt": invocation.get("attempt_count"),
             }
         )
-    retry_subjects = [selected_subject] if selected_subject is not None else subjects
-    for subject in retry_subjects:
-        retry = subject.get("publication_operation_retry")
-        if isinstance(retry, dict):
-            projection.update(
-                {
-                    "publication_operation_retry_attempts": retry.get("attempts"),
-                    "publication_operation_retry_limit": retry.get("limit"),
-                }
-            )
-            break
+    retry = subject.get("publication_operation_retry") if isinstance(subject, dict) else None
+    if isinstance(retry, dict):
+        projection.update(
+            {
+                "publication_operation_retry_attempts": retry.get("attempts"),
+                "publication_operation_retry_limit": retry.get("limit"),
+            }
+        )
     resume = latest_resume_audit(state)
     if resume is not None:
         projection.update(
@@ -560,16 +727,16 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             and publication.get("phase") in {"ready_for_human", "waiting_external", "waiting_checks", "ready_for_approval"}
         )
     ) and isinstance(publication, dict) and publication_is_current:
-        phase = str(publication.get("phase", "pending"))
-        role = _worker_role(publication, phase)
+        phase = work_phase(publication) or "pending"
+        role, attempt, thread_id = _history_work_context(state, publication, location="run_publication")
         approval_grant = publication.get("approval_grant")
         required_checks = publication.get("required_checks_evidence")
         return _with_human_blockers({
             "kind": "run_publication",
             "status": status,
             "worker": _worker_name(role, run=True),
-            "attempt": _worker_attempt(publication, role),
-            "thread_id": _thread_id_for_role(publication, role),
+            "attempt": attempt,
+            "thread_id": thread_id,
             "phase": phase,
             "pr_number": publication.get("pr_number"),
             "commit_sha": publication.get("integrated_sha"),
@@ -598,30 +765,34 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
         phase = str(run_acceptance.get("phase", "pending"))
         repair = run_acceptance.get("repair_job")
         subject = repair if isinstance(repair, dict) else run_acceptance
-        subject_phase = str(subject.get("phase", phase))
-        role = _worker_role(subject, subject_phase)
+        subject_phase = work_phase(subject) or phase
+        role, attempt, thread_id = _history_work_context(
+            state, subject, location="run_repair" if isinstance(repair, dict) else "run_acceptance",
+        )
         return _with_human_blockers({
             "kind": "run_acceptance",
             "status": status,
             "worker": _worker_name(role, run=not isinstance(repair, dict)),
-            "attempt": _worker_attempt(subject, role),
-            "thread_id": _thread_id_for_role(subject, role),
+            "attempt": attempt,
+            "thread_id": thread_id,
             "phase": subject_phase,
             "pr_number": subject.get("pr_number"),
-            "commit_sha": subject.get("integrated_sha"),
+            "commit_sha": subject.get("integrated_sha") or subject.get("candidate_sha"),
         }, subject)
     active = state.get("active_ticket_job")
     if isinstance(active, dict):
-        return _job_timeline_marker(active, status)
+        return _job_timeline_marker(state, active, status)
     parent_job = state.get("parent_job")
     if isinstance(parent_job, dict):
-        return _job_timeline_marker(parent_job, status)
+        return _job_timeline_marker(state, parent_job, status)
     return {"kind": "run_status", "status": status}
 
 
-def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
-    phase = str(job.get("phase", "pending"))
-    role = _worker_role(job, phase)
+def _job_timeline_marker(state: dict[str, Any], job: dict[str, Any], status: str) -> dict[str, object]:
+    phase = work_phase(job) or "pending"
+    role, attempt, thread_id = _history_work_context(
+        state, job, hide_pending_development=job.get("phase") in {"developing", "repairing"},
+    )
     ticket = job.get("ticket_number")
     grant = job.get("approval_grant")
     return _with_human_blockers({
@@ -629,12 +800,8 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         "status": status,
         "ticket": ticket if isinstance(ticket, int) else None,
         "worker": _worker_name(role),
-        "attempt": _worker_attempt(job, role),
-        "thread_id": _thread_id_for_role(
-            job,
-            role,
-            hide_pending_development=phase in {"developing", "repairing"},
-        ),
+        "attempt": attempt,
+        "thread_id": thread_id,
         "phase": phase,
         "pr_number": job.get("pr_number"),
         "approval_granted_at": grant.get("granted_at") if isinstance(grant, dict) else None,
@@ -642,6 +809,55 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         or job.get("publication_sha")
         or job.get("candidate_sha"),
     }, job)
+
+
+def _history_work_context(
+    state: dict[str, Any], subject: dict[str, Any], *,
+    location: str | None = None, hide_pending_development: bool = False,
+) -> tuple[str | None, int | None, object]:
+    """History attributes a saved return to its Agent, even during program closeout."""
+    pending = subject.get("pending_semantic_attempt")
+    if isinstance(pending, dict) and pending.get("status") == "pending":
+        role = pending.get("role")
+        if role in {"development", "reviewer", "publication"}:
+            ordinal = pending.get("ordinal")
+            attempt = ordinal if isinstance(ordinal, int) else work_attempt(subject, role)
+            returned = pending.get("returned_result")
+            if isinstance(returned, dict):
+                thread_id = returned.get("thread_id")
+                artifact = returned.get("artifact")
+                if thread_id is None and isinstance(artifact, dict):
+                    thread_id = artifact.get("_thread_id")
+                if isinstance(thread_id, str):
+                    return role, attempt, thread_id
+            invocation = state.get("active_agent_invocation")
+            if isinstance(invocation, dict):
+                bound = invocation.get("semantic_attempt")
+                if (isinstance(bound, dict) and isinstance(pending.get("attempt_id"), str)
+                        and bound.get("attempt_id") == pending["attempt_id"]
+                        and bound.get("work_subject") == pending.get("work_subject")
+                        and invocation.get("work_subject", bound.get("work_subject")) == pending.get("work_subject")):
+                    thread_id = invocation.get("reported_thread_id") or invocation.get("requested_thread_id")
+                    return role, attempt, thread_id if isinstance(thread_id, str) else None
+            if role == "reviewer":
+                prefix = "reviewer" if location == "run_acceptance" else "review"
+                if subject.get(f"{prefix}_new_thread"):
+                    return role, attempt, None
+                resume_thread = subject.get(f"{prefix}_resume_thread_id")
+                if isinstance(resume_thread, str):
+                    return role, attempt, resume_thread
+                human_resume = (subject.get("prior_human_blockers") if prefix == "reviewer"
+                                else subject.get("review_human_blocker_resume"))
+                if not human_resume:
+                    return role, attempt, None
+            return role, attempt, _thread_id_for_role(
+                subject, role, hide_pending_development=hide_pending_development,
+            )
+    role = work_role(subject, location=location)
+    return role, work_attempt(subject, role), (
+        _thread_id_for_role(subject, role, hide_pending_development=hide_pending_development)
+        if role is not None else None
+    )
 
 
 def _with_human_blockers(
@@ -653,28 +869,6 @@ def _with_human_blockers(
     return marker
 
 
-def _worker_role(subject: dict[str, Any], phase: str) -> str | None:
-    blocked_reason = subject.get("blocked_reason")
-    if blocked_reason == "reviewer_requires_human":
-        return "reviewer"
-    if phase in {"reviewing", "validating"}:
-        return "reviewer"
-    if phase in {"developing", "repairing", "committing_candidate"}:
-        return "development"
-    if phase in {"publishing", "publication_pending"}:
-        return "publication"
-    if phase not in {"blocked", "ready_for_human"}:
-        return None
-    blocked_phase = str(subject.get("human_blocker_phase", ""))
-    if blocked_phase in {"developing", "repairing"}:
-        return "development"
-    if blocked_phase in {"candidate", "reviewing", "validating"}:
-        return "reviewer"
-    if blocked_phase in {"accepted", "publishing", "pending"}:
-        return "publication"
-    return None
-
-
 def _worker_name(role: str | None, *, run: bool = False) -> str | None:
     if role == "development":
         return "开发工作代理"
@@ -683,18 +877,6 @@ def _worker_name(role: str | None, *, run: bool = False) -> str | None:
     if role == "publication":
         return "运行发布工作代理" if run else "发布工作代理"
     return None
-
-
-def _worker_attempt(subject: dict[str, Any], role: str | None) -> int | None:
-    if role == "development":
-        value = subject.get("pending_attempt", subject.get("modification_attempts"))
-    elif role == "reviewer":
-        value = subject.get("validation_attempts")
-    elif role == "publication":
-        value = subject.get("publication_attempts")
-    else:
-        return None
-    return value if isinstance(value, int) else None
 
 
 def _thread_id_for_role(
@@ -760,17 +942,23 @@ def _timeline_result(state: dict[str, Any]) -> object:
     )
 
 
-def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_durable_errors(
+    value: dict[str, Any], *, redacted: dict[str, str] | None = None,
+    key_kinds: dict[str, tuple[bool, bool, bool]] | None = None,
+) -> dict[str, Any]:
     """Build an isolated durable copy while bounding and redacting payloads."""
 
     # Static instructions are intentional user content, not diagnostic payloads.
     # Preserve them verbatim across restart; dynamic output remains sanitized.
-    resources = value.get("prompt_resources")
-    sanitized = _sanitize_error_value(value)
+    sanitized = _sanitize_error_value(
+        {key: item for key, item in value.items() if key != "prompt_resources"},
+        redacted={} if redacted is None else redacted,
+        key_kinds={} if key_kinds is None else key_kinds,
+    )
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")
-    if resources is not None:
-        sanitized["prompt_resources"] = deepcopy(resources)
+    if "prompt_resources" in value:
+        sanitized["prompt_resources"] = deepcopy(value["prompt_resources"])
     diagnostics = sanitized.get("diagnostics")
     if isinstance(diagnostics, list):
         sanitized["diagnostics"] = [
@@ -781,54 +969,98 @@ def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+_IDENTITY_SNAPSHOT_PATHS = frozenset({
+    ("github_identity",), ("runner_github_identity",),
+    ("creation_configuration", "github_identity"),
+    ("creation_configuration", "runner_github_identity"),
+})
+
+
 def _sanitize_error_value(
-    value: object, *, diagnostic: bool = False, path: tuple[str, ...] = ()
+    value: object, *, redacted: dict[str, str],
+    key_kinds: dict[str, tuple[bool, bool, bool]],
+    diagnostic: bool = False, path: tuple[str, ...] = ()
 ) -> object:
+    if path in _IDENTITY_SNAPSHOT_PATHS:
+        # Only validated source and references belong here, never credential values.
+        from agent_run.github_identity import validate_identity_snapshot
+
+        return validate_identity_snapshot(value)
     if isinstance(value, list):
         return [
-            _sanitize_error_value(item, diagnostic=diagnostic, path=path)
+            _sanitize_error_value(
+                item, redacted=redacted, key_kinds=key_kinds, diagnostic=diagnostic, path=path,
+            )
             for item in value
         ]
     if isinstance(value, str):
-        return bounded_error(value) if diagnostic else redact_credentials(value)
+        if diagnostic:
+            return bounded_error(value)
+        cached = redacted.get(value)
+        return cached if cached is not None else _redact_uncached_text(value, redacted)
     if not isinstance(value, dict):
         # JSON scalars are immutable. Extensions such as tuples may contain
         # mutable values, so retain their previous deepcopy isolation.
         return value if value is None or type(value) in (bool, int, float) else deepcopy(value)
     sanitized: dict[object, object] = {}
     for key, item in value.items():
-        if isinstance(key, str) and _is_ephemeral_payload_key(key):
+        ephemeral = credential = error_field = False
+        if isinstance(key, str):
+            kinds = key_kinds.get(key)
+            if kinds is None:
+                normalized = key.casefold().replace("_", "").replace("-", "").replace(" ", "")
+                kinds = (
+                    _is_ephemeral_payload_key(normalized),
+                    _is_credential_key(normalized),
+                    key == "error" or key.endswith("_error"),
+                )
+                if len(key_kinds) < 256 and len(key) <= 128:
+                    key_kinds[key] = kinds
+            ephemeral, credential, error_field = kinds
+        if ephemeral:
             continue
-        item_path = (*path, key) if isinstance(key, str) else path
         if (
-            isinstance(key, str)
-            and _is_credential_key(key)
-            and not _is_durable_protocol_identity(item_path)
+            credential and isinstance(key, str)
+            and not _is_durable_protocol_identity((*path, key))
         ):
             sanitized[key] = "[REDACTED]"
             continue
         is_diagnostic = key == "diagnostics"
-        if diagnostic and isinstance(item, str):
-            sanitized[key] = bounded_error(item)
-        elif isinstance(key, str) and (
-            key == "error" or key.endswith("_error")
-        ) and isinstance(item, str):
-            sanitized[key] = bounded_error(item)
-        else:
+        # Leaf values need neither a recursive container dispatch nor a path.
+        # Credential-key exceptions above still use the full current path.
+        if isinstance(item, str):
+            if diagnostic or is_diagnostic or error_field:
+                sanitized[key] = bounded_error(item)
+            else:
+                cached = redacted.get(item)
+                sanitized[key] = (
+                    cached if cached is not None else _redact_uncached_text(item, redacted)
+                )
+        elif isinstance(item, (dict, list)):
             sanitized[key] = _sanitize_error_value(
                 item,
+                redacted=redacted,
+                key_kinds=key_kinds,
                 diagnostic=diagnostic or is_diagnostic,
-                path=item_path,
+                path=(*path, key) if isinstance(key, str) else path,
+            )
+        else:
+            sanitized[key] = (
+                item if item is None or type(item) in (bool, int, float) else deepcopy(item)
             )
     return sanitized
 
 
-def _normalized_key(value: str) -> str:
-    return value.casefold().replace("_", "").replace("-", "").replace(" ", "")
+def _redact_uncached_text(value: str, redacted: dict[str, str]) -> str:
+    result = redact_credentials(value)
+    # Repeated history labels/identities need one scan per save. Keep raw
+    # text only within this traversal, with bounded entries and key size.
+    if len(redacted) < 256 and len(value) <= 1024:
+        redacted[value] = result
+    return result
 
 
-def _is_ephemeral_payload_key(value: str) -> bool:
-    normalized = _normalized_key(value)
+def _is_ephemeral_payload_key(normalized: str) -> bool:
     return (
         normalized in {"env", "stdout", "stderr"}
         or "environment" in normalized
@@ -837,8 +1069,7 @@ def _is_ephemeral_payload_key(value: str) -> bool:
     )
 
 
-def _is_credential_key(value: str) -> bool:
-    normalized = _normalized_key(value)
+def _is_credential_key(normalized: str) -> bool:
     return "credential" in normalized or normalized.endswith(
         (
             "authorization",
@@ -859,7 +1090,9 @@ def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
             "action_application_receipt", "target_executor", "worker",
             "process_start_token",
         ),
-    } or path[-2:] == ("candidate_commit_intent", "token") or (
+    } or path[-4:] == (
+        "last_ticket_resume", "payload", "resume_intent", "authorization"
+    ) or path[-2:] == ("candidate_commit_intent", "token") or (
         bool(path)
         and path[-1]
         in {

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
+from agent_run.error_safety import bounded_error
+from agent_run.external_supervision import supervision_window_matches
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 from agent_run.scope_changes import unsupported_scope_change_identity_is_consistent
+from agent_run.ticket_queue import next_ticket
 
 
 _OPERATOR_GATE_STATUSES = frozenset(
@@ -51,12 +55,132 @@ _REQUEUE_GENERATION_KEY_BY_LOCATION = {
 }
 
 
+def run_failure_diagnostic(
+    state: dict[str, Any], *, code: str, message: str,
+    action_kind: str = "execution_failure",
+) -> dict[str, Any]:
+    """Bind shared failure evidence to the Run, independently of selection."""
+    return {
+        "code": code,
+        "message": bounded_error(message),
+        "operator_gate": {
+            "work_subject": f"run:{state['run_id']}",
+            "action_kind": action_kind,
+            "phase": "deterministic_contradiction" if action_kind == "deterministic_contradiction" else "execution_failed",
+            "reason": code,
+        },
+    }
+
+
 def operator_gate_subjects(
     state: dict[str, Any],
 ) -> list[tuple[str, dict[str, Any]]]:
     """Return current top-level work subjects that require operator action."""
 
     return list(_iter_operator_gate_subjects(state))
+
+
+@dataclass(frozen=True)
+class OperatorGateSource:
+    location: str
+    subject: dict[str, Any]
+    scope: str
+    top_level: bool = False
+
+
+def operator_gate_sources(
+    state: dict[str, Any],
+) -> list[OperatorGateSource]:
+    """Read every current gate without changing lifecycle admission semantics.
+
+    A Run stop/failure is independent of a retained Ticket pause.  Keep both
+    facts even when the stopped Invocation belongs to that same Ticket.
+    """
+    if state.get("status") in {"completed", "abandoned"}:
+        return []
+    local = list(_iter_local_operator_gate_subjects(state))
+    result = [
+        OperatorGateSource(location, subject, "local" if location.startswith("ticket:") else "global")
+        for location, subject in local
+        if subject.get("phase") != "ready_for_approval"
+        or state.get("status") == {
+            "parent": "parent_approval_pending",
+            "run_publication": "run_approval_pending",
+        }.get(location)
+    ]
+    if not _status_requires_operator_gate(state):
+        return result
+    status = state.get("status")
+    if status == "supervision_timeout":
+        location, subject = _supervision_gate_subject(state) or ("run", state)
+        result.insert(0, OperatorGateSource(location, subject, "global", top_level=True))
+        return result
+    if status in {"operator_stopped", "abandonment_pending", "unsupported_scope_change"}:
+        result.insert(0, OperatorGateSource("run", state, "global", top_level=True))
+        return result
+    current = _global_gate_subject(state)
+    if status == "requeue_required" and current is not None:
+        # A stale Generation cannot resume its old pause. Its Requeue boundary
+        # replaces that object's gate; independent Ticket gates remain visible.
+        location, subject = current
+        return [OperatorGateSource(location, subject, "global", top_level=True)] + [
+            source for source in result if source.location != location
+        ]
+    seen = {source.location for source in result}
+    if current is not None and current[0] in seen:
+        # A top-level execution diagnostic is additional evidence, never the
+        # reason for a different local gate on the same work object.
+        binding = operator_gate_evidence(state)
+        same_reason = binding is not None and binding["reason"] == current[1].get("blocked_reason")
+        if status in {"execution_failed", "deterministic_contradiction"} and not same_reason:
+            result.append(OperatorGateSource(current[0], current[1], "global", top_level=True))
+        return result
+    if current is not None:
+        location, subject = current
+        if subject.get("phase") == "ready_for_approval" and status in {
+            "run_approval_pending", "parent_approval_pending"
+        } and (location, subject) not in local:
+            return result
+        result.append(OperatorGateSource(location, subject, "global", top_level=True))
+    elif _unbound_status_gate_is_distinct(state, seen):
+        result.append(OperatorGateSource("run", state, "global", top_level=True))
+    return result
+
+
+def _supervision_gate_subject(
+    state: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Bind a timeout to the still-current PR or initial-credential window."""
+    wait = state.get("supervision_wait")
+    if not isinstance(wait, dict) or not supervision_window_matches(state, wait):
+        return None
+    active = state.get("active_ticket_job")
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    # Match the supervisor's PR selection order, retaining a separate Run
+    # boundary when it was supervising general GitHub state instead.
+    candidates = [
+        (f"ticket:{active.get('ticket_number')}", active,
+         f"ticket-{active.get('ticket_number')}") if isinstance(active, dict) else None,
+        ("run_repair", repair, f"run-repair-{repair.get('repair_attempt')}") if isinstance(repair, dict) else None,
+        ("run_publication", state.get("run_publication"), "run-publication"),
+        ("parent", state.get("parent_job"), "parent-only"),
+        ("run_acceptance", acceptance, "run-acceptance"),
+    ]
+    availability = state.get("credential_availability")
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        location, subject, credential_label = candidate
+        if not isinstance(subject, dict):
+            continue
+        if isinstance(availability, dict):
+            matches = availability.get("change_job") == credential_label
+        else:
+            matches = isinstance(subject.get("pr_number"), int)
+        if matches:
+            return location, subject
+    return None
 
 
 def _iter_operator_gate_subjects(
@@ -74,6 +198,9 @@ def _iter_operator_gate_subjects(
 def _iter_local_operator_gate_subjects(
     state: dict[str, Any],
 ) -> Iterator[tuple[str, dict[str, Any]]]:
+    if state.get("status") == "abandoned":
+        # Retained owner records describe discarded work, not current actions.
+        return
     seen: set[str] = set()
     active = state.get("active_ticket_job")
     if isinstance(active, dict) and _subject_requires_operator(active):
@@ -142,18 +269,27 @@ def operator_gate_subject_count(state: dict[str, Any]) -> int:
 def operator_gate_identity_is_consistent(state: dict[str, Any]) -> bool:
     """Whether the current gate matches its top-level status and subject."""
 
-    if state.get("status") == "requeue_required" and _requeue_gate_subject(
-        state
-    ) is None:
-        return False
     if (
         state.get("status") == "unsupported_scope_change"
         and not unsupported_scope_change_identity_is_consistent(state)
     ):
         return False
-    local = next(_iter_local_operator_gate_subjects(state), None)
-    if local is not None and not _local_gate_matches_top_status(state, local):
-        return False
+    if state.get("status") == "requeue_required":
+        requeue = _requeue_gate_subject(state)
+        if requeue is None:
+            return False
+        # Requeue is a global currentness boundary for one Generation. Other
+        # Tickets retain their own gates; none must become the Requeue subject
+        # merely because it is the first paused job in the iteration order.
+        for location, _subject in _iter_local_operator_gate_subjects(state):
+            if location != requeue[0] and not (
+                location.startswith("ticket:") and requeue[0].startswith("ticket:")
+            ):
+                return False
+    else:
+        local = next(_iter_local_operator_gate_subjects(state), None)
+        if local is not None and not _local_gate_matches_top_status(state, local):
+            return False
     if not _status_requires_operator_gate(state):
         return True
     binding, count = _operator_gate_evidence_summary(state)
@@ -167,6 +303,8 @@ def operator_gate_identity_is_consistent(state: dict[str, Any]) -> bool:
     resolved = _work_subject(state, binding["work_subject"])
     if resolved is None:
         return False
+    if resolved[0] == "run":
+        return binding["phase"] == state.get("status")
     phase = resolved[1].get("phase")
     if phase is None:
         # A graph-selected Ticket has no Change Job phase until its first
@@ -184,10 +322,57 @@ def _local_gate_matches_top_status(
     status = state.get("status")
     location, subject = local
     phase = subject.get("phase")
+    binding = operator_gate_evidence(state)
+    if (
+        status in {"execution_failed", "deterministic_contradiction"}
+        and binding is not None
+        and binding["work_subject"] == f"run:{state.get('run_id')}"
+    ):
+        # A shared failure preserves every retained object gate, including
+        # Parent approval and human decisions; it adds a separate Run gate.
+        return True
+    active = state.get("active_ticket_job")
+    if (
+        location.startswith("ticket:")
+        and isinstance(active, dict)
+        and location != f"ticket:{active.get('ticket_number')}"
+        and status in {"active", "ticket_delivery_pending", "ticket_completed", "waiting_checks"}
+    ):
+        return True
+    if (
+        location.startswith("ticket:")
+        and active is None
+        and status == "progress_exhausted"
+        and state.get("terminal_kind") == "waiting_human"
+    ):
+        return True
+    if (
+        location.startswith("ticket:")
+        and status == "execution_failed"
+        and (evidence := operator_gate_evidence(state)) is not None
+        and evidence["reason"] in {"runner_credential_failed", "session_interrupted"}
+        and evidence["action_kind"] == "execution_failure"
+    ):
+        # A Run failure stops execution without consuming independent Ticket gates.
+        return True
     if status == "operator_stopped":
         return True
     if status in {"waiting_external", "supervision_timeout", "abandonment_pending"}:
         return True
+    if status == "execution_failed" and phase == "ready_for_approval":
+        # Authentication may fail before approval is consumed. Keep the exact
+        # approval subject; Resume refreshes it and still requires approval.
+        evidence = operator_gate_evidence(state)
+        resolved = _work_subject(state, evidence["work_subject"]) if evidence else None
+        return bool(evidence and evidence["reason"] == "runner_credential_failed"
+                    and resolved is not None and resolved[0] == location)
+    if status == "deterministic_contradiction" and phase == "ready_for_approval":
+        # A proven authority contradiction pauses the retained approval object.
+        # It cannot become an approval action merely because its phase is kept.
+        evidence = operator_gate_evidence(state)
+        resolved = _work_subject(state, evidence["work_subject"]) if evidence else None
+        return bool(evidence and evidence["action_kind"] == "deterministic_contradiction"
+                    and resolved is not None and resolved[0] == location)
     if status == "ready_for_human":
         return phase in {"blocked", "ready_for_human"}
     if status == "blocked":
@@ -198,23 +383,38 @@ def _local_gate_matches_top_status(
         return location == "parent" and phase == "ready_for_approval"
     if status == "run_approval_pending":
         return location == "run_publication" and phase == "ready_for_approval"
-    if status == "requeue_required":
-        resolved = _requeue_gate_subject(state)
-        return resolved is not None and resolved[0] == location
     if status == "unsupported_scope_change":
-        # A newly observed graph contradiction invalidates an approval that was
-        # current under the accepted graph.  The retained owner is still the
-        # accurate Work Subject and preserves its accepted Candidate/PR.
-        return phase == "ready_for_approval"
+        # The independently validated global scope gate stops all work without
+        # consuming retained local blockers, publication failures or approvals.
+        return phase in _OPERATOR_GATE_PHASES
     return False
 
 
 def has_run_operator_gate(state: dict[str, Any]) -> bool:
     """Whether automatic selection of another top-level work subject must stop."""
 
-    if has_local_operator_gate(state):
+    if has_local_operator_gate(state) and not _has_independent_ticket_work(state):
         return True
+    if _has_independent_ticket_work(state) and state.get("status") in {
+        "blocked", "ready_for_human", "publication_pending", "progress_exhausted"
+    }:
+        return False
     return _status_requires_operator_gate(state)
+
+
+def _has_independent_ticket_work(state: dict[str, Any]) -> bool:
+    frontier = state.get("frontier")
+    jobs = state.get("ticket_jobs")
+    if not isinstance(frontier, list) or not isinstance(jobs, dict):
+        return False
+    if not isinstance(state.get("ticket_integration_queue"), list) or (
+        "ticket_integration_holder" not in state
+    ):
+        return False
+    selected = next_ticket(state, frontier)
+    return selected is not None and jobs.get(str(selected), {}).get("phase") not in {
+        "blocked", "completed", "publication_pending",
+    }
 
 
 def has_local_operator_gate(state: dict[str, Any]) -> bool:
@@ -234,37 +434,12 @@ def has_non_invocation_execution_failure(state: dict[str, Any]) -> bool:
 def active_ticket_gate_mirror_is_consistent(state: dict[str, Any]) -> bool:
     """Whether every gate agrees with the current active Ticket identity."""
 
-    subjects = operator_gate_subjects(state)
     active = state.get("active_ticket_job")
     if not isinstance(active, dict):
-        return not any(
-            location.startswith("ticket:") for location, _subject in subjects
-        )
+        return True
     ticket_number = active.get("ticket_number")
     if not isinstance(ticket_number, int):
         return True
-    if not subjects:
-        return True
-    terminal = active.get("phase") in {"merged", "completed", "abandoned"}
-    ticket_subjects = [
-        location for location, _subject in subjects if location.startswith("ticket:")
-    ]
-    if terminal and not ticket_subjects:
-        return True
-    evidence = operator_gate_evidence(state)
-    if (
-        active.get("phase") in {"completed", "abandoned"}
-        and evidence is not None
-        and evidence["work_subject"].startswith("ticket:")
-    ):
-        # A completed Ticket cannot become the current Change Job again merely
-        # because a later top-level diagnostic names it.  The merged phase is
-        # intentionally excluded: response-loss recovery may still own the
-        # exact, mirrored Ticket while its closeout operation is uncertain.
-        return False
-    expected_location = f"ticket:{ticket_number}"
-    if any(location != expected_location for location, _subject in subjects):
-        return False
     jobs = state.get("ticket_jobs")
     mirror = (
         jobs.get(str(ticket_number))
@@ -277,7 +452,7 @@ def active_ticket_gate_mirror_is_consistent(state: dict[str, Any]) -> bool:
 def has_unresolved_subject_gate(state: dict[str, Any]) -> bool:
     """Whether Controller refresh could bypass an unresolved local decision."""
 
-    return any(
+    return not _has_independent_ticket_work(state) and any(
         subject.get("phase") in {"blocked", "ready_for_human"}
         for _location, subject in _iter_operator_gate_subjects(state)
     )
@@ -314,6 +489,13 @@ def has_mechanical_revision_restart(state: dict[str, Any]) -> bool:
 
 def _status_requires_operator_gate(state: dict[str, Any]) -> bool:
     status = state.get("status")
+    binding = operator_gate_evidence(state)
+    if (
+        status in {"execution_failed", "deterministic_contradiction"}
+        and binding is not None
+        and binding["work_subject"] == f"run:{state.get('run_id')}"
+    ):
+        return True
     if status != "requeue_required" and has_mechanical_revision_restart(state):
         return False
     if status in _OPERATOR_GATE_STATUSES:
@@ -548,6 +730,8 @@ def _work_subject(
         job = jobs.get(key) if isinstance(jobs, dict) else None
         return (f"ticket:{key}", job) if isinstance(job, dict) else None
     run_id = state.get("run_id")
+    if work_subject == f"run:{run_id}":
+        return "run", state
     if work_subject == f"parent-only:{run_id}":
         parent = state.get("parent_job")
         return ("parent", parent) if isinstance(parent, dict) else None

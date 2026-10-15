@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from test_codex_prompt_contract import _capture_public_prompt
+from support.prompt_capture import _capture_public_prompt
 
 
 def test_initial_development_recommends_one_review_round_without_stage_selection(

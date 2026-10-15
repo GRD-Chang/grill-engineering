@@ -16,6 +16,9 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_driver import _FencedExternal, _fenced_publisher
 from agent_run.state import StateStore
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
+from agent_run.object_state import save_owned
+
+from support.state import snapshot_run
 
 
 def _publisher(tmp_path: Path):
@@ -51,12 +54,18 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revocation: str
 ) -> None:
     publisher, control, task, identity, states, state = _publisher(tmp_path)
-    before = (states.runs_directory / "run-156.json").read_bytes()
+    before = snapshot_run((states.root, 'run-156'))
     entered, release = Event(), Event()
     mutations: list[str] = []
     remote = {"state": "OPEN", "comments": []}
 
     def read(command, **kwargs):
+        if command[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps({"login": "publisher"}), "")
+        if command[:2] == ["gh", "api"] and command[2].endswith("events"):
+            events = ([{"id": 1, "event": "closed", "actor": {"login": "publisher"},
+                        "created_at": "2026-09-28T10:00:01Z"}] if remote["state"] == "CLOSED" else [])
+            return subprocess.CompletedProcess(command, 0, json.dumps([events]), "")
         assert command[:3] == ["gh", "issue", "view"]
         return subprocess.CompletedProcess(command, 0, json.dumps(remote), "")
 
@@ -66,7 +75,8 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
         if operation == "comment":
             entered.set()
             assert release.wait(5), "test did not release the in-flight comment"
-            remote["comments"].append({"body": command[command.index("--body") + 1]})
+            remote["comments"].append({"body": command[command.index("--body") + 1],
+                                       "author": {"login": "publisher"}, "createdAt": "2026-09-28T10:00:00Z"})
         else:
             assert operation == "close"
             remote["state"] = "CLOSED"
@@ -102,19 +112,23 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
     if revocation != "none":
         assert remote["state"] == "OPEN"
         with pytest.raises(ActionReconciliationError):
-            states.save_run("run-156", {**state, "status": "completed"})
-        assert (states.runs_directory / "run-156.json").read_bytes() == before
+            save_owned(states, "run-156", {**state, "status": "completed"}, fields={'status'})
+        assert snapshot_run((states.root, 'run-156')) == before
 
 
 @pytest.mark.parametrize("revoke_after_write", [False, True])
 def test_git_dispatch_rechecks_ownership_but_inflight_readback_is_allowed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revoke_after_write: bool
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, revoke_after_write: bool
 ) -> None:
-    publisher, control, task, identity, states, _state = _publisher(tmp_path)
+    publisher, control, task, identity, states, _state = _publisher(git_repo)
     writes = []
     reads = []
-    head = "a" * 40
-    previous = "b" * 40
+    previous = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "publication"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    head = GitRepository(git_repo).resolve("HEAD")
 
     def revoke():
         control.claim_control_action(task, kind="stop", payload={}, run_id="run-156", state_dir=states.root)
@@ -194,6 +208,7 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
 ) -> None:
     publisher, control, task, _identity, states, _state = _publisher(tmp_path)
     commands = []
+    created = False
     head, base = "a" * 40, "b" * 40
     pull = {
         "number": 5,
@@ -202,13 +217,15 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
     }
 
     def dispatch(command, **kwargs):
+        nonlocal created
         commands.append(command)
         if command[1:3] == ["pr", "create"]:
             control.claim_control_action(task, kind="stop", payload={}, run_id="run-156", state_dir=states.root)
+            created = True
             result = ""
         else:
             assert command[1] == "api" and command[command.index("--method") + 1] == "GET"
-            result = json.dumps([] if len(commands) == 1 else [pull])
+            result = json.dumps([pull] if created else [])
         return subprocess.CompletedProcess(command, 0, result, "")
 
     def unexpected_retry(*args, **kwargs):
@@ -220,4 +237,4 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
         branch="topic", base_branch="main", title="change", body="description",
         expected_head_sha=head, expected_base_sha=base,
     ) == 5
-    assert len(commands) == 3
+    assert len(commands) == 4

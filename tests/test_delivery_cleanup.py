@@ -8,20 +8,16 @@ from pathlib import Path
 import pytest
 
 from agent_run.controller import Controller
+from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
-from conftest import write_fixture
-from test_delivery import (
-    E2E_PASS_EVIDENCE,
-    SPEC_PASS_EVIDENCE,
-    STANDARDS_PASS_EVIDENCE,
-    PassAgents,
-    ScriptedPublisher,
-    issue,
-)
+from support.seeding import write_fixture
+from support.delivery_agents import E2E_PASS_EVIDENCE, SPEC_PASS_EVIDENCE, STANDARDS_PASS_EVIDENCE, PassAgents, issue
+from support.delivery_publisher import ScriptedPublisher
+from support.state import persist_run_fixture
 
 
 class PartialCheckoutGit(GitRepository):
@@ -80,6 +76,7 @@ def test_completed_ticket_cleanup_preserves_tracked_modifications(
     )
     (checkout / "README.md").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -120,6 +117,7 @@ def test_completed_ticket_cleanup_preserves_untracked_files(
     )
     (checkout / "unsaved.txt").write_text("unsaved delivery\n", encoding="utf-8")
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -149,6 +147,7 @@ def test_completed_ticket_cleanup_removes_clean_checkout(git_repo: Path) -> None
         checkout=checkout,
     )
     state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    persist_run_fixture(states, run_id, state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -193,13 +192,20 @@ def test_partial_checkout_is_cleaned_when_preparation_fails(
     )
     partial_git = PartialCheckoutGit(git_repo)
 
-    with pytest.raises(OSError, match="partial checkout"):
-        TicketDeliveryEngine(
-            git=partial_git,
-            states=states,
-            github=ScriptedPublisher(git_repo),
-            agents=PassAgents(checkout),
-        ).deliver(state["run_id"])
+    result = TicketDeliveryEngine(
+        git=partial_git,
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=PassAgents(checkout),
+    ).deliver(state["run_id"])
+    assert result["status"] == "blocked"
+    job = result["ticket_jobs"]["3"]
+    assert job["ticket_number"] == 3
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_execution_failed"
+    assert job["execution_resume_phase"] == "developing"
+    assert "partial checkout" in job["execution_failure"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"]["3"] == job
 
     assert partial_git.cleanup_called
     assert not checkout.exists()
@@ -218,13 +224,20 @@ def test_preexisting_inconsistent_ticket_checkout_is_preserved(
     evidence = checkout / "unsaved.txt"
     evidence.write_text("must survive\n", encoding="utf-8")
 
-    with pytest.raises(GitError, match="existing ticket checkout does not match"):
-        TicketDeliveryEngine(
-            git=GitRepository(git_repo),
-            states=states,
-            github=ScriptedPublisher(git_repo),
-            agents=PassAgents(checkout),
-        ).deliver(state["run_id"])
+    result = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=PassAgents(checkout),
+    ).deliver(state["run_id"])
+    assert result["status"] == "blocked"
+    job = result["ticket_jobs"]["3"]
+    assert job["ticket_number"] == 3
+    assert job["phase"] == "blocked"
+    assert job["blocked_reason"] == "ticket_execution_failed"
+    assert job["execution_resume_phase"] == "developing"
+    assert "existing ticket checkout does not match" in job["execution_failure"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"]["3"] == job
 
     assert evidence.read_text(encoding="utf-8") == "must survive\n"
 
@@ -248,7 +261,7 @@ def test_completed_ticket_cleanup_retries_without_reopening_delivery(
         "integrated_sha": git.resolve(branch),
         "publication_sha": git.resolve(branch),
     }
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
 
     failed = DeliveryCleanupEngine(
         git=FailingBranchCleanupGit(git_repo), states=states
@@ -276,6 +289,7 @@ def test_cleanup_never_deletes_a_maintainer_branch(git_repo: Path) -> None:
     branch = "maintainer/keep-me"
     git.ensure_run_branch(branch, git.resolve("main"))
     state = {"run_id": "run-1", "status": "completed", "ticket_jobs": {}}
+    states.save_run("run-1", state)
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
@@ -374,10 +388,22 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
+            "ci_recovery": new_ticket_ci_recovery_budget(),
         }
     )
     cleanup_job = state["ticket_jobs"]["2"]
     cleanup_record = cleanup_job["deterministic_integration_record"]
+    cleanup_record["ticket_integration"] = {
+        "base_sha": "base",
+        "candidate_sha": "integrated",
+        "candidate_tree": "tree",
+        "source_sha": "base",
+        "target_sha": "base",
+        "head_sha": "integrated",
+        "head_tree": "tree",
+        "conflict_paths": [],
+    }
+    cleanup_job["ticket_integration"] = deepcopy(cleanup_record["ticket_integration"])
     cleanup_acceptance = cleanup_record["acceptance_record"]
     cleanup_review_artifact = {
         "reviewer_thread_id": cleanup_acceptance["reviewer_thread_id"],
@@ -417,7 +443,7 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
             }
         },
     }
-    states.save_run(run_id, state)
+    persist_run_fixture(states, run_id, state)
     github = RecordingBranchPublisher()
 
     resumed = DeliveryCleanupEngine(

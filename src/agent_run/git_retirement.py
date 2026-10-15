@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
-import re
 
 from agent_run.git_cleanup_lock import hold_cleanup_head
 from agent_run.git_errors import GitError
@@ -23,55 +22,6 @@ class ManagedBranchRetirementGit:
 
     def __init__(self, git: GitRepository) -> None:
         self.git = git
-
-    def rotate_run_repair_checkout(
-        self,
-        *,
-        checkout: Path,
-        current_branch: str,
-        next_branch: str,
-        candidate_sha: str,
-        current_publication_sha: str,
-    ) -> None:
-        """Transfer a successor Candidate, then retire the completed source head."""
-        for branch in (current_branch, next_branch):
-            if (
-                not is_managed_delivery_branch(branch)
-                or self.git._run("check-ref-format", f"refs/heads/{branch}").returncode != 0
-            ):
-                raise GitError(f"refusing to rotate unmanaged branch {branch!r}")
-        if not all(
-            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
-            for sha in (candidate_sha, current_publication_sha)
-        ):
-            raise GitError("Run Repair rotation requires exact commit identities")
-        self.git.require_clean_managed_checkout(checkout)
-        if self.git.checkout_head(checkout) != candidate_sha:
-            raise GitError("Run Repair rotation has a foreign Candidate")
-        if not self.git.ticket_checkout_matches(checkout, next_branch):
-            if not self.git.ticket_checkout_matches(checkout, current_branch):
-                raise GitError("existing Run Repair checkout does not match its Job branch")
-            if self.git.managed_branch_head(next_branch) is not None:
-                raise GitError(f"Run Repair Job branch {next_branch!r} already exists")
-            switched = self.git._run_in(checkout, "switch", "-c", next_branch, candidate_sha)
-            if switched.returncode != 0:
-                raise GitError(switched.stderr.strip() or "could not rotate Run Repair Job branch")
-        previous = self.git.managed_branch_head(current_branch)
-        if previous == current_publication_sha:
-            return
-        if previous != candidate_sha:
-            raise GitError("completed Run Repair source branch has a foreign head")
-        # Verify that the successor still holds the saved Candidate in the
-        # same ref transaction that restores the completed publication ref.
-        restored = self.git._run_in(
-            self.git.root, "update-ref", "--no-deref", "--stdin",
-            input=(
-                f"verify refs/heads/{next_branch} {candidate_sha}\n"
-                f"update refs/heads/{current_branch} {current_publication_sha} {candidate_sha}\n"
-            ),
-        )
-        if restored.returncode != 0:
-            raise GitError(restored.stderr.strip() or "could not retire completed Run Repair source")
 
     def managed_branch_head(self, branch: str) -> str | None:
         """Distinguish an absent ref from an unreadable local ref database."""

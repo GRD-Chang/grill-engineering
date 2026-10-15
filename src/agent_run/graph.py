@@ -12,11 +12,29 @@ from agent_run.revisions import (
 )
 from agent_run.ticket_phase import BLOCKED_MESSAGES, TicketPhase
 from agent_run.ticket_eligibility import label_blocker
+from agent_run.ticket_queue import next_ticket
+from agent_run.run_orchestration import parent_stage_state
 
 
 def state_from_graph(
     previous: dict[str, Any], graph: DeliveryGraph
 ) -> dict[str, Any]:
+    state, parent_ready = schedule_from_graph(previous, graph)
+    if parent_ready:
+        state.update(parent_stage_state(
+            previous, parent_only=not graph.parent.sub_issue_numbers,
+        ))
+    return state
+
+
+def schedule_from_graph(
+    previous: dict[str, Any], graph: DeliveryGraph
+) -> tuple[dict[str, Any], bool]:
+    """Refresh runnable Ticket work and actual Parent readiness.
+
+    The readiness result is ephemeral: Parent stages remain owned by their
+    existing Jobs, not a second graph-owned lifecycle.
+    """
     missing = [
         number
         for number in graph.parent.sub_issue_numbers
@@ -32,7 +50,7 @@ def state_from_graph(
                 "message": f"GitHub did not return sub-issue #{number}",
                 "ticket_number": number,
             },
-        )
+        ), False
 
     order = list(graph.parent.sub_issue_numbers)
     if not graph.parent.sub_issue_order_reliable:
@@ -48,7 +66,7 @@ def state_from_graph(
                 "ticket_numbers": cycles,
             },
             order,
-        )
+        ), False
 
     tickets: dict[str, Any] = {}
     for number in order:
@@ -58,6 +76,21 @@ def state_from_graph(
 
     ticket_jobs = _retained_ticket_jobs(previous, order)
     _preserve_completed_ticket_snapshots(previous, tickets, ticket_jobs)
+    # A closed dependency Issue is not proof of this Run's Ticket Completion.
+    # Dependent work may start only after the Publisher's closeout was saved.
+    for number in order:
+        unresolved = [
+            blocker.number
+            for blocker in graph.issues[number].blocked_by
+            if blocker.number in order
+            and ticket_jobs.get(str(blocker.number), {}).get("phase")
+            != TicketPhase.COMPLETED.value
+        ]
+        if unresolved:
+            tickets[str(number)]["eligibility"] = {
+                "eligible": False,
+                "reason": "blocked_by_incomplete_tickets",
+            }
     parent_revision = fingerprint(
         {"title": graph.parent.title, "body": graph.parent.body}
     )
@@ -65,6 +98,7 @@ def state_from_graph(
     frontier = [
         number
         for number in order
+        if tickets[str(number)]["eligibility"]["reason"] != "blocked_by_incomplete_tickets"
         if (
             tickets[str(number)]["eligibility"]["eligible"]
             or (
@@ -79,6 +113,7 @@ def state_from_graph(
             graph_revision=str(ticket_graph["revision"]),
         )
     ]
+    parent_ready = not order or _all_ticket_jobs_completed(ticket_jobs, order)
     active: dict[str, Any] | None
     if frontier:
         previous_active = previous.get("active_ticket_job")
@@ -87,10 +122,12 @@ def state_from_graph(
             if isinstance(previous_active, dict) and previous_active.get("phase")
             else None
         )
-        selected = continuing if continuing in frontier else frontier[0]
+        selected = next_ticket({**previous, "ticket_jobs": ticket_jobs}, frontier)
+        if selected is None:
+            selected = continuing if continuing in frontier else frontier[0]
         active = ticket_jobs.get(str(selected), {"ticket_number": selected})
         active["selection_reason"] = (
-            "first eligible ticket by parent sub-issue order, then issue number"
+            "Ticket work queue, integration queue, then eligible ticket order"
         )
         previous_graph = previous.get("ticket_graph")
         if str(selected) in ticket_jobs and isinstance(previous_graph, dict):
@@ -116,6 +153,9 @@ def state_from_graph(
                     subject_key="ticket_number", subject=active["ticket_number"]
                 )
             ]
+        elif active.get("phase") == TicketPhase.WAITING_CHECKS.value:
+            status = "waiting_checks"
+            diagnostics = []
         elif (
             active.get("phase") == TicketPhase.BLOCKED.value
             and active.get("blocked_reason") != "no_code_changes"
@@ -133,36 +173,9 @@ def state_from_graph(
             active = _first_job_in_phase(
                 ticket_jobs, order, TicketPhase.MERGED
             )
-        if not order:
-            parent_job = previous.get("parent_job")
-            phase = parent_job.get("phase") if isinstance(parent_job, dict) else None
-            if phase == "completed":
-                status = "completed"
-                diagnostics = []
-            elif phase == "ready_for_approval":
-                status = "parent_approval_pending"
-                diagnostics = []
-            elif phase == "waiting_checks":
-                status = "waiting_checks"
-                diagnostics = []
-            elif phase == TicketPhase.PUBLICATION_PENDING.value:
-                status = "publication_pending"
-                diagnostics = [
-                    publication_pending_diagnostic(
-                        subject_key="change_job", subject="parent-only"
-                    )
-                ]
-            elif phase == "merging":
-                status = "parent_closeout_pending"
-                diagnostics = []
-            elif phase in {"blocked", "escalating"}:
-                status = "blocked"
-                diagnostics = list(previous.get("diagnostics", []))
-            else:
-                status = "parent_delivery_pending"
-                diagnostics = []
-        elif _all_ticket_jobs_completed(ticket_jobs, order):
-            status, diagnostics = _run_completion_status(previous)
+        if parent_ready:
+            status = "active"
+            diagnostics = []
         elif active is not None:
             if active.get("phase") == TicketPhase.ESCALATING.value:
                 status = "escalating"
@@ -201,12 +214,9 @@ def state_from_graph(
             "status": status,
             "diagnostics": diagnostics,
             "terminal_kind": (
-                "all_tickets_completed"
-                if status == "run_acceptance_pending"
-                else "completed" if status == "completed"
-                else "publication_pending" if status == "publication_pending"
+                "publication_pending" if status == "publication_pending"
                 else (
-                    _exhaustion_kind(diagnostics[0]["remaining_tickets"])
+                    _exhaustion_kind(diagnostics[0]["remaining_tickets"], ticket_jobs)
                     if status == "progress_exhausted"
                     else None
                 )
@@ -214,36 +224,13 @@ def state_from_graph(
             "updated_at": _now(),
         }
     )
-    return state
-
-
-def _run_completion_status(previous: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    acceptance = previous.get("run_acceptance")
-    publication = previous.get("run_publication")
-    if (
-        not isinstance(acceptance, dict)
-        or acceptance.get("phase") != "accepted"
-    ):
-        return "run_acceptance_pending", []
-    if not isinstance(publication, dict):
-        return "run_publication_pending", []
-    phase = publication.get("phase")
-    if phase == "publication_pending":
-        return (
-            "publication_pending",
-            [
-                publication_pending_diagnostic(
-                    subject_key="delivery_run", subject=str(previous["run_id"])
-                )
-            ],
+    if active is not None and type(active.get("ticket_number")) is int:
+        invocations = state.get("ticket_agent_invocations")
+        state["active_agent_invocation"] = (
+            invocations.get(str(active["ticket_number"]))
+            if isinstance(invocations, dict) else None
         )
-    if phase == "waiting_checks":
-        return "waiting_checks", []
-    if phase == "ready_for_approval":
-        return "run_approval_pending", []
-    if phase == "merged":
-        return "parent_closeout_pending", []
-    return "run_publication_pending", []
+    return state, parent_ready
 
 
 def _blocked_graph_state(
@@ -382,7 +369,15 @@ def _remaining_ticket_reasons(
     return remaining
 
 
-def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
+def _exhaustion_kind(
+    remaining: list[dict[str, Any]], ticket_jobs: dict[str, dict[str, Any]]
+) -> str:
+    if any(
+        ticket_jobs.get(str(item["ticket_number"]), {}).get("phase")
+        == TicketPhase.BLOCKED.value
+        for item in remaining
+    ):
+        return "waiting_human"
     human_reasons = {
         "agent_requires_human",
         "reviewer_requires_human",
@@ -393,6 +388,11 @@ def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
         "acceptance_record_mismatch",
         "merged_result_mismatch",
         "no_code_changes",
+        "integration_development_exhausted",
+        "integration_resync_exhausted",
+        "integration_conflict_unresolved",
+        "integration_conflict_requires_human",
+        "integration_history_rewritten",
     }
     if any(item.get("reason") in human_reasons for item in remaining):
         return "waiting_human"
@@ -439,11 +439,11 @@ def _job_is_executable(
 
 def _job_diagnostic(job: dict[str, Any]) -> dict[str, Any]:
     reason = job.get("blocked_reason") or job.get("escalation_code")
-    if not isinstance(reason, str) or reason not in BLOCKED_MESSAGES:
-        raise ValueError("unresolved Ticket Job has unknown blocker")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("unresolved Ticket Job is missing its pause reason")
     return {
         "code": reason,
-        "message": BLOCKED_MESSAGES[reason],
+        "message": BLOCKED_MESSAGES.get(reason, str(job.get("execution_failure") or reason)),
         "ticket_number": job["ticket_number"],
     }
 

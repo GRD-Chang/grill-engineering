@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import codecs
 import json
+import logging
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -13,7 +15,6 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
-from agent_run.worker_credentials import WORKER_GH_RESPONSE_TIMEOUT_SECONDS
 from agent_run.git_output import git_environment
 
 
@@ -23,6 +24,10 @@ class WorkerSandboxError(RuntimeError):
 
 class WorkerDeadlineExceeded(WorkerSandboxError):
     pass
+
+
+class WorkerExitUnknownError(WorkerSandboxError):
+    """Keep Worker ownership unresolved until an independent exit check."""
 
 
 _STREAM_CHUNK_BYTES = 64 * 1024
@@ -143,6 +148,28 @@ class _BoundedJsonlStream:
             self._pinned["error"] = line
 
 
+def native_worker_environment(
+    environment: dict[str, str], gh_config: Path, *, host: bool
+) -> dict[str, str]:
+    """Pass the selected native identity, without Runner control secrets."""
+    result = {
+        key: value for key, value in environment.items()
+        if not key.startswith(("AGENT_RUN_EXECUTOR_", "AGENT_RUN_INTERNAL_"))
+        and key not in {
+            "AGENT_RUN_GITHUB_APP_ID", "AGENT_RUN_GITHUB_APP_INSTALLATION_ID",
+            "AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "AGENT_RUN_GITHUB_READ_PERMISSIONS",
+            "AGENT_RUN_GITHUB_READ_TOKEN", "DBUS_SESSION_BUS_ADDRESS",
+        }
+    }
+    if not host:
+        for key in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "SSH_ASKPASS"):
+            result.pop(key, None)
+        gh_config.mkdir(parents=True, exist_ok=True)
+        result["GH_CONFIG_DIR"] = str(gh_config)
+        result["GH_PROMPT_DISABLED"] = "1"
+    return result
+
+
 def worker_environment(
     gh_config: Path, github_read_token: str
 ) -> dict[str, str]:
@@ -169,9 +196,6 @@ def worker_environment(
             "DBUS_SESSION_BUS_ADDRESS",
         }
     }
-    environment["PATH"] = _without_inherited_gh_adapters(
-        environment.get("PATH", os.defpath)
-    )
     gh_config.mkdir(parents=True, exist_ok=True)
     environment.update(
         {
@@ -199,141 +223,6 @@ def _validate_inherited_github_host() -> None:
         raise WorkerSandboxError("Worker GitHub read host is not authorized")
 
 
-def _without_inherited_gh_adapters(path: str) -> str:
-    """Keep a previous Worker-local `gh` adapter out of a new Worker PATH."""
-
-    return os.pathsep.join(
-        entry
-        for entry in path.split(os.pathsep)
-        if not (
-            Path(entry).name == "gh-adapter"
-            and Path(entry).parent.name.startswith("agent-run-codex-")
-        )
-    )
-
-
-def worker_credential_environment(
-    gh_config: Path, adapter_directory: Path
-) -> dict[str, str]:
-    """Create a Worker environment whose `gh` obtains credentials on demand."""
-
-    environment = worker_environment(gh_config, "placeholder")
-    environment.pop("GH_TOKEN", None)
-    adapter_directory.mkdir(parents=True, exist_ok=True)
-    return environment
-
-
-def _worker_gh_targets(
-    environment: dict[str, str], *, cwd: Path
-) -> tuple[Path, ...]:
-    """Find the real ``gh`` files that the Worker command environment may use.
-
-    The command tool may put ``CODEX_INSTALL_DIR`` in front of the inherited
-    PATH after the Worker starts.  Collecting both locations before creating
-    the bubblewrap command lets the namespace cover either resolution without
-    changing PATH precedence or probing the command tool at runtime.
-    """
-
-    path = environment.get("PATH", os.defpath)
-    worker_cwd = cwd.absolute()
-    directories = []
-    for entry in path.split(os.pathsep):
-        directory = Path(entry or ".")
-        directories.append(
-            directory if directory.is_absolute() else worker_cwd / directory
-        )
-    codex_install_dir = environment.get("CODEX_INSTALL_DIR")
-    if codex_install_dir:
-        codex_directory: Path | None
-        try:
-            codex_directory = Path(codex_install_dir).expanduser()
-        except (OSError, RuntimeError):
-            codex_directory = None
-        if codex_directory is not None:
-            directories.append(
-                codex_directory
-                if codex_directory.is_absolute()
-                else worker_cwd / codex_directory
-            )
-    else:
-        directories.append(Path.home() / ".local" / "bin")
-
-    targets: list[Path] = []
-    for directory in directories:
-        candidate = directory / "gh"
-        try:
-            if not candidate.is_file() or not os.access(candidate, os.X_OK):
-                continue
-            target = candidate.resolve(strict=True)
-            if not target.is_file() or not os.access(target, os.X_OK):
-                continue
-        except (OSError, RuntimeError):
-            continue
-        if target not in targets:
-            targets.append(target)
-    return tuple(targets)
-
-
-def create_gh_access_adapter(
-    adapter_directory: Path, socket_path: Path, environment: dict[str, str]
-) -> Path:
-    """Write the temporary Worker-local `gh` adapter without persisting a token."""
-
-    adapter = adapter_directory / "gh"
-    adapter.write_text(
-        _gh_adapter_script(socket_path), encoding="utf-8"
-    )
-    adapter.chmod(0o700)
-    return adapter
-
-
-def _gh_adapter_script(socket_path: Path) -> str:
-    return f'''#!/usr/bin/env python3
-import json
-import socket
-import sys
-
-SOCKET_PATH = {str(socket_path)!r}
-
-def channel(arguments):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(5)
-        connection.connect(SOCKET_PATH)
-        payload = json.dumps({{"kind": "run", "arguments": arguments}}).encode()
-        if len(payload) > 16 * 1024 * 1024:
-            raise RuntimeError("Worker GitHub read request exceeded the size limit")
-        connection.sendall(len(payload).to_bytes(4, "big") + payload)
-        connection.settimeout({WORKER_GH_RESPONSE_TIMEOUT_SECONDS!r})
-        size = int.from_bytes(read_exact(connection, 4), "big")
-        if size > 16 * 1024 * 1024:
-            raise RuntimeError("Worker GitHub read response exceeded the size limit")
-        response = json.loads(read_exact(connection, size))
-    if "error" in response:
-        raise RuntimeError(response["error"])
-    return response
-
-def read_exact(connection, size):
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = connection.recv(remaining)
-        if not chunk:
-            raise RuntimeError("Worker GitHub credential channel closed early")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-try:
-    result = channel(sys.argv[1:])
-    sys.stdout.write(result["stdout"])
-    sys.stderr.write(result["stderr"])
-    raise SystemExit(result["returncode"])
-except (OSError, ValueError, RuntimeError) as error:
-    sys.stderr.write("Worker GitHub read credential error: " + str(error) + "\\n")
-    raise SystemExit(1)
-'''
-
-
 def bubblewrap_command(
     command: list[str],
     *,
@@ -342,8 +231,7 @@ def bubblewrap_command(
     writable_checkout: bool,
     environment: dict[str, str],
     hidden_paths: Sequence[Path] = (),
-    gh_adapter: Path | None = None,
-    gh_targets: Sequence[Path] = (),
+    inherit_host_auth: bool = False,
 ) -> list[str]:
     _reject_credentialed_http_remotes(checkout, environment)
     executable = shutil.which("bwrap")
@@ -382,10 +270,10 @@ def bubblewrap_command(
         arguments.extend(["--bind", str(codex_home), str(codex_home)])
     home = Path.home()
     for secret_directory in (home / ".config" / "gh", home / ".ssh"):
-        if secret_directory.exists():
+        if not inherit_host_auth and secret_directory.exists():
             arguments.extend(["--tmpfs", str(secret_directory)])
     git_credentials = home / ".git-credentials"
-    if git_credentials.exists():
+    if not inherit_host_auth and git_credentials.exists():
         arguments.extend(["--ro-bind", "/dev/null", str(git_credentials)])
     hidden = _mask_worker_paths(
         arguments,
@@ -412,13 +300,6 @@ def bubblewrap_command(
             checkout=checkout,
             temporary=temporary,
         )
-    if gh_targets:
-        if gh_adapter is None:
-            raise WorkerSandboxError(
-                "worker_gh_binding_failed: adapter is unavailable"
-            )
-        for target in gh_targets:
-            arguments.extend(["--ro-bind", str(gh_adapter), str(target)])
     arguments.extend(["--chdir", str(checkout), "--", *command])
     return arguments
 
@@ -448,13 +329,13 @@ def _mask_worker_paths(
     )
     mounted_directories: list[Path] = []
     for directory in directories:
-        if any(parent in mounted_directories for parent in directory.parents):
-            continue
+        # Keep explicitly masked subdirectories available as empty private
+        # mountpoints even when their parent state root is already hidden.
         arguments.extend(["--tmpfs", str(directory)])
         mounted_directories.append(directory)
 
     for path in sorted(paths - set(directories), key=str):
-        if any(directory in path.parents for directory in mounted_directories):
+        if path.name != ".lock" and any(directory in path.parents for directory in mounted_directories):
             continue
         arguments.extend(["--ro-bind", "/dev/null", str(path)])
     return paths
@@ -595,9 +476,14 @@ def run_worker_process(
     abort_event: threading.Event | None = None,
     abort_reason: Callable[[], str] | None = None,
     on_process_started: Callable[[int], None] | None = None,
+    on_process_released: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    from agent_run.executor_host import _process_start_token
+    from agent_run.worker_control import check_worker_control
+
+    check_worker_control()
     gate_write: int | None = None
-    if on_process_started is None:
+    if on_process_started is None and on_process_released is None:
         process = subprocess.Popen(
             arguments,
             cwd=cwd,
@@ -635,9 +521,20 @@ def run_worker_process(
             )
         finally:
             os.close(gate_read)
+    start_token = _process_start_token(process.pid)
+
+    def terminate() -> None:
+        try:
+            _terminate_process_group(process, start_token=start_token)
+        except OSError as error:
+            message = f"Worker pid={process.pid} exit unknown; process control failed: {error}"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message) from error
+
     try:
         if on_process_started is not None:
             on_process_started(process.pid)
+        check_worker_control()
         if gate_write is not None:
             if (
                 deadline_at_monotonic is not None
@@ -645,6 +542,10 @@ def run_worker_process(
             ):
                 raise WorkerDeadlineExceeded("Codex worker timed out")
             os.write(gate_write, b"1")
+            # Registration, persistence and control checks ran while the
+            # bootstrap was blocked. Timing may start only after releasing it.
+            if on_process_released is not None:
+                on_process_released()
             if (
                 deadline_at_monotonic is not None
                 and time.monotonic() >= deadline_at_monotonic
@@ -654,7 +555,7 @@ def run_worker_process(
         if gate_write is not None:
             os.close(gate_write)
         try:
-            _terminate_process_group(process)
+            terminate()
             process.wait()
         finally:
             for pipe in (process.stdin, process.stdout, process.stderr):
@@ -676,6 +577,7 @@ def run_worker_process(
     stderr_reader: threading.Thread | None = None
     stdin_writer: threading.Thread | None = None
     wait_error: BaseException | None = None
+    stream_stop = threading.Event()
 
     def join_started(thread: threading.Thread | None) -> None:
         # A signal or a start failure may leave a later thread unstarted.
@@ -699,14 +601,19 @@ def run_worker_process(
                     on_stdout_line(line)
                 except BaseException as error:
                     callback_errors.append(error)
-                    _terminate_process_group(process)
+                    terminate()
 
         stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
         stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
 
         def read_stdout() -> None:
             try:
-                while chunk := os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                while not stream_stop.is_set():
+                    if not select.select([stdout_pipe], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
                     stdout_capture.feed(chunk)
                 stdout_capture.finish()
             except BaseException as error:
@@ -714,19 +621,33 @@ def run_worker_process(
 
         def read_stderr() -> None:
             try:
-                while chunk := os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                while not stream_stop.is_set():
+                    if not select.select([stderr_pipe], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
                     stderr_capture.append(chunk)
             except BaseException as error:
                 reader_errors.append(error)
 
         def write_stdin() -> None:
             try:
-                stdin.write(prompt.encode("utf-8"))
-                stdin.close()
+                os.set_blocking(stdin.fileno(), False)
+                pending = memoryview(prompt.encode("utf-8"))
+                while pending and not stream_stop.is_set():
+                    if not select.select([], [stdin], [], 0.1)[1]:
+                        continue
+                    try:
+                        pending = pending[os.write(stdin.fileno(), pending[:_STREAM_CHUNK_BYTES]):]
+                    except BlockingIOError:
+                        continue
             except BrokenPipeError:
                 return
             except BaseException as error:
                 writer_errors.append(error)
+            finally:
+                stdin.close()
 
         stdout_reader = threading.Thread(
             target=read_stdout,
@@ -755,9 +676,13 @@ def run_worker_process(
             else time.monotonic() + timeout
         )
         while process.poll() is None:
+            if callback_errors or reader_errors or writer_errors:
+                wait_error = (callback_errors or reader_errors or writer_errors)[0]
+                break
+            check_worker_control()
             if abort_event is not None and abort_event.is_set():
                 wait_error = WorkerSandboxError(
-                    abort_reason() if abort_reason is not None else "Worker read credential renewal expired"
+                    abort_reason() if abort_reason is not None else "Worker credential renewal expired"
                 )
                 break
             remaining = deadline - time.monotonic()
@@ -771,7 +696,13 @@ def run_worker_process(
     except BaseException as error:
         wait_error = error
     finally:
-        _terminate_process_group(process)
+        try:
+            terminate()
+        except WorkerExitUnknownError as error:
+            # Unknown process ownership is not permission to kill it. Stop our
+            # pipe threads independently, retain the unresolved process fact.
+            stream_stop.set()
+            wait_error = error
         join_started(stdin_writer)
         join_started(stdout_reader)
         join_started(stderr_reader)
@@ -795,6 +726,12 @@ def run_worker_process(
         for pipe in (stdin, stdout_pipe, stderr_pipe):
             if pipe is not None:
                 pipe.close()
+    if isinstance(wait_error, WorkerExitUnknownError):
+        # Persistence callback errors explain the stop trigger, but cannot
+        # erase the independent fact that this process has not proven exit.
+        if callback_errors:
+            raise wait_error from callback_errors[0]
+        raise wait_error
     if callback_errors:
         raise callback_errors[0]
     if wait_error is not None:
@@ -813,10 +750,36 @@ def run_worker_process(
     )
 
 
-def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+def _terminate_process_group(process: subprocess.Popen[Any], *, start_token: str | None) -> None:
+    from agent_run.executor_host import _process_start_token
+
+    def require_identity() -> None:
+        current = _process_start_token(process.pid)
+        if (start_token is None or (current is not None and current != start_token)
+                or (current is None and process.poll() is None)):
+            message = f"Worker pid={process.pid} ownership/exit unknown; no process group signal sent"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message)
+
+    def reap() -> None:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired as error:
+            message = f"Worker pid={process.pid} exit unknown after process group termination"
+            logging.getLogger(__name__).error("%s", message)
+            raise WorkerExitUnknownError(message) from error
+
+    # Popen owns the child and its session. Check the captured start identity
+    # before each group signal, including cleanup after the child was reaped.
+    require_identity()
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        # The original Popen remains our child even if its group disappeared.
+        # Reap it before the caller can release its Ticket work lease.
+        if process.poll() is None:
+            process.kill()
+        reap()
         return
     deadline = time.monotonic() + 0.2
     while time.monotonic() < deadline:
@@ -826,9 +789,10 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
             break
         time.sleep(0.01)
     else:
+        require_identity()
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
     if process.poll() is None:
-        process.wait()
+        reap()

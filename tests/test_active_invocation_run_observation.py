@@ -20,10 +20,13 @@ from agent_run.systemd_executor_host import (
     SystemdUserExecutorHost,
 )
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import write_fixture
-from test_cli import PROJECT_ROOT
-from test_run_lifecycle import _file_snapshot, _isolated_environment
-from test_ticket_191_resume import _fail_parent_run
+from support.seeding import write_fixture
+from support.cli import PROJECT_ROOT
+from support.lifecycle import _file_snapshot, _isolated_environment
+from support.resume import _fail_parent_run
+
+from support.state import snapshot_runs
+from support.state import persist_run_fixture
 
 
 _OBSERVE = """
@@ -140,7 +143,7 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
     state["agent_invocation_history"][-1] = copy.deepcopy(invocation)
     record = control.load(task)
     prepare_action_application_receipt(state, record["action"])
-    states.save_run(state["run_id"], state)
+    persist_run_fixture(states, state["run_id"], state)
     control.record_application(
         task, action_id=spec.action_id, run_id=spec.run_id, generation=spec.generation,
         payload_digest=record["action"]["payload_digest"],
@@ -177,7 +180,7 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
     process_environment = os.environ.copy()
     process_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     original_control = control.load(task)
-    original_runs = _file_snapshot(states.root / "runs")
+    original_runs = snapshot_runs(states.root)
     original_worktrees = _file_snapshot(states.root / "worktrees")
     fixture_before = fixture.read_bytes()
     previous_control: bytes | None = None
@@ -221,12 +224,12 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
             assert "resume" in output["next_action"]
         else:
             assert current_control == original_control
-            assert _file_snapshot(states.root / "runs") == original_runs
+            assert snapshot_runs(states.root) == original_runs
             if host_status != "running":
                 assert output["diagnostics"][0]["code"] == "executor_start_unknown"
         if previous_control is not None:
             assert control.path_for(task).read_bytes() == previous_control
-            assert _file_snapshot(states.root / "runs") == previous_runs
+            assert snapshot_runs(states.root) == previous_runs
         previous_control = control.path_for(task).read_bytes()
-        previous_runs = _file_snapshot(states.root / "runs")
+        previous_runs = snapshot_runs(states.root)
     assert not list((tmp_path / "runtime").rglob("*.json"))

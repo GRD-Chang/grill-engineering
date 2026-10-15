@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_scenarios import _accepted_run
+from support.run_artifacts import _passing_artifact
+
 import subprocess
 import json
 from copy import deepcopy
@@ -18,134 +21,29 @@ from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.publication_operation_retry import MAX_PUBLICATION_OPERATION_ATTEMPTS
 from agent_run.run_repair_requests import RunRepairRequests
 
-from run_acceptance_test_support import _completed_run, _passing_artifact
-from conftest import seed_idle_control
-from test_cli import run_internal_stage, run_cli, stdout_json
-from test_codex_prompt_contract import _capture_public_prompt
+from support.seeding import seed_idle_control
+from support.cli import run_internal_stage, run_cli, stdout_json
+from support.prompt_capture import _capture_public_prompt
 
-from run_publication_test_support import (
-    InterruptedRunPublisher,
-    InvocationRunPublicationAgents,
-    PassingRunReviewer,
-    RunPublicationAgents,
-    _accepted_run,
-)
+from support.run_publication import InterruptedRunPublisher, InvocationRunPublicationAgents, RunPublicationAgents
+from support.state import persist_run_fixture
 
 
-def _accepted_run_with_integration(
-    git_repo: Path,
-) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
-    state, states, git = _completed_run(git_repo)
-    tree = git.resolve(f"{state['run_branch']}^{{tree}}")
-    integrated = subprocess.run(
-        [
-            "git",
-            "commit-tree",
-            tree,
-            "-p",
-            str(state["run_branch"]),
-            "-m",
-            "feat(ticket): integrate accepted ticket for publication contract",
-        ],
-        cwd=git_repo,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated],
-        cwd=git_repo,
-        check=True,
-    )
-    state["ticket_jobs"]["2"].update(
-        {
-            "integrated_sha": integrated,
-            "deterministic_integration_record": {
-                "source": "accepted",
-                "base_sha": git.commit_parents(integrated)[0],
-                "candidate_sha": integrated,
-                "candidate_tree": tree,
-                "publication_sha": integrated,
-                "integrated_sha": integrated,
-                "integrated_publication_sha": integrated,
-                "integrated_tree": tree,
-                "integrated_message": "feat(ticket): integrate accepted ticket for publication contract",
-                "integrated_parents": [git.commit_parents(integrated)[0]],
-                "window": 1,
-                "final_ci_fix_used": False,
-                "pr_number": 11,
-                "required_checks_mode": "configured",
-                "required_checks": "pass",
-                "required_checks_evidence": {
-                    "pr_number": 11,
-                    "head_sha": integrated,
-                    "result": "pass",
-                    "checks": [{"name": "quality", "bucket": "pass"}],
-                },
-                "pr": {
-                    "number": 11,
-                    "state": "MERGED",
-                    "head_sha": integrated,
-                    "base_sha": git.commit_parents(integrated)[0],
-                    "merge_commit_sha": integrated,
-                },
-                "effective_revision": state["ticket_graph"]["tickets"]["2"][
-                    "content_revision"
-                ],
-                "acceptance_record": {
-                    "acceptance_scope": "change_job",
-                    "reviewed_base_sha": git.commit_parents(integrated)[0],
-                    "reviewed_candidate_sha": integrated,
-                    "reviewed_candidate_tree": tree,
-                    "effective_revision": state["ticket_graph"]["tickets"]["2"][
-                        "content_revision"
-                    ],
-                    "reviewer_thread_id": "ticket-reviewer",
-                    "artifact": _passing_artifact(),
-                },
-            },
-        }
-    )
-    completed_job = state["ticket_jobs"]["2"]
-    completed_record = completed_job["deterministic_integration_record"]
-    completed_acceptance = completed_record["acceptance_record"]
-    review_artifact = {
-        "reviewer_thread_id": completed_acceptance["reviewer_thread_id"],
-        "candidate_sha": completed_acceptance["reviewed_candidate_sha"],
-        "reviewed_base_sha": completed_acceptance["reviewed_base_sha"],
-        "review_identity": {
-            "reviewed_base_sha": completed_acceptance["reviewed_base_sha"],
-            "reviewed_candidate_sha": completed_acceptance[
-                "reviewed_candidate_sha"
-            ],
-            "reviewed_candidate_tree": completed_acceptance[
-                "reviewed_candidate_tree"
-            ],
-        },
-        "artifact": completed_acceptance["artifact"],
-    }
-    completed_job["review_budget"] = {
-        "window": 1,
-        "development_attempts": 1,
-        "reviewer_invocations": 1,
-        "final_ci_fix_used": False,
-        "review_artifacts": [review_artifact],
-        "checkpoint_reason": None,
-    }
-    completed_job["review_budget_history"] = []
-    completed_record["review_budget"] = deepcopy(completed_job["review_budget"])
-    states.save_run(str(state["run_id"]), state)
-    publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
-    accepted = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=PassingRunReviewer(),
-        github=publisher,
-        default_head_sha=git.resolve("main"),
-    ).accept(str(state["run_id"]))
-    return accepted, states, git, publisher
+def _exhaust_publication_operations(
+    engine: RunPublicationEngine, run_id: str,
+) -> dict[str, Any]:
+    # 未知写入每次先等待对账；真实推进到预算耗尽，不能将首次等待当作耗尽。
+    for attempt in range(1, MAX_PUBLICATION_OPERATION_ATTEMPTS + 1):
+        pending = engine.publish(run_id)
+        assert pending["run_publication"]["publication_operation_retry"]["attempts"] == attempt
+        assert pending["status"] == (
+            "publication_pending" if attempt == MAX_PUBLICATION_OPERATION_ATTEMPTS
+            else "waiting_external"
+        )
+    return pending
 
 
 def _bind_ticket_review_budget(
@@ -174,6 +72,20 @@ def _bind_ticket_review_budget(
     job["review_budget"] = deepcopy(budget)
     job["review_budget_history"] = []
     record["review_budget"] = deepcopy(budget)
+
+
+def _bind_ticket_integration(job: dict[str, Any], record: dict[str, Any]) -> None:
+    record["ticket_integration"] = {
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "candidate_tree": record["candidate_tree"],
+        "source_sha": record["base_sha"],
+        "target_sha": record["base_sha"],
+        "head_sha": record["candidate_sha"],
+        "head_tree": record["candidate_tree"],
+        "conflict_paths": [],
+    }
+    job["ticket_integration"] = deepcopy(record["ticket_integration"])
 
 
 def test_worker_failure_before_publication_artifact_is_not_retried(
@@ -568,14 +480,15 @@ def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     repo = workspace.repository_root
     state, states, git, publisher = _accepted_run(repo, state_root=workspace.state_root)
 
-    pending = RunPublicationEngine(
+    interrupted_engine = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
         github=InterruptedRunPublisher(repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    pending = _exhaust_publication_operations(interrupted_engine, str(state["run_id"]))
     acceptance = pending["run_acceptance"]["acceptance_record"]
     agents = repo / "resume-publication-agents.json"
     agents.write_text(
@@ -600,7 +513,11 @@ def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     assert recovered["run_publication"]["publication_attempts"] == 1
     retry = recovered["run_publication"]["publication_operation_retry"]
     assert retry["attempts"] == retry["limit"]
-    assert recovered["run_publication"]["artifact"]
+    assert recovered["run_publication"]["artifact"] == pending["run_publication"]["artifact"]
+    assert recovered["run_publication"]["write_intent"] == pending["run_publication"]["write_intent"]
+    assert "publication_operation_retry_history" not in recovered["run_publication"]
+    remote = FixtureGitHubPublisher(repo / "github.json", git)
+    assert remote.data["delivery"].get("pull_requests", []) == []
 
 
 def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
@@ -608,20 +525,22 @@ def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
-    pending = RunPublicationEngine(
+    interrupted_engine = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
         github=InterruptedRunPublisher(git_repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    pending = _exhaust_publication_operations(interrupted_engine, str(state["run_id"]))
     publisher.data["delivery"]["required_checks"] = ["pending"]
 
+    recovered_agents = RunPublicationAgents()
     waiting = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=recovered_agents,
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
@@ -630,11 +549,16 @@ def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
     assert pending["terminal_kind"] == "publication_pending"
     assert waiting["status"] == "publication_pending"
     assert waiting["terminal_kind"] == "publication_pending"
+    assert waiting["run_publication"]["publication_operation_retry"] == pending["run_publication"]["publication_operation_retry"]
+    assert waiting["run_publication"]["artifact"] == pending["run_publication"]["artifact"]
+    assert waiting["run_publication"]["write_intent"] == pending["run_publication"]["write_intent"]
+    assert recovered_agents.requests == []
+    assert publisher.data["delivery"].get("pull_requests", []) == []
 
 def test_final_run_publication_receives_only_role_required_facts(
     git_repo: Path,
 ) -> None:
-    state, states, git, publisher = _accepted_run_with_integration(git_repo)
+    state, states, git, publisher = _accepted_run(git_repo)
     state["ticket_jobs"]["2"]["deterministic_integration_record"] = {
         "source": "accepted",
         "base_sha": "run-base",
@@ -680,8 +604,12 @@ def test_final_run_publication_receives_only_role_required_facts(
         state["ticket_jobs"]["2"],
         state["ticket_jobs"]["2"]["deterministic_integration_record"],
     )
+    _bind_ticket_integration(
+        state["ticket_jobs"]["2"],
+        state["ticket_jobs"]["2"]["deterministic_integration_record"],
+    )
     state["prompt_resources"]["methods/publishing"] = "Run 创建时固定的发布方法"
-    states.save_run(str(state["run_id"]), state)
+    persist_run_fixture(states, str(state["run_id"]), state)
     agents = RunPublicationAgents()
 
     RunPublicationEngine(
@@ -711,7 +639,7 @@ def test_final_run_publication_receives_only_role_required_facts(
 def test_publication_prompts_and_run_repair_requests_keep_integration_records_with_reviewers(
     git_repo: Path, tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    state, states, git, publisher = _accepted_run_with_integration(git_repo)
+    state, states, git, publisher = _accepted_run(git_repo)
     fallback_ticket_records = [
         {"sentinel": "fallback-ticket-record-publication-leak"}
     ]
@@ -772,7 +700,11 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         state["ticket_jobs"]["2"],
         integration_records[0]["integration_record"],
     )
-    states.save_run(str(state["run_id"]), state)
+    _bind_ticket_integration(
+        state["ticket_jobs"]["2"],
+        integration_records[0]["integration_record"],
+    )
+    persist_run_fixture(states, str(state["run_id"]), state)
 
     repair_requests = RunRepairRequests(
         git=SimpleNamespace(
@@ -788,14 +720,10 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         "development_thread_id": "repair-developer",
         "publication_attempts": 0,
     }
-    publication_request = repair_requests.publication(
-        state, repair_job, git_repo / "checkout"
-    )
     review_request = repair_requests.review(
         state, repair_job, git_repo / "validation"
     )
 
-    assert "ticket_integration_records" not in publication_request
     reviewer_records = review_request["ticket_integration_records"]
     assert len(reviewer_records) == 1
     assert reviewer_records[0]["ticket_number"] == 2
@@ -816,19 +744,19 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         },
         name="final-publication-role-facts",
     )
-    run_repair_publication_prompt = _capture_public_prompt(
+    parent_only_publication_prompt = _capture_public_prompt(
         tmp_path,
         monkeypatch,
         "publication",
         {
-            "acceptance_scope": "run",
+            "acceptance_scope": "parent_only",
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "acceptance_artifact": {},
             "fallback_ticket_records": fallback_ticket_records,
             "previous_review_identity": previous_review_identity,
             "ticket_integration_records": integration_records,
         },
-        name="run-repair-publication-role-facts",
+        name="parent-only-publication-role-facts",
     )
     reviewer_prompt = _capture_public_prompt(
         tmp_path,
@@ -852,7 +780,7 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         name="reviewer-integration-facts",
     )
 
-    for prompt in (final_publication_prompt, run_repair_publication_prompt):
+    for prompt in (final_publication_prompt, parent_only_publication_prompt):
         assert "ticket_integration_records" not in prompt
         assert "reviewer-only integration evidence" not in prompt
         assert "fallback-ticket-record-publication-leak" not in prompt
@@ -913,14 +841,20 @@ def test_retries_publication_operation_without_a_fresh_narrative_agent(
         default_head_sha=git.resolve("main"),
     )
 
+    interrupted = engine.publish(str(state["run_id"]))
+    assert interrupted["status"] == "waiting_external"
+    assert interrupted["run_publication"]["write_intent"]["action"] == "create_final_pr"
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
     retried = engine.publish(str(state["run_id"]))
 
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
+    assert "write_intent" not in retried["run_publication"]
     assert retried["status"] == "run_approval_pending"
     assert len(agents.requests) == 1
     assert retried["run_publication"]["publication_attempts"] == 1
     assert retried["run_publication"]["publication_operation_retry"]["attempts"] == 1
 
-def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> None:
+def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
     engine = RunPublicationEngine(
@@ -931,7 +865,12 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
         default_branch="main",
         default_head_sha=git.resolve("main"),
     )
+    interrupted = engine.publish(str(state["run_id"]))
+    assert interrupted["status"] == "waiting_external"
+    # 先读回已创建的原 PR，完成对账后再测试下一轮验收中的关闭保护。
     published = engine.publish(str(state["run_id"]))
+    assert published["status"] == "run_approval_pending"
+    assert "write_intent" not in published["run_publication"]
     prior_attempt = published["run_publication"]["semantic_attempt_history"][-1]
     assert prior_attempt["publication_operation_retry"] == {
         "attempts": 1,
@@ -939,7 +878,7 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
     }
     publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
     published["run_publication"]["phase"] = "publishing"
-    states.save_run(str(state["run_id"]), published)
+    persist_run_fixture(states, str(state["run_id"]), published)
 
     stale = engine.publish(str(state["run_id"]))
 
@@ -959,32 +898,27 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
         github=publisher,
         default_head_sha=git.resolve("main"),
     ).accept(str(state["run_id"]))
-    recovered = RunPublicationEngine(
+    resumed_agents = RunPublicationAgents()
+    resumed_engine = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=resumed_agents,
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    recovered = resumed_engine.publish(str(state["run_id"]))
 
     assert fresh["run_acceptance"]["phase"] == "accepted"
-    attempts = recovered["run_publication"]["semantic_attempt_history"]
-    assert [attempt["ordinal"] for attempt in attempts] == [1, 2]
-    assert attempts[0]["attempt_id"] == prior_attempt["attempt_id"]
-    assert attempts[0]["publication_operation_retry"] == {
-        "attempts": 1,
-        "limit": 5,
-    }
-    assert attempts[1]["attempt_id"] != attempts[0]["attempt_id"]
-    assert (
-        recovered["run_publication"]["pr_number"]
-        != published["run_publication"]["pr_number"]
-    )
-    assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == [
-        "CLOSED",
-        "OPEN",
-    ]
+    assert recovered["status"] == "ready_for_human"
+    assert recovered["diagnostics"][0]["code"] == "final_run_pr_closed"
+    assert recovered["run_publication"]["phase"] == "ready_for_human"
+    assert recovered["run_publication"]["pr_number"] == published["run_publication"]["pr_number"]
+    assert recovered["run_publication"]["semantic_attempt_history"][0]["attempt_id"] == prior_attempt["attempt_id"]
+    assert resumed_agents.requests == []
+    assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == ["CLOSED"]
+    assert resumed_engine.publish(str(state["run_id"]))["status"] == "ready_for_human"
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
 
 def test_revise_is_rejected_outside_a_human_gate(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)

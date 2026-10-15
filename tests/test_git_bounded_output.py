@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from agent_run.git import GitError, GitRepository
+
+
+def test_git_dispatch_honors_path_changes_after_cached_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.git_output import run_git
+
+    original_path = os.environ.get("PATH", "")
+    for marker in ("first", "second"):
+        directory = tmp_path / marker
+        directory.mkdir()
+        executable = directory / "git"
+        executable.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n", encoding="utf-8")
+        executable.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{directory}:{original_path}")
+        result = run_git(["git", "--version"], cwd=tmp_path)
+        assert result.returncode == 0
+        assert result.stdout.strip() == marker
 
 
 @pytest.mark.parametrize("megabytes", [2, 4])
@@ -158,3 +177,170 @@ def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> Non
     assert len(processes) == 1
     assert processes[0].poll() is not None
     assert processes[0].stdout.closed and processes[0].stderr.closed
+
+
+def test_git_timeout_retains_output_and_reaps_hook_group(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    from agent_run import git_output, git_integration_operation
+
+    hook = git_repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nprintf 'before timeout\n' >&2\nexec sleep 10\n")
+    hook.chmod(0o700)
+    processes = []
+    real_popen = git_output.subprocess.Popen
+
+    def start(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(git_output.subprocess, "Popen", start)
+    monkeypatch.setattr(git_integration_operation, "INTEGRATION_COMMAND_TIMEOUT_SECONDS", 0.25)
+    git = GitRepository(git_repo)
+    head = git.checkout_head(git_repo)
+    (git_repo / "README.md").write_text("bounded integration\n")
+    with pytest.raises(GitError, match="timed out") as error:
+        git.commit_integration_work(
+            git_repo, expected_head_sha=head, expected_merge_sha=None, message="bounded",
+        )
+    assert error.value.evidence["command"] == ["git", "commit", "-m", "bounded"]
+    assert error.value.evidence["head_sha"] == head
+    assert error.value.evidence["timeout_seconds"] == 0.25
+    assert "before timeout" in error.value.evidence["stderr"]
+    assert all(process.poll() is not None for process in processes)
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True,
+    ).stdout == "M  README.md\n"
+
+
+def test_mechanical_merge_recovery_bounds_real_merge_driver_and_preserves_scene(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import json
+    import shlex
+    from agent_run import git as git_module, git_output
+
+    git = GitRepository(git_repo)
+    (git_repo / ".gitattributes").write_text("README.md merge=bounded\n")
+    git._run("add", ".gitattributes")
+    git._run("commit", "-m", "merge attribute")
+    base = git.checkout_head(git_repo)
+    (git_repo / "README.md").write_text("candidate\n")
+    git._run("commit", "-am", "candidate")
+    candidate = git.checkout_head(git_repo)
+    git._run("checkout", "--detach", base)
+    (git_repo / "README.md").write_text("source\n")
+    git._run("commit", "-am", "source")
+    source = git.checkout_head(git_repo)
+    git._run("checkout", "--detach", candidate)
+    pause = tmp_path / "pause-driver"
+    pid_path = tmp_path / "driver-pid"
+    driver = tmp_path / "merge-driver.py"
+    driver.write_text(
+        "import os, time\nfrom pathlib import Path\n"
+        f"if Path({str(pause)!r}).exists():\n"
+        f" Path({str(pid_path)!r}).write_text(str(os.getpid()))\n"
+        " print('driver running', flush=True)\n time.sleep(10)\n"
+    )
+    git._run("config", "merge.bounded.driver", f"python3 {shlex.quote(str(driver))} %O %A %B")
+    merged = git.integrate_remote_heads(git_repo, candidate_sha=candidate,
+                                       source_sha=source, target_sha=base)
+    assert merged.status == "clean"
+    original_head = merged.head_sha
+    processes = []
+    real_popen = git_output.subprocess.Popen
+
+    def start(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    # Own only the recorded orphan driver, so the timeout test itself leaves
+    # neither an executing descendant nor a zombie under a container PID 1.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0  # GET_CHILD_SUBREAPER
+    assert libc.prctl(36, 1, 0, 0, 0) == 0  # SET_CHILD_SUBREAPER
+    try:
+        monkeypatch.setattr(git_output.subprocess, "Popen", start)
+        monkeypatch.setattr(git_module, "GIT_COMMAND_TIMEOUT_SECONDS", 0.25)
+        pause.touch()
+        with pytest.raises(GitError, match="timed out") as caught:
+            git.integrate_remote_heads(git_repo, candidate_sha=candidate,
+                                       source_sha=source, target_sha=base)
+        evidence = caught.value.evidence
+        assert evidence["command"] == ["git", "merge-tree", "--write-tree", candidate, source]
+        assert evidence["timeout_seconds"] == 0.25
+        assert "driver running" in json.loads(evidence["stdout_json"])
+        assert evidence["head_sha"] == original_head
+        assert evidence["merge_head_sha"] is None
+        assert all(process.poll() is not None for process in processes)
+        assert git.checkout_head(git_repo) == original_head
+        assert git._run("diff", "--quiet").returncode == 0
+        assert git._run("diff", "--cached", "--quiet").returncode == 0
+        # Git's killed driver may leave its scratch files in the scene; those
+        # are preserved for the recorded failure and can be cleaned in repair.
+        assert all(line.startswith("?? .merge_file_") for line in git._run("status", "--porcelain").stdout.splitlines())
+    finally:
+        for scratch in git_repo.glob(".merge_file_*"):
+            scratch.unlink()
+        try:
+            if pid_path.exists():
+                _assert_merge_driver_exited(int(pid_path.read_text()))
+        finally:
+            assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def _assert_merge_driver_exited(driver_pid: int) -> None:
+    import signal
+    import time
+
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            waited, _ = os.waitpid(driver_pid, os.WNOHANG)
+        except ChildProcessError:
+            # Git's shell may reap the driver before it can be adopted by
+            # our subreaper. ECHILD alone does not prove that it has exited.
+            assert not Path(f"/proc/{driver_pid}").exists(), "merge driver is alive but not owned"
+            return
+        if waited == driver_pid:
+            return
+        if time.monotonic() >= deadline:
+            os.kill(driver_pid, signal.SIGKILL)
+            os.waitpid(driver_pid, 0)
+            pytest.fail("merge driver remained executing after the Git timeout")
+        time.sleep(0.01)
+
+
+def test_merge_driver_exit_check_accepts_parent_reaped_child() -> None:
+    import subprocess
+    import sys
+
+    # A real intermediate parent owns and reaps its child before exiting.
+    # This is the other valid outcome of killing Git's driver process group.
+    parent = subprocess.run(
+        [sys.executable, "-c", "import subprocess, sys; subprocess.run("
+         "[sys.executable, '-c', 'import os; print(os.getpid())'], check=True)"],
+        capture_output=True, text=True, check=True, timeout=5,
+    )
+    driver_pid = int(parent.stdout.strip())
+    _assert_merge_driver_exited(driver_pid)
+    assert not Path(f"/proc/{driver_pid}").exists()
+
+
+def test_merge_driver_exit_check_reaps_owned_child() -> None:
+    import subprocess
+    import sys
+
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as process:
+        _assert_merge_driver_exited(process.pid)
+        assert not Path(f"/proc/{process.pid}").exists()
+
+
+def test_merge_driver_exit_check_rejects_unowned_live_process() -> None:
+    with pytest.raises(AssertionError, match="driver.*alive"):
+        _assert_merge_driver_exited(os.getpid())

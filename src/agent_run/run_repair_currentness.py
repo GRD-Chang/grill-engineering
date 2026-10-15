@@ -13,8 +13,10 @@ from agent_run.external_supervision import (
     wait_for_github_convergence,
 )
 from agent_run.git import GitRepository
+from agent_run.parent_integration import parent_integration_record_is_valid
 from agent_run.github import GitHubReadError
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state import StateStore
 
 
@@ -67,15 +69,11 @@ class RunRepairCurrentness:
         default_head_sha: str,
     ) -> bool:
         run_head = self.git.resolve(str(state["run_branch"]))
-        expected_run_heads = {job.get("base_sha")}
-        integrated = job.get("integrated_sha")
-        if isinstance(integrated, str):
-            expected_run_heads.add(integrated)
         return (
             not self.trigger_is_current(
                 state, job, default_head_sha=default_head_sha
             )
-            or run_head not in expected_run_heads
+            or not repair_run_branch_is_current(self.git, job, run_head)
             or _mapping(state, "parent").get("revision")
             != job.get("parent_revision")
             or _mapping(state, "ticket_graph").get("revision")
@@ -112,18 +110,30 @@ class RunRepairCurrentness:
         live_base = live.get("base_sha")
         if trigger_base != live_base and live_base != default_head_sha:
             return False
-        head_transitioned_after_merge = False
+        head_transitioned = False
         if trigger.get("head_sha") != live.get("head_sha"):
             integrated = job.get("integrated_sha")
-            head_transitioned_after_merge = (
+            head_transitioned = (
                 isinstance(integrated, str)
                 and live.get("head_sha") == integrated
                 and self.git.resolve(str(state["run_branch"])) == integrated
             )
-            if not head_transitioned_after_merge:
+            integration = job.get("run_repair_integration")
+            if not head_transitioned and isinstance(integration, dict):
+                head_transitioned = (
+                    live.get("head_sha") == integration.get("target_sha")
+                    and parent_integration_record_is_valid(
+                        self.git, {**job, "candidate_sha": integration.get("head_sha"),
+                                   "parent_integration": integration},
+                    )
+                    and self.git.is_ancestor(
+                        str(trigger["head_sha"]), str(integration["target_sha"]),
+                    )
+                )
+            if not head_transitioned:
                 return False
         evidence_fingerprint = trigger.get("ci_evidence_fingerprint")
-        if head_transitioned_after_merge or not isinstance(evidence_fingerprint, str):
+        if head_transitioned or not isinstance(evidence_fingerprint, str):
             return True
         try:
             current_evidence = self.github.required_check_evidence(

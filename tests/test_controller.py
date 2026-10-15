@@ -14,7 +14,10 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.state import StateStore
-from conftest import write_fixture
+from support.seeding import write_fixture
+
+from support.state import run_refs, snapshot_run
+from support.state import persist_run_fixture
 
 
 def _issue(number: int) -> dict[str, Any]:
@@ -46,7 +49,7 @@ def test_initial_state_failure_happens_before_branch_creation(
     def fail_save(_run_id: str, _state: dict[str, Any]) -> None:
         raise OSError("simulated first-write interruption")
 
-    monkeypatch.setattr(store, "save_run", fail_save)
+    monkeypatch.setattr(store._repository, "save", fail_save)
 
     with pytest.raises(OSError, match="first-write interruption"):
         controller.start(1)
@@ -59,7 +62,7 @@ def test_initial_state_failure_happens_before_branch_creation(
         check=True,
     ).stdout.splitlines()
     assert branches == []
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not run_refs(git_repo / '.agent-run')
 
 
 def test_locator_registration_retries_only_for_new_pending_run(git_repo: Path) -> None:
@@ -184,7 +187,7 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
         state["language"] = "fr"
     else:
         state["prompt_resources"].pop("methods/acceptance")
-    store.save_run(str(state["run_id"]), state)
+    persist_run_fixture(store, str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 
     with pytest.raises(IncompatibleRunStateError, match="legacy state|Prompt"):
@@ -205,7 +208,7 @@ def test_state_missing_active_invocation_fails_closed_before_controller_mutates_
     )
     state, _ = controller.start(1)
     state.pop("active_agent_invocation")
-    store.save_run(str(state["run_id"]), state)
+    persist_run_fixture(store, str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 
     with pytest.raises(IncompatibleRunStateError, match="active_agent_invocation"):
@@ -293,9 +296,9 @@ def test_credential_renewal_failure_uses_a_recoverable_diagnostic(
             "code": "worker_credential_renewal_failed",
             "message": "Worker GitHub read credential error: worker_credential_renewal_failed: retries exhausted; token=[REDACTED]",
             "operator_gate": {
-                "work_subject": "ticket:2",
+                "work_subject": f"run:{run_id}",
                 "action_kind": "execution_failure",
-                "phase": "active",
+                "phase": "execution_failed",
                 "reason": "worker_credential_renewal_failed",
             },
         }
@@ -319,7 +322,7 @@ def test_execution_failure_producer_persists_one_bounded_safe_diagnostic(
         f"command failed; token={credential}; " + ("raw tool output " * 20_000),
     )
 
-    persisted_bytes = (store.runs_directory / f"{run_id}.json").read_bytes()
+    persisted_bytes = snapshot_run((store.root, str(run_id)))
     recorded = store.load_run(run_id)
     assert recorded is not None
     assert len(recorded["diagnostics"]) == 1

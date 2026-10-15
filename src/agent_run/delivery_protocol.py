@@ -3,8 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from agent_run.branch_publication import BranchPublicationResult
+
 
 class GitHubPublisher(Protocol):
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]: ...
+
     def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None: ...
 
     def ensure_change_branch(
@@ -96,6 +102,8 @@ class GitHubPublisher(Protocol):
         pr_number: int,
         integrated_sha: str,
         delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None: ...
 
     def abandon_run_pr(self, pr_number: int) -> None: ...
@@ -108,7 +116,7 @@ class GitHubPublisher(Protocol):
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None: ...
+    ) -> BranchPublicationResult: ...
 
     def verify_change_pr_before_publish(
         self,
@@ -137,7 +145,11 @@ class GitHubPublisher(Protocol):
         body: str,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int: ...
+
+    def find_change_pr_number(self, *, branch: str) -> int | None: ...
 
     def ensure_ticket_pr(
         self,
@@ -149,6 +161,8 @@ class GitHubPublisher(Protocol):
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
+        write_intent: dict[str, Any] | None = None,
+        save_intent: Callable[[], None] | None = None,
     ) -> int: ...
 
     def abandon_parent_pr(self, pr_number: int) -> bool: ...
@@ -179,13 +193,7 @@ class GitHubPublisher(Protocol):
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]: ...
 
-    def run_pr_narrative_matches(
-        self, pr_number: int, *, title: str, body: str
-    ) -> bool: ...
-
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None: ...
+    def read_run_pr_narrative(self, pr_number: int) -> dict[str, str]: ...
 
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]

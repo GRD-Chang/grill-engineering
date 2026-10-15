@@ -59,7 +59,12 @@ def _final_request(request: dict[str, Any]) -> dict[str, Any]:
 
 def _publication_evidence(request: dict[str, Any]) -> str:
     fallback = request.get("fallback_publication_context")
+    ci_repair = request.get("ci_repair_publication_context")
     artifact = request.get("acceptance_artifact")
+    if isinstance(ci_repair, dict):
+        return resource(request, "publication/ci-repair-evidence").format(
+            pretty(ci_repair)
+        )
     if isinstance(fallback, dict):
         return (
             resource(request, "publication/fallback-evidence").format(pretty(fallback))
@@ -70,5 +75,5 @@ def _publication_evidence(request: dict[str, Any]) -> str:
             + "\n" + pretty(artifact)
         )
     raise ValueError(
-        "Publication requires acceptance_artifact or fallback_publication_context"
+        "Publication requires acceptance_artifact, fallback_publication_context, or ci_repair_publication_context"
     )

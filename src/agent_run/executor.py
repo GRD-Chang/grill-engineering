@@ -8,13 +8,16 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from agent_run.executor_admission import executor_failure_scope, report_executor_failure
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notifications import Notifications
+from agent_run.object_state import ObjectStateStore
 from agent_run.messages import error_detail, selected_language
-from agent_run.runner_lease import runner_usage_lease
-from agent_run.state import SimulatedProcessCrash, StateStore
-from agent_run.task_control import TaskControlBusyError, TaskControlError, TaskKey
+from agent_run.runner_lease import retain_lease_for_systemd_exit, runner_usage_lease
+from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
+from agent_run.revisions import TicketGraphDriftError
+from agent_run.task_control import ActionReconciliationError, TaskControlError, TaskKey
 from agent_run.ticket_eligibility import TicketEligibilityError
 
 if TYPE_CHECKING:
@@ -84,51 +87,73 @@ class DeliveryExecutor:
         state = states.load_current_run(run_id)
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
+        def observation_state() -> dict[str, Any] | None:
+            # Presentation reads happen outside business transactions. Its
+            # complete facts retain sibling gates and completed Ticket events.
+            if isinstance(states, ObjectStateStore):
+                return states.load_full_run(run_id)
+            return states.load_current_run(run_id)
+
         feedback = self.resume_feedback
         if feedback is not None:
             if action_id is not None:
                 feedback.identity = action_id
-            feedback.observe(state)
-        notifications = Notifications(states.root, feedback.project(state) if feedback else state)
+            feedback.observe(observation_state() or state)
+        def notification_state() -> dict[str, Any] | None:
+            current = observation_state()
+            return feedback.project(current) if feedback and current is not None else current
+
+        notifications = Notifications(states.root, feedback.project(state) if feedback else state,
+                                      load_state=notification_state)
         if feedback is not None:
             feedback.attach(notifications, action_id)
-        states.run_saved_observer = feedback.observe if feedback else notifications.observe
-        try:
-            driver = self.driver_factory(states, binding)
-            if control_operation is None:
-                result = driver.advance(state)
-                if feedback is not None:
-                    feedback.observe(dict(result))
-                return result
-            return driver.advance(state, control_operation=control_operation)
-        except KeyboardInterrupt:
-            if self.record_execution_failure is not None:
-                self.record_execution_failure(
-                    states,
-                    run_id,
-                    (
-                        "control_executor_interrupted"
-                        if control_operation is not None
-                        else "executor_agent_interrupted"
-                    ),
+        states.run_saved_observer = (
+            lambda saved: feedback.observe(observation_state() or saved)
+        ) if feedback else notifications.observe
+        driver: _RunDriver | None = None
+
+        def record_failure(error: BaseException) -> bool:
+            if isinstance(error, KeyboardInterrupt):
+                return self.record_execution_failure is not None and self.record_execution_failure(
+                    states, run_id,
+                    "control_executor_interrupted" if control_operation is not None else "executor_agent_interrupted",
                     binding,
                 )
-            raise
-        except (SimulatedProcessCrash, TaskControlBusyError, TicketEligibilityError):
-            # An abrupt exit, unresolved ownership or rejected precondition
-            # must not be rewritten as an applied business-operation failure.
-            raise
-        except Exception as error:
+            if not isinstance(error, Exception) or isinstance(error, (SimulatedProcessCrash, ConcurrentRunStateError, TicketGraphDriftError, TicketEligibilityError, ActionReconciliationError)):
+                return False
             if feedback is not None:
                 feedback.failure(error_detail(error, selected_language(state)), evidence="execution")
+            driver_record = getattr(driver, "record_failure", None)
+            if callable(driver_record):
+                return bool(driver_record(run_id, error))
             if self.record_execution_failure is not None:
-                self.record_execution_failure(states, run_id, str(error), binding)
-            if feedback is not None:
-                feedback.observe(states.load_current_run(run_id) or state)
-            raise
-        finally:
-            states.run_saved_observer = None
-            notifications.close()
+                return self.record_execution_failure(states, run_id, str(error), binding)
+            return False
+
+        with executor_failure_scope(record_failure):
+            try:
+                driver = self.driver_factory(states, binding)
+                if control_operation is None:
+                    result = driver.advance(state)
+                    if feedback is not None:
+                        feedback.observe(observation_state() or dict(result))
+                    return result
+                return driver.advance(state, control_operation=control_operation)
+            except KeyboardInterrupt as error:
+                report_executor_failure(error)
+                raise
+            except (SimulatedProcessCrash, TicketEligibilityError):
+                # An abrupt exit or rejected precondition
+                # must not be rewritten as an applied business-operation failure.
+                raise
+            except Exception as error:
+                report_executor_failure(error)
+                if feedback is not None:
+                    feedback.observe(observation_state() or state)
+                raise
+            finally:
+                states.run_saved_observer = None
+                notifications.close()
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -155,7 +180,12 @@ def main(arguments: list[str] | None = None) -> int:
         generation=parsed.generation,
         state_root=state_root,
     )
-    with runner_usage_lease(Path(parsed.runner_lock)):
+    with runner_usage_lease(Path(parsed.runner_lock)) as lease:
+        notify_socket = os.environ.get("AGENT_RUN_INTERNAL_EXIT_NOTIFY_SOCKET")
+        credentials_directory = os.environ.get("AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY")
+        systemd_runtime = os.environ.get("AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY")
+        if notify_socket:
+            retain_lease_for_systemd_exit(lease, notify_socket)
         environment, command = consume_environment_carrier(
             Path(parsed.carrier), spec
         )
@@ -170,6 +200,10 @@ def main(arguments: list[str] | None = None) -> int:
                 "AGENT_RUN_INTERNAL_STATE_ROOT": str(state_root),
             }
         )
+        if credentials_directory:
+            environment["AGENT_RUN_INTERNAL_CREDENTIALS_DIRECTORY"] = credentials_directory
+        if systemd_runtime:
+            environment["AGENT_RUN_INTERNAL_SYSTEMD_RUNTIME_DIRECTORY"] = systemd_runtime
         os.environ.clear()
         os.environ.update(environment)
         os.chdir(task.workspace)

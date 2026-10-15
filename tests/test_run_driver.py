@@ -25,7 +25,8 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from conftest import write_fixture
+from agent_run.object_state import save_owned
+from support.seeding import write_fixture
 
 
 @pytest.mark.parametrize(
@@ -191,6 +192,7 @@ def test_driver_applies_stop_control_before_automatic_progress() -> None:
 def test_driver_persists_backoff_before_sleep_and_a_restart_uses_it(tmp_path) -> None:
     state: dict[str, object] = {"run_id": "run-1", "status": "waiting_external"}
     states = StateStore(tmp_path)
+    states.save_run("run-1", state)
     now = [0.0]
     sleeps: list[float] = []
 
@@ -299,6 +301,7 @@ def test_driver_records_failure_when_progress_identity_does_not_change(tmp_path)
 def test_driver_does_not_apply_no_progress_guard_to_external_waits(tmp_path) -> None:
     state: dict[str, object] = {"run_id": "run-1", "status": "waiting_external"}
     states = StateStore(tmp_path)
+    states.save_run("run-1", state)
     retries = 0
 
     class Controller:
@@ -552,9 +555,7 @@ def test_dispatch_fence_rejects_old_external_operation_and_state_commit(
     def deliver(_run_id: str) -> RunOutcome:
         operations.agents.develop({})
         operations.git.resolve("after-agent")
-        operations.states.save_run(
-            "run-1", {"run_id": "run-1", "status": "execution_failed"}
-        )
+        save_owned(operations.states, "run-1", {"run_id": "run-1", "status": "execution_failed"}, fields={'status'})
         return RunOutcome(
             RunOutcomeKind.PROGRESS,
             {"run_id": "run-1", "status": "active"},
@@ -575,9 +576,7 @@ def test_dispatch_fence_rejects_old_external_operation_and_state_commit(
     assert not replacer.is_alive()
 
     with pytest.raises(ActionReconciliationError, match="generation"):
-        states.save_run(
-            "run-1", {"run_id": "run-1", "status": "execution_failed"}
-        )
+        save_owned(states, "run-1", {"run_id": "run-1", "status": "execution_failed"}, fields={'status'})
     assert states.load_run("run-1") == initial
 
 
@@ -657,8 +656,8 @@ def test_direct_operations_fence_controller_github_and_publisher(
     for operation in (
         lambda: operations.controller.resume("run-1"),
         lambda: operations.github_reader.repository(),
-        lambda: operations.publisher.ensure_run_repair_branch(
-            branch="agent-run/test", base_branch="main"
+        lambda: operations.publisher.publish_branch(
+            "agent-run/test", git.resolve("main"), expected_remote_sha=git.resolve("main")
         ),
     ):
         with pytest.raises(ActionReconciliationError):
@@ -677,14 +676,16 @@ def test_state_commit_transaction_serializes_generation_replacement(tmp_path) ->
             self.commit_entered = threading.Event()
             self.allow_commit = threading.Event()
             self.pause_commit = False
+            self.raw_save_objects = self._repository.save_objects
+            self._repository.save_objects = self._save_objects
 
-        def _save_run_unlocked(self, run_id, state) -> None:
+        def _save_objects(self, run_id, state, **options) -> None:
             if self.pause_commit:
                 self.pause_commit = False
                 self.commit_entered.set()
                 if not self.allow_commit.wait(timeout=2):
                     raise AssertionError("state commit barrier was not released")
-            super()._save_run_unlocked(run_id, state)
+            self.raw_save_objects(run_id, state, **options)
 
     states = BarrierStateStore(tmp_path / "runs")
     initial = {"run_id": "run-1", "status": "active"}
@@ -733,7 +734,7 @@ def test_state_commit_transaction_serializes_generation_replacement(tmp_path) ->
 
     def write_state() -> None:
         try:
-            states.save_run("run-1", {"run_id": "run-1", "status": "committed"})
+            save_owned(states, "run-1", {"run_id": "run-1", "status": "committed"}, fields={'status'})
         except BaseException as error:  # pragma: no cover - diagnostic propagation
             writer_errors.append(error)
         finally:
@@ -791,7 +792,5 @@ def test_state_commit_transaction_serializes_generation_replacement(tmp_path) ->
     assert committed["run_id"] == "run-1"
     assert committed["status"] == "committed"
     with pytest.raises(ActionReconciliationError, match="generation"):
-        states.save_run(
-            "run-1", {"run_id": "run-1", "status": "stale-overwrite"}
-        )
+        save_owned(states, "run-1", {"run_id": "run-1", "status": "stale-overwrite"}, fields={'status'})
     assert states.load_run("run-1")["status"] == "committed"

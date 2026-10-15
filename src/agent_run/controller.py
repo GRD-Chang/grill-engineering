@@ -5,11 +5,15 @@ import secrets
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol, cast
 
+from agent_run.resume_work import continuation_phase
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
-from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
+from agent_run.agent_invocation import (
+    fail_interrupted_invocation, interrupt_exited_ticket_invocations, restore_operator_stop,
+)
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
@@ -17,6 +21,7 @@ from agent_run.change_currentness import (
     unknown_pr_mutation,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_loop import _record_superseded_integration
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     DeliveryPolicy,
@@ -28,6 +33,7 @@ from agent_run.delivery_policy import (
     ticket_budget_policy_for_job,
 )
 from agent_run.error_safety import bounded_error
+from agent_run.resume_materials import require_resume_checkout
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
@@ -49,6 +55,7 @@ from agent_run.operator_gate import (
     has_run_operator_gate,
     has_unresolved_subject_gate,
     operator_gate_subjects,
+    run_failure_diagnostic,
 )
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.run_currentness import (
@@ -58,29 +65,42 @@ from agent_run.run_currentness import (
     ticket_completion_records_fingerprint,
 )
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
+from agent_run.run_repair_integration import repair_run_branch_is_current
+from agent_run.delivery_budget import delivery_budget_owner, repair_integration_budget_owner
+from agent_run.run_repair_cycle import remove_repair_job
 from agent_run.review_budget import (
     budget_checkpoint_subjects,
     reset_budget,
+    renew_run_budget,
 )
 from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
 )
+from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
-from agent_run.resume_intent import resume_pause_state
+from agent_run.resume_intent import is_ticket_execution_recovery, resume_pause_state
+from agent_run.publication_operation_retry import require_publication_operation_retry
 from agent_run.scope_changes import reconcile_structure
+from agent_run.agent_return import clear_blocked_agent_return
 from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
-from agent_run.state import StateStore
+from agent_run.object_state import ObjectStateStore, object_store
+from agent_run.state import ConcurrentRunStateError, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
     human_blocker_subject_count,
     require_current_run_state,
 )
-from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlBusyError
 from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
+from agent_run.ticket_phase import sync_active_ticket_job
+from agent_run.ticket_queue import acquire as acquire_ticket_slot, reconcile_all as reconcile_ticket_slots
+from agent_run.integration_resync_budget import renew_resync_budget
+from agent_run.integration_development_budget import renew_integration_development_budget
+from agent_run.ci_recovery_budget import ci_limit_for_job, reset_exhausted_ci_budget
 
 
 class GitHubReader(Protocol):
@@ -103,7 +123,7 @@ class Controller:
         delivery_policy_provider: Callable[[], DeliveryPolicy] | None = None,
     ) -> None:
         self.github = github
-        self.states = states
+        self.states = object_store(states)
         self.checkout = git.root
         self.publisher = Publisher(git)
         self.locator = locator
@@ -111,6 +131,8 @@ class Controller:
         self.delivery_policy = delivery_policy or default_delivery_policy()
         self.delivery_policy_provider = delivery_policy_provider
         self.creation_language: str | None = None
+        self.creation_github_identity: dict[str, Any] | None = None
+        self.creation_runner_github_identity: dict[str, Any] | None = None
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -198,6 +220,11 @@ class Controller:
                 return existing, True
         resumed = existing is not None
         if existing is None:
+            runner_identity = self.creation_runner_github_identity or self.publisher.git.runner_identity
+            if runner_identity and runner_identity.get("source") in {"pat", "app"}:
+                # Credential authentication does not prove repository access.
+                # Do not invent a recoverable Run for failed PAT/App initialization.
+                raise error
             provisional = Repository(
                 name_with_owner=repository_hint,
                 default_branch="HEAD",
@@ -260,17 +287,90 @@ class Controller:
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
         budget_policy: DeliveryPolicy | None = None,
         validate_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        ticket_number: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        automatic_refresh = not any((
+            resume_human_blocker, explicit_resume, resume_budget_checkpoint,
+            new_thread, ticket_number is not None,
+            human_response is not None, message is not None,
+            prepare_state is not None, validate_resume_state is not None,
+        ))
+        attempts = 3 if automatic_refresh else 1
+        for attempt in range(attempts):
+            baseline = self._load_run(run_id)
+            try:
+                with cast(ObjectStateStore, self.states).require_unchanged_run(run_id, baseline):
+                    result = self._resume_once(
+                        run_id,
+                        resume_human_blocker=resume_human_blocker,
+                        new_thread=new_thread,
+                        human_response=human_response,
+                        message=message,
+                        explicit_resume=explicit_resume,
+                        record_explicit_resume_audit=record_explicit_resume_audit,
+                        resume_budget_checkpoint=resume_budget_checkpoint,
+                        prepare_state=prepare_state,
+                        budget_policy=budget_policy,
+                        validate_resume_state=validate_resume_state,
+                        ticket_number=ticket_number,
+                    )
+                    latest = cast(ObjectStateStore, self.states).load_unchanged_run(run_id)
+                    if latest is not None and any(
+                        result[0].get(key) != latest.get(key)
+                        for key in (
+                            "status", "terminal_kind", "operator_stop", "diagnostics",
+                            "ticket_jobs", "ticket_pause_requests",
+                            "ticket_integration_queue", "ticket_integration_holder", "ticket_work_queue",
+                            "active_ticket_job",
+                        )
+                    ):
+                        raise ConcurrentRunStateError(
+                            "Run changed before Controller returned its refresh"
+                        )
+                    return result
+            except ConcurrentRunStateError as error:
+                latest = self.states.load_current_run(run_id)
+                if automatic_refresh and latest is not None and latest.get("status") in {
+                    "operator_stopped", "abandoned", "abandonment_pending",
+                    "completed", "supervision_timeout",
+                }:
+                    return latest, True
+                if attempt + 1 == attempts:
+                    raise TaskControlBusyError(
+                        "Run changed during Controller refresh; retry the operation"
+                    ) from error
+        raise AssertionError("Controller refresh retry limit was not enforced")
+
+    def _resume_once(
+        self,
+        run_id: str,
+        *,
+        resume_human_blocker: bool = False,
+        new_thread: bool = False,
+        human_response: str | None = None,
+        message: str | None = None,
+        explicit_resume: bool = False,
+        record_explicit_resume_audit: bool = True,
+        resume_budget_checkpoint: bool = False,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+        budget_policy: DeliveryPolicy | None = None,
+        validate_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        ticket_number: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if message is not None:
             if human_response is not None:
-                raise ValueError("pass only one Human Blocker response")
+                raise ValueError("pass only one resume message")
             human_response = message
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        if explicit_resume:
+            require_resume_checkout(
+                existing, self.states.root, self.publisher.git, ticket_number=ticket_number
+            )
         retry_window = None
         if (
-            validate_resume_state is not None
+            (explicit_resume or validate_resume_state is not None)
             and existing.get("status") == "waiting_external"
             and is_github_refresh_wait(existing)
         ):
@@ -307,17 +407,18 @@ class Controller:
         try:
             existing = self._load_bound_run(run_id, state=existing)
             if explicit_resume or resume_human_blocker or resume_budget_checkpoint:
-                self._require_ticket_labels(existing)
+                self._require_ticket_labels(existing, ticket_number=ticket_number)
         except GitHubReadError as error:
             if not is_github_convergence_error(error.code):
                 raise
             response_replayed = False
             if human_response is not None:
-                response_binding = _bind_current_human_response(
-                    existing, human_response
+                response_binding = _bind_resume_message(
+                    existing, human_response, ticket_number=ticket_number,
+                    human_blocker=resume_human_blocker
                 )
-                if not resume_human_blocker or response_binding is None:
-                    raise ValueError("--message requires a current Human Blocker")
+                if response_binding is None:
+                    raise ValueError("--message requires a current work subject")
                 response_replayed = response_binding == "replayed"
             audit_replayed = response_replayed and _resume_audit_matches_replay(
                 existing, new_thread=new_thread
@@ -331,6 +432,7 @@ class Controller:
                     existing,
                     new_thread=new_thread,
                     human_response_supplied=human_response is not None,
+                    ticket_number=ticket_number,
                 )
             wait_for_github_refresh(
                 existing,
@@ -345,21 +447,27 @@ class Controller:
             "abandoned",
             "abandonment_pending",
             "completed",
-            "deterministic_contradiction",
         }:
+            return existing, True
+        if existing.get("status") == "deterministic_contradiction" and not explicit_resume:
             return existing, True
         response_replayed = False
         if human_response is not None:
-            response_binding = _bind_current_human_response(
-                existing, human_response
+            response_binding = _bind_resume_message(
+                existing, human_response, ticket_number=ticket_number,
+                human_blocker=resume_human_blocker
             )
-            if not resume_human_blocker or response_binding is None:
-                raise ValueError("--message requires a current Human Blocker")
+            if response_binding is None:
+                raise ValueError("--message requires a current work subject")
             response_replayed = response_binding == "replayed"
         hold_operator_gate = (
             not explicit_resume
             and not resume_human_blocker
             and not resume_budget_checkpoint
+            and not (
+                isinstance(existing.get("active_ticket_job"), dict)
+                and existing["active_ticket_job"].get("phase") == "completed"
+            )
             and (
                 has_unresolved_subject_gate(existing)
                 or has_non_invocation_execution_failure(existing)
@@ -377,28 +485,24 @@ class Controller:
                 existing,
                 new_thread=new_thread,
                 human_response_supplied=human_response is not None,
+                ticket_number=ticket_number,
             )
         if resuming_operator_stop:
-            if new_thread or human_response is not None:
-                raise ValueError(
-                    "operator_stopped resume does not accept Agent or Human Blocker options"
-                )
             restore_operator_stop(existing)
+        if explicit_resume and ticket_number is None and is_ticket_execution_recovery(
+            existing, resume_pause["status"],
+        ):
+            # The public lifecycle has fenced out the previous Executor before
+            # applying this Run-wide recovery. A crash can occur after lease
+            # persistence but before an Invocation exists, so Invocation-only
+            # interruption recovery is insufficient here.
+            from agent_run.ticket_work import release_exited_executor_leases
+
+            release_exited_executor_leases(existing)
         if human_response is not None:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
-        existing_invocation = existing.get("active_agent_invocation")
-        resume_completed_invocation = (
-            existing.get("status") == "execution_failed"
-            and isinstance(existing_invocation, dict)
-            and existing_invocation.get("status") == "completed"
-            and invocation_attempt_is_pending(existing, existing_invocation)
-        )
         if resuming_supervision_timeout:
-            if new_thread or human_response is not None:
-                raise ValueError(
-                    "supervision timeout resume does not accept Agent or Human Blocker options"
-                )
             restore_supervision_wait(existing)
             if retry_window is not None:
                 existing["supervision_window"] = retry_window
@@ -464,6 +568,7 @@ class Controller:
         if (
             isinstance(invocation, dict)
             and invocation.get("role") in {"reviewer", "final_publication"}
+            and invocation_attempt_is_pending(state, invocation)
             and not self._run_invocation_boundary_is_current(state, invocation)
         ):
             _invalidate_stale_run_invocation(state, invocation)
@@ -472,7 +577,8 @@ class Controller:
             return state, True
         if validate_resume_state is not None:
             validation_state = state
-            if resuming_operator_stop or resuming_supervision_timeout:
+            if (resuming_operator_stop or resuming_supervision_timeout
+                    or resume_pause["status"] == "execution_failed"):
                 # These pauses were consumed above by this authorized action.
                 # Recheck refreshed work identities against the original pause,
                 # without mistaking our own consumption for external drift.
@@ -480,40 +586,13 @@ class Controller:
             validate_resume_state(validation_state)
         if hold_operator_gate:
             return existing, True
-        resuming_run_acceptance = False
-        budget_resumed = (
-            _resume_review_budget_window(
-                state,
-                effective_budget_policy,
-            )
-            if resume_budget_checkpoint
-            else False
+        apply_resume_to_state(
+            state, explicit_resume=explicit_resume,
+            resume_human_blocker=resume_human_blocker, new_thread=new_thread,
+            human_response=human_response, resume_budget_checkpoint=resume_budget_checkpoint,
+            budget_policy=effective_budget_policy, ticket_number=ticket_number,
+            source_status=str(resume_pause["status"]),
         )
-        if budget_resumed and human_response is not None:
-            raise ValueError("Review Budget resume does not accept a Human Blocker response")
-        if budget_resumed:
-            resumed_subject = True
-        elif resume_human_blocker:
-            resuming_run_acceptance = _run_acceptance_human_blocker(state)
-            resumed_subject = _resume_agent_human_blocker(state)
-            if human_response is not None and not resumed_subject:
-                raise ValueError("--message requires a current Human Blocker")
-        elif human_response is not None:
-            raise ValueError("--message requires Human Blocker resume")
-        invocation_already_resuming = (
-            isinstance(state.get("active_agent_invocation"), dict)
-            and state["active_agent_invocation"].get("status") == "resuming"
-        )
-        if new_thread and not budget_resumed:
-            if resuming_run_acceptance:
-                _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
-            else:
-                _clear_current_invocation_thread(state)
-        elif not invocation_already_resuming:
-            _restore_current_invocation_thread(
-                state, allow_completed=resume_completed_invocation
-            )
-        _mark_failed_invocation_resuming(state)
         self._ensure_delivery_branch(state, base_sha)
         self.states.save_run(run_id, state)
         self._initialize_direct_profile(state)
@@ -731,147 +810,149 @@ class Controller:
             )
         )
 
-    def record_execution_failure(self, run_id: str, message: str) -> bool:
-        state = self.states.load_run(run_id)
-        if state is None:
-            return False
-        try:
-            require_current_run_state(state)
-        except IncompatibleRunStateError:
-            return False
-        if state.get("status") in {
-            "abandoned",
-            "abandonment_pending",
-            "completed",
-            "parent_closeout_pending",
-        }:
-            return False
-        # Requeue persists its replacement intent before it performs any
-        # Publisher mutation. A lost response while retiring the old PR
-        # must preserve the pending state for a fresh currentness decision,
-        # never turn it into an ordinary failed invocation.
-        if state.get("status") == "requeue_required" and isinstance(
-            state.get("requeue_transition"), dict
-        ):
-            return False
-        if (
-            has_run_operator_gate(state)
-            and state.get("status") != "execution_failed"
-        ):
-            return False
+    def record_execution_failure(
+        self, run_id: str, message: str, *, runner_credential_failure: bool = False,
+    ) -> bool:
+        """Record an Executor-wide failure; Ticket lanes retain local failures."""
+        # Resolve external identity before the short state-write transaction.
         hint_reader = getattr(self.github, "repository_hint", None)
         repository_hint = hint_reader() if callable(hint_reader) else None
-        if (
-            isinstance(repository_hint, str)
-            and repository_hint
-            and not same_repository(state.get("repository"), repository_hint)
-        ):
-            return False
         try:
             repository = self.github.repository()
         except (GitHubReadError, OSError, ValueError):
             repository = None
-        if (
-            repository is not None
-            and not same_repository(state.get("repository"), repository.name_with_owner)
-        ):
-            return False
-        active = state.get("active_agent_invocation")
-        invocation_owns_failure = (
-            isinstance(active, dict)
-            and (
-                active.get("status") in {"running", "failed"}
-                or (
-                    active.get("status") == "completed"
-                    and invocation_attempt_is_pending(state, active)
+
+        def record() -> bool:
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+            }:
+                return False
+            # Requeue persists its replacement intent before it performs any
+            # Publisher mutation. A lost response while retiring the old PR
+            # must preserve the pending state for a fresh currentness decision,
+            # never turn it into an ordinary failed invocation.
+            if state.get("status") == "requeue_required" and isinstance(
+                state.get("requeue_transition"), dict
+            ):
+                return False
+            if (
+                has_run_operator_gate(state)
+                and state.get("status") != "execution_failed"
+                and not (runner_credential_failure and state.get("terminal_kind") != "permanent_blocked" and state.get("status") in {
+                    "parent_approval_pending", "run_approval_pending", "blocked",
+                    "ready_for_human", "publication_pending", "progress_exhausted",
+                })
+            ):
+                return False
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and not same_repository(state.get("repository"), repository_hint)
+            ):
+                return False
+            if (
+                repository is not None
+                and not same_repository(state.get("repository"), repository.name_with_owner)
+            ):
+                return False
+            failure_message = message
+            active = state.get("active_agent_invocation")
+            # Ticket lanes record their own failures. The selected Ticket is
+            # only an observation pointer, never the owner of a shared error.
+            if (isinstance(active, dict) and isinstance(active.get("role"), str)
+                    and not str(active.get("work_subject", "")).startswith("ticket:")):
+                fail_interrupted_invocation(
+                    state,
+                    role=str(active["role"]),
+                    save=lambda _state: None,
                 )
+            if runner_credential_failure:
+                code = "runner_credential_failed"
+            elif failure_message.startswith("controller_no_progress:"):
+                code = "controller_no_progress"
+                failure_message = failure_message.partition(":")[2].strip()
+            else:
+                code = (
+                    "worker_credential_renewal_failed"
+                    if "worker_credential_renewal_failed:" in failure_message
+                    else "command_failed"
+                )
+            diagnostic = run_failure_diagnostic(
+                state, code=code, message=failure_message,
             )
-        )
-        if isinstance(active, dict) and isinstance(active.get("role"), str):
-            fail_interrupted_invocation(
-                state,
-                role=str(active["role"]),
-                save=lambda _state: None,
+            state.update(
+                {
+                    "status": "execution_failed",
+                    "terminal_kind": "execution_failed",
+                    "diagnostics": [diagnostic],
+                    "updated_at": _now(),
+                }
             )
-        if message.startswith("controller_no_progress:"):
-            code = "controller_no_progress"
-            message = message.partition(":")[2].strip()
-        else:
-            code = (
-                "worker_credential_renewal_failed"
-                if "worker_credential_renewal_failed:" in message
-                else "command_failed"
-            )
-        diagnostic = _operator_gate_diagnostic(
-            state,
-            code=code,
-            message=message,
-            action_kind="execution_failure",
-            reason=code,
-            fallback_phase=str(state.get("status") or "execution_failed"),
-            bind_to_current_change_job=not invocation_owns_failure,
-        )
-        state.update(
-            {
-                "status": "execution_failed",
-                "terminal_kind": "execution_failed",
-                "diagnostics": [diagnostic],
-                "updated_at": _now(),
-            }
-        )
-        self.states.save_run(run_id, state)
-        return True
+            cast(ObjectStateStore, self.states)._save_objects_and_notify_unlocked(run_id, state)
+            return True
+
+        return self.states._commit_run(record)
 
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
     ) -> bool:
         """Persist a proven GitHub fact without treating it as retryable."""
 
-        state = self.states.load_run(run_id)
-        if state is None:
-            return False
-        try:
-            require_current_run_state(state)
-        except IncompatibleRunStateError:
-            return False
-        if state.get("status") in {
-            "abandoned",
-            "abandonment_pending",
-            "completed",
-            "parent_closeout_pending",
-            "deterministic_contradiction",
-        }:
-            return False
         hint_reader = getattr(self.github, "repository_hint", None)
         repository_hint = hint_reader() if callable(hint_reader) else None
-        if (
-            isinstance(repository_hint, str)
-            and repository_hint
-            and not same_repository(state.get("repository"), repository_hint)
-        ):
-            return False
-        state.pop("supervision_window", None)
-        state.pop("supervision_wait", None)
-        diagnostic = _operator_gate_diagnostic(
-            state,
-            code=code,
-            message=message,
-            action_kind="deterministic_contradiction",
-            reason=code,
-            fallback_phase=str(
-                state.get("status") or "deterministic_contradiction"
-            ),
-        )
-        state.update(
-            {
-                "status": "deterministic_contradiction",
-                "terminal_kind": "deterministic_contradiction",
-                "diagnostics": [diagnostic],
-                "updated_at": _now(),
-            }
-        )
-        self.states.save_run(run_id, state)
-        return True
+
+        def record() -> bool:
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+                "deterministic_contradiction",
+            }:
+                return False
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and not same_repository(state.get("repository"), repository_hint)
+            ):
+                return False
+            state.pop("supervision_window", None)
+            state.pop("supervision_wait", None)
+            diagnostic = run_failure_diagnostic(
+                state,
+                code=code,
+                message=message,
+                action_kind="deterministic_contradiction",
+            )
+            state.update(
+                {
+                    "status": "deterministic_contradiction",
+                    "terminal_kind": "deterministic_contradiction",
+                    "diagnostics": [diagnostic],
+                    "updated_at": _now(),
+                }
+            )
+            cast(ObjectStateStore, self.states)._save_objects_and_notify_unlocked(run_id, state)
+            return True
+
+        return self.states._commit_run(record)
 
     def _load_bound_run(
         self, run_id: str, *, state: dict[str, Any] | None = None
@@ -914,14 +995,24 @@ class Controller:
         return waiting
 
     def _load_run(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_run(run_id)
+        loader = getattr(self.states, "load_scheduler_run", self.states.load_run)
+        state = loader(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         require_current_run_state(state)
         return state
 
-    def _require_ticket_labels(self, state: dict[str, Any]) -> None:
-        subject, job, _ = current_change_job(state)
+    def _require_ticket_labels(
+        self, state: dict[str, Any], *, ticket_number: int | None = None
+    ) -> None:
+        if ticket_number is None:
+            subject, job, _ = current_change_job(state)
+        else:
+            jobs = state.get("ticket_jobs")
+            job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
+            subject = f"ticket:{ticket_number}"
+            if not isinstance(job, dict):
+                raise ValueError(f"Ticket #{ticket_number} has no current Job")
         if job is None or not subject.startswith("ticket:"):
             return
         number = int(job["ticket_number"])
@@ -952,6 +1043,12 @@ class Controller:
         *,
         check_requeue_currentness: bool = False,
     ) -> dict[str, Any]:
+        run = state.get("run_acceptance")
+        repair = run.get("repair_job") if isinstance(run, dict) else None
+        if isinstance(repair, dict) and isinstance(repair.get("run_branch_write_intent"), dict):
+            # Let the original Run Branch write settle before projecting new
+            # graph/currentness facts onto its still-pending authority.
+            return state
         try:
             repository = self.github.repository()
             default_head = self.publisher.resolve_base(
@@ -961,6 +1058,10 @@ class Controller:
             previous_boundary = waiting_boundary(state)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            refreshed.pop("github_refresh_resume_status", None)
+            _select_ticket_currentness_subject(
+                refreshed, previous=state, git=self.publisher.git
+            )
             supervision_window = state.get("supervision_window")
             credential_availability = state.get("credential_availability")
             if isinstance(credential_availability, dict):
@@ -1002,9 +1103,9 @@ class Controller:
                     self._mark_stale_change_job(
                         refreshed, check_requeue_currentness=True
                     )
-                if refreshed.get("status") not in {
-                    "active",
-                    "requeue_required",
+                if refreshed.get("status") in {
+                    "unsupported_scope_change", "deterministic_contradiction",
+                    "abandoned", "completed",
                 }:
                     return refreshed
                 # Graph reconciliation projects normal lifecycle phases from
@@ -1028,6 +1129,7 @@ class Controller:
                     refreshed, check_requeue_currentness=check_requeue_currentness
                 )
             self._invalidate_stale_final_run(refreshed, default_head)
+            reconcile_ticket_slots(refreshed)
             refreshed.pop("github_refresh_pending", None)
             return refreshed
         except GitHubReadError as error:
@@ -1042,15 +1144,11 @@ class Controller:
             else:
                 failed.pop("supervision_window", None)
                 failed.pop("supervision_wait", None)
-                diagnostic = _operator_gate_diagnostic(
+                diagnostic = run_failure_diagnostic(
                     failed,
                     code=error.code,
                     message=error.message,
                     action_kind="deterministic_contradiction",
-                    reason=error.code,
-                    fallback_phase=str(
-                        failed.get("status") or "deterministic_contradiction"
-                    ),
                 )
                 failed.update(
                     {
@@ -1076,11 +1174,17 @@ class Controller:
         if state.get("status") == "requeue_required" and not check_requeue_currentness:
             return
         subject, job, _ = current_change_job(state)
-        if job is None or job.get("phase") in {
-            "completed",
-            "merged",
-            "merging",
-        }:
+        if job is None:
+            return
+        if subject.startswith("run-repair:") and isinstance(job.get("run_branch_write_intent"), dict):
+            # A pending Run Branch mutation belongs to its deterministic
+            # write owner. Resume must retain it until remote readback has
+            # resolved the original operation, even when facts drifted.
+            return
+        phase = job.get("phase")
+        if phase == "publication_pending" and job.get("execution_resume_phase") in {"merging", "merged"}:
+            phase = job["execution_resume_phase"]
+        if phase in {"completed", "merging"}:
             return
         if not any(
             type(job.get(key)) is int
@@ -1100,6 +1204,16 @@ class Controller:
             # invocation-recovery checks, but cannot be mechanically labelled
             # stale solely because a required fact is absent.
             return
+        if phase == "merged":
+            reason = stale_change_job_reason(state, subject, job, self.publisher.git)
+            if reason is None:
+                return
+            integrated = job.get("integrated_sha")
+            if not isinstance(integrated, str) or not integrated:
+                raise ValueError("merged Ticket Job is missing integrated SHA")
+            _record_superseded_integration(job, integrated)
+            _mark_requeue_required(state, subject, job, reason)
+            return
         external = (
             None
             if job.get("blocked_reason") == "merged_revision_mismatch"
@@ -1107,7 +1221,21 @@ class Controller:
                 state, subject, job, self.github, self.publisher.git
             )
         )
+        if (
+            external in {
+                "change_pr_head_changed_externally",
+                "change_pr_base_changed_externally",
+            }
+            and subject.startswith("parent-only:")
+            # A failed remote read cannot prove a rewrite. Delivery will
+            # re-read the exact snapshot before reviewing or publishing.
+            and _change_pr_is_append_only(
+                state, job, self.github, self.publisher.git
+            ) is not False
+        ):
+            external = None
         if external is not None:
+            _pause_currentness_job(job, external)
             job.pop("approval_grant", None)
             state.update(
                 {
@@ -1128,7 +1256,8 @@ class Controller:
                 }
             )
             return
-        if candidate_or_acceptance_is_inconsistent(job):
+        if candidate_or_acceptance_is_inconsistent(job, budget_owner=delivery_budget_owner(state, job)):
+            _pause_currentness_job(job, "candidate_or_acceptance_inconsistent")
             job.pop("approval_grant", None)
             state.update(
                 {
@@ -1150,10 +1279,29 @@ class Controller:
             )
             return
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
+        if reason is None and subject.startswith("ticket:") and job.get(
+            "blocked_reason"
+        ) in {"effective_revision_mismatch", "merged_revision_mismatch"}:
+            reason = "ticket_requirements_changed"
         if reason is None:
+            if job.get("blocked_reason") in {
+                "change_pr_head_changed_externally", "change_pr_base_changed_externally",
+                "change_pr_closed_or_merged_externally", "change_pr_base_unknown",
+                "candidate_or_acceptance_inconsistent",
+            }:
+                # Explicit continuation still owns the permission decision.
+                # Restored external facts no longer need the currentness gate.
+                job["phase"] = continuation_phase("change", job)
+                job.pop("blocked_reason", None)
+                job.pop("pause_resume_phase", None)
+                if subject.startswith("parent-only:"):
+                    from agent_run.run_orchestration import parent_stage_state
+                    state.update(parent_stage_state(state, parent_only=True))
+                elif subject.startswith("ticket:"):
+                    sync_active_ticket_job(state)
             return
-        job.pop("approval_grant", None)
         if subject.startswith("run-repair:"):
+            job.pop("approval_grant", None)
             checkout = (
                 self.states.root
                 / "worktrees"
@@ -1184,23 +1332,7 @@ class Controller:
                     pass
             invalidate_stale_run_repair(state)
             return
-        state.update(
-            {
-                "status": "requeue_required",
-                "terminal_kind": "requeue_required",
-                "diagnostics": [
-                    {
-                        "code": reason,
-                        "message": "Change Job Generation is stale; run requeue",
-                    }
-                ],
-                "requeue_required": {
-                    "work_subject": subject,
-                    "generation": _subject_generation(job),
-                    "reason": reason,
-                },
-            }
-        )
+        _mark_requeue_required(state, subject, job, reason)
 
     def _invalidate_stale_final_run(
         self, state: dict[str, Any], default_head: str
@@ -1209,6 +1341,9 @@ class Controller:
         if state.get("status") in {
             "unsupported_scope_change",
             "deterministic_contradiction",
+            "requeue_required",
+            "blocked",
+            "ready_for_human",
         }:
             return
         acceptance = state.get("run_acceptance")
@@ -1218,10 +1353,13 @@ class Controller:
         if (
             isinstance(publication, dict)
             and publication.get("phase") not in {"merged", "abandoned", "stale"}
-            and isinstance(publication.get("merge_intent"), dict)
+            and (
+                isinstance(publication.get("merge_intent"), dict)
+                or isinstance(publication.get("approval_grant"), dict)
+            )
         ):
-            # A merge may have succeeded before GitHub's response or readback
-            # converged. The approval path owns exact merge-intent recovery.
+            # Approval owns exact PR/ref reconciliation and the handoff to
+            # stoppable updating, including any unknown merge result.
             return
         record = acceptance.get("acceptance_record")
         if not isinstance(record, dict):
@@ -1261,13 +1399,27 @@ class Controller:
         now = _now()
         policy = delivery_policy or self.delivery_policy
         language = selected_language(self.creation_language)
+        from agent_run.github_identity import resolve_worker_identity, validate_identity_snapshot
+        from agent_run.user_defaults import UserDefaultsStore
+
+        github_identity = (validate_identity_snapshot(self.creation_github_identity)
+                           if self.creation_github_identity is not None else
+                           resolve_worker_identity(UserDefaultsStore().load().get("github")))
         state: dict[str, Any] = {
             "run_id": run_id,
             "language": language,
+            "github_identity": github_identity,
+            "runner_github_identity": validate_identity_snapshot(
+                self.creation_runner_github_identity
+                or self.publisher.git.runner_identity or {"source": "host"}
+            ),
             "prompt_resources": resolve_resources(language),
-            "branch_authority_protocol": 2,
-            "review_budget_protocol": 1,
+            "branch_authority_protocol": 3,
+            "review_budget_protocol": 2,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
+            "multi_ticket_protocol": 4,
+            "ticket_agent_invocations": {},
+            "ticket_pause_requests": {},
             "semantic_attempt_protocol": 1,
             "human_response_audit_protocol": 1,
             "lifecycle_action_protocol": TASK_CONTROL_PROTOCOL,
@@ -1284,6 +1436,9 @@ class Controller:
             "frontier": [],
             "active_ticket_job": None,
             "ticket_jobs": {},
+            "ticket_integration_queue": [],
+            "ticket_work_queue": [],
+            "ticket_integration_holder": None,
             "retired_ticket_generations": {},
             "pending_ticket_retirements": {},
             "accepted_ticket_graph_revision": None,
@@ -1358,7 +1513,15 @@ class Controller:
                 identity_sha,
                 delivery_policy=self._policy_for_new_run(),
             )
-            state["base_resolution_pending"] = True
+            runner_identity = state["runner_github_identity"]
+            if runner_identity["source"] in {"pat", "app"}:
+                # Explicit identity initialization must succeed before publishing a Run.
+                state["base"]["sha"] = self.publisher.resolve_base(
+                    repository.default_branch, repository.default_head_sha,
+                )
+            else:
+                state["base_resolution_pending"] = True
+            # Host mode preserves its existing durable fetch recovery boundary.
             # Persist identity before a remote fetch.  A timeout can then be
             # resumed against the same durable Run rather than creating a new
             # branch or Worker identity on the next foreground invocation.
@@ -1377,7 +1540,7 @@ class Controller:
                 return state, True
             self._initialize_direct_profile(state)
         else:
-            state = existing
+            state = self._load_run(str(existing["run_id"]))
             require_current_run_state(state)
             self._require_current_checkout(state)
             run_id = str(state["run_id"])
@@ -1491,6 +1654,13 @@ def _run_id(
     return f"run-{parent_number}-{suffix}"
 
 
+def _pause_currentness_job(job: dict[str, Any], reason: str) -> None:
+    if job.get("phase") != "blocked":
+        job["pause_resume_phase"] = job["phase"]
+    job["phase"] = "blocked"
+    job["blocked_reason"] = reason
+
+
 def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:
     """Whether fresh external Change-PR facts require a maintainer decision."""
     return (
@@ -1518,7 +1688,8 @@ def _now() -> str:
 
 
 def _resume_agent_human_blocker(
-    state: dict[str, Any], human_response: str | None = None
+    state: dict[str, Any], human_response: str | None = None,
+    *, ticket_number: int | None = None,
 ) -> bool:
     """Re-enter exactly one top-level Agent phase after an explicit resume.
 
@@ -1526,11 +1697,11 @@ def _resume_agent_human_blocker(
     the maintainer chose to resume.  The controller neither interprets the
     condition nor declares it fixed.
     """
-    if human_blocker_subject_count(state) > 1:
+    if ticket_number is None and human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
-    target = _current_human_blocker_target(state)
+    target = _current_human_blocker_target(state, ticket_number=ticket_number)
     if target is None:
         return False
     location, subject, _generation = target
@@ -1557,10 +1728,11 @@ def _resume_agent_human_blocker(
         )
         acceptance.update(
             {
-                "phase": str(acceptance.get("human_blocker_phase", "pending")),
+                "phase": continuation_phase("run_acceptance", acceptance),
                 "prior_human_blockers": blockers,
             }
         )
+        clear_blocked_agent_return(acceptance)
         acceptance.pop("blocked_reason", None)
         state.update(
             {
@@ -1574,7 +1746,7 @@ def _resume_agent_human_blocker(
     if location == "run_publication" and isinstance(publication, dict):
         publication.update(
             {
-                "phase": str(publication.get("human_blocker_phase", "pending")),
+                "phase": continuation_phase("run_publication", publication),
                 "prior_human_blockers": _human_blockers(publication),
             }
         )
@@ -1584,6 +1756,7 @@ def _resume_agent_human_blocker(
             human_response,
             generation=_publication_generation(state),
         )
+        clear_blocked_agent_return(publication)
         publication.pop("blocked_reason", None)
         state.update(
             {
@@ -1596,16 +1769,59 @@ def _resume_agent_human_blocker(
     return False
 
 
+def _bind_resume_message(
+    state: dict[str, Any], response: str, *, ticket_number: int | None = None,
+    human_blocker: bool = False,
+) -> Literal["appended", "replayed"] | None:
+    """Attach maintainer context to the retained work, without granting permission."""
+    if human_blocker:
+        return _bind_current_human_response(state, response, ticket_number=ticket_number)
+    invocation = state.get("active_agent_invocation")
+    if ticket_number is not None:
+        subject = state.get("ticket_jobs", {}).get(str(ticket_number))
+        if not isinstance(subject, dict):
+            return None
+        generation = _subject_generation(subject)
+    elif (isinstance(invocation, dict) and invocation.get("status") != "completed"
+          and not is_ticket_execution_recovery(state, state.get("status"))):
+        role = invocation.get("role")
+        if role == "reviewer":
+            subject = _run_acceptance_for_invocation(state, invocation)
+        elif role in {"publication", "final_publication"}:
+            subject, _mirror = _publication_job_for_invocation(state, invocation)
+        else:
+            subject = _change_job_for_invocation(state, invocation)
+        generation = int(invocation["generation"])
+    else:
+        from agent_run.resume_work import resume_message_owner
+        target = resume_message_owner(state, ticket_number)
+        if target is None:
+            return None
+        _work_subject, subject, generation = target
+    blockers: list[str] = []
+    if _is_replayed_human_response(state, subject, blockers, response, generation=generation):
+        return "replayed"
+    append_human_response(subject, blockers, response, generation=generation)
+    if type(subject.get("ticket_number")) is int:
+        state["ticket_jobs"][str(subject["ticket_number"])] = subject
+    active = state.get("active_ticket_job")
+    if (isinstance(active, dict) and subject.get("ticket_number") is not None
+            and active.get("ticket_number") == subject.get("ticket_number")):
+        state["active_ticket_job"] = subject
+        sync_active_ticket_job(state)
+    return "appended"
+
+
 def _bind_current_human_response(
-    state: dict[str, Any], response: str
+    state: dict[str, Any], response: str, *, ticket_number: int | None = None
 ) -> Literal["appended", "replayed"] | None:
     """Bind response to one current Generation without releasing its gate."""
 
-    if human_blocker_subject_count(state) > 1:
+    if ticket_number is None and human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
-    target = _current_human_blocker_target(state)
+    target = _current_human_blocker_target(state, ticket_number=ticket_number)
     if target is None:
         return None
     _location, subject, generation = target
@@ -1667,10 +1883,7 @@ def _latest_unconsumed_response_audit(
             continue
         if event.get("successor_invocation_started_at") is not None:
             return None
-        if event.get("human_response_supplied") is True and event.get("kind") in {
-            "human_blocker",
-            "github_refresh_retry",
-        }:
+        if event.get("human_response_supplied") is True:
             return event
     return None
 
@@ -1681,7 +1894,6 @@ def _resume_audit_matches_replay(
     event = latest_resume_audit(state)
     return (
         event is not None
-        and event.get("kind") in {"human_blocker", "github_refresh_retry"}
         and event.get("human_response_supplied") is True
         and event.get("successor_invocation_started_at") is None
         and event.get("new_thread") is new_thread
@@ -1690,8 +1902,11 @@ def _resume_audit_matches_replay(
 
 def _current_human_blocker_target(
     state: dict[str, Any],
+    *, ticket_number: int | None = None,
 ) -> tuple[str, dict[str, Any], int] | None:
     for location, subject in operator_gate_subjects(state):
+        if ticket_number is not None and location != f"ticket:{ticket_number}":
+            continue
         if location.startswith("ticket:"):
             ticket_jobs = state.get("ticket_jobs")
             key = location.removeprefix("ticket:")
@@ -1732,13 +1947,329 @@ def _is_ready_human_blocker(value: object) -> bool:
     )
 
 
+def _resume_ticket_pause(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "blocked"
+        and job.get("blocked_reason") in {"ticket_paused", "ci_investigation_paused"}
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket pauses require --ticket")
+    job = paused[0]
+    phase = job.pop("pause_resume_phase", None)
+    if phase not in {
+        "developing", "repairing", "candidate", "reviewing", "accepted",
+        "ready_for_integration", "waiting_checks", "publication_pending",
+        "committing_candidate", "publishing",
+    }:
+        raise ValueError("Ticket pause has no recoverable phase")
+    job["phase"] = phase
+    job.pop("blocked_reason", None)
+    state["ticket_pause_requests"].pop(str(job["ticket_number"]), None)
+    state["active_ticket_job"] = job
+    state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(job["ticket_number"]))
+    if phase in {"accepted", "waiting_checks", "publishing"}:
+        job["integration_resume_phase"] = phase
+        phase = "ready_for_integration"
+        job["phase"] = phase
+    if phase == "ready_for_integration":
+        from agent_run.ticket_queue import enqueue
+
+        enqueue(state, job)
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
+def _resume_ticket_execution_failure(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "blocked"
+        and job.get("blocked_reason") in {"ticket_execution_failed", "ticket_supervision_timeout"}
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket execution failures require --ticket")
+    job = paused[0]
+    phase = job.pop("execution_resume_phase", None)
+    if phase not in {
+        "developing", "repairing", "committing_candidate", "candidate", "reviewing",
+        "ready_for_integration", "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged",
+    }:
+        raise ValueError("Ticket execution failure has no recoverable phase")
+    if job.get("blocked_reason") == "ticket_supervision_timeout":
+        job.pop("supervision_wait", None)
+        job.pop("external_wait", None)
+        state.pop("supervision_window", None)
+        state.pop("supervision_wait", None)
+    job["phase"] = phase
+    job.pop("blocked_reason", None)
+    job.pop("execution_failure", None)
+    if phase in {"ready_for_integration", "accepted", "publishing", "waiting_checks", "waiting_merge", "merging", "merged"}:
+        from agent_run.ticket_queue import enqueue
+
+        if phase != "ready_for_integration" and state["ticket_integration_holder"] != job["ticket_number"]:
+            job["integration_resume_phase"] = phase
+        enqueue(state, job)
+    state["active_ticket_job"] = job
+    invocations = state.get("ticket_agent_invocations")
+    if isinstance(invocations, dict):
+        state["active_agent_invocation"] = invocations.get(str(job["ticket_number"]))
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
+def _resume_ticket_publication_retry(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    """Open one explicitly authorized external-operation retry window."""
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "publication_pending"
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket publication pauses require an unambiguous resume target")
+    job = paused[0]
+    retry = require_publication_operation_retry(job.get("publication_operation_retry"))
+    if retry["attempts"] != retry["limit"]:
+        raise ValueError("Ticket publication pause has not exhausted its operation retry window")
+    if not isinstance(job.get("publication_sha"), str):
+        raise ValueError("Ticket publication pause is missing its current publication")
+    history = job.setdefault("publication_operation_retry_history", [])
+    if not isinstance(history, list):
+        raise ValueError("Ticket publication retry history must be a list")
+    history.append(deepcopy(retry))
+    job.pop("publication_operation_retry", None)
+    job.pop("last_publication_error", None)
+    phase = job.pop("execution_resume_phase", "publishing")
+    if phase not in {"publishing", "merging", "merged"}:
+        raise ValueError("Ticket publication pause has no recoverable phase")
+    if state["ticket_integration_holder"] != job["ticket_number"]:
+        job["integration_resume_phase"] = phase
+    job["phase"] = phase
+    acquire_ticket_slot(state, job)
+    state["active_ticket_job"] = job
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
+def _resume_ci_recovery_window(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    """Renew only one exhausted CI allowance and preserve all other budgets."""
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        candidates.extend(
+            ("ticket", job) for job in jobs.values() if isinstance(job, dict)
+        )
+    else:
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            candidates.append(("ticket", active))
+    for key in ("parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            candidates.append((key, job))
+    exhausted = [
+        (kind, job) for kind, job in candidates
+        if job.get("blocked_reason") in {
+            "ci_development_budget_exhausted"
+        }
+        and (
+            ticket_number is None
+            or (kind == "ticket" and job.get("ticket_number") == ticket_number)
+        )
+    ]
+    if not exhausted:
+        return False
+    if len(exhausted) != 1:
+        raise ValueError("multiple CI recovery checkpoints require an unambiguous resume target")
+    kind, job = exhausted[0]
+    limit = ci_limit_for_job(job)
+    repair_job = job.get("repair_job") if kind == "run_acceptance" else None
+    if repair_job is not None:
+        if not isinstance(repair_job, dict):
+            raise ValueError("Run Repair state is invalid")
+        evidence = repair_job.get("ci_evidence")
+        origin = repair_job.get("required_checks_origin")
+        budget = job["ci_recovery"]
+        publication = state.get("run_publication")
+        expected_pr = publication.get("pr_number") if isinstance(publication, dict) else None
+        origin = require_required_checks_observation(
+            origin,
+            location="run_acceptance.repair_job.required_checks_origin",
+            expected_pr_number=expected_pr if type(expected_pr) is int else None,
+            expected_head_sha=budget["failure_head"],
+            allowed_results=frozenset({"fail"}),
+        )
+        if isinstance(evidence, dict) and (
+            evidence.get("pr_number") != origin["pr_number"]
+            or ("head_sha" in evidence and evidence["head_sha"] != budget["failure_head"])
+        ):
+            raise ValueError("Run Repair CI evidence differs from its failed PR/head")
+    elif kind == "run_acceptance" and not isinstance(job.get("ci_failed_evidence"), dict):
+        raise ValueError("Run CI recovery requires its failed check evidence")
+    reset_exhausted_ci_budget(
+        job, limit=limit,
+        is_ticket=kind == "ticket",
+    )
+    job.pop("blocked_reason", None)
+    job.pop("escalation_code", None)
+    job["phase"] = "repairing"
+    if kind == "run_acceptance":
+        if isinstance(repair_job, dict):
+            repair_job.pop("blocked_reason", None)
+            repair_job.pop("escalation_code", None)
+            repair_job["phase"] = "repairing"
+            repair_job["next_attempt_kind"] = "ci_repair"
+            cycle = job.get("repair_cycle")
+            if isinstance(cycle, dict) and cycle.get("ended_reason") in {
+                "ci_development_budget_exhausted"
+            }:
+                cycle["status"] = "active"
+                cycle.pop("ended_reason", None)
+        if repair_job is None:
+            job["repair_request"] = {
+                "repair_source": "required_checks", "ci_evidence": job["ci_failed_evidence"]
+            }
+        publication = state.get("run_publication")
+        if isinstance(publication, dict):
+            publication["phase"] = "stale"
+        state.update({
+            "status": "run_acceptance_pending", "terminal_kind": "run_repair_pending",
+            "diagnostics": [],
+        })
+    else:
+        job["next_attempt_kind"] = "ci_repair"
+        if kind == "ticket":
+            state["active_ticket_job"] = job
+            sync_active_ticket_job(state)
+        state.update({
+            "status": "active" if kind == "ticket" else "parent_delivery_pending",
+            "terminal_kind": None, "diagnostics": [],
+        })
+    return True
+
+
+def _change_pr_is_append_only(
+    state: dict[str, Any], job: dict[str, Any],
+    github: GitHubReader, git: GitRepository,
+) -> bool | None:
+    pr_number = job.get("pr_number")
+    published = job.get("published_sha")
+    parent_only = state.get("delivery_type") == "parent_only"
+    branch = job.get("parent_branch" if parent_only else "repair_branch")
+    base_branch = (
+        _state_mapping(state, "base").get("branch")
+        if parent_only else state.get("run_branch")
+    )
+    if (
+        type(pr_number) is not int or not isinstance(published, str)
+        or not isinstance(branch, str) or not isinstance(base_branch, str)
+    ):
+        return False
+    live = github.live_pull_request(pr_number)
+    source = live.get("head_sha")
+    target = live.get("base_sha")
+    if (
+        live.get("state") != "OPEN"
+        or live.get("head_branch") != branch
+        or live.get("head_repository") != state.get("repository")
+        or live.get("base_repository") != state.get("repository")
+        or live.get("base_branch") != base_branch
+        or not isinstance(source, str)
+        or not isinstance(target, str)
+    ):
+        return False
+    try:
+        if not parent_only and not repair_run_branch_is_current(git, job, git.resolve(base_branch)):
+            return False
+    except GitError:
+        return False
+    try:
+        git.fetch_remote_commit(branch, source)
+        git.fetch_remote_commit(base_branch, target)
+        return (
+            git.is_ancestor(published, source)
+            and git.is_ancestor(str(job["base_sha"]), target)
+        )
+    except GitError:
+        # Git transport/read failures do not establish a changed history.
+        # The delivery stage repeats this read before it can mutate the PR.
+        return None
+
+
+def _resume_run_repair_integration(state: dict[str, Any]) -> bool:
+    acceptance = state.get("run_acceptance")
+    job = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if not isinstance(job, dict) or job.get("phase") != "blocked":
+        return False
+    reason = job.get("blocked_reason")
+    if reason not in {"integration_resync_exhausted", "integration_failed"}:
+        return False
+    if reason == "integration_resync_exhausted":
+        renew_resync_budget(
+            repair_integration_budget_owner(state, job),
+            policy_snapshot=job.get("policy_snapshot") or state["policy_snapshot"],
+        )
+    # The integration attempt can start before or after Candidate Acceptance.
+    # Re-enter that same stage so live refs are read again and any changed
+    # combination receives a fresh review through the normal delivery path.
+    job["phase"] = (
+        "accepted" if isinstance(job.get("acceptance_record"), dict) else "candidate"
+    )
+    job.pop("blocked_reason", None)
+    assert isinstance(acceptance, dict)
+    acceptance["phase"] = "repairing"
+    state.update({
+        "status": "run_acceptance_pending",
+        "terminal_kind": "run_repair_pending",
+        "diagnostics": [],
+    })
+    return True
+
+
 def _resume_review_budget_window(
-    state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None
+    state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None,
+    *, ticket_number: int | None = None,
 ) -> bool:
     """Open exactly one new bounded window after an explicit budget pause."""
 
     policy = delivery_policy or default_delivery_policy()
     subjects = budget_checkpoint_subjects(state)
+    if ticket_number is not None:
+        subjects = [
+            (kind, subject) for kind, subject in subjects
+            if kind == "ticket" and subject.get("ticket_number") == ticket_number
+        ]
     if not subjects:
         return False
     if len(subjects) > 1:
@@ -1752,7 +2283,8 @@ def _resume_review_budget_window(
             ),
         )
         subject["policy_snapshot"] = policy.snapshot()
-        state["policy_snapshot"] = policy.snapshot()
+        if ticket_number is None:
+            state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject.pop("escalation_code", None)
         _resume_change_subject_after_budget(subject)
@@ -1775,42 +2307,36 @@ def _resume_review_budget_window(
             {"status": "parent_delivery_pending", "terminal_kind": None, "diagnostics": []}
         )
         return True
-    if subject_kind == "run":
-        reset_budget(
-            subject,
-            run_repair_budget_policy_for_job(
-                subject, state_snapshot=state.get("policy_snapshot")
-            ),
-        )
-        subject["policy_snapshot"] = policy.snapshot()
-        state["policy_snapshot"] = policy.snapshot()
-        subject.pop("blocked_reason", None)
-        subject["phase"] = "repairing"
-        subject["repair_request"] = _budget_repair_request(subject)
-        state.update(
-            {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
-        )
-        return True
     run_state = _state_mapping(state, "run_acceptance")
-    reset_budget(
+    reason = str(subject["blocked_reason"])
+    renew_run_budget(
         run_state,
-        run_repair_budget_policy_for_job(
-            run_state,
-            state_snapshot=(
-                subject.get("policy_snapshot")
-                or state.get("policy_snapshot")
-            ),
-        ),
+        run_repair_budget_policy_for_job(run_state, state_snapshot=state.get("policy_snapshot")),
+        reason=reason,
     )
-    run_state["policy_snapshot"] = policy.snapshot()
-    state["policy_snapshot"] = policy.snapshot()
-    run_state["repair_request"] = _budget_repair_request(subject)
-    run_state["phase"] = "repairing"
+    subject.pop("blocked_reason", None)
+    subject.pop("escalation_code", None)
     run_state.pop("blocked_reason", None)
-    run_state.pop("repair_job", None)
-    state.update(
-        {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
-    )
+    if subject_kind == "run":
+        artifact = subject.get("acceptance_artifact")
+        has_findings = isinstance(artifact, dict) and AcceptanceArtifact.parse(artifact).has_failures
+        if isinstance(subject.get("run_integration_conflict"), dict) or not has_findings:
+            subject["phase"] = "pending"
+        else:
+            subject["phase"] = "repairing"
+            subject["repair_request"] = _budget_repair_request(subject)
+    else:
+        # Keep the active Repair, its Candidate, source evidence and delivery identity.
+        artifact = subject.get("acceptance_artifact")
+        has_findings = isinstance(artifact, dict) and AcceptanceArtifact.parse(artifact).has_failures
+        if isinstance(subject.get("run_repair_integration_conflict"), dict) or (
+            isinstance(subject.get("candidate_sha"), str) and not has_findings
+        ):
+            subject["phase"] = "candidate"
+        else:
+            _resume_change_subject_after_budget(subject)
+        run_state["phase"] = "repairing"
+    state.update({"status": "run_acceptance_pending", "terminal_kind": None, "diagnostics": []})
     return True
 
 
@@ -1911,6 +2437,9 @@ def _carry_development_thread_context(
     if thread_id is not None:
         request["development_thread_id"] = thread_id
     request["development_thread_history"] = deepcopy(history)
+    for key in ("human_response_history", "human_response_generation"):
+        if key in job:
+            request[key] = deepcopy(job[key])
     return request
 
 
@@ -1918,9 +2447,22 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
     if not isinstance(invocation, dict):
         raise ValueError("--new-thread requires a current Agent Invocation")
+    from agent_run.agent_return import agent_return_requires_human
+    from agent_run.semantic_attempt import semantic_attempt_subjects
+    bound = invocation.get("semantic_attempt")
+    for owner in semantic_attempt_subjects(state):
+        pending = owner.get("pending_semantic_attempt")
+        if isinstance(pending, dict) and isinstance(bound, dict) and pending.get("attempt_id") == bound.get("attempt_id"):
+            returned = pending.get("returned_result")
+            if isinstance(returned, dict) and not agent_return_requires_human(returned):
+                return  # A saved response retains its original Thread for closeout.
     role = invocation.get("role")
     if role == "reviewer":
         run = _run_acceptance_for_invocation(state, invocation)
+        # The returned result still owns this Attempt. Consume it before
+        # choosing a Thread for any further Reviewer work.
+        if isinstance(run.get("pending_review_result"), dict):
+            return
         run.pop("reviewer_resume_thread_id", None)
         run["reviewer_new_thread"] = True
         run["phase"] = "pending"
@@ -1935,6 +2477,10 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         if role == "development":
+            from agent_run.work_facts import integration_scene
+            scene = integration_scene(job)
+            if scene is not None and scene.get("development_summary"):
+                return
             previous_thread = invocation.get("reported_thread_id") or job.get(
                 "development_thread_id"
             ) or invocation.get("requested_thread_id")
@@ -1964,6 +2510,41 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         mirror.pop("publication_thread_id", None)
         mirror["publication_new_thread"] = True
         mirror.pop("publication_failure_resume", None)
+
+
+def _clear_successor_thread(state: dict[str, Any], ticket_number: int | None) -> None:
+    """Apply a Thread choice to retained work without a pending Invocation."""
+    from agent_run.resume_work import resume_message_owner
+    target = resume_message_owner(state, ticket_number)
+    if target is None:
+        raise ValueError("--new-thread requires current work facts")
+    work_subject, subject, _generation = target
+    from agent_run.work_facts import work_role
+    location = "run_acceptance" if work_subject.startswith(("run-acceptance:", "run-integration:")) else None
+    role = work_role(subject, location=location)
+    if work_subject.startswith("run-acceptance:") and subject.get("phase") == "repairing":
+        request = subject.get("repair_request")
+        if isinstance(request, dict):
+            subject = request
+    if role is None:
+        return  # A returned result belongs to deterministic continuation.
+    if role == "development":
+        previous = subject.pop("development_thread_id", None)
+        if isinstance(previous, str) and previous:
+            history = subject.setdefault("development_thread_history", [])
+            if previous not in history:
+                history.append(previous)
+        subject["development_new_thread"] = True
+    elif role == "reviewer" and location == "run_acceptance":
+        subject.pop("reviewer_resume_thread_id", None)
+        subject["reviewer_new_thread"] = True
+    elif role == "reviewer":
+        subject.pop("review_resume_thread_id", None)
+        subject["review_new_thread"] = True
+    else:
+        subject.pop("publication_thread_id", None)
+        subject.pop("thread_id", None)
+        subject["publication_new_thread"] = True
 
 
 def _restore_current_invocation_thread(
@@ -1999,7 +2580,7 @@ def _restore_current_invocation_thread(
         if isinstance(thread_id, str) and thread_id.strip():
             run["reviewer_resume_thread_id"] = thread_id
         run.pop("reviewer_new_thread", None)
-        run["phase"] = "pending"
+        run["phase"] = "reviewing" if "pending_review_result" in run else "pending"
         state.update(
             {
                 "status": "run_acceptance_pending",
@@ -2016,6 +2597,10 @@ def _restore_current_invocation_thread(
         if not isinstance(thread_id, str) or not thread_id.strip():
             return
         if role == "development":
+            from agent_run.work_facts import integration_scene
+            scene = integration_scene(job)
+            if scene is not None and scene.get("development_summary"):
+                return
             job["development_thread_id"] = thread_id
             job.pop("development_new_thread", None)
             job["development_failure_resume"] = True
@@ -2043,12 +2628,61 @@ def _restore_current_invocation_thread(
             mirror["publication_failure_resume"] = True
 
 
+def _ticket_invocation_is_gated(state: dict[str, Any], invocation: dict[str, Any]) -> bool:
+    subject = invocation.get("work_subject", "")
+    if not isinstance(subject, str) or not subject.startswith("ticket:"):
+        return False
+    job = state.get("ticket_jobs", {}).get(subject.removeprefix("ticket:"), {})
+    return job.get("phase") in {"blocked", "publication_pending", "completed"}
+
+
 def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
     """Make an explicit resume distinguishable from a still-unacknowledged failure."""
 
     invocation = state.get("active_agent_invocation")
-    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+    if (
+        isinstance(invocation, dict) and invocation.get("status") == "failed"
+        and not _ticket_invocation_is_gated(state, invocation)
+    ):
         invocation["status"] = "resuming"
+    invocations = state.get("ticket_agent_invocations")
+    if isinstance(invocations, dict):
+        for ticket_invocation in invocations.values():
+            if (
+                isinstance(ticket_invocation, dict)
+                and not _ticket_invocation_is_gated(state, ticket_invocation)
+                and ticket_invocation.get("status") == "failed"
+                and ticket_invocation.get("error") in {
+                    "operator_stopped", "session_interrupted", "controller_interrupted"
+                }
+            ):
+                ticket_invocation["status"] = "resuming"
+
+
+def _restore_parallel_ticket_invocations(state: dict[str, Any]) -> None:
+    invocations = state.get("ticket_agent_invocations")
+    if not isinstance(invocations, dict):
+        return
+    selected = state.get("active_agent_invocation")
+    for invocation in invocations.values():
+        if (
+            isinstance(invocation, dict)
+            and not _ticket_invocation_is_gated(state, invocation)
+            and (
+                invocation.get("status") == "completed"
+                or (invocation.get("status") == "failed" and invocation.get("error") in {
+                    "operator_stopped", "session_interrupted", "controller_interrupted"
+                })
+            )
+            and not (
+                isinstance(selected, dict)
+                and invocation.get("work_subject") == selected.get("work_subject")
+                and invocation.get("started_at") == selected.get("started_at")
+            )
+        ):
+            state["active_agent_invocation"] = invocation
+            _restore_current_invocation_thread(state, allow_completed=True)
+    state["active_agent_invocation"] = selected
 
 
 def _run_acceptance_for_invocation(
@@ -2203,6 +2837,14 @@ def _change_job_for_invocation(
             raise ValueError("current Run Repair Change Job is missing")
         _require_invocation_generation(generation, job.get("repair_generation"))
         return job
+    if subject == f"run-integration:{run_id}" and invocation.get("role") == "development":
+        acceptance = state.get("run_acceptance")
+        if not isinstance(acceptance, dict):
+            raise ValueError("current Run Acceptance job is missing")
+        _require_invocation_generation(
+            generation, acceptance.get("acceptance_generation")
+        )
+        return acceptance
     raise ValueError("Change Job Invocation work_subject is invalid")
 
 
@@ -2224,6 +2866,7 @@ def _resume_change_job(
     _resume_change_job_owner(value, human_response=human_response)
     if ticket:
         state["active_ticket_job"] = value
+        state["active_agent_invocation"] = state.get("ticket_agent_invocations", {}).get(str(value["ticket_number"]))
         status = "active"
     elif "ticket_number" in value:
         status = "active"
@@ -2233,6 +2876,30 @@ def _resume_change_job(
         {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
     )
     return True
+
+
+def _reactivate_resumed_ticket(state: dict[str, Any]) -> None:
+    """Restore a resumed Ticket to the graph frontier saved before its release."""
+    active = state.get("active_ticket_job")
+    if not isinstance(active, dict) or active.get("phase") == "blocked":
+        return
+    number = active.get("ticket_number")
+    graph = state.get("ticket_graph")
+    tickets = graph.get("tickets") if isinstance(graph, dict) else None
+    ticket = tickets.get(str(number)) if isinstance(tickets, dict) else None
+    eligibility = ticket.get("eligibility") if isinstance(ticket, dict) else None
+    if not isinstance(eligibility, dict) or eligibility.get("eligible") is not True:
+        return
+    frontier = state.get("frontier")
+    order = graph.get("ordered_ticket_numbers") if isinstance(graph, dict) else None
+    if not isinstance(frontier, list) or not isinstance(order, list):
+        return
+    if number not in frontier:
+        frontier.append(number)
+        frontier.sort(key=lambda item: order.index(item))
+    if active.get("phase") == "accepted":
+        acquire_ticket_slot(state, active)
+    state["terminal_kind"] = None
 
 
 def _resume_change_job_owner(
@@ -2249,9 +2916,16 @@ def _resume_change_job_owner(
         human_response,
         generation=_subject_generation(value),
     )
+    resume_phase = continuation_phase("change", value)
+    if (
+        value.get("attempt_kind") == "ci_repair"
+        and isinstance(value.get("integration_conflict"), dict)
+        and value.get("blocked_reason") == "agent_requires_human"
+    ):
+        resume_phase = "accepted"
     value.update(
         {
-            "phase": str(value.get("human_blocker_phase", "developing")),
+            "phase": resume_phase,
             "prior_human_blockers": blockers,
         }
     )
@@ -2259,6 +2933,7 @@ def _resume_change_job_owner(
         value["review_human_blocker_resume"] = True
     else:
         value.pop("review_human_blocker_resume", None)
+    clear_blocked_agent_return(value)
     value.pop("blocked_reason", None)
 
 
@@ -2307,15 +2982,6 @@ def _human_blockers(subject: dict[str, Any]) -> list[str]:
     return list(value)
 
 
-def _run_acceptance_human_blocker(state: dict[str, Any]) -> bool:
-    acceptance = state.get("run_acceptance")
-    return isinstance(acceptance, dict) and (
-        acceptance.get("phase") == "ready_for_human"
-        and acceptance.get("blocked_reason")
-        in {"agent_requires_human", "reviewer_requires_human"}
-    )
-
-
 def _validated_human_response(value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -2335,6 +3001,75 @@ def _subject_generation(subject: dict[str, Any]) -> int:
         if isinstance(value, int):
             return value
     return 1
+
+
+def _select_ticket_currentness_subject(
+    state: dict[str, Any], *, previous: dict[str, Any], git: GitRepository
+) -> None:
+    """Check retained Ticket requirements before selecting independent work."""
+    if state.get("status") in {
+        "unsupported_scope_change", "abandoned", "completed",
+    }:
+        return
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return
+    prior_requeue = previous.get("requeue_required")
+    if previous.get("status") == "requeue_required" and isinstance(prior_requeue, dict):
+        subject = prior_requeue.get("work_subject")
+        if isinstance(subject, str) and subject.startswith("ticket:"):
+            job = jobs.get(subject.removeprefix("ticket:"))
+            if isinstance(job, dict):
+                state["active_ticket_job"] = job
+        return
+    graph = state.get("ticket_graph")
+    order = graph.get("ordered_ticket_numbers") if isinstance(graph, dict) else None
+    if not isinstance(order, list):
+        return
+    for number in order:
+        if type(number) is not int:
+            continue
+        job = jobs.get(str(number))
+        subject = f"ticket:{number}"
+        if (
+            not isinstance(job, dict)
+            or job.get("phase") == "completed"
+            or type(job.get("ticket_branch_generation")) is not int
+            or not has_currentness_facts(subject, job)
+        ):
+            continue
+        if stale_change_job_reason(state, subject, job, git) is None and job.get(
+            "blocked_reason"
+        ) not in {"effective_revision_mismatch", "merged_revision_mismatch"}:
+            continue
+        state["active_ticket_job"] = job
+        if job.get("phase") == "merging":
+            # Reconcile an in-flight merge before replacing its Generation.
+            state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+        return
+
+
+def _mark_requeue_required(
+    state: dict[str, Any], subject: str, job: dict[str, Any], reason: str
+) -> None:
+    job.pop("approval_grant", None)
+    state.update(
+        {
+            "status": "requeue_required",
+            "terminal_kind": "requeue_required",
+            "diagnostics": [
+                {
+                    "code": reason,
+                    "message": "Change Job Generation is stale; run requeue",
+                }
+            ],
+            "requeue_required": {
+                "work_subject": subject,
+                "generation": _subject_generation(job),
+                "reason": reason,
+            },
+        }
+    )
 
 
 def _publication_generation(state: dict[str, Any]) -> int:
@@ -2370,32 +3105,211 @@ def _operator_gate_binding(
     }
 
 
-def _operator_gate_diagnostic(
-    state: dict[str, Any],
-    *,
-    code: str,
-    message: str,
-    action_kind: str,
-    reason: str,
-    fallback_phase: str,
-    bind_to_current_change_job: bool = True,
-) -> dict[str, Any]:
-    diagnostic: dict[str, Any] = {
-        "code": code,
-        "message": bounded_error(message),
-    }
-    if not bind_to_current_change_job:
-        return diagnostic
-    try:
-        work_subject, subject, _container = current_change_job(state)
-    except RequeueError:
-        return diagnostic
-    if subject is not None:
-        diagnostic["operator_gate"] = _operator_gate_binding(
-            work_subject,
-            subject,
-            action_kind=action_kind,
-            reason=reason,
-            fallback_phase=fallback_phase,
+def apply_resume_to_state(
+    state: dict[str, Any], *, explicit_resume: bool,
+    resume_human_blocker: bool, new_thread: bool,
+    human_response: str | None, resume_budget_checkpoint: bool,
+    budget_policy: DeliveryPolicy, ticket_number: int | None,
+    source_status: str,
+) -> None:
+    """Apply the shared pause, budget and Invocation continuation rules."""
+    if (
+        explicit_resume and ticket_number is None
+        and is_ticket_execution_recovery(state, source_status)
+    ):
+        # 公开生命周期已排除旧 Executor/Worker；在恢复 Thread 前收口
+        # 仍未结束的准确 Ticket 调用，不在共享故障报告时推定退出。
+        interrupt_exited_ticket_invocations(state, "controller_interrupted")
+        # Executor recovery does not authorize consuming independent local gates.
+        active = state.get("active_ticket_job")
+        if not isinstance(active, dict) or active.get("phase") not in {
+            "blocked", "publication_pending", "completed",
+        }:
+            if new_thread:
+                if isinstance(state.get("active_agent_invocation"), dict):
+                    _clear_current_invocation_thread(state)
+                elif isinstance(active, dict) and active.get("phase") is not None:
+                    _clear_successor_thread(state, active["ticket_number"])
+                # Before the first Invocation, newly selected work already
+                # starts a fresh Thread; there is no prior Thread to replace.
+            else:
+                _restore_current_invocation_thread(state, allow_completed=True)
+        _restore_parallel_ticket_invocations(state)
+        _mark_failed_invocation_resuming(state)
+        return
+    if ticket_number is not None:
+        state["active_ticket_job"] = state["ticket_jobs"][str(ticket_number)]
+        state["active_agent_invocation"] = state["ticket_agent_invocations"].get(str(ticket_number))
+    ticket_execution_resumed = False
+    budget_resumed = (
+        _resume_review_budget_window(
+            state,
+            budget_policy,
+            ticket_number=ticket_number,
         )
-    return diagnostic
+        if resume_budget_checkpoint
+        else False
+    )
+    if explicit_resume and not budget_resumed:
+        budget_resumed = _resume_ci_recovery_window(state, ticket_number=ticket_number)
+    if explicit_resume and not budget_resumed:
+        budget_resumed = _resume_ticket_publication_retry(
+            state, ticket_number=ticket_number
+        )
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        from agent_run.publication_resume import resume_parent_publication_retry
+
+        budget_resumed = resume_parent_publication_retry(state)
+    if explicit_resume and not budget_resumed:
+        ticket_execution_resumed = _resume_ticket_execution_failure(
+            state, ticket_number=ticket_number
+        )
+        budget_resumed = ticket_execution_resumed
+    if explicit_resume and not budget_resumed:
+        ticket_execution_resumed = _resume_ticket_pause(
+            state, ticket_number=ticket_number
+        )
+        budget_resumed = ticket_execution_resumed
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        budget_resumed = _resume_run_repair_integration(state)
+    if explicit_resume and not budget_resumed and ticket_number is None:
+        parent_job = state.get("parent_job")
+        if (isinstance(parent_job, dict) and parent_job.get("phase") == "blocked"
+            and parent_job.get("blocked_reason") == "integration_development_exhausted"):
+            renew_integration_development_budget(parent_job, policy_snapshot=budget_policy.snapshot())
+            parent_job["phase"] = "repairing" if parent_job.get("next_attempt_kind") == "integration" else "accepted"
+            parent_job.pop("blocked_reason", None)
+            state.update({"status": "parent_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            budget_resumed = True
+    if explicit_resume and not budget_resumed:
+        jobs = state.get("ticket_jobs", {})
+        integration_jobs = [
+            job for job in jobs.values()
+            if isinstance(job, dict) and job.get("phase") == "blocked"
+            and job.get("blocked_reason") == "integration_development_exhausted"
+            and (ticket_number is None or job.get("ticket_number") == ticket_number)
+        ] if isinstance(jobs, dict) else []
+        if len(integration_jobs) == 1:
+            job = integration_jobs[0]
+            renew_integration_development_budget(
+                job, policy_snapshot=budget_policy.snapshot(),
+            )
+            job["phase"] = "accepted"
+            job.pop("blocked_reason", None)
+            if job["phase"] == "accepted":
+                acquire_ticket_slot(state, job)
+            state["active_ticket_job"] = job
+            state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            sync_active_ticket_job(state)
+            budget_resumed = True
+    if explicit_resume and not budget_resumed:
+        active_ticket = state.get("active_ticket_job")
+        if (
+            ticket_number is not None
+            and isinstance(active_ticket, dict)
+            and active_ticket.get("ticket_number") != ticket_number
+        ):
+            active_ticket = None
+        if not isinstance(active_ticket, dict):
+            ticket_jobs = state.get("ticket_jobs")
+            matches = [
+                value for value in ticket_jobs.values()
+                if isinstance(value, dict)
+                and value.get("phase") == "blocked"
+                and value.get("blocked_reason") == "integration_resync_exhausted"
+            ] if isinstance(ticket_jobs, dict) else []
+            if ticket_number is not None:
+                matches = [
+                    value for value in matches
+                    if value.get("ticket_number") == ticket_number
+                ]
+            active_ticket = matches[0] if len(matches) == 1 else None
+        if (
+            isinstance(active_ticket, dict)
+            and active_ticket.get("phase") == "blocked"
+            and active_ticket.get("blocked_reason") == "integration_resync_exhausted"
+        ):
+            renew_resync_budget(
+                active_ticket,
+                policy_snapshot=active_ticket["policy_snapshot"],
+            )
+            active_ticket["phase"] = "accepted"
+            active_ticket.pop("blocked_reason", None)
+            if active_ticket["phase"] == "accepted":
+                acquire_ticket_slot(state, active_ticket)
+            state["active_ticket_job"] = active_ticket
+            state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
+            sync_active_ticket_job(state)
+            budget_resumed = True
+        if not budget_resumed:
+            for key, resume_phase, resume_status in (
+                ("parent_job", "accepted", "parent_delivery_pending"),
+                ("run_acceptance", "pending", "run_acceptance_pending"),
+            ):
+                subject = state.get(key)
+                if not isinstance(subject, dict) or subject.get("blocked_reason") != "integration_resync_exhausted":
+                    continue
+                if subject.get("phase") not in {"blocked", "ready_for_human"}:
+                    continue
+                renew_resync_budget(
+                    subject,
+                    policy_snapshot=subject.get("policy_snapshot") or state["policy_snapshot"],
+                )
+                subject["phase"] = (
+                    "repairing"
+                    if key == "run_acceptance"
+                    and isinstance(subject.get("repair_job"), dict)
+                    else resume_phase
+                )
+                subject.pop("blocked_reason", None)
+                state.update({
+                    "status": resume_status,
+                    "terminal_kind": None,
+                    "diagnostics": [],
+                })
+                budget_resumed = True
+                break
+    resumed_subject = False
+    if budget_resumed:
+        resumed_subject = True
+    elif resume_human_blocker:
+        resumed_subject = _resume_agent_human_blocker(
+            state, ticket_number=ticket_number
+        )
+        if human_response is not None and not resumed_subject:
+            raise ValueError("--message requires a current Human Blocker")
+    elif explicit_resume:
+        from agent_run.resume_work import resume_paused_work
+        resumed_subject = resume_paused_work(state, ticket_number=ticket_number)
+    # A targeted resume may replace the previously selected Ticket. Bind
+    # completed-result recovery to that final owner and its pending Attempt.
+    invocation = state.get("active_agent_invocation")
+    resume_completed_invocation = (
+        (explicit_resume or ticket_execution_resumed)
+        and isinstance(invocation, dict)
+        and invocation.get("status") == "completed"
+        and invocation_attempt_is_pending(state, invocation)
+    )
+    invocation_already_resuming = (
+        isinstance(state.get("active_agent_invocation"), dict)
+        and state["active_agent_invocation"].get("status") == "resuming"
+    )
+    if new_thread and budget_resumed and not ticket_execution_resumed:
+        if isinstance(invocation, dict) and invocation_attempt_is_pending(state, invocation):
+            _clear_current_invocation_thread(state)
+        else:
+            _clear_successor_thread(state, ticket_number)
+    elif new_thread:
+        if not isinstance(invocation, dict) or not invocation_attempt_is_pending(state, invocation):
+            _clear_successor_thread(state, ticket_number)
+        else:
+            _clear_current_invocation_thread(state)
+    elif not invocation_already_resuming:
+        _restore_current_invocation_thread(
+            state, allow_completed=resume_completed_invocation
+        )
+    if explicit_resume and ticket_number is None:
+        _restore_parallel_ticket_invocations(state)
+    _mark_failed_invocation_resuming(state)
+    if resumed_subject:
+        _reactivate_resumed_ticket(state)

@@ -15,8 +15,9 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
-from conftest import write_fixture
-from test_delivery import ScriptedAgents, issue
+from support.seeding import write_fixture
+from support.delivery_agents import ScriptedAgents, issue
+from support.state import persist_run_fixture
 
 
 COMMIT_MESSAGE = "fix: 恢复完整交付\n\n问题：合并完成后继续收尾。\n\n证据：保留多段正文与中文引号‘验收’。"
@@ -87,8 +88,10 @@ def test_ticket_recovery_reconciles_successful_merge_before_old_base_ref_check(
     publisher = InterruptedMergePublisher(fixture, git)
     engine = TicketDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
 
-    with pytest.raises(OSError, match="lost response after remote merge"):
-        engine.deliver(run_id)
+    waiting = engine.deliver(run_id)
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["code"] == "merge_reconciliation_pending"
+    assert waiting["ticket_integration_holder"] == 3
     interrupted = states.load_current_run(run_id)
     assert interrupted is not None
     job = interrupted["active_ticket_job"]
@@ -105,7 +108,7 @@ def test_ticket_recovery_reconciles_successful_merge_before_old_base_ref_check(
         {"head_repository": "foreign/project"}, {"head_ref": "foreign-branch"},
         {"base_repository": "foreign/project"}, {"commit_body": "正文被替换"}, {},
     ):
-        states.save_run(run_id, deepcopy(interrupted))
+        persist_run_fixture(states, run_id, deepcopy(interrupted))
         subprocess.run(
             ["git", "update-ref", f"refs/heads/{state['run_branch']}", original_integrated],
             cwd=git_repo, check=True, capture_output=True,
@@ -143,39 +146,43 @@ def test_ticket_recovery_reconciles_successful_merge_before_old_base_ref_check(
 
 
 
-def test_run_repair_recovers_merge_without_a_saved_integrated_sha(
+def test_parent_repair_recovers_push_without_a_saved_integrated_sha(
     git_repo: Path, tmp_path: Path,
 ) -> None:
     from agent_run.run_acceptance import RunAcceptanceEngine
-    from run_acceptance_test_support import ScriptedRunAgents, _completed_run
+    from support.run_agents import ScriptedRunAgents
+    from support.run_scenarios import _completed_run
 
     state, states, git = _completed_run(git_repo)
     run_id = str(state["run_id"])
-    publisher = InterruptedMergePublisher(git_repo / "github.json", git)
-    class RepairAgents(ScriptedRunAgents):
-        def publication(self, request: dict[str, Any]) -> dict[str, Any]:
-            result = super().publication(request)
-            result["commit_message"] = COMMIT_MESSAGE
+
+    class InterruptedPushPublisher(InterruptedMergePublisher):
+        writes = 0
+
+        def publish_branch(self, branch: str, head_sha: str, *, expected_remote_sha: str) -> Any:
+            self.writes += 1
+            result = super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
+            if self.writes == 1:
+                raise OSError("lost response after remote push")
             return result
 
-    agents = RepairAgents()
-    engine = RunAcceptanceEngine(git=git, states=states, github=publisher, agents=agents)
-
-    with pytest.raises(OSError, match="lost response after remote merge"):
-        engine.accept(run_id)
-    interrupted = states.load_current_run(run_id)
-    assert interrupted is not None
-    job = interrupted["run_acceptance"]["repair_job"]
-    assert job["phase"] == "merging"
-    assert "integrated_sha" not in job
+    publisher = InterruptedPushPublisher(git_repo / "github.json", git)
     publisher.mirror_remote(tmp_path / "remote.git")
+    agents = ScriptedRunAgents()
+    engine = RunAcceptanceEngine(git=git, states=states, github=publisher, agents=agents)
+    interrupted = engine.accept(run_id)
+    assert interrupted["status"] == "ready_for_human"
+    job = interrupted["run_acceptance"]["repair_job"]
+    assert job["phase"] == "blocked"
+    assert "integrated_sha" not in job
+    intent = job["run_branch_write_intent"]
+    assert publisher.live_branch_heads(state["run_branch"], "main")[0] == intent["candidate_sha"]
     work_before = (len(agents.development_requests), len(agents.review_requests))
-
     recovered = engine.accept(run_id)
-
     assert recovered["status"] == "run_publication_pending"
     require_current_run_state(states.load_current_run(run_id))
     assert (len(agents.development_requests), len(agents.review_requests)) == work_before
+    assert publisher.writes == 1
     assert len(recovered["run_acceptance"]["completed_repair_jobs"]) == 1
 
 

@@ -13,11 +13,13 @@
 - 普通人工开发在最终交付或合并前也需要完整验证，可采用同一候选的有效 CI 证据，无需固定在本地再跑一遍。需在本地完整验证时运行 `make test-full` 和 `make typecheck`；其余步骤以 [CI workflow](../../.github/workflows/ci.yml) 为准。
 - 纯文档、注释等不改变运行行为的修改，检查内容、链接和 diff 即可；可执行示例或行为合同按影响补充验证。
 
-CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown 或图片的 PR/push，保留必需的 `quality` 检查、记录跳过原因，并跳过依赖安装、测试和类型检查。PR 按相对目标分支的累计差异判断，不只看最后一次提交。`docs/` 下脚本、配置、其他目录的 Skill/Prompt，以及任何混合代码修改仍运行完整 CI。手动触发始终运行完整 CI；无法确定变更范围时也运行完整 CI。图片限 PNG、JPG、JPEG、SVG、GIF、WebP。
+CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown、HTML 文档或图片的 PR/push，保留必需的 `quality` 检查、记录跳过原因，并跳过依赖安装、测试和类型检查。HTML 限 `docs/` 及其子目录中的 `.html` 文件，包含流程原型；其他目录的 HTML 不在此范围。PR 按相对目标分支的累计差异判断，不只看最后一次提交。`docs/` 下其他脚本、配置、其他目录的 Skill/Prompt，以及任何混合代码修改仍运行完整 CI。手动触发始终运行完整 CI；无法确定变更范围时也运行完整 CI。图片限 PNG、JPG、JPEG、SVG、GIF、WebP。
 
 同一 PR 更新提交时取消尚未结束的旧 CI；不同 PR、`main` 的 push 和手动运行互不取消。合并到 `main` 后继续检查，并适用相同的轻量或完整验证规则。
 
 ## 如何编写和改造测试
+
+共享工具与有限合法场景的维护归属见[测试支撑](test-support.md)；跨用例复用从 `tests/support/` 导入。
 
 - **测试行为**：断言公开接口的结果、错误边界和状态变化，优先扩展现有测试。缺陷修复补充能暴露原缺陷的回归，覆盖直接受影响的同族场景；避免绑定私有函数结构、无关调用次数或重复实现逻辑。
 - **分配验证层次**：选择能暴露目标缺陷的最小层级；保留代表性真实 CLI、Git、持久化和进程集成测试，重复纯逻辑组合通过现有模块接口验证。参数化优先扩展轻量逻辑，避免将完整流程乘上大量组合。外部服务使用现有 fake/local 边界；真实 Codex 验证显式 opt-in，不进入普通 pytest 或常规 CI。
@@ -51,7 +53,7 @@ CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown
 | --- | --- |
 | 命令入口、暂停与恢复 | `test_cli_mvp.py`、`test_cli_run_supervision.py`、`test_cli_run_repair_supervision.py` 中的真实 run/resume/approve 与进程重新启动 |
 | 持久化、授权与版本漂移 | StateStore、Locator、`test_ticket_191_*.py`、`test_git_dispatch_fence.py` 的真实文件、锁、Git 与前后状态断言 |
-| Worker 隔离、取消与凭据回收 | `test_codex_backend.py` 的真实子进程、bubblewrap、信号、socket 和清理验证 |
+| Worker 隔离、取消与凭据回收 | `test_codex_backend.py` 的真实子进程、bubblewrap、信号验证，以及 App 凭据测试中的文件更新和清理验证 |
 | 安装与离线构建 | 安装器真实构建、激活、回滚及中断恢复；依赖在测试前准备 |
 
 同一流程中的辅助结果查询可以调用进程内公开 CLI；CLI 启动、环境继承、跨目录选择与信号测试仍需真实子进程。
