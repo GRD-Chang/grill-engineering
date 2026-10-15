@@ -16,14 +16,17 @@
 | Run Artifact、Agent 与发布 fake | `run_artifacts`、`run_agents`、`run_publication` | Artifact 数据不反向依赖场景 builder；故障注入保持在消费它的场景 |
 | 已完成 Ticket / accepted Integration / accepted Run | `run_scenarios` | 创建真实 commit/ref，Integration 的 parents/tree 与 Git 一致，持久化后供 Acceptance/Repair/Publication 消费 |
 | repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，以显式 fixture 设置已有场景；Candidate 和 currentness 由被测 Engine 执行 |
-| CLI 所需 accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号 |
+| CLI 所需 completed/accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号；completed 起点不预先执行 Run Acceptance |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
+| 并发测试的线程生命周期 | `ticket_execution` | 原窗口内先断言正常退出；失败时独立取消并释放 gate，等待本次线程池退出后才能关闭 sender 或撤销 fixture；取消不能制造成功 |
+| 共享存储故障的真实 Worker | `shared_storage`、`shared_storage_processes` | 历史准备先于 ready 计时；测试资源登记独立于受测故障存储，按 PID/start token 回收全部启动者，使用 subreaper 回收孤儿并保护无关进程 |
 | 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision`、`parent_approval_update`、`run_approval_update` | 保留真实 Git 冲突、子进程、信号及归属清理 |
 
 ## 合法前置与负向输入
 
 `run_scenarios._completed_run` 创建单个 completed Ticket，其 reviewed Candidate、Integration、
 PR merge identity 与 Run ref 对齐；`_accepted_run` 在这个基础上运行真实 Run Acceptance。
+历史 Ticket 保留准确 `ticket_branch` 归属，分支及 checkout 已清理；后续公开恢复可真实对账清理，不必重跑 Ticket 交付。
 两者使用调用方独立仓库与 StateStore，不缓存可变 Run、Locator 或工作目录。
 `test_run_scenarios.py` 从落盘状态与 Git 独立读取验证 parents/tree/ref 和 currentness。
 `prepare_run_repair` 只提供 Candidate 创建前的有限前置，不校正任意输入。
@@ -32,6 +35,11 @@ PR merge identity 与 Run ref 对齐；`_accepted_run` 在这个基础上运行�
 唯一共享 Git 模板按 worker 创建，完成写入并关闭自动维护后才返回；每例完整复制。
 测试通过或失败都由持有资源的 fixture/调用方负责回收，不能借共享支撑延长 monkeypatch
 或可变状态的生命周期。隔离回归见 `test_test_environment.py`；场景测试需能单独及有限并行运行。
+
+并发断言只涉及 Ticket frontier 时，`ticket_execution.deliver_through_ticket_frontier`
+保留真实 Driver 的监督和图刷新回调，仅在真实 `develop_frontier` 已返回、线程池已退出后结束本次调用。
+若场景还断言全票完成，应随后同步运行真实交付；目标本身要求的在途 Publication 不提前终止。
+失败取消只负责资源回收，不能替代正常退出断言。
 
 ## 选择测试层级
 

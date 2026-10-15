@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import json
-from functools import partial
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
@@ -17,13 +16,27 @@ from agent_run.executor_host import _process_start_token
 from agent_run.object_state import object_store
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
+from support.seeding import seed_run, write_fixture
+from support.shared_storage import prepare_shared_storage
+from support.shared_storage_processes import started_storage_workers, storage_executor, wait_for_storage_workers
 from support.worker_process_timing import wait_until
 from support.workspace import managed_repo, managed_state
 
 
+@pytest.fixture
+def unrelated() -> Iterator[subprocess.Popen[Any]]:
+    child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], start_new_session=True)
+    try:
+        yield child
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait(timeout=5)
+
+
 @pytest.mark.parametrize("storage_loss", [False, True], ids=["shared_failure", "storage_loss"])
 def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
-    git_repo: Path, tmp_path: Path, storage_loss: bool,
+    git_repo: Path, tmp_path: Path, storage_loss: bool, unrelated: subprocess.Popen[Any],
 ) -> None:
     # 原 test_shared_storage_stop 的代表性真实 Worker 测试在此保留全部退出
     # 边界，并增补 Executor 真正消失后的公开恢复；不重复另一套昂贵准备。
@@ -31,27 +44,12 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
     project = Path(__file__).parents[1]
     environment["PYTHONPATH"] = os.pathsep.join((str(project / "src"), str(project / "tests")))
     stderr_path = tmp_path / "storage-executor.stderr"
-    unrelated = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], start_new_session=True)
-    with stderr_path.open("w", encoding="utf-8") as stderr:
-        executor = subprocess.Popen(
-            [sys.executable, "-m", "support.shared_storage", "interrupt", str(git_repo),
-             "storage" if storage_loss else "shared"],
-            env=environment, stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True,
-        )
-    workers: dict[int, int] = {}
-    observed_tokens: dict[int, str] = {}
-    try:
-        def worker_ready(number: int) -> str | None:
-            assert executor.poll() is None, stderr_path.read_text()
-            marker = git_repo / f"{number}.ready"
-            return marker.read_text() if marker.exists() else None
-
-        for number in (3, 4):
-            pid = int(wait_until(partial(worker_ready, number)))
-            workers[number] = pid
-            token = _process_start_token(pid)
-            assert token is not None
-            observed_tokens[pid] = token
+    prepare_shared_storage(git_repo)
+    with storage_executor(git_repo, [
+        sys.executable, "-m", "support.shared_storage", "interrupt", str(git_repo),
+        "storage" if storage_loss else "shared",
+    ], environment, stderr_path) as executor:
+        workers = wait_for_storage_workers(git_repo, executor, stderr_path)
         states = StateStore(managed_state(git_repo))
         run_id, = states.list_run_ids()
         control = TaskControlStore(states.root)
@@ -198,16 +196,34 @@ def test_shared_storage_loss_and_first_public_resume_preserve_parallel_work(
         assert (developer_checkout / "retained-draft.txt").read_text() == "draft 4"
         assert (developer_checkout / "resumed.txt").read_text() == "successor started\n"
         assert unrelated.poll() is None
-    finally:
-        # 先验证真实退出，再兜底；只回收本例登记的准确进程组。
-        for child in (executor, unrelated):
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
-        for pid in workers.values():
-            if _process_start_token(pid) != observed_tokens.get(pid):
-                continue
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+
+
+def test_unready_reviewer_cleanup_reaps_the_earlier_ready_developer(
+    git_repo: Path, tmp_path: Path, unrelated: subprocess.Popen[Any],
+) -> None:
+    # 只准备两个目标 Ticket；真实 backend/bootstrap 是此回归独有的风险。
+    fixture = write_fixture(git_repo / "github.json", issues={
+        str(number): {"number": number, "title": f"Ticket {number}", "body": f"Deliver {number}",
+                      "state": "OPEN", "labels": ["ready-for-agent"], "blocked_by": []}
+        for number in (3, 4)
+    })
+    seeded = seed_run(git_repo, fixture, "1", "--ticket-development-workers", "2")
+    assert seeded.returncode == 0, seeded.stderr
+    project = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join((str(project / "src"), str(project / "tests")))
+    stderr_path = tmp_path / "storage-executor.stderr"
+    with storage_executor(git_repo, [
+        sys.executable, "-m", "support.shared_storage", "interrupt", str(git_repo), "ready-timeout",
+    ], environment, stderr_path) as executor:
+        wait_until(lambda: (git_repo / "3.before-ready").exists() and (git_repo / "4.ready").exists())
+        assert executor.poll() is None, stderr_path.read_text()
+        workers = started_storage_workers(git_repo)
+        assert {worker.number for worker in workers} == {3, 4}
+        assert all(_process_start_token(worker.pid) == worker.process_start_token for worker in workers)
+        assert not (git_repo / "3.ready").exists()
+        with pytest.raises(AssertionError, match="Worker did not reach"):
+            wait_for_storage_workers(git_repo, executor, stderr_path, timeout=0.05)
+    assert not Path(f"/proc/{executor.pid}").exists()
+    assert all(not Path(f"/proc/{worker.pid}").exists() for worker in workers)
+    assert unrelated.poll() is None

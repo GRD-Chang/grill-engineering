@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event
 from typing import Any
 
 import pytest
@@ -12,6 +12,7 @@ from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
+from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -69,17 +70,21 @@ def test_development_wait_is_supervised_before_other_agent_returns(
             return original(publisher, pr_number, **kwargs)
 
         monkeypatch.setattr(FixtureGitHubPublisher, "required_checks_snapshot", read)
-    errors: list[BaseException] = []
 
     def run() -> None:
-        try:
-            DeliveryRunEngine(controller=controller, tickets=engine).deliver_from_state(run_id, state)
-        except BaseException as error:
-            errors.append(error)
+        deliver_through_ticket_frontier(
+            DeliveryRunEngine(controller=controller, tickets=engine), run_id, state,
+        )
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    def release_all() -> None:
+        # Ticket 2 has reached the asserted completion/timeout. The unrelated
+        # Ticket only needs to return its Agent work at the stage boundary.
+        engine.development_only = True
+        release.set()
+        release_read.set()
+
+    with TicketExecution(run, release=release_all, name="development-wait-supervision") as execution:
+        errors, thread = execution.errors, execution.thread
         assert entered.wait(10) and waiting.wait(10), errors
         if slow_read:
             assert reading.wait(10), errors
@@ -105,11 +110,7 @@ def test_development_wait_is_supervised_before_other_agent_returns(
             assert len(attempts) >= 2
             assert job["ticket_closed_by_run"] is True
         require_current_run_state(current)
-    finally:
-        release.set()
-        release_read.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
 
 
 @pytest.mark.parametrize("wait_kind", ["branch", "credential"])
@@ -159,28 +160,20 @@ def test_preparation_wait_leaves_fifo_and_expires_while_work_slot_is_full(
     monkeypatch.setattr(FixtureGitHubPublisher, "ensure_ticket_branch", prepare)
     states.run_saved_observer = lambda value: expired.set() if value["ticket_jobs"].get("2", {}).get("blocked_reason") == "ticket_supervision_timeout" else None
     agents = TicketAgents(git_repo, (2, 3), develop)
-    engine = ticket_engine(git, states, fixture, agents)
-    errors: list[BaseException] = []
+    engine = ticket_engine(git, states, fixture, agents, development_only=True)
 
     def run() -> None:
-        try:
-            engine.develop_frontier(run_id, state, supervise=lambda lanes: engine.supervise(run_id, lanes))
-        except BaseException as error:
-            errors.append(error)
+        assert engine.develop_frontier(run_id, state, supervise=lambda lanes: engine.supervise(run_id, lanes))
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    with TicketExecution(run, release=release.set, name="preparation-wait-supervision") as execution:
+        errors = execution.errors
         assert entered.wait(10), errors
         current = states.load_current_run(run_id)
         wait = current["ticket_jobs"]["2"]["external_wait"]
         clock[0] = wait["supervision_window"]["deadline"] + 1
         assert expired.wait(10), errors
         assert not release.is_set()
-    finally:
-        release.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
     final = states.load_current_run(run_id)
     assert final["ticket_jobs"]["2"]["blocked_reason"] == "ticket_supervision_timeout"
     assert final["ticket_work_queue"] == []

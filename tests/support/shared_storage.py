@@ -28,14 +28,15 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_payloads import human_blocker_step
 from support.seeding import seed_run, write_fixture
+from support.shared_storage_processes import register_storage_worker
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.worker_process_timing import wait_until
 from support.workspace import managed_repo, managed_state
 from support.state import persist_run_fixture
 
 
-def interrupt_shared_storage(repo: Path, *, storage_loss: bool) -> None:
-    """运行真实并发 Reviewer/Developer，等待父进程注入持续 commit 失效。"""
+def prepare_shared_storage(repo: Path) -> None:
+    """先完成历史交付，准备耗时不占用目标 Worker 的就绪窗口。"""
     fixture = write_fixture(repo / "github.json", issues={
         str(number): {
             "number": number, "title": f"Ticket {number}", "body": f"Deliver {number}",
@@ -57,6 +58,18 @@ def interrupt_shared_storage(repo: Path, *, storage_loss: bool) -> None:
     assert state["ticket_jobs"]["2"]["phase"] == "completed"
     assert state["ticket_jobs"]["6"]["blocked_reason"] == "agent_requires_human"
 
+
+def interrupt_shared_storage(
+    repo: Path, *, storage_loss: bool, hold_reviewer_ready: bool = False,
+) -> None:
+    """运行真实并发 Reviewer/Developer，等待父进程注入持续 commit 失效。"""
+    fixture = repo / "github.json"
+    states = StateStore(managed_state(repo))
+    git = GitRepository(managed_repo(repo))
+    run_id, = states.list_run_ids()
+    state = states.load_current_run(run_id)
+    assert state is not None
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
     control = TaskControlStore(states.root)
     task = TaskKey(git.root, "example/project", 1)
     claim = control.claim_action(task, kind="run", payload={})
@@ -74,12 +87,19 @@ def interrupt_shared_storage(repo: Path, *, storage_loss: bool) -> None:
 
     script = repo / "held-worker.py"
     script.write_text('''import json, os, pathlib, signal, sys, time
-number, root = sys.argv[1:]
+number, root, ready_mode = sys.argv[1:]
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 print(json.dumps({"type": "thread.started", "thread_id": "held-" + number}), flush=True)
 if number == "4":
     pathlib.Path("retained-draft.txt").write_text("draft " + number)
-(pathlib.Path(root) / (number + ".ready")).write_text(str(os.getpid()))
+if number == "3" and ready_mode == "hold":
+    (pathlib.Path(root) / "3.before-ready").touch()
+    while True:
+        time.sleep(1)
+ready = pathlib.Path(root) / (number + ".ready")
+pending = ready.with_suffix(".pending")
+pending.write_text(str(os.getpid()))
+pending.replace(ready)
 while True:
     time.sleep(1)
 ''', encoding="utf-8")
@@ -91,16 +111,20 @@ while True:
         child = real_popen(*args, **kwargs)
         if str(script) in args[0]:
             processes.append(child)
+            number = int(args[0][args[0].index(str(script)) + 1])
+            register_storage_worker(repo, number, child.pid)
         return child
 
     def command(arguments: list[str], *, checkout: Path, **_options: Any) -> list[str]:
         number = int(checkout.name.split("ticket-", 1)[1].split("-", 1)[0])
         starts.append(number)
-        return [sys.executable, str(script), str(number), str(repo)]
+        return [sys.executable, str(script), str(number), str(repo),
+                "hold" if hold_reviewer_ready else "ready"]
 
     def worker_started(pid: int) -> None:
         token = _process_start_token(pid)
         assert token is not None
+        tokens[pid] = token
         control.mark_worker_started(task, action_id=action_id, generation=generation,
                                     pid=pid, process_start_token=token)
 
@@ -163,6 +187,7 @@ while True:
         with patch("agent_run.codex.bubblewrap_command", command), patch.object(subprocess, "Popen", popen), \
                 patch.object(sqlite3, "connect", connect), patch.object(control, "_write_unlocked", write), \
                 executor_admission_scope(close):
+            (repo / "storage-prepared").touch()
             DeliveryExecutor(
                 states=states,
                 driver_factory=lambda *_: SimpleNamespace(advance=lambda _: engine.develop_frontier(
@@ -217,7 +242,8 @@ class IndependentResumeHost(FakeExecutorHost):
 
 if __name__ == "__main__":
     if sys.argv[1] == "interrupt":
-        interrupt_shared_storage(Path(sys.argv[2]), storage_loss=sys.argv[3] == "storage")
+        interrupt_shared_storage(Path(sys.argv[2]), storage_loss=sys.argv[3] == "storage",
+                                 hold_reviewer_ready=sys.argv[3] == "ready-timeout")
     else:
         setattr(cli, "FakeExecutorHost", IndependentResumeHost)
         raise SystemExit(cli.main(sys.argv[2:]))

@@ -10,6 +10,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlBusyError
+from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -196,7 +197,7 @@ def test_control_contention_pauses_only_its_ticket(git_repo: Path) -> None:
 
 
 def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Path) -> None:
-    from threading import Event, Thread
+    from threading import Event
     from agent_run.resume_intent import bind_resume_intent
     from agent_run.task_control import TaskControlStore, TaskKey
     from agent_run.ticket_resume import admit_ticket_resume
@@ -205,7 +206,6 @@ def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Pa
     run_id = state['run_id']
     sibling_started, release_sibling, paused, resumed = (Event() for _ in range(4))
     failed_once = False
-    errors: list[BaseException] = []
     control = TaskControlStore(states.root)
     task = TaskKey(git_repo, 'example/project', 1)
     claim = control.claim_action(task, kind='run', payload={})
@@ -234,19 +234,16 @@ def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Pa
 
     states.run_saved_observer = saved
     controller = Controller(FixtureGitHubReader(fixture), git, states)
-    engine = DeliveryRunEngine(controller=controller, tickets=ticket_engine(
-        git, states, fixture, TicketAgents(git_repo, (2, 3), develop),
-    ))
+    tickets = ticket_engine(
+        git, states, fixture, TicketAgents(git_repo, (2, 3), develop), development_only=True,
+    )
+    engine = DeliveryRunEngine(controller=controller, tickets=tickets)
 
     def run() -> None:
-        try:
-            engine.deliver_from_state(run_id, state)
-        except BaseException as error:
-            errors.append(error)
+        deliver_through_ticket_frontier(engine, run_id, state)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    with TicketExecution(run, release=release_sibling.set, name="local-contention-resume") as execution:
+        errors, thread = execution.errors, execution.thread
         assert paused.wait(10), errors
         current = states.load_current_run(run_id)
         budget = deepcopy(current['ticket_jobs']['2']['review_budget'])
@@ -261,10 +258,9 @@ def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Pa
         assert accepted['ticket_jobs']['2']['review_budget'] == budget
         assert resumed.wait(10), errors
         assert thread.is_alive() and not release_sibling.is_set()
-    finally:
-        release_sibling.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
+    tickets.development_only = False
+    engine.deliver(run_id)
     final = states.load_current_run(run_id)
     assert all(final['ticket_jobs'][str(number)]['phase'] == 'completed' for number in (2, 3))
     assert final['ticket_jobs']['2']['review_budget']['development_attempts'] == 1

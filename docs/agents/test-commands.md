@@ -14,7 +14,9 @@ pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命�
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
-`make test` 默认依次运行下表前四组快速回归；交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
+`make test` 在一次 pytest 中运行下表前四组快速回归的用例并集，重叠的 StateStore/Locator 用例只执行一次。
+Policy、State、Prompts 按完整模块选择，Locator 沿用原有关键词筛选；各组独立入口和 `make test-report` 继续可用。
+交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
 快速回归通过仅代表这四组通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
 
 | 入口 | 验证范围 | 需要补充的直接影响 |

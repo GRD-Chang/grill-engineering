@@ -18,9 +18,6 @@ import sys
 import time
 from pathlib import Path
 
-from agent_run.executor_host import _process_start_token
-from agent_run.task_control import TaskControlStore, TaskKey
-
 
 def main() -> None:
     launch = json.loads(Path(sys.argv[1]).read_text())
@@ -98,13 +95,12 @@ raise SystemExit(executor.main(sys.argv[1:]))
                 else:
                     os.close(descriptor)
         assert executor.stdout is not None and executor.stdout.readline() == b"ready\n"
-        task = TaskKey(Path(launch["workspace"]), launch["repository"], launch["parent"])
-        control = TaskControlStore(Path(launch["state_root"]))
-        binding = dict(action_id=launch["action_id"], generation=launch["generation"],
-                       pid=executor.pid, process_start_token=_process_start_token(executor.pid))
-        control.mark_process_started(task, **binding)
-        control.mark_handshake(task, **binding)
-        (root / "ready").write_text(str(executor.pid))
+        # The parent registers the controlled Executor's fixture identity after
+        # this real credential/fd-store barrier. The isolated manager needs no
+        # business-state imports before observing the process and exit hook.
+        pending = root / "ready.pending"
+        pending.write_text(str(executor.pid))
+        pending.replace(root / "ready")
         code = executor.wait()
         (root / "exit-code").write_text(str(code))
         if hook:

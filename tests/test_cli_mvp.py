@@ -28,6 +28,9 @@ from support.cli import (
 )
 from support.cli_payloads import passing_acceptance, publication, repair_acceptance, ticket
 from support.cli_crash import run_cli_at_development_boundary
+from support.published_run import (
+    prepare_accepted_run, prepare_completed_run, prepare_published_run,
+)
 
 
 def _assert_credential_wait_is_not_public(
@@ -118,11 +121,8 @@ def test_run_reaches_explicit_approval_with_status_and_history(
 def test_displayed_final_approval_selects_the_unique_active_run(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = _run_agents(git_repo / "agents.json")
-
-    first = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    first_run_id = str(stdout_json(first)["run_id"])
+    fixture, first = prepare_published_run(git_repo)
+    first_run_id = str(first["run_id"])
     first_approved = run_cli(git_repo, fixture, "approve", first_run_id)
     assert first_approved.returncode == 0, first_approved.stderr
     assert stdout_json(first_approved)["status"] == "completed"
@@ -169,12 +169,8 @@ def test_displayed_final_approval_selects_the_unique_active_run(
 def test_parent_approval_selector_refuses_two_approval_ready_runs(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = _run_agents(git_repo / "agents.json")
-    pending = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
-    )
-    run_id = str(stdout_json(pending)["run_id"])
+    fixture, published = prepare_published_run(git_repo)
+    run_id = str(published["run_id"])
     duplicate_id = f"{run_id}-duplicate"
     original = snapshot_run_states(git_repo)[run_id]
     duplicate = json.loads(json.dumps(original).replace(run_id, duplicate_id))
@@ -299,12 +295,8 @@ def test_current_long_blocker_is_full_in_status_and_bounded_in_history(
 def test_history_continues_after_timeline_capacity_without_new_invocations(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = _run_agents(git_repo / "agents.json")
-    pending = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
-    )
-    run_id = str(stdout_json(pending)["run_id"])
+    fixture, published = prepare_published_run(git_repo)
+    run_id = str(published["run_id"])
     state = load_only_run_state(git_repo)
     invocation_count = len(state["agent_invocation_history"])
     capacity_at = state["timeline"][-1]["at"]
@@ -409,18 +401,19 @@ def test_history_renders_device_timezone_and_keeps_json_events_in_utc(
 def test_history_keeps_later_invocations_after_an_early_timeline_tail(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, _ = prepare_completed_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
     agent_data = json.loads(agents.read_text(encoding="utf-8"))
-    agent_data["developments"].append(
+    agent_data["developments"] = [
         {
             "expected_thread_id": None,
             "thread_id": "run-repair-developer",
             "summary": "Repaired the accumulated Run.",
             "write_files": {"run-repair.txt": "repaired\n"},
         }
-    )
-    agent_data["publications"].append(publication())
+    ]
+    agent_data["publications"] = []
+    agent_data["reviews"] = []
     agent_data["run_reviews"] = [
         repair_acceptance("run-reviewer-1"),
         passing_acceptance("run-repair-reviewer", "Run repair passed."),
@@ -757,20 +750,16 @@ def test_run_retries_initial_credential_before_starting_each_ticket_worker(
     assert attempts[0]["status"] == "completed"
 
 
-@pytest.mark.parametrize(
-    ("failure", "http_status"),
-    [
-        ("temporary issuer outage", None),
-        ({"message": "temporary issuer outage", "http_status": 503}, 503),
-    ],
-)
 def test_run_pauses_after_the_initial_worker_credential_window_expires(
-    git_repo: Path, failure: object, http_status: int | None
+    git_repo: Path,
 ) -> None:
+    # HTTP 字段有无的组合在 test_credential_availability 中验证；这里保留真实 CLI。
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
-    data["initial_credential_failures"] = [failure] * 130
+    data["initial_credential_failures"] = [
+        {"message": "temporary issuer outage", "http_status": 503}
+    ] * 130
     agents.write_text(json.dumps(data), encoding="utf-8")
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
@@ -786,16 +775,15 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         "phase": "developing",
         "resume_status": "active",
         "retry_count": 13,
+        "http_status": 503,
     }
-    if http_status is not None:
-        availability["http_status"] = http_status
     assert state["credential_availability"] == availability
     assert state["supervision_wait"]["kind"] == "github_convergence"
     assert "Worker credential availability" in state["supervision_wait"]["waiting_for"]
     assert state["supervision_wait"]["credential_failure_class"] == (
         "credential_unavailable"
     )
-    assert state["supervision_wait"].get("credential_http_status") == http_status
+    assert state["supervision_wait"]["credential_http_status"] == 503
     # The final sleep expires the window; it does not authorize another retry.
     assert state["supervision_wait"]["retry_count"] == 13
     assert state["active_agent_invocation"] is None
@@ -808,7 +796,7 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         )
         snapshot = output["supervision"]
         assert snapshot["credential_failure_class"] == "credential_unavailable"
-        assert snapshot.get("credential_http_status") == http_status
+        assert snapshot["credential_http_status"] == 503
         assert snapshot["next_action"] == f"agent-run resume {run_id} --ticket 3"
         text = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
@@ -835,7 +823,10 @@ def test_run_retries_initial_credential_for_final_workers_once(
     invocation_role: str,
     phase: str,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    if fixture_role == "run_publications":
+        fixture, _ = prepare_accepted_run(git_repo)
+    else:
+        fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["initial_credential_failures_by_role"] = {
@@ -885,7 +876,10 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
     work_subject: str,
     resume_status: str,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    if fixture_role == "run_publications":
+        fixture, _ = prepare_accepted_run(git_repo)
+    else:
+        fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock_multiplier"] = 120
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
@@ -1373,11 +1367,12 @@ def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
 
 
 def test_publish_run_retries_final_pr_after_external_wait(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, published = prepare_published_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
-    started = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = stdout_json(started)["run_id"]
+    run_id = str(published["run_id"])
     state = load_only_run_state(git_repo)
+    original_invocations = state["agent_invocation_history"]
+    original_pr = state["run_publication"]["pr_number"]
     state.update({"status": "waiting_external", "terminal_kind": "waiting_external"})
     state["run_publication"]["phase"] = "waiting_checks"
     replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
@@ -1388,6 +1383,10 @@ def test_publish_run_retries_final_pr_after_external_wait(git_repo: Path) -> Non
 
     assert retried.returncode == 0, retried.stderr
     assert stdout_json(retried)["status"] == "run_approval_pending"
+    current = load_only_run_state(git_repo)
+    assert current["agent_invocation_history"] == original_invocations
+    assert current["run_publication"]["pr_number"] == original_pr
+    assert len(json.loads(fixture.read_text())["delivery"]["pull_requests"]) == 2
 
 
 def test_run_supervises_read_failures_after_supervision_timeout(

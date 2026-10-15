@@ -121,6 +121,8 @@ def _completed_run(
     state["ticket_jobs"] = {
         ticket_key: {
             "ticket_number": ticket_number,
+            # 历史 Ticket 的分支已清理，恢复清理仍需要其准确归属身份。
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-{ticket_number}",
             "phase": "completed",
             "development_thread_id": "ticket-developer",
             "development_thread_history": [],

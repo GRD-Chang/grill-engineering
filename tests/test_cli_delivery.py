@@ -30,7 +30,9 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state, prepare_workspace
-from support.published_run import prepare_accepted_run, prepare_published_run
+from support.published_run import (
+    prepare_accepted_run, prepare_completed_run, prepare_published_run,
+)
 from support.cli import (
     load_only_run_state,
     run_internal_stage,
@@ -4846,22 +4848,8 @@ def test_resume_targets_failed_run_repair_development_not_completed_ticket(
     expected_thread: str | None,
     successor_mode: str,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    ticket_agents = git_repo / "ticket-agents.json"
-    ticket_agents.write_text(json.dumps({
-        "developments": [{
-            "expected_thread_id": None, "thread_id": "ticket-developer",
-            "summary": "Delivered the Ticket candidate.",
-            "write_files": {"feature.txt": "ticket\n"},
-        }],
-        "publications": [publication()],
-        "reviews": [passing_acceptance("ticket-reviewer", "Ticket passed.")],
-    }), encoding="utf-8")
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents),
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    fixture, completed = prepare_completed_run(git_repo)
+    run_id = str(completed["run_id"])
 
     failed_agents = git_repo / "failed-run-repair-agents.json"
     failed_agents.write_text(json.dumps({

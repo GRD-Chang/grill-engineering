@@ -17,6 +17,7 @@ import pytest
 
 from agent_run.notifications import read_notifications
 from agent_run import cli
+from agent_run.executor_host import _process_start_token
 from agent_run.runner_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
 from agent_run.systemd_executor_host import (
     FakeSystemdTransport, SystemdStartResult, SystemdUnitObservation, SystemdUserExecutorHost,
@@ -71,10 +72,7 @@ else:
         def start(self, **kwargs: Any) -> SystemdStartResult:
             nonlocal manager
             super().start(**kwargs)
-            launch = {"root": str(launch_root), "workspace": str(spec.task.workspace),
-                      "repository": spec.task.repository, "parent": spec.task.parent_number,
-                      "state_root": str(states.root), "action_id": spec.action_id,
-                      "generation": spec.generation, "properties": kwargs["properties"],
+            launch = {"root": str(launch_root), "properties": kwargs["properties"],
                       "command": kwargs["command"]}
             path = launch_root / "launch.json"
             path.write_text(json.dumps(launch))
@@ -87,8 +85,12 @@ else:
                 assert manager.poll() is None, manager.communicate(timeout=1)
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
-            self.unit = SystemdUnitObservation("running", kwargs["description"],
-                                              int((launch_root / "ready").read_text()), None)
+            pid = int((launch_root / "ready").read_text())
+            binding = dict(action_id=spec.action_id, generation=spec.generation,
+                           pid=pid, process_start_token=_process_start_token(pid))
+            control.mark_process_started(spec.task, **binding)
+            control.mark_handshake(spec.task, **binding)
+            self.unit = SystemdUnitObservation("running", kwargs["description"], pid, None)
             return SystemdStartResult("accepted")
 
     transport = IsolatedManager()

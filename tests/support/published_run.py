@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from support.run_scenarios import _accepted_run
+from support.run_scenarios import _accepted_run, _completed_run
 
 import json
 from pathlib import Path
@@ -16,6 +16,18 @@ from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.run_publication import InvocationRunPublicationAgents
 
 
+def prepare_completed_run(
+    repo: Path, *, ticket_number: int = 3, delivery: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """准备历史 Ticket 已交付、尚未进行 Run Acceptance 的真实 CLI 起点。"""
+    workspace = prepare_workspace(repo)
+    state, _, _ = _completed_run(
+        workspace.repository_root, ticket_number=ticket_number,
+        state_root=workspace.state_root,
+    )
+    return _register_historical_run(repo, state, ticket_number, delivery)
+
+
 def prepare_accepted_run(
     repo: Path, *, ticket_number: int = 3, delivery: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
@@ -29,7 +41,15 @@ def prepare_accepted_run(
         workspace.repository_root, ticket_number=ticket_number,
         state_root=workspace.state_root,
     )
-    fixture = workspace.repository_root / "github.json"
+    return _register_historical_run(repo, state, ticket_number, delivery)
+
+
+def _register_historical_run(
+    repo: Path, state: dict[str, Any], ticket_number: int,
+    delivery: dict[str, Any] | None,
+) -> tuple[Path, dict[str, Any]]:
+    """登记同一历史 Ticket PR、Locator 和 idle ownership，不推进被测动作。"""
+    fixture = managed_repo(repo) / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data.setdefault("delivery", {}).update(delivery or {})
     data["delivery"]["closed_issues"] = [ticket_number]

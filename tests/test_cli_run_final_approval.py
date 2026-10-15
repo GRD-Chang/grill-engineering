@@ -76,18 +76,11 @@ def test_run_supervises_pending_final_run_checks_in_one_call(
 def test_final_run_approval_survives_pending_checks_until_the_same_pr_merges(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "none", "pending", "pass"]},
-    )
-    agents = run_agents(git_repo / "agents.json")
-
-    awaiting_approval = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
-    )
-    assert stdout_json(awaiting_approval)["status"] == "run_approval_pending"
-    run_id = str(stdout_json(awaiting_approval)["run_id"])
+    fixture, published = prepare_published_run(git_repo)
+    run_id = str(published["run_id"])
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"].update(required_checks=["pending", "pass"], check_position=0)
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
     completed = run_cli(git_repo, fixture, "approve", run_id)
     assert completed.returncode == 0, completed.stderr
@@ -337,19 +330,12 @@ def test_parent_approval_supervises_pending_checks_to_timeout(
 def test_final_approval_supervises_pending_checks_to_timeout(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "none", "pending"]},
-        # Advance the existing clock; keep the real supervision budget.
-        supervision_clock_multiplier=120,
-    )
-    agents = run_agents(git_repo / "agents.json")
-    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert awaiting.returncode == 0, awaiting.stderr
-    assert stdout_json(awaiting)["status"] == "run_approval_pending"
-    waiting = run_cli(git_repo, fixture, "approve", str(stdout_json(awaiting)["run_id"]))
+    fixture, published = prepare_published_run(git_repo)
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["supervision_clock_multiplier"] = 120
+    fixture_data["delivery"].update(required_checks=["pending"], check_position=0)
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    waiting = run_cli(git_repo, fixture, "approve", str(published["run_id"]))
 
     assert waiting.returncode == 2, waiting.stderr
     assert stdout_json(waiting)["status"] == "supervision_timeout"
@@ -583,10 +569,8 @@ def test_status_comment_failure_after_approval_resumes_same_run_across_processes
 def test_resume_finished_delivery_only_retries_unfinished_cleanup(git_repo: Path) -> None:
     from agent_run.state import StateStore
 
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
-    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(awaiting)["run_id"])
+    fixture, published = prepare_published_run(git_repo)
+    run_id = str(published["run_id"])
     approved = run_cli(git_repo, fixture, "approve", run_id)
     assert approved.returncode == 0, approved.stderr
     state = load_only_run_state(git_repo)
@@ -708,12 +692,20 @@ def test_resume_schedules_final_cleanup_after_closeout_committed_before_a_crash(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_run.delivery_cleanup import DeliveryCleanupEngine
+    from agent_run.git import GitRepository
+    from agent_run.github_fixture import FixtureGitHubPublisher
+    from agent_run.state import StateStore
     from support.inprocess_cli import invoke_cli_inprocess
+    from support.workspace import managed_repo
 
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
-    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(awaiting)["run_id"])
+    fixture, published = prepare_published_run(git_repo)
+    run_id = str(published["run_id"])
+    # 与完整 Ticket 前置相同，历史 Ticket 已完成清理；这里只中断 Final 清理登记。
+    git = GitRepository(managed_repo(git_repo))
+    DeliveryCleanupEngine(
+        git=git, states=StateStore(managed_state(git_repo)),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).resume(run_id)
 
     def exit_before_cleanup(self: Any, state: dict[str, Any]) -> dict[str, Any]:
         raise SystemExit("process exited before scheduling final cleanup")

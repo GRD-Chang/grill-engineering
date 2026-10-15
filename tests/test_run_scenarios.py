@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.run_currentness import refresh_run_currentness, ticket_completion_records
+from agent_run.state import StateStore
 from support.repairing_run import prepare_run_repair
 from support.run_scenarios import _accepted_run, _completed_run
 
@@ -35,6 +37,18 @@ def test_completed_ticket_scenario_has_real_integration_identity(
         loaded, reader=FixtureGitHubReader(git_repo / "github.json"), git=git,
     ) == git.resolve("main")
     assert ticket_completion_records(loaded) == before
+    branch = f"agent-run/{state['run_id']}/ticket-{ticket_number}"
+    assert job["ticket_branch"] == branch
+    cleaned = DeliveryCleanupEngine(git=git, states=states, github=publisher).resume(
+        str(state["run_id"]),
+    )
+    item = cleaned["delivery_cleanup"]["items"][branch]
+    assert item["status"] == "completed"
+    assert item["expected_head_sha"] == record["publication_sha"]
+    reopened = StateStore(states.root).load_current_run(str(state["run_id"]))
+    assert reopened is not None
+    assert ticket_completion_records(reopened) == before
+    assert git.resolve(str(reopened["run_branch"])) == integrated
 
 
 def test_accepted_run_scenario_is_persisted_and_repair_setup_is_isolated(git_repo: Path) -> None:

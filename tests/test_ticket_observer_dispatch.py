@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event
 
 import pytest
 
@@ -17,6 +17,7 @@ from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.ticket_resume import admit_ticket_resume
 from agent_run.object_state import save_owned
+from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -28,7 +29,6 @@ def test_resume_dispatches_after_development_drains_before_observer_returns(
     run_id = state['run_id']
     publishing, release_publication, developing, release_development = (Event() for _ in range(4))
     drained, admitted, resumed = (Event() for _ in range(3))
-    errors: list[BaseException] = []
     preparation = True
 
     def develop(number: int) -> None:
@@ -77,17 +77,23 @@ def test_resume_dispatches_after_development_drains_before_observer_returns(
             engine.supervise(run_id, lanes)
 
     def run() -> None:
-        try:
-            if publication_timing == 'integration_only':
-                DeliveryRunEngine(controller=controller, tickets=engine).deliver_from_state(run_id, state)
-            else:
-                engine.develop_frontier(run_id, state, after_lane=after_lane, supervise=supervise)
-        except BaseException as error:
-            errors.append(error)
+        if publication_timing == 'integration_only':
+            deliver_through_ticket_frontier(
+                DeliveryRunEngine(controller=controller, tickets=engine), run_id, state,
+            )
+        else:
+            assert engine.develop_frontier(run_id, state, after_lane=after_lane, supervise=supervise)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    def release_all() -> None:
+        # The already-running observer finishes Ticket 2. Later observations
+        # leave unrelated candidates at the existing integration boundary.
+        engine.development_only = True
+        admitted.set()
+        release_development.set()
+        release_publication.set()
+
+    with TicketExecution(run, release=release_all, name="observer-resume-dispatch") as execution:
+        errors, thread = execution.errors, execution.thread
         if publication_timing != 'integration_only':
             assert developing.wait(10), errors
             if publication_timing == 'ongoing':
@@ -112,12 +118,7 @@ def test_resume_dispatches_after_development_drains_before_observer_returns(
         admitted.set()
         assert resumed.wait(5), errors
         assert not release_publication.is_set() and thread.is_alive()
-    finally:
-        admitted.set()
-        release_development.set()
-        release_publication.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
     final = states.load_current_run(run_id)
     assert final is not None
     assert final['ticket_jobs']['4']['candidate_sha'] is not None
@@ -162,9 +163,12 @@ def test_observer_only_interval_handles_completion_failure_and_stop(git_repo: Pa
         except BaseException as error:
             errors.append(error)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    def release_all() -> None:
+        continue_dispatch.set()
+        release_observer.set()
+
+    with TicketExecution(run, release=release_all, name="observer-only-dispatch") as execution:
+        thread = execution.thread
         assert drained.wait(10), errors
         if outcome == 'stop':
             current = states.load_current_run(run_id)
@@ -177,13 +181,6 @@ def test_observer_only_interval_handles_completion_failure_and_stop(git_repo: Pa
             assert closed.wait(5), errors
             assert closures == [None]
             assert thread.is_alive() and not release_observer.is_set()
-        release_observer.set()
-        thread.join(10)
-        assert not thread.is_alive()
+        execution.finish(timeout=10)
         assert errors == ([failure] if outcome == 'failure' else [])
         assert closures == ([failure] if outcome == 'failure' else [None] if outcome == 'stop' else [])
-    finally:
-        continue_dispatch.set()
-        release_observer.set()
-        thread.join(10)
-    assert not thread.is_alive()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event
 from typing import Any
 
 import pytest
@@ -15,6 +15,7 @@ from agent_run.notification_events import events
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.task_control import ActionBusyError, TaskControlBusyError, TaskControlStore, TaskKey
+from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 
 
@@ -93,9 +94,8 @@ def test_graph_removal_closes_resume_and_notifies_before_sibling_finishes(
         except BaseException as error:
             errors.append(error)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    with TicketExecution(run, release=release.set, name="graph-removal-dispatch") as execution:
+        thread = execution.thread
         assert started.wait(5), errors
         assert closed.wait(5), errors
         assert thread.is_alive() and not release.is_set()
@@ -106,10 +106,8 @@ def test_graph_removal_closes_resume_and_notifies_before_sibling_finishes(
         with pytest.raises(ActionBusyError):
             with control.ticket_resume_transaction(task, **identity):
                 pytest.fail("graph-invalid dispatch admitted Resume")
-    finally:
-        release.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
+    assert not errors, errors
     assert development_calls.count(2) == development_calls.count(3) == 1
     if refresh_contention:
         assert refresh_calls >= 2
@@ -123,7 +121,6 @@ def test_recovered_graph_observation_keeps_same_dispatcher_alive(
     monkeypatch.setattr(delivery, "SUPERVISION_POLL_SECONDS", 0.01)
     state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=2)
     started, release, observed_again = Event(), Event(), Event()
-    errors: list[BaseException] = []
     closures: list[BaseException | None] = []
     calls: list[int] = []
 
@@ -132,7 +129,9 @@ def test_recovered_graph_observation_keeps_same_dispatcher_alive(
         started.set()
         assert release.wait(10)
 
-    tickets = ticket_engine(git, states, fixture, TicketAgents(git_repo, (2, 3), develop))
+    tickets = ticket_engine(
+        git, states, fixture, TicketAgents(git_repo, (2, 3), develop), development_only=True,
+    )
     original = tickets.supervise
     observations = 0
 
@@ -149,20 +148,13 @@ def test_recovered_graph_observation_keeps_same_dispatcher_alive(
     engine = DeliveryRunEngine(controller=Controller(FixtureGitHubReader(fixture), git, states), tickets=tickets)
 
     def run() -> None:
-        try:
-            with executor_admission_scope(closures.append):
-                engine.deliver_from_state(state["run_id"], state)
-        except BaseException as error:
-            errors.append(error)
+        with executor_admission_scope(closures.append):
+            deliver_through_ticket_frontier(engine, state["run_id"], state)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    with TicketExecution(run, release=release.set, name="recovered-graph-dispatch") as execution:
+        errors, thread = execution.errors, execution.thread
         assert observed_again.wait(5), errors
         assert thread.is_alive() and not release.is_set()
         assert closures == []
-    finally:
-        release.set()
-        thread.join(10)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=10)
     assert calls.count(2) == calls.count(3) == 1
