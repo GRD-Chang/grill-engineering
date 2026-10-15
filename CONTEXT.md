@@ -417,6 +417,7 @@ _Avoid_: 裸 `run_id`、单张 Child Ticket、整个 Repository、以启动目�
 
 **Delivery Run（交付运行）**:
 由一次人工授权在一个 Local Delivery Workspace 中启动、覆盖一个 Delivery Task 的 Parent Issue 及其相关 Ticket、并以最终整体验收结束的交付范围。一个 Run 拥有独立身份和集成边界；同一工作区内同一 Delivery Task 的多个 Run 只能按时间先后存在，不能并行。普通 `run` 本身就是创建或恢复授权：没有未完成 Run 且 Parent 当前可执行时创建后继 Run，旧终态 Run 只保留为历史，不复活、不覆盖。
+各交付对象分别拥有自身的工作事实，Run 级故障和单对象故障有各自明确归属。当前选中对象只是观察或推进某项工作的视角，不代替其他对象的状态。
 _Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务、同一 Parent 的并行 Run、复活或覆盖终态 Run、额外 `--new-run`
 
 **Run 定位索引（Run Locator Index）**:
