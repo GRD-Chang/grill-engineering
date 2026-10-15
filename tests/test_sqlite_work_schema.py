@@ -28,9 +28,9 @@ def test_work_query_rejects_current_storage_after_successful_read(
             # The underscore is a literal prefix character, not a LIKE wildcard.
             connection.execute("CREATE TABLE sqlitex_extra(value TEXT)")
         elif damage == "missing_index":
-            connection.execute("DROP INDEX current_work_objects")
+            connection.execute("DROP INDEX work_invocation_resume")
         elif damage == "missing_table":
-            connection.execute("DROP TABLE run_history")
+            connection.execute("DROP TABLE work_invocation_history")
         else:
             connection.execute("CREATE TRIGGER unexpected AFTER INSERT ON runs BEGIN SELECT 1; END")
         connection.commit()

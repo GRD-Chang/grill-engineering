@@ -286,4 +286,7 @@ def _accepted_run(
         github=publisher,
         default_head_sha=git.resolve("main"),
     ).accept(str(state["run_id"]))
-    return accepted, states, git, publisher
+    # 场景夹具交付完整持久事实，供后续测试明确修改和重新保存。
+    complete = states.load_current_run(str(accepted["run_id"]))
+    assert complete is not None
+    return complete, states, git, publisher

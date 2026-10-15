@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, cast
 
 from agent_run.resume_work import continuation_phase
+from agent_run.sqlite_change_job_gates import CURRENTNESS_REASONS, retains_run_control
+from agent_run.work_facts import work_phase
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
@@ -87,7 +89,7 @@ from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
-from agent_run.object_state import ObjectStateStore, object_store
+from agent_run.object_state import ObjectStateStore, object_store, current_projection_facts
 from agent_run.state import ConcurrentRunStateError, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -315,8 +317,10 @@ class Controller:
                         ticket_number=ticket_number,
                     )
                     latest = cast(ObjectStateStore, self.states).load_unchanged_run(run_id)
+                    returned_facts = current_projection_facts(result[0])
+                    latest_facts = current_projection_facts(latest) if latest is not None else {}
                     if latest is not None and any(
-                        result[0].get(key) != latest.get(key)
+                        returned_facts.get(key) != latest_facts.get(key)
                         for key in (
                             "status", "terminal_kind", "operator_stop", "diagnostics",
                             "ticket_jobs", "ticket_pause_requests",
@@ -364,6 +368,9 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        if any((explicit_resume, resume_human_blocker, resume_budget_checkpoint,
+                new_thread, human_response is not None)):
+            existing = self._load_change_job_history(run_id, existing, ticket_number=ticket_number)
         if explicit_resume:
             require_resume_checkout(
                 existing, self.states.root, self.publisher.git, ticket_number=ticket_number
@@ -582,7 +589,8 @@ class Controller:
                 # These pauses were consumed above by this authorized action.
                 # Recheck refreshed work identities against the original pause,
                 # without mistaking our own consumption for external drift.
-                validation_state = {**state, **resume_pause}
+                validation_state = state.copy()
+                validation_state.update(resume_pause)
             validate_resume_state(validation_state)
         if hold_operator_gate:
             return existing, True
@@ -620,6 +628,7 @@ class Controller:
             and is_github_refresh_wait(existing)
         ):
             raise RequeueError("requeue is only allowed in requeue_required state")
+        existing = self._load_change_job_history(run_id, existing)
         if prepare_state is not None:
             # Keep the accepted Action in memory until qualification succeeds
             # or an external wait is durably recorded. Refusal consumes no work.
@@ -691,7 +700,8 @@ class Controller:
     def finalize_requeue(self, run_id: str) -> dict[str, Any]:
         """Commit a prepared replacement only after old assets are retired."""
         try:
-            state = self._load_bound_run(run_id)
+            state = self._load_change_job_history(run_id, self._load_run(run_id))
+            state = self._load_bound_run(run_id, state=state)
         except GitHubReadError as error:
             return self._wait_for_github_read(
                 run_id,
@@ -1002,6 +1012,20 @@ class Controller:
         require_current_run_state(state)
         return state
 
+    def _load_change_job_history(
+        self, run_id: str, state: dict[str, Any], *, ticket_number: int | None = None,
+    ) -> dict[str, Any]:
+        """Load exact target evidence before an explicit resume or retirement."""
+        selected = state.get("active_ticket_job")
+        target = (ticket_number if ticket_number is not None else
+                  selected.get("ticket_number") if isinstance(selected, dict) else None)
+        loader = getattr(self.states, "load_current_run_for_ticket", None)
+        if type(target) is int and callable(loader):
+            loaded = cast(dict[str, Any] | None, loader(run_id, target))
+            if loaded is not None:
+                return loaded
+        return state
+
     def _require_ticket_labels(
         self, state: dict[str, Any], *, ticket_number: int | None = None
     ) -> None:
@@ -1133,7 +1157,7 @@ class Controller:
             refreshed.pop("github_refresh_pending", None)
             return refreshed
         except GitHubReadError as error:
-            failed = dict(state)
+            failed = state.copy()
             if is_github_convergence_error(error.code):
                 wait_for_github_refresh(
                     failed,
@@ -1235,47 +1259,13 @@ class Controller:
         ):
             external = None
         if external is not None:
-            _pause_currentness_job(job, external)
-            job.pop("approval_grant", None)
-            state.update(
-                {
-                    "status": "blocked",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [
-                        {
-                            "code": external,
-                            "message": "Change PR changed outside the current Generation",
-                            "operator_gate": _operator_gate_binding(
-                                subject,
-                                job,
-                                action_kind="deterministic_contradiction",
-                                reason=external,
-                            ),
-                        }
-                    ],
-                }
+            _record_currentness_gate(
+                state, subject, job, external, "Change PR changed outside the current Generation",
             )
             return
         if candidate_or_acceptance_is_inconsistent(job, budget_owner=delivery_budget_owner(state, job)):
-            _pause_currentness_job(job, "candidate_or_acceptance_inconsistent")
-            job.pop("approval_grant", None)
-            state.update(
-                {
-                    "status": "blocked",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [
-                        {
-                            "code": "candidate_or_acceptance_inconsistent",
-                            "message": "Candidate or Acceptance cannot be safely requeued",
-                            "operator_gate": _operator_gate_binding(
-                                subject,
-                                job,
-                                action_kind="deterministic_contradiction",
-                                reason="candidate_or_acceptance_inconsistent",
-                            ),
-                        }
-                    ],
-                }
+            _record_currentness_gate(
+                state, subject, job, "candidate_or_acceptance_inconsistent", "Candidate or Acceptance cannot be safely requeued",
             )
             return
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
@@ -1284,17 +1274,15 @@ class Controller:
         ) in {"effective_revision_mismatch", "merged_revision_mismatch"}:
             reason = "ticket_requirements_changed"
         if reason is None:
-            if job.get("blocked_reason") in {
-                "change_pr_head_changed_externally", "change_pr_base_changed_externally",
-                "change_pr_closed_or_merged_externally", "change_pr_base_unknown",
-                "candidate_or_acceptance_inconsistent",
-            }:
+            if job.get("blocked_reason") in CURRENTNESS_REASONS:
                 # Explicit continuation still owns the permission decision.
                 # Restored external facts no longer need the currentness gate.
+                previous_reason = job["blocked_reason"]
                 job["phase"] = continuation_phase("change", job)
                 job.pop("blocked_reason", None)
                 job.pop("pause_resume_phase", None)
-                if subject.startswith("parent-only:"):
+                _clear_currentness_diagnostic(state, subject, previous_reason)
+                if subject.startswith("parent-only:") and not retains_run_control(state):
                     from agent_run.run_orchestration import parent_stage_state
                     state.update(parent_stage_state(state, parent_only=True))
                 elif subject.startswith("ticket:"):
@@ -1655,10 +1643,35 @@ def _run_id(
 
 
 def _pause_currentness_job(job: dict[str, Any], reason: str) -> None:
-    if job.get("phase") != "blocked":
-        job["pause_resume_phase"] = job["phase"]
+    stage = work_phase(job)
+    if stage in {None, "blocked", "ready_for_human", "paused", "execution_failed"}:
+        stage = continuation_phase("change", job)
+    job["pause_resume_phase"] = stage
     job["phase"] = "blocked"
     job["blocked_reason"] = reason
+
+
+def _record_currentness_gate(
+    state: dict[str, Any], subject: str, job: dict[str, Any], reason: str, message: str,
+) -> None:
+    _pause_currentness_job(job, reason)
+    job.pop("approval_grant", None)
+    if retains_run_control(state):
+        return
+    state.update(status="blocked", terminal_kind="waiting_human", diagnostics=[{
+        "code": reason, "message": message,
+        "operator_gate": _operator_gate_binding(subject, job, action_kind="deterministic_contradiction", reason=reason),
+    }])
+
+
+def _clear_currentness_diagnostic(state: dict[str, Any], subject: str, reason: str) -> None:
+    state["diagnostics"] = [item for item in state.get("diagnostics", []) if not (
+        isinstance(item, dict) and item.get("code") == reason
+        and isinstance(item.get("operator_gate"), dict) and item["operator_gate"].get("work_subject") == subject
+    )]
+    if not retains_run_control(state) and not state["diagnostics"] and state.get("status") == "blocked":
+        state.update(status="active" if subject.startswith("ticket:") else "run_acceptance_pending",
+                     terminal_kind=None)
 
 
 def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:
@@ -2935,6 +2948,7 @@ def _resume_change_job_owner(
         value.pop("review_human_blocker_resume", None)
     clear_blocked_agent_return(value)
     value.pop("blocked_reason", None)
+    value.pop("human_blocker_phase", None)
 
 
 def _resume_run_repair_human_blocker(

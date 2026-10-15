@@ -198,7 +198,7 @@ def schedule_from_graph(
                 }
             ]
 
-    state = dict(previous)
+    state = previous.copy()
     state.update(
         {
             "parent": {
@@ -244,7 +244,7 @@ def _blocked_graph_state(
         str(number): _ticket_state(issue, False, "graph_invalid")
         for number, issue in graph.issues.items()
     }
-    state = dict(previous)
+    state = previous.copy()
     ticket_jobs = _retained_ticket_jobs(previous, ordered_numbers)
     state.update(
         {

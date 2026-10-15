@@ -2,17 +2,29 @@
 from __future__ import annotations
 
 import sqlite3
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent_run.object_state import save_owned
 from agent_run.sqlite_state import SQLiteStateRepository
 from support.state import persist_run_fixture
+from support.work_records import invocation as stored_invocation
 
 
-def _invocation(position: int, **extra: object) -> dict[str, object]:
-    return {"work_subject": "parent", "started_at": f"2026-10-13T00:{position:04d}:00Z", **extra}
+def _invocation(position: int, **extra: Any) -> dict[str, Any]:
+    subject = extra.pop("work_subject", "parent-only:run-1")
+    context = extra.pop("review_context", {"position": position})
+    if "evidence" in extra:
+        context = {**context, "evidence": extra.pop("evidence")}
+    role, phase = ("fresh_acceptance", "run_acceptance") if subject.startswith("run-acceptance:") else (
+        ("final_publication", "final_publication") if subject.startswith("run-publication:")
+        else ("development", "developing"))
+    value = stored_invocation(subject, extra.pop("started_at", f"invocation-{position}"), context=context,
+                              status=extra.pop("status", "completed"), role=role, phase=phase)
+    return {**value, **extra}
 
 
 def test_current_projection_reads_only_exact_invocation_and_resume_links(tmp_path: Path) -> None:
@@ -39,12 +51,15 @@ def test_history_update_and_duplicate_append_keep_unrelated_archives(tmp_path: P
                 "agent_invocation_history": [_invocation(0), previous]}
     repository.save("run-1", original)
     state, positions = repository.load_objects("run-1")  # type: ignore[misc]
-    state["agent_invocation_history"][0]["status"] = "returned"
+    state["agent_invocation_history"][0]["status"] = "completed"
+    state["active_agent_invocation"]["status"] = "completed"
     state["agent_invocation_history"].append(_invocation(2))
     repository.save_objects("run-1", state, fields={"agent_invocation_history"}, history_positions=positions)
     repository.save_objects("run-1", state, fields={"agent_invocation_history"}, history_positions=positions)
-    assert repository.load("run-1")["agent_invocation_history"] == [  # type: ignore[index]
-        _invocation(0), _invocation(1, status="returned"), _invocation(2)]
+    saved = repository.load("run-1")
+    assert saved["agent_invocation_history"] == [  # type: ignore[index]
+        _invocation(0), _invocation(1), _invocation(2)]
+    assert saved["active_agent_invocation"] == _invocation(1)  # type: ignore[index]
 
 
 def test_scoped_size_limit_and_failure_restore_prior_objects_and_indexes(tmp_path: Path) -> None:
@@ -65,12 +80,13 @@ def test_unrelated_archived_material_is_not_decoded_by_current_commit(tmp_path: 
              "agent_invocation_history": [_invocation(0, evidence="x" * 1024), _invocation(1)]}
     repository.save("run-1", state)
     with sqlite3.connect(repository.path) as connection:
-        connection.execute("UPDATE run_materials SET value='broken' WHERE byte_length=1024")
+        cursor = connection.execute("UPDATE work_evidence_materials SET body='broken' WHERE instr(body,?)>0", ("x" * 1024,))
+        assert cursor.rowcount >= 1
     projection, positions = repository.load_objects("run-1")  # type: ignore[misc]
     projection["phase"] = "candidate"
     repository.save_objects("run-1", projection, fields={"phase"}, history_positions=positions)
     assert repository.load_objects("run-1")[0]["phase"] == "candidate"  # type: ignore[index]
-    with pytest.raises(ValueError, match="material identity"):
+    with pytest.raises(ValueError, match="work evidence byte length"):
         repository.load("run-1")
 
 
@@ -90,6 +106,8 @@ def test_scoped_material_replacement_preserves_shared_archive_and_collects_unuse
     state = {"current": {"evidence": shared}, "other": {"evidence": shared},
              "agent_invocation_history": [_invocation(0, evidence=shared)]}
     repository.save("run-1", state)
+    repository.save("run-2", {"current": {"evidence": shared},
+                              "agent_invocation_history": [_invocation(0, evidence=shared)]})
     repository.save_objects("run-1", {"current": {"evidence": "changed" * 256}}, fields={"current"})
     reopened = repository.load("run-1")
     assert reopened == {**state, "current": {"evidence": "changed" * 256}}
@@ -97,6 +115,9 @@ def test_scoped_material_replacement_preserves_shared_archive_and_collects_unuse
     with sqlite3.connect(repository.path) as connection:
         assert not connection.execute("SELECT 1 FROM run_materials WHERE value=?", ("changed" * 256,)).fetchall()
         assert connection.execute("SELECT 1 FROM run_materials WHERE value=?", (shared,)).fetchall()
+        assert connection.execute("SELECT 1 FROM work_evidence_materials WHERE instr(body,?)>0", (shared,)).fetchall()
+    assert repository.load("run-2") == {"current": {"evidence": shared},
+                                         "agent_invocation_history": [_invocation(0, evidence=shared)]}
 
 
 def test_owned_commit_checks_action_receipt_and_notifies_after_durability(tmp_path: Path) -> None:
@@ -170,10 +191,8 @@ def test_old_sqlite_protocol_is_rejected_without_migration(tmp_path: Path) -> No
         assert connection.execute("SELECT value_json FROM run_objects WHERE object_path=?", ('["phase"]',)).fetchone()[0] == '"developing"'
 
 
-@pytest.mark.parametrize("claim", ["invocation", "resume"])
+@pytest.mark.parametrize("claim", ["current_reference", "attempt_binding"])
 def test_corrupted_history_claim_is_rejected_without_overwriting_archives(tmp_path: Path, claim: str) -> None:
-    from agent_run.sqlite_objects import invocation_identity
-
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
     first = _invocation(0, resume_id="resume-first")
     second = _invocation(1, resume_id="resume-second")
@@ -181,30 +200,24 @@ def test_corrupted_history_claim_is_rejected_without_overwriting_archives(tmp_pa
                 "resume_audit": {"history": [{"resume_id": "resume-first"}]},
                 "agent_invocation_history": [first, second]}
     repository.save("run-1", original)
-    path = '["agent_invocation_history",1]'
-    column = "invocation_id" if claim == "invocation" else "resume_id"
-    value = invocation_identity(first) if claim == "invocation" else first["resume_id"]
+    table = "work_invocation_current" if claim == "current_reference" else "work_invocations"
+    column = "started_at" if claim == "current_reference" else "attempt_version_id"
     with sqlite3.connect(repository.path) as connection:
-        # Move the genuine first claim aside so indexed lookup identifies the
-        # second payload as the first Invocation/Resume instead.
-        if claim == "invocation":
-            connection.execute("UPDATE run_object_index SET invocation_id='unrelated' WHERE object_path=?",
-                               ('["agent_invocation_history",0]',))
-        connection.execute(f"UPDATE run_object_index SET {column}=? WHERE object_path=?", (value, path))
-        before = list(connection.execute("SELECT * FROM run_object_index ORDER BY object_path"))
-    with pytest.raises(ValueError, match="history index claim"):
+        cursor = connection.execute(f"UPDATE {table} SET {column}='foreign identity' WHERE run_id=? AND started_at=?",
+                                    ("run-1", first["started_at"]))
+        assert cursor.rowcount == 1
+        before = list(connection.execute(f"SELECT * FROM {table} ORDER BY started_at"))
+        archived = list(connection.execute("SELECT * FROM work_invocation_history ORDER BY position"))
+    with pytest.raises(ValueError, match="Missing Agent Invocation|Missing Semantic Attempt"):
         repository.load_objects("run-1")
-    updated = {**first, "status": "returned"}
-    # In the resume case update the actual second Invocation so saving must
-    # check both its identity and its incorrect Resume claim.
-    if claim == "resume":
-        updated = {**second, "status": "returned"}
-    with pytest.raises(ValueError, match="history index claim"):
+    updated = {**first, "error": "observed after return"}
+    with pytest.raises(ValueError, match="Missing Agent Invocation|Missing Semantic Attempt"):
         repository.save_objects("run-1", {"phase": "candidate", "agent_invocation_history": [updated]},
                                 fields={"phase", "agent_invocation_history"})
-    assert SQLiteStateRepository(tmp_path, max_bytes=4096).load("run-1") == original
+    assert repository.load_fields("run-1", {"phase"}) == {"phase": "developing"}
     with sqlite3.connect(repository.path) as connection:
-        assert list(connection.execute("SELECT * FROM run_object_index ORDER BY object_path")) == before
+        assert list(connection.execute(f"SELECT * FROM {table} ORDER BY started_at")) == before
+        assert list(connection.execute("SELECT * FROM work_invocation_history ORDER BY position")) == archived
 
 
 @pytest.mark.parametrize("damage", ["wrong_size", "missing_proof"])
@@ -222,13 +235,14 @@ def test_damaged_unmodified_field_size_cannot_bypass_run_limit(tmp_path: Path, d
     assert SQLiteStateRepository(tmp_path, max_bytes=512).load("run-1") == original
 
 
-@pytest.mark.parametrize("damaged_owner", ['["current"]', '["agent_invocation_history",0]'])
+@pytest.mark.parametrize("damaged_owner", ['["current"]', '["run_archive",0]'])
 def test_damaged_dependency_index_cannot_collect_material_used_by_archive(tmp_path: Path, damaged_owner: str) -> None:
     import hashlib
 
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
     shared = "shared" * 256
-    original = {"current": shared, "agent_invocation_history": [_invocation(0, evidence=shared)]}
+    original = {"current": shared, "run_archive": [shared],
+                "agent_invocation_history": [_invocation(0, evidence=shared)]}
     repository.save("run-1", original)
     identity = hashlib.sha256(shared.encode()).hexdigest()
     with sqlite3.connect(repository.path) as connection:
@@ -238,64 +252,76 @@ def test_damaged_dependency_index_cannot_collect_material_used_by_archive(tmp_pa
     assert SQLiteStateRepository(tmp_path, max_bytes=4096).load("run-1") == original
     with sqlite3.connect(repository.path) as connection:
         assert connection.execute("SELECT value FROM run_materials WHERE material_id=?", (identity,)).fetchone()[0] == shared
+        assert connection.execute("SELECT 1 FROM work_evidence_materials WHERE instr(body,?)>0", (shared,)).fetchone()
 
 
 def test_related_ticket_projection_and_patch_never_decode_sibling(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=16 * 1024)
     sibling_evidence = "sibling" * 256
-    original = {"active_ticket_job": {"ticket_number": 2}, "ticket_jobs": {
-        "2": {"phase": "developing"}, "3": {"phase": "completed", "evidence": sibling_evidence}},
+    job = {"ticket_number": 2, "phase": "developing"}
+    original = {"active_ticket_job": job, "ticket_jobs": {
+        "2": job, "3": {"ticket_number": 3, "phase": "completed", "review_context": {"body": sibling_evidence}}},
         "ticket_agent_invocations": {}, "retired_ticket_generations": {}, "pending_ticket_retirements": {},
         "agent_invocation_history": []}
     repository.save("run-1", original)
     with sqlite3.connect(repository.path) as connection:
-        connection.execute("UPDATE run_materials SET value='broken' WHERE value=?", (sibling_evidence,))
+        cursor = connection.execute("UPDATE work_evidence_materials SET body='broken' WHERE instr(body,?)>0", (sibling_evidence,))
+        assert cursor.rowcount == 1
     projection, _ = repository.load_objects("run-1", related_tickets=True)  # type: ignore[misc]
-    assert projection["ticket_jobs"] == {"2": {"phase": "developing"}}
-    repository.save_objects("run-1", {"ticket_jobs": {"2": {"phase": "candidate"}}}, fields={"ticket_jobs"},
+    assert projection["ticket_jobs"] == {"2": job}
+    updated = {**job, "phase": "candidate"}
+    repository.save_objects("run-1", {"ticket_jobs": {"2": updated}}, fields={"ticket_jobs"},
                             keyed_changes={"ticket_jobs": {"2"}})
-    assert repository.load_paths("run-1", {("ticket_jobs", "2")}) == {"ticket_jobs": {"2": {"phase": "candidate"}}}
+    assert repository.load_paths("run-1", {("ticket_jobs", "2")}) == {"ticket_jobs": {"2": updated}}
     with sqlite3.connect(repository.path) as connection:
-        connection.execute("UPDATE run_materials SET value=? WHERE value='broken'", (sibling_evidence,))
-    assert repository.load("run-1") == {**original, "ticket_jobs": {**original["ticket_jobs"], "2": {"phase": "candidate"}}}
+        connection.execute("UPDATE work_evidence_materials SET body=? WHERE body='broken'",
+                           ('{"body":"' + sibling_evidence + '"}',))
+    assert repository.load("run-1") == {**original, "active_ticket_job": updated,
+                                         "ticket_jobs": {**original["ticket_jobs"], "2": updated}}
 
 
 def test_append_archive_reads_only_new_records_and_rolls_back_on_size_limit(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=16 * 1024)
     old_evidence = "old" * 512
-    original = {"retired_job_generations": [{"generation": 1, "evidence": old_evidence}], "current": "kept"}
+    original = {"retired_job_generations": [{"generation": 1, "review_context": {"body": old_evidence}}], "current": "kept"}
     repository.save("run-1", original)
     with sqlite3.connect(repository.path) as connection:
-        connection.execute("UPDATE run_materials SET value='broken' WHERE value=?", (old_evidence,))
+        cursor = connection.execute("UPDATE work_evidence_materials SET body='broken' WHERE instr(body,?)>0", (old_evidence,))
+        assert cursor.rowcount == 1
     repository.append_array("run-1", "retired_job_generations", [{"generation": 2}])
     with sqlite3.connect(repository.path) as connection:
-        connection.execute("UPDATE run_materials SET value=? WHERE value='broken'", (old_evidence,))
+        connection.execute("UPDATE work_evidence_materials SET body=? WHERE body='broken'",
+                           ('{"body":"' + old_evidence + '"}',))
     expected = {**original, "retired_job_generations": [*original["retired_job_generations"], {"generation": 2}]}
     assert repository.load("run-1") == expected
-    with pytest.raises(ValueError, match="persistence limit"):
-        repository.append_array("run-1", "retired_job_generations", [{"generation": 3, "evidence": "too big" * 4096}])
+    with pytest.raises(ValueError, match="Work evidence exceeds .* byte limit"):
+        repository.append_array("run-1", "retired_job_generations",
+                                [{"generation": 3, "review_context": {"body": "x" * (4 * 1024 * 1024)}}])
     assert SQLiteStateRepository(tmp_path, max_bytes=16 * 1024).load("run-1") == expected
 
 
 @pytest.mark.parametrize("changes", [{"3"}, {"2", "3"}])
 def test_keyed_children_delete_add_and_size_match_complete_view(tmp_path: Path, changes: set[str]) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    original = {"ticket_jobs": {"2": {"phase": "developing"}, "3": {"phase": "completed"}}}
+    original = {"ticket_jobs": {"2": {"ticket_number": 2, "phase": "developing"},
+                                "3": {"ticket_number": 3, "phase": "completed"}}}
     repository.save("run-1", original)
     repository.save_objects("run-1", {"ticket_jobs": {}}, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": changes})
     remaining = {key: value for key, value in original["ticket_jobs"].items() if key not in changes}
     assert repository.load("run-1") == {"ticket_jobs": remaining}
-    repository.save_objects("run-1", {"ticket_jobs": {"4": {"phase": "developing"}}}, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"4"}})
-    expected = {"ticket_jobs": {**remaining, "4": {"phase": "developing"}}}
+    new_job = {"ticket_number": 4, "phase": "developing"}
+    repository.save_objects("run-1", {"ticket_jobs": {"4": new_job}}, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"4"}})
+    expected = {"ticket_jobs": {**remaining, "4": new_job}}
     assert repository.load("run-1") == expected
     assert repository.load_objects("run-1")[0]["ticket_jobs"] == expected["ticket_jobs"]  # type: ignore[index]
 
 
 def test_related_projection_includes_int_holder_without_work_queue_and_scheduler_generations(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    original = {"active_ticket_job": {"ticket_number": 2, "phase": "blocked"},
+    job = {"ticket_number": 2, "phase": "blocked"}
+    original = {"active_ticket_job": job,
                 "ticket_integration_holder": 3, "ticket_work_queue": [], "ticket_integration_queue": [],
-                "ticket_jobs": {"2": {"phase": "blocked"}, "3": {"phase": "accepted"}},
+                "ticket_jobs": {"2": job, "3": {"ticket_number": 3, "phase": "accepted"}},
                 "ticket_agent_invocations": {}, "retired_ticket_generations": {"2": 1, "3": 2, "4": 3},
                 "pending_ticket_retirements": {}, "agent_invocation_history": []}
     repository.save("run-1", original)
@@ -306,17 +332,16 @@ def test_related_projection_includes_int_holder_without_work_queue_and_scheduler
     assert scheduler["retired_ticket_generations"] == original["retired_ticket_generations"]
 
 
-def _detailed_invocation(position: int, *, attempt_id: str | None = None) -> dict[str, object]:
+def _detailed_invocation(
+    position: int, *, subject: str = "parent-only:run-1", context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from datetime import UTC, datetime, timedelta
     start = datetime(2026, 10, 13, tzinfo=UTC) + timedelta(seconds=position * 3)
     end = start + timedelta(seconds=1)
-    value = _invocation(position, status="completed", started_at=start.isoformat(), reported_thread_id=f"thread-{position}",
+    return _invocation(position, work_subject=subject, review_context=context or {"accepted": True, "position": position},
+                        status="completed", started_at=start.isoformat(), reported_thread_id=f"thread-{position}",
                         execution_segments=[{"started_at": start.isoformat(), "ended_at": end.isoformat()}],
-                        recovery_wait_intervals=[{"started_at": end.isoformat(), "ended_at": (end + timedelta(seconds=1)).isoformat()}],
-                        review_evidence={"accepted": True})
-    if attempt_id is not None:
-        value["semantic_attempt"] = {"attempt_id": attempt_id, "review_context": {"evidence": "original"}}
-    return value
+                        recovery_wait_intervals=[{"started_at": end.isoformat(), "ended_at": (end + timedelta(seconds=1)).isoformat()}])
 
 
 def test_incremental_retention_keeps_recent_256_and_compacts_released_canonical(tmp_path: Path) -> None:
@@ -336,7 +361,7 @@ def test_incremental_retention_keeps_recent_256_and_compacts_released_canonical(
     reopened = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024).load("run-1")
     assert reopened is not None
     assert reopened["agent_invocation_history"][0]["execution_segments"] == []
-    assert reopened["agent_invocation_history"][0]["review_evidence"] == {"accepted": True}
+    assert reopened["agent_invocation_history"][0]["semantic_attempt"]["review_context"] == {"accepted": True, "position": 0}
     assert all(item["execution_segments"] for item in reopened["agent_invocation_history"][-256:])
 
 
@@ -352,18 +377,19 @@ def test_incremental_retention_protects_pending_predecessors_until_attempt_consu
     tmp_path: Path, subject: str, owner_path: tuple[str, ...],
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
-    history = [_detailed_invocation(position, attempt_id="pending" if position < 2 else f"attempt-{position}") for position in range(256)]
+    history = [_detailed_invocation(position, subject=subject, context={"evidence": "original"})
+               if position < 2 else _detailed_invocation(position) for position in range(256)]
     history[0]["status"] = "failed"
-    for item in history[:2]:
-        item["work_subject"] = subject
-    pending: dict[str, object] = {"pending_semantic_attempt": {"attempt_id": "pending"}}
+    pending: dict[str, Any] = {"pending_semantic_attempt": deepcopy(history[0]["semantic_attempt"])}
+    if owner_path[0] == "ticket_jobs":
+        pending["ticket_number"] = 2
     owner = pending if len(owner_path) == 1 else {owner_path[1]: pending}
     repository.save("run-1", {"agent_invocation_history": history, "active_agent_invocation": history[0],
                               owner_path[0]: owner})
     repository.append_array("run-1", "agent_invocation_history", [_detailed_invocation(256), _detailed_invocation(257)])
     repository.save_objects("run-1", {"active_agent_invocation": _detailed_invocation(257)}, fields={"active_agent_invocation"})
     assert all(item["execution_segments"] for item in repository.load("run-1")["agent_invocation_history"][:2])  # type: ignore[index]
-    released = {} if len(owner_path) == 1 else {owner_path[1]: {}}
+    released = {} if len(owner_path) == 1 else {owner_path[1]: {"ticket_number": 2} if owner_path[0] == "ticket_jobs" else {}}
     keyed_changes = {"ticket_jobs": {"2"}} if owner_path[0] == "ticket_jobs" else {}
     repository.save_objects("run-1", {owner_path[0]: released}, fields={owner_path[0]}, keyed_changes=keyed_changes)
     saved = repository.load("run-1")
@@ -455,25 +481,29 @@ def test_selected_history_batch_preserves_positions_and_independent_evidence(tmp
     loaded, positions = repository.load_objects("run-1")
     assert loaded == original
     assert set(positions.values()) == set(range(260))
-    loaded["agent_invocation_history"][0]["review_context"]["feedback"].append("caller change")
-    assert loaded["agent_invocation_history"][1]["review_context"]["feedback"] == ["keep"]
+    loaded["agent_invocation_history"][0]["semantic_attempt"]["review_context"]["feedback"].append("caller change")
+    assert loaded["agent_invocation_history"][1]["semantic_attempt"]["review_context"]["feedback"] == ["keep"]
     assert SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024).load_objects("run-1")[0] == original
 
 
-@pytest.mark.parametrize("column", ["invocation_id", "resume_id", "attempt_id"])
+@pytest.mark.parametrize("column", ["current_reference", "attempt_identity", "attempt_version"])
 def test_batched_selected_history_rejects_each_actual_identity_claim(tmp_path: Path, column: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    history = [_invocation(number, resume_id=f"resume-{number}") for number in range(3)]
+    history = [_invocation(number, work_subject=f"ticket:{number + 1}", resume_id=f"resume-{number}") for number in range(3)]
     original = {"phase": "active", "agent_invocation_history": history,
-                "ticket_agent_invocations": {str(number): item for number, item in enumerate(history)},
+                "ticket_agent_invocations": {str(number + 1): item for number, item in enumerate(history)},
                 "resume_audit": {"history": [{"resume_id": entry["resume_id"]} for entry in history]}}
     repository.save("run-1", original)
     assert repository.load_objects("run-1")[0] == original
+    table, field, key_column, key = {
+        "current_reference": ("work_invocation_current", "started_at", "reference_key", "2"),
+        "attempt_identity": ("work_attempts", "role", "attempt_id", history[1]["semantic_attempt"]["attempt_id"]),
+        "attempt_version": ("work_invocations", "attempt_version_id", "started_at", history[1]["started_at"]),
+    }[column]
     with sqlite3.connect(repository.path) as connection:
-        connection.execute(f"UPDATE run_object_index SET {column}=? WHERE object_path=?",
-                           ("foreign identity", '["agent_invocation_history",1]'))
-    with pytest.raises(ValueError, match="history index claim"):
+        cursor = connection.execute(f"UPDATE {table} SET {field}=? WHERE run_id='run-1' AND {key_column}=?", ("foreign identity", key))
+        assert cursor.rowcount == 1
+    with pytest.raises(ValueError, match="Missing Agent Invocation|Missing Semantic Attempt|Invalid Semantic Attempt size|identity"):
         repository.load_objects("run-1")
     with sqlite3.connect(repository.path) as connection:
-        assert connection.execute(f"SELECT {column} FROM run_object_index WHERE object_path=?",
-                                  ('["agent_invocation_history",1]',)).fetchone() == ("foreign identity",)
+        assert connection.execute(f"SELECT {field} FROM {table} WHERE run_id='run-1' AND {key_column}=?", (key,)).fetchone() == ("foreign identity",)

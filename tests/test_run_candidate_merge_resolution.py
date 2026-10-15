@@ -221,6 +221,9 @@ def test_written_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         # Model a Cycle already close to its ten-change ceiling.  The
         # revalidation Finding must consume the same budget instead of opening
         # a fresh Cycle.
+        first = states.load_current_run(str(state["run_id"]))
+        active_run = first["run_acceptance"]
+        active_job = active_run["repair_job"]
         active_job["modification_attempts"] = 9
         active_job["code_modification_attempts"] = 9
         active_run["review_budget"]["development_attempts"] = 9

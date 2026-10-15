@@ -39,11 +39,15 @@ def test_projection_prefetch_preserves_text_aliases_and_independent_reads(
         loaded = load_projection(connection, "run-1", max_bytes=repository.max_bytes)
         assert loaded is not None
         state, _ = loaded
-        assert state == original
+        assert state == {key: original[key] for key in ("parent", "ticket", "phase", "timeline")}
         state["parent"]["nested"][0]["count"] = 100
         state["timeline"][0]["body"] = "caller change"
         assert state["ticket"] == original["ticket"]
         assert state["timeline"][1] == original["timeline"][1]
+        complete = repository.load_objects("run-1")[0]
+        assert complete == original
+        complete["ticket_jobs"]["2"]["review_context"]["nested"][0]["count"] = 200
+        assert complete["parent"]["nested"][0]["count"] == 1
         assert repository.load_objects("run-1")[0] == original
 
 
@@ -79,7 +83,7 @@ def test_projection_prefetch_revalidates_actual_materials(tmp_path: Path, damage
 def test_projection_prefetch_never_aggregates_oversized_bodies(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
     evidence = {"rows": [{"label": "中文🙂\x00" * 20} for _ in range(3500)]}
-    original = {"parent": evidence, "ticket": deepcopy(evidence), "agent_invocation_history": []}
+    original = {"parent": evidence, "ticket": deepcopy(evidence)}
     repository.save("run-1", original)
 
     class GuardBodies(sqlite3.Connection):
@@ -109,8 +113,7 @@ def test_projection_prefetch_does_not_borrow_another_runs_material_link(tmp_path
 
 def test_projection_prefetch_keeps_each_material_batch_bounded(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    original = {"timeline": [{"event": str(index), "items": [index]} for index in range(300)],
-                "agent_invocation_history": []}
+    original = {"timeline": [{"event": str(index), "items": [index]} for index in range(300)]}
     repository.save("run-1", original)
     batches = []
 

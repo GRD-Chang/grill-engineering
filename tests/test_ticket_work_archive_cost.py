@@ -24,6 +24,72 @@ from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 from support.state import persist_run_fixture
 
 
+def test_attempt_history_summary_reads_have_constant_sql_cost_and_exact_bytes(tmp_path: Path) -> None:
+    from agent_run.sqlite_encoding import encode_json
+    from agent_run.sqlite_state import SQLiteStateRepository
+    from agent_run.sqlite_work_execution import attempt_history_metadata
+    from support.work_records import attempt
+
+    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    costs = []
+    for count in (1, 128):
+        run_id = f"run-{count}"
+        history = [attempt(f"parent-only:{run_id}", ordinal=ordinal,
+                           context={"body": "证据\x00\n", "ordinal": ordinal}) for ordinal in range(1, count + 1)]
+        repository.save(run_id, {"parent_job": {"semantic_attempt_history": history}})
+        with sqlite3.connect(repository.path) as connection:
+            job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id=?", (run_id,)).fetchone()[0]
+            steps = []
+            statements = []
+            connection.set_trace_callback(statements.append)
+            connection.set_progress_handler(lambda: steps.append(1) or 0, 1)
+            metadata = attempt_history_metadata(connection, run_id, job_id)
+            connection.set_progress_handler(None, 0)
+            assert metadata == (len(encode_json(history).encode("utf-8")), count)
+            assert all("work_job_attempt_history" not in sql for sql in statements)
+            costs.append(len(steps))
+    assert costs[1] <= costs[0] + 2, costs
+
+
+def test_attempt_history_summary_tracks_version_changes_and_trimmed_positions(tmp_path: Path) -> None:
+    from agent_run.sqlite_encoding import encode_json
+    from agent_run.sqlite_state import SQLiteStateRepository
+    from agent_run.sqlite_work_execution import attempt_history_metadata
+    from support.work_records import attempt
+
+    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    history = [attempt("parent-only:run-1", ordinal=ordinal) for ordinal in range(1, 4)]
+    repository.save("run-1", {"parent_job": {"semantic_attempt_history": history}})
+    retained = deepcopy(history[1:])
+    retained[-1]["budget_consumed"] = True
+    repository.save_objects("run-1", {"parent_job": {"semantic_attempt_history": retained}}, fields={"parent_job"})
+    assert SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1") == {
+        "parent_job": {"semantic_attempt_history": retained},
+    }
+    with sqlite3.connect(repository.path) as connection:
+        job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id='run-1'").fetchone()[0]
+        assert attempt_history_metadata(connection, "run-1", job_id) == (len(encode_json(retained).encode()), 2)
+
+
+@pytest.mark.parametrize("damage", ["count", "bytes", "proof"])
+def test_attempt_history_summary_corruption_is_rejected_before_skipping_history(tmp_path: Path, damage: str) -> None:
+    from agent_run.sqlite_state import SQLiteStateRepository
+    from agent_run.sqlite_work_execution import attempt_history_metadata
+    from support.work_records import attempt
+
+    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository.save("run-1", {"parent_job": {"semantic_attempt_history": [attempt("parent-only:run-1")]}})
+    with sqlite3.connect(repository.path) as connection:
+        job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id='run-1'").fetchone()[0]
+        field, value = {"count": ("history_count", "history_count+1"),
+                        "bytes": ("history_bytes", "history_bytes+1"), "proof": ("history_proof", "'foreign'")}[damage]
+        connection.execute(f"UPDATE work_job_attempt_roots SET {field}={value} WHERE run_id='run-1'")
+    with sqlite3.connect(repository.path) as connection, pytest.raises(ValueError, match="Attempt history summary"):
+        attempt_history_metadata(connection, "run-1", job_id)
+    with pytest.raises(ValueError, match="Attempt history summary"):
+        SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1")
+
+
 def _prepare_cost_run(git_repo: Path, monkeypatch: pytest.MonkeyPatch, *, retry_pending: bool) -> tuple[str, StateStore, dict]:
     state, states, git, fixture = ticket_run(git_repo, (2, 3))
     run_id = str(state["run_id"])
@@ -217,22 +283,28 @@ def test_related_attempt_damage_is_rejected_by_complete_and_work_queries(
 ) -> None:
     run_id, states, original = _prepare_cost_run(git_repo, monkeypatch, retry_pending=True)
     persist_run_fixture(states, run_id, original)
-    parent = '["ticket_jobs","3","semantic_attempt_history"]'
     with states._repository.atomic():
         connection = states._repository._local.connection
-        path = connection.execute(
-            "SELECT object_path FROM run_job_attempts WHERE run_id=? AND parent_path=? AND role='publication'",
-            (run_id, parent),
-        ).fetchone()[0]
+        job_id, attempt_id, version_id, position, evidence_id = connection.execute(
+            "SELECT h.job_id,h.attempt_id,h.version_id,h.position,v.publication_evidence_id "
+            "FROM work_job_attempt_history h JOIN work_attempts a USING(run_id,attempt_id) "
+            "JOIN work_attempt_versions v USING(run_id,attempt_id,version_id) "
+            "WHERE h.run_id=? AND a.work_subject='ticket:3' AND a.role='publication'",
+            (run_id,),
+        ).fetchone()
         if damage == "position":
-            connection.execute("UPDATE run_job_attempts SET position=position+1 WHERE run_id=? AND object_path=?", (run_id, path))
+            connection.execute("UPDATE work_job_attempt_history SET position=position+1 WHERE run_id=? AND job_id=? AND attempt_id=?",
+                               (run_id, job_id, attempt_id))
         elif damage == "missing":
-            connection.execute("DELETE FROM run_job_attempts WHERE run_id=? AND object_path=?", (run_id, path))
+            connection.execute("DELETE FROM work_job_attempt_history WHERE run_id=? AND job_id=? AND attempt_id=?",
+                               (run_id, job_id, attempt_id))
         else:
-            connection.execute("DELETE FROM run_object_material_refs WHERE run_id=? AND object_path=?", (run_id, path))
+            assert evidence_id is not None
+            connection.execute("UPDATE work_evidence SET owner_id='attempt:foreign' WHERE run_id=? AND evidence_id=?",
+                               (run_id, evidence_id))
     reopened = StateStore(states.root)
-    with pytest.raises(ValueError, match="Attempt index|material references"):
+    with pytest.raises(ValueError, match="Semantic Attempt|work evidence"):
         reopened.load_current_run(run_id)
     reopened._repository._aggregate_rows = aggregate
-    with pytest.raises(ValueError, match="Attempt|references|publication_operation_retry"):
+    with pytest.raises(ValueError, match="Attempt|work evidence|publication_operation_retry"):
         reopened.load_work_run(run_id, 2)

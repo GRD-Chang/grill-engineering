@@ -1,4 +1,4 @@
-"""Transaction view isolation and the expanded logical persistence limit."""
+"""Transaction view isolation and separate Run and work-evidence limits."""
 from __future__ import annotations
 
 import json
@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 
 from agent_run.sqlite_state import SQLiteStateRepository
-from agent_run import sqlite_state
+from agent_run.sqlite_work_evidence import MAX_EVIDENCE_BYTES
 from agent_run.state import StateStore
+from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.sqlite_rows import read_row_source, read_run_rows, read_schema
 from agent_run.object_state import save_owned
+from support.work_records import invocation
 
 
 def test_transaction_reads_are_isolated_and_follow_writes_and_rollback(tmp_path: Path) -> None:
@@ -59,8 +61,8 @@ def test_caught_nested_failure_rolls_back_the_entire_transaction(tmp_path: Path)
 @pytest.mark.parametrize("state", [
     {},
     {"转义\n\"": [True, None, -1, 1.25, "中文\t\\\"\n"], "tuple": (1, 2)},
-    {"ticket_jobs": {str(number): {"review_context": {"body": "中文\n" * 400}}
-                     for number in range(4)}},
+    {"requirements": {str(number): {"review_context": {"body": "中文\n" * 400}}
+                      for number in range(4)}},
 ])
 def test_size_limit_counts_exact_utf8_json_including_expanded_materials(
     tmp_path: Path, state: dict,
@@ -78,6 +80,25 @@ def test_size_limit_counts_exact_utf8_json_including_expanded_materials(
     assert repository.load("run-1") == json.loads(encoded)
 
 
+def test_work_evidence_limit_is_independent_of_expanded_run_aliases(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=3)
+    body = "x" * (MAX_EVIDENCE_BYTES - len('{"body":""}'))
+    job = {"ticket_number": 2, "review_context": {"body": body}}
+    original = {"active_ticket_job": job, "ticket_jobs": {"2": job}}
+    repository.save("run-1", original)
+    saved = SQLiteStateRepository(tmp_path, max_bytes=3).load("run-1")
+    assert saved == original
+    assert (len(saved["active_ticket_job"]["review_context"]["body"])
+            + len(saved["ticket_jobs"]["2"]["review_context"]["body"])) > MAX_EVIDENCE_BYTES
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("SELECT byte_length FROM work_evidence_materials").fetchall() == [(MAX_EVIDENCE_BYTES,)]
+        assert connection.execute("SELECT logical_bytes FROM run_sizes").fetchone() == (3,)
+    oversized = {"ticket_jobs": {"2": {"ticket_number": 2, "review_context": {"body": body + "x"}}}}
+    with pytest.raises(ValueError, match="Work evidence exceeds"):
+        repository.save_objects("run-1", oversized, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
+    assert repository.load("run-1") == original
+
+
 def test_material_reclamation_preserves_other_run_references(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
     material = "same exact evidence " * 100
@@ -90,24 +111,33 @@ def test_material_reclamation_preserves_other_run_references(tmp_path: Path) -> 
     assert repository.load("run-2") == {"evidence": "also replaced"}
 
 
-def test_existing_node_projection_can_be_read_and_updated_as_keyed_objects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = {"ticket_jobs": {"2": {"phase": "developing", "review_context": {
+def test_relational_projection_can_be_read_and_updated_as_keyed_objects(tmp_path: Path) -> None:
+    state = {"ticket_jobs": {"2": {"ticket_number": 2, "phase": "developing", "review_context": {
         "body": "exact evidence " * 100, "revision": "original",
-    }}}, "agent_invocation_history": [{"thread_id": "original-thread", "status": "running"}]}
+    }}}, "agent_invocation_history": [invocation(status="running")]}
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
-    # Exercise the earlier node layout under the same SQLite protocol. The
-    # existing reader must work before any subsequent business transition.
-    with monkeypatch.context() as earlier:
-        earlier.setattr(sqlite_state, "_OBJECT_COLLECTIONS", set())
-        earlier.setattr(sqlite_state, "_CURRENT_OBJECTS", set())
-        repository.save("run-1", state)
+    repository.save("run-1", state)
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM work_jobs").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM work_invocations").fetchone() == (1,)
+        assert connection.execute("SELECT object_path FROM run_objects").fetchall() == [("[]",)]
     reopened = SQLiteStateRepository(tmp_path, max_bytes=8192)
     assert reopened.load("run-1") == state
     state["ticket_jobs"]["2"]["phase"] = "candidate"
     reopened.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
     assert repository.load("run-1") == state
+
+
+def test_previous_sqlite_protocol_is_rejected_without_migrating_nodes(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
+    repository.save("run-1", {"phase": "developing"})
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute("UPDATE schema_meta SET value='sqlite-task-run-v3' WHERE key='protocol'")
+        before = tuple(connection.iterdump())
+    with pytest.raises(IncompatibleRunStateError):
+        SQLiteStateRepository(tmp_path, max_bytes=8192).load("run-1")
+    with sqlite3.connect(repository.path) as connection:
+        assert tuple(connection.iterdump()) == before
 
 
 def test_observer_receives_isolated_durable_facts(tmp_path: Path) -> None:
@@ -197,40 +227,41 @@ def test_reused_projection_rechecks_actual_database_contents(tmp_path: Path, dam
                                      (1, 1.0), (1.0, 1), (0.0, -0.0)])
 def test_object_reuse_preserves_exact_json_types_and_values(tmp_path: Path, old, new) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
-    repository.save("run-1", {"ticket_jobs": {"2": {"nested": {"value": old}}}})
+    repository.save("run-1", {"ticket_jobs": {"2": {"ticket_number": 2, "review_context": {"value": old}}}})
     with repository.atomic():
         state = repository.load("run-1")
-        state["ticket_jobs"]["2"]["nested"]["value"] = new
+        state["ticket_jobs"]["2"]["review_context"]["value"] = new
         repository.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
         assert json.dumps(repository.load("run-1")) == json.dumps(state)
     saved = SQLiteStateRepository(tmp_path, max_bytes=8192).load("run-1")
-    value = saved["ticket_jobs"]["2"]["nested"]["value"]
+    value = saved["ticket_jobs"]["2"]["review_context"]["value"]
     assert type(value) is type(new)
     assert json.dumps(value) == json.dumps(new)
 
 
 def test_observer_and_reopened_store_agree_on_changed_object_type(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
-    state = {"ticket_jobs": {"2": {"extension": {"value": 1}}}}
+    state = {"ticket_jobs": {"2": {"ticket_number": 2, "review_context": {"value": 1}}}}
     store.save_run("run-1", state)
     observed = []
     store.run_saved_observer = observed.append
-    state["ticket_jobs"]["2"]["extension"]["value"] = True
+    state["ticket_jobs"]["2"]["review_context"]["value"] = True
     save_owned(store, "run-1", state, fields={"ticket_jobs"})
     saved = StateStore(tmp_path).load_run("run-1")
-    assert saved["ticket_jobs"]["2"]["extension"]["value"] is True
-    assert observed[0]["ticket_jobs"]["2"]["extension"]["value"] is True
+    assert saved["ticket_jobs"]["2"]["review_context"]["value"] is True
+    assert observed[0]["ticket_jobs"]["2"]["review_context"]["value"] is True
 
 
 def test_native_and_missing_json_row_sources_preserve_actual_sql_values(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     body = '["snapshot","literal"]\n\x00中文' * 100
-    repository.save("run-1", {"ticket_jobs": {"2": {"review_context": {"body": body}}}})
+    repository.save("run-1", {"parent": {"body": body}, "timeline": [{"body": body}]})
     with sqlite3.connect(repository.path) as connection:
         rows = read_row_source(connection, "run-1", aggregate=False)
         native = read_row_source(connection, "run-1", aggregate=True)
         assert native.material_rows() == rows.material_rows()
         assert native.object_rows() == rows.object_rows()
+        assert native.material_rows() and native.object_rows()
 
         class WithoutJson:
             def execute(self, sql, args=()):
@@ -249,50 +280,51 @@ def test_native_and_missing_json_row_sources_preserve_actual_sql_values(tmp_path
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
         ))
         assert metadata is None
-    assert repository.load("run-1")["ticket_jobs"]["2"]["review_context"]["body"] == body
+    assert repository.load("run-1")["parent"]["body"] == body
 
 
 def test_sibling_change_preserves_independent_snapshot_values(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     state = {"ticket_jobs": {
-        "2": {"value": 1, "literal": {"tags": ["snapshot", "literal"]},
-              "review_context": {"body": "original evidence " * 100}},
-        "3": {"value": 0.0},
+        "2": {"ticket_number": 2, "review_context": {
+            "value": 1, "literal": {"tags": ["snapshot", "literal"]}, "body": "original evidence " * 100}},
+        "3": {"ticket_number": 3, "review_context": {"value": 0.0}},
     }}
     repository.save("run-1", state)
     assert repository.load("run-1") == state
     other = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    state["ticket_jobs"]["3"]["value"] = -0.0
+    state["ticket_jobs"]["3"]["review_context"]["value"] = -0.0
     other.save_objects("run-1", state, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"3"}})
     changed = repository.load("run-1")
     assert json.dumps(changed, sort_keys=True) == json.dumps(state, sort_keys=True)
-    changed["ticket_jobs"]["2"]["literal"]["tags"].clear()
+    changed["ticket_jobs"]["2"]["review_context"]["literal"]["tags"].clear()
     assert repository.load("run-1") == state
     with repository.atomic():
         changed = repository.load("run-1")
-        changed["ticket_jobs"]["2"]["value"] = True
+        changed["ticket_jobs"]["2"]["review_context"]["value"] = True
         repository.save_objects("run-1", changed, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
-    assert other.load("run-1")["ticket_jobs"]["2"]["value"] is True
+    assert other.load("run-1")["ticket_jobs"]["2"]["review_context"]["value"] is True
 
 
 @pytest.mark.parametrize("damage", ["body", "length", "reference"])
 def test_unchanged_snapshot_rechecks_transitive_materials(tmp_path: Path, damage: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     body = "original evidence " * 100
-    state = {"ticket_jobs": {"2": {"review_context": {"body": body}}}}
+    state = {"ticket_jobs": {"2": {"ticket_number": 2, "review_context": {"body": body}}}}
     repository.save("run-1", state)
     assert repository.load("run-1") == state
-    identity = hashlib.sha256(body.encode()).hexdigest()
     with sqlite3.connect(repository.path) as connection:
+        identity = connection.execute("SELECT material_id FROM work_evidence WHERE kind='review_context'").fetchone()[0]
         if damage == "body":
-            connection.execute("UPDATE run_materials SET value = ? WHERE material_id = ?",
-                               ("X" + body[1:], identity))
+            cursor = connection.execute("UPDATE work_evidence_materials SET body=replace(body,'original','Original') WHERE material_id=?",
+                                        (identity,))
         elif damage == "length":
-            connection.execute("UPDATE run_materials SET byte_length = byte_length + 1 WHERE material_id = ?",
-                               (identity,))
+            cursor = connection.execute("UPDATE work_evidence_materials SET byte_length=byte_length+1 WHERE material_id=?",
+                                        (identity,))
         else:
-            connection.execute("DELETE FROM run_material_refs WHERE material_id = ?", (identity,))
-    with pytest.raises(ValueError, match="material"):
+            cursor = connection.execute("DELETE FROM work_evidence WHERE material_id=?", (identity,))
+        assert cursor.rowcount == 1
+    with pytest.raises(ValueError, match="work evidence"):
         repository.load("run-1")
 
 

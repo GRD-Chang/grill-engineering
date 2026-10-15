@@ -16,24 +16,22 @@ from typing import Any, cast
 
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.sqlite_encoding import copy_json_tree, copy_projection_fields, encode_json, object_path, scalar_value, snapshot_fields
-from agent_run.sqlite_mutations import create_run_objects, save_work
+from agent_run.sqlite_mutations import create_run_objects
 from agent_run import sqlite_timeline
-from agent_run.sqlite_work_objects import check_indexes, load_work, index_run, _object_rows, _decode
+from agent_run.sqlite_work_objects import check_indexes, index_run, _object_rows, _decode
 from agent_run.sqlite_work_indexes import IndexFacts
 from agent_run.sqlite_work_fields import field_node_counts
 from agent_run.sqlite_rows import ReadConnection, RowSource, read_document, read_run_rows, read_schema
-from agent_run.sqlite_job_history import FIELDS as JOB_HISTORIES, CURRENT_WORK_PREDICATE
 from agent_run import sqlite_control
 from agent_run.sqlite_scope import context_for
-from agent_run.sqlite_runtime import require_wal_runtime
+from agent_run.sqlite_runtime import enable_wal, require_wal_runtime
+from agent_run import sqlite_work_records as work_records
 
 
-_PROTOCOL = "sqlite-task-run-v3"
+_PROTOCOL = "sqlite-work-records-v4"
 _MATERIAL_THRESHOLD = 1024
 _SNAPSHOT_FIELDS = {"prompt_resources", "review_context", "parent", "ticket", "issue_snapshot"}
-_OBJECT_COLLECTIONS = {"ticket_jobs", "ticket_agent_invocations", "agent_invocation_history",
-                       "timeline", "timeline_continuation"}
-_CURRENT_OBJECTS = {"active_ticket_job", "active_agent_invocation"}
+_OBJECT_COLLECTIONS = {"timeline", "timeline_continuation"}
 _READ_VIEW_BYTES = 512 * 1024
 _VALID_SCHEMAS: set[tuple[tuple[str, str, str, str | None], ...]] = set()
 _SCHEMA_CACHE_LOCK = threading.Lock()
@@ -46,10 +44,7 @@ _COLUMNS = {
     "run_object_index": ("run_id", "object_path", "invocation_id", "resume_id", "logical_bytes", "content_digest", "size_proof", "child_count", "attempt_id"),
     "run_object_materials": ("run_id", "object_path", "material_id"),
     "run_sizes": ("run_id", "logical_bytes", "canonical_count"),
-    "run_history": ("run_id", "position", "ticket_number", "work_subject", "started_at", "resume_id", "logical_bytes", "detailed"),
     "run_object_material_refs": ("run_id", "object_path", "material_id"),
-    "run_job_history": ("run_id", "object_path", "logical_bytes", "item_count"),
-    "run_job_attempts": ("run_id", "object_path", "parent_path", "position", "role", "status", "ordinal"),
 }
 _KEYS = {
     "schema_meta": ("key",),
@@ -60,10 +55,7 @@ _KEYS = {
     "run_object_index": ("run_id", "object_path"),
     "run_object_materials": ("run_id", "object_path", "material_id"),
     "run_sizes": ("run_id",),
-    "run_history": ("run_id", "position"),
     "run_object_material_refs": ("run_id", "object_path", "material_id"),
-    "run_job_history": ("run_id", "object_path"),
-    "run_job_attempts": ("run_id", "object_path"),
 }
 _FOREIGN_KEYS = {
     "run_objects": {("runs", "run_id", "run_id", "CASCADE")},
@@ -74,19 +66,10 @@ _FOREIGN_KEYS = {
         ("run_materials", "material_id", "material_id", "NO ACTION"),
     },
     "run_sizes": {("runs", "run_id", "run_id", "CASCADE")},
-    "run_history": {("runs", "run_id", "run_id", "CASCADE")},
     "run_object_material_refs": {
         ("run_objects", "run_id", "run_id", "CASCADE"),
         ("run_objects", "object_path", "object_path", "CASCADE"),
         ("run_materials", "material_id", "material_id", "NO ACTION"),
-    },
-    "run_job_history": {
-        ("run_objects", "run_id", "run_id", "CASCADE"),
-        ("run_objects", "object_path", "object_path", "CASCADE"),
-    },
-    "run_job_attempts": {
-        ("run_objects", "run_id", "run_id", "CASCADE"),
-        ("run_objects", "object_path", "object_path", "CASCADE"),
     },
 }
 _SCHEMA: tuple[str, ...] = (
@@ -111,34 +94,14 @@ _SCHEMA: tuple[str, ...] = (
     "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
     "CREATE TABLE run_sizes (run_id TEXT PRIMARY KEY, logical_bytes INTEGER NOT NULL, canonical_count INTEGER NOT NULL, "
     "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
-    "CREATE TABLE run_history (run_id TEXT NOT NULL, position INTEGER NOT NULL, "
-    "ticket_number INTEGER, work_subject TEXT, started_at TEXT, resume_id TEXT, "
-    "logical_bytes INTEGER NOT NULL, detailed INTEGER NOT NULL, PRIMARY KEY (run_id, position), "
-    "FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
     "CREATE TABLE run_object_material_refs (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
     "material_id TEXT NOT NULL, PRIMARY KEY (run_id, object_path, material_id), "
     "FOREIGN KEY (run_id, object_path) REFERENCES run_objects(run_id, object_path) ON DELETE CASCADE, "
     "FOREIGN KEY (material_id) REFERENCES run_materials(material_id))",
-    "CREATE TABLE run_job_history (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
-    "logical_bytes INTEGER NOT NULL, item_count INTEGER NOT NULL, PRIMARY KEY (run_id, object_path), "
-    "FOREIGN KEY (run_id, object_path) REFERENCES run_objects(run_id, object_path) ON DELETE CASCADE)",
-    "CREATE TABLE run_job_attempts (run_id TEXT NOT NULL, object_path TEXT NOT NULL, "
-    "parent_path TEXT NOT NULL, position INTEGER NOT NULL, role TEXT, status TEXT, ordinal INTEGER, "
-    "PRIMARY KEY (run_id, object_path), FOREIGN KEY (run_id, object_path) "
-    "REFERENCES run_objects(run_id, object_path) ON DELETE CASCADE)",
     "CREATE INDEX current_field_sizes ON run_object_index(run_id, logical_bytes) WHERE logical_bytes > 0",
-    "CREATE INDEX run_invocation_identity ON run_object_index(run_id, invocation_id)",
-    "CREATE INDEX run_attempt_identity ON run_object_index(run_id, attempt_id)",
-    "CREATE INDEX run_resume_identity ON run_object_index(run_id, resume_id)",
     "CREATE INDEX object_material_identity ON run_object_materials(run_id, material_id)",
     "CREATE INDEX runs_parent ON runs(repository COLLATE NOCASE, parent_number, created_at)",
-    "CREATE INDEX history_ticket ON run_history(run_id, ticket_number, position)",
-    "CREATE INDEX history_resume ON run_history(run_id, resume_id, position)",
-    "CREATE INDEX history_identity ON run_history(run_id, work_subject, started_at, position)",
-    "CREATE INDEX history_detail ON run_history(run_id, detailed, position)",
     "CREATE INDEX object_material ON run_object_material_refs(material_id, run_id)",
-    "CREATE INDEX job_attempt_role ON run_job_attempts(run_id, parent_path, role, status, ordinal, position)",
-    "CREATE INDEX current_work_objects ON run_objects(run_id, object_path) WHERE " + CURRENT_WORK_PREDICATE,
     "CREATE INDEX material_run_refs ON run_material_refs(material_id, run_id)",
 )
 _BUSINESS_TABLES = dict(zip(_COLUMNS, _SCHEMA[:len(_COLUMNS)], strict=True))
@@ -146,8 +109,8 @@ _BUSINESS_INDEXES = {statement.split()[2]: statement for statement in _SCHEMA[le
 _COLUMNS.update(sqlite_control.COLUMNS)
 _KEYS.update(sqlite_control.KEYS)
 _FOREIGN_KEYS.update(sqlite_control.FOREIGN_KEYS)
-_CANONICAL_TABLES = {**_BUSINESS_TABLES, **sqlite_control.TABLES}
-_CANONICAL_INDEXES = {**_BUSINESS_INDEXES, **sqlite_control.INDEXES}
+_CANONICAL_TABLES = {**_BUSINESS_TABLES, **sqlite_control.TABLES, **work_records.TABLES}
+_CANONICAL_INDEXES = {**_BUSINESS_INDEXES, **sqlite_control.INDEXES, **work_records.INDEXES}
 _SCHEMA = (*_CANONICAL_TABLES.values(), *_CANONICAL_INDEXES.values())
 _WORK_SCHEMA_PARAMETERS = {
     "schema_definitions": encode_json(sorted(
@@ -293,7 +256,7 @@ class SQLiteStateRepository:
             raise IncompatibleRunStateError("Incompatible SQLite Run state schema")
         if not tables and allow_empty:
             return False
-        if tables != set(_COLUMNS):
+        if tables != set(_CANONICAL_TABLES):
             raise IncompatibleRunStateError("Incompatible SQLite Run state schema")
         if metadata is None:
             metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
@@ -302,6 +265,9 @@ class SQLiteStateRepository:
         indexes = {name: sql for kind, name, _, sql in definitions if kind == "index"}
         if any(indexes.get(name) != sql for name, sql in _CANONICAL_INDEXES.items()):
             raise IncompatibleRunStateError("Incompatible SQLite Run state indexes")
+        actual_tables = {name: sql for kind, name, _, sql in definitions if kind == "table"}
+        if any(actual_tables.get(name) != ddl for name, ddl in work_records.TABLES.items()):
+            raise IncompatibleRunStateError("Incompatible SQLite work records schema")
         if isinstance(connection, ReadConnection) and connection.schema_facts is not None:
             # read_document proved these exact table definitions against the
             # creator's DDL in the same SQL snapshot as all returned Run facts.
@@ -333,11 +299,10 @@ class SQLiteStateRepository:
                 nullable = ((name == "runs" and row[1] != "root_keys_json") or row[1] == "key"
                             or name in {"run_materials", "run_sizes"} and row[1] in {"material_id", "run_id"}
                             or name == "run_object_index" and row[1] in {"invocation_id", "resume_id", "content_digest", "size_proof", "child_count", "attempt_id"}
-                            or name == "run_history" and row[1] in {"ticket_number", "work_subject", "started_at", "resume_id"}
-                            or name == "run_job_attempts" and row[1] in {"role", "status", "ordinal"})
+                            )
                 if row[2] != expected_type or bool(row[3]) == nullable:
                     raise IncompatibleRunStateError("Incompatible SQLite Run state schema")
-        if sum(len(text or "") for _, _, _, text in definitions) <= 16 * 1024:
+        if sum(len(text or "") for _, _, _, text in definitions) <= 128 * 1024:
             with _SCHEMA_CACHE_LOCK:
                 if len(_VALID_SCHEMAS) >= 16:
                     _VALID_SCHEMAS.clear()
@@ -374,9 +339,7 @@ class SQLiteStateRepository:
             # boundary and restores it before BEGIN when necessary.
             if session is None or connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
                 connection.execute("PRAGMA foreign_keys = ON")
-            mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-            if mode != "wal":
-                raise OSError("SQLite Run state requires WAL journal support")
+            enable_wal(connection, timeout=timeout)
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("BEGIN IMMEDIATE")
             if initialized:
@@ -395,10 +358,11 @@ class SQLiteStateRepository:
             self._local.rollback_callbacks = []
             self._local.view = None
             self._local.work_view = None
-            self._local.work_source = None
             self._local.work_archives = {}
             self._local.work_attempts = {}
             self._local.work_timelines = {}
+            self._local.object_archives = {}
+            self._local.object_attempts = {}
             try:
                 yield
                 if self._local.failed:
@@ -425,10 +389,11 @@ class SQLiteStateRepository:
             self._local.rollback_callbacks = []
             self._local.view = None
             self._local.work_view = None
-            self._local.work_source = None
             self._local.work_archives = {}
             self._local.work_attempts = {}
             self._local.work_timelines = {}
+            self._local.object_archives = {}
+            self._local.object_attempts = {}
             if connection is not None and session is None:
                 # SQLite handles checkpoints and WAL/SHM cleanup on writer
                 # close when other connections allow it. Readers never perform
@@ -569,7 +534,7 @@ class SQLiteStateRepository:
         if view is not None and view.run_id == run_id:
             # Only the current write transaction can reuse its validated view.
             # Callers own mutable projections, never the transaction baseline.
-            return self._copy_view(view)
+            return work_records.load_complete(self._local.connection, run_id, self._copy_view(view))
         with self._reading(run_id) as connection:
             if connection is None:
                 return None
@@ -594,7 +559,7 @@ class SQLiteStateRepository:
                 check_indexes(self, connection, run_id, state, cached.view.logical_bytes,
                               cached.view.objects, cached.view.materials, snapshot_refs=cached.view.snapshot_refs,
                               expected=cached.view.index_facts)
-                return state
+                return work_records.load_complete(connection, run_id, state)
             materials: dict[str, str] = {}
             for identity, material_value, byte_length in source.material_rows():
                 if not isinstance(material_value, str) or type(byte_length) is not int:
@@ -736,11 +701,27 @@ class SQLiteStateRepository:
                 self._local.view = view
             if view is not None and view.fields is not None:
                 self._local.last_read_view = weakref.ref(view)
-            return root
+            return work_records.load_complete(connection, run_id, root)
 
     def load_work(self, run_id: str, ticket_number: int | None, *, thin_timeline: bool = False) -> dict[str, Any] | None:
         """Read work facts and indexed related history in one SQL snapshot."""
-        return load_work(self, run_id, ticket_number, thin_timeline=thin_timeline)
+        from agent_run.sqlite_work_objects import load_base_work
+
+        with self._reading() as connection:
+            if connection is None:
+                return None
+            if self.in_transaction:
+                self._check_schema(connection)
+            loaded = load_base_work(self, connection, run_id, thin_timeline=thin_timeline)
+            if loaded is None:
+                return None
+            state, archives, related = work_records.load_work(connection, run_id, loaded[0], ticket_number)
+            self._local.work_archives = archives
+            self._local.work_attempts = related
+            self._local.work_timelines = loaded[1]
+            self._local.work_projection_bytes = loaded[2]
+            self._local.work_view = work_records.WorkBaseline(run_id, copy_json_tree(state), connection.total_changes)
+            return state
 
     def work_baseline(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         """Borrow the proved transaction baseline for internal read-only use.
@@ -749,23 +730,20 @@ class SQLiteStateRepository:
         is already isolated from it; a custom or changed view keeps the copy
         path. Neither result grants authority outside the current transaction.
         """
-        from agent_run.sqlite_work_objects import WorkView
         from agent_run.sqlite_mutations import _same
 
         view = getattr(self._local, "work_view", None)
         connection = getattr(self._local, "connection", None)
-        if (connection is not None and isinstance(view, WorkView) and view.run_id == run_id
+        if (connection is not None and isinstance(view, work_records.WorkBaseline) and view.run_id == run_id
                 and view.total_changes == connection.total_changes and _same(view.baseline, state)):
             return view.baseline
         return cast(dict[str, Any], copy_json_tree(state))
 
     def current_work_baseline(self, run_id: str) -> dict[str, Any]:
         """Borrow only the isolated source of this unchanged write snapshot."""
-        from agent_run.sqlite_work_objects import WorkView
-
         view = getattr(self._local, "work_view", None)
         connection = getattr(self._local, "connection", None)
-        if (connection is None or not isinstance(view, WorkView) or view.run_id != run_id
+        if (connection is None or not isinstance(view, work_records.WorkBaseline) or view.run_id != run_id
                 or view.total_changes != connection.total_changes):
             raise ValueError("Work baseline requires a current transaction read")
         return view.baseline
@@ -902,17 +880,81 @@ class SQLiteStateRepository:
         return dict(getattr(self._local, "work_timelines", {}))
 
     def save_work(self, run_id: str, state: Mapping[str, Any], baseline: Mapping[str, Any],
-                  *, timeline_updates: Mapping[str, dict[str, Any]] | None = None) -> None:
+                  *, timeline_updates: Mapping[str, dict[str, Any]] | None = None) -> bool:
         """Patch a work projection without replacing unloaded history."""
         with self.atomic():
-            self._local.work_source = None
-            save_work(self, run_id, state, baseline, timeline_updates=timeline_updates)
+            from agent_run.sqlite_mutations import _same
+            from agent_run.sqlite_objects import save_projection
+
+            view = getattr(self._local, "work_view", None)
+            connection = self._local.connection
+            if (not isinstance(view, work_records.WorkBaseline) or view.run_id != run_id
+                    or view.total_changes != connection.total_changes or not _same(view.baseline, baseline)):
+                raise ValueError("SQLite work patch requires its current transaction baseline")
+            scopes = self.work_timelines()
+            updates = timeline_updates or {}
+            if updates.keys() - scopes.keys() or any(key in state or key in baseline for key in scopes):
+                raise ValueError("SQLite work patch cannot replace unloaded Timeline fields")
+            fields = {key for key in state.keys() | baseline.keys()
+                      if key not in state or key not in baseline or not _same(state[key], baseline[key])}
+            owned = fields & work_records.FIELDS
+            remaining = fields - work_records.FIELDS
+            run_state = work_records.without_work(state)
+            append = {}
+            for key in remaining & sqlite_timeline.FIELDS:
+                old_events, new_events = baseline.get(key), state.get(key)
+                if (isinstance(old_events, list) and isinstance(new_events, list)
+                        and len(new_events) >= len(old_events) and new_events[:len(old_events)] == old_events):
+                    append[key] = new_events[len(old_events):]
+            for key, event in updates.items():
+                if not isinstance(event, dict):
+                    raise ValueError("Timeline event must be an object")
+                scope = scopes[key]
+                if scope.count >= sqlite_timeline.limit(key):
+                    if key != "timeline_continuation":
+                        raise ValueError("Timeline reached its event limit")
+                    # Continuation is capped at 256 entries. Only this rare
+                    # rotation replaces its bounded field; ordinary appends
+                    # encode the new event and retain prior material rows.
+                    run_state[key] = [*json.loads(scope.encoded)[1:], event]
+                else:
+                    append[key] = [event]
+                remaining.add(key)
+            if remaining:
+                save_projection(self, connection, run_id, run_state, remaining, {}, append_changes=append)
+            work_records.save(self._local.connection, run_id, state, baseline, fields=owned)
+            gates_changed = False
+            if isinstance(state, dict):
+                gates_changed, mirrors = self.project_saved_job_gates(run_id, state, fields=owned)
+                if gates_changed and "ticket_work_queue" in state:
+                    from agent_run.ticket_work import reconcile
+
+                    before_queue = state["ticket_work_queue"]
+                    reconcile(state)
+                    if not _same(before_queue, state["ticket_work_queue"]):
+                        mirrors.add("ticket_work_queue")
+                if mirrors:
+                    save_projection(self, connection, run_id, work_records.without_work(state), mirrors, {})
+            # These scalar locators have real query consumers. A no-op work
+            # boundary can repair their drift without rewriting any evidence.
+            for column in ("repository", "status", "phase", "created_at", "updated_at"):
+                value = state.get(column)
+                connection.execute(f"UPDATE runs SET {column}=? WHERE run_id=? AND {column} IS NOT ?",
+                                   (value, run_id, value))
+            parent_number = state.get("parent", {}).get("number")
+            connection.execute("UPDATE runs SET parent_number=? WHERE run_id=? AND parent_number IS NOT ?",
+                               (parent_number, run_id, parent_number))
+            self._local.view = None
+            self._local.work_view = None
             if state.get("action_application_receipt") != baseline.get("action_application_receipt"):
                 self._observe_application(self._local.connection, run_id, state)
+            return gates_changed
 
     def _objects(
         self, state: Mapping[str, Any],
     ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+        if state.keys() & work_records.FIELDS:
+            raise ValueError("Work records must use their relational storage boundary")
         objects: dict[str, tuple[str, str]] = {}
         materials: dict[str, str] = {}
 
@@ -950,24 +992,8 @@ class SQLiteStateRepository:
             fixed_snapshot = bool(path) and (
                 path[-1] in _SNAPSHOT_FIELDS or len(path) > 1 and path[-2] == "tickets"
             )
-            keyed_object = (
-                len(path) == 1 and path[0] in _CURRENT_OBJECTS
-                or len(path) == 2 and path[0] in _OBJECT_COLLECTIONS
-            )
-            job_object = (path == ("active_ticket_job",)
-                          or len(path) == 2 and path[0] == "ticket_jobs")
-            if isinstance(value, Mapping) and job_object and JOB_HISTORIES.intersection(value):
-                # The current Job owns its scheduling facts; an archive remains
-                # independently addressable without expanding sibling evidence.
-                add(path, {key: item for key, item in value.items() if key not in JOB_HISTORIES})
-                for key in JOB_HISTORIES.intersection(value):
-                    if key == "semantic_attempt_history" and isinstance(value[key], list):
-                        objects[_json((*path, key))] = ("list", str(len(value[key])))
-                        for position, attempt in enumerate(value[key]):
-                            objects[_json((*path, key, position))] = ("snapshot", _json(snapshot(attempt)))
-                    else:
-                        objects[_json((*path, key))] = ("snapshot", _json(snapshot(value[key])))
-            elif isinstance(value, Mapping) and (fixed_snapshot or keyed_object):
+            keyed_object = len(path) == 2 and path[0] in _OBJECT_COLLECTIONS
+            if isinstance(value, Mapping) and (fixed_snapshot or keyed_object):
                 objects[location] = ("snapshot", _json(snapshot(value)))
             elif isinstance(value, Mapping):
                 objects[location] = ("map", "null")
@@ -1014,8 +1040,9 @@ class SQLiteStateRepository:
             connection = self._local.connection
             if connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None:
                 raise ValueError("SQLite Run already exists; use object commits to update it")
-            self._check_size(state)
-            objects, materials = self._objects(state)
+            unowned = work_records.without_work(state)
+            self._check_size(unowned)
+            objects, materials = self._objects(unowned)
             representation_bytes = sum(len(path.encode()) + len(value.encode())
                                        for path, (_, value) in objects.items())
             representation_bytes += sum(len(value.encode()) for value in materials.values())
@@ -1031,19 +1058,19 @@ class SQLiteStateRepository:
                               state.get("created_at"), state.get("updated_at"))
             )
             self._local.view = None
-            self._local.work_source = None
             connection.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, metadata[0], parent_number, *metadata[1:], _json(sorted(state))),
+                (run_id, metadata[0], parent_number, *metadata[1:], _json(sorted(unowned))),
             )
             from agent_run.sqlite_objects import index_objects
-            index_objects(connection, run_id, state, objects, materials, {})
+            index_objects(connection, run_id, unowned, objects, materials, {})
             self._aggregate_rows = create_run_objects(
                 connection, run_id, objects=objects, materials=materials, native=self._aggregate_rows,
             )
             from agent_run.sqlite_integrity import sync_material_counts
             sync_material_counts(connection, run_id)
-            index_run(self, connection, run_id, state, objects, materials)
+            index_run(self, connection, run_id, unowned, objects, materials)
+            work_records.save(connection, run_id, state, {}, fields=set(state) & work_records.FIELDS)
             self._local.work_view = None
             if "action_application_receipt" in state:
                 self._observe_application(connection, run_id, state)
@@ -1063,45 +1090,110 @@ class SQLiteStateRepository:
         """Read current facts and only history linked to current identities."""
         from agent_run.sqlite_objects import load_projection
         with self._reading() as connection:
-            return None if connection is None else load_projection(connection, run_id, excluded_fields=excluded_fields, max_bytes=self.max_bytes,
-                                                                       related_tickets=related_tickets, ticket_numbers=ticket_numbers,
-                                                                       scheduler_tickets=scheduler_tickets)
+            if connection is None:
+                return None
+            loaded = load_projection(connection, run_id, excluded_fields=set(excluded_fields or ()) | work_records.FIELDS,
+                                     max_bytes=self.max_bytes, related_tickets=related_tickets,
+                                     ticket_numbers=ticket_numbers, scheduler_tickets=scheduler_tickets)
+            if loaded is None:
+                return None
+            result = work_records.load_objects(
+                connection, run_id, loaded[0], excluded_fields=set(excluded_fields or ()),
+                related_tickets=related_tickets, ticket_numbers=ticket_numbers, scheduler_tickets=scheduler_tickets,
+                max_bytes=self.max_bytes,
+            )
+            self._local.object_archives, self._local.object_attempts = work_records.object_scope(connection, run_id, result[0])
+            return result
 
     def load_fields(self, run_id: str, fields: set[str]) -> dict[str, Any] | None:
         from agent_run.sqlite_objects import load_fields
         with self._reading() as connection:
-            return None if connection is None else load_fields(connection, run_id, fields, max_bytes=self.max_bytes)
+            if connection is None:
+                return None
+            base = load_fields(connection, run_id, fields - work_records.FIELDS, max_bytes=self.max_bytes)
+            return None if base is None else work_records.load_fields(connection, run_id, base, fields)
 
     def save_objects(
         self, run_id: str, state: Mapping[str, Any], *, fields: set[str],
         history_positions: Mapping[str, int] | None = None,
         keyed_changes: Mapping[str, set[str]] | None = None,
+        archive_scope: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         from agent_run.sqlite_objects import save_projection
         with self.atomic():
-            save_projection(self, self._local.connection, run_id, state, fields,
-                            history_positions or {}, keyed_changes=keyed_changes)
+            connection = self._local.connection
+            remaining = fields - work_records.FIELDS
+            if remaining:
+                save_projection(self, connection, run_id, work_records.without_work(state), remaining,
+                                history_positions or {}, keyed_changes={key: value for key, value in (keyed_changes or {}).items()
+                                                                       if key not in work_records.FIELDS})
+            owned = fields & work_records.FIELDS
+            if owned:
+                baseline = work_records.baseline_for_save(connection, run_id, state, owned, keyed_changes, archive_scope)
+                work_records.save(connection, run_id, state, baseline, fields=owned, keyed_changes=keyed_changes)
             self._local.view = None
+            self._local.work_view = None
             if "action_application_receipt" in fields:
                 self._observe_application(self._local.connection, run_id, state)
+
+    def project_saved_job_gates(
+        self, run_id: str, state: dict[str, Any], *, fields: set[str],
+        keyed_changes: Mapping[str, set[str]] | None = None,
+    ) -> tuple[bool, set[str]]:
+        """Refresh only gates in the caller's existing save transaction."""
+        from agent_run.sqlite_change_jobs import FIELDS as JOB_FIELDS
+        if not fields & JOB_FIELDS:
+            return False, set()
+        connection = getattr(self._local, "connection", None)
+        if connection is None or not connection.in_transaction:
+            raise RuntimeError("Job gate projection requires the save transaction")
+        return work_records.project_saved_gates(
+            connection, run_id, state, fields=fields, keyed_changes=keyed_changes,
+        )
 
     def load_paths(self, run_id: str, paths: set[tuple[str | int, ...]]) -> dict[str, Any] | None:
         from agent_run.sqlite_collections import load_paths
         from agent_run.sqlite_integrity import require_field_sizes
+        if any(not path or any(not isinstance(part, str) for part in path) for path in paths):
+            raise ValueError("Collection path projection requires mapping ancestors")
         with self._reading() as connection:
             if connection is None or connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is None:
                 return None
             require_field_sizes(connection, run_id, max_bytes=self.max_bytes)
-            return load_paths(connection, run_id, paths)
+            plain_paths = {path for path in paths if path[0] not in work_records.FIELDS}
+            base = load_paths(connection, run_id, plain_paths)
+            owned = {path for path in paths if path[0] in work_records.FIELDS}
+            if not owned:
+                return base
+            numbers = {int(path[1]) for path in owned if len(path) > 1
+                       and path[0] in {"ticket_jobs", "ticket_agent_invocations"}}
+            work = work_records.load_fields(connection, run_id, {}, {str(path[0]) for path in owned},
+                                            ticket_numbers=numbers if numbers else None)
+            for path in owned:
+                source: Any = work
+                target: Any = base
+                for part in path[:-1]:
+                    if not isinstance(source, dict) or part not in source:
+                        break
+                    source = source[part]
+                    target = target.setdefault(part, {})
+                else:
+                    if isinstance(source, dict) and path[-1] in source:
+                        target[path[-1]] = source[path[-1]]
+            return base
 
     def append_array(self, run_id: str, field: str, items: list[Any]) -> None:
         from agent_run.sqlite_objects import save_projection
         with self.atomic():
-            if field == "agent_invocation_history":
-                save_projection(self, self._local.connection, run_id, {field: items}, {field}, {})
+            if field in work_records.FIELDS:
+                if field == "agent_invocation_history":
+                    work_records.save(self._local.connection, run_id, {field: items}, {}, fields={field})
+                else:
+                    work_records.append_archive(self._local.connection, run_id, field, items)
             else:
                 save_projection(self, self._local.connection, run_id, {}, {field}, {}, append_changes={field: items})
             self._local.view = None
+            self._local.work_view = None
 
     def has(self, run_id: str) -> bool:
         with self._reading() as connection:

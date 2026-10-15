@@ -3,6 +3,7 @@ from __future__ import annotations
 from support.run_artifacts import _passing_artifact
 
 from pathlib import Path
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -490,7 +491,8 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
     assert git.checkout_head(checkout) == job["managed_checkout_head"]
     assert preserved.read_text() == "development before credential failure\n"
 
-    assert resumed["ticket_jobs"]["3"]["human_response_history"][-1]["response"] == "凭据已恢复，继续原开发。"
+    durable = StateStore(store.root).load_current_run(run_id)
+    assert durable["ticket_jobs"]["3"]["human_response_history"][-1]["response"] == "凭据已恢复，继续原开发。"
 
 
 @pytest.mark.parametrize(
@@ -545,10 +547,19 @@ def test_parent_only_resume_rejects_invalid_generation_without_mutation(
     controller, store, run_id = _prepared_resume(
         git_repo,
         subject_kind="parent_only",
-        invocation_generation=invocation_generation,
+        invocation_generation=invocation_generation if invocation_generation is _MISSING else 1,
     )
     before = store.load_run(run_id)
     assert before is not None
+    if invocation_generation is not _MISSING:
+        damaged = deepcopy(before)
+        damaged["active_agent_invocation"]["generation"] = invocation_generation
+        # Typed relational persistence rejects booleans and text before an
+        # invalid generation can become authority for a public resume.
+        with pytest.raises(ValueError, match="Invalid execution record generation"):
+            persist_run_fixture(store, run_id, damaged)
+        assert StateStore(store.root).load_current_run(run_id) == before
+        return
     save_calls: list[str] = []
     monkeypatch.setattr(
         store,

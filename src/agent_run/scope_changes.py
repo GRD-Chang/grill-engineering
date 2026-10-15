@@ -35,7 +35,7 @@ def reconcile_structure(
 
     reopened = _reopened_completed_tickets(previous, projected)
     if reopened:
-        blocked = dict(previous)
+        blocked = previous.copy()
         blocked.update(
             {
                 "parent": _mapping(projected, "parent"),
@@ -103,7 +103,7 @@ def reconcile_structure(
 def _unsupported(
     previous: dict[str, Any], change: dict[str, Any]
 ) -> dict[str, Any]:
-    blocked = dict(previous)
+    blocked = previous.copy()
     blocked.update(
         {
             "status": "unsupported_scope_change",

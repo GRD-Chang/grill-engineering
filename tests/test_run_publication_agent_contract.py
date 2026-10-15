@@ -877,6 +877,7 @@ def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) ->
         "limit": 5,
     }
     publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
+    published = states.load_current_run(str(state["run_id"]))
     published["run_publication"]["phase"] = "publishing"
     persist_run_fixture(states, str(state["run_id"]), published)
 

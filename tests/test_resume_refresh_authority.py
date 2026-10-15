@@ -18,7 +18,7 @@ from agent_run.resume_intent import (
     validate_resume_intent,
 )
 from agent_run.state import StateStore
-from agent_run.object_state import save_owned
+from agent_run.object_state import current_projection_facts, save_owned
 from support.seeding import write_fixture
 from support.state import persist_run_fixture
 
@@ -269,6 +269,7 @@ def test_global_refresh_recovery_preserves_independent_ticket_gate(
     record_session_interruption(paused, save=lambda current: save_owned(states, run_id, current, fields={'active_agent_invocation', 'agent_invocation_history', 'diagnostics', 'github_refresh_resume_status', 'operator_stop', 'status', 'terminal_kind', 'ticket_agent_invocations', 'ticket_work_queue'}))
     intent = bind_resume_intent(paused)
     sibling = deepcopy(paused["ticket_jobs"]["2"])
+    sibling_current = current_projection_facts(paused)["ticket_jobs"]["2"]
     assert sibling["blocked_reason"] == gate
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     original_binding = controller._load_bound_run
@@ -291,7 +292,8 @@ def test_global_refresh_recovery_preserves_independent_ticket_gate(
             ),
         )
         assert waiting["status"] == "waiting_external"
-        assert waiting["ticket_jobs"]["2"] == sibling
+        assert current_projection_facts(waiting)["ticket_jobs"]["2"] == sibling_current
+        assert states.load_current_run(run_id)["ticket_jobs"]["2"] == sibling
         assert waiting["github_refresh_resume_status"] == "execution_failed"
         current_deadline = waiting["supervision_window"]["deadline"]
         assert deadline is None or deadline == current_deadline
@@ -303,7 +305,8 @@ def test_global_refresh_recovery_preserves_independent_ticket_gate(
         ),
     )
     assert resumed["status"] == "active"
-    assert resumed["ticket_jobs"]["2"] == sibling
+    assert current_projection_facts(resumed)["ticket_jobs"]["2"] == sibling_current
+    assert states.load_current_run(run_id)["ticket_jobs"]["2"] == sibling
     assert [item["ticket_number"] for item in resumed["ticket_work_queue"]] == [3]
     assert resumed.get("github_refresh_pending") is not True
     assert "github_refresh_resume_status" not in resumed

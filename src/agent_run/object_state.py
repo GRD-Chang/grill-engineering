@@ -9,13 +9,17 @@ from typing import Any, cast
 
 from agent_run.state import ConcurrentRunStateError, StateStore, _append_timeline_event, _sanitize_durable_errors
 from agent_run.object_projection import ObjectProjection, ProjectionBaseline, ProjectionKey
-from agent_run.sqlite_encoding import copy_json_tree
+from agent_run.sqlite_encoding import copy_json_tree, encode_json
+from agent_run.sqlite_job_history import FIELDS as JOB_ARCHIVES
+from agent_run.sqlite_change_job_schema import CYCLE_DERIVED
+from agent_run.sqlite_mutations import _same
 
 
 _MISSING = object()
 
 _ARCHIVE_FIELDS = frozenset({
     "retired_job_generations", "retired_parent_job", "retired_run_acceptance", "retired_run_publication",
+    "retired_semantic_attempt_owners",
 })
 _KEYED_TICKET_FIELDS = frozenset({
     "ticket_jobs", "ticket_agent_invocations", "retired_ticket_generations", "pending_ticket_retirements",
@@ -29,21 +33,41 @@ _PARENT_EXCLUDED_FIELDS = frozenset({
 })
 
 
+def _ticket_current(job: Any) -> Any:
+    if not isinstance(job, dict):
+        return job
+    return {key: value for key, value in job.items() if key not in JOB_ARCHIVES}
+
+
+def _owner_facts(job: Any) -> Any:
+    """Compare Repair facts rather than temporary mirrors of that same Job."""
+    if not isinstance(job, dict):
+        return job
+    repair, cycle = job.get("repair_job"), job.get("repair_cycle")
+    if not (isinstance(repair, dict) and isinstance(cycle, dict)
+            and repair.get("repair_generation") == cycle.get("generation")):
+        return job
+    return {**{key: value for key, value in job.items()
+               if key not in {"modification_attempts", "code_modification_attempts"}},
+            "repair_cycle": {key: value for key, value in cycle.items() if key not in CYCLE_DERIVED}}
+
+
 def _merge_change(old: Any, new: Any, latest: Any, owner: str) -> Any:
-    if old == new:
+    if _same(old, new):
         return deepcopy(latest)
     if isinstance(old, dict) and isinstance(new, dict) and isinstance(latest, dict):
-        if owner in {"parent_job", "run_acceptance", "run_publication", "active_agent_invocation"} or (
-            owner.startswith("ticket_jobs.") and owner.count(".") == 1
-        ):
-            if old != latest and new != latest:
+        if owner == "active_ticket_job" or owner.startswith("ticket_jobs.") and owner.count(".") == 1:
+            if not _same(_ticket_current(old), _ticket_current(latest)) and not _same(_ticket_current(new), _ticket_current(latest)):
+                raise ConcurrentRunStateError(f"Owner changed before commit: {owner}")
+        elif owner in {"parent_job", "run_acceptance", "run_publication", "active_agent_invocation"}:
+            if not _same(_owner_facts(old), _owner_facts(latest)) and not _same(_owner_facts(new), _owner_facts(latest)):
                 raise ConcurrentRunStateError(f"Owner changed before commit: {owner}")
         result = deepcopy(latest)
         for key in old.keys() | new.keys():
-            if old.get(key, _MISSING) == new.get(key, _MISSING):
+            if _same(old.get(key, _MISSING), new.get(key, _MISSING)):
                 continue
             if key not in new:
-                if key in latest and latest[key] != old.get(key, _MISSING):
+                if key in latest and not _same(latest[key], old.get(key, _MISSING)):
                     raise ConcurrentRunStateError(f"Object changed before commit: {owner}.{key}")
                 result.pop(key, None)
             else:
@@ -55,10 +79,10 @@ def _merge_change(old: Any, new: Any, latest: Any, owner: str) -> Any:
         result = {invocation_identity(item): deepcopy(item) for item in latest}
         for item in new:
             identity = invocation_identity(item)
-            if item != previous.get(identity):
+            if not _same(item, previous.get(identity)):
                 result[identity] = _merge_change(previous.get(identity), item, result.get(identity), "invocation:" + identity)
         return list(result.values())
-    if latest != old and latest != new:
+    if not _same(latest, old) and not _same(latest, new):
         raise ConcurrentRunStateError(f"Object changed before commit: {owner}")
     return deepcopy(new)
 
@@ -79,7 +103,7 @@ def _sync_current_facts(target: dict[str, Any], source: dict[str, Any], *, exclu
             target[key] = deepcopy(value)
 
 
-def _comparison_facts(state: dict[str, Any]) -> dict[str, Any]:
+def current_projection_facts(state: dict[str, Any]) -> dict[str, Any]:
     """Compare the same current Invocation relationship after owner retirement."""
     from agent_run.sqlite_objects import invocation_identity
     identities = {
@@ -90,7 +114,11 @@ def _comparison_facts(state: dict[str, Any]) -> dict[str, Any]:
     }
     resumes = {item.get("resume_id") for item in state.get("resume_audit", {}).get("history", [])
                if isinstance(item, dict)} - {None}
-    return {**state, "agent_invocation_history": [
+    return {**{key: value for key, value in state.items() if key not in _ARCHIVE_FIELDS},
+        "active_ticket_job": _ticket_current(state.get("active_ticket_job")),
+        "ticket_jobs": {key: _ticket_current(job) for key, job in state.get("ticket_jobs", {}).items()},
+        **{field: _owner_facts(state[field]) for field in ("parent_job", "run_acceptance", "run_publication") if field in state},
+        "agent_invocation_history": [
         item for item in state.get("agent_invocation_history", [])
         if invocation_identity(item) in identities or item.get("resume_id") in resumes
     ]}
@@ -169,14 +197,18 @@ class ObjectStateStore:
     ) -> dict[str, Any] | None:
         self._store._reject_legacy_run(run_id)
         excluded = self._excluded_fields | (set(_KEYED_TICKET_FIELDS) if not self._parent_scope else set())
-        loaded = self._store._repository.load_objects(
+        loaded = self._store._read_run_materials(run_id, lambda: self._store._repository.load_objects(
             run_id, excluded_fields=excluded, related_tickets=not self._parent_scope,
             ticket_numbers=ticket_numbers, scheduler_tickets=scheduler,
-        )
+        ))
         if loaded is None:
             return None
         facts, positions = loaded
         state = ObjectProjection(facts)
+        state.archive_scope = dict(getattr(self._store._repository._local, "object_archives", {}))
+        state.attempt_scope = deepcopy(getattr(self._store._repository._local, "object_attempts", {}))
+        self._store._repository._local.object_archives = {}
+        self._store._repository._local.object_attempts = {}
         self._record_baseline(run_id, state, positions)
         return state
 
@@ -195,7 +227,9 @@ class ObjectStateStore:
 
     def load_delivery_evidence(self, run_id: str) -> dict[str, Any]:
         self._store._reject_legacy_run(run_id)
-        evidence = self._store._repository.load_fields(run_id, {"ticket_jobs"})
+        evidence = self._store._read_run_materials(
+            run_id, lambda: self._store._repository.load_fields(run_id, {"ticket_jobs"}),
+        )
         if evidence is None:
             raise ValueError("Delivery Run disappeared at its evidence boundary")
         from agent_run.integration_record_contract import require_completed_ticket_integration_records
@@ -221,7 +255,7 @@ class ObjectStateStore:
         touched = {
             int(number) for field in _KEYED_TICKET_FIELDS
             for number in original.get(field, {}).keys() | state.get(field, {}).keys()
-            if original.get(field, {}).get(number, _MISSING) != state.get(field, {}).get(number, _MISSING)
+            if not _same(original.get(field, {}).get(number, _MISSING), state.get(field, {}).get(number, _MISSING))
         }
         # Keep the caller's loaded relationship set coherent after readback.
         # In particular a Controller graph refresh must retain a known sibling
@@ -240,7 +274,8 @@ class ObjectStateStore:
         excluded = self._excluded_fields | (set(_KEYED_TICKET_FIELDS) if not self._parent_scope else set())
         loaded = self._store._repository.load_objects(
             run_id, excluded_fields=excluded, related_tickets=not self._parent_scope,
-            ticket_numbers=touched, scheduler_tickets=expected is not None,
+            ticket_numbers=None if self._parent_scope else touched,
+            scheduler_tickets=not self._parent_scope,
         )
         if loaded is None:
             # New Run creation remains a complete creation transaction.
@@ -250,6 +285,28 @@ class ObjectStateStore:
                 self._record_baseline(run_id, created[0], created[1], projection=state)
             return
         latest, positions = loaded
+        # Keep an explicitly loaded target history available for later role
+        # closeout. A scheduling-only sibling has no loaded archive fields
+        # and remains outside this read and commit scope.
+        if baseline is not None:
+            for ticket_number in touched:
+                key_number = str(ticket_number)
+                old_job = original.get("ticket_jobs", {}).get(key_number, {})
+                new_job = state.get("ticket_jobs", {}).get(key_number, {})
+                if (isinstance(old_job, dict) and isinstance(new_job, dict)
+                        and any(field in old_job or field in new_job for field in JOB_ARCHIVES)):
+                    current = self._store._repository.load_paths(run_id, {("ticket_jobs", key_number)})
+                    owner = current.get("ticket_jobs", {}).get(key_number) if current else None
+                    if isinstance(owner, dict):
+                        latest.setdefault("ticket_jobs", {})[key_number] = owner
+                        archive_scope = self._store._repository._local.object_archives
+                        for field in JOB_ARCHIVES & owner.keys():
+                            archive_scope.pop(encode_json(("ticket_jobs", key_number, field)), None)
+                        selected = latest.get("active_ticket_job")
+                        if isinstance(selected, dict) and selected.get("ticket_number") == ticket_number:
+                            latest["active_ticket_job"] = owner
+                            for field in JOB_ARCHIVES & owner.keys():
+                                archive_scope.pop(encode_json(("active_ticket_job", field)), None)
         from agent_run.invocation_settlement import current_settlement, commit_settlement
         from agent_run.ticket_state import RUN_STOP_STATUSES
         permission = current_settlement()
@@ -275,8 +332,8 @@ class ObjectStateStore:
             }
             owners.update(
                 number for number in old.get("ticket_jobs", {}).keys() | state.get("ticket_jobs", {}).keys()
-                if old.get("ticket_jobs", {}).get(number, _MISSING)
-                != state.get("ticket_jobs", {}).get(number, _MISSING)
+                if not _same(old.get("ticket_jobs", {}).get(number, _MISSING),
+                             state.get("ticket_jobs", {}).get(number, _MISSING))
             )
             for number in owners:
                 job = latest.get("ticket_jobs", {}).get(number, {})
@@ -289,7 +346,8 @@ class ObjectStateStore:
             # Parent results also depend on unchanged requirements and the
             # current owner, even when this write only updates an Invocation.
             for field in ("parent_job", "run_acceptance", "run_publication"):
-                if latest.get(field) != old.get(field) and latest.get(field) != state.get(field):
+                if (not _same(_owner_facts(latest.get(field)), _owner_facts(old.get(field)))
+                        and not _same(_owner_facts(latest.get(field)), _owner_facts(state.get(field)))):
                     raise ConcurrentRunStateError(f"Parent owner changed before commit: {field}")
             for field in ("accepted_parent_spec_revision", "accepted_ticket_graph_revision"):
                 if latest.get(field) != old.get(field):
@@ -301,16 +359,16 @@ class ObjectStateStore:
                 if latest.get("status") != old.get("status") and latest.get("status") != state.get("status"):
                     raise ConcurrentRunStateError("Parent lost Run authorization before commit")
         fields = {key for key in (old.keys() | state.keys()) - self._excluded_fields
-                  if old.get(key, _MISSING) != state.get(key, _MISSING)}
+                  if not _same(old.get(key, _MISSING), state.get(key, _MISSING))}
         expected = getattr(self._local, "expected", {}).get(run_id)
-        if expected is not None and _comparison_facts(latest) != _comparison_facts(expected):
+        if expected is not None and not _same(current_projection_facts(latest), current_projection_facts(expected)):
             raise ConcurrentRunStateError("Run changed during Controller refresh")
         merged = copy_json_tree(latest)
         for field in fields:
             if field in state:
                 merged[field] = _merge_change(old.get(field, _MISSING), state[field], latest.get(field, _MISSING), field)
             else:
-                if field in latest and latest[field] != old.get(field, _MISSING):
+                if field in latest and not _same(latest[field], old.get(field, _MISSING)):
                     raise ConcurrentRunStateError(f"Object changed before commit: {field}")
                 merged.pop(field, None)
         # Current selection is a view of the exact Ticket Invocation, as in
@@ -331,22 +389,46 @@ class ObjectStateStore:
         durable = _sanitize_durable_errors(merged)
         _append_timeline_event(durable, latest)
         from agent_run.state_contract import require_current_run_state
-        require_current_run_state(durable, parent_scope=self._parent_scope)
-        changed = {key for key in latest.keys() | durable.keys() if latest.get(key, _MISSING) != durable.get(key, _MISSING)}
+        archives = dict(getattr(self._store._repository._local, "object_archives", {}))
+        attempts = dict(getattr(self._store._repository._local, "object_attempts", {}))
+        if archives and not self._parent_scope:
+            from agent_run.state_contract import require_current_work_state
+            scope = ObjectProjection(durable)
+            scope.archive_scope, scope.attempt_scope = archives, attempts
+            # Graph refresh can select a different Ticket. Follow its exact
+            # canonical owner rather than retaining the old selection's proof.
+            scope.refresh_scope()
+            archives, attempts = scope.archive_scope, scope.attempt_scope
+            require_current_work_state(durable, archives, attempts)
+        else:
+            require_current_run_state(durable, parent_scope=self._parent_scope)
+        changed = {key for key in latest.keys() | durable.keys() if not _same(latest.get(key, _MISSING), durable.get(key, _MISSING))}
         keyed_changes = {
             field: {number for number in latest.get(field, {}).keys() | durable.get(field, {}).keys()
-                    if latest.get(field, {}).get(number, _MISSING) != durable.get(field, {}).get(number, _MISSING)}
+                    if not _same(latest.get(field, {}).get(number, _MISSING), durable.get(field, {}).get(number, _MISSING))}
             for field in _KEYED_TICKET_FIELDS & changed
         }
         self._store._repository.save_objects(
             run_id, durable, fields=changed, history_positions=positions, keyed_changes=keyed_changes,
+            archive_scope=archives,
         )
+        gates_changed, gate_mirrors = self._store._repository.project_saved_job_gates(
+            run_id, durable, fields=changed, keyed_changes=keyed_changes,
+        )
+        if gates_changed:
+            if archives and not self._parent_scope:
+                require_current_work_state(durable, archives, attempts)
+            else:
+                require_current_run_state(durable, parent_scope=self._parent_scope)
+            if gate_mirrors:
+                self._store._repository.save_objects(run_id, durable, fields=gate_mirrors)
         # Requeue emits a new retirement record; append it atomically without
         # assembling any earlier generation or another Ticket's archive.
-        retired = state.get("retired_job_generations")
-        if isinstance(retired, list) and retired:
-            self._store._repository.append_array(run_id, "retired_job_generations", retired)
-            state.pop("retired_job_generations", None)
+        for archive_field in ("retired_job_generations", "retired_semantic_attempt_owners"):
+            retired = state.get(archive_field)
+            if isinstance(retired, list) and retired:
+                self._store._repository.append_array(run_id, archive_field, retired)
+                state.pop(archive_field, None)
         # Structure retirement emits one former Parent owner. Persist it with
         # removal of the current owner; do not hydrate or rewrite old archives.
         if "retired_parent_job" in state:
@@ -361,8 +443,11 @@ class ObjectStateStore:
         notifications.append(deepcopy(durable) if self.run_saved_observer is not None else None)
         self._record_baseline(run_id, durable, positions, projection=state)
         if expected is not None:
-            self._local.expected[run_id] = deepcopy(_comparison_facts(durable))
+            self._local.expected[run_id] = deepcopy(current_projection_facts(durable))
         _sync_current_facts(state, durable, excluded=self._excluded_fields)
+        if isinstance(state, ObjectProjection):
+            state.archive_scope = archives
+            state.attempt_scope = attempts
 
     @contextmanager
     def require_unchanged_run(self, run_id: str, expected: dict[str, Any]) -> Iterator[None]:
@@ -376,7 +461,7 @@ class ObjectStateStore:
     def load_unchanged_run(self, run_id: str) -> dict[str, Any] | None:
         expected = getattr(self._local, "expected", {}).get(run_id)
         latest = self.load_scheduler_current_run(run_id)
-        if expected is None or latest is None or _comparison_facts(latest) != _comparison_facts(expected):
+        if expected is None or latest is None or not _same(current_projection_facts(latest), current_projection_facts(expected)):
             raise ConcurrentRunStateError("Run changed before Controller returned its refresh")
         return latest
 
@@ -470,8 +555,17 @@ def save_owned(
                 # projection that the Driver received, keeping Run stop gates.
                 observed = {**latest, **wait}
             for field in expected:
-                if (observed.get(field) != expected.get(field)
-                        and (field not in fields or observed.get(field) != durable.get(field))):
+                def matches(left: Any, right: Any) -> bool:
+                    # A wait owns current facts. The exact Ticket's archived
+                    # evidence can be absent from its scheduling projection.
+                    if field == "active_ticket_job":
+                        return _same(_ticket_current(left), _ticket_current(right))
+                    # Numeric wait clocks allow equivalent int/float values
+                    # across the typed SQL and remaining Run representations.
+                    return bool(left == right)
+
+                if (not matches(observed.get(field), expected.get(field))
+                        and (field not in fields or not matches(observed.get(field), durable.get(field)))):
                     raise ConcurrentRunStateError(f"Object changed before commit: {field}")
             if latest.get("status") in {"abandoned", "completed"} and latest.get("status") != state.get("status"):
                 raise ConcurrentRunStateError("Run became terminal before wait/control commit")

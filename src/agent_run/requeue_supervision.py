@@ -79,7 +79,7 @@ def refresh_requeue_transition_facts(
         return state
     except GitHubReadError as error:
         return wait_for_recoverable_github_read(
-            dict(state),
+            state.copy(),
             error,
             waiting_for="GitHub requeue transition refresh",
             now=now,

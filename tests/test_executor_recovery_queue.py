@@ -54,7 +54,13 @@ def test_executor_recovery_preserves_fifo_and_local_pause(
         run_id, explicit_resume=True,
     )
 
-    assert resumed["ticket_jobs"].get("2") == paused_job
+    current_job = resumed["ticket_jobs"].get("2")
+    if isinstance(current_job, dict):
+        assert current_job == {key: paused_job[key] for key in current_job}
+    else:
+        assert current_job == paused_job
+    durable = states.load_current_run(run_id)
+    assert durable["ticket_jobs"].get("2") == paused_job
     assert resumed["ticket_agent_invocations"].get("2") == paused_invocation
     assert [item["ticket_number"] for item in resumed["ticket_work_queue"]] == [4, 3]
     assert admission.acquire(3, 1, "development") is None
@@ -155,8 +161,21 @@ def test_global_resume_binds_ticket_authority_not_active_projection(
     )
     assert resumed["active_agent_invocation"]["work_subject"] == "ticket:3"
     assert resumed["ticket_agent_invocations"] == identities
+    projection_fields = {"selection_reason", "source_revision_changed"}
     for number, job in jobs.items():
-        assert {key: resumed["ticket_jobs"][number][key] for key in job} == job
+        current = resumed["ticket_jobs"][number]
+        assert set(current) <= set(job) | projection_fields
+        assert {key: value for key, value in current.items() if key not in projection_fields} == {
+            key: job[key] for key in current if key not in projection_fields
+        }
+    durable = states.load_current_run(run_id)
+    assert {number: {key: value for key, value in durable["ticket_jobs"][number].items() if key not in projection_fields}
+            for number in jobs} == {
+        number: {key: value for key, value in job.items() if key not in projection_fields} for number, job in jobs.items()
+    }
+    assert durable["active_ticket_job"] == durable["ticket_jobs"]["3"]
+    assert durable["ticket_jobs"]["3"]["selection_reason"] == resumed["active_ticket_job"]["selection_reason"]
+    assert durable["ticket_jobs"]["3"]["source_revision_changed"] is False
     assert resumed["status"] == "active"
 
 

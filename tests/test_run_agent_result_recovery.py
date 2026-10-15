@@ -148,6 +148,10 @@ def test_public_resume_reuses_publication_return_after_remote_currentness_timeou
     assert durable["run_publication"]["pending_semantic_attempt"]["returned_result"]["artifact"]["_thread_id"] == "returned-run-publisher"
     assert "artifact" not in durable["run_publication"]
     assert len(agents.requests) == 1
+    # The control result is a current projection. Arrange the complete fixture
+    # from persisted facts before replacing a Run; unloaded archives stay owned
+    # by SQLite and must not be reconstructed from the thin return value.
+    paused = durable
     clock = [0.0]
     supervisor = ExternalSupervisor(now=lambda: clock[0])
     window = supervisor.observe(paused)

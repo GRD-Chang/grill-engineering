@@ -102,4 +102,6 @@ def prepare_published_run(
     assert published["run_publication"]["pr_number"] != historical_pr
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert len({pull["number"] for pull in pulls}) == len(pulls)
-    return fixture, published
+    complete = StateStore(managed_state(repo)).load_current_run(str(published["run_id"]))
+    assert complete is not None
+    return fixture, complete

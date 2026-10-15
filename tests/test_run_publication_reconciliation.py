@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.object_state import current_projection_facts
 from agent_run.run_publication import RunPublicationEngine
 from support.run_publication import RunPublicationAgents
 from support.run_scenarios import _accepted_run
@@ -79,7 +80,8 @@ def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
         assert lagging["run_publication"]["merge_intent"] == original["merge_intent"]
         assert lagging["run_publication"].get("approval_update") is None
         assert lagging["run_acceptance"] == pending["run_acceptance"]
-        assert lagging["ticket_jobs"] == pending["ticket_jobs"]
+        assert current_projection_facts(lagging)["ticket_jobs"] == current_projection_facts(pending)["ticket_jobs"]
+        assert states.load_current_run(run_id)["ticket_jobs"] == pending["ticket_jobs"]
         assert lagging["agent_invocation_history"] == pending["agent_invocation_history"]
         assert 1 not in publisher.data["delivery"]["closed_issues"]
 

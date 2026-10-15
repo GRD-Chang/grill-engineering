@@ -14,6 +14,7 @@ import pytest
 from support.workspace import prepare_workspace
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.approval_grant import create_grant, grant_authority
 from agent_run.controller import Controller
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_history import history_records
@@ -30,6 +31,7 @@ from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt
 from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.object_state import current_projection_facts
 
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import stdout_json
@@ -587,7 +589,7 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
         assert run["repair_job"]["modification_attempts"] == 1
         assert run["ci_recovery"]["developments_used"] == 0
         assert len(first_agents.review_requests) == 2
-        assert states.load_current_run(str(state["run_id"])) == first
+        assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(first)
         return
     assert first["status"] == "run_acceptance_pending", first
     job = run["repair_job"]
@@ -677,7 +679,7 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
     assert repair_branches.isdisjoint(fixture_data["delivery"]["published_branches"])
     assert not repair_checkout.exists()
 
-    archived_owners = second.get("retired_semantic_attempt_owners", [])
+    archived_owners = states.load_current_run(str(state["run_id"])).get("retired_semantic_attempt_owners", [])
     assert len(archived_owners) == 1
     archived_owner = archived_owners[0]
     archived_attempts = archived_owner["semantic_attempt_history"]
@@ -803,7 +805,7 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     assert job["candidate_sha"]
     assert run["repair_cycle"]["status"] == "active"
     ci_before = deepcopy(run["ci_recovery"])
-    assert states.load_current_run(str(state["run_id"])) == first
+    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(first)
 
     second = RunAcceptanceEngine(
         git=git, states=states, agents=agents,
@@ -856,7 +858,7 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     assert third["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
     assert third["run_acceptance"]["integration_resync"]["used"] == 1
     assert third["run_acceptance"]["ci_recovery"] == ci_before
-    assert states.load_current_run(str(state["run_id"])) == third
+    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(third)
 
 
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(
@@ -883,7 +885,10 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
         "phase": "ready_for_approval",
         "pr_number": final_pr,
         "artifact": {"pr_body_markdown": "Original final Run narrative."},
-        "approval_grant": {"fingerprint": "stale-default-boundary"},
+        "approval_grant": create_grant(grant_authority(
+            repository=state["repository"], pr_number=final_pr, head_branch=state["run_branch"],
+            head_sha=git.resolve(state["run_branch"]), base_branch="main", base_sha=git.resolve("main"),
+            acceptance_fingerprint="stale-default-boundary")),
     }
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -1121,7 +1126,10 @@ def test_required_check_repair_promotion_clears_old_observation_and_archives_pro
         "pr_number": final_pr,
         "required_checks_evidence": old_observation,
         "artifact": {"pr_body_markdown": "Original final Run narrative."},
-        "approval_grant": {"fingerprint": "old-observation"},
+        "approval_grant": create_grant(grant_authority(
+            repository=state["repository"], pr_number=final_pr, head_branch=state["run_branch"],
+            head_sha=old_head, base_branch="main", base_sha=git.resolve("main"),
+            acceptance_fingerprint="old-observation")),
     }
     state["run_acceptance"] = {
         "phase": "repairing",

@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.sqlite_integrity import field_size_proof, require_field_sizes, source_objects_digest
-from agent_run.sqlite_objects import _rows
+from agent_run.sqlite_integrity import field_size_proof, require_field_sizes
 from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.sqlite_work_records import without_work
+from support.work_records import attempt
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
@@ -27,8 +28,8 @@ def test_alternating_work_and_owned_commits_reopen_complete_evidence(tmp_path: P
         current = deepcopy(baseline)
         assert "human_blocker_history" not in current["ticket_jobs"]["3"]
         current["ticket_jobs"]["3"]["phase"] = "reviewing"
-        current["ticket_jobs"]["2"]["semantic_attempt_history"] = [{"role": "developer", "status": "completed", "ordinal": 1}]
-        current["agent_invocation_history"].append({"work_subject": "parent-only", "started_at": "2026-01-01T00:00:00Z"})
+        current["ticket_jobs"]["2"]["semantic_attempt_history"] = [attempt()]
+        current["agent_invocation_history"].append({"work_subject": "parent-only", "started_at": "2026-01-01T00:00:00Z", "status": "completed"})
         current["timeline"].append({"event": "work"})
         repository.save_work("run-1", current, baseline=baseline)
     expected["ticket_jobs"]["3"]["phase"] = "reviewing"
@@ -39,7 +40,7 @@ def test_alternating_work_and_owned_commits_reopen_complete_evidence(tmp_path: P
     repository.save_objects("run-1", {"phase": "run_acceptance", "ticket_jobs": {"2": {"ticket_number": 2, "phase": "completed"}}},
                             fields={"phase", "ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}})
     expected["phase"] = "run_acceptance"
-    expected["ticket_jobs"]["2"] = {"ticket_number": 2, "phase": "completed"}
+    expected["ticket_jobs"]["2"]["phase"] = "completed"
     repository.append_array("run-1", "timeline", [{"event": "parent"}])
     expected["timeline"].append({"event": "parent"})
     reopened = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
@@ -49,10 +50,10 @@ def test_alternating_work_and_owned_commits_reopen_complete_evidence(tmp_path: P
     with reopened._reading() as connection:
         assert connection is not None
         size = require_field_sizes(connection, "run-1", max_bytes=reopened.max_bytes)
-        assert size == reopened._check_size(expected)
+        assert size == reopened._check_size(without_work(expected))
         assert connection.execute("SELECT logical_bytes FROM run_sizes").fetchone() == (size,)
-        assert connection.execute("SELECT content_digest FROM run_object_index WHERE object_path='[\"ticket_jobs\"]'").fetchone() == (
-            source_objects_digest(_rows(connection, "run-1", '["ticket_jobs"]')),)
+        assert connection.execute("SELECT COUNT(*) FROM run_objects WHERE object_path LIKE '[\"ticket_jobs\"%'").fetchone() == (0,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
@@ -70,29 +71,32 @@ def test_work_updates_hidden_active_archive_owner_with_complete_field_proof(tmp_
         current["active_ticket_job"]["phase"] = "reviewing"
         repository.save_work("run-1", current, baseline)
     expected["active_ticket_job"]["phase"] = "reviewing"
+    expected["ticket_jobs"]["3"]["phase"] = "reviewing"
     assert repository.load("run-1") == expected
     with repository._reading() as connection:
         assert connection is not None
-        assert require_field_sizes(connection, "run-1", max_bytes=repository.max_bytes) == repository._check_size(expected)
-        digest, child_count = connection.execute(
-            "SELECT content_digest,child_count FROM run_object_index WHERE object_path='[\"active_ticket_job\"]'",
+        assert require_field_sizes(connection, "run-1", max_bytes=repository.max_bytes) == repository._check_size(without_work(expected))
+        selected, canonical = connection.execute(
+            "SELECT active_job_id,(SELECT job_id FROM work_job_slots WHERE run_id='run-1' AND container='ticket_jobs' AND slot='3') "
+            "FROM work_job_layout WHERE run_id='run-1'",
         ).fetchone()
-        assert child_count == len(expected["active_ticket_job"])
-        assert digest == source_objects_digest(_rows(connection, "run-1", '["active_ticket_job"]'))
+        assert selected == canonical
+        assert connection.execute("SELECT COUNT(*) FROM work_job_archives WHERE history_kind='human_blocker_history'").fetchone() == (1,)
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
-def test_work_history_generic_json_entries_have_no_invocation_locator(tmp_path: Path, aggregate: bool) -> None:
+def test_work_history_requires_invocation_identity_and_keeps_previous_commit(tmp_path: Path, aggregate: bool) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
     repository._aggregate_rows = aggregate
     repository.save("run-1", {"agent_invocation_history": []})
-    with repository.atomic():
-        baseline = repository.load_work("run-1", 2)
-        assert baseline is not None
-        current = deepcopy(baseline)
-        current["agent_invocation_history"].extend([None, "historical note", 2])
-        repository.save_work("run-1", current, baseline)
-    assert repository.load("run-1") == current
+    with pytest.raises(ValueError, match="array of records"):
+        with repository.atomic():
+            baseline = repository.load_work("run-1", 2)
+            assert baseline is not None
+            current = deepcopy(baseline)
+            current["agent_invocation_history"].extend([None, "historical note", 2])
+            repository.save_work("run-1", current, baseline)
+    assert repository.load("run-1") == {"agent_invocation_history": []}
     with repository._reading() as connection:
         assert connection is not None
         assert connection.execute("SELECT count(*) FROM run_object_index WHERE invocation_id IS NOT NULL").fetchone() == (0,)

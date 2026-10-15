@@ -14,6 +14,27 @@ from support.conflict_invocations import prepared_conflict, run_conflict
 from support.state import write_run_fixture
 
 
+def test_failed_invocation_accepts_explicit_recovery_wait_but_rejects_late_running(tmp_path: Path) -> None:
+    from agent_run.sqlite_state import SQLiteStateRepository
+    from support.work_records import invocation
+
+    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    failed = invocation(role="development", phase="integration_conflict", status="failed")
+    repository.save("run-1", {"active_agent_invocation": failed, "agent_invocation_history": [failed]})
+    with pytest.raises(ValueError, match="Failed Invocation cannot be replaced"):
+        repository.save_objects("run-1", {"active_agent_invocation": {**failed, "status": "running"}},
+                                fields={"active_agent_invocation"})
+    assert repository.load("run-1")["agent_invocation_history"] == [failed]
+    waiting = {**failed, "status": "resuming", "recovery_waiting": True,
+               "recovery_wait_intervals": [{"kind": "ordinary", "started_at": "waiting", "ended_at": None}]}
+    repository.save_objects("run-1", {"active_agent_invocation": waiting}, fields={"active_agent_invocation"})
+    assert repository.load("run-1")["agent_invocation_history"] == [waiting]
+    running = {**waiting, "status": "running", "recovery_waiting": False,
+               "recovery_wait_intervals": [{"kind": "ordinary", "started_at": "waiting", "ended_at": "resumed"}]}
+    repository.save_objects("run-1", {"active_agent_invocation": running}, fields={"active_agent_invocation"})
+    assert SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1")["agent_invocation_history"] == [running]
+
+
 # Ticket CI now finishes Development–Review before integration. Its live
 # integration/conflict boundary is accepted, never an unreviewed candidate;
 # candidate entry remains applicable to the unchanged Parent paths.
@@ -80,6 +101,7 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
 
     def develop(request: dict[str, Any]) -> DevelopmentResult:
         request["_invocation_event"]("started", requested_thread_id="conflict-thread", attempt_count=1)
+        before = StateStore(store.root).load_current_run(state["run_id"])
         if damage == "context":
             job.pop(stage.conflict_key)
         elif damage in {"candidate", "stage", "paths"}:
@@ -100,7 +122,8 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
             for invocation in [state["active_agent_invocation"], *state["agent_invocation_history"]]:
                 invocation["work_subject"] = "ticket:999"
         elif damage == "ordinary_phase":
-            for invocation in [state["active_agent_invocation"], *state["agent_invocation_history"]]:
+            for invocation in [state["active_agent_invocation"], *state["agent_invocation_history"],
+                               *state.get("ticket_agent_invocations", {}).values()]:
                 invocation["phase"] = "developing"
         elif damage == "generation":
             job[{"ticket": "ticket_branch_generation", "parent_only": "parent_generation", "run_repair": "repair_generation"}[kind]] = 2
@@ -110,7 +133,16 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
             else:
                 job["integration_development_budget"]["window"] = 2
         else:
-            state["active_agent_invocation"]["role"] = "publication"
+            for invocation in [state["active_agent_invocation"], *state["agent_invocation_history"],
+                               *state.get("ticket_agent_invocations", {}).values()]:
+                invocation["role"] = "publication"
+        if damage in {"paths", "role", "pending_mismatch", "subject"}:
+            # These facts are now rejected by their typed relation or exact
+            # Attempt binding before a corrupt Run can become durable.
+            with pytest.raises(ValueError, match="must contain strings|identity"):
+                write_run_fixture((store.root, state["run_id"]), state)
+            assert StateStore(store.root).load_current_run(state["run_id"]) == before
+            raise InterruptedError("stop before business closeout")
         # 损坏注入绕过业务校验，仅用于读取拒绝断言。
         write_run_fixture((store.root, state["run_id"]), state)
         with pytest.raises(IncompatibleRunStateError) as caught:

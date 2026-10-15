@@ -14,9 +14,12 @@ from agent_run.sqlite_state import SQLiteStateRepository
 
 def _repository(tmp_path: Path) -> SQLiteStateRepository:
     repository = SQLiteStateRepository(tmp_path, max_bytes=2 * 1024 * 1024)
-    body = {"phase": "active", "review_context": {"body": "证据🙂\x00 evidence" * 200}}
-    repository.save("run-1", {"ticket_jobs": {"2": deepcopy(body), "3": deepcopy(body),
-        "sibling": {"body": "unselected evidence" * 200}}, "variables": {
+    context = {"body": "证据🙂\x00 evidence" * 200}
+    repository.save("run-1", {"ticket_jobs": {
+        str(number): {"ticket_number": number, "phase": "reviewing", "review_context": deepcopy(context)}
+        for number in (2, 3)
+    } | {"4": {"ticket_number": 4, "phase": "reviewing",
+              "review_context": {"body": "unselected evidence" * 200}}}, "variables": {
             "scalar": "value", "list": [{"nested": [1, 2]}, 3], "empty": {},
         }})
     return repository
@@ -25,14 +28,20 @@ def _repository(tmp_path: Path) -> SQLiteStateRepository:
 def test_batched_collection_children_are_independent_and_skip_damaged_siblings(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_materials SET value='broken' WHERE value=?", ("unselected evidence" * 200,))
+        changed = connection.execute(
+            "UPDATE work_evidence_materials SET body=replace(body,'unselected','Unselected') "
+            "WHERE body LIKE '%unselected evidence%'",
+        )
+        assert changed.rowcount == 1
         connection.commit()
-    selected = {("ticket_jobs", "2"), ("ticket_jobs", "3"), ("ticket_jobs", "missing")}
+    selected = {("ticket_jobs", "2"), ("ticket_jobs", "3"), ("ticket_jobs", "5")}
     first = repository.load_paths("run-1", selected)
     assert set(first["ticket_jobs"]) == {"2", "3"}
     first["ticket_jobs"]["2"]["review_context"]["body"] = "caller mutation"
     assert "caller mutation" != first["ticket_jobs"]["3"]["review_context"]["body"]
     assert "caller mutation" != repository.load_paths("run-1", selected)["ticket_jobs"]["2"]["review_context"]["body"]
+    with pytest.raises(ValueError, match="work evidence"):
+        repository.load_paths("run-1", {("ticket_jobs", "4")})
 
 
 def test_collection_batch_accepts_scalar_list_map_and_missing_roots(tmp_path: Path) -> None:
@@ -98,17 +107,17 @@ def test_collection_reads_preserve_current_material_checks(tmp_path: Path, damag
     repository = _repository(tmp_path)
     with closing(sqlite3.connect(repository.path)) as connection:
         if damage == "sha":
-            connection.execute("UPDATE run_materials SET value=replace(value,'evidence','Evidence')")
+            connection.execute("UPDATE work_evidence_materials SET body=replace(body,'evidence','Evidence')")
         elif damage == "length":
-            connection.execute("UPDATE run_materials SET byte_length=byte_length+1")
+            connection.execute("UPDATE work_evidence_materials SET byte_length=byte_length+1")
         elif damage == "run_link":
-            connection.execute("DELETE FROM run_material_refs WHERE run_id='run-1'")
+            connection.execute("DELETE FROM work_evidence WHERE run_id='run-1'")
         elif damage == "missing":
-            connection.execute("DELETE FROM run_materials")
+            connection.execute("DELETE FROM work_evidence_materials")
         else:
-            connection.execute("UPDATE run_materials SET value=CAST(value AS BLOB)")
+            connection.execute("UPDATE work_evidence_materials SET body=CAST(body AS BLOB)")
         connection.commit()
-    with pytest.raises(ValueError, match="material|dependency"):
+    with pytest.raises(ValueError, match="work evidence"):
         if reader == "load":
             repository.load_paths("run-1", {("ticket_jobs", "2"), ("ticket_jobs", "3")})
         else:
@@ -129,15 +138,18 @@ def test_collection_batch_handles_utf8_quoted_keys_and_more_than_eighty_paths(tm
 
 
 def test_collection_prepare_reads_existing_selected_child_once(tmp_path: Path) -> None:
-    repository = _repository(tmp_path)
+    repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
+    original = {"pending_ticket_retirements": {"2": {"ticket_number": 2, "generation": 1}}}
+    repository.save("run-1", original)
     with repository.atomic():
         statements: list[str] = []
         repository._local.connection.set_trace_callback(statements.append)
-        repository.save_objects("run-1", {"ticket_jobs": {"2": {"phase": "changed"}}}, fields={"ticket_jobs"},
-                                keyed_changes={"ticket_jobs": {"2"}})
+        updated = {"pending_ticket_retirements": {"2": {"ticket_number": 2, "generation": 2}}}
+        repository.save_objects("run-1", updated, fields={"pending_ticket_retirements"},
+                                keyed_changes={"pending_ticket_retirements": {"2"}})
         # Only the exact selected-child subtree reader is counted. Source
         # budget/digest validation keeps its independent real SQL checks.
         child_reads = [sql for sql in statements if "SELECT object_path, kind, value_json FROM run_objects WHERE run_id=" in sql
-                       and "[\"ticket_jobs\",\"2\"]" in sql]
+                       and "[\"pending_ticket_retirements\",\"2\"]" in sql]
         assert len(child_reads) == 1
-    assert repository.load_paths("run-1", {("ticket_jobs", "2")}) == {"ticket_jobs": {"2": {"phase": "changed"}}}
+    assert repository.load_paths("run-1", {("pending_ticket_retirements", "2")}) == updated

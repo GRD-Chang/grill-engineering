@@ -14,20 +14,8 @@ from agent_run.sqlite_encoding import encode_json
 
 _MODULUS = 1 << 256
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-KEYED_FIELDS = frozenset({"ticket_jobs", "ticket_agent_invocations", "retired_ticket_generations", "pending_ticket_retirements"})
+KEYED_FIELDS = frozenset({"retired_ticket_generations", "pending_ticket_retirements"})
 
-
-# Job archives are independent canonical objects. Their proof can change with
-# the current owner without decoding unchanged archived review evidence.
-SOURCE_DIGEST_FIELDS = frozenset({"ticket_jobs", "active_ticket_job"})
-
-
-def source_object_digest(path: str, source: tuple[str, str]) -> int:
-    return int(hashlib.sha256(encode_json((path, *source)).encode()).hexdigest(), 16)
-
-
-def source_objects_digest(objects: Mapping[str, tuple[str, str]]) -> str:
-    return f"{sum(source_object_digest(path, source) for path, source in objects.items()) % _MODULUS:064x}"
 
 
 def history_item_digest(position: str | int, item: Any) -> int:

@@ -22,7 +22,7 @@ from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
 
-from support.state import snapshot_run
+from support.state import persist_run_fixture, snapshot_run
 
 
 @pytest.fixture
@@ -71,7 +71,7 @@ def test_resume_stop_and_stale_supervision_cannot_replay_authority(paused_ticket
     assert controller.states.load_current_run(run_id)['ticket_jobs']['2']['review_budget'] == stale['ticket_jobs']['2']['review_budget']
 
 
-@pytest.mark.parametrize('drift', ['requirements', 'global_stop', 'pause', 'ownership'])
+@pytest.mark.parametrize('drift', ['requirements', 'global_stop', 'ownership'])
 def test_active_resume_revalidates_before_commit(paused_ticket, monkeypatch, drift: str) -> None:
     controller, control, task, executor, payload, fixture = paused_ticket
     original = controller._refresh
@@ -85,14 +85,7 @@ def test_active_resume_revalidates_before_commit(paused_ticket, monkeypatch, dri
             control.finish_executor(task, action_id=executor['action_id'], generation=executor['generation'])
         else:
             current = controller.states.load_current_run(payload['run_id'])
-            if drift == 'global_stop':
-                current['status'] = 'operator_stopped'
-            else:
-                job = current['ticket_jobs']['2']
-                job['blocked_reason'] = 'ticket_paused'
-                job['pause_resume_phase'] = job.pop('execution_resume_phase')
-                if current.get('active_ticket_job', {}).get('ticket_number') == 2:
-                    current['active_ticket_job'] = job
+            current['status'] = 'operator_stopped'
             controller.states.save_run(payload['run_id'], current)
         return result
 
@@ -104,6 +97,34 @@ def test_active_resume_revalidates_before_commit(paused_ticket, monkeypatch, dri
     assert after['resume_audit'] == before['resume_audit']
     assert after['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
     assert after['ticket_jobs'].get('3') == before['ticket_jobs'].get('3')
+
+
+def test_active_resume_retains_pause_added_before_commit(paused_ticket, monkeypatch) -> None:
+    controller, control, task, executor, payload, _ = paused_ticket
+    original = controller._refresh
+    before = controller.states.load_current_run(payload['run_id'])
+
+    def refresh(state, parent):
+        result = original(state, parent)
+        current = controller.states.load_current_run(payload['run_id'])
+        job = current['ticket_jobs']['2']
+        job.update(blocked_reason='ticket_paused', pause_resume_phase=job['execution_resume_phase'])
+        current['active_ticket_job'] = job
+        controller.states.save_run(payload['run_id'], current)
+        return result
+
+    monkeypatch.setattr(controller, '_refresh', refresh)
+    # 已授权的执行失败条件可以收口，后到的独立暂停仍阻止新工作准入。
+    resumed, repeated = admit_ticket_resume(controller, control, task, executor, payload)
+    assert not repeated
+    assert resumed['status'] == 'blocked'
+    assert resumed['ticket_jobs']['2']['phase'] == 'blocked'
+    assert resumed['ticket_jobs']['2']['blocked_reason'] == 'ticket_paused'
+    assert resumed['ticket_jobs']['2']['pause_resume_phase'] == 'developing'
+    assert resumed['ticket_work_queue'] == []
+    assert resumed['ticket_jobs']['2']['review_budget'] == before['ticket_jobs']['2']['review_budget']
+    assert resumed['ticket_jobs'].get('3') == before['ticket_jobs'].get('3')
+    assert StateStore(controller.states.root).load_current_run(payload['run_id']) == resumed
 
 
 def test_executor_exit_closes_admission_or_yields_to_new_resume(paused_ticket) -> None:
@@ -322,15 +343,15 @@ def test_unknown_ticket_pause_continues_original_attempt_without_sibling_unlock(
     ticket_engine(controller.publisher.git, controller.states, fixture,
                   TicketAgents(fixture.parent, (2, 3), fail_sibling),
                   development_only=True).deliver_ticket(payload['run_id'], 3)
-    # 两个当前 Job 的准备属于显式调度查询，日常目标投影不读取无关暂停票。
-    state = controller.states.load_scheduler_current_run(payload['run_id'])
+    # 夹具的未知失败是最初的单一原因；不通过真实保存额外叠加第二门禁。
+    state = StateStore(controller.states.root).load_current_run(payload['run_id'])
     job = state['ticket_jobs']['2']
     job['blocked_reason'] = 'unclassified_worker_failure'
     state['active_ticket_job'] = job
     sibling = state['ticket_jobs']['3']
     sibling['blocked_reason'] = 'ticket_paused'
     sibling['pause_resume_phase'] = sibling.pop('execution_resume_phase')
-    controller.states.save_run(payload['run_id'], state)
+    persist_run_fixture(StateStore(controller.states.root), payload['run_id'], state)
     payload['resume_intent'] = bind_resume_intent(state, ticket_number=2)
     before = deepcopy(state)
     resumed, repeated = admit_ticket_resume(controller, control, task, executor, payload)

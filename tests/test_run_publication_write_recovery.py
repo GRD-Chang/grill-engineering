@@ -52,6 +52,8 @@ def _prepare(git_repo: Path, action: str, applied: bool) -> tuple[Any, ...]:
             git=git, states=states, agents=agents, github=publisher,
             default_branch="main", default_head_sha=git.resolve("main"),
         ).publish(run_id)
+        assert initial["status"] == "run_approval_pending"
+        initial = states.load_current_run(run_id)
         initial["run_publication"].pop("record")
         initial["run_publication"]["phase"] = "waiting_external"
         initial["status"] = "waiting_external"
@@ -169,6 +171,7 @@ def test_explicit_final_publication_resume_keeps_intent_and_artifact(git_repo: P
     publisher._save()
     for _ in range(6):
         paused = engine.publish(run_id)
+    paused = states.load_current_run(run_id)
     original = deepcopy(paused["run_publication"])
     intent = bind_resume_intent(paused)
     assert intent["authorization"] == "renew_publication_operation_retry"
@@ -310,7 +313,7 @@ def test_parent_only_published_retry_resume_continues_without_new_agents(git_rep
     from agent_run.change_delivery import ChangeDeliveryEngine
     from types import SimpleNamespace
     stage = SimpleNamespace(contract=SimpleNamespace(label="parent-only"))
-    paused = published
+    paused = states.load_current_run(run_id)
     paused["parent_job"]["phase"] = "publishing"
     for _ in range(5):
         ChangeDeliveryEngine._record_publication_operation_failure_in_memory(

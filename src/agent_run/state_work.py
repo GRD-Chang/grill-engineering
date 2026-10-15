@@ -83,7 +83,28 @@ def save_work(
     require_current_work_state(
         durable, repository.work_archives(durable), repository.work_attempts(durable), timelines,
     )
-    repository.save_work(run_id, durable, baseline, timeline_updates=timeline_updates)
+    gates_changed = repository.save_work(run_id, durable, baseline, timeline_updates=timeline_updates)
+    if gates_changed:
+        # A resumed condition can reveal another retained gate. Validate the
+        # committed projection before this same transaction may publish it.
+        require_current_work_state(
+            durable, repository.work_archives(durable), repository.work_attempts(durable), timelines,
+        )
+        from agent_run.sqlite_change_job_schema import GATE_FIELDS
+
+        owners = [(state.get("active_ticket_job"), durable.get("active_ticket_job"))]
+        owners.extend((job, durable.get("ticket_jobs", {}).get(key))
+                      for key, job in state.get("ticket_jobs", {}).items())
+        for target, saved in owners:
+            if isinstance(target, dict) and isinstance(saved, dict):
+                for key in GATE_FIELDS:
+                    if key in saved:
+                        target[key] = saved[key]
+                    else:
+                        target.pop(key, None)
+        for key in ("status", "terminal_kind", "diagnostics", "ticket_work_queue"):
+            if key in durable:
+                state[key] = copy_json_tree(durable[key])
     return durable
 
 

@@ -63,6 +63,7 @@ def test_default_append_preserves_unknown_final_update_until_read_only_settlemen
     original_head = initial["run_publication"]["record"]["run_head_sha"]
     # An existing PR with old text forces the actual update operation while
     # retaining the already prepared publication artifact and exact PR.
+    initial = states.load_current_run(run_id)
     initial["run_publication"].pop("record")
     initial["run_publication"]["phase"] = "waiting_external"
     initial.update(status="waiting_external", terminal_kind="waiting_external")

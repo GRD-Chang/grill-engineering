@@ -326,6 +326,34 @@ def _validate_budget_history(
                 raise ValueError(f"{location}.{key} is missing from the audit snapshot")
 
 
+_WINDOW_EVIDENCE_FIELDS = frozenset({
+    "phase", "modification_attempts", "validation_attempts", "policy_snapshot",
+    "acceptance_artifact", "acceptance_record", "development_summary", "publication",
+    "publication_authority", "fallback_publication_receipt", "deterministic_integration_record",
+    "ci_repair_publication_receipt", "required_checks_evidence", "required_checks_origin", "ci_evidence",
+    "repair_source", "repair_trigger", "git_integrity_evidence", "candidate_sha", "publication_sha",
+    "integrated_sha", "reviewed_head_sha", "base_sha", "effective_revision", "pr_number",
+    "ticket_number", "ticket_branch_generation", "parent_generation", "repair_generation", "acceptance_generation",
+    "semantic_attempt_history", "pending_semantic_attempt",
+})
+
+
+def _window_audit(job: dict[str, Any], *, include_budget: bool = True) -> dict[str, Any]:
+    """Keep old quota and exact evidence, excluding mutable recovery machinery.
+
+    SQLite owns these materials once and stores version references for the
+    projected evidence and Attempts. Intent, checkout, active selection, and
+    live integration/CI windows are not a budget ledger.
+    """
+    snapshot = {key: deepcopy(value) for key, value in job.items() if key in _WINDOW_EVIDENCE_FIELDS}
+    if include_budget:
+        snapshot["review_budget"] = deepcopy(job["review_budget"])
+    repair = job.get("repair_job")
+    if isinstance(repair, dict):
+        snapshot["repair_job"] = _window_audit(repair, include_budget=False)
+    return snapshot
+
+
 def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudget:
     """Open a new numbered window while retaining historical state elsewhere."""
 
@@ -333,14 +361,7 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     history = job["review_budget_history"]
     if not isinstance(history, list):
         raise ValueError("review_budget_history must be a list")
-    # Keep the complete pre-reset Job projection except the history container
-    # itself.  Excluding that one recursive field keeps storage linear in the
-    # number of windows while retaining every finding, repair input, receipt,
-    # thread, and checkpoint belonging to the old window.
-    snapshot = deepcopy(
-        {key: value for key, value in job.items() if key != "review_budget_history"}
-    )
-    history.append(snapshot)
+    history.append(_window_audit(job))
     next_window = int(current["window"]) + 1
     job["review_budget"] = new_budget(window=next_window)
     # Archive once on the delivery object and reset its live repair progress.
@@ -363,9 +384,7 @@ def renew_run_budget(job: dict[str, Any], policy: ReviewBudgetPolicy, *, reason:
     if reason not in {"modification_budget_exhausted", "review_budget_exhausted"}:
         raise ValueError("unknown Parent allowance renewal")
     current = deepcopy(ensure_budget(job, policy))
-    job["review_budget_history"].append(deepcopy({
-        key: value for key, value in job.items() if key != "review_budget_history"
-    }))
+    job["review_budget_history"].append(_window_audit(job))
     current["window"] += 1
     current["checkpoint_reason"] = None
     if reason == "modification_budget_exhausted":

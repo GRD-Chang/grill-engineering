@@ -16,6 +16,7 @@ from agent_run import cli_presentation
 from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
+from agent_run.object_state import current_projection_facts
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_lifecycle import prepare_action_application_receipt
@@ -92,7 +93,7 @@ def test_repairable_final_run_ci_failure_after_approval_opens_recovery_round(
     assert run["ci_recovery"]["window"] == 1
     assert run["ci_recovery"]["failure_head"] == git.resolve(str(state["run_branch"]))
     assert run["ci_recovery"]["developments_used"] == 0
-    assert states.load_current_run(str(state["run_id"])) == failed
+    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(failed)
 
 
 def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
@@ -303,6 +304,7 @@ def test_first_unknown_required_checks_observation_does_not_create_operation_ret
     assert waiting["run_publication"]["required_checks_observation_status"] == "unknown"
     assert "publication_operation_retry" not in waiting["run_publication"]
 
+    waiting = states.load_current_run(str(state["run_id"]))
     waiting["run_publication"]["publication_operation_retry"] = {
         "attempts": 4,
         "limit": 5,
@@ -406,6 +408,7 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
     # Model an interruption after the PR narrative write but before its
     # Publication Record became durable. Recovery must reconcile the write
     # intent without replaying it.
+    initial = states.load_current_run(str(state["run_id"]))
     initial["run_publication"].pop("record")
     initial["run_publication"]["phase"] = "waiting_external"
     initial["status"] = "waiting_external"

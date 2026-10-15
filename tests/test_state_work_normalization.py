@@ -28,23 +28,21 @@ def test_ticket_partial_save_keeps_normalization_and_reopens_independent_baselin
     current = lane.load_current_run(run_id)
     unchanged = deepcopy(current["active_ticket_job"]["review_budget"])
     job = current["active_ticket_job"]
-    job["evidence"] = {"message": "token=private-value", "stdout": "private-output"}
+    job["failure_evidence"] = {"message": "token=private-value", "stdout": "private-output", "number": 1}
     job["environment"] = {"PRIVATE_TOKEN": "private-value"}
-    job["extension_number"] = 1
     lane.save_run(run_id, current)
     durable = StateStore(states.root).load_current_run(run_id)
-    assert durable["ticket_jobs"]["2"]["evidence"] == {"message": "token=[REDACTED]"}
+    assert durable["ticket_jobs"]["2"]["failure_evidence"] == {"message": "token=[REDACTED]", "number": 1}
     assert "environment" not in durable["ticket_jobs"]["2"]
     assert durable["ticket_jobs"]["2"]["review_budget"] == unchanged
     # A later save against the same lane must use the normalized committed
     # baseline, even though the caller still owns its unsanitized input tree.
-    job["evidence"] = {"error": "password=second-value\x00"}
-    job["extension_number"] = True
+    job["failure_evidence"] = {"error": "password=second-value\x00", "number": True}
     lane.save_run(run_id, current)
     reopened = StateStore(states.root).load_current_run(run_id)
     saved_job = reopened["ticket_jobs"]["2"]
-    assert saved_job["evidence"] == {"error": "password=[REDACTED]"}
-    assert saved_job["extension_number"] is True
+    assert saved_job["failure_evidence"] == {"error": "password=[REDACTED]", "number": True}
+    assert saved_job["failure_evidence"]["number"] is True
     assert saved_job["review_budget"] == unchanged
     job["review_budget"]["caller_mutation"] = True
     assert StateStore(states.root).load_current_run(run_id)["ticket_jobs"]["2"]["review_budget"] == unchanged

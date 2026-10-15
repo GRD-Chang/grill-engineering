@@ -10,6 +10,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.state_contract import require_current_run_state
+from agent_run.object_state import current_projection_facts
 from support.cli_payloads import human_blocker_step
 from support.cli import run_cli, stdout_json
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
@@ -87,11 +88,12 @@ def test_run_resume_restores_nonselected_threads_without_consuming_local_gate(
     assert StateStore(states.root).load_current_run(run_id) == failed
     resumed, _ = controller.resume(run_id, explicit_resume=True)
     reopened = StateStore(states.root).load_current_run(run_id)
+    reopened_current, resumed_current = current_projection_facts(reopened), current_projection_facts(resumed)
     for field in (
         "status", "terminal_kind", "diagnostics", "active_ticket_job",
         "active_agent_invocation", "ticket_jobs", "ticket_agent_invocations",
     ):
-        assert reopened[field] == resumed[field]
+        assert reopened_current[field] == resumed_current[field]
     # Controller 返回相关调用投影，完整查询仍须保留全部已归档调用。
     assert all(item in reopened["agent_invocation_history"]
                for item in resumed["agent_invocation_history"])

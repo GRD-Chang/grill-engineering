@@ -130,7 +130,7 @@ def test_work_session_revalidates_persisted_storage(tmp_path: Path, damage: str)
             else:
                 database.execute("UPDATE run_materials SET byte_length=byte_length+1")
             database.commit()
-        with pytest.raises(ValueError, match="protocol|schema|byte length"):
+        with pytest.raises(ValueError, match="protocol|schema|byte length|material identity"):
             repository.load_work("run-1", 2)
 
 

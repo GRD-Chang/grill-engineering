@@ -11,6 +11,7 @@ from pathlib import Path
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.controller import Controller
+from agent_run.object_state import current_projection_facts
 from agent_run.ci_recovery_budget import (
     mark_ci_repair, observe_repairable_ci_failure,
 )
@@ -97,6 +98,7 @@ def test_own_final_ref_readback_does_not_open_new_run_integration(
         git=git, states=states, agents=RunPublicationAgents(),
         github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
+    failed = states.load_current_run(str(state["run_id"]))
     run = failed["run_acceptance"]
     record = dict(run["run_integration"])
     assert failed["run_publication"]["published_head_sha"] == record["head_sha"]
@@ -168,7 +170,7 @@ def test_final_publication_rejects_rollback_before_repush(git_repo: Path) -> Non
     assert paused["run_publication"]["published_head_sha"] == published
     reloaded = states.load_current_run(str(state["run_id"]))
     assert reloaded is not None
-    assert publication.publish(str(state["run_id"])) == reloaded
+    assert current_projection_facts(publication.publish(str(state["run_id"]))) == current_projection_facts(reloaded)
 
 
 def test_final_publication_append_requires_new_acceptance_and_reuses_pr(
@@ -233,6 +235,7 @@ def test_run_resync_resume_renews_only_exhausted_allowance(git_repo: Path) -> No
         git=git, states=states, agents=agents,
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
+    accepted = states.load_current_run(str(state["run_id"]))
     run = accepted["run_acceptance"]
     budget = run["integration_resync"]
     budget["used"] = budget["limit"]
@@ -264,6 +267,7 @@ def test_run_resync_resume_preserves_active_repair(git_repo: Path) -> None:
         git=git, states=states, agents=agents,
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
+    accepted = states.load_current_run(str(state["run_id"]))
     run = accepted["run_acceptance"]
     budget = run["integration_resync"]
     budget["used"] = budget["limit"]
@@ -308,6 +312,7 @@ def test_run_ci_resume_renews_only_the_exhausted_ci_window(git_repo: Path) -> No
         git=git, states=states, agents=agents,
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
+    accepted = states.load_current_run(str(state["run_id"]))
     run = accepted["run_acceptance"]
     failed_head = git.resolve(str(state["run_branch"]))
     publisher = FixtureGitHubPublisher(fixture, git)

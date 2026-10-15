@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.sqlite_state import SQLiteStateRepository
-from agent_run import sqlite_mutations
+from agent_run import sqlite_state
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
@@ -39,7 +39,7 @@ def test_timeline_append_only_mutates_changed_objects_materials(
         timeline_encodings = []
         encoded_bytes = []
         real_objects = repository._objects
-        real_encode = sqlite_mutations.encode_json
+        real_encode = sqlite_state._json
         real_dumps = json.dumps
         def objects(state, **kwargs):
             if "timeline" in state:
@@ -54,7 +54,7 @@ def test_timeline_append_only_mutates_changed_objects_materials(
             encoded_bytes.append(len(result.encode("utf-8")))
             return result
         monkeypatch.setattr(repository, "_objects", objects)
-        monkeypatch.setattr(sqlite_mutations, "encode_json", encode)
+        monkeypatch.setattr(sqlite_state, "_json", encode)
         monkeypatch.setattr(json, "dumps", dumps)
         connection.set_trace_callback(writes.append)
         try:

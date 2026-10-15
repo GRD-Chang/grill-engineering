@@ -15,6 +15,7 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
 from agent_run.controller import Controller
+from agent_run.object_state import current_projection_facts
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -285,7 +286,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         run_id,
     )
 
-    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
     output = stdout_json(resumed)
     assert output["status"] == "run_acceptance_pending"
     persisted = states.load_run(run_id)
@@ -441,7 +442,7 @@ def test_run_repair_preserves_dirty_inflight_development_after_parent_drift(
     cleanup = stale["delivery_cleanup"]
     assert cleanup["status"] == "cleanup_pending"
     assert cleanup["last_error"] == "untracked files"
-    retired = stale["retired_semantic_attempt_owners"][-1]
+    retired = states.load_current_run(str(state["run_id"]))["retired_semantic_attempt_owners"][-1]
     assert retired["work_subject"] == f"run-repair:{state['run_id']}"
     assert retired["semantic_attempt_history"][-1]["outcome"] == (
         "currentness_invalidated"
@@ -510,7 +511,7 @@ def test_run_repair_preserves_dirty_inflight_development_after_final_pr_drift(
     cleanup = stale["delivery_cleanup"]
     assert cleanup["status"] == "cleanup_pending"
     assert cleanup["last_error"] == "untracked files"
-    retired = stale["retired_semantic_attempt_owners"][-1]
+    retired = states.load_current_run(str(state["run_id"]))["retired_semantic_attempt_owners"][-1]
     assert retired["work_subject"] == f"run-repair:{state['run_id']}"
     assert retired["semantic_attempt_history"][-1]["outcome"] == (
         "currentness_invalidated"
@@ -1142,7 +1143,7 @@ def test_returned_run_review_survives_currentness_read_failure(
             FixtureGitHubReader(git_repo / "github.json"), git, states,
         ).resume(state["run_id"], explicit_resume=True, new_thread=new_thread)
         reloaded = states.load_current_run(state["run_id"])
-        assert reloaded == resumed_state
+        assert current_projection_facts(reloaded) == current_projection_facts(resumed_state)
         assert reloaded["run_acceptance"]["phase"] == "reviewing"
         assert not reloaded["run_acceptance"].get("reviewer_new_thread", False)
         assert reloaded["run_acceptance"]["pending_review_result"] == run["pending_review_result"]
@@ -1270,4 +1271,4 @@ def test_returned_review_finishes_before_new_integration_work(
             assert persisted_failure[f"{stream}_json"] == failure[f"{stream}_json"]
             assert stream not in failure
             assert stream not in persisted_failure
-    assert persisted == result
+    assert current_projection_facts(persisted) == current_projection_facts(result)

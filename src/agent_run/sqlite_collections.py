@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, TYPE_CHECKING
 
 from agent_run.sqlite_encoding import encode_json, object_path
-from agent_run.sqlite_integrity import (KEYED_FIELDS, SOURCE_DIGEST_FIELDS, history_item_digest, field_size_proof, source_object_digest)
+from agent_run.sqlite_integrity import (KEYED_FIELDS, history_item_digest, field_size_proof)
 
 if TYPE_CHECKING:
     from agent_run.sqlite_state import SQLiteStateRepository
@@ -119,8 +119,7 @@ def prepare_collections(
                 previous.update(child_rows)
                 body = len(encode_json(old).encode()) + (len(encode_json(key).encode()) + 1 if isinstance(key, str) else 0)
                 size -= body + bool(count > 1)
-                digest -= (sum(source_object_digest(location, value) for location, value in child_rows.items())
-                           if field in SOURCE_DIGEST_FIELDS else history_item_digest(key, old))
+                digest -= history_item_digest(key, old)
                 count -= 1
             if not present:
                 continue
@@ -134,13 +133,9 @@ def prepare_collections(
             materials.update(encoded_materials)
             body = len(encode_json(item).encode()) + (len(encode_json(key).encode()) + 1 if isinstance(key, str) else 0)
             size += body + bool(count)
-            digest += (sum(source_object_digest(location, value) for location, value in objects.items()
-                           if object_path(location)[:2] == child_path)
-                       if field in SOURCE_DIGEST_FIELDS else history_item_digest(key, item))
+            digest += history_item_digest(key, item)
             count += 1
         objects[path] = ("map", "null") if field in keyed else ("list", str(count))
-        if field in SOURCE_DIGEST_FIELDS and source is None:
-            digest += source_object_digest(path, objects[path])
         summaries[field] = (size, f"{digest % (1 << 256):064x}", count)
     return summaries
 

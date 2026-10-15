@@ -11,7 +11,7 @@ from typing import Any, TYPE_CHECKING, cast
 from agent_run.sqlite_encoding import encode_json, object_path, scalar_value
 from agent_run.sqlite_mutations import _batch
 from agent_run.sqlite_integrity import (
-    KEYED_FIELDS, SOURCE_DIGEST_FIELDS, source_objects_digest, field_content_digest, field_size_proof, history_item_digest,
+    KEYED_FIELDS, field_content_digest, field_size_proof,
     require_field_sizes, require_material_counts, require_material_payloads, root_fields,
     source_material_dependencies, sync_material_counts,
 )
@@ -116,27 +116,13 @@ def index_objects(
             connection.executemany("INSERT INTO run_object_materials VALUES (?,?,?)",
                                    ((run_id, path, identity) for identity in refs))
     entries: list[tuple[str, str, str | None, Any, int, str | None, str | None, int | None, str | None]] = []
-    history_claims = dict((row[0], row[1:]) for row in connection.execute(
-        "SELECT object_path,invocation_id,resume_id,logical_bytes,content_digest,size_proof,child_count,attempt_id FROM run_object_index "
-        "WHERE run_id=? AND invocation_id IS NOT NULL", (run_id,),
-    )) if _HISTORY in state else {}
     for field, value in state.items():
-        if field == _HISTORY:
-            for position, item in enumerate(value):
-                if isinstance(item, dict):
-                    path = encode_json((field, position))
-                    claim = invocation_identity(item), item.get("resume_id"), 0, None, None, None, invocation_attempt_identity(item)
-                    if history_claims.get(path) != claim:
-                        entries.append((run_id, path, *claim))
         if field not in changed_fields:
             continue
         path = encode_json((field,))
         encoded_value = encode_json(value).encode()
         size = len(encode_json(field).encode()) + len(encoded_value) + 2
         digest = field_content_digest(field, value) if isinstance(value, list) or field in KEYED_FIELDS else hashlib.sha256(encoded_value).hexdigest()
-        if field in SOURCE_DIGEST_FIELDS:
-            digest = source_objects_digest({location: source for location, source in objects.items()
-                                            if object_path(location)[:1] == (field,)})
         child_count = len(value) if isinstance(value, (dict, list)) else None
         entries.append((run_id, path, None, None, size, digest,
                         field_size_proof(path, size, digest, objects[path], child_count), child_count, None))
@@ -273,25 +259,6 @@ def _decode(
     return cast(dict[str, Any], nodes[()])
 
 
-def _require_history_claim(
-    connection: sqlite3.Connection, run_id: str, path: str, item: Mapping[str, Any],
-    *, identity: str | None = None, indexed: tuple[Any, ...] | None = None,
-) -> None:
-    if not isinstance(item, Mapping):
-        raise ValueError("Invalid SQLite Invocation history index claim")
-    parts = object_path(path)
-    if indexed is None:
-        indexed = connection.execute(
-            "SELECT invocation_id,resume_id,attempt_id FROM run_object_index WHERE run_id=? AND object_path=?",
-            (run_id, path),
-        ).fetchone()
-    actual = invocation_identity(item)
-    if (len(parts) != 2 or parts[0] != _HISTORY or type(parts[1]) is not int
-            or parts[1] < 0 or indexed != (actual, item.get("resume_id"), invocation_attempt_identity(item))
-            or identity is not None and actual != identity):
-        raise ValueError("Invalid SQLite Invocation history index claim")
-
-
 def load_projection(connection: sqlite3.Connection, run_id: str, *, excluded_fields: set[str] | None = None, max_bytes: int,
                     related_tickets: bool = False, ticket_numbers: set[int] | None = None,
                     scheduler_tickets: bool = False) -> tuple[dict[str, Any], dict[str, int]] | None:
@@ -300,11 +267,9 @@ def load_projection(connection: sqlite3.Connection, run_id: str, *, excluded_fie
     _require_root(connection, run_id)
     require_field_sizes(connection, run_id, max_bytes=max_bytes)
     excluded_fields = set(excluded_fields or set())
-    if related_tickets or ticket_numbers is not None or scheduler_tickets:
-        excluded_fields.update(KEYED_FIELDS)
     paths = []
     for (path,) in connection.execute("SELECT object_path FROM run_object_index WHERE run_id=? AND logical_bytes>0", (run_id,)):
-        if object_path(path) != (_HISTORY,) and object_path(path)[0] not in (excluded_fields or set()):
+        if object_path(path)[0] not in (excluded_fields or set()):
             paths.append(path)
     rows = _rows_for_paths(connection, run_id, paths)
     if any(path not in rows for path in paths):
@@ -313,75 +278,7 @@ def load_projection(connection: sqlite3.Connection, run_id: str, *, excluded_fie
     # Verify its actual bytes once in this consistent read, never across reads.
     material_values: dict[str, str] = {}
     state = _decode(connection, rows, run_id=run_id, material_values=material_values)
-    if related_tickets or ticket_numbers is not None or scheduler_tickets:
-        from agent_run.sqlite_collections import load_paths
-        numbers = set(ticket_numbers or set())
-        active = state.get("active_ticket_job")
-        if isinstance(active, dict) and type(active.get("ticket_number")) is int:
-            numbers.add(active["ticket_number"])
-        holder = state.get("ticket_integration_holder")
-        if type(holder) is int:
-            numbers.add(holder)
-        for item in [holder, *state.get("ticket_integration_queue", []), *state.get("ticket_work_queue", [])]:
-            if isinstance(item, dict) and type(item.get("ticket_number")) is int:
-                numbers.add(item["ticket_number"])
-        change = state.get("unsupported_scope_change")
-        summary = change.get("graph_change_summary") if isinstance(change, dict) else None
-        reopened = summary.get("reopened_completed_tickets") if isinstance(summary, dict) else None
-        if isinstance(reopened, list):
-            # This gate depends on completed owners outside the active/queue
-            # selection. Read only its exact references in the same snapshot.
-            numbers.update(number for number in reopened if type(number) is int)
-        whole_fields = {"ticket_jobs", "ticket_agent_invocations", "retired_ticket_generations"} if scheduler_tickets else set()
-        child_paths: set[tuple[str | int, ...]] = {(field, str(number)) for field in KEYED_FIELDS - whole_fields for number in numbers}
-        subsets = load_paths(connection, run_id, child_paths, material_values=material_values)
-        for field in KEYED_FIELDS:
-            state[field] = subsets.get(field, {})
-        if scheduler_tickets:
-            whole = _decode(connection, _rows_for_paths(connection, run_id, [encode_json((field,)) for field in whole_fields]),
-                            run_id=run_id, material_values=material_values)
-            for field in whole_fields:
-                state[field] = whole.get(field, {})
-    ids = {invocation_identity(invocation) for invocation in
-           [state.get("active_agent_invocation"), *state.get("ticket_agent_invocations", {}).values()]
-           if isinstance(invocation, dict)} - {None}
-    resumes = {record.get("resume_id") for record in state.get("resume_audit", {}).get("history", [])
-               if isinstance(record, dict)} - {None}
-    selected: set[str] = set()
-    for column, values in (("invocation_id", ids), ("resume_id", resumes)):
-        pending = iter(values)
-        while batch := tuple(islice(pending, 256)):
-            selected.update(path for (path,) in connection.execute(
-                f"SELECT object_path FROM run_object_index WHERE run_id=? "
-                f"AND {column} IN ({','.join('?' for _ in batch)})", (run_id, *batch)))
-    history, positions = [], {}
-    ordered = sorted(selected, key=lambda value: object_path(value)[1])
-    claimed: dict[str, tuple[Any, ...]] = {}
-    for offset in range(0, len(ordered), 256):
-        paths = ordered[offset:offset + 256]
-        claimed.update((row[0], row[1:]) for row in connection.execute(
-            "SELECT o.object_path,o.kind,o.value_json,i.invocation_id,i.resume_id,i.attempt_id "
-            "FROM run_objects o LEFT JOIN run_object_index i USING(run_id,object_path) "
-            f"WHERE o.run_id=? AND o.object_path IN ({','.join('?' for _ in paths)})", (run_id, *paths),
-        ))
-    if selected - claimed.keys():
-        raise ValueError("Missing indexed SQLite Invocation")
-    # Every selected record retains its actual claim and independent returned
-    # containers. Batch their exact roots so shared evidence and material
-    # prefetch do not create one SQL round trip per history item.
-    items = _decode(connection, {encode_json((f"item-{index}",)): (claimed[path][0], claimed[path][1])
-                                for index, path in enumerate(ordered)},
-                    run_id=run_id, material_values=material_values) if ordered else {}
-    for index, path in enumerate(ordered):
-        row = claimed.get(path)
-        if row is None:
-            raise ValueError("Missing indexed SQLite Invocation")
-        item = items[f"item-{index}"]
-        _require_history_claim(connection, run_id, path, item, indexed=row[2:])
-        history.append(item)
-        positions[invocation_identity(item)] = int(object_path(path)[1])
-    state[_HISTORY] = history
-    return state, positions
+    return state, {}
 
 
 def save_projection(
@@ -394,55 +291,15 @@ def save_projection(
     _require_root(connection, run_id)
     require_field_sizes(connection, run_id, max_bytes=repository.max_bytes)
     old_fields = root_fields(connection, run_id)
-    from agent_run.sqlite_history_retention import retain_details
-    state, fields = retain_details(connection, run_id, state, fields, keyed_changes or {})
     keyed_changes = keyed_changes or {}
     append_changes = append_changes or {}
     partial_fields = keyed_changes.keys() | append_changes.keys()
-    selected = {key: state[key] for key in fields - {_HISTORY} - partial_fields if key in state}
+    selected = {key: state[key] for key in fields - partial_fields if key in state}
     objects, materials = repository._objects(selected)
     objects.pop("[]", None)
     previous = {}
-    for field in fields - {_HISTORY} - partial_fields:
+    for field in fields - partial_fields:
         previous.update(_rows(connection, run_id, encode_json((field,))))
-    history_bytes_delta = 0
-    history_digest_delta = 0
-    if _HISTORY in fields:
-        row = connection.execute("SELECT value_json FROM run_objects WHERE run_id=? AND object_path=?",
-                                 (run_id, encode_json((_HISTORY,)))).fetchone()
-        length = int(row[0]) if row else 0
-        summary = connection.execute("SELECT logical_bytes,content_digest FROM run_object_index WHERE run_id=? AND object_path=?",
-                                     (run_id, encode_json((_HISTORY,)))).fetchone()
-        prior_history_size = summary[0] if summary else len(encode_json(_HISTORY).encode()) + 4
-        prior_history_digest = int(summary[1], 16) if summary else 0
-        for item in state.get(_HISTORY, []):
-            identity = invocation_identity(item)
-            position = positions.get(identity)
-            existing = connection.execute("SELECT object_path FROM run_object_index WHERE run_id=? AND invocation_id=?", (run_id, identity)).fetchone()
-            if existing is not None:
-                position = int(object_path(existing[0])[1])
-            elif position is None:
-                position = length
-                length += 1
-            path = encode_json((_HISTORY, position))
-            item_objects, item_materials = repository._objects({_HISTORY: [item]})
-            old = connection.execute("SELECT kind,value_json FROM run_objects WHERE run_id=? AND object_path=?", (run_id, path)).fetchone()
-            if old is not None:
-                previous[path] = old
-                old_item = _decode(connection, {encode_json(("item",)): old}, run_id=run_id)["item"]
-                _require_history_claim(connection, run_id, path, old_item, identity=identity)
-                history_bytes_delta -= len(encode_json(old_item).encode())
-                history_digest_delta -= history_item_digest(position, old_item)
-            else:
-                history_bytes_delta += bool(position)
-            history_bytes_delta += len(encode_json(item).encode())
-            history_digest_delta += history_item_digest(position, item)
-            objects[path] = item_objects[encode_json((_HISTORY, 0))]
-            materials.update(item_materials)
-            connection.execute("INSERT INTO run_object_index(run_id,object_path,invocation_id,resume_id,logical_bytes,attempt_id) VALUES (?,?,?,?,0,?) ON CONFLICT(run_id,object_path) "
-                               "DO UPDATE SET invocation_id=excluded.invocation_id,resume_id=excluded.resume_id,attempt_id=excluded.attempt_id",
-                               (run_id, path, identity, item.get("resume_id"), invocation_attempt_identity(item)))
-        objects[encode_json((_HISTORY,))] = ("list", str(length))
     from agent_run.sqlite_collections import prepare_collections, save_summaries
     summaries = prepare_collections(repository, connection, run_id, state, keyed_changes, append_changes,
                                     objects, materials, previous)
@@ -450,16 +307,8 @@ def save_projection(
     require_material_counts(connection, run_id, candidates | materials.keys())
     require_material_payloads(connection, materials)
     index_objects(connection, run_id, selected, objects, materials, previous)
-    if _HISTORY in fields:
-        path = encode_json((_HISTORY,))
-        size = prior_history_size + history_bytes_delta
-        digest = f"{(prior_history_digest + history_digest_delta) % (1 << 256):064x}"
-        connection.execute("INSERT INTO run_object_index VALUES (?,?,NULL,NULL,?,?,?,?,NULL) "
-                           "ON CONFLICT(run_id,object_path) DO UPDATE SET logical_bytes=excluded.logical_bytes,"
-                           "content_digest=excluded.content_digest,size_proof=excluded.size_proof,child_count=excluded.child_count",
-                           (run_id, path, size, digest, field_size_proof(path, size, digest, objects[path], length), length))
     save_summaries(connection, run_id, summaries, objects)
-    new_fields = (old_fields - fields) | selected.keys() | partial_fields | ({_HISTORY} if _HISTORY in fields else set())
+    new_fields = (old_fields - fields) | selected.keys() | partial_fields
     connection.execute("UPDATE runs SET root_keys_json=? WHERE run_id=?", (encode_json(sorted(new_fields)), run_id))
     affected = {identity for identity in candidates if connection.execute(
         "SELECT 1 FROM run_object_materials WHERE run_id=? AND material_id=? LIMIT 1",

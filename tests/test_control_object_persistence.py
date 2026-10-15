@@ -171,7 +171,7 @@ def test_ordinary_control_projection_omits_completed_sibling_and_retirement_arch
     assert full["ticket_jobs"]["3"]["phase"] == "completed"
     full["retired_job_generations"] = [
         {"work_subject": f"ticket:{100 + number}", "generation": 1,
-         "reason": "requeue", "evidence": "archived evidence " * 64}
+         "selection_reason": "requeue", "review_context": {"body": "archived evidence " * 64}}
         for number in range(history_size)
     ]
     persist_run_fixture(states, run_id, full)

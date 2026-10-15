@@ -100,7 +100,9 @@ class StateStore:
     ) -> dict[str, Any] | None:
         """Read current work and only the Invocation history it references."""
         self._reject_legacy_run(run_id)
-        state = self._repository.load_work(run_id, ticket_number, thin_timeline=thin_timeline)
+        state = self._read_run_materials(run_id, lambda: self._repository.load_work(
+            run_id, ticket_number, thin_timeline=thin_timeline,
+        ))
         if state is not None:
             from agent_run.state_contract import require_current_work_state
             from agent_run.state_errors import MissingRunMaterialsError
@@ -353,7 +355,18 @@ class StateStore:
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
         self._reject_legacy_run(run_id)
-        return self._repository.load(run_id)
+        return self._read_run_materials(run_id, lambda: self._repository.load(run_id))
+
+    def _read_run_materials(self, run_id: str, read: Callable[[], _T]) -> _T:
+        """Keep relational material damage at the existing public query boundary."""
+        from agent_run.state_errors import MissingRunMaterialsError
+
+        try:
+            return read()
+        except IncompatibleRunStateError:
+            raise
+        except ValueError as error:
+            raise MissingRunMaterialsError(f"{self._repository.path} Run {run_id}: {error}") from error
 
     def has_run(self, run_id: str) -> bool:
         """Locate persisted records, including unsupported legacy identities."""
@@ -446,10 +459,15 @@ class StateStore:
 
     def _validate_current_run(self, run_id: str, state: dict[str, Any]) -> None:
         from agent_run.state_contract import require_current_run_state
+        from agent_run.object_projection import ObjectProjection
+        from agent_run.state_contract import require_current_work_state
         from agent_run.state_errors import MissingRunMaterialsError
 
         try:
-            require_current_run_state(state)
+            if isinstance(state, ObjectProjection) and state.archive_scope:
+                require_current_work_state(state, state.archive_scope, state.attempt_scope)
+            else:
+                require_current_run_state(state)
         except MissingRunMaterialsError as error:
             raise MissingRunMaterialsError(
                 f"{self._repository.path} Run {run_id}: {error}"

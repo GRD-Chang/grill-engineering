@@ -110,10 +110,7 @@ def require_current_work_state(
             raise IncompatibleRunStateError("invalid scoped Publication Attempt association")
         attempt_owners[id(related_owner)] = attempt
     with scoped_budget_validation(budget_owners), scoped_publication_attempts(attempt_owners):
-        if timelines:
-            _validate_current_run_state(state, timelines)
-        else:
-            require_current_run_state(state)
+        _validate_current_run_state(state, timelines)
 
 
 _DEFAULT_WORK_VALIDATION = require_current_work_state
@@ -147,6 +144,11 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
 def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = False) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
+    from agent_run.object_projection import ObjectProjection
+
+    if not parent_scope and isinstance(state, ObjectProjection) and state.archive_scope:
+        require_current_work_state(state, state.archive_scope, state.attempt_scope)
+        return
     if parent_scope:
         # This is a validation scope, never a replacement authority record.
         # Delivery evidence attached by a caller remains outside Parent writes.
@@ -1005,6 +1007,8 @@ def _human_blocker_subjects(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _require_human_blocker(subject: dict[str, Any]) -> None:
+    from agent_run.sqlite_change_job_gates import CURRENTNESS_REASONS
+
     reason = subject.get("blocked_reason")
     blockers = subject.get("human_blockers")
     if subject.get("phase") not in {"blocked", "ready_for_human"}:
@@ -1012,7 +1016,7 @@ def _require_human_blocker(subject: dict[str, Any]) -> None:
     recognized = reason in {"agent_requires_human", "reviewer_requires_human"}
     if not recognized and not isinstance(blockers, list):
         return
-    if not recognized:
+    if not recognized and reason not in CURRENTNESS_REASONS:
         raise IncompatibleRunStateError("legacy state has an invalid Human Blocker phase")
     if not isinstance(blockers, list) or not 1 <= len(blockers) <= 8 or not all(
         isinstance(blocker, str) and blocker and len(blocker) <= 2000

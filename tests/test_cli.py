@@ -6,6 +6,7 @@ from support.run_artifacts import _canonical_run_budget
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -31,6 +32,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.operator_action_presentation import print_operator_action
 from agent_run.presentation_helpers import human_next_action
 from agent_run.requeue import RequeueError
+from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.object_state import save_owned
 from agent_run.state import StateStore
 from support.seeding import seed_run, write_fixture
@@ -38,6 +40,7 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state, managed_workspace, prepare_workspace
 
 from support.state import has_run, only_run_ref, read_run, run_refs, run_state_text, snapshot_run, write_run_fixture
+from support.work_records import invocation as stored_invocation
 
 
 _DOCTOR_TIMEOUT_TEST_LIMIT_SECONDS = 5
@@ -495,6 +498,7 @@ def test_status_uses_saved_publication_boundary_before_publication_record(
         "status": "run_publication_pending",
         "run_acceptance": {
             "phase": "accepted",
+            "acceptance_generation": 1,
             "reviewed_head_sha": "run-head",
             "acceptance_record": {
                 "reviewed_head_sha": "run-head",
@@ -503,13 +507,17 @@ def test_status_uses_saved_publication_boundary_before_publication_record(
         },
         "run_publication": {
             "phase": "publishing",
-            "pending_semantic_attempt": {
-                "role": "publication",
-                "currentness_boundary": {"reviewed_head_sha": "run-head"},
-            },
         },
         "diagnostics": [],
         "schema_version": 1,
+    }
+    boundary = {"reviewed_head_sha": "run-head"}
+    attempt = allocate_semantic_attempt(state["run_publication"], role="publication", work_subject="run-publication:run-1",
+                                        generation=1, currentness_boundary=boundary, ordinal=1)
+    state["active_agent_invocation"] = {
+        "work_subject": "run-publication:run-1", "generation": 1, "role": "final_publication", "phase": "run_publication",
+        "mode": "fresh", "input_fingerprint": "fixture", "status": "completed",
+        "started_at": "2026-09-09T00:00:00+00:00", "currentness_boundary": boundary, "semantic_attempt": deepcopy(attempt),
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
@@ -3049,28 +3057,23 @@ def test_history_matches_review_artifact_by_attempt_candidate_and_reviewer() -> 
 def test_timeline_projects_semantic_invocation_output_and_retry_counters(
     tmp_path: Path,
 ) -> None:
-    attempt = {
-        "attempt_id": "attempt-publication-2",
-        "role": "publication",
-        "work_subject": "ticket:3",
-        "generation": 2,
-        "currentness_boundary_fingerprint": "sha256:boundary",
-        "ordinal": 2,
-        "budget_window": None,
-        "status": "pending",
-    }
+    job = {"ticket_number": 3, "ticket_branch_generation": 2, "phase": "publication_pending",
+           "publication_operation_retry": {"attempts": 2, "limit": 4}}
+    attempt = allocate_semantic_attempt(job, role="publication", work_subject="ticket:3", generation=2,
+                                        currentness_boundary={}, ordinal=2)
     state: dict[str, Any] = {
         "run_id": "run-1",
         "status": "execution_failed",
-        "active_ticket_job": {
-            "ticket_number": 3,
-            "phase": "publication_pending",
-            "pending_semantic_attempt": attempt,
-            "publication_operation_retry": {"attempts": 2, "limit": 4},
-        },
+        "active_ticket_job": job,
+        "ticket_jobs": {"3": job},
         "active_agent_invocation": {
             "work_subject": "ticket:3",
             "role": "publication",
+            "generation": 2,
+            "phase": "publication",
+            "mode": "fresh",
+            "input_fingerprint": "fixture",
+            "currentness_boundary": {},
             "status": "failed",
             "attempt_count": 1,
             "started_at": "2026-08-24T00:00:00+00:00",
@@ -3095,7 +3098,7 @@ def test_timeline_projects_semantic_invocation_output_and_retry_counters(
         "worker": "发布工作代理",
         "phase": "publication_pending",
         "attempt": 2,
-        "semantic_attempt_id": "attempt-publication-2",
+        "semantic_attempt_id": attempt["attempt_id"],
         "semantic_attempt_role": "publication",
         "semantic_attempt_ordinal": 2,
         "budget_window": None,
@@ -5230,23 +5233,47 @@ def test_cli_rejects_a_malformed_canonical_nested_state(
         ("agent_invocation_history", ["not an invocation record"]),
     ],
 )
+@pytest.mark.parametrize("damage", ["value", "sql_type", "missing_relation"])
 def test_status_rejects_malformed_invocation_records(
-    git_repo: Path, field: str, value: object
+    git_repo: Path, field: str, value: object, damage: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
+    original = deepcopy(state)
     state["status"] = "execution_failed"
     state[field] = value
     state_ref = only_run_ref(managed_state(git_repo))
+    with pytest.raises(ValueError, match="Invocation"):
+        write_run_fixture(state_ref, state)
+    assert read_run(state_ref) == original
+    state = deepcopy(original)
+    state.update(status="execution_failed", terminal_kind="execution_failed")
+    invocation = stored_invocation("ticket:2", "2026-08-13T00:00:00+00:00", role="development", phase="developing")
+    invocation["attempt_count"] = 1
+    state["active_agent_invocation"] = invocation if field == "active_agent_invocation" else None
+    state["agent_invocation_history"] = [deepcopy(invocation)]
     write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+    healthy = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
+    assert healthy.returncode == 0, healthy.stdout
+    database = StateStore(state_ref[0])._repository.path
+    with sqlite3.connect(database) as connection:
+        if damage == "missing_relation":
+            table = "work_invocation_current" if field == "active_agent_invocation" else "work_invocation_history"
+            connection.execute(f"UPDATE {table} SET started_at='missing Invocation' WHERE run_id=?", (run_id,))
+        else:
+            bad_status = sqlite3.Binary(b'["failed"]') if damage == "sql_type" else "not an Invocation status"
+            connection.execute("UPDATE work_invocations SET status=? WHERE run_id=? AND work_subject=? AND started_at=?",
+                               (bad_status, run_id, invocation["work_subject"], invocation["started_at"]))
+    with sqlite3.connect(database) as connection:
+        before = tuple(connection.iterdump())
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert read_run(state_ref) == before
+    with sqlite3.connect(database) as connection:
+        assert tuple(connection.iterdump()) == before
 
 
 def test_resume_rejects_unknown_invocation_role_without_mutation(
@@ -5255,13 +5282,28 @@ def test_resume_rejects_unknown_invocation_role_without_mutation(
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
+    original = deepcopy(state)
     state["status"] = "execution_failed"
     state["active_agent_invocation"] = failed_invocation(
         work_subject="ticket:2", role="unknown", phase="developing"
     )
     state_ref = only_run_ref(managed_state(git_repo))
+    with pytest.raises(ValueError, match="Semantic Attempt identity"):
+        write_run_fixture(state_ref, state)
+    assert read_run(state_ref) == original
+    state = deepcopy(original)
+    state.update(status="execution_failed", terminal_kind="execution_failed")
+    invocation = stored_invocation("ticket:2", "2026-08-13T00:00:00+00:00", role="development", phase="developing")
+    invocation["attempt_count"] = 1
+    state["active_agent_invocation"] = invocation
+    state["agent_invocation_history"] = [deepcopy(invocation)]
     write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+    healthy = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
+    assert healthy.returncode == 0, healthy.stdout
+    with sqlite3.connect(StateStore(state_ref[0])._repository.path) as connection:
+        connection.execute("UPDATE work_invocations SET role='unknown' WHERE run_id=? AND work_subject=? AND started_at=?",
+                           (run_id, invocation["work_subject"], invocation["started_at"]))
+    before = read_run(state_ref)
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 

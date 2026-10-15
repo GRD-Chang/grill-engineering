@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from contextlib import closing
+import sqlite3
 
 import pytest
 
@@ -11,6 +13,27 @@ from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state import StateStore
 from agent_run.object_state import save_owned
 from support.ticket_parallel import ticket_run
+
+
+@pytest.mark.parametrize("reference", ["history", "active", "ticket"])
+def test_missing_invocation_identity_is_not_silently_omitted(tmp_path: Path, reference: str) -> None:
+    invocation = {"work_subject": "ticket:2", "started_at": "original", "status": "completed"}
+    field = {"history": "agent_invocation_history", "active": "active_agent_invocation", "ticket": "ticket_agent_invocations"}[reference]
+    value = [invocation] if reference == "history" else {"2": invocation} if reference == "ticket" else invocation
+    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository.save("run-1", {field: value})
+    with closing(sqlite3.connect(repository.path)) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("DELETE FROM work_invocations WHERE run_id='run-1'")
+        connection.commit()
+    with pytest.raises(ValueError, match="Invocation"):
+        repository.load("run-1")
+    if reference != "history":
+        with pytest.raises(ValueError, match="Invocation"):
+            repository.load_work("run-1", 2)
+    else:
+        # An unreferenced historical row is outside this bounded work query.
+        assert repository.load_work("run-1", 2)["agent_invocation_history"] == []
 
 
 def test_caller_mutations_do_not_become_validated_durable_facts(git_repo: Path) -> None:

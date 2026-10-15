@@ -5,6 +5,8 @@ import http.server
 import io
 import json
 import os
+import select
+import signal
 import socket
 import ssl
 import subprocess
@@ -20,6 +22,7 @@ import pytest
 from agent_run.credential_lifecycle import RenewableCredential, ReadCredential
 from agent_run.github_auth import _GitHubAppCredentialProvider, mint_installation_credential, GitHubCredentialError
 from agent_run.github_auth_profile import GitHubAppProfile
+from agent_run.process_cleanup import capture_process_scope, child_subreaper, descendant_pids
 from agent_run.worker_credentials import NativeCredentialDelivery
 
 def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
@@ -90,11 +93,14 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
     )
     unrelated: subprocess.Popen[str] | None = None
     renewal_thread: threading.Thread | None = None
+    owned_pidfds: dict[int, int] = {}
 
-    try:
-        credentials.start()
-        renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
+    # Own the detached child's reaping instead of depending on the host's init.
+    with child_subreaper():
+        baseline = capture_process_scope()
         try:
+            credentials.start()
+            renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not (
                 parent_pid_path.exists() and child_pid_path.exists()
@@ -105,27 +111,60 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
             assert int(invocation_path.read_text(encoding="utf-8")) >= 3
             assert renewal_thread is not None
 
+            for pid_path in (parent_pid_path, child_pid_path):
+                pid = int(pid_path.read_text(encoding="utf-8"))
+                owned_pidfds[pid] = os.pidfd_open(pid)
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
             unrelated = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"]
             )
             credentials.close()
             assert unrelated.poll() is None
-        finally:
-            if renewal_thread is not None and renewal_thread.is_alive():
-                credentials.close()
-    finally:
-        if unrelated is not None and unrelated.poll() is None:
-            unrelated.terminate()
-        if unrelated is not None:
-            unrelated.wait(timeout=5)
 
-    assert renewal_thread is not None
-    assert not renewal_thread.is_alive()
-    assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
-    for pid_path in (parent_pid_path, child_pid_path):
-        pid = int(pid_path.read_text(encoding="utf-8"))
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+            assert not renewal_thread.is_alive()
+            assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
+            # A pidfd signals real exit even while the orphan is still a zombie.
+            # Keep the signer's existing one-second cleanup bound; no init polling.
+            assert select.select([owned_pidfds[child_pid]], [], [], 1)[0], (
+                "signer child survived credential close"
+            )
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass  # The provider may already have reaped this owned orphan.
+            for pid in owned_pidfds:
+                with pytest.raises(ProcessLookupError):
+                    os.kill(pid, 0)
+        finally:
+            # Business exit assertions above precede this failure-path safety net.
+            try:
+                credentials.close()
+            finally:
+                # Also own children whose startup failed before PID files/fds were ready.
+                excluded = baseline | ({unrelated.pid} if unrelated is not None else set())
+                for pid in descendant_pids(os.getpid()):
+                    if pid not in excluded and pid not in owned_pidfds:
+                        try:
+                            owned_pidfds[pid] = os.pidfd_open(pid)
+                        except ProcessLookupError:
+                            pass
+                for descriptor in owned_pidfds.values():
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                # Reap even when signaling reports ESRCH; parents precede children.
+                for pid, descriptor in owned_pidfds.items():
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                    finally:
+                        os.close(descriptor)
+                if unrelated is not None and unrelated.poll() is None:
+                    unrelated.terminate()
+                if unrelated is not None:
+                    unrelated.wait(timeout=5)
 
 
 def test_app_credential_lifecycle_close_after_network_timeout_joins_renewal(

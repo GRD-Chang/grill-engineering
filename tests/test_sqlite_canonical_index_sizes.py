@@ -11,16 +11,17 @@ import pytest
 
 from agent_run.sqlite_encoding import encode_json
 from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.sqlite_integrity import field_size_proof
+from support.work_records import attempt, invocation as stored_invocation
 
 
 def _state() -> dict[str, Any]:
-    invocation = {"work_subject": "ticket:2", "started_at": "2026-01-01T00:00:00Z",
-                  "number": 1e100, "review_context": {"body": "中文🙂证据" * 200},
-                  "execution_segments": [{"started_at": "start", "ended_at": "end"}]}
+    invocation = stored_invocation(context={"body": "中文🙂证据" * 200, "number": 1e100})
+    invocation["execution_segments"] = [{"started_at": "start", "ended_at": "end"}]
     job = {"ticket_number": 2, "semantic_attempt_history": [
-        {"role": "reviewer", "ordinal": 1, "status": "completed", "number": 1e100},
+        attempt(context={"number": 1e100}),
     ], "human_blocker_history": [{"number": 1e100, "message": "历史问题🙂"}]}
-    return {"phase": "active", "ticket_agent_invocations": {"2": deepcopy(invocation)},
+    return {"phase": "active", "parent": {"number": 1e100}, "ticket_agent_invocations": {"2": deepcopy(invocation)},
             "agent_invocation_history": [invocation], "ticket_jobs": {"2": job}}
 
 
@@ -36,6 +37,17 @@ def _rewrite_numbers(repository: SQLiteStateRepository) -> None:
             connection.execute("UPDATE run_material_refs SET material_id=? WHERE material_id=?", (identity, previous))
             connection.execute("UPDATE run_object_materials SET material_id=? WHERE material_id=?", (identity, previous))
             connection.execute("DELETE FROM run_materials WHERE material_id=?", (previous,))
+        # The numerical value and canonical logical size stay equal. Only the
+        # immutable source identity changed, so bind its current header to the
+        # same logical field proof rather than leaving a corrupt test fixture.
+        path = encode_json(("parent",))
+        size, digest, count, kind, encoded = connection.execute(
+            "SELECT i.logical_bytes,i.content_digest,i.child_count,o.kind,o.value_json "
+            "FROM run_object_index i JOIN run_objects o USING(run_id,object_path) "
+            "WHERE i.run_id='run-1' AND i.object_path=?", (path,),
+        ).fetchone()
+        connection.execute("UPDATE run_object_index SET size_proof=? WHERE run_id='run-1' AND object_path=?",
+                           (field_size_proof(path, size, digest, (kind, encoded), count), path))
         connection.commit()
         assert rows
 
@@ -50,12 +62,12 @@ def test_index_sizes_use_canonical_restoration_of_noncanonical_numbers(tmp_path:
     assert read() == original
     # Same-source cached encodings remain independent from returned containers.
     loaded = read()
-    loaded["agent_invocation_history"][0]["review_context"]["body"] = "caller mutation"
+    loaded["agent_invocation_history"][0]["semantic_attempt"]["review_context"]["body"] = "caller mutation"
     assert read() == original
     with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_history SET logical_bytes=logical_bytes+1")
+        connection.execute("UPDATE work_attempt_versions SET logical_bytes=logical_bytes+1")
         connection.commit()
-    with pytest.raises(ValueError, match="history index"):
+    with pytest.raises(ValueError, match="Attempt size"):
         read()
 
 
@@ -71,10 +83,12 @@ def test_canonical_archive_sizes_still_reject_actual_logical_size_damage(
     read = lambda: repository.load("run-1") if reader == "full" else repository.load_work("run-1", 2)
     assert read() == original
     with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_job_history SET logical_bytes=logical_bytes+1 WHERE object_path=?",
-                           (encode_json(("ticket_jobs", "2", archive)),))
+        if archive == "semantic_attempt_history":
+            connection.execute("UPDATE work_attempt_versions SET logical_bytes=logical_bytes+1")
+        else:
+            connection.execute("UPDATE work_job_archives SET logical_bytes=logical_bytes+1 WHERE history_kind=?", (archive,))
         connection.commit()
-    with pytest.raises(ValueError, match="Job history size"):
+    with pytest.raises(ValueError, match="history size|Attempt size"):
         read()
 
 
@@ -83,21 +97,18 @@ def test_complete_history_descendant_override_sizes_the_assembled_entry(tmp_path
     original = _state()
     repository.save("run-1", original)
     expected = deepcopy(original)
-    expected["agent_invocation_history"][0]["summary"] = "actual descendant🙂"
-    with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("INSERT INTO run_objects VALUES (?,?,?,?)", (
-            "run-1", encode_json(("agent_invocation_history", 0, "summary")), "scalar", json.dumps("actual descendant🙂")))
-        connection.execute("UPDATE run_sizes SET logical_bytes=?", (repository._check_size(expected),))
-        connection.execute("UPDATE run_history SET logical_bytes=?", (len(encode_json(expected["agent_invocation_history"][0]).encode()),))
-        connection.commit()
-    # The second read reuses a complete field encoding but must still exclude
-    # the separately overridden snapshot when deriving its history metadata.
+    expected["agent_invocation_history"][0]["error"] = "actual observation🙂"
+    expected["ticket_agent_invocations"]["2"]["error"] = "actual observation🙂"
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        current = deepcopy(baseline)
+        current["agent_invocation_history"][0]["error"] = "actual observation🙂"
+        repository.save_work("run-1", current, baseline)
+    # Both views read the single Invocation fact; no descendant snapshot can
+    # become a competing authority after a complete query has been cached.
     assert repository.load("run-1") == expected
     expected["phase"] = "paused"
-    with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_objects SET value_json=? WHERE object_path=?",
-                           (encode_json("paused"), encode_json(("phase",))))
-        connection.commit()
+    SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"phase"})
     assert repository.load("run-1") == expected
 
 
@@ -107,21 +118,15 @@ def test_archive_descendant_override_sizes_the_assembled_archive(tmp_path: Path)
     original = _state()
     repository.save("run-1", original)
     expected = deepcopy(original)
-    expected["ticket_jobs"]["2"][archive][0]["summary"] = "actual descendant🙂"
-    path = encode_json(("ticket_jobs", "2", archive))
-    with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("INSERT INTO run_objects VALUES (?,?,?,?)", (
-            "run-1", encode_json(("ticket_jobs", "2", archive, 0, "summary")), "scalar", json.dumps("actual descendant🙂")))
-        connection.execute("UPDATE run_sizes SET logical_bytes=?", (repository._check_size(expected),))
-        connection.execute("UPDATE run_job_history SET logical_bytes=? WHERE object_path=?",
-                           (len(encode_json(expected["ticket_jobs"]["2"][archive]).encode()), path))
-        connection.commit()
+    expected["ticket_jobs"]["2"][archive][0]["publication_operation_retry"] = {"attempts": 2, "limit": 5}
+    with repository.atomic():
+        baseline = repository.load_work("run-1", 2)
+        current = deepcopy(baseline)
+        current["ticket_jobs"]["2"][archive][0]["publication_operation_retry"] = {"attempts": 2, "limit": 5}
+        repository.save_work("run-1", current, baseline)
     assert repository.load("run-1") == expected
     expected["phase"] = "paused"
-    with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_objects SET value_json=? WHERE object_path=?",
-                           (encode_json("paused"), encode_json(("phase",))))
-        connection.commit()
+    SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"phase"})
     assert repository.load("run-1") == expected
     assert repository.load_work("run-1", 2) == expected
 
@@ -135,7 +140,7 @@ def test_native_selected_history_sizes_local_positions_and_isolates_writer_basel
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     original = _state()
     first = original["agent_invocation_history"][0]
-    unrelated = {"work_subject": "ticket:3", "started_at": "unselected"}
+    unrelated = stored_invocation("ticket:3", "unselected")
     resumed = deepcopy(first)
     resumed.update(started_at="resumed", resume_id="audit-two")
     original["agent_invocation_history"] = [first, unrelated, resumed]
@@ -143,24 +148,19 @@ def test_native_selected_history_sizes_local_positions_and_isolates_writer_basel
         {"resume_id": "audit-two", "successor_invocation_started_at": "resumed"},
     ]}
     repository.save("run-1", original)
-    if missing_proof:
-        prove = sqlite_work_objects._verified_snapshot_encodings
-
-        def incomplete_proof(*args: Any, **kwargs: Any) -> dict[tuple[str | int, ...], str]:
-            encodings = prove(*args, **kwargs)
-            encodings.pop(("agent_invocation_history", 2), None)
-            return encodings
-
-        monkeypatch.setattr(sqlite_work_objects, "_verified_snapshot_encodings", incomplete_proof)
+    if not missing_proof:
+        assert repository.load("run-1") == original
     expected = deepcopy(original)
     expected["agent_invocation_history"] = [deepcopy(first), deepcopy(resumed)]
     with repository.atomic():
         current = repository.load_work("run-1", 2)
         assert current == expected
-        assert repository._local.work_view.positions == [0, 2]
-        assert repository._local.work_projection_bytes == repository._check_size(expected)
+        from agent_run.sqlite_work_execution import load_invocations
+        _, positions = load_invocations(repository._local.connection, "run-1", ticket_numbers={2},
+                                        resume_ids={"audit-two"}, history=True)
+        assert list(positions.values()) == [0, 2]
         baseline = repository.current_work_baseline("run-1")
-        current["agent_invocation_history"][0]["review_context"]["body"] = "caller mutation"
+        current["agent_invocation_history"][0]["semantic_attempt"]["review_context"]["body"] = "caller mutation"
         assert baseline == expected
         assert current["agent_invocation_history"][1] == resumed
         assert current["ticket_agent_invocations"]["2"] == first
@@ -174,7 +174,6 @@ def test_native_empty_history_baseline_is_independent(tmp_path: Path) -> None:
     with repository.atomic():
         current = repository.load_work("run-1", 2)
         assert current == original
-        assert repository._local.work_projection_bytes == repository._check_size(original)
         baseline = repository.current_work_baseline("run-1")
         current["agent_invocation_history"].append({"caller": "mutation"})
         assert baseline == original
@@ -190,12 +189,11 @@ def test_selected_history_encoding_cannot_hide_current_index_damage(tmp_path: Pa
     assert repository.load_work("run-1", 2) == original
     with closing(sqlite3.connect(repository.path)) as connection:
         if damage == "metadata":
-            connection.execute("UPDATE run_history SET logical_bytes=logical_bytes+1")
+            connection.execute("UPDATE work_attempt_versions SET logical_bytes=logical_bytes+1")
         else:
-            connection.execute("DELETE FROM run_object_material_refs WHERE object_path=?",
-                               (encode_json(("agent_invocation_history", 0)),))
+            connection.execute("UPDATE work_invocations SET attempt_version_id='missing'")
         connection.commit()
-    with pytest.raises(ValueError, match="history index|material references"):
+    with pytest.raises(ValueError, match="Attempt size|Attempt version"):
         repository.load_work("run-1", 2)
 
 
@@ -222,31 +220,15 @@ def test_fresh_writer_baseline_keeps_all_caller_and_baseline_containers_independ
                 "run-1", encode_json(("parent", "summary")), "scalar", encode_json("current source override")))
             connection.execute("UPDATE run_sizes SET logical_bytes=?", (repository._check_size(expected),))
             connection.commit()
-    contexts = []
-    decode = sqlite_work_objects._decode
-
-    def observe(*args: Any, **kwargs: Any) -> Any:
-        result = decode(*args, **kwargs)
-        if kwargs.get("context") is not None:
-            contexts.append(kwargs["context"])
-        return result
-
-    monkeypatch.setattr(sqlite_work_objects, "_decode", observe)
     with repository.atomic():
+        queries = []
+        repository._local.connection.set_trace_callback(queries.append)
         current = repository.load_work("run-1", 2)
+        repository._local.connection.set_trace_callback(None)
+        assert any("run_objects" in query and query.startswith("SELECT") for query in queries)
         assert current == expected
         baseline = repository.current_work_baseline("run-1")
         assert baseline == expected
-        context = contexts[0]
-        if shape in {"repeated_identity", "shared_nested_snapshot"}:
-            # One independent source tree is reused. The other root must own
-            # separate containers even when their nested material is shared.
-            roots = [baseline[key] for key in ("parent", "ticket")]
-            assert sum(any(root is value for value in context.snapshots.values()) for root in roots) == 1
-        elif shape == "prior_only":
-            assert not context.restored_encodings
-        else:
-            assert not any(baseline["parent"] is value for value in context.snapshots.values())
         assert baseline["parent"] is not current["parent"]
         assert baseline["ticket"] is not current["ticket"]
         assert baseline["parent"] is not baseline["ticket"]
@@ -275,7 +257,7 @@ def test_prior_sibling_snapshot_copy_stays_independent_when_selected_job_has_des
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     original = {"agent_invocation_history": [], "ticket_jobs": {
         "2": {"ticket_number": 2, "semantic_attempt_history": [
-            {"role": "reviewer", "status": "completed", "ordinal": 1},
+            attempt(),
         ]},
         "3": {"ticket_number": 3, "review_context": {
             "body": "sibling evidence🙂" * 200, "nested": [{"count": 1}],

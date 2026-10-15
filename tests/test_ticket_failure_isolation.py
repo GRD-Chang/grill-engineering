@@ -83,6 +83,7 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
     assert paused["ticket_jobs"][str(completed_number)]["execution_failure"] == "temporary result persistence failure"
     pending = deepcopy(paused["ticket_jobs"]["3"]["pending_semantic_attempt"])
     other_job = deepcopy(paused["ticket_jobs"]["2"])
+    other_history = states.load_current_run(run_id)["ticket_jobs"]["2"]
     other_invocation = deepcopy(paused["ticket_agent_invocations"]["2"])
     successor_thread = "replacement-3" if new_thread and not target_completed else "developer-3"
     if not target_completed:
@@ -119,10 +120,11 @@ def test_targeted_resume_uses_target_invocation_after_result_save_failure(
         assert successor[-1]["requested_thread_id"] == (None if new_thread else "developer-3")
         assert successor[-1]["mode"] == ("new-thread" if new_thread else "resume")
         assert successor[-1]["semantic_attempt"] == pending
-    attempts = [item for item in job["semantic_attempt_history"] if item["role"] == "development"]
+    attempts = [item for item in history["ticket_jobs"]["3"]["semantic_attempt_history"] if item["role"] == "development"]
     assert len(attempts) == 1
     assert attempts[0]["attempt_id"] == pending["attempt_id"]
     assert result["ticket_jobs"]["2"] == other_job
+    assert history["ticket_jobs"]["2"] == other_history
     assert result["ticket_agent_invocations"]["2"] == other_invocation
     require_current_run_state(states.load_current_run(run_id))
 

@@ -163,7 +163,7 @@ def test_merge_resolution_candidate_save_crash_recovers_append_only_candidate(
     assert result["run_acceptance"]["candidate_sha"] == committed
     assert len(fixture.agents.development_requests) == calls_before
     assert result["run_acceptance"]["review_budget"]["development_attempts"] == used
-    retired = result["retired_semantic_attempt_owners"][-1]
+    retired = fixture.states.load_current_run(run_id)["retired_semantic_attempt_owners"][-1]
     attempts = retired["semantic_attempt_history"]
     assert sum(attempt["attempt_id"] == attempt_id for attempt in attempts) == 1
 

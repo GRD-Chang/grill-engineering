@@ -98,7 +98,7 @@ def test_complete_work_field_reuse_never_bypasses_actual_material_checks(tmp_pat
         else:
             connection.execute("UPDATE run_materials SET value=CAST(value AS BLOB)")
         connection.commit()
-    with pytest.raises(ValueError, match="material|persistence limit"):
+    with pytest.raises(ValueError, match="material|persistence limit|BLOB"):
         repository.load_work("run-1", 2)
 
 

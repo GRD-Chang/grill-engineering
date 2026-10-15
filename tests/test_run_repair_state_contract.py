@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from support.run_artifacts import _canonical_run_budget
 
+from contextlib import closing
 from copy import deepcopy
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -18,6 +20,8 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.state import MAX_RUN_STATE_BYTES
+from agent_run.sqlite_state import SQLiteStateRepository
 from support.environment import _apply_test_environment
 from support.seeding import seed_run, write_fixture
 from support.cli import issue, load_only_run_state, run_cli, stdout_json
@@ -73,9 +77,14 @@ def _git_refs(repo: Path) -> str:
     ).stdout
 
 
+def _sql_snapshot(reference: tuple[Path, str]) -> tuple[str, ...]:
+    with closing(sqlite3.connect(SQLiteStateRepository(reference[0], max_bytes=MAX_RUN_STATE_BYTES).path)) as connection:
+        return tuple(connection.iterdump())
+
+
 @pytest.mark.parametrize("phase", ["developing", "escalating", "accepted"])
 @pytest.mark.parametrize("repair_mode", [None, "legacy", 1])
-def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
+def test_noncanonical_run_repair_mode_is_rejected_before_mutation(
     git_repo: Path, repair_mode: object, phase: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
@@ -94,6 +103,18 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     }
     state_ref = only_run_ref(managed_state(git_repo))
     _with_canonical_ci_budget(state)
+    if type(repair_mode) is int:
+        # Typed storage rejects this value before a recovery command can see
+        # it. Business-invalid strings still exercise public resume below.
+        before = _sql_snapshot(state_ref)
+        fixture_before = fixture.read_bytes()
+        refs_before = _git_refs(managed_repo(git_repo))
+        with pytest.raises(ValueError, match="repair_mode must be text"):
+            SQLiteStateRepository(state_ref[0], max_bytes=MAX_RUN_STATE_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
+        assert _sql_snapshot(state_ref) == before
+        assert fixture.read_bytes() == fixture_before
+        assert _git_refs(managed_repo(git_repo)) == refs_before
+        return
     write_run_fixture(state_ref, state)
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
@@ -409,7 +430,7 @@ def _integrated_revalidation_merge() -> dict[str, str]:
         "merging_phase",
     ],
 )
-def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
+def test_storage_rejects_retired_integrated_revalidation_merge_before_mutation(
     git_repo: Path, phase: str, marker: object
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
@@ -427,17 +448,16 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     }
     state_ref = only_run_ref(managed_state(git_repo))
     _with_canonical_ci_budget(state)
-    write_run_fixture(state_ref, state)
-    state_before = deepcopy(state)
+    before = _sql_snapshot(state_ref)
     fixture_before = fixture.read_text(encoding="utf-8")
     refs_before = _git_refs(managed_repo(git_repo))
 
-    result = run_cli(git_repo, fixture, "resume", run_id)
+    # The retired field has no relation in the current protocol. The actual
+    # persistence API now rejects it before any saved recovery state exists.
+    with pytest.raises(ValueError, match="Unsupported run_repair Job fields.*integrated_revalidation_merge"):
+        SQLiteStateRepository(state_ref[0], max_bytes=MAX_RUN_STATE_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
 
-    assert result.returncode == 2
-    assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "recovery_materials_missing"
-    assert read_run(state_ref) == state_before
+    assert _sql_snapshot(state_ref) == before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert _git_refs(managed_repo(git_repo)) == refs_before
 

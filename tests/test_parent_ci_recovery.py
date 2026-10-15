@@ -13,6 +13,7 @@ import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
+from agent_run.object_state import current_projection_facts
 from agent_run.cli_presentation import _run_repair_status
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -286,7 +287,7 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     assert first_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 2
     assert first_repair["run_acceptance"]["completed_repair_jobs"]
     assert "repair_job" not in first_repair["run_acceptance"]
-    assert StateStore(states.root).load_current_run(run_id) == first_repair
+    assert current_projection_facts(StateStore(states.root).load_current_run(run_id)) == current_projection_facts(first_repair)
     failed_again = publication.publish(run_id)
     assert failed_again["status"] == "run_acceptance_pending"
     assert failed_again["run_publication"]["pr_number"] == final_pr
@@ -300,7 +301,7 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     assert run["review_budget"]["development_attempts"] == 0
     assert all(key not in run["repair_job"] for key in
                ("review_budget", "review_budget_history", "ci_recovery", "integration_resync"))
-    assert StateStore(states.root).load_current_run(run_id) == second_repair
+    assert current_projection_facts(StateStore(states.root).load_current_run(run_id)) == current_projection_facts(second_repair)
     ordinary = deepcopy(run["review_budget"])
     ticket_budget = deepcopy(second_repair["ticket_jobs"]["2"]["review_budget"])
     fixture = git_repo / "github.json"

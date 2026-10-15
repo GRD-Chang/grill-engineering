@@ -55,6 +55,29 @@ def test_immediate_human_boundary_takes_priority_over_start(tmp_path: Path) -> N
     assert feedback.result["outcome"] == "human_action"
 
 
+@pytest.mark.parametrize("status,outcome", [("ready_for_human", "human_action"), ("execution_failed", "failed")])
+def test_notification_read_derives_current_gate_before_business_observation(
+    tmp_path: Path, status: str, outcome: str,
+) -> None:
+    from agent_run.notification_events import events
+
+    state: dict[str, Any] = {"run_id": "run", "repository": "example/project", "parent": {"number": 1},
+                             "language": "en", "status": "active"}
+    feedback = ResumeFeedback(tmp_path, state, lambda: state)
+    feedback.progressed(state, "progress")
+    assert feedback.result is not None and feedback.result["outcome"] == "started"
+    # The notification thread can read the new durable gate before the
+    # committing thread reaches feedback.observe. No sleep orders this read.
+    current = {**state, "status": status, "human_blockers": ["Access is still required."]}
+    projected = feedback.project(current)
+    assert projected["_manual_resume_result"]["outcome"] == outcome
+    boundaries = [event for event in events(projected) if event.get("current")]
+    assert len(boundaries) == 1
+    assert boundaries[0]["resume_outcome"] == outcome
+    assert boundaries[0]["resume_id"] == feedback.identity
+    assert feedback.result["outcome"] == "started", "Presentation reads do not mutate the observer"
+
+
 def test_attached_frontend_does_not_open_sender(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state: dict[str, Any] = {"run_id": "run", "status": "active"}
     feedback = ResumeFeedback(tmp_path, state, lambda: state)
@@ -93,6 +116,7 @@ def test_targeted_feedback_ignores_sibling_progress_and_failure(tmp_path: Path) 
         "work_subject": "ticket:3", "action_kind": "execution_failure", "phase": "developing",
         "reason": "ticket_execution_failed",
     }}]
+    assert "_manual_resume_result" not in feedback.project(failed)
     feedback.observe(failed)
     assert feedback.result is None
     target = {**sibling, "work_subject": "ticket:2", "reported_thread_id": "target"}
@@ -111,6 +135,10 @@ def test_noncurrent_ticket_resume_gate_reports_target(tmp_path: Path, reason: st
     feedback = ResumeFeedback(tmp_path, state, lambda: state, ticket_number=2)
     updated = deepcopy(state)
     updated["ticket_jobs"]["2"].update(phase="blocked", blocked_reason=reason)
+    projected = feedback.project(updated)["_manual_resume_result"]
+    assert projected["outcome"] == outcome
+    assert projected["ticket_number"] == 2
+    assert feedback.result is None
     feedback.observe(updated)
     assert feedback.result is not None
     assert feedback.result["outcome"] == outcome

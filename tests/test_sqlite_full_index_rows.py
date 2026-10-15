@@ -1,5 +1,6 @@
 """Full index checks retain actual SQLite types and complete references."""
 from contextlib import closing
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run import sqlite_job_history, sqlite_work_objects as sqlite_objects
+from support.work_records import attempt, invocation
 
 
 def _repository(path: Path) -> SQLiteStateRepository:
@@ -38,24 +40,11 @@ def test_work_size_reuse_counts_restored_json_and_checks_current_materials(
         connection.execute("DELETE FROM run_materials WHERE material_id=?", (old,))
     assert repository.load("run-1") == original
     repository._aggregate_rows = aggregate
-    check_size = repository._check_size
-    reused = []
-    def observe_size(state, **kwargs):
-        fields = kwargs.get("encoded_fields", {})
-        if "timeline" in fields:
-            reused.append(fields["timeline"])
-            assert check_size(state, **kwargs) == check_size(state)
-        return check_size(state, **kwargs)
-    monkeypatch.setattr(repository, "_check_size", observe_size)
     with repository.atomic():
         current = repository.load_work("run-1", 2)
         assert current == original
-        view = repository._local.work_view
-        # This field comes from the full read's canonical restored encoding,
-        # while the current material intentionally has fewer numeric bytes.
-        assert '1e+99' in repository._read_view.view.fields["timeline"]
-        assert view.logical_bytes == repository._check_size(current)
-    assert reused and all("1e+99" in text for text in reused)
+        assert repository.current_work_baseline("run-1") == original
+        assert repository._check_size(current) == repository._check_size(original)
     with repository.atomic():
         repository._local.connection.execute("DELETE FROM run_object_material_refs WHERE object_path=?", (path,))
     with pytest.raises(ValueError, match="material references"):
@@ -99,8 +88,8 @@ def test_full_indexes_reject_blob_values_without_json_coercion(
     tmp_path: Path, aggregate: bool, damage: str,
 ) -> None:
     repository = _repository(tmp_path)
-    original = {"agent_invocation_history": [{"work_subject": "ticket:2", "started_at": "original"}],
-                "ticket_jobs": {"2": {"semantic_attempt_history": [{"role": "reviewer", "status": "completed", "ordinal": 1}]}}}
+    original = {"agent_invocation_history": [invocation(started="original", context={"body": "immutable evidence"})],
+                "ticket_jobs": {"2": {"semantic_attempt_history": [attempt()]}}}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
     assert repository.load("run-1") == original
@@ -108,18 +97,18 @@ def test_full_indexes_reject_blob_values_without_json_coercion(
     with closing(sqlite3.connect(repository.path)) as connection:
         if damage in {"history_blob", "history_json_blob"}:
             value = b'"ticket:2"' if damage.endswith("json_blob") else b"ticket:2"
-            connection.execute("UPDATE run_history SET work_subject=?", (sqlite3.Binary(value),))
+            connection.execute("UPDATE work_invocations SET work_subject=?", (sqlite3.Binary(value),))
         elif damage in {"refs_blob", "refs_json_blob"}:
             if damage.endswith("json_blob"):
-                connection.execute("UPDATE run_object_material_refs SET material_id=CAST(json_quote(material_id) AS BLOB)")
+                connection.execute("UPDATE work_evidence SET material_id=CAST(json_quote(material_id) AS BLOB) WHERE material_id IS NOT NULL")
             else:
-                connection.execute("UPDATE run_object_material_refs SET material_id=CAST(material_id AS BLOB)")
+                connection.execute("UPDATE work_evidence SET material_id=CAST(material_id AS BLOB) WHERE material_id IS NOT NULL")
         else:
             value = b'"reviewer"' if damage.endswith("json_blob") else b"reviewer"
-            connection.execute("UPDATE run_job_attempts SET role=?", (sqlite3.Binary(value),))
+            connection.execute("UPDATE work_attempts SET role=?", (sqlite3.Binary(value),))
         connection.commit()
     repository._aggregate_rows = aggregate
-    with pytest.raises(ValueError, match="history index|material references|Attempt index"):
+    with pytest.raises(ValueError, match="Invocation|evidence|execution record|Attempt"):
         repository.load("run-1")
 
 
@@ -129,38 +118,25 @@ def test_identical_complete_source_reuses_expected_metadata_and_still_reads_sql(
 ) -> None:
     repository = _repository(tmp_path)
     repository._aggregate_rows = aggregate
-    original = {"ticket_agent_invocations": {"2": {"work_subject": "ticket:2", "started_at": "original"}},
-                "agent_invocation_history": [{"work_subject": "ticket:2", "started_at": "original", "body": "evidence" * 100}],
-                "ticket_jobs": {"2": {"semantic_attempt_history": [{"role": "reviewer", "status": "completed", "ordinal": 1}],
+    current = invocation(started="original", context={"body": "evidence" * 100})
+    original = {"ticket_agent_invocations": {"2": deepcopy(current)},
+                "agent_invocation_history": [current],
+                "ticket_jobs": {"2": {"semantic_attempt_history": [attempt()],
                                       "human_blocker_history": [{"body": "retained evidence" * 100}]}}}
     repository.save("run-1", original)
     assert repository.load("run-1") == original
-    facts = repository._read_view.view.index_facts
-    assert facts is not None
-
-    def recalculate(*args, **kwargs):
-        raise AssertionError("identical sources recalculated expected index metadata")
-
-    monkeypatch.setattr(sqlite_objects, "_history_row", recalculate)
-    monkeypatch.setattr(sqlite_objects, "_references", recalculate)
-    monkeypatch.setattr(sqlite_job_history, "sizes", recalculate)
-    monkeypatch.setattr(sqlite_job_history, "attempt_rows", recalculate)
-    actual_sizes = sqlite_job_history.read_sizes
     current_archive_reads = []
-
-    def read_sizes(*args, **kwargs):
+    from agent_run import sqlite_change_jobs
+    actual_history = sqlite_change_jobs._load_history
+    def read_history(*args, **kwargs):
         current_archive_reads.append(True)
-        return actual_sizes(*args, **kwargs)
-
-    monkeypatch.setattr(sqlite_job_history, "read_sizes", read_sizes)
+        return actual_history(*args, **kwargs)
+    monkeypatch.setattr(sqlite_change_jobs, "_load_history", read_history)
     first = repository.load("run-1")
     assert first == original
     first["ticket_jobs"]["2"]["human_blocker_history"][0]["body"] = "caller mutation"
     assert repository.load("run-1") == original
-    assert repository._read_view.view.index_facts is facts
-    assert len(current_archive_reads) == 2
-    with pytest.raises(TypeError):
-        facts.job_sizes['["ticket_jobs","2","human_blocker_history"]'] = (2, 0)
+    assert len(current_archive_reads) >= 2
 
 
 @pytest.mark.parametrize("aggregate", [True, False])

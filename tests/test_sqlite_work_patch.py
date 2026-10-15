@@ -11,7 +11,7 @@ from agent_run.sqlite_state import SQLiteStateRepository
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
-@pytest.mark.parametrize("body", ["new evidence", "\x00中文🙂" * 300, "large evidence" * 6000])
+@pytest.mark.parametrize("body", ["new evidence", "\x00中文🙂" * 300, "large evidence" * 6000], ids=["short", "unicode", "large"])
 def test_work_patch_batches_keep_other_run_materials_and_exact_reopen(
     tmp_path: Path, aggregate: bool, body: str,
 ) -> None:
@@ -26,7 +26,7 @@ def test_work_patch_batches_keep_other_run_materials_and_exact_reopen(
         updated = deepcopy(baseline)
         for job in updated["ticket_jobs"].values():
             job["phase"] = "candidate"
-        updated["ticket_jobs"]["2"]["body"] = body
+        updated["ticket_jobs"]["2"]["review_context"] = {"body": body}
         updated["ticket_jobs"].pop("271")
         repository.save_work("run-1", updated, baseline)
     reopened = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)

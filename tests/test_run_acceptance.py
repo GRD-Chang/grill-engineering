@@ -1286,6 +1286,7 @@ def test_parent_drift_immediately_stales_completed_run_acceptance(
         github=FixtureGitHubPublisher(git_repo / "github.json", git),
     ).accept(str(state["run_id"]))
     assert accepted["run_acceptance"]["phase"] == "accepted"
+    accepted = states.load_current_run(str(state["run_id"]))
     accepted["run_acceptance"].update(
         {
             "prior_human_blockers": ["An old blocker must not cross generations."],
@@ -1732,6 +1733,7 @@ def test_run_acceptance_human_resume_rejects_an_older_reviewer_thread(
         github=FixtureGitHubPublisher(git_repo / "github.json", git),
     )
     blocked = engine.accept(str(state["run_id"]))
+    blocked = states.load_current_run(str(state["run_id"]))
     run = blocked["run_acceptance"]
     run["reviewer_thread_ids"].insert(0, "older-reviewer")
     save_run_with_ci_fixture(states, str(state["run_id"]), blocked)

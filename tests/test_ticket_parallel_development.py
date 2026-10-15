@@ -378,9 +378,14 @@ def test_lane_rejects_real_concurrent_changes(
         latest["ticket_jobs"]["2"]["base_sha"] = "concurrent-head"
         latest["active_ticket_job"] = latest["ticket_jobs"]["2"]
     elif changed == "invocation":
-        latest["ticket_agent_invocations"]["2"]["concurrent_marker"] = "changed"
-        if latest["active_ticket_job"]["ticket_number"] == 2:
-            latest["active_agent_invocation"] = latest["ticket_agent_invocations"]["2"]
+        from agent_run.agent_invocation import _sync_invocation_history
+
+        invocation = latest["ticket_agent_invocations"]["2"]
+        invocation["error"] = "concurrent execution observation"
+        _sync_invocation_history(latest, invocation)
+        active = latest.get("active_agent_invocation")
+        if isinstance(active, dict) and (active["work_subject"], active["started_at"]) == (invocation["work_subject"], invocation["started_at"]):
+            latest["active_agent_invocation"] = invocation
     elif changed == "demand":
         latest["ticket_graph"]["tickets"]["2"]["content_revision"] = "changed"
     else:
@@ -394,6 +399,11 @@ def test_lane_rejects_real_concurrent_changes(
     saved = states.load_current_run(run_id)
     assert saved is not None
     assert saved["status"] == latest["status"]
+    if changed == "invocation":
+        invocation = saved["ticket_agent_invocations"]["2"]
+        assert invocation["error"] == "concurrent execution observation"
+        assert next(entry for entry in saved["agent_invocation_history"]
+                    if (entry["work_subject"], entry["started_at"]) == (invocation["work_subject"], invocation["started_at"])) == invocation
 
 
 @pytest.mark.parametrize("failure", [False, True])

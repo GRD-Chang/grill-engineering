@@ -1631,6 +1631,7 @@ def test_fresh_validation_human_resume_with_new_thread_replaces_blocker_artifact
         str(state["run_id"]),
         resume_human_blocker=True,
     )
+    resumed = states.load_current_run(str(state["run_id"]))
     resumed_job = resumed["ticket_jobs"]["3"]
     resumed_job["review_new_thread"] = True
     resumed["active_ticket_job"] = resumed_job
@@ -5298,7 +5299,7 @@ def test_resume_preserves_local_gate_while_selecting_independent_frontier(
             "development_thread_id": "developer-3",
             "reviewer_thread_ids": ["standards-3", "spec-3"],
             "pr_number": 33,
-            "merge_intent": {"expected_head_sha": "a" * 40},
+            "merge_intent": {"head_sha": "a" * 40},
             "review_budget": {
                 "window": 1,
                 "development_attempts": 0,
@@ -5440,16 +5441,17 @@ def test_resume_preserves_local_gate_while_selecting_independent_frontier(
     ).resume(state["run_id"])
 
     assert resumed["active_ticket_job"]["ticket_number"] == 5
-    assert resumed["ticket_jobs"]["3"] == old_job
+    saved_job = states.load_current_run(state["run_id"])["ticket_jobs"]["3"]
+    assert saved_job == old_job
     assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("reviewer_requires_human")
     assert resumed["ticket_jobs"]["3"]["development_thread_id"] == ("developer-3")
-    assert resumed["ticket_jobs"]["3"]["reviewer_thread_ids"] == [
+    assert saved_job["reviewer_thread_ids"] == [
         "standards-3",
         "spec-3",
     ]
     assert resumed["ticket_jobs"]["3"]["pr_number"] == 33
     assert resumed["ticket_jobs"]["3"]["merge_intent"] == {
-        "expected_head_sha": "a" * 40
+        "head_sha": "a" * 40
     }
     completed_ticket = resumed["ticket_jobs"]["4"]
     assert completed_ticket["phase"] == "completed"

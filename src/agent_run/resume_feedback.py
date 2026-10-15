@@ -44,21 +44,33 @@ class ResumeFeedback:
         if action_id:
             self.identity = action_id
 
-    def _result(self, outcome: str, evidence: str, reason: str = "") -> None:
+    def _make_result(self, outcome: str, evidence: str, reason: str = "") -> dict[str, Any]:
         if not reason and self.result is not None and self.result.get("outcome") == outcome:
             reason = str(self.result.get("reason") or "")
-        self.result = {"id": self.identity, "outcome": outcome,
-                       "evidence": evidence, "reason": reason,
-                       "ticket_number": self.ticket_number, "work_subject": self.work_subject}
+        return {"id": self.identity, "outcome": outcome,
+                "evidence": evidence, "reason": reason,
+                "ticket_number": self.ticket_number, "work_subject": self.work_subject}
 
     def failure(self, reason: str, *, evidence: str = "preflight") -> None:
-        self._result("failed", evidence, reason)
+        self.result = self._make_result("failed", evidence, reason)
 
     def project(self, state: dict[str, Any]) -> dict[str, Any]:
-        return {**state, "_manual_resume_result": self.result} if self.result else state
+        # A sender can read a committed gate before the business observer is
+        # called. Derive the result from this same snapshot without changing
+        # the observer or recursively sending another notification.
+        result = self._observed_result(state)
+        return {**state, "_manual_resume_result": result} if result else state
 
     def observe(self, state: dict[str, Any], *, outcome_observed: bool = False) -> None:
         self.state = state
+        self.result = self._observed_result(state, outcome_observed=outcome_observed)
+        if self.sender is not None:
+            self.sender.observe(self.project(state))
+
+    def _observed_result(
+        self, state: dict[str, Any], *, outcome_observed: bool = False,
+    ) -> dict[str, Any] | None:
+        result = self.result
         fresh = outcome_observed or any(state.get(key) != self.baseline.get(key) for key in _BASELINE_FIELDS)
         gates = operator_action_facts(state)
         relevant = [item for item in gates if self.work_subject is None
@@ -71,42 +83,38 @@ class ResumeFeedback:
                              item["work_subject"].removeprefix("ticket:"))), None)
         if fresh and gate is not None and gate["action_kind"] != "operator_stopped":
             failed = gate["action_kind"] in {"execution_failure", "supervision_timeout", "deterministic_contradiction"}
-            self._result("failed" if failed else "human_action", "execution" if failed else "controller_boundary")
-            assert self.result is not None
-            self.result.update({key: gate[key] for key in ("work_subject", "scope", "action_kind", "generation")})
-            self.result["ticket_number"] = (
-                int(gate["work_subject"].removeprefix("ticket:"))
-                if gate["work_subject"].startswith("ticket:") else None
-            )
-        if self.result is None and self.ticket_number is not None:
+            result = {**self._make_result("failed" if failed else "human_action", "execution" if failed else "controller_boundary"),
+                      **{key: gate[key] for key in ("work_subject", "scope", "action_kind", "generation")},
+                      "ticket_number": (int(gate["work_subject"].removeprefix("ticket:"))
+                                        if gate["work_subject"].startswith("ticket:") else None)}
+        if result is None and self.ticket_number is not None:
             target = (state.get("ticket_jobs") or {}).get(str(self.ticket_number), {})
             previous_target = (self.baseline.get("ticket_jobs") or {}).get(str(self.ticket_number), {})
             observed = target.get("publication_observed_at")
             if (parse_optional_timestamp(observed) is not None
                     and observed != previous_target.get("publication_observed_at")):
-                self._result("started", "controller_check")
+                result = self._make_result("started", "controller_check")
         invocations = list((state.get("ticket_agent_invocations") or {}).values())
         invocations.append(state.get("active_agent_invocation"))
         previous = list((self.baseline.get("ticket_agent_invocations") or {}).values())
         previous.append(self.baseline.get("active_agent_invocation"))
         old_starts = {(item.get("work_subject"), item.get("started_at"))
                       for item in previous if isinstance(item, dict) and invocation_started(item)}
-        if self.result is None and any(
+        if result is None and any(
             isinstance(item, dict) and invocation_started(item)
             and item.get("status") == "running"
             and (self.ticket_number is None or item.get("work_subject") == f"ticket:{self.ticket_number}")
             and (item.get("work_subject"), item.get("started_at")) not in old_starts
             for item in invocations
         ):
-            self._result("started", "worker_started")
-        if self.sender is not None:
-            self.sender.observe(self.project(state))
+            result = self._make_result("started", "worker_started")
+        return result
 
     def progressed(self, state: dict[str, Any], kind: str) -> None:
         target = (state.get("ticket_jobs") or {}).get(str(self.ticket_number), {})
         if (self.result is None and kind in {"progress", "external_wait", "terminal_completion"}
                 and (self.ticket_number is None or target.get("phase") == "completed")):
-            self._result("started", "controller_check" if kind == "external_wait" else "controller_progress")
+            self.result = self._make_result("started", "controller_check" if kind == "external_wait" else "controller_progress")
         self.observe(state, outcome_observed=True)
 
     def close(self) -> None:

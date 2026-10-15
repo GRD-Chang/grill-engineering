@@ -13,6 +13,7 @@ from agent_run.agents import DevelopmentResult, HumanBlockerResult
 from agent_run import cli_presentation
 from agent_run.attempt_projection import semantic_attempt_history
 from agent_run.controller import Controller
+from agent_run.object_state import current_projection_facts
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.graph import state_from_graph
 from agent_run.github import GitHubReadError
@@ -148,7 +149,8 @@ def test_completed_tickets_enter_parent_review_without_initial_development(
     result = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher).accept(state["run_id"])
     assert result["status"] == "run_publication_pending"
     assert agents.events == ["review"]
-    assert result["ticket_jobs"] == jobs
+    assert current_projection_facts(result)["ticket_jobs"] == current_projection_facts(state)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == jobs
     assert {item["ticket_number"] for item in agents.review_requests[0]["ticket_completion_records"]} == {2, 3}
     assert result["run_acceptance"]["review_budget"]["development_attempts"] == 0
 
@@ -163,7 +165,8 @@ def test_failed_git_check_returns_raw_csv_error_to_next_integration_development(
     assert result["status"] == "run_publication_pending"
     assert agents.events == ["development", "development", "review"]
     assert result["run_acceptance"]["review_budget"]["development_attempts"] == 2
-    assert result["ticket_jobs"] == jobs
+    assert current_projection_facts(result)["ticket_jobs"] == current_projection_facts(state)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == jobs
     assert _git(git_repo, "show", f"{result['run_branch']}:market.csv") == "code,value\nA,1"
     integration_rows = [row for row in history_records(result, {
         "semantic_agent_attempts": semantic_attempt_history(result, include_history_facts=True),
@@ -252,7 +255,8 @@ def test_exhausted_integration_development_public_resume_preserves_scene_and_rev
     completed = engine.accept(state["run_id"])
     assert completed["status"] == "run_publication_pending"
     assert agents.events == ["development"] * 4 + ["review"]
-    assert completed["ticket_jobs"] == state["ticket_jobs"]
+    assert current_projection_facts(completed)["ticket_jobs"] == current_projection_facts(state)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == state["ticket_jobs"]
     if default_append:
         assert _git(git_repo, "show", f"{completed['run_branch']}:later-default.txt") == "later default outcome"
         assert completed["run_acceptance"]["run_integration"]["target_sha"] == git.resolve("main")
@@ -269,7 +273,8 @@ def test_git_work_and_parent_findings_share_development_allowance(
     budget = result["run_acceptance"]["review_budget"]
     assert budget["development_attempts"] == 3
     assert budget["reviewer_invocations"] == 2
-    assert result["ticket_jobs"] == state["ticket_jobs"]
+    assert current_projection_facts(result)["ticket_jobs"] == current_projection_facts(state)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == state["ticket_jobs"]
 
 
 def test_closed_ticket_without_completion_cannot_start_parent_integration(
@@ -297,6 +302,7 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
     accepted = RunAcceptanceEngine(
         git=git, states=states, agents=agents, github=publisher,
     ).accept(state["run_id"])
+    accepted = states.load_current_run(state["run_id"])
     run = accepted["run_acceptance"]
     budget = run["review_budget"]
     budget["reviewer_invocations"] = 4
@@ -318,7 +324,8 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
     assert current["run_integration"] == before["run_integration"]
     assert current["integration_work_history"] == before["integration_work_history"]
     assert current["integration_conflict_agent_ordinal"] == 2
-    assert resumed["ticket_jobs"] == accepted["ticket_jobs"]
+    assert current_projection_facts(resumed)["ticket_jobs"] == current_projection_facts(accepted)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == accepted["ticket_jobs"]
 
 
 @pytest.mark.parametrize("missing_scene,new_thread", [(False, False), (False, True), (True, True)])
@@ -475,7 +482,8 @@ def test_parent_repair_base_snapshot_recovers_lost_response_without_repeat_write
     assert publisher.writes == 2
     assert "integration_publication_intent" not in completed["run_acceptance"]
     assert len(agents.review_requests) == 2
-    assert completed["ticket_jobs"] == state["ticket_jobs"]
+    assert current_projection_facts(completed)["ticket_jobs"] == current_projection_facts(state)["ticket_jobs"]
+    assert states.load_current_run(state["run_id"])["ticket_jobs"] == state["ticket_jobs"]
 
 
 def test_run_integration_return_is_reused_before_git_closeout(

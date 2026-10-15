@@ -7,6 +7,7 @@ import pytest
 
 from agent_run import sqlite_work_objects as sqlite_objects
 from agent_run.sqlite_state import SQLiteStateRepository
+from support.work_records import attempt
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
@@ -19,7 +20,7 @@ def test_work_snapshot_reuse_owns_independent_trees_and_run_scope(
         "parent": body,
         "timeline": [{"review_context": body}, {"review_context": body}],
         "ticket_jobs": {"2": {"semantic_attempt_history": [
-            {"role": "reviewer", "status": "completed", "ordinal": 1, "review_context": body},
+            attempt(context=body),
         ]}},
     }
     repository.save("run-1", original)

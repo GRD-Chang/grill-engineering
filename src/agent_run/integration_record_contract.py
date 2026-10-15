@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
+from agent_run.object_projection import ObjectProjection
+from agent_run.review_budget import scoped_budget_validation
+from agent_run.sqlite_encoding import encode_json
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.required_checks_observation import (
     require_required_checks_observation,
@@ -21,6 +25,28 @@ from agent_run.ticket_ci_repair_contract import (
 def require_completed_ticket_integration_records(state: dict[str, Any]) -> None:
     """Require canonical Integration Records for every completed Ticket."""
 
+    owners: dict[int, int] = {}
+    jobs = state.get("ticket_jobs")
+    if isinstance(state, ObjectProjection) and isinstance(jobs, dict):
+        for key, job in jobs.items():
+            if not isinstance(job, dict) or job.get("phase") != "completed" or "review_budget_history" in job:
+                continue
+            archived = state.archive_scope.get(encode_json(("ticket_jobs", key, "review_budget_history")))
+            if archived is None:
+                continue
+            size, count = archived
+            if type(size) is not int or size < 2 or type(count) is not int or count < 0:
+                raise IncompatibleRunStateError("invalid completed Ticket budget archive scope")
+            owners[id(job)] = count
+    # Currentness consumers also validate completion evidence after the main
+    # work validator has returned. Borrow only the exact unloaded owners of
+    # this SQL projection, never metadata supplied in ordinary JSON facts.
+    # Loaded archives retain the complete validator, including old windows.
+    with scoped_budget_validation(owners) if owners else nullcontext():
+        _require_completed_ticket_integration_records(state)
+
+
+def _require_completed_ticket_integration_records(state: dict[str, Any]) -> None:
     jobs = state.get("ticket_jobs")
     if not isinstance(jobs, dict):
         raise IncompatibleRunStateError(

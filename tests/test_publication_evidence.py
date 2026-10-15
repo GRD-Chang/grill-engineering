@@ -180,6 +180,7 @@ def test_new_final_narrative_updates_existing_pr_without_repeating_review(git_re
     ready = engine.publish(run_id)
     original_review = deepcopy(ready["run_acceptance"]["acceptance_record"])
     number = ready["run_publication"]["pr_number"]
+    ready = states.load_current_run(run_id)
     ready["run_publication"]["artifact"]["pr_title"] = "Unbound result"
     persist_run_fixture(states, run_id, ready)
 

@@ -176,6 +176,9 @@ def test_completed_invocation_keeps_bounded_recovery_summary(
     invocation = state["agent_invocation_history"][-1]
     assert invocation["status"] == "completed"
     invocation.update(ordinary_recovery_used=True, capacity_recovery_count=3)
+    current = state.get("active_agent_invocation")
+    if isinstance(current, dict) and (current["work_subject"], current["started_at"]) == (invocation["work_subject"], invocation["started_at"]):
+        current.update(ordinary_recovery_used=True, capacity_recovery_count=3)
     write_run_fixture(state_ref, state)
     before = _workspace_snapshot(git_repo, extra_env=environment)
     for command in ("history", "status"):

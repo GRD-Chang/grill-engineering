@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from agent_run.sqlite_encoding import encode_json
+from agent_run.sqlite_integrity import field_size_proof
 from agent_run.sqlite_state import SQLiteStateRepository
 
 
@@ -39,7 +40,14 @@ def test_work_material_transfer_hashes_noncanonical_snapshot_bytes(tmp_path: Pat
         connection.execute("INSERT INTO run_materials VALUES (?,?,?)", (identity, rewritten, len(rewritten.encode("utf-8"))))
         connection.execute("UPDATE run_objects SET value_json=? WHERE value_json=?", (encode_json(identity), encode_json(old_identity)))
         connection.execute("UPDATE run_object_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
+        connection.execute("UPDATE run_object_materials SET material_id=? WHERE material_id=?", (identity, old_identity))
         connection.execute("UPDATE run_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
+        path = encode_json(("parent",))
+        size, digest, count = connection.execute(
+            "SELECT logical_bytes,content_digest,child_count FROM run_object_index WHERE object_path=?", (path,),
+        ).fetchone()
+        proof = field_size_proof(path, size, digest, ("snapshot", encode_json(identity)), count)
+        connection.execute("UPDATE run_object_index SET size_proof=? WHERE object_path=?", (proof, path))
         connection.execute("DELETE FROM run_materials WHERE material_id=?", (old_identity,))
         connection.commit()
     assert repository.load_work("run-1", 2) == original
@@ -67,14 +75,11 @@ def test_work_material_transfer_rejects_current_damage(tmp_path: Path, damage: s
         elif damage == "missing_run_link":
             connection.execute("DELETE FROM run_material_refs")
         else:
-            old_identity = connection.execute("SELECT material_id FROM run_materials").fetchone()[0]
-            identity = hashlib.sha256(b"\x80").hexdigest()
-            connection.execute("UPDATE run_materials SET material_id=?,value=CAST(X'80' AS TEXT),byte_length=1", (identity,))
-            connection.execute("UPDATE run_objects SET value_json=? WHERE value_json=?", (encode_json(identity), encode_json(old_identity)))
-            connection.execute("UPDATE run_object_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
-            connection.execute("UPDATE run_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
+            # Keep the object header and its size proof intact so the reader
+            # reaches the actual malformed SQL text rather than an index error.
+            connection.execute("UPDATE run_materials SET value=CAST(X'80' AS TEXT),byte_length=1")
         connection.commit()
-    message = "UTF-8" if damage == "invalid_utf8" else "material"
+    message = "UTF-8" if damage == "invalid_utf8" else "material|BLOB"
     with pytest.raises(ValueError, match=message):
         repository.load_work("run-1", 2)
 

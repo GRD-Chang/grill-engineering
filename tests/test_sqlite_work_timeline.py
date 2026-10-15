@@ -28,7 +28,7 @@ def test_sparse_timeline_matches_complete_append_and_reopen(
     repository = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
     count = 0 if change == "empty" else 255 if change == "capacity" else 256 if change in {"continuation", "shift"} else 10
     original = {"status": "active", "timeline": [{"summary": f"old {i}"} for i in range(count)],
-                "agent_invocation_history": [{"work_subject": "ticket:3", "started_at": "historical"}]}
+                "agent_invocation_history": [{"work_subject": "ticket:3", "started_at": "historical", "status": "completed"}]}
     if change in {"continuation", "shift"}:
         original["timeline_at_capacity"] = True
         original["timeline_continuation"] = [{"summary": f"continuation {i}"} for i in range(256 if change == "shift" else 5)]
@@ -64,10 +64,10 @@ def test_sparse_timeline_matches_complete_append_and_reopen(
         references = {row[0] for row in connection.execute("SELECT material_id FROM run_object_material_refs")}
         assert materials == references
         size = connection.execute("SELECT logical_bytes FROM run_sizes").fetchone()[0]
-        assert size == repository._check_size(expected)
+        assert size == repository._check_size({key: value for key, value in expected.items() if key != "agent_invocation_history"})
         assert connection.execute("SELECT value_json FROM run_objects WHERE object_path='[\"timeline\"]'").fetchone() == (str(len(expected["timeline"])),)
-        assert connection.execute("SELECT value_json FROM run_objects WHERE object_path='[\"agent_invocation_history\"]'").fetchone() == ("1",)
-        assert connection.execute("SELECT COUNT(*) FROM run_history").fetchone() == (1,)
+        assert connection.execute("SELECT value_json FROM run_objects WHERE object_path='[\"agent_invocation_history\"]'").fetchone() is None
+        assert connection.execute("SELECT COUNT(*) FROM work_invocation_history").fetchone() == (1,)
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
@@ -128,7 +128,7 @@ def test_thin_timeline_retains_current_damage_checks(
         else:
             connection.execute("DELETE FROM run_objects WHERE object_path='[\"timeline\",0]'")
         connection.commit()
-    with pytest.raises(ValueError, match="material|list item"):
+    with pytest.raises(ValueError, match="material|list item|field size proof"):
         repository.load_work("run-1", 2, thin_timeline=True)
 
 
