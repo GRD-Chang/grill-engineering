@@ -17,7 +17,7 @@ def test_work_snapshot_reuse_owns_independent_trees_and_run_scope(
     repository = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
     body = {"body": "nested evidence" * 100, "number": 1e99}
     original = {
-        "parent": body,
+        "issue_snapshot": body,
         "timeline": [{"review_context": body}, {"review_context": body}],
         "ticket_jobs": {"2": {"semantic_attempt_history": [
             attempt(context=body),
@@ -61,7 +61,7 @@ def test_work_snapshot_reuse_rejects_current_material_damage(
     tmp_path: Path, aggregate: bool, damage: str,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
-    original = {"parent": {"body": "evidence" * 200},
+    original = {"issue_snapshot": {"body": "evidence" * 200},
                 "timeline": [{"review_context": {"body": "evidence" * 200}}]}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
@@ -79,7 +79,7 @@ def test_work_snapshot_reuse_rejects_current_material_damage(
         elif damage == "object_refs":
             # The sibling event retains the same materials. Presence alone
             # cannot stand in for this object's exact reference closure.
-            connection.execute("DELETE FROM run_object_material_refs WHERE object_path='[\"parent\"]'")
+            connection.execute("DELETE FROM run_object_material_refs WHERE object_path='[\"issue_snapshot\"]'")
         else:
             connection.execute("DELETE FROM run_material_refs WHERE run_id='run-1'")
         connection.commit()

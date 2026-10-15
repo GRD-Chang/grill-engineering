@@ -56,7 +56,7 @@ def test_complete_query_reuses_proved_closures_but_rechecks_actual_references(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool,
 ) -> None:
     repository = _repository(tmp_path)
-    original = {"parent": {"body": "frozen requirement" * 100},
+    original = {"issue_snapshot": {"body": "frozen requirement" * 100},
                 "timeline": [{"summary": "evidence", "review_context": {"body": "review evidence" * 100}}]}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
@@ -73,8 +73,8 @@ def test_complete_query_reuses_proved_closures_but_rechecks_actual_references(
     with repository.atomic():
         connection = repository._local.connection
         identity = connection.execute(
-            "SELECT material_id FROM run_object_material_refs WHERE object_path='[\"parent\"]' "
-            "AND material_id!=(SELECT json_extract(value_json,'$') FROM run_objects WHERE object_path='[\"parent\"]')",
+            "SELECT material_id FROM run_object_material_refs WHERE object_path='[\"issue_snapshot\"]' "
+            "AND material_id!=(SELECT json_extract(value_json,'$') FROM run_objects WHERE object_path='[\"issue_snapshot\"]')",
         ).fetchone()[0]
         connection.execute("DELETE FROM run_object_material_refs WHERE run_id='run-1' AND material_id=?", (identity,))
     with pytest.raises(ValueError, match="material references"):
@@ -146,8 +146,8 @@ def test_complete_query_reuses_only_unchanged_source_fields(
     from agent_run import sqlite_state
 
     repository = _repository(tmp_path)
-    original = {"status": "active", "ticket_graph": {"tickets": {"2": {"number": 123456, "title": "retained title"}}},
-                "parent": {"body": "frozen requirement" * 100}, "timeline": [{"event": "retained event"}]}
+    original = {"status": "active", "observations": {"tickets": {"2": {"number": 123456, "title": "retained title"}}},
+                "issue_snapshot": {"body": "frozen requirement" * 100}, "timeline": [{"event": "retained event"}]}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
     assert repository.load("run-1") == original
@@ -163,13 +163,13 @@ def test_complete_query_reuses_only_unchanged_source_fields(
     monkeypatch.setattr(sqlite_state, "scalar_value", decode)
     current = repository.load("run-1")
     assert current == changed
-    current["ticket_graph"]["tickets"]["2"]["title"] = "caller mutation"
+    current["observations"]["tickets"]["2"]["title"] = "caller mutation"
     assert repository.load("run-1") == changed
     # An external source-node change invalidates the field even when metadata
     # such as updated_at did not change, and the returned tree stays isolated.
     monkeypatch.setattr(sqlite_state, "scalar_value", decode_scalar)
-    changed["ticket_graph"] = {"tickets": {"2": {"number": 123457, "title": "new title"}}}
-    writer.save_objects("run-1", changed, fields={"ticket_graph"})
+    changed["observations"] = {"tickets": {"2": {"number": 123457, "title": "new title"}}}
+    writer.save_objects("run-1", changed, fields={"observations"})
     assert repository.load("run-1") == changed
 
 
@@ -177,12 +177,12 @@ def test_complete_query_reuses_only_unchanged_source_fields(
 @pytest.mark.parametrize("damage", ["content", "blob"])
 def test_unchanged_complete_field_still_checks_actual_material_bytes(tmp_path: Path, aggregate: bool, damage: str) -> None:
     repository = _repository(tmp_path)
-    original = {"status": "active", "parent": {"body": "frozen requirement" * 100}}
+    original = {"status": "active", "issue_snapshot": {"body": "frozen requirement" * 100}}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
     assert repository.load("run-1") == original
     with closing(sqlite3.connect(repository.path)) as connection:
-        connection.execute("UPDATE run_objects SET value_json='\"paused\"' WHERE object_path='[\"status\"]'")
+        connection.execute("UPDATE runs SET status='paused'")
         if damage == "blob":
             connection.execute("UPDATE run_materials SET value=CAST(value AS BLOB)")
         else:

@@ -323,37 +323,49 @@ def test_marker_comment_requires_exact_remote_readback(
     monkeypatch.setattr(publisher, "_json", fake_json)
 
     with pytest.raises(GitHubReadError) as captured:
-        publisher.record_run_publication(12, {"run_id": "run-1"})
+        publisher.record_agent_run_status(12, {
+            "scope": "run", "base_sha": "base", "candidate_sha": "candidate",
+            "validation_outcome": "pass", "lane_statuses": {},
+            "required_checks": "pass", "next_action": "await explicit maintainer approval",
+        })
 
     assert captured.value.code == "github_write_outcome_unknown"
     assert reads == 2
 
 
-def test_marker_comment_lost_response_is_reconciled_without_second_write(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+def test_status_updates_preserve_historical_publication_comments(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
-    recorded: dict[str, object] | None = None
-    writes = 0
+    historical = {"id": 8, "user": {"login": "agent-run-bot"}, "body":
+                  '<!-- agent-run:run-publication-record -->\n## Run Publication Record\n\n```json\n{"run_id":"old"}\n```'}
+    comments = [dict(historical)]
 
-    def fake_json(*arguments: str, **_kwargs: object) -> object:
-        nonlocal recorded, writes
-        if "comments" in arguments[1] and "-f" not in arguments:
-            return [[recorded] if recorded is not None else []]
-        writes += 1
-        body_argument = next(value for value in arguments if value.startswith("body="))
-        recorded = {"id": 10, "body": body_argument.removeprefix("body="), "user": {"login": "agent-run-bot"}}
-        raise OSError("lost response after comment write")
+    def api(*arguments: str, **_kwargs: object) -> object:
+        if "-f" not in arguments:
+            assert "DELETE" not in arguments
+            return [comments]
+        body = next(arg.removeprefix("body=") for arg in arguments if arg.startswith("body="))
+        assert "```json" not in body and "Run Publication Record" not in body
+        if "PATCH" in arguments:
+            assert arguments[arguments.index("PATCH") + 1].endswith("/9")
+            comments[1]["body"] = body
+        else:
+            comments.append({"id": 9, "user": {"login": "agent-run-bot"}, "body": body})
+        return comments[1]
 
-    monkeypatch.setattr(publisher, "_json", fake_json)
-    record = {"run_id": "run-1", "candidate_sha": "abc123"}
+    monkeypatch.setattr(publisher, "_json", api)
+    status = {"scope": "run", "base_sha": "base", "candidate_sha": "candidate",
+              "validation_outcome": "pass", "lane_statuses": {},
+              "required_checks": "pending", "next_action": "wait"}
+    publisher.record_agent_run_status(12, status)
+    publisher.record_agent_run_status(12, {**status, "required_checks": "pass"})
+    assert len(comments) == 2
+    assert comments[0] == historical
+    assert "Required Checks: `pass`" in comments[1]["body"]
 
-    with pytest.raises(OSError, match="lost response"):
-        publisher.record_run_publication(12, record)
-    publisher.record_run_publication(12, record)
 
-    assert writes == 1
 
 
 @pytest.mark.parametrize(

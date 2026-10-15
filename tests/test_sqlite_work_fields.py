@@ -13,7 +13,7 @@ from agent_run.sqlite_state import SQLiteStateRepository
 
 
 def _state() -> dict[str, Any]:
-    return {"phase": "active", "creation_configuration": {
+    return {"marker": "active", "configuration": {
         "policy": {"attempts": 3, "roles": ["reviewer", "executor"]},
         "evidence": "中文🙂\x00evidence" * 200,
     }, "graph": {"a": {"children": [2, 3], "enabled": True}}}
@@ -46,10 +46,10 @@ def test_complete_work_fields_use_fresh_source_and_independent_cjson_copies(
     with repository.atomic():
         loaded = repository.load_work("run-1", 2)
         assert loaded == original
-        assert {"creation_configuration", "graph"} <= contexts[-1].fields.keys()
+        assert {"configuration", "graph"} <= contexts[-1].fields.keys()
         baseline = repository.current_work_baseline("run-1")
         assert baseline == original
-        loaded["creation_configuration"]["policy"]["roles"].append("caller")
+        loaded["configuration"]["policy"]["roles"].append("caller")
         assert baseline == original
     assert repository.load_work("run-1", 2) == original
 
@@ -65,18 +65,18 @@ def test_complete_field_reuse_observes_current_changed_nodes(
     contexts = _observe(monkeypatch)
     expected = deepcopy(original)
     if change == "add":
-        expected["creation_configuration"]["new"] = {"actual": 1}
+        expected["configuration"]["new"] = {"actual": 1}
     elif change == "delete":
-        del expected["creation_configuration"]["policy"]["attempts"]
+        del expected["configuration"]["policy"]["attempts"]
     elif change == "scalar":
-        expected["creation_configuration"]["policy"]["attempts"] = 4
+        expected["configuration"]["policy"]["attempts"] = 4
     elif change == "kind":
-        expected["creation_configuration"]["policy"]["attempts"] = {"nested": 4}
+        expected["configuration"]["policy"]["attempts"] = {"nested": 4}
     else:
-        expected["creation_configuration"]["evidence"] = "changed body" * 200
-    SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"creation_configuration"})
+        expected["configuration"]["evidence"] = "changed body" * 200
+    SQLiteStateRepository(tmp_path, max_bytes=65536).save_objects("run-1", expected, fields={"configuration"})
     assert repository.load_work("run-1", 2) == expected
-    assert "creation_configuration" not in contexts[-1].fields
+    assert "configuration" not in contexts[-1].fields
     assert "graph" in contexts[-1].fields
 
 
@@ -108,17 +108,17 @@ def test_complete_work_field_reuse_preserves_node_alias_and_override_checks(tmp_
     original = _state()
     repository.save("run-1", original)
     assert repository.load("run-1") == original
-    path = encode_json(("creation_configuration", "policy", "attempts"))
+    path = encode_json(("configuration", "policy", "attempts"))
     with closing(sqlite3.connect(repository.path)) as connection:
         if change == "alias":
             connection.execute("UPDATE run_objects SET object_path=? WHERE object_path=?",
-                               ('["creation_configuration", "policy", "attempts"]', path))
+                               ('["configuration", "policy", "attempts"]', path))
         elif change == "duplicate":
             connection.execute("INSERT INTO run_objects SELECT run_id,?,kind,value_json FROM run_objects WHERE object_path=?",
-                               ('["creation_configuration", "policy", "attempts"]', path))
+                               ('["configuration", "policy", "attempts"]', path))
         else:
             connection.execute("INSERT INTO run_objects VALUES (?,?,?,?)", (
-                "run-1", encode_json(("creation_configuration", "policy", "attempts", "override")), "scalar", "1"))
+                "run-1", encode_json(("configuration", "policy", "attempts", "override")), "scalar", "1"))
         connection.commit()
     if change == "alias":
         assert repository.load_work("run-1", 2) == original
@@ -132,7 +132,7 @@ def test_complete_work_field_large_view_has_no_reusable_field_cache(
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=2 * 1024 * 1024)
     original = _state()
-    original["creation_configuration"]["evidence"] = "large" * 110000
+    original["configuration"]["evidence"] = "large" * 110000
     repository.save("run-1", original)
     assert repository.load("run-1") == original
     assert repository._read_view is None

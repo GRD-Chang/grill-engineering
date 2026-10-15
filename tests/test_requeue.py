@@ -635,7 +635,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     rejected = run_cli(git_repo, fixture, "requeue", run_id)
 
     assert rejected.returncode == 2
-    assert stdout_json(rejected)["status"] == "blocked"
+    assert stdout_json(rejected)["status"] == "blocked", rejected.stdout
     blocked = states.load_run(run_id)
     assert blocked is not None
     assert blocked["status"] == "blocked"

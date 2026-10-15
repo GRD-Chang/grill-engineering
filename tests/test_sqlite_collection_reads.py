@@ -137,19 +137,24 @@ def test_collection_batch_handles_utf8_quoted_keys_and_more_than_eighty_paths(tm
         assert sum("WITH requested(path,start,stop)" in sql for sql in statements) == 3
 
 
-def test_collection_prepare_reads_existing_selected_child_once(tmp_path: Path) -> None:
+def test_collection_prepare_reads_only_selected_retirement(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    original = {"pending_ticket_retirements": {"2": {"ticket_number": 2, "generation": 1}}}
+    original = {"pending_ticket_retirements": {
+        "2": {"ticket_number": 2, "generation": 1},
+        "3": {"ticket_number": 3, "generation": 1, "message": "unselected retirement evidence"},
+    }}
     repository.save("run-1", original)
+    with closing(sqlite3.connect(repository.path)) as connection:
+        changed = connection.execute(
+            "UPDATE work_evidence_materials SET body=replace(body,'unselected','Unselected') "
+            "WHERE body LIKE '%unselected retirement evidence%'",
+        )
+        assert changed.rowcount == 1
+        connection.commit()
     with repository.atomic():
-        statements: list[str] = []
-        repository._local.connection.set_trace_callback(statements.append)
         updated = {"pending_ticket_retirements": {"2": {"ticket_number": 2, "generation": 2}}}
         repository.save_objects("run-1", updated, fields={"pending_ticket_retirements"},
                                 keyed_changes={"pending_ticket_retirements": {"2"}})
-        # Only the exact selected-child subtree reader is counted. Source
-        # budget/digest validation keeps its independent real SQL checks.
-        child_reads = [sql for sql in statements if "SELECT object_path, kind, value_json FROM run_objects WHERE run_id=" in sql
-                       and "[\"pending_ticket_retirements\",\"2\"]" in sql]
-        assert len(child_reads) == 1
     assert repository.load_paths("run-1", {("pending_ticket_retirements", "2")}) == updated
+    with pytest.raises(ValueError, match="work evidence"):
+        repository.load_paths("run-1", {("pending_ticket_retirements", "3")})

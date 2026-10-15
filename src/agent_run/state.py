@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import threading
-import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -53,7 +52,6 @@ class StateStore:
         self._repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
         self._coordinator = coordinator_for(root)
         self._commit_context = threading.local()
-        self._validated_read: tuple[object, weakref.ReferenceType[object]] | None = None
 
     def _set_write_guard(
         self,
@@ -387,24 +385,10 @@ class StateStore:
         """Load only the one supported persisted Run contract."""
 
         state = self.load_run(run_id)
-        if state is None:
-            self._validated_read = None
-            return None
-        from agent_run.state_contract import require_current_run_state
-
-        token = self._repository.read_token()
-        ordinary = (
-            getattr(self.load_run, "__func__", None) is _DEFAULT_LOAD_RUN
-            and getattr(self._validate_current_run, "__func__", None) is _DEFAULT_VALIDATE_CURRENT_RUN
-        )
-        cached = self._validated_read
-        if not (ordinary and token is not None and cached is not None
-                and cached[0] is require_current_run_state and cached[1]() is token):
+        if state is not None:
+            # The remaining generic-node cache cannot prove current Run/Job
+            # relations. Validate the assembled facts on each boundary.
             self._validate_current_run(run_id, state)
-        # Only SQLite's immutable, content-proven baseline identifies this
-        # pure validation. Never retain/recognize the caller's mutable dict.
-        self._validated_read = ((require_current_run_state, weakref.ref(token))
-                                if ordinary and token is not None else None)
         return state
 
     @contextmanager
@@ -501,8 +485,6 @@ class StateStore:
 # Preserve custom read/validation hooks, including class-level replacements.
 _DEFAULT_LOAD_WORK_RUN = StateStore.load_work_run
 _DEFAULT_REPOSITORY_LOAD_WORK = SQLiteStateRepository.load_work
-_DEFAULT_LOAD_RUN = StateStore.load_run
-_DEFAULT_VALIDATE_CURRENT_RUN = StateStore._validate_current_run
 
 
 def _timeline_change(

@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run.object_state import save_owned
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
@@ -52,7 +53,18 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
         assert git.resolve(f"{default}^{{tree}}") == git.resolve("main^{tree}")
     elif drift == "merge_result":
         state["run_acceptance"]["acceptance_record"]["expected_merge_tree"] = "different-result"
-    persist_run_fixture(states, run_id, state)
+    if drift in {"requirements", "graph"}:
+        # 输入变化仍保留旧审核所引用的不可变版本。
+        save_owned(
+            states, run_id, state,
+            fields={"parent"} if drift == "requirements" else {"ticket_graph"},
+        )
+        preserved = StateStore(states.root).load_run(run_id)
+        assert preserved["run_acceptance"]["acceptance_record"] == original
+        field = "parent" if drift == "requirements" else "ticket_graph"
+        assert preserved[field] == state[field]
+    else:
+        persist_run_fixture(states, run_id, state)
     reloaded_states = StateStore(states.root)
     agents = RunPublicationAgents()
     result = RunPublicationEngine(

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, TYPE_CHECKING
 
 from agent_run.sqlite_encoding import encode_json, object_path
-from agent_run.sqlite_integrity import (KEYED_FIELDS, history_item_digest, field_size_proof)
+from agent_run.sqlite_integrity import history_item_digest, field_size_proof
 
 if TYPE_CHECKING:
     from agent_run.sqlite_state import SQLiteStateRepository
@@ -80,15 +80,13 @@ def load_paths(
     return result
 
 
-def prepare_collections(
+def prepare_appends(
     repository: SQLiteStateRepository, connection: sqlite3.Connection, run_id: str,
-    state: Mapping[str, Any], keyed: Mapping[str, set[str]], append: Mapping[str, list[Any]],
+    append: Mapping[str, list[Any]],
     objects: dict[str, tuple[str, str]], materials: dict[str, str], previous: dict[str, tuple[str, str]],
 ) -> dict[str, tuple[int, str, int]]:
-    from agent_run.sqlite_objects import _rows
     summaries = {}
-    read_materials: dict[str, str] = {}
-    for field in keyed.keys() | append.keys():
+    for field in append:
         path = encode_json((field,))
         source = connection.execute("SELECT kind,value_json FROM run_objects WHERE run_id=? AND object_path=?", (run_id, path)).fetchone()
         summary = connection.execute("SELECT logical_bytes,content_digest,child_count FROM run_object_index WHERE run_id=? AND object_path=?",
@@ -97,45 +95,25 @@ def prepare_collections(
         if type(count) is not int or count < 0:
             raise ValueError("Invalid SQLite collection child count")
         if source is not None:
-            if source[0] != ("map" if field in keyed else "list"):
+            if source[0] != "list":
                 raise ValueError("Invalid SQLite collection object kind")
             previous[path] = source
-        changes: list[tuple[str | int, Any, bool]]
-        if field in keyed:
-            if field not in KEYED_FIELDS:
-                raise ValueError("Unsupported keyed SQLite collection")
-            incoming = state.get(field, {})
-            if not isinstance(incoming, Mapping):
-                raise ValueError("Keyed SQLite collection must be a mapping")
-            changes = [(key, incoming.get(key), key in incoming) for key in sorted(keyed[field])]
-        else:
-            changes = [(count + index, item, True) for index, item in enumerate(append[field])]
-        for key, item, present in changes:
+        changes = [(count + index, item) for index, item in enumerate(append[field])]
+        for key, item in changes:
             child_path = (field, key)
-            child_rows = _rows(connection, run_id, encode_json(child_path)) if field in keyed else {}
-            if child_rows:
-                old = _decode_paths(connection, run_id, {child_path}, child_rows,
-                                    material_values=read_materials)[child_path]
-                previous.update(child_rows)
-                body = len(encode_json(old).encode()) + (len(encode_json(key).encode()) + 1 if isinstance(key, str) else 0)
-                size -= body + bool(count > 1)
-                digest -= history_item_digest(key, old)
-                count -= 1
-            if not present:
-                continue
-            shaped: dict[str, Any] = {field: {key: item}} if isinstance(key, str) else {field: [item]}
+            shaped = {field: [item]}
             encoded_objects, encoded_materials = repository._objects(shaped)
-            origin = (field, key if isinstance(key, str) else 0)
+            origin = (field, 0)
             for location, value in encoded_objects.items():
                 parts = object_path(location)
                 if parts[:2] == origin:
                     objects[encode_json(child_path + parts[2:])] = value
             materials.update(encoded_materials)
-            body = len(encode_json(item).encode()) + (len(encode_json(key).encode()) + 1 if isinstance(key, str) else 0)
+            body = len(encode_json(item).encode())
             size += body + bool(count)
             digest += history_item_digest(key, item)
             count += 1
-        objects[path] = ("map", "null") if field in keyed else ("list", str(count))
+        objects[path] = ("list", str(count))
         summaries[field] = (size, f"{digest % (1 << 256):064x}", count)
     return summaries
 

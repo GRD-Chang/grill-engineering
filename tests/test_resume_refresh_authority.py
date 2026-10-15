@@ -114,7 +114,7 @@ def test_resume_preserves_authority_across_persisted_refresh_wait(
         intent = bind_resume_intent(persisted)
         assert intent["pause_reason"] == pause
     if drift == "persisted_pause":
-        persisted[pause_key]["waiting_for"] = "a different pause"
+        persisted[pause_key]["resume_status"] = "execution_failed"
         persist_run_fixture(states, run_id, persisted)
     if drift in {"persisted_pause", "refreshed_invocation"}:
         with pytest.raises(ResumeIntentError, match="暂停对象或授权已变化"):

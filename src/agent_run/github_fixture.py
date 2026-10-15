@@ -228,7 +228,6 @@ class FixtureGitHubPublisher:
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
         delivery.setdefault("agent_run_status", [])
-        delivery.setdefault("run_publication_records", [])
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
 
@@ -566,20 +565,6 @@ class FixtureGitHubPublisher:
             self._crash_once("abandon_parent_pr")
             return True
         return False
-
-    def record_run_publication(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
-        records = _mutable_list(self._delivery(), "run_publication_records")
-        replacement = {"pr_number": pr_number, **record}
-        for position, existing in enumerate(records):
-            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
-                records[position] = replacement
-                break
-        else:
-            records.append(replacement)
-        self._save()
-        self._crash_once("record_run_publication")
 
     def normal_merge(
         self,

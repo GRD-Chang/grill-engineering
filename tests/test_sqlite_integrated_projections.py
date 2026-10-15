@@ -132,7 +132,7 @@ def test_work_commit_borrows_only_its_isolated_current_transaction_baseline(tmp_
 
 
 @pytest.mark.parametrize("aggregate", [True, False])
-def test_noop_work_commit_does_not_create_revision_but_repairs_actual_metadata_drift(tmp_path: Path, aggregate: bool) -> None:
+def test_noop_work_commit_preserves_the_single_authoritative_status(tmp_path: Path, aggregate: bool) -> None:
     from agent_run.sqlite_watcher import SQLiteWatcher
 
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
@@ -149,24 +149,25 @@ def test_noop_work_commit_does_not_create_revision_but_repairs_actual_metadata_d
             assert repository._local.connection.total_changes == changes
         assert watcher.version() == before
         with repository.atomic():
-            repository._local.connection.execute("UPDATE runs SET status='stale metadata'")
+            repository._local.connection.execute("UPDATE runs SET status='external fact'")
         drift = watcher.version()
         assert drift != before
         with repository.atomic():
             current = repository.load_work("run-1", 2)
+            assert current["status"] == "external fact"
             repository.save_work("run-1", current, repository.work_baseline("run-1", current))
-            assert repository._local.connection.execute("SELECT status FROM runs").fetchone() == ("active",)
-        assert watcher.version() != drift
-    assert repository.load("run-1") == original
+            assert repository._local.connection.execute("SELECT status FROM runs").fetchone() == ("external fact",)
+        assert watcher.version() == drift
+    assert repository.load("run-1") == {**original, "status": "external fact"}
 
 
 @pytest.mark.parametrize("digest", ["A" * 64, "g" * 64, "ｆ" * 64, "f" * 63, "f" * 65, "f" * 63 + "\n"])
 def test_field_digest_rejects_noncanonical_hex_even_with_matching_proof(tmp_path: Path, digest: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    repository.save("run-1", {"phase": "active"})
+    repository.save("run-1", {"marker": "active"})
     with repository.atomic():
         connection = repository._local.connection
-        path = '["phase"]'
+        path = '["marker"]'
         size, count, kind, encoded = connection.execute(
             "SELECT i.logical_bytes,i.child_count,o.kind,o.value_json FROM run_object_index i "
             "JOIN run_objects o USING(run_id,object_path) WHERE i.run_id=? AND i.object_path=?", ("run-1", path),

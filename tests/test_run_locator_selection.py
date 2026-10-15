@@ -330,10 +330,13 @@ def test_exact_mutations_reject_a_state_record_for_another_run_without_writes(
     fixture = write_fixture(git_repo / "github.json", issues={})
     target = stdout_json(seed_run(git_repo, fixture))["run_id"]
     state_dir = managed_state(git_repo)
-    # The payload is valid, but its persisted record key selects a different Run.
+    # A different record key cannot borrow the valid Run's identity. The
+    # relational boundary now rejects that alias before it can be discovered.
     alias = "wrong-run"
-    write_run_fixture((state_dir, alias), read_run((state_dir, target)))
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
+    with pytest.raises(ValueError, match="Run root identity"):
+        write_run_fixture((state_dir, alias), read_run((state_dir, target)))
+    assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
     monkeypatch.chdir(git_repo)
 
     for command in ("resume", "stop", "abandon"):

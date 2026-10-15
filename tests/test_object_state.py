@@ -62,16 +62,28 @@ def test_history_update_and_duplicate_append_keep_unrelated_archives(tmp_path: P
     assert saved["active_agent_invocation"] == _invocation(1)  # type: ignore[index]
 
 
-def test_scoped_size_limit_and_failure_restore_prior_objects_and_indexes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field,limit,message", [
+    ("phase", 256 * 1024, "Run current record exceeds byte limit"),
+    ("current", 512, "persistence limit"),
+])
+def test_scoped_size_limit_and_failure_restore_prior_objects_and_indexes(
+    tmp_path: Path, field: str, limit: int, message: str,
+) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=512)
-    original = {"active_agent_invocation": _invocation(0), "agent_invocation_history": [_invocation(0)], "phase": "developing"}
+    original = {"active_agent_invocation": _invocation(0), "agent_invocation_history": [_invocation(0)],
+                "phase": "developing", "current": "original"}
     repository.save("run-1", original)
     state, positions = repository.load_objects("run-1")  # type: ignore[misc]
-    state["phase"] = "x" * 512
-    with pytest.raises(ValueError, match="persistence limit"):
-        repository.save_objects("run-1", state, fields={"phase"}, history_positions=positions)
+    state.update(phase="candidate", current="changed")
+    state[field] = "x" * limit
+    with sqlite3.connect(repository.path) as connection:
+        indexes = connection.execute("SELECT * FROM run_object_index ORDER BY object_path").fetchall()
+    with pytest.raises(ValueError, match=message):
+        repository.save_objects("run-1", state, fields={"phase", "current"}, history_positions=positions)
     assert SQLiteStateRepository(tmp_path, max_bytes=512).load("run-1") == original
     assert repository.load_objects("run-1")[0] == original  # type: ignore[index]
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("SELECT * FROM run_object_index ORDER BY object_path").fetchall() == indexes
 
 
 def test_unrelated_archived_material_is_not_decoded_by_current_commit(tmp_path: Path) -> None:
@@ -170,7 +182,9 @@ def test_owned_commit_checks_action_receipt_and_notifies_after_durability(tmp_pa
         assert store.load_run("run-1")["delivery_cleanup"] == state["delivery_cleanup"]  # type: ignore[index]
         observations.append(state)
     store.run_saved_observer = observe
-    save_owned(store, "run-1", {"delivery_cleanup": {"completed": True}}, fields={"delivery_cleanup"})
+    cleanup = {"status": "completed", "items": {}}
+    save_owned(store, "run-1", {"delivery_cleanup": cleanup}, fields={"delivery_cleanup"})
+    assert observations[0]["delivery_cleanup"] == cleanup
     assert observations[0]["run_id"] == "run-1"
     assert observations[0]["status"] == "waiting_external"
     assert "agent_invocation_history" not in observations[0]
@@ -188,7 +202,8 @@ def test_old_sqlite_protocol_is_rejected_without_migration(tmp_path: Path) -> No
         repository.save_objects("run-1", {"phase": "candidate"}, fields={"phase"})
     with sqlite3.connect(repository.path) as connection:
         assert connection.execute("SELECT value FROM schema_meta WHERE key='protocol'").fetchone()[0] == "sqlite-run-objects-v1"
-        assert connection.execute("SELECT value_json FROM run_objects WHERE object_path=?", ('["phase"]',)).fetchone()[0] == '"developing"'
+        assert connection.execute("SELECT phase FROM runs WHERE run_id='run-1'").fetchone() == ("developing",)
+        assert connection.execute("SELECT 1 FROM run_objects WHERE object_path=?", ('["phase"]',)).fetchone() is None
 
 
 @pytest.mark.parametrize("claim", ["current_reference", "attempt_binding"])

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from agent_run.delivery_policy import DeliveryPolicy, DeliveryPolicyError
+from agent_run.object_state import save_owned
 from agent_run.state import StateStore
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.task_control import TaskControlBusyError
@@ -170,8 +171,9 @@ def test_capacity_requires_positive_integer(invalid: Any) -> None:
     "missing", "not_list", "duplicate_ticket", "duplicate_lease", "stale_generation",
     "unknown_role", "unknown_ticket", "over_capacity", "invalid_capacity",
 ])
-def test_invalid_persisted_queue_is_rejected(git_repo: Path, corruption: str) -> None:
+def test_invalid_queue_is_rejected(git_repo: Path, corruption: str) -> None:
     state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
+    original = deepcopy(state)
     entry = {"ticket_number": 2, "generation": generation(state, 2),
              "role": "development", "lease_id": "lease-2"}
     state["ticket_work_queue"] = [entry]
@@ -194,10 +196,19 @@ def test_invalid_persisted_queue_is_rejected(git_repo: Path, corruption: str) ->
         entry["ticket_number"] = 999
     elif corruption == "invalid_capacity":
         state["policy_snapshot"]["ticket_development_workers"] = True
+    if corruption in {"not_list", "duplicate_ticket"}:
+        # 结构错误在关系写入时拒绝，失败事务保留原调度和授权事实。
+        message = "scheduling queue" if corruption == "not_list" else "Duplicate Run scheduling Ticket"
+        with pytest.raises(ValueError, match=message):
+            save_owned(states, state["run_id"], state, fields={"ticket_work_queue"})
+        assert StateStore(states.root).load_current_run(state["run_id"]) == original
+        return
     path_ref = (states.root, str(state['run_id']))
     write_run_fixture(path_ref, state)
+    persisted = states.load_run(state["run_id"])
     with pytest.raises(IncompatibleRunStateError):
         StateStore(states.root).load_current_run(state["run_id"])
+    assert states.load_run(state["run_id"]) == persisted
 
 
 @pytest.mark.parametrize("role", ["development", "reviewer", "publication", "integration_conflict"])

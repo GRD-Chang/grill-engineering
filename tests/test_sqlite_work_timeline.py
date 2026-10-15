@@ -11,6 +11,7 @@ import pytest
 
 from agent_run import state as state_module, sqlite_timeline
 from agent_run.sqlite_state import SQLiteStateRepository
+from agent_run.sqlite_work_records import without_work
 
 
 class _Clock(datetime):
@@ -64,7 +65,7 @@ def test_sparse_timeline_matches_complete_append_and_reopen(
         references = {row[0] for row in connection.execute("SELECT material_id FROM run_object_material_refs")}
         assert materials == references
         size = connection.execute("SELECT logical_bytes FROM run_sizes").fetchone()[0]
-        assert size == repository._check_size({key: value for key, value in expected.items() if key != "agent_invocation_history"})
+        assert size == repository._check_size(without_work(expected))
         assert connection.execute("SELECT value_json FROM run_objects WHERE object_path='[\"timeline\"]'").fetchone() == (str(len(expected["timeline"])),)
         assert connection.execute("SELECT value_json FROM run_objects WHERE object_path='[\"agent_invocation_history\"]'").fetchone() is None
         assert connection.execute("SELECT COUNT(*) FROM work_invocation_history").fetchone() == (1,)

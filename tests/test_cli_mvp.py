@@ -980,6 +980,7 @@ def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
     started = seed_run(git_repo, fixture, "1", extra_env=locator_env)
     assert started.returncode == 0, started.stderr
     legacy = load_only_run_state(git_repo, extra_env=locator_env)
+    original = read_run_state_bytes(git_repo, str(legacy["run_id"]), extra_env=locator_env)
     if legacy_protocol is None:
         legacy.pop("branch_authority_protocol")
     else:
@@ -989,6 +990,23 @@ def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
         state.clear()
         state.update(legacy)
 
+    if legacy_protocol is not None and type(legacy_protocol) is not int:
+        fixture_before, agent_before = fixture.read_bytes(), agents.read_bytes()
+        locator_path = locator_home / "agent-run" / "run-locator.json"
+        locator_before = locator_path.read_bytes()
+        refs_before = subprocess.run(["git", "for-each-ref"], cwd=managed_repo(git_repo, extra_env=locator_env),
+                                     check=True, capture_output=True).stdout
+        # Malformed values now fail at the typed persistence boundary, before
+        # a Run with that protocol can be discovered or start any work.
+        with pytest.raises(ValueError, match="branch_authority_protocol must be integer"):
+            replace_only_run_state(git_repo, install_legacy_state, extra_env=locator_env)
+        assert read_run_state_bytes(git_repo, str(legacy["run_id"]), extra_env=locator_env) == original
+        assert fixture.read_bytes() == fixture_before
+        assert agents.read_bytes() == agent_before
+        assert locator_path.read_bytes() == locator_before
+        assert subprocess.run(["git", "for-each-ref"], cwd=managed_repo(git_repo, extra_env=locator_env),
+                              check=True, capture_output=True).stdout == refs_before
+        return
     replace_only_run_state(git_repo, install_legacy_state, extra_env=locator_env)
     state_before = read_run_state_bytes(
         git_repo, str(legacy["run_id"]), extra_env=locator_env

@@ -78,10 +78,6 @@ class GitHubPublisher(Protocol):
         expected_base_sha: str,
     ) -> int | None: ...
 
-    def record_run_publication(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None: ...
-
     def normal_merge(
         self,
         *,

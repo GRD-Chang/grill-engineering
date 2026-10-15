@@ -3,6 +3,10 @@
 新 Run 的 SQLite 权威、对象提交与一致读取、提交后 observer 和历史保留合同见
 [状态存储](docs/agents/state-storage.md)。旧 JSON Run 只发现身份并明确拒绝，不迁移或双写。
 
+完整 Parent 的 Run 身份、调度和全局门禁，以及验收、发布、批准与关闭边界采用明确关系记录。
+Final Run PR 保留 PR Narrative 与一条原地更新的 Agent Run Status；不再同步完整
+`Run Publication Record` JSON 评论，历史评论保留。本地证据与外部未知结果的关闭对账继续有效。
+
 本上下文描述以结构化 Agent 工作结果驱动、由确定性程序控制外部写入的自动交付流程。
 
 Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。

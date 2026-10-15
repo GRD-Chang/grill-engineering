@@ -14,7 +14,6 @@ from agent_run.sqlite_encoding import encode_json
 
 _MODULUS = 1 << 256
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-KEYED_FIELDS = frozenset({"retired_ticket_generations", "pending_ticket_retirements"})
 
 
 
@@ -25,8 +24,6 @@ def history_item_digest(position: str | int, item: Any) -> int:
 def field_content_digest(field: str, value: Any) -> str:
     if isinstance(value, list):
         return f"{sum(history_item_digest(position, item) for position, item in enumerate(value)) % _MODULUS:064x}"
-    if field in KEYED_FIELDS:
-        return f"{sum(history_item_digest(key, item) for key, item in value.items()) % _MODULUS:064x}"
     return hashlib.sha256(encode_json(value).encode()).hexdigest()
 
 

@@ -1,7 +1,7 @@
 """Assemble work dictionaries from their single relational authorities.
 
-The remaining Run fields keep their existing storage during this domain
-change. They never receive a serialized Job, Attempt or Invocation. Views
+Run identity, scheduling, fixed inputs and global conditions join the same
+relations as Jobs, Attempts and Invocations. Views
 join the same SQLite read snapshot, and writes join the existing authorized
 transaction; this module grants no execution or settlement permission.
 """
@@ -15,14 +15,15 @@ from typing import Any
 from agent_run import sqlite_change_jobs as jobs
 from agent_run import sqlite_work_execution as execution
 from agent_run import sqlite_work_evidence as evidence
+from agent_run import sqlite_run_records as roots
 
 
 INVOCATION_FIELDS = frozenset({
     "active_agent_invocation", "ticket_agent_invocations", "agent_invocation_history",
 })
-FIELDS = frozenset(jobs.FIELDS) | INVOCATION_FIELDS
-TABLES = {**evidence.TABLES, **jobs.TABLES, **execution.TABLES}
-INDEXES = {**evidence.INDEXES, **jobs.INDEXES, **execution.INDEXES}
+FIELDS = frozenset(jobs.FIELDS) | INVOCATION_FIELDS | roots.FIELDS
+TABLES = {**evidence.TABLES, **jobs.TABLES, **execution.TABLES, **roots.TABLES}
+INDEXES = {**evidence.INDEXES, **jobs.INDEXES, **execution.INDEXES, **roots.INDEXES}
 
 
 @dataclass
@@ -34,6 +35,12 @@ class WorkBaseline:
 
 def without_work(state: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in state.items() if key not in FIELDS}
+
+
+def _base(base: dict[str, Any]) -> dict[str, Any]:
+    if base.keys() & FIELDS:
+        raise ValueError("Relational Run facts cannot have legacy object nodes")
+    return dict(base)
 
 
 def _resume_ids(state: Mapping[str, Any]) -> set[str]:
@@ -66,7 +73,8 @@ def _related_tickets(state: Mapping[str, Any], requested: set[int] | None) -> se
 def load_complete(
     connection: sqlite3.Connection, run_id: str, base: dict[str, Any],
 ) -> dict[str, Any]:
-    state = without_work(base)
+    state = _base(base)
+    state.update(roots.load(connection, run_id))
     state.update(jobs.load_jobs(connection, run_id, include_history=True))
     invocations, _ = execution.load_invocations(
         connection, run_id, current_only=False, history=True,
@@ -80,8 +88,11 @@ def load_objects(
     excluded_fields: set[str], related_tickets: bool,
     ticket_numbers: set[int] | None, scheduler_tickets: bool, max_bytes: int,
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    state = without_work(base)
+    state = _base(base)
     fields = set(FIELDS) - excluded_fields
+    maps = {"retired_ticket_generations", "pending_ticket_retirements"}
+    scoped = related_tickets or ticket_numbers is not None or scheduler_tickets
+    state.update(roots.load(connection, run_id, fields=(fields - maps if scoped else fields) & roots.FIELDS))
     if related_tickets or ticket_numbers is not None or scheduler_tickets:
         fields.update({"ticket_jobs", "ticket_agent_invocations"})
     selected_number = (jobs.selected_ticket_number(connection, run_id)
@@ -95,19 +106,10 @@ def load_objects(
                                               ticket_numbers if ticket_numbers is not None else numbers),
                               include_history=not scheduler_tickets and ticket_numbers is None)
     state.update(selected)
-    if related_tickets or ticket_numbers is not None or scheduler_tickets:
-        from agent_run.sqlite_collections import load_paths
-        from agent_run.sqlite_objects import load_fields as load_run_fields
-
-        # These generation/retirement selectors still belong to the remaining
-        # Run domain. They contain identities, never another mutable Job.
-        keys = {"retired_ticket_generations", "pending_ticket_retirements"} - FIELDS
-        related = load_paths(connection, run_id, {(field, str(number)) for field in keys for number in numbers or ()})
-        state.update((field, related.get(field, {})) for field in keys)
-        if scheduler_tickets and "retired_ticket_generations" in keys:
-            whole = load_run_fields(connection, run_id, {"retired_ticket_generations"}, max_bytes=max_bytes)
-            if whole is not None:
-                state.update(whole)
+    if scoped:
+        state.update(roots.load(connection, run_id, fields=maps,
+                                keyed_changes={field: {str(number) for number in numbers or ()} for field in maps
+                                               if not scheduler_tickets or field != "retired_ticket_generations"}))
     invocations, positions = execution.load_invocations(
         connection, run_id,
         ticket_numbers=None if scheduler_tickets or ticket_numbers is not None else numbers,
@@ -120,7 +122,8 @@ def load_objects(
 def load_work(
     connection: sqlite3.Connection, run_id: str, base: dict[str, Any], ticket_number: int | None,
 ) -> tuple[dict[str, Any], dict[str, tuple[int, int]], dict[str, dict[str, Any]]]:
-    state = without_work(base)
+    state = _base(base)
+    state.update(roots.load(connection, run_id))
     targets = {ticket_number} if ticket_number is not None else set()
     state.update(jobs.load_jobs(connection, run_id, ticket_numbers=targets, include_history=False))
     current, _ = execution.load_invocations(
@@ -141,9 +144,10 @@ def load_work(
 
 def load_fields(
     connection: sqlite3.Connection, run_id: str, base: dict[str, Any], fields: set[str],
-    *, ticket_numbers: set[int] | None = None,
+    *, ticket_numbers: set[int] | None = None, root_keys: Mapping[str, set[str]] | None = None,
 ) -> dict[str, Any]:
-    state = without_work(base)
+    state = _base(base)
+    state.update(roots.load(connection, run_id, fields=fields & roots.FIELDS, keyed_changes=root_keys))
     state.update(jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
                                ticket_numbers=ticket_numbers, include_history=True))
     if fields & INVOCATION_FIELDS:
@@ -159,9 +163,18 @@ def save(
     connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any], baseline: Mapping[str, Any],
     *, fields: set[str], keyed_changes: Mapping[str, set[str]] | None = None,
 ) -> None:
+    # Inputs precede Job bindings; closeout/requeue references follow their
+    # source Job changes in this same transaction. Remove a retired reference
+    # first when the transaction explicitly completes that transition.
+    deferred = fields & {"requeue_transition", "run_abandonment", "delivery_cleanup"}
+    removed = {field for field in deferred if state.get(field) is None}
+    roots.save(connection, run_id, state, baseline, fields=(fields & roots.FIELDS) - deferred | removed,
+               keyed_changes=keyed_changes)
     if fields & jobs.FIELDS:
         jobs.save_jobs(connection, run_id, state, baseline,
                        fields=fields & jobs.FIELDS, keyed_changes=keyed_changes)
+    if deferred - removed:
+        roots.save(connection, run_id, state, baseline, fields=deferred - removed)
     if fields & INVOCATION_FIELDS:
         proposed = dict(state)
         for field in INVOCATION_FIELDS - fields:
@@ -179,6 +192,8 @@ def save(
         # when this commit has no new Invocation facts of its own.
         from agent_run.sqlite_work_execution_retention import compact_details
         compact_details(connection, run_id)
+    if connection.execute("SELECT 1 FROM run_requeue_transition WHERE run_id=?", (run_id,)).fetchone():
+        roots.load_requeue(connection, run_id)
 
 
 def project_saved_gates(
@@ -199,8 +214,10 @@ def baseline_for_save(
 ) -> dict[str, Any]:
     numbers = {int(number) for field in ("ticket_jobs", "ticket_agent_invocations")
                for number in (keyed_changes or {}).get(field, set())}
-    baseline = jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
+    baseline = roots.load(connection, run_id, fields=fields & roots.FIELDS, keyed_changes=keyed_changes)
+    baseline.update(jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
                               ticket_numbers=numbers if numbers else None, include_history=True, archive_scope=archive_scope)
+                    )
     if archive_scope is None:
         # A direct owned patch carries no proof that omitted history was read.
         # Only an explicit projection scope may describe a loaded deletion.

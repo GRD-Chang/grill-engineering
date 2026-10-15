@@ -2698,7 +2698,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
 def test_old_run_without_lifecycle_protocol_is_read_only_but_not_mutable(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": ticket()})
+    fixture = write_fixture(git_repo / "github.json", issues={"2": {**ticket(), "number": 2}})
     started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
     state_ref = only_run_ref(managed_state(git_repo))

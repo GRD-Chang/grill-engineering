@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from agent_run.sqlite_change_job_archives import TABLES as _ARCHIVE_TABLES
+from agent_run.sqlite_ticket_completions import TABLES as _COMPLETION_TABLES
 
 TEXT_FIELDS = frozenset("""
 run_id owner_kind work_subject effective_revision base_sha candidate_sha publication_sha
@@ -31,16 +32,16 @@ repair_trigger_pending integration_reprepare_required integration_reprepare_disc
 integration_squash_conversion_required parent_closed ticket_closed_by_run source_revision_changed parent_integration_stage integration_reprepare_preserved_changes
 """.split())
 EVIDENCE_FIELDS = frozenset("""
-policy_snapshot review_context acceptance_artifact acceptance_record previous_parent_acceptance_record
-previous_run_repair_acceptance_record unresolved_acceptance_artifact repair_input_artifact publication artifact
-record development_summary human_feedback ci_evidence ci_failed_evidence required_checks_evidence
+policy_snapshot review_context acceptance_artifact
+unresolved_acceptance_artifact repair_input_artifact publication artifact
+development_summary human_feedback ci_evidence ci_failed_evidence required_checks_evidence
 required_checks_origin git_integrity_evidence merge_conflict_evidence repair_trigger
 fallback_publication_receipt deterministic_integration_record ci_repair_publication_receipt
 branch_publication_observation pending_publication_result pending_review_result
-ticket_completion_records ticket_integration parent_integration run_integration run_repair_integration
+ticket_completion_records ticket_integration parent_integration run_repair_integration
 integration_history_rewrite parent_integration_history_rewrite run_repair_integration_history_rewrite
 linked_branch_display human_blockers prior_human_blockers current_human_response
-diagnostics last_ticket_resume approval_update execution_activity
+diagnostics last_ticket_resume execution_activity
 summary failure_evidence integration_evidence action_application_receipt integrated_message required_checks
 """.split())
 HISTORY_FIELDS = frozenset("""
@@ -78,10 +79,34 @@ _WAIT = {**{key: "TEXT" for key in ("identity", "kind", "waiting_for", "phase", 
          "base_sha", "credential_failure_class")}, **{key: "REAL" for key in ("started_at", "deadline", "last_retry_delay_seconds", "next_retry_at")},
          **{key: "INTEGER" for key in ("retry_count", "elapsed_seconds", "budget_seconds", "credential_http_status")},
          "latest_observation": "EVIDENCE"}
+_ACCEPTANCE = {
+    **{key: "TEXT" for key in (
+        "acceptance_scope", "acceptance_state", "effective_revision", "reviewed_base_sha",
+        "reviewed_candidate_sha", "reviewed_candidate_tree", "reviewed_default_base_sha",
+        "reviewed_head_sha", "repair_base_run_head_sha", "expected_merge_tree", "parent_revision",
+        "ticket_graph_revision", "reviewer_thread_id", "repair_source",
+    )},
+    "parent_number": "INTEGER", "ticket_completion_records": "COMPLETIONS", "artifact": "EVIDENCE",
+}
+_PUBLICATION = {
+    **{key: "TEXT" for key in (
+        "parent_revision", "ticket_graph_revision", "default_head_sha", "run_head_sha",
+        "pr_head_sha", "expected_merge_tree",
+    )},
+    "ticket_completion_records": "COMPLETIONS",
+}
+INPUT_BOUND_RECORDS = frozenset({"acceptance_record", "previous_parent_acceptance_record",
+                               "previous_run_repair_acceptance_record", "record", "merge_intent"})
 
 # Each mapping defines one concrete record. Unknown fields are rejected rather
 # than hidden in an extras/payload column.
 RECORDS: dict[str, dict[str, str]] = {
+    **{key: _ACCEPTANCE for key in ("acceptance_record", "previous_parent_acceptance_record",
+                                   "previous_run_repair_acceptance_record")},
+    "record": _PUBLICATION,
+    "approval_update": {key: "TEXT" for key in ("granted_at", "previous_head_sha", "previous_base_sha", "source_sha", "target_sha")},
+    "run_integration": {**{key: "TEXT" for key in ("candidate_sha", "candidate_tree", "source_sha", "target_sha", "head_sha", "head_tree")},
+                        "conflict_paths": "STRINGS"},
     "supervision_wait": _WAIT,
     "attempts": {key: "INTEGER" for key in ("modification_attempts", "validation_attempts", "publication_attempts")},
     "candidate_commit_intent": {"kind": "TEXT", "expected_head": "TEXT", "attempt": "INTEGER", "token": "TEXT"},
@@ -91,7 +116,8 @@ RECORDS: dict[str, dict[str, str]] = {
     "run_branch_write_intent": {key: "TEXT" for key in ("branch", "base_sha", "candidate_sha", "default_base_sha")},
     "integration_publication_intent": {key: "TEXT" for key in ("branch", "head_sha", "source_sha", "target_sha")},
     "merge_intent": {**{key: "TEXT" for key in ("head_sha", "head_branch", "base_branch", "base_sha", "effective_revision", "repository")},
-                     "pr_number": "INTEGER", "attempts": "INTEGER", "commit_message": "EVIDENCE", "acceptance_boundary": "EVIDENCE"},
+                     "pr_number": "INTEGER", "attempts": "INTEGER", "commit_message": "EVIDENCE",
+                     **{f"acceptance_boundary.{key}": kind for key, kind in _PUBLICATION.items()}},
     "controller_candidate_reprepare": {**{key: "TEXT" for key in ("kind", "work_subject", "base_sha", "default_base_sha", "expected_head", "intent_id")},
                                       "generation": "INTEGER", "attempt": "INTEGER"},
     **{key: _CONFLICT for key in ("integration_conflict", "parent_integration_conflict", "run_integration_conflict", "run_repair_integration_conflict")},
@@ -131,10 +157,11 @@ def record_table(field: str) -> str:
 
 
 def _record_ddl(field: str, schema: dict[str, str]) -> str:
-    columns = ", ".join(f"{column(key)} {'TEXT' if kind == 'EVIDENCE' else 'INTEGER' if kind == 'BOOLEAN' else 'BLOB' if kind == 'IDENTITY' else kind}"
+    columns = ", ".join(f"{column(key)} {'TEXT' if kind in {'EVIDENCE', 'COMPLETIONS'} else 'INTEGER' if kind == 'BOOLEAN' else 'BLOB' if kind == 'IDENTITY' else kind}"
                         for key, kind in schema.items() if kind not in {"STRINGS", "EVENTS", "ARTIFACTS"})
+    inputs = ", parent_version_id TEXT, graph_version_id TEXT" if field in INPUT_BOUND_RECORDS else ""
     return (f"CREATE TABLE {record_table(field)} (run_id TEXT NOT NULL, job_id TEXT NOT NULL, presence BLOB NOT NULL, nulls BLOB NOT NULL, "
-            f"{columns}, PRIMARY KEY(run_id, job_id), FOREIGN KEY(run_id, job_id) REFERENCES work_jobs(run_id, job_id) ON DELETE CASCADE)")
+            f"{columns}{inputs}, PRIMARY KEY(run_id, job_id), FOREIGN KEY(run_id, job_id) REFERENCES work_jobs(run_id, job_id) ON DELETE CASCADE)")
 
 
 _CORE_COLUMNS = {**{key: "TEXT" for key in TEXT_FIELDS | EVIDENCE_FIELDS},
@@ -175,6 +202,7 @@ TABLES = {
 }
 TABLES.update({record_table(field): _record_ddl(field, schema) for field, schema in RECORDS.items()})
 TABLES.update(_ARCHIVE_TABLES)
+TABLES.update(_COMPLETION_TABLES)
 INDEXES = {
     "work_jobs_owner": "CREATE INDEX work_jobs_owner ON work_jobs(run_id, owner_kind, owner_key)",
     "work_job_slots_owner": "CREATE INDEX work_job_slots_owner ON work_job_slots(run_id, job_id)",

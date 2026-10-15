@@ -135,7 +135,7 @@ def test_work_rejects_oversized_material_before_restoring_its_body(
     tmp_path: Path, aggregate: bool,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    repository.save("run-1", {"parent": {"body": "frozen requirement"}})
+    repository.save("run-1", {"issue_snapshot": {"body": "frozen requirement"}})
     with repository.atomic():
         repository._local.connection.execute(
             "UPDATE run_materials SET value=?,byte_length=?", ("damaged" * 10000, 70000),

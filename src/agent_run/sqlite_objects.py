@@ -11,7 +11,7 @@ from typing import Any, TYPE_CHECKING, cast
 from agent_run.sqlite_encoding import encode_json, object_path, scalar_value
 from agent_run.sqlite_mutations import _batch
 from agent_run.sqlite_integrity import (
-    KEYED_FIELDS, field_content_digest, field_size_proof,
+    field_content_digest, field_size_proof,
     require_field_sizes, require_material_counts, require_material_payloads, root_fields,
     source_material_dependencies, sync_material_counts,
 )
@@ -122,7 +122,7 @@ def index_objects(
         path = encode_json((field,))
         encoded_value = encode_json(value).encode()
         size = len(encode_json(field).encode()) + len(encoded_value) + 2
-        digest = field_content_digest(field, value) if isinstance(value, list) or field in KEYED_FIELDS else hashlib.sha256(encoded_value).hexdigest()
+        digest = field_content_digest(field, value) if isinstance(value, list) else hashlib.sha256(encoded_value).hexdigest()
         child_count = len(value) if isinstance(value, (dict, list)) else None
         entries.append((run_id, path, None, None, size, digest,
                         field_size_proof(path, size, digest, objects[path], child_count), child_count, None))
@@ -291,18 +291,18 @@ def save_projection(
     _require_root(connection, run_id)
     require_field_sizes(connection, run_id, max_bytes=repository.max_bytes)
     old_fields = root_fields(connection, run_id)
-    keyed_changes = keyed_changes or {}
+    if keyed_changes:
+        raise ValueError("Unsupported keyed SQLite collection")
     append_changes = append_changes or {}
-    partial_fields = keyed_changes.keys() | append_changes.keys()
+    partial_fields = append_changes.keys()
     selected = {key: state[key] for key in fields - partial_fields if key in state}
     objects, materials = repository._objects(selected)
     objects.pop("[]", None)
     previous = {}
     for field in fields - partial_fields:
         previous.update(_rows(connection, run_id, encode_json((field,))))
-    from agent_run.sqlite_collections import prepare_collections, save_summaries
-    summaries = prepare_collections(repository, connection, run_id, state, keyed_changes, append_changes,
-                                    objects, materials, previous)
+    from agent_run.sqlite_collections import prepare_appends, save_summaries
+    summaries = prepare_appends(repository, connection, run_id, append_changes, objects, materials, previous)
     candidates = source_material_dependencies(connection, run_id, previous)
     require_material_counts(connection, run_id, candidates | materials.keys())
     require_material_payloads(connection, materials)
@@ -332,11 +332,6 @@ def save_projection(
                            ((identity, identity) for identity in affected))
     sync_material_counts(connection, run_id, candidates | materials.keys())
     require_field_sizes(connection, run_id, max_bytes=repository.max_bytes)
-    columns = {"repository", "status", "phase", "created_at", "updated_at"} & fields
-    for column in columns:
-        connection.execute(f"UPDATE runs SET {column}=? WHERE run_id=?", (state.get(column), run_id))
-    if "parent" in fields:
-        connection.execute("UPDATE runs SET parent_number=? WHERE run_id=?", (state.get("parent", {}).get("number"), run_id))
 
 
 def load_fields(connection: sqlite3.Connection, run_id: str, fields: set[str], *, max_bytes: int) -> dict[str, Any] | None:

@@ -25,7 +25,6 @@ from agent_run.github import (
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
 
-_RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
 _AGENT_RUN_STATUS_MARKER = "<!-- agent-run:agent-run-status -->"
 
 
@@ -341,19 +340,6 @@ class GhGitHubPublisher:
             return False
         self._require("pr", "close", str(pr_number), "--repo", self.repository)
         return True
-
-    def record_run_publication(self, pr_number: int, record: dict[str, Any]) -> None:
-        body = (
-            f"{_RUN_PUBLICATION_MARKER}\n"
-            "## Run Publication Record\n\n```json\n"
-            f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n```"
-        )
-        self._record_marker_comment(
-            pr_number=pr_number,
-            marker=_RUN_PUBLICATION_MARKER,
-            body=body,
-            label="Run publication record",
-        )
 
     def normal_merge(
         self,

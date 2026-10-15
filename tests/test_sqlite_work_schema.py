@@ -23,7 +23,12 @@ def test_work_query_rejects_current_storage_after_successful_read(
         if damage == "protocol_blob":
             connection.execute("UPDATE schema_meta SET value=CAST(value AS BLOB)")
         elif damage == "material_blob":
-            connection.execute("UPDATE run_materials SET value=CAST(value AS BLOB)")
+            damaged = connection.execute(
+                "UPDATE work_evidence_materials SET body=CAST(body AS BLOB) WHERE material_id IN "
+                "(SELECT material_id FROM work_evidence WHERE run_id='run-1' "
+                "AND owner_id='run:run-1' AND kind='parent.body')"
+            )
+            assert damaged.rowcount == 1
         elif damage == "extra_table":
             # The underscore is a literal prefix character, not a LIKE wildcard.
             connection.execute("CREATE TABLE sqlitex_extra(value TEXT)")
@@ -35,7 +40,7 @@ def test_work_query_rejects_current_storage_after_successful_read(
             connection.execute("CREATE TRIGGER unexpected AFTER INSERT ON runs BEGIN SELECT 1; END")
         connection.commit()
     expected = ValueError if damage in {"protocol_blob", "material_blob"} else IncompatibleRunStateError
-    with pytest.raises(expected, match="protocol|schema|indexes|BLOB|material"):
+    with pytest.raises(expected, match="protocol|schema|indexes|BLOB|material|evidence byte length"):
         repository.load_work("run-1", 2)
 
 

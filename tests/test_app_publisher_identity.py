@@ -14,6 +14,12 @@ from agent_run.github_auth_profile import GitHubAppProfile
 from agent_run.github_publish import GhGitHubPublisher
 
 
+def _run_status():
+    return {"scope": "run", "candidate_sha": "abc", "base_sha": "base",
+            "validation_outcome": "pass", "lane_statuses": {},
+            "required_checks": "pass", "next_action": "await explicit maintainer approval"}
+
+
 @pytest.fixture
 def app_publisher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> GhGitHubPublisher:
     key = tmp_path / "app.pem"
@@ -59,16 +65,16 @@ def test_app_publication_recovers_lost_response_and_ignores_foreign_comment(app_
         raise OSError("lost publication response")
 
     monkeypatch.setattr(app_publisher, "_json", api)
-    record = {"run_id": "run-1", "candidate_sha": "abc"}
+    record = _run_status()
     with pytest.raises(OSError, match="lost publication"):
-        app_publisher.record_run_publication(10, record)
+        app_publisher.record_agent_run_status(10, record)
     # A second operation with the same body but another author must not satisfy recovery.
     owned = comments.pop()
     comments.append({**owned, "id": 1, "user": {"login": "other[bot]"}})
     with pytest.raises(OSError, match="lost publication"):
-        app_publisher.record_run_publication(10, record)
+        app_publisher.record_agent_run_status(10, record)
     assert len(writes) == 2
-    app_publisher.record_run_publication(10, record)
+    app_publisher.record_agent_run_status(10, record)
     assert len(writes) == 2
 
 
@@ -248,8 +254,8 @@ print(json.dumps([comments]))
     monkeypatch.setenv("GITHUB_TOKEN", "host-secret")
     with runner_credential_scope():
         with pytest.raises(GitHubReadError, match="response lost"):
-            app_publisher.record_run_publication(10, {"run_id": "run-1", "candidate_sha": "abc"})
-        app_publisher.record_run_publication(10, {"run_id": "run-1", "candidate_sha": "abc"})
+            app_publisher.record_agent_run_status(10, _run_status())
+        app_publisher.record_agent_run_status(10, _run_status())
     assert cancelled
     calls = [json.loads(line) for line in capture.read_text().splitlines()]
     assert sum("-f" in call for call in calls) == 1

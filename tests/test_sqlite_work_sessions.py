@@ -128,7 +128,12 @@ def test_work_session_revalidates_persisted_storage(tmp_path: Path, damage: str)
             elif damage == "schema":
                 database.execute("CREATE VIEW unexpected AS SELECT 1")
             else:
-                database.execute("UPDATE run_materials SET byte_length=byte_length+1")
+                damaged = database.execute(
+                    "UPDATE work_evidence_materials SET byte_length=byte_length+1 WHERE material_id IN "
+                    "(SELECT material_id FROM work_evidence WHERE run_id='run-1' "
+                    "AND owner_id='run:run-1' AND kind='parent.body')"
+                )
+                assert damaged.rowcount == 1
             database.commit()
         with pytest.raises(ValueError, match="protocol|schema|byte length|material identity"):
             repository.load_work("run-1", 2)

@@ -17,7 +17,7 @@ def test_work_material_transfer_preserves_exact_text_and_independent_values(
     tmp_path: Path, aggregate: bool, body: str,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
-    original = {"parent": {"body": body}, "timeline": [{"body": body}, {"body": body}]}
+    original = {"issue_snapshot": {"body": body}, "timeline": [{"body": body}, {"body": body}]}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
     assert repository.load("run-1") == original
@@ -30,7 +30,7 @@ def test_work_material_transfer_preserves_exact_text_and_independent_values(
 
 def test_work_material_transfer_hashes_noncanonical_snapshot_bytes(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
-    original = {"parent": {"number": 1e100, "body": "Unicode 中文🙂"}}
+    original = {"issue_snapshot": {"number": 1e100, "body": "Unicode 中文🙂"}}
     repository.save("run-1", original)
     with closing(sqlite3.connect(repository.path)) as connection:
         old_identity, raw = connection.execute("SELECT material_id,value FROM run_materials").fetchone()
@@ -42,7 +42,7 @@ def test_work_material_transfer_hashes_noncanonical_snapshot_bytes(tmp_path: Pat
         connection.execute("UPDATE run_object_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
         connection.execute("UPDATE run_object_materials SET material_id=? WHERE material_id=?", (identity, old_identity))
         connection.execute("UPDATE run_material_refs SET material_id=? WHERE material_id=?", (identity, old_identity))
-        path = encode_json(("parent",))
+        path = encode_json(("issue_snapshot",))
         size, digest, count = connection.execute(
             "SELECT logical_bytes,content_digest,child_count FROM run_object_index WHERE object_path=?", (path,),
         ).fetchone()
@@ -59,7 +59,7 @@ def test_work_material_transfer_hashes_noncanonical_snapshot_bytes(tmp_path: Pat
 @pytest.mark.parametrize("warm_complete", [False, True])
 def test_work_material_transfer_rejects_current_damage(tmp_path: Path, damage: str, warm_complete: bool) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
-    original = {"parent": {"body": "evidence 中文🙂"}}
+    original = {"issue_snapshot": {"body": "evidence 中文🙂"}}
     repository.save("run-1", original)
     if warm_complete:
         assert repository.load("run-1") == original
@@ -88,7 +88,7 @@ def test_work_material_body_aggregation_is_skipped_above_physical_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=2 * 1024 * 1024)
-    original = {"parent": {"body": "中文🙂\x00" * 70000}}
+    original = {"issue_snapshot": {"body": "中文🙂\x00" * 70000}}
     repository.save("run-1", original)
     connect = sqlite3.connect
     aggregated = []

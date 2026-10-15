@@ -15,7 +15,7 @@ from agent_run.sqlite_state import SQLiteStateRepository
 
 def _state(body: str = "中文🙂\x00\\\n" * 100) -> dict[str, Any]:
     evidence = {"body": body, "nested": [{"count": 1}, {"count": 2}]}
-    return {"agent_invocation_history": [], "parent": evidence, "ticket": deepcopy(evidence), "phase": "active",
+    return {"agent_invocation_history": [], "issue_snapshot": evidence, "ticket": deepcopy(evidence), "marker": "active",
             "timeline": [{"body": body}, {"body": body}],
             "ticket_jobs": {"2": {"ticket_number": 2, "review_context": evidence}}}
 
@@ -39,15 +39,15 @@ def test_projection_prefetch_preserves_text_aliases_and_independent_reads(
         loaded = load_projection(connection, "run-1", max_bytes=repository.max_bytes)
         assert loaded is not None
         state, _ = loaded
-        assert state == {key: original[key] for key in ("parent", "ticket", "phase", "timeline")}
-        state["parent"]["nested"][0]["count"] = 100
+        assert state == {key: original[key] for key in ("issue_snapshot", "ticket", "marker", "timeline")}
+        state["issue_snapshot"]["nested"][0]["count"] = 100
         state["timeline"][0]["body"] = "caller change"
         assert state["ticket"] == original["ticket"]
         assert state["timeline"][1] == original["timeline"][1]
         complete = repository.load_objects("run-1")[0]
         assert complete == original
         complete["ticket_jobs"]["2"]["review_context"]["nested"][0]["count"] = 200
-        assert complete["parent"]["nested"][0]["count"] == 1
+        assert complete["issue_snapshot"]["nested"][0]["count"] == 1
         assert repository.load_objects("run-1")[0] == original
 
 
@@ -59,7 +59,7 @@ def test_projection_prefetch_revalidates_actual_materials(tmp_path: Path, damage
     assert repository.load_objects("run-1")[0] == original
     with closing(sqlite3.connect(repository.path)) as connection:
         parent_id = connection.execute(
-            "SELECT value_json FROM run_objects WHERE object_path=?", (encode_json(("parent",)),),
+            "SELECT value_json FROM run_objects WHERE object_path=?", (encode_json(("issue_snapshot",)),),
         ).fetchone()[0]
         if damage in {"body", "nested_body"}:
             if damage == "body":
@@ -83,7 +83,7 @@ def test_projection_prefetch_revalidates_actual_materials(tmp_path: Path, damage
 def test_projection_prefetch_never_aggregates_oversized_bodies(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4 * 1024 * 1024)
     evidence = {"rows": [{"label": "中文🙂\x00" * 20} for _ in range(3500)]}
-    original = {"parent": evidence, "ticket": deepcopy(evidence)}
+    original = {"issue_snapshot": evidence, "ticket": deepcopy(evidence)}
     repository.save("run-1", original)
 
     class GuardBodies(sqlite3.Connection):
@@ -133,11 +133,11 @@ def test_projection_prefetch_keeps_each_material_batch_bounded(tmp_path: Path) -
 
 def test_projection_prefetch_does_not_expand_unselected_materials(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    original = {"parent": {"body": "selected evidence"}, "ticket": {"body": "unselected evidence"}}
+    original = {"issue_snapshot": {"body": "selected evidence"}, "ticket": {"body": "unselected evidence"}}
     repository.save("run-1", original)
     with closing(sqlite3.connect(repository.path)) as connection:
         connection.execute("UPDATE run_materials SET value=replace(value,'unselected','Unselected')")
         connection.commit()
-    assert repository.load_fields("run-1", {"parent"}) == {"parent": original["parent"]}
+    assert repository.load_fields("run-1", {"issue_snapshot"}) == {"issue_snapshot": original["issue_snapshot"]}
     with pytest.raises(ValueError, match="material"):
         repository.load_fields("run-1", {"ticket"})

@@ -18,27 +18,40 @@ def _history(count: int, *, body: str = "证据\x00\n" * 300) -> list[dict[str, 
             for index in range(count)]
 
 
-def test_object_commit_updates_only_changed_field_indexes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["phase", "current"])
+def test_object_commit_updates_only_changed_field_indexes(tmp_path: Path, field: str) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
-    state = {"phase": "pending", "fixed": {"body": "fixed evidence " * 300},
+    state = {"phase": "pending", "current": "pending", "fixed": {"body": "fixed evidence " * 300},
              "agent_invocation_history": _history(12)}
     repository.save("run-1", state)
     writes: list[str] = []
     with repository.atomic():
         changed = repository.load("run-1")
         assert changed is not None
-        changed["phase"] = "completed"
+        changed[field] = "completed"
         repository._local.connection.set_trace_callback(writes.append)
-        repository.save_objects("run-1", changed, fields={"phase"})
+        repository.save_objects("run-1", changed, fields={field})
     indexes = [sql for sql in writes if sql.startswith("INSERT INTO run_object_index ")]
-    assert len(indexes) == 1 and '["phase"]' in indexes[0]
-    assert repository.load("run-1") == {**state, "phase": "completed"}
+    if field == "phase":
+        assert indexes == []
+    else:
+        assert len(indexes) == 1 and '["current"]' in indexes[0]
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("SELECT phase FROM runs WHERE run_id='run-1'").fetchone() == (
+            "completed" if field == "phase" else "pending",)
+        for table in ("run_objects", "run_object_index"):
+            assert connection.execute(f"SELECT 1 FROM {table} WHERE object_path=?",
+                                      (encode_json(("phase",)),)).fetchone() is None
+    assert repository.load("run-1") == {**state, field: "completed"}
 
 
 @pytest.mark.parametrize("damage", ["proof", "missing"])
-def test_object_commit_rejects_damaged_unchanged_field_index(tmp_path: Path, damage: str) -> None:
+@pytest.mark.parametrize("field", ["phase", "current"])
+def test_object_commit_checks_unchanged_field_index_within_its_storage_scope(
+    tmp_path: Path, damage: str, field: str,
+) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=4096)
-    state = {"phase": "pending", "fixed": {"body": "evidence"}}
+    state = {"phase": "pending", "current": "pending", "fixed": {"body": "evidence"}}
     repository.save("run-1", state)
     with sqlite3.connect(repository.path) as connection:
         if damage == "proof":
@@ -46,9 +59,18 @@ def test_object_commit_rejects_damaged_unchanged_field_index(tmp_path: Path, dam
                                (encode_json(("fixed",)),))
         else:
             connection.execute("DELETE FROM run_object_index WHERE object_path=?", (encode_json(("fixed",)),))
-    with pytest.raises(ValueError, match="field size proof"):
+    if field == "phase":
         repository.save_objects("run-1", {"phase": "completed"}, fields={"phase"})
-    assert repository.load("run-1") == state
+        expected = {**state, "phase": "completed"}
+    else:
+        with pytest.raises(ValueError, match="field size proof"):
+            repository.save_objects("run-1", {"current": "completed"}, fields={"current"})
+        expected = state
+    assert repository.load("run-1") == expected
+    with sqlite3.connect(repository.path) as connection:
+        row = connection.execute("SELECT size_proof FROM run_object_index WHERE object_path=?",
+                                 (encode_json(("fixed",)),)).fetchone()
+        assert row == (("broken",) if damage == "proof" else None)
 
 
 def test_unrelated_commit_preserves_damaged_history_for_explicit_validation(tmp_path: Path) -> None:

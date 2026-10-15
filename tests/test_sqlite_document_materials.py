@@ -125,7 +125,7 @@ def test_material_source_equality_includes_actual_sql_metadata(damage: str) -> N
 def test_cached_complete_query_rechecks_same_length_material_bytes(tmp_path: Path) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     body = "unchanged evidence " * 100
-    original = {"parent": {"body": body}}
+    original = {"issue_snapshot": {"body": body}}
     repository.save("run-1", original)
     assert repository.load("run-1") == original
     assert repository.load("run-1") == original

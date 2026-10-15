@@ -21,7 +21,9 @@ def _state() -> dict[str, Any]:
     job = {"ticket_number": 2, "semantic_attempt_history": [
         attempt(context={"number": 1e100}),
     ], "human_blocker_history": [{"number": 1e100, "message": "历史问题🙂"}]}
-    return {"phase": "active", "parent": {"number": 1e100}, "ticket_agent_invocations": {"2": deepcopy(invocation)},
+    # Noncanonical numeric text belongs to an uninterpreted snapshot. Parent
+    # identity now uses a positive INTEGER and cannot hold arbitrary numbers.
+    return {"phase": "active", "issue_snapshot": {"number": 1e100}, "ticket_agent_invocations": {"2": deepcopy(invocation)},
             "agent_invocation_history": [invocation], "ticket_jobs": {"2": job}}
 
 
@@ -40,7 +42,7 @@ def _rewrite_numbers(repository: SQLiteStateRepository) -> None:
         # The numerical value and canonical logical size stay equal. Only the
         # immutable source identity changed, so bind its current header to the
         # same logical field proof rather than leaving a corrupt test fixture.
-        path = encode_json(("parent",))
+        path = encode_json(("issue_snapshot",))
         size, digest, count, kind, encoded = connection.execute(
             "SELECT i.logical_bytes,i.content_digest,i.child_count,o.kind,o.value_json "
             "FROM run_object_index i JOIN run_objects o USING(run_id,object_path) "
@@ -205,19 +207,19 @@ def test_fresh_writer_baseline_keeps_all_caller_and_baseline_containers_independ
 
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
     evidence = {"body": "中文🙂证据" * 200, "nested": [{"count": 1}]}
-    original = {"parent": deepcopy(evidence), "ticket": deepcopy(evidence)}
+    original = {"issue_snapshot": deepcopy(evidence), "ticket": deepcopy(evidence)}
     if shape == "shared_nested_snapshot":
-        original = {"parent": {"name": "parent", "review_context": deepcopy(evidence)},
+        original = {"issue_snapshot": {"name": "issue_snapshot", "review_context": deepcopy(evidence)},
                     "ticket": {"name": "ticket", "review_context": deepcopy(evidence)}}
     repository.save("run-1", original)
     if shape == "prior_only":
         assert repository.load("run-1") == original
     expected = deepcopy(original)
     if shape == "descendant_override":
-        expected["parent"]["summary"] = "current source override"
+        expected["issue_snapshot"]["summary"] = "current source override"
         with closing(sqlite3.connect(repository.path)) as connection:
             connection.execute("INSERT INTO run_objects VALUES (?,?,?,?)", (
-                "run-1", encode_json(("parent", "summary")), "scalar", encode_json("current source override")))
+                "run-1", encode_json(("issue_snapshot", "summary")), "scalar", encode_json("current source override")))
             connection.execute("UPDATE run_sizes SET logical_bytes=?", (repository._check_size(expected),))
             connection.commit()
     with repository.atomic():
@@ -229,11 +231,11 @@ def test_fresh_writer_baseline_keeps_all_caller_and_baseline_containers_independ
         assert current == expected
         baseline = repository.current_work_baseline("run-1")
         assert baseline == expected
-        assert baseline["parent"] is not current["parent"]
+        assert baseline["issue_snapshot"] is not current["issue_snapshot"]
         assert baseline["ticket"] is not current["ticket"]
-        assert baseline["parent"] is not baseline["ticket"]
-        parent = current["parent"]
-        baseline_parent = baseline["parent"]
+        assert baseline["issue_snapshot"] is not baseline["ticket"]
+        parent = current["issue_snapshot"]
+        baseline_parent = baseline["issue_snapshot"]
         if shape == "shared_nested_snapshot":
             parent = parent["review_context"]
             baseline_parent = baseline_parent["review_context"]
@@ -244,7 +246,7 @@ def test_fresh_writer_baseline_keeps_all_caller_and_baseline_containers_independ
         # Mutation here tests isolation only; the private baseline is otherwise
         # read-only, and no modified baseline is submitted for persistence.
         baseline_parent["nested"][0]["count"] = 20
-        assert current["parent"] != baseline["parent"]
+        assert current["issue_snapshot"] != baseline["issue_snapshot"]
         assert baseline["ticket"] == expected["ticket"]
     assert repository.load("run-1") == expected
 

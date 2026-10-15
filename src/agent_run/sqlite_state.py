@@ -6,7 +6,6 @@ import hashlib
 import json
 import sqlite3
 import threading
-import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.sqlite_encoding import copy_json_tree, copy_projection_fields, encode_json, object_path, scalar_value, snapshot_fields
 from agent_run.sqlite_mutations import create_run_objects
 from agent_run import sqlite_timeline
-from agent_run.sqlite_work_objects import check_indexes, index_run, _object_rows, _decode
+from agent_run.sqlite_work_objects import check_indexes, index_run
 from agent_run.sqlite_work_indexes import IndexFacts
 from agent_run.sqlite_work_fields import field_node_counts
 from agent_run.sqlite_rows import ReadConnection, RowSource, read_document, read_run_rows, read_schema
@@ -28,7 +27,7 @@ from agent_run.sqlite_runtime import enable_wal, require_wal_runtime
 from agent_run import sqlite_work_records as work_records
 
 
-_PROTOCOL = "sqlite-work-records-v4"
+_PROTOCOL = "sqlite-work-records-v5"
 _MATERIAL_THRESHOLD = 1024
 _SNAPSHOT_FIELDS = {"prompt_resources", "review_context", "parent", "ticket", "issue_snapshot"}
 _OBJECT_COLLECTIONS = {"timeline", "timeline_continuation"}
@@ -112,13 +111,7 @@ _FOREIGN_KEYS.update(sqlite_control.FOREIGN_KEYS)
 _CANONICAL_TABLES = {**_BUSINESS_TABLES, **sqlite_control.TABLES, **work_records.TABLES}
 _CANONICAL_INDEXES = {**_BUSINESS_INDEXES, **sqlite_control.INDEXES, **work_records.INDEXES}
 _SCHEMA = (*_CANONICAL_TABLES.values(), *_CANONICAL_INDEXES.values())
-_WORK_SCHEMA_PARAMETERS = {
-    "schema_definitions": encode_json(sorted(
-        [("table", name, ddl) for name, ddl in _CANONICAL_TABLES.items()]
-        + [("index", name, ddl) for name, ddl in _CANONICAL_INDEXES.items()],
-    )),
-    "schema_protocol": _PROTOCOL,
-}
+
 
 
 _json = encode_json
@@ -518,18 +511,12 @@ class SQLiteStateRepository:
             raise ValueError(f"Run state exceeds {self.max_bytes} byte persistence limit")
         return size
 
-    def read_token(self) -> object | None:
-        reference = getattr(self._local, "last_read_view", None)
-        return reference() if reference is not None else None
-
     def _copy_view(self, view: _RunView) -> dict[str, Any]:
         if view.fields is not None:
-            self._local.last_read_view = weakref.ref(view)
             return copy_projection_fields(view.state, view.fields)
         return cast(dict[str, Any], copy_json_tree(view.state))
 
     def load(self, run_id: str) -> dict[str, Any] | None:
-        self._local.last_read_view = None
         view = cast(_RunView | None, getattr(self._local, "view", None))
         if view is not None and view.run_id == run_id:
             # Only the current write transaction can reuse its validated view.
@@ -699,8 +686,6 @@ class SQLiteStateRepository:
                                    if reusable and view is not None else None)
             if active:
                 self._local.view = view
-            if view is not None and view.fields is not None:
-                self._local.last_read_view = weakref.ref(view)
             return work_records.load_complete(connection, run_id, root)
 
     def load_work(self, run_id: str, ticket_number: int | None, *, thin_timeline: bool = False) -> dict[str, Any] | None:
@@ -748,115 +733,42 @@ class SQLiteStateRepository:
             raise ValueError("Work baseline requires a current transaction read")
         return view.baseline
 
-    def has_ticket_supervision_work(self, run_id: str) -> bool:
-        """Skip only a proved empty normal supervision observation."""
-        with self._reading(check_schema=False) as connection:
-            if connection is None:
-                return False
-            if self.in_transaction:
-                self._check_schema(connection)
-            if self._aggregate_rows:
-                from agent_run.sqlite_supervision_read import read_supervision_work
+    def _require_run_query(self, connection: sqlite3.Connection, run_id: str) -> bool:
+        row = connection.execute(
+            "SELECT s.logical_bytes FROM runs r LEFT JOIN run_sizes s ON s.run_id=r.run_id WHERE r.run_id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if type(row[0]) is not int or not 3 <= row[0] <= self.max_bytes:
+            raise ValueError("Invalid SQLite Run size metadata")
+        from agent_run.sqlite_objects import _require_root
+        _require_root(connection, run_id)
+        return True
 
-                observed = read_supervision_work(connection, run_id, max_bytes=self.max_bytes,
-                                                 schema_parameters=_WORK_SCHEMA_PARAMETERS)
-                if observed is not None:
-                    return observed
-            if not self.in_transaction and not self._check_schema(connection, allow_empty=True):
+    def has_ticket_supervision_work(self, run_id: str) -> bool:
+        """Read the same authoritative queue and status without history bodies."""
+        from agent_run.sqlite_run_records import has_supervision_work
+
+        with self._reading() as connection:
+            if connection is not None and self.in_transaction:
+                self._check_schema(connection)
+            if connection is None or not self._require_run_query(connection, run_id):
                 return False
-            size = connection.execute(
-                "SELECT s.logical_bytes FROM runs r LEFT JOIN run_sizes s "
-                "ON s.run_id=r.run_id WHERE r.run_id=?", (run_id,),
-            ).fetchone()
-            if size is None:
-                return False
-            if type(size[0]) is not int or not 3 <= size[0] <= self.max_bytes:
-                raise ValueError("Invalid SQLite Run size metadata")
-            status_path = encode_json(("status",))
-            holder_path = encode_json(("ticket_integration_holder",))
-            queue_path = encode_json(("ticket_integration_queue",))
-            rows = _object_rows(self, connection, run_id, ["[]", status_path, holder_path, queue_path])
-            by_path = {path: (kind, value) for path, kind, value in rows}
-            if by_path.get("[]") != ("map", "null"):
-                raise ValueError("Invalid SQLite Run object root")
-            for path, kind in ((holder_path, "scalar"), (queue_path, "list")):
-                if path not in by_path or by_path[path][0] != kind:
-                    raise ValueError("Invalid SQLite Ticket supervision object shape")
-            status_entry = by_path.get(status_path)
-            if status_entry is None or status_entry[0] not in {"scalar", "material"}:
-                raise ValueError("Invalid SQLite Ticket supervision status shape")
-            status = scalar_value(status_entry[1])
-            holder = scalar_value(by_path[holder_path][1])
-            count = scalar_value(by_path[queue_path][1])
-            if (not isinstance(status, str)
-                    or holder is not None and (type(holder) is not int or holder < 1)
-                    or type(count) is not int or not 0 <= count <= self.max_bytes):
-                raise ValueError("Invalid SQLite Ticket supervision status or queue")
-            leaf_paths = [status_path, holder_path] + ([queue_path] if count == 0 else [])
-            # Separate range arms keep each lookup on (run_id, object_path).
-            # A combined OR otherwise makes SQLite scan every path in the Run.
-            ranges = " UNION ALL ".join(
-                "SELECT 1 FROM run_objects WHERE run_id=? AND object_path>=? AND object_path<?"
-                for _ in leaf_paths
-            )
-            bounds = tuple(bound for path in leaf_paths for bound in (run_id, path[:-1] + ",", path[:-1] + "-"))
-            if connection.execute(
-                "SELECT 1 FROM (" + ranges + ") LIMIT 1", bounds,
-            ).fetchone() is not None:
-                raise ValueError("Invalid SQLite Ticket supervision object children")
-            # All other strings, including control gates or future statuses,
-            # retain the original complete work contract and owner selection.
-            return (status_entry[0] == "material" or status not in {"active", "ticket_delivery_pending"}
-                    or holder is not None or count != 0)
+            return has_supervision_work(connection, run_id)
 
     def ticket_pause_requested(self, run_id: str, ticket_number: int) -> bool:
-        """Observe one Stop intent without loading execution or history bodies."""
+        """Observe one exact Ticket Stop in the current read-only snapshot."""
+        from agent_run.sqlite_run_records import pause_requested
+
         if type(ticket_number) is not int or ticket_number < 1:
             raise ValueError("Ticket number must be positive")
-        with self._reading(check_schema=False) as connection:
-            if connection is None:
-                raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-            # Writers retain their fresh structural validation. Ordinary
-            # readers first prove current canonical DDL in the scalar query.
-            if self.in_transaction:
+        with self._reading() as connection:
+            if connection is not None and self.in_transaction:
                 self._check_schema(connection)
-            if self._aggregate_rows:
-                from agent_run.sqlite_ticket_pause_read import read_ticket_pause
-
-                observed = read_ticket_pause(connection, run_id, ticket_number, max_bytes=self.max_bytes,
-                                             schema_parameters=_WORK_SCHEMA_PARAMETERS)
-                if observed is not None:
-                    return observed
-            if not self.in_transaction and not self._check_schema(connection, allow_empty=True):
+            if connection is None or not self._require_run_query(connection, run_id):
                 raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-            size = connection.execute(
-                "SELECT s.logical_bytes FROM runs r LEFT JOIN run_sizes s "
-                "ON s.run_id=r.run_id WHERE r.run_id=?", (run_id,),
-            ).fetchone()
-            if size is None:
-                raise ValueError("Delivery Run disappeared at Ticket pause boundary")
-            if type(size[0]) is not int or not 3 <= size[0] <= self.max_bytes:
-                raise ValueError("Invalid SQLite Run size metadata")
-            root = encode_json(("ticket_pause_requests",))
-            target = encode_json(("ticket_pause_requests", str(ticket_number)))
-            rows = _object_rows(self, connection, run_id, ["[]", root, target])
-            by_path = {path: (kind, value) for path, kind, value in rows}
-            if any(by_path.get(path) != ("map", "null") for path in ("[]", root)):
-                raise ValueError("Invalid SQLite Ticket pause request map")
-            entry = by_path.get(target)
-            if entry is not None and entry[0] not in {"scalar", "material"}:
-                raise ValueError("Invalid SQLite Ticket pause request value")
-            if connection.execute(
-                "SELECT 1 FROM run_objects WHERE run_id=? "
-                "AND object_path>=? AND object_path<? LIMIT 1",
-                (run_id, target[:-1] + ",", target[:-1] + "-"),
-            ).fetchone() is not None:
-                raise ValueError("Invalid SQLite Ticket pause request children")
-            state, _ = _decode(self, connection, run_id, rows)
-            requests = state["ticket_pause_requests"]
-            if entry is not None and not isinstance(requests[str(ticket_number)], str):
-                raise ValueError("Invalid SQLite Ticket pause request timestamp")
-            return entry is not None
+            return pause_requested(connection, run_id, ticket_number)
 
     def work_archives(self, state: Mapping[str, Any] | None = None) -> dict[str, tuple[int, int]]:
         """Metadata proved by the current thread's latest consistent work read."""
@@ -934,16 +846,13 @@ class SQLiteStateRepository:
                     if not _same(before_queue, state["ticket_work_queue"]):
                         mirrors.add("ticket_work_queue")
                 if mirrors:
-                    save_projection(self, connection, run_id, work_records.without_work(state), mirrors, {})
-            # These scalar locators have real query consumers. A no-op work
-            # boundary can repair their drift without rewriting any evidence.
-            for column in ("repository", "status", "phase", "created_at", "updated_at"):
-                value = state.get(column)
-                connection.execute(f"UPDATE runs SET {column}=? WHERE run_id=? AND {column} IS NOT ?",
-                                   (value, run_id, value))
-            parent_number = state.get("parent", {}).get("number")
-            connection.execute("UPDATE runs SET parent_number=? WHERE run_id=? AND parent_number IS NOT ?",
-                               (parent_number, run_id, parent_number))
+                    plain = mirrors - work_records.FIELDS
+                    if plain:
+                        save_projection(self, connection, run_id, work_records.without_work(state), plain, {})
+                    owned_mirrors = mirrors & work_records.FIELDS
+                    if owned_mirrors:
+                        current = work_records.baseline_for_save(connection, run_id, state, owned_mirrors, None)
+                        work_records.save(connection, run_id, state, current, fields=owned_mirrors)
             self._local.view = None
             self._local.work_view = None
             if state.get("action_application_receipt") != baseline.get("action_application_receipt"):
@@ -1048,19 +957,10 @@ class SQLiteStateRepository:
             representation_bytes += sum(len(value.encode()) for value in materials.values())
             if representation_bytes > 8 * self.max_bytes:
                 raise ValueError(f"Run state exceeds {self.max_bytes} byte persistence limit")
-            parent = state.get("parent")
-            parent_number = parent.get("number") if isinstance(parent, Mapping) else None
-            if type(parent_number) is not int:
-                parent_number = None
-            metadata = tuple(
-                value if isinstance(value, str) else None
-                for value in (state.get("repository"), state.get("status"), state.get("phase"),
-                              state.get("created_at"), state.get("updated_at"))
-            )
             self._local.view = None
             connection.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, metadata[0], parent_number, *metadata[1:], _json(sorted(unowned))),
+                (run_id, None, None, None, None, None, None, _json(sorted(unowned))),
             )
             from agent_run.sqlite_objects import index_objects
             index_objects(connection, run_id, unowned, objects, materials, {})
@@ -1167,8 +1067,12 @@ class SQLiteStateRepository:
                 return base
             numbers = {int(path[1]) for path in owned if len(path) > 1
                        and path[0] in {"ticket_jobs", "ticket_agent_invocations"}}
+            root_maps = {"retired_ticket_generations", "pending_ticket_retirements", "ticket_pause_requests"}
+            root_maps -= {str(path[0]) for path in owned if len(path) == 1}
+            root_keys = {field: {str(path[1]) for path in owned if len(path) > 1 and path[0] == field}
+                         for field in root_maps if any(len(path) > 1 and path[0] == field for path in owned)}
             work = work_records.load_fields(connection, run_id, {}, {str(path[0]) for path in owned},
-                                            ticket_numbers=numbers if numbers else None)
+                                            ticket_numbers=numbers if numbers else None, root_keys=root_keys)
             for path in owned:
                 source: Any = work
                 target: Any = base

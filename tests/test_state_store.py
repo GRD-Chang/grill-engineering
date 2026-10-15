@@ -350,8 +350,8 @@ def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
             "candidate_commit_intent": {"token": "candidate-intent-nonce"}
         },
         "credential_availability": {
-            "status": "waiting",
-            "detail": {"token": credential},
+            "phase": "waiting",
+            "failure_class": credential,
         },
     }
 
@@ -378,8 +378,8 @@ def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
         == "candidate-intent-nonce"
     )
     assert persisted["credential_availability"] == {
-        "status": "waiting",
-        "detail": {"token": "[REDACTED]"},
+        "phase": "waiting",
+        "failure_class": "[REDACTED]",
     }
 
 

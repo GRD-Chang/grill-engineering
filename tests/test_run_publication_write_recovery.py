@@ -83,6 +83,10 @@ def test_final_write_response_loss_reconciles_before_continuing(
     assert publisher.calls[action] == 1
     resumed = engine.publish(run_id)
     assert resumed["status"] == "run_approval_pending"
+    assert "run_publication_records" not in publisher.data["delivery"]
+    assert states.load_current_run(run_id)["run_publication"]["record"] == resumed["run_publication"]["record"]
+    assert len(publisher.data["delivery"]["agent_run_status"]) == 1
+    assert "Run Publication Record" not in publisher.data["delivery"]["pull_requests"][0]["body"]
     assert publisher.calls[action] == (1 if applied or action == "ref" else 2)
     assert len(agents.requests) == 1
     again = engine.publish(run_id)

@@ -46,8 +46,8 @@ def test_work_patch_rejects_existing_unreferenced_material_and_rolls_back(
     tmp_path: Path, aggregate: bool, damage: str,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
-    original = {"parent": {"body": "old evidence"}}
-    proposed = {"parent": {"body": "new evidence"}}
+    original = {"issue_snapshot": {"body": "old evidence"}}
+    proposed = {"issue_snapshot": {"body": "new evidence"}}
     repository.save("run-1", original)
     _, generated = repository._objects(proposed)
     identity, value = next(iter(generated.items()))
@@ -70,14 +70,14 @@ def test_secondary_reference_batch_failure_rolls_back_both_projection_indexes(
     tmp_path: Path, aggregate: bool,
 ) -> None:
     repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
-    original = {"parent": {"body": "old material " * 200}}
+    original = {"issue_snapshot": {"body": "old material " * 200}}
     repository.save("run-1", original)
     repository._aggregate_rows = aggregate
     with pytest.raises(OSError, match="injected reference failure"):
         with repository.atomic():
             baseline = repository.load_work("run-1", 2)
             updated = deepcopy(baseline)
-            updated["parent"]["body"] = "new material " * 200
+            updated["issue_snapshot"]["body"] = "new material " * 200
             # The failure occurs after the first projection's rows and material
             # references have changed, at the second index's actual SQL write.
             repository._local.connection.execute(

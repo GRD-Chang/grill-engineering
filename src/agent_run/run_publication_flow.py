@@ -817,7 +817,6 @@ class RunPublicationFlow(RunPublicationShared):
             # durable pre-call intent makes an interrupted call indeterminate
             # and prevents any recovery replay.
             self._save(state)
-        self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
         publication.pop("last_publication_error", None)
         observation = self._observe_required_checks(

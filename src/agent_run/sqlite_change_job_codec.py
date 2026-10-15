@@ -6,7 +6,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from agent_run.sqlite_change_job_schema import (
-    BOOLEAN_FIELDS, EVIDENCE_FIELDS, INTEGER_FIELDS, JOB_FIELDS, RECORDS, TEXT_FIELDS, THREAD_FIELDS,
+    BOOLEAN_FIELDS, EVIDENCE_FIELDS, INPUT_BOUND_RECORDS, INTEGER_FIELDS, JOB_FIELDS, RECORDS, TEXT_FIELDS, THREAD_FIELDS,
     column, record_table,
 )
 from agent_run.sqlite_encoding import encode_json
@@ -38,6 +38,9 @@ def present(mask: Any, fields: Any) -> set[str]:
 
 def put_material(c: sqlite3.Connection, run_id: str, owner_id: str, field: str, value: Any, *,
                  review_record: Mapping[str, Any] | None = None) -> str:
+    if field == "ticket_completion_records":
+        from agent_run.sqlite_ticket_completions import put_completions
+        return put_completions(c, run_id, f"job:{owner_id}", field, value)
     from agent_run.sqlite_work_evidence import get_evidence, put_evidence, put_evidence_member, put_job_material
     from agent_run.sqlite_work_execution import find_result_reference
     query = "review_artifact" if review_record is not None else {
@@ -60,6 +63,9 @@ def put_material(c: sqlite3.Connection, run_id: str, owner_id: str, field: str, 
 
 
 def material(c: sqlite3.Connection, run_id: str, owner_id: str, field: str, identity: str) -> Any:
+    if field == "ticket_completion_records":
+        from agent_run.sqlite_ticket_completions import get_completions
+        return get_completions(c, run_id, f"job:{owner_id}", field, identity)
     from agent_run.sqlite_work_evidence import get_evidence
     return get_evidence(c, run_id, identity, owner_id=f"job:{owner_id}", kind=field)
 
@@ -180,6 +186,38 @@ def _assign(value: dict[str, Any], path: str, item: Any) -> None:
     target[keys[-1]] = item
 
 
+def _input_versions(c: sqlite3.Connection, run_id: str, field: str, record: Mapping[str, Any]) -> dict[str, str | None]:
+    if field not in INPUT_BOUND_RECORDS:
+        return {}
+    # Direct Job-layer tests and small storage consumers can omit Run inputs.
+    # A real Run supplies them before saving its review/publication relations.
+    has_inputs = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_root'").fetchone()
+    boundary = record.get("acceptance_boundary", {}) if field == "merge_intent" else record
+    result: dict[str, str | None] = {}
+    for kind, key in (("parent", "parent_revision"), ("graph", "ticket_graph_revision")):
+        revision = boundary.get(key) if isinstance(boundary, Mapping) else None
+        identity = None
+        if has_inputs and isinstance(revision, str):
+            from agent_run.sqlite_run_inputs import input_version_for_revision
+            identity = input_version_for_revision(c, run_id, kind, revision)
+            table = "run_parent_versions" if kind == "parent" else "run_graph_versions"
+            if identity is None and c.execute(f"SELECT 1 FROM {table} WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+                raise ValueError(f"Missing immutable {kind} input version")
+        result[f"{kind}_version_id"] = identity
+    return result
+
+
+def _check_record_size(c: sqlite3.Connection, run_id: str, job_id: str, field: str, columns: list[str]) -> None:
+    lengths = "+".join(f"COALESCE(LENGTH(CAST(r.{name} AS BLOB)),0)+16" for name in ["presence", "nulls", *columns])
+    size = c.execute(
+        f"SELECT {lengths}+COALESCE((SELECT SUM(LENGTH(CAST(s.text_value AS BLOB))+16) "
+        "FROM work_job_record_strings s WHERE s.run_id=r.run_id AND s.job_id=r.job_id AND s.record_kind=?),0) "
+        f"FROM {record_table(field)} r WHERE r.run_id=? AND r.job_id=?", (field, run_id, job_id),
+    ).fetchone()
+    if size is not None and (type(size[0]) is not int or size[0] > MAX_CURRENT_BYTES):
+        raise ValueError("Change Job record exceeds byte limit")
+
+
 def save_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, value: Any, *, owner_id: str) -> None:
     schema = RECORDS[field]
     table = record_table(field)
@@ -191,6 +229,7 @@ def save_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, val
         raise ValueError(f"Change Job {field} must be an object or null")
     flat = _flatten(value, schema)
     columns, encoded = [], []
+    string_bytes = 0
     for path, kind in schema.items():
         item = flat.get(path)
         if kind in {"ARTIFACTS", "EVENTS"}:
@@ -201,27 +240,44 @@ def save_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, val
             if item is not None:
                 if not isinstance(item, list) or any(type(text) is not str for text in item):
                     raise ValueError(f"Change Job {field}.{path} must contain strings")
+                string_bytes += sum(len(text.encode("utf-8")) + 16 for text in item)
+                if string_bytes > MAX_CURRENT_BYTES:
+                    raise ValueError("Change Job record exceeds byte limit")
                 c.executemany("INSERT INTO work_job_record_strings VALUES (?,?,?,?,?,?)",
                               ((run_id, job_id, field, path, position, text) for position, text in enumerate(item)))
             continue
-        if kind == "EVIDENCE":
-            item = put_material(c, run_id, owner_id, f"{field}.{path}", item) if item is not None else None
+        if kind == "COMPLETIONS":
+            from agent_run.sqlite_ticket_completions import put_completions
+            item = put_completions(c, run_id, f"job:{owner_id}", f"{field}.{path}", item) if item is not None else None
+        elif kind == "EVIDENCE":
+            review = value if path == "artifact" and "reviewer_thread_id" in value else None
+            item = put_material(c, run_id, owner_id, f"{field}.{path}", item, review_record=review) if item is not None else None
         else:
             item = _typed(item, kind, f"{field}.{path}")
         columns.append(column(path))
         encoded.append(item)
+    versions = _input_versions(c, run_id, field, value)
+    columns.extend(versions)
+    encoded.extend(versions.values())
+    if string_bytes + sum(len(item.encode()) if isinstance(item, str) else 16 for item in encoded) > MAX_CURRENT_BYTES:
+        raise ValueError(f"Change Job {field} record exceeds {MAX_CURRENT_BYTES} bytes")
     c.execute(f"INSERT INTO {table} (run_id,job_id,presence,nulls,{','.join(columns)}) VALUES ({','.join('?' for _ in range(len(columns) + 4))})",
               (run_id, job_id, presence(flat, _shape(schema)), presence((key for key, item in flat.items() if item is None), _shape(schema)), *encoded))
+    _check_record_size(c, run_id, job_id, field, columns)
 
 
 def load_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *, owner_id: str) -> Any:
     schema = RECORDS[field]
     columns = [column(path) for path, kind in schema.items() if kind not in {"STRINGS", "ARTIFACTS", "EVENTS"}]
-    row = c.execute(f"SELECT presence,nulls,{','.join(columns)} FROM {record_table(field)} WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
+    inputs = ",parent_version_id,graph_version_id" if field in INPUT_BOUND_RECORDS else ""
+    _check_record_size(c, run_id, job_id, field, columns + (["parent_version_id", "graph_version_id"] if inputs else []))
+    row = c.execute(f"SELECT presence,nulls,{','.join(columns)}{inputs} FROM {record_table(field)} WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None:
         return None
     keys = present(row[0], _shape(schema))
     nulls = present(row[1], _shape(schema))
+    if not nulls <= keys:
+        raise ValueError("Invalid Change Job record null fields")
     scalars = iter(row[2:])
     values: dict[str, Any] = {}
     for path in sorted(keys - schema.keys(), key=lambda key: key.count(".")):
@@ -234,13 +290,26 @@ def load_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *, 
             _assign(values, path, None)
             continue
         if kind == "STRINGS":
-            item = [row[0] for row in c.execute("SELECT text_value FROM work_job_record_strings WHERE run_id=? AND job_id=? AND record_kind=? AND list_name=? ORDER BY position", (run_id, job_id, field, path))]
+            item = []
+            for position, text in c.execute("SELECT position,text_value FROM work_job_record_strings WHERE run_id=? AND job_id=? AND record_kind=? AND list_name=? ORDER BY position", (run_id, job_id, field, path)):
+                if type(position) is not int or position != len(item) or not isinstance(text, str):
+                    raise ValueError("Invalid Change Job record strings")
+                item.append(text)
         elif kind in {"ARTIFACTS", "EVENTS"}:
             from agent_run.sqlite_change_job_budget import load_list
             item = load_list(c, run_id, job_id, field, path, kind=kind, owner_id=owner_id)
+        elif kind == "COMPLETIONS" and item is not None:
+            from agent_run.sqlite_ticket_completions import get_completions
+            item = get_completions(c, run_id, f"job:{owner_id}", f"{field}.{path}", item)
         elif kind == "EVIDENCE" and item is not None:
             item = material(c, run_id, owner_id, f"{field}.{path}", item)
         elif kind == "BOOLEAN":
+            if item is not None and (type(item) is not int or item not in (0, 1)):
+                raise ValueError("Invalid Change Job record boolean")
             item = bool(item) if item is not None else None
+        elif kind not in {"EVIDENCE", "COMPLETIONS", "STRINGS", "ARTIFACTS", "EVENTS"}:
+            item = _typed(item, kind, f"{field}.{path}")
         _assign(values, path, item)
+    if inputs and tuple(_input_versions(c, run_id, field, values).values()) != row[-2:]:
+        raise ValueError("Run evidence does not match its immutable input version")
     return values

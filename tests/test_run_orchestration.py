@@ -70,10 +70,22 @@ def test_legacy_branch_authority_state_is_rejected_before_reuse(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     )
     state, _ = controller.start(1)
+    before = snapshot_run((states.root, str(state["run_id"])))
+    remote_before = fixture.read_bytes()
+    refs_before = subprocess.run(["git", "for-each-ref"], cwd=git_repo, check=True, capture_output=True).stdout
     if legacy_protocol is None:
         state.pop("branch_authority_protocol")
     else:
         state["branch_authority_protocol"] = legacy_protocol
+    if legacy_protocol is not None and type(legacy_protocol) is not int:
+        # The typed boundary rejects malformed protocol values before they
+        # can replace durable state or authorize any external operation.
+        with pytest.raises(ValueError, match="branch_authority_protocol must be integer"):
+            persist_run_fixture(states, str(state["run_id"]), state)
+        assert snapshot_run((states.root, str(state["run_id"]))) == before
+        assert fixture.read_bytes() == remote_before
+        assert subprocess.run(["git", "for-each-ref"], cwd=git_repo, check=True, capture_output=True).stdout == refs_before
+        return
     persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="branch authority"):
@@ -102,10 +114,22 @@ def test_legacy_semantic_attempt_state_is_rejected_before_reuse(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     )
     state, _ = controller.start(1)
+    before = snapshot_run((states.root, str(state["run_id"])))
+    remote_before = fixture.read_bytes()
+    refs_before = subprocess.run(["git", "for-each-ref"], cwd=git_repo, check=True, capture_output=True).stdout
     if legacy_protocol is None:
         state.pop("semantic_attempt_protocol")
     else:
         state["semantic_attempt_protocol"] = legacy_protocol
+    if legacy_protocol is not None and type(legacy_protocol) is not int:
+        # The typed boundary rejects malformed protocol values before they
+        # can replace durable state or authorize any external operation.
+        with pytest.raises(ValueError, match="semantic_attempt_protocol must be integer"):
+            persist_run_fixture(states, str(state["run_id"]), state)
+        assert snapshot_run((states.root, str(state["run_id"]))) == before
+        assert fixture.read_bytes() == remote_before
+        assert subprocess.run(["git", "for-each-ref"], cwd=git_repo, check=True, capture_output=True).stdout == refs_before
+        return
     persist_run_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="Semantic Agent Attempt"):
