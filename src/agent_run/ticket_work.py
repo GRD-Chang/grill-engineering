@@ -196,7 +196,7 @@ class TicketWorkAdmission:
         self.states._commit_run(commit)
 
     def _load(self) -> dict[str, Any]:
-        state = self.states.load_work_run(self.run_id, thin_timeline=True)
+        state = self.states.load_dispatch_run(self.run_id)
         if state is None:
             raise ValueError("Delivery Run disappeared during work admission")
         return state

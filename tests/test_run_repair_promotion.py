@@ -41,6 +41,14 @@ from support.run_publication import RunPublicationAgents
 from support.state import persist_run_fixture
 
 
+def _parent_current_facts(state: dict[str, Any]) -> dict[str, Any]:
+    # Parent work excludes these empty Ticket control collections. Compare
+    # the same current facts while retaining the exact empty-value checks.
+    return {"pending_ticket_retirements": {}, "retired_ticket_generations": {},
+            "ticket_agent_invocations": {}, "ticket_pause_requests": {},
+            **current_projection_facts(state)}
+
+
 def _malformed_candidate_history() -> list[dict[str, object]]:
     return [{"candidate_sha": "candidate", "artifact": {"result_kind": "acceptance"}}]
 
@@ -154,7 +162,9 @@ def test_run_repair_promotion_rejects_each_authority_binding(
         "acceptance_record" not in item and "artifact" not in item
         for item in run.get("candidate_acceptance_history", [])
     )
-    assert run["discarded_repair_thread_ids"][-1] == "run-reviewer-2"
+    retained = states.load_current_run(str(state["run_id"]))
+    assert retained is not None
+    assert retained["run_acceptance"]["discarded_repair_thread_ids"][-1] == "run-reviewer-2"
     assert not (states.root / "worktrees" / str(state["run_id"]) / "run-repair").exists()
 
 @pytest.mark.parametrize(
@@ -589,7 +599,7 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
         assert run["repair_job"]["modification_attempts"] == 1
         assert run["ci_recovery"]["developments_used"] == 0
         assert len(first_agents.review_requests) == 2
-        assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(first)
+        assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == _parent_current_facts(first)
         return
     assert first["status"] == "run_acceptance_pending", first
     job = run["repair_job"]
@@ -607,7 +617,7 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
     assert "review_budget" not in job
     assert run["review_budget"]["reviewer_invocations"] == 2
     assert run["review_budget"]["development_attempts"] == 1
-    assert run["review_budget_history"] == []
+    assert states.load_history_run(str(state["run_id"]))["run_acceptance"]["review_budget_history"] == []
     assert repair_checkout.exists()
 
     first_ci_budget = deepcopy(run["ci_recovery"])
@@ -697,11 +707,12 @@ def test_run_repair_default_drift_after_write_revalidates_same_cycle(
         for attempt in archived_attempts
         if isinstance(attempt.get("attempt_id"), str)
     }
+    history_state = states.load_history_run(str(state["run_id"]))
     audit = {
         "semantic_agent_attempts": archived_attempts,
-        "agent_invocations": second.get("agent_invocation_history", []),
-        "timeline": second.get("timeline", []),
-        "timeline_continuation": second.get("timeline_continuation", []),
+        "agent_invocations": history_state.get("agent_invocation_history", []),
+        "timeline": history_state["timeline"],
+        "timeline_continuation": history_state.get("timeline_continuation", []),
         "agent_resumes": [],
     }
     archived_records = [
@@ -800,12 +811,12 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     assert "review_budget" not in job
     assert "review_budget_history" not in job
     assert run["review_budget"]["reviewer_invocations"] == 4
-    assert run["review_budget_history"] == []
+    assert states.load_history_run(str(state["run_id"]))["run_acceptance"]["review_budget_history"] == []
     assert run["review_budget"]["development_attempts"] == 3
     assert job["candidate_sha"]
     assert run["repair_cycle"]["status"] == "active"
     ci_before = deepcopy(run["ci_recovery"])
-    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(first)
+    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == _parent_current_facts(first)
 
     second = RunAcceptanceEngine(
         git=git, states=states, agents=agents,
@@ -858,7 +869,7 @@ def test_exhausted_run_repair_budget_requires_resume_after_external_resync(
     assert third["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
     assert third["run_acceptance"]["integration_resync"]["used"] == 1
     assert third["run_acceptance"]["ci_recovery"] == ci_before
-    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == current_projection_facts(third)
+    assert current_projection_facts(states.load_current_run(str(state["run_id"]))) == _parent_current_facts(third)
 
 
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(
@@ -1164,7 +1175,7 @@ def test_required_check_repair_promotion_clears_old_observation_and_archives_pro
     assert publication["phase"] == "stale"
     assert "required_checks_evidence" not in publication
     assert "required_checks_observation_status" not in publication
-    completed = promoted["run_acceptance"]["completed_repair_jobs"][-1]
+    completed = states.load_history_run(str(state["run_id"]))["run_acceptance"]["completed_repair_jobs"][-1]
     archived = completed["ci_evidence"]
     assert archived["pr_number"] == final_pr
     assert archived["head_sha"] == old_head

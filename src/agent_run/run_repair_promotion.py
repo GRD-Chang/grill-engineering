@@ -25,6 +25,7 @@ from agent_run.semantic_attempt import (
     retire_semantic_attempt_owner,
 )
 from agent_run.state_contract import require_candidate_acceptance_history
+from agent_run.work_projection import materialize_history
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
@@ -328,11 +329,11 @@ class RunRepairPromotion:
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
         candidate_history = require_candidate_acceptance_history(
-            job.get("candidate_acceptance_history", []),
+            materialize_history(job, "candidate_acceptance_history", []),
             "run_acceptance.repair_job.candidate_acceptance",
         )
         run_history = require_candidate_acceptance_history(
-            self.owner._run_state(state).get("candidate_acceptance_history", []),
+            materialize_history(self.owner._run_state(state), "candidate_acceptance_history", []),
             "run_acceptance.candidate_acceptance",
         )
         integrated = str(job["integrated_sha"])
@@ -425,7 +426,8 @@ class RunRepairPromotion:
                     "integrated_sha": integrated,
                 }
             )
-        completed_repairs = run.setdefault("completed_repair_jobs", [])
+        completed_repairs = materialize_history(run, "completed_repair_jobs", [])
+        run["completed_repair_jobs"] = completed_repairs
         if not isinstance(completed_repairs, list):
             raise ValueError("completed_repair_jobs must be a list")
         completed = {

@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.work_projection import materialize_history
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
@@ -363,6 +364,10 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
     monkeypatch.setattr(
         git, "prepare_expected_merge_checkout", prepare_expected_merge
     )
+    # Replace this fixture with complete archives, preserving the preflight facts.
+    state = states.load_history_run(str(state["run_id"]))
+    assert state is not None
+    run = state["run_acceptance"]
     run["phase"] = "pending"
     run.pop("repair_request")
     state.update(
@@ -1546,7 +1551,7 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
         key: value for key, value in old_attempt.items() if key != "returned_result"
     }
     assert resumed_run["review_budget"] == old_budget
-    assert resumed_job["reviewer_thread_ids"][-1] == "run-reviewer-2"
+    assert materialize_history(resumed_job, "reviewer_thread_ids")[-1] == "run-reviewer-2"
     assert resumed_job["review_human_blocker_resume"] is True
     assert resumed_run["repair_cycle"]["status"] == "active"
     assert resumed_run.get("repair_cycle_history", []) == []
@@ -1698,7 +1703,7 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     )
     assert len(set(agents.checkouts)) == 1
     assert all(not checkout.exists() for checkout in agents.checkouts)
-    assert run["human_blocker_history"] == [
+    assert materialize_history(run, "human_blocker_history") == [
         {
             "phase": "pending",
             "human_blockers": [

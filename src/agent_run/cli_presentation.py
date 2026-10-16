@@ -554,6 +554,7 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
             if isinstance(reviewer_ids, list) and reviewer_ids
             else subject.get("development_thread_id")
         )
+        thread_id = subject.get("_query_latest_reviewer_thread") or thread_id
         return {
             "role": "运行验收工作代理",
             "attempt": work_attempt(subject, role),
@@ -583,6 +584,7 @@ def _worker_from_job(
     if role == "reviewer":
         reviewer_ids = job.get("reviewer_thread_ids")
         thread_id = reviewer_ids[-1] if isinstance(reviewer_ids, list) and reviewer_ids else None
+        thread_id = job.get("_query_latest_reviewer_thread", thread_id)
         return {
             "role": review_role,
             "attempt": work_attempt(job, role),

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.work_projection import materialize_history
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
@@ -140,7 +141,7 @@ def test_installed_publication_commit_resume_preserves_accepted_work(
     assert after["acceptance_record"] == before["acceptance_record"]
     assert after["publication_attempts"] == before["publication_attempts"] == 1
     closed_attempts = [
-        item for item in after["semantic_attempt_history"]
+        item for item in materialize_history(after, "semantic_attempt_history")
         if item["role"] == "publication"
     ]
     assert len(closed_attempts) == 1
@@ -148,7 +149,7 @@ def test_installed_publication_commit_resume_preserves_accepted_work(
     assert closed_attempts[0]["currentness_boundary_fingerprint"] == attempt["currentness_boundary_fingerprint"]
     assert closed_attempts[0]["outcome"] == "publication_artifact"
     assert [
-        item for item in after["semantic_attempt_history"] if item["role"] != "publication"
+        item for item in materialize_history(after, "semantic_attempt_history") if item["role"] != "publication"
     ] == before["semantic_attempt_history"]
     assert after["publication"] == before["pending_publication_result"]
     persisted = restored.load_current_run(run_id)

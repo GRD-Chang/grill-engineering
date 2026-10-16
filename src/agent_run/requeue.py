@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.run_repair_cycle import remove_repair_job
+from agent_run.work_projection import materialize_history
 
 
 class RequeueError(ValueError):
@@ -128,11 +129,11 @@ def _retired_record(subject: str, job: dict[str, Any]) -> dict[str, Any]:
         "had_acceptance": isinstance(job.get("acceptance_record"), dict),
         "had_publication": isinstance(job.get("publication"), dict),
         "superseded_integrations": deepcopy(
-            job.get("superseded_integrations", [])
+            materialize_history(job, "superseded_integrations", [])
         ),
         "review_budget": deepcopy(job.get("review_budget")),
-        "review_budget_history": deepcopy(job.get("review_budget_history", [])),
-        "semantic_attempt_history": deepcopy(job.get("semantic_attempt_history", [])),
+        "review_budget_history": deepcopy(materialize_history(job, "review_budget_history", [])),
+        "semantic_attempt_history": deepcopy(materialize_history(job, "semantic_attempt_history", [])),
         "pending_semantic_attempt": deepcopy(job.get("pending_semantic_attempt")),
     }
     return record
@@ -146,7 +147,7 @@ def _thread_ids(job: dict[str, Any]) -> set[str]:
         if key.endswith("thread_id") and isinstance(value, str) and value
     }
     for key in ("development_thread_history", "reviewer_thread_ids"):
-        history = job.get(key)
+        history = materialize_history(job, key)
         if isinstance(history, list):
             ids.update(value for value in history if isinstance(value, str) and value)
     return ids

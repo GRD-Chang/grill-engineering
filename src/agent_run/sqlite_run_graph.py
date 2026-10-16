@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_run_inputs import identity, input_version_for_revision, owner
 from agent_run.sqlite_work_evidence import get_evidence, put_evidence
 
@@ -73,7 +74,7 @@ def save_graph(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
         previous = input_version_for_revision(c, run_id, "graph", revision)
         if previous is not None and previous != version:
             raise ValueError("One graph revision identifies different fixed structures")
-    row = c.execute("SELECT revision FROM run_graph_versions WHERE run_id=? AND version_id=?", (run_id, version)).fetchone()
+    row = bounded_query(c, "SELECT revision FROM run_graph_versions WHERE run_id=? AND version_id=?", (run_id, version)).fetchone()
     if row is None:
         c.execute("INSERT INTO run_graph_versions VALUES (?,?,?)", (run_id, version, revision))
         c.executemany("INSERT INTO run_graph_members VALUES (?,?,?)", ((run_id, version, number) for number in sorted(order)))
@@ -85,7 +86,7 @@ def save_graph(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
         _structure(c, run_id, version)
     evidence_id = put_evidence(c, run_id, owner(run_id), "graph.observation", report)
     snapshot = identity(value)
-    old = c.execute("SELECT version_id,evidence_id FROM run_graph_snapshots WHERE run_id=? AND snapshot_id=?",
+    old = bounded_query(c, "SELECT version_id,evidence_id FROM run_graph_snapshots WHERE run_id=? AND snapshot_id=?",
                     (run_id, snapshot)).fetchone()
     if old is not None:
         if old != (version, evidence_id) or load_graph(c, run_id, snapshot) != value:
@@ -100,13 +101,12 @@ def save_graph(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
 
 
 def _structure(c: sqlite3.Connection, run_id: str, version: str) -> tuple[Any, set[int], dict[str, tuple[int, int]]]:
-    row = c.execute("SELECT revision FROM run_graph_versions WHERE run_id=? AND version_id=?", (run_id, version)).fetchone()
+    row = bounded_query(c, "SELECT revision FROM run_graph_versions WHERE run_id=? AND version_id=?", (run_id, version)).fetchone()
     if row is None:
         raise ValueError("Missing fixed Run graph version")
-    members = [item[0] for item in c.execute("SELECT ticket_number FROM run_graph_members WHERE run_id=? AND version_id=? ORDER BY ticket_number",
+    members = [item[0] for item in bounded_query(c, "SELECT ticket_number FROM run_graph_members WHERE run_id=? AND version_id=? ORDER BY ticket_number",
                                           (run_id, version))]
-    edges = {edge_id: (source, target) for edge_id, source, target in c.execute(
-        "SELECT edge_id,ticket_number,blocker_number FROM run_graph_edges WHERE run_id=? AND version_id=?", (run_id, version))}
+    edges = {edge_id: (source, target) for edge_id, source, target in bounded_query(c, "SELECT edge_id,ticket_number,blocker_number FROM run_graph_edges WHERE run_id=? AND version_id=?", (run_id, version))}
     if (len(members) > MAX_GRAPH_TICKETS or any(type(number) is not int or number < 1 for number in members)
             or any(edge_id != identity(edge) for edge_id, edge in edges.items())
             or version != identity((row[0], members, sorted(edges.values())))):
@@ -115,7 +115,7 @@ def _structure(c: sqlite3.Connection, run_id: str, version: str) -> tuple[Any, s
 
 
 def load_graph(c: sqlite3.Connection, run_id: str, snapshot: str) -> dict[str, Any]:
-    row = c.execute("SELECT version_id,evidence_id FROM run_graph_snapshots WHERE run_id=? AND snapshot_id=?",
+    row = bounded_query(c, "SELECT version_id,evidence_id FROM run_graph_snapshots WHERE run_id=? AND snapshot_id=?",
                     (run_id, snapshot)).fetchone()
     if row is None:
         raise ValueError("Missing immutable Run graph observation")
@@ -125,8 +125,7 @@ def load_graph(c: sqlite3.Connection, run_id: str, snapshot: str) -> dict[str, A
     if report["revision_present"]:
         result["revision"] = revision
     order = []
-    for expected, (position, number) in enumerate(c.execute(
-        "SELECT position,ticket_number FROM run_graph_scope_order WHERE run_id=? AND snapshot_id=? ORDER BY position", (run_id, snapshot))):
+    for expected, (position, number) in enumerate(bounded_query(c, "SELECT position,ticket_number FROM run_graph_scope_order WHERE run_id=? AND snapshot_id=? ORDER BY position", (run_id, snapshot))):
         if position != expected or number not in members:
             raise ValueError("Invalid Run graph order reference")
         order.append(number)
@@ -135,15 +134,14 @@ def load_graph(c: sqlite3.Connection, run_id: str, snapshot: str) -> dict[str, A
     if report["order_present"]:
         result["ordered_ticket_numbers"] = order
     tickets = {}
-    for expected, (position, number, number_present) in enumerate(c.execute(
-        "SELECT position,ticket_number,number_present FROM run_graph_ticket_slots WHERE run_id=? AND snapshot_id=? ORDER BY position",
+    for expected, (position, number, number_present) in enumerate(bounded_query(c, "SELECT position,ticket_number,number_present FROM run_graph_ticket_slots WHERE run_id=? AND snapshot_id=? ORDER BY position",
         (run_id, snapshot))):
         if position != expected or not 0 <= position < len(report["tickets"]) or number_present not in {0, 1}:
             raise ValueError("Invalid Run graph Ticket observation reference")
         ticket = report["tickets"][position]
         if number_present:
             ticket["number"] = number
-        blocker_rows = c.execute("SELECT position,edge_id,number_present FROM run_graph_blocker_slots "
+        blocker_rows = bounded_query(c, "SELECT position,edge_id,number_present FROM run_graph_blocker_slots "
                                 "WHERE run_id=? AND snapshot_id=? AND ticket_position=? ORDER BY position", (run_id, snapshot, position)).fetchall()
         blockers = ticket.get("blocked_by", [])
         if len(blockers) != len(blocker_rows):

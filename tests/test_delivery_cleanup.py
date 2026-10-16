@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_run.object_state import current_projection_facts
 from agent_run.controller import Controller
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
@@ -450,7 +451,8 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
         git=GitRepository(git_repo), states=states, github=github
     ).resume(run_id)
 
-    assert resumed == state
+    assert current_projection_facts(resumed) == current_projection_facts(state)
+    assert states.load_history_run(run_id) == state
     assert github.deleted_branches == []
 
 

@@ -291,13 +291,14 @@ def test_ticket_wait_rejects_malformed_or_other_head_observation(
 
 def test_ticket_scope_cannot_read_or_write_another_run(git_repo: Path) -> None:
     state, states, _, _ = ticket_run(git_repo, (2,))
-    states.save_run('other', {'value': 'preserved'})
+    other = {'status': 'operator_stopped'}
+    states.save_run('other', other)
     scoped = TicketState(states, str(state['run_id']), 2)
     with pytest.raises(ValueError, match='another Run'):
         scoped.load_current_run('other')
     with pytest.raises(ValueError, match='another Run'):
-        scoped.save_run('other', {'value': 'overwrite'})
-    assert states.load_run('other') == {'value': 'preserved'}
+        scoped.save_run('other', {'status': 'active'})
+    assert states.load_run('other') == other
 
 
 def test_foreground_timeout_uses_the_same_ticket_pause_and_resume_boundary(

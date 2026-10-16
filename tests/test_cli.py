@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,11 +40,18 @@ from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state, managed_workspace, prepare_workspace
 
-from support.state import has_run, only_run_ref, read_run, run_refs, run_state_text, snapshot_run, write_run_fixture
+from support.state import current_query_fixture, has_run, only_run_ref, read_run, run_refs, run_state_text, snapshot_run, write_run_fixture
 from support.work_records import invocation as stored_invocation
 
 
 _DOCTOR_TIMEOUT_TEST_LIMIT_SECONDS = 5
+
+
+def _previous_protocol_snapshot(repo: Path) -> tuple[Path, bytes]:
+    database = managed_state(repo) / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("UPDATE schema_meta SET value='sqlite-work-records-v5' WHERE key='protocol'")
+    return database, database.read_bytes()
 
 
 def test_lifecycle_help_describes_operator_boundaries() -> None:
@@ -123,7 +131,7 @@ def test_status_does_not_fall_back_to_findings_from_another_work_subject(
             },
         },
         "parent_job": {
-            "phase": "blocked",
+            "phase": "stale",
             "acceptance_artifact": {
                 "checks": {
                     "e2e": {
@@ -146,10 +154,10 @@ def test_status_does_not_fall_back_to_findings_from_another_work_subject(
         },
         "diagnostics": [],
     }
-    state["schema_version"] = 1
+    state["ticket_jobs"] = {"2": state["active_ticket_job"]}
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -195,10 +203,9 @@ def test_status_binds_run_acceptance_verdict_to_publication_head(
         },
         "diagnostics": [],
     }
-    state["schema_version"] = 1
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -234,7 +241,10 @@ def test_status_binds_promoted_repair_acceptance_to_publication_boundary(
         "run_id": "run-promoted-repair-status",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Status card"},
-        "status": "completed" if publication_phase == "merged" else "run_publication_pending",
+        "status": {
+            "merged": "completed",
+            "publication_pending": "publication_pending",
+        }.get(publication_phase, "run_publication_pending"),
         "run_acceptance": {
             "phase": "accepted",
             "candidate_sha": "repair-candidate",
@@ -252,12 +262,11 @@ def test_status_binds_promoted_repair_acceptance_to_publication_boundary(
             "record": {"run_head_sha": publication_head},
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
     StateStore(managed_state(git_repo)).save_run(
-        "run-promoted-repair-status", state
+        "run-promoted-repair-status", current_query_fixture(state)
     )
 
     output = stdout_json(
@@ -337,12 +346,11 @@ def test_status_keeps_matching_acceptance_conclusion_after_completion(
             },
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
     StateStore(managed_state(git_repo)).save_run(
-        "run-completed-conclusion", state
+        "run-completed-conclusion", current_query_fixture(state)
     )
 
     json_result = invoke_cli_inprocess(
@@ -385,7 +393,6 @@ def test_status_does_not_infer_completed_acceptance_without_matching_record(
             "candidate_sha": "candidate-current",
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
     parent_job = state["parent_job"]
     assert isinstance(parent_job, dict)
@@ -394,7 +401,7 @@ def test_status_does_not_infer_completed_acceptance_without_matching_record(
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
     StateStore(managed_state(git_repo)).save_run(
-        "run-completed-without-proof", state
+        "run-completed-without-proof", current_query_fixture(state)
     )
 
     output = stdout_json(
@@ -460,7 +467,6 @@ def test_status_keeps_acceptance_findings_until_repaired_candidate_is_accepted(
         ),
         "_executor_control": {"activity": "running"},
         "diagnostics": [],
-        "schema_version": 1,
     }
     cli.cli_presentation._print_status(state, as_json=True)
     before = json.loads(capsys.readouterr().out)
@@ -509,19 +515,18 @@ def test_status_uses_saved_publication_boundary_before_publication_record(
             "phase": "publishing",
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
     boundary = {"reviewed_head_sha": "run-head"}
     attempt = allocate_semantic_attempt(state["run_publication"], role="publication", work_subject="run-publication:run-1",
                                         generation=1, currentness_boundary=boundary, ordinal=1)
     state["active_agent_invocation"] = {
         "work_subject": "run-publication:run-1", "generation": 1, "role": "final_publication", "phase": "run_publication",
-        "mode": "fresh", "input_fingerprint": "fixture", "status": "completed",
+        "mode": "fresh", "input_fingerprint": "fixture", "status": "completed", "attempt_count": 1,
         "started_at": "2026-09-09T00:00:00+00:00", "currentness_boundary": boundary, "semantic_attempt": deepcopy(attempt),
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     output = stdout_json(
         invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
@@ -582,7 +587,6 @@ def test_status_distinguishes_first_acceptance_revalidation_and_activity(
         },
         "_executor_control": {"activity": activity},
         "diagnostics": [],
-        "schema_version": 1,
     }
     if activity in {"capacity_wait", "recovery_wait"}:
         state["_executor_control"] = {"activity": "running"}
@@ -650,7 +654,6 @@ def test_status_repair_conclusion_respects_execution_activity(
         },
         "_executor_control": {"activity": "running"},
         "diagnostics": [],
-        "schema_version": 1,
     }
     if activity == "interrupted":
         state["_executor_control"] = {"activity": "not_running"}
@@ -696,11 +699,11 @@ def test_status_exposes_current_cycle_rounds_alongside_window_budget(
             },
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
+    state["ticket_jobs"] = {"2": state["active_ticket_job"]}
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     json_result = invoke_cli_inprocess(
         git_repo, fixture, "status", "run-1", "--json"
@@ -752,11 +755,11 @@ def test_status_fails_closed_when_current_candidate_identity_is_missing(
             },
         },
         "diagnostics": [],
-        "schema_version": 1,
     }
+    state["ticket_jobs"] = {"2": state["active_ticket_job"]}
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -789,10 +792,10 @@ def test_plain_status_places_next_action_before_complete_finding_details(
         },
         "diagnostics": [],
     }
-    state["schema_version"] = 1
+    state["ticket_jobs"] = {"2": state["active_ticket_job"]}
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", state)
+    StateStore(managed_state(git_repo)).save_run("run-1", current_query_fixture(state))
 
     result = invoke_cli_inprocess(
         git_repo, fixture, "status", "run-1", "--plain"
@@ -5127,82 +5130,78 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     started = seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
-    state["schema_version"] = 1
-    state_ref = only_run_ref(managed_state(git_repo))
-    write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+    database, before = _previous_protocol_snapshot(git_repo)
 
     result = run_cli(git_repo, fixture, "run", "1")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
     assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
-    assert read_run(state_ref) == before
+    assert database.read_bytes() == before
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
-def test_status_and_history_show_incompatible_legacy_evidence(
+def test_status_and_history_reject_incompatible_legacy_protocol_without_mutation(
     git_repo: Path, command: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
-    state = load_only_run_state(git_repo)
-    state["schema_version"] = 1
-    state_ref = only_run_ref(managed_state(git_repo))
-    write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+    database, before = _previous_protocol_snapshot(git_repo)
 
     result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
-    assert result.returncode == 0
+    assert result.returncode == 2
     output = stdout_json(result)
-    assert output["run_id"] == run_id
-    if command == "status":
-        assert output["status"] == before["status"]
-    assert read_run(state_ref) == before
+    assert output["status"] == "incompatible_run_state"
+    assert database.read_bytes() == before
 
 
-@pytest.mark.parametrize("command", ["status", "history"])
-@pytest.mark.parametrize("timeline", [None, {}, "not an event list"])
-def test_status_and_history_reject_an_invalid_timeline_without_mutation(
-    git_repo: Path, command: str, timeline: object
+@pytest.mark.parametrize("command,damage", [
+    ("status", "root_type"), ("history", "root_type"),
+    ("history", "missing_stream"), ("history", "missing_event"), ("history", "positions"),
+])
+def test_query_rejects_invalid_timeline_in_its_read_scope_without_mutation(
+    git_repo: Path, command: str, damage: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
-    if timeline is None:
+    if damage == "missing_stream":
         state.pop("timeline")
-    else:
-        state["timeline"] = timeline
-    state_ref = only_run_ref(managed_state(git_repo))
-    write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+        write_run_fixture(only_run_ref(managed_state(git_repo)), state)
+    database = managed_state(git_repo) / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        if damage == "root_type":
+            connection.execute("UPDATE run_query_roots SET presence=CAST(presence AS TEXT)")
+        elif damage == "missing_event":
+            connection.execute("DELETE FROM run_timeline_events")
+        elif damage == "positions":
+            connection.execute("UPDATE run_timeline_slots SET position=position+1000")
+    before = database.read_bytes()
 
     result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert read_run(state_ref) == before
+    assert database.read_bytes() == before
 
 
-def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
+def test_history_rejects_a_malformed_timeline_event_without_mutation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    state = load_only_run_state(git_repo)
-    state["timeline"] = ["not an event"]
-    state_ref = only_run_ref(managed_state(git_repo))
-    write_run_fixture(state_ref, state)
-    before = deepcopy(state)
+    database = managed_state(git_repo) / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("UPDATE run_timeline_events SET value_status=CAST(value_status AS BLOB)")
+    before = database.read_bytes()
 
     result = invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert read_run(state_ref) == before
+    assert database.read_bytes() == before
 
 
 @pytest.mark.parametrize("command", ["status", "history", "resume"])

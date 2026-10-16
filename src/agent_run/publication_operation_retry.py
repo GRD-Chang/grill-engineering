@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from collections.abc import Iterator, Mapping
 from typing import Any
+from agent_run.work_projection import JobProjection, publication_attempt_for_current_ordinal
 
 
 MAX_PUBLICATION_OPERATION_ATTEMPTS = 5
@@ -43,9 +44,7 @@ def require_publication_operation_retry(
     return {"attempts": attempts, "limit": limit}
 
 
-def record_publication_operation_failure(
-    owner: dict[str, Any], error: Exception
-) -> bool:
+def record_publication_operation_failure(owner: dict[str, Any], error: Exception) -> bool:
     """Increment one canonical retry and report whether it is exhausted."""
 
     value = owner.get("publication_operation_retry")
@@ -85,10 +84,17 @@ def publication_operation_attempt(
     if isinstance(pending, dict) and pending.get("role") == "publication":
         return pending
     current_ordinal = owner.get("publication_attempts")
+    if isinstance(owner, JobProjection):
+        attempt = publication_attempt_for_current_ordinal(owner)
+        if attempt is not None and attempt.get("status") == "completed":
+            return attempt
     related = _RELATED_ATTEMPTS.get().get(id(owner))
     if related is not None and "semantic_attempt_history" not in owner:
-        if (related.get("role") == "publication" and related.get("status") == "completed"
-                and related.get("ordinal") == current_ordinal):
+        if (
+            related.get("role") == "publication"
+            and related.get("status") == "completed"
+            and related.get("ordinal") == current_ordinal
+        ):
             return related
         return None
     history = owner.get("semantic_attempt_history")
@@ -104,9 +110,7 @@ def publication_operation_attempt(
     return None
 
 
-def _sync_completed_publication_attempt(
-    owner: dict[str, Any], *, required: bool = False
-) -> None:
+def _sync_completed_publication_attempt(owner: dict[str, Any], *, required: bool = False) -> None:
     value = owner.get("publication_operation_retry")
     if value is None:
         return

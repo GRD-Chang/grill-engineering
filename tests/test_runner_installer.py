@@ -6,9 +6,11 @@ import os
 import signal
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -20,7 +22,7 @@ from support.seeding import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
 
-from support.state import include_in_state_snapshot, read_run, run_refs, snapshot_run, write_run_fixture
+from support.state import include_in_state_snapshot, run_refs
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -2771,7 +2773,6 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     started_output = json.loads(started.stdout)
     run_id = started_output["run_id"]
     state_root = _data_root(home) / "repositories" / "example" / "project" / "state"
-    state_ref = (state_root, str(run_id))
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'second'\n", encoding="utf-8"
@@ -2804,10 +2805,10 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     rollback_output = json.loads(continued_after_rollback.stdout)
     assert rollback_output["run_id"] == run_id
 
-    incompatible = read_run(state_ref)
-    incompatible["schema_version"] = 1
-    write_run_fixture(state_ref, incompatible)
-    before = snapshot_run(state_ref)
+    database = state_root / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("UPDATE schema_meta SET value='sqlite-work-records-v5' WHERE key='protocol'")
+    before = database.read_bytes()
     locator_path = _data_root(home) / "run-locator.json"
     locator_before = locator_path.read_bytes()
     target_files_before = {
@@ -2836,7 +2837,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected.returncode == 2
     assert json.loads(rejected.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
+    assert database.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
@@ -2863,7 +2864,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_install.returncode == 2
     assert json.loads(rejected_after_install.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
+    assert database.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()
@@ -2887,7 +2888,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert rejected_after_rollback.returncode == 2
     assert json.loads(rejected_after_rollback.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
+    assert database.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
         path.relative_to(state_root): path.read_bytes()

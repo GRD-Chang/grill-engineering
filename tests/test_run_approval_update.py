@@ -190,8 +190,15 @@ def test_run_update_reviews_latest_target_after_another_append(
     from agent_run.agents import ReviewResult
     from agent_run.notification_events import events
     from agent_run.notifications import Notifications
+    from agent_run.object_state import save_owned
+    from agent_run.state import StateStore
 
     fixture, before = prepare_published_run(git_repo)
+    before["notifications"] = {
+        "enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test",
+    }
+    save_owned(StateStore(managed_state(git_repo)), before["run_id"], before, fields={"notifications"})
+    monkeypatch.setattr("agent_run.notifications.send", lambda *_args, **_kwargs: {"outcome": "success", "reason": None})
     append_remote(git_repo, fixture, "main", "first.txt", "first update\n")
     agents = update_agents(git_repo)
     script = json.loads(agents.read_text())
@@ -199,7 +206,7 @@ def test_run_update_reviews_latest_target_after_another_append(
     agents.write_text(json.dumps(script))
     publishers: list[FixtureGitHubPublisher] = []
     notice_order = git_repo / "update-notice-order.jsonl"
-    observe = Notifications.observe
+    observe = Notifications._observe
     integrate = GitRepository.integrate_remote_heads
 
     def observe_update(self: Any, state: dict[str, Any], **kwargs: Any) -> None:
@@ -238,7 +245,7 @@ def test_run_update_reviews_latest_target_after_another_append(
     backend = MovingTargetAgents(agents)
     monkeypatch.setattr(cli, "FixtureGitHubPublisher", LivePublisher)
     monkeypatch.setattr(cli, "_agent_backend", lambda *_args, **_kwargs: backend)
-    monkeypatch.setattr(Notifications, "observe", observe_update)
+    monkeypatch.setattr(Notifications, "_observe", observe_update)
     monkeypatch.setattr(GitRepository, "integrate_remote_heads", integrate_after_notice)
     result = invoke_cli_inprocess(git_repo, fixture, "approve", before["run_id"], "--json")
 

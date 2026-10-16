@@ -21,7 +21,8 @@ from agent_run.run_locator import RunLocatorIndex
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from support.seeding import write_fixture
+from support.seeding import seed_run, write_fixture
+from support.state import persist_run_fixture
 from support.lifecycle import _file_snapshot, _isolated_environment
 from support.cli import modify_only_run_state, snapshot_run_states
 from support.inprocess_cli import invoke_cli_inprocess
@@ -372,10 +373,13 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    prepare_workspace(git_repo)
-    StateStore(managed_state(git_repo)).save_run("run-1", {
-        "schema_version": 1, "language": "zh", "run_id": "run-1", "status": "completed",
-        "repository": "example/project", "parent": {"number": 1},
+    created = seed_run(git_repo, fixture, idle_control=True)
+    assert created.returncode == 0, created.stderr
+    run_id = json.loads(created.stdout)["run_id"]
+    states = StateStore(managed_state(git_repo))
+    state = states.load_run(run_id)
+    state.update({
+        "status": "completed",
         "diagnostics": [], "delivery_cleanup": {
             "status": "cleanup_pending", "last_error": "source head changed",
             "items": {"agent-run/ticket-3": {
@@ -385,9 +389,10 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
             }},
         },
     })
+    persist_run_fixture(states, run_id, state)
     before = _workspace_snapshot(git_repo)
     for command in ("status", "history"):
-        result = invoke_cli_inprocess(git_repo, fixture, command, "run-1", "--plain")
+        result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--plain")
         assert result.returncode == 0, result.stderr
         assert "无需操作" not in result.stdout
         assert "已合并，待清理" in result.stdout
@@ -398,7 +403,7 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
     monkeypatch.chdir(git_repo)
     output = TerminalOutput()
     with redirect_stdout(output):
-        assert cli.main(["status", "run-1", "--github-fixture", str(fixture)]) == 0
+        assert cli.main(["status", run_id, "--github-fixture", str(fixture)]) == 0
     assert "提交已变化" in Text.from_ansi(output.getvalue()).plain
     assert "/preserved/worktree" in Text.from_ansi(output.getvalue()).plain
     assert _workspace_snapshot(git_repo) == before

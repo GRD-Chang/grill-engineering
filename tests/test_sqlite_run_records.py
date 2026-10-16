@@ -9,11 +9,10 @@ import sqlite3
 
 import pytest
 
-from agent_run.sqlite_encoding import object_path
 from agent_run.sqlite_run_inputs import input_version_for_revision, load_parent
-from agent_run.sqlite_run_schema import FIELDS
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state_errors import IncompatibleRunStateError
+from support.work_records import invocation
 
 
 def _facts() -> dict:
@@ -28,17 +27,17 @@ def _facts() -> dict:
         "frontier": [2], "ticket_integration_holder": None, "ticket_integration_queue": [],
         "ticket_work_queue": [{"ticket_number": 2, "generation": 1, "role": "development", "lease_id": None}],
         "ticket_pause_requests": {}, "retired_ticket_generations": {}, "pending_ticket_retirements": {},
-        "diagnostics": [], "timeline": [{"status": "active"}],
+        "diagnostics": [], "timeline": [{"at": "2026-10-15T00:00:00+00:00", "kind": "run_status", "status": "active"}],
         "ticket_jobs": {"2": {"ticket_number": 2, "ticket_branch_generation": 1, "phase": "candidate", "candidate_sha": "candidate-A"},
                         "3": {"ticket_number": 3, "ticket_branch_generation": 1, "phase": "completed", "candidate_sha": "candidate-B"}},
     }
 
 
 def test_root_current_fields_paths_and_discovery_share_one_authority(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
-    reopened = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
+    reopened = SQLiteStateRepository(tmp_path)
     assert reopened.load("run-1") == state
     assert reopened.load_work("run-1", 2) == state
     assert reopened.load_fields("run-1", {"repository", "parent", "frontier"}) == {key: state[key] for key in ("repository", "parent", "frontier")}
@@ -47,10 +46,9 @@ def test_root_current_fields_paths_and_discovery_share_one_authority(tmp_path: P
     }
     assert reopened.find_ids("example/repo", 1, unfinished_only=True) == ["run-1"]
     with closing(sqlite3.connect(repo.path)) as c:
-        paths = [object_path(row[0]) for row in c.execute("SELECT object_path FROM run_objects")]
-        assert not any(path and path[0] in FIELDS for path in paths)
+        names = {row[0] for row in c.execute("SELECT name FROM sqlite_master")}
+        assert not names & {"run_objects", "run_materials", "run_sizes", "run_object_index"}
         assert c.execute("SELECT repository,status,phase,parent_number FROM runs").fetchone() == ("Example/Repo", "active", "delivery", 1)
-        assert json.loads(c.execute("SELECT root_keys_json FROM runs").fetchone()[0]) == ["timeline"]
         c.execute("UPDATE runs SET status='completed'")
         c.commit()
     assert reopened.load_fields("run-1", {"status"}) == {"status": "completed"}
@@ -58,7 +56,7 @@ def test_root_current_fields_paths_and_discovery_share_one_authority(tmp_path: P
 
 
 def test_parent_versions_preserve_requirements_and_reject_ambiguous_revision(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
     with closing(sqlite3.connect(repo.path)) as c:
@@ -75,7 +73,7 @@ def test_parent_versions_preserve_requirements_and_reject_ambiguous_revision(tmp
 
 
 def test_same_graph_structure_keeps_identity_across_current_observations(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
     with closing(sqlite3.connect(repo.path)) as c:
@@ -104,7 +102,7 @@ def test_same_graph_structure_keeps_identity_across_current_observations(tmp_pat
 
 
 def test_shared_run_failure_and_operator_stop_preserve_completed_sibling(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     original = _facts()
     repo.save("run-1", original)
     diagnostic = {"code": "shared_storage_failure", "message": "disk full", "operator_gate": {
@@ -115,7 +113,7 @@ def test_shared_run_failure_and_operator_stop_preserve_completed_sibling(tmp_pat
                "operator_stop": {"resume_status": "execution_failed", "resume_terminal_kind": None,
                                  "resume_diagnostics": [diagnostic], "stopped_at": "stop"}}
     repo.save_objects("run-1", stopped, fields=set(stopped))
-    loaded = SQLiteStateRepository(tmp_path, max_bytes=65536).load_work("run-1", 2)
+    loaded = SQLiteStateRepository(tmp_path).load_work("run-1", 2)
     assert loaded["operator_stop"]["resume_diagnostics"] == [diagnostic]
     assert loaded["ticket_jobs"]["3"] == original["ticket_jobs"]["3"]
     with closing(sqlite3.connect(repo.path)) as c:
@@ -126,7 +124,7 @@ def test_shared_run_failure_and_operator_stop_preserve_completed_sibling(tmp_pat
 
 
 def test_keyed_partial_save_and_field_deletion_do_not_clear_siblings(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts() | {"ticket_pause_requests": {"2": "pause-A", "3": "pause-B"},
                         "retired_ticket_generations": {"2": 1, "3": 2}}
     repo.save("run-1", state)
@@ -143,7 +141,7 @@ def test_keyed_partial_save_and_field_deletion_do_not_clear_siblings(tmp_path: P
 
 
 def test_root_and_job_results_rollback_together(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
     with pytest.raises(OSError, match="crash"):
@@ -153,14 +151,15 @@ def test_root_and_job_results_rollback_together(tmp_path: Path) -> None:
             changed["ticket_jobs"]["2"]["candidate_sha"] = "new-candidate"
             repo.save_objects("run-1", changed, fields={"status", "ticket_jobs"})
             raise OSError("crash")
-    assert SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1") == state
+    assert SQLiteStateRepository(tmp_path).load("run-1") == state
 
 
 def test_small_root_patch_does_not_load_fixed_inputs_or_unrelated_history(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     state["parent"]["body"] = "大正文" * 10000
-    state["unrelated_history"] = [{"body": "history" * 300} for _ in range(100)]
+    state["agent_invocation_history"] = [invocation(started=f"old-{number}", context={"body": "history" * 300})
+                                          for number in range(100)]
     repo.save("run-1", state)
     with repo.atomic():
         c = repo._local.connection
@@ -171,13 +170,13 @@ def test_small_root_patch_does_not_load_fixed_inputs_or_unrelated_history(tmp_pa
         finally:
             c.set_trace_callback(None)
     reads = [query.lower() for query in queries if query.lstrip().lower().startswith("select")]
-    assert not any("from work_evidence_materials" in query or "from run_parent_versions" in query or "from run_objects" in query
+    assert not any("from work_evidence_materials" in query or "from run_parent_versions" in query
                    for query in reads)
     assert repo.load_fields("run-1", {"status"}) == {"status": "run_acceptance_pending"}
 
 
 def test_owned_root_material_cannot_borrow_another_run_reference(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     repo.save("run-1", {"prompt_resources": {"text": "one"}})
     repo.save("run-2", {"prompt_resources": {"text": "two"}})
     with closing(sqlite3.connect(repo.path)) as c:
@@ -189,7 +188,7 @@ def test_owned_root_material_cannot_borrow_another_run_reference(tmp_path: Path)
 
 
 def test_previous_sqlite_protocol_is_rejected_without_rewriting(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     repo.save("run-1", _facts())
     with closing(sqlite3.connect(repo.path)) as c:
         c.execute("UPDATE schema_meta SET value='sqlite-work-records-v4'")
@@ -201,7 +200,7 @@ def test_previous_sqlite_protocol_is_rejected_without_rewriting(tmp_path: Path) 
 
 
 def test_abandonment_and_cleanup_keep_typed_closeout_facts_and_exact_receipt(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     receipt = {"run_id": "run-1", "ticket_number": 3, "pr_number": 30, "integrated_sha": "integrated",
                "event_id": "event-3", "actor": "bot", "dispatch_attempted": True}
@@ -222,17 +221,16 @@ def test_abandonment_and_cleanup_keep_typed_closeout_facts_and_exact_receipt(tmp
     with closing(sqlite3.connect(repo.path)) as c:
         assert c.execute("SELECT COUNT(*),source_record_kind,value_event_id FROM run_close_receipts").fetchone() == (1, "ticket_close_ownership", None)
         assert c.execute("SELECT value_expected_head_sha,value_expected_remote_head_sha,value_attempts FROM run_cleanup_items").fetchone() == ("local", "remote", 2)
-        assert not any(object_path(path)[0] in closeout for path, in c.execute("SELECT object_path FROM run_objects WHERE object_path!='[]'"))
     completed = deepcopy(closeout)
     completed["run_abandonment"]["phase"] = "completed"
     completed["run_abandonment"]["tickets"][0]["status"] = "completed"
     repo.save_objects("run-1", completed, fields=set(completed))
-    assert SQLiteStateRepository(tmp_path, max_bytes=65536).load_fields("run-1", set(completed)) == completed
+    assert SQLiteStateRepository(tmp_path).load_fields("run-1", set(completed)) == completed
 
 
 @pytest.mark.parametrize("field", ["status", "repository", "language"])
 def test_metadata_and_core_share_the_current_record_limit(tmp_path: Path, field: str) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=1024 * 1024)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
     with pytest.raises(ValueError, match="current record"):
@@ -247,7 +245,7 @@ def test_metadata_and_core_share_the_current_record_limit(tmp_path: Path, field:
 
 
 def test_run_delete_cascades_owned_input_gate_and_closeout_relations(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     repo.save("run-1", _facts())
     repo.save_objects("run-1", {"diagnostics": [{"code": "failed", "message": "original"}],
                       "run_abandonment": {"kind": "parent_only", "phase": "pending", "parent_pr": {"pr_number": 42, "status": "pending"}}},
@@ -261,7 +259,7 @@ def test_run_delete_cascades_owned_input_gate_and_closeout_relations(tmp_path: P
 def test_requeue_transition_references_an_exact_source_job_version(tmp_path: Path) -> None:
     from agent_run.requeue import _retired_record
 
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     state = _facts()
     repo.save("run-1", state)
     original = repo.load_fields("run-1", {"ticket_jobs"})["ticket_jobs"]["2"]
@@ -293,7 +291,7 @@ def test_requeue_transition_references_an_exact_source_job_version(tmp_path: Pat
 
 
 def test_pause_limits_large_current_intent_before_returning_body(tmp_path: Path) -> None:
-    repo = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repo = SQLiteStateRepository(tmp_path)
     repo.save("run-1", {"ticket_pause_requests": {"2": "original"}})
     with closing(sqlite3.connect(repo.path)) as c:
         c.execute("UPDATE run_ticket_pause_requests SET requested_at=?", ("X" * (300 * 1024),))

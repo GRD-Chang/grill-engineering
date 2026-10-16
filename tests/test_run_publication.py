@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.work_projection import materialize_history
 from agent_run.agents import ReviewResult
 from agent_run import cli_presentation
 from agent_run.delivery_step import DeliveryStepKind
@@ -21,6 +22,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.state import StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
@@ -37,13 +39,16 @@ from support.run_publication import InvocationRunPublicationAgents
 from support.state import persist_run_fixture
 
 
-def _assert_program_continuation(state: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+def _assert_program_continuation(
+    state: dict[str, Any], capsys: pytest.CaptureFixture[str], states: StateStore,
+) -> None:
     cli_presentation._print_status(state, as_json=True)
     status = json.loads(capsys.readouterr().out)
     assert status["worker"] is None
     recent_agent = status["progress"]["current_agent"]
     assert recent_agent is None or recent_agent["is_active"] is False
-    event = next(event for event in reversed(state["timeline"]) if event["kind"] == "run_publication")
+    timeline = StateStore(states.root).load_history_run(state["run_id"])["timeline"]
+    event = next(event for event in reversed(timeline) if event["kind"] == "run_publication")
     assert event.get("worker") is None
     assert event.get("thread_id") is None
     assert state["run_publication"]["thread_id"]  # Retained historical output.
@@ -114,7 +119,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
 
     assert published["status"] == "run_approval_pending"
     assert "run_publication_records" not in publisher.data["delivery"]
-    _assert_program_continuation(published, capsys)
+    _assert_program_continuation(published, capsys, states)
     final = published["run_publication"]
     assert final["phase"] == "ready_for_approval"
     assert len(agents.requests) == 1
@@ -139,7 +144,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     completed = engine.approve(str(state["run_id"]))
 
     assert completed["status"] == "completed"
-    _assert_program_continuation(completed, capsys)
+    _assert_program_continuation(completed, capsys, states)
     merged = publisher.live_pull_request(int(final["pr_number"]))
     assert merged["state"] == "MERGED"
     assert merged["integrated_parents"] == [
@@ -168,7 +173,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     waiting = engine.publish(str(state["run_id"]))
 
     assert waiting["status"] == "waiting_external"
-    _assert_program_continuation(waiting, capsys)
+    _assert_program_continuation(waiting, capsys, states)
     assert waiting["run_publication"]["phase"] == "waiting_external"
     assert waiting["diagnostics"][0]["waiting_for"] == (
         "Run PR #1 Required Checks observation"
@@ -178,7 +183,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     resumed = engine.publish(str(state["run_id"]))
 
     assert resumed["status"] == "run_approval_pending"
-    _assert_program_continuation(resumed, capsys)
+    _assert_program_continuation(resumed, capsys, states)
     assert len(agents.requests) == 1
 
 def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
@@ -534,7 +539,7 @@ def test_final_publication_human_resume_clears_current_blocker(
     assert published["status"] == "run_approval_pending"
     publication = published["run_publication"]
     assert publication["thread_id"] == "blocked-publication-thread"
-    assert publication["human_blocker_history"] == [
+    assert materialize_history(publication, "human_blocker_history") == [
         {
             "phase": "pending",
             "human_blockers": [
@@ -691,7 +696,7 @@ def test_parent_closeout_recovers_without_a_second_merge(
     assert pending is not None
     assert pending["run_publication"]["phase"] == "merged"
     assert pending["status"] == "parent_closeout_pending"
-    _assert_program_continuation(pending, capsys)
+    _assert_program_continuation(pending, capsys, states)
     step = engine.advance(str(state["run_id"]))
     assert step.kind == DeliveryStepKind.WAITING
     assert step.reason == "parent_closeout_pending"

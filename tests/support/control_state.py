@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from agent_run.state import MAX_RUN_STATE_BYTES
+from agent_run.state_limits import MAX_QUERY_BYTES
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.task_control import TaskControlStore, TaskKey
 
@@ -42,7 +42,7 @@ def persist_control_fixture(
     """仅用于 arrange；被测 Action 必须调用真实生产入口。"""
     from agent_run import sqlite_control
 
-    repository = SQLiteStateRepository(control.root, max_bytes=MAX_RUN_STATE_BYTES)
+    repository = SQLiteStateRepository(control.root, max_bytes=MAX_QUERY_BYTES)
     with repository.atomic():
         sqlite_control.save(repository._local.connection, task.fingerprint, record)
 

@@ -20,6 +20,7 @@ from agent_run.semantic_attempt import (
 )
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.work_facts import work_identity
+from agent_run.work_projection import materialize_history
 
 
 def append_explicit_resume_audit(
@@ -201,7 +202,7 @@ def _latest_human_response(
         subject = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
     elif isinstance(work_subject, str) and work_subject.startswith("run-publication:"):
         subject = state.get("run_publication")
-    history = subject.get("human_response_history") if isinstance(subject, dict) else None
+    history = materialize_history(subject, "human_response_history") if isinstance(subject, dict) else None
     if not isinstance(history, list):
         return None
     for entry in reversed(history):

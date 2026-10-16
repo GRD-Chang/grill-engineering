@@ -74,3 +74,51 @@ def test_damaged_or_oversized_evidence_is_rejected_before_body_read(tmp_path: Pa
         connection.set_trace_callback(None)
         with pytest.raises(ValueError, match="exceeds"):
             put_evidence(connection, "run-1", "job:one", "review_context", "x" * MAX_EVIDENCE_BYTES)
+
+
+@pytest.mark.parametrize("member", [False, True])
+def test_evidence_reads_owned_header_and_material_lengths_together(tmp_path: Path, member: bool) -> None:
+    with closing(_create(tmp_path / "state.sqlite3")) as connection, connection:
+        payload = {"kind": "development", "summary": "准确原文"}
+        reference = put_evidence(connection, "run-1", "attempt:one", "returned_result", payload)
+        if member:
+            reference = put_evidence_member(connection, "run-1", "job:one", "development_summary",
+                                            reference, ("summary",))
+        statements = []
+        connection.set_trace_callback(statements.append)
+        assert get_evidence(connection, "run-1", reference) == (payload["summary"] if member else payload)
+        assert len(statements) == (3 if member else 2)
+
+
+def test_evidence_query_quota_is_checked_before_body_transfer(tmp_path: Path) -> None:
+    from agent_run.state_limits import QueryLimitError, query_scope
+
+    with closing(_create(tmp_path / "state.sqlite3")) as connection, connection:
+        reference = put_evidence(connection, "run-1", "job:one", "review_context", "原文" * 1000)
+        statements = []
+        connection.set_trace_callback(statements.append)
+        with query_scope(max_bytes=1024), pytest.raises(QueryLimitError, match="byte read limit"):
+            get_evidence(connection, "run-1", reference)
+        assert not any(statement.startswith("SELECT body FROM") for statement in statements)
+
+
+@pytest.mark.parametrize("member", [False, True])
+def test_joined_headers_keep_their_row_quota_before_body_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: bool,
+) -> None:
+    from agent_run import state_limits as limits
+
+    with closing(_create(tmp_path / "state.sqlite3")) as connection, connection:
+        payload = {"kind": "development", "summary": "准确原文"}
+        reference = put_evidence(connection, "run-1", "attempt:one", "returned_result", payload)
+        if member:
+            reference = put_evidence_member(connection, "run-1", "job:one", "development_summary",
+                                            reference, ("summary",))
+        statements = []
+        connection.set_trace_callback(statements.append)
+        # Owner and material headers retain separate admission; a member also
+        # reads its own reference header. The next row would transfer the body.
+        monkeypatch.setattr(limits, "MAX_QUERY_ROWS", 2 + int(member))
+        with limits.query_scope(), pytest.raises(limits.QueryLimitError, match="row limit"):
+            get_evidence(connection, "run-1", reference)
+        assert not any(statement.startswith("SELECT body FROM") for statement in statements)

@@ -46,9 +46,8 @@ def semantic_attempt_history(
                 continue
             seen.add(attempt_id)
             attempts.append(history_attempt_view(attempt, include_history_facts))
-    # The durable state keeps Attempts on their owning subject.  Accept the
-    # compact top-level projection as a read-only legacy/test input as well;
-    # this does not change the JSON contract emitted by history.
+    # The public history query also supplies a compact top-level projection.
+    # This is presentation input; persistent Runs use their explicit owners.
     projected = state.get("semantic_agent_attempts")
     if isinstance(projected, list):
         for attempt in projected:

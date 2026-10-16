@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import shlex
+import sqlite3
 import subprocess
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -829,7 +831,7 @@ def test_run_retries_initial_credential_for_final_workers_once(
     if fixture_role == "run_publications":
         fixture, _ = prepare_accepted_run(git_repo)
     else:
-        fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+        fixture, _ = prepare_completed_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["initial_credential_failures_by_role"] = {
@@ -882,7 +884,7 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
     if fixture_role == "run_publications":
         fixture, _ = prepare_accepted_run(git_repo)
     else:
-        fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+        fixture, _ = prepare_completed_run(git_repo)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock_multiplier"] = 120
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
@@ -1180,9 +1182,8 @@ def test_run_reconciles_unknown_ticket_merge_outcomes_in_one_call(
 def test_run_supervises_misclassified_final_checks_read_without_rewriting_pr(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         delivery={
             "run_required_checks_read_failures": [
                 {
@@ -1663,9 +1664,10 @@ def test_incompatible_state_preserves_existing_publisher_ledger_and_worktree(
     assert checkout.is_dir()
     preserved = checkout / "legacy-recovery.txt"
     preserved.write_text("do not clean or publish\n", encoding="utf-8")
-    state["schema_version"] = 1
-    replace_only_run_state(git_repo, lambda persisted: persisted.update(state))
-    state_before = read_run_state_bytes(git_repo, str(run_id))
+    database = managed_state(git_repo) / "state.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("UPDATE schema_meta SET value='sqlite-work-records-v5' WHERE key='protocol'")
+    state_before = database.read_bytes()
     fixture_before = fixture.read_text(encoding="utf-8")
     delivery_before = json.loads(fixture_before)["delivery"]
     assert len(delivery_before["pull_requests"]) == 1
@@ -1693,7 +1695,7 @@ def test_incompatible_state_preserves_existing_publisher_ledger_and_worktree(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert read_run_state_bytes(git_repo, str(run_id)) == state_before
+    assert database.read_bytes() == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert preserved.read_text(encoding="utf-8") == "do not clean or publish\n"
     assert (
@@ -1775,11 +1777,9 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
 
 
 def test_completed_run_is_not_reopened_by_run_command(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, published = prepare_published_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
-    run_id = stdout_json(
-        run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    )["run_id"]
+    run_id = str(published["run_id"])
     assert (
         stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"]
         == "completed"

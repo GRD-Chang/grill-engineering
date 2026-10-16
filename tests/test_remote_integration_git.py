@@ -26,7 +26,7 @@ def _assert_durable_conflict_evidence(
     assert "CONFLICT" in json.loads(evidence["stdout_json"])
     assert json.loads(evidence["stderr_json"]) == ""
     store = StateStore(tmp_path / "conflict-state")
-    state = {"failure": evidence}
+    state = {"parent_job": {"phase": "integrating", "failure_evidence": evidence}}
     store.save_run("conflict", state)
     assert store.load_run("conflict") == state
 

@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 from contextlib import redirect_stdout
+from copy import deepcopy
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
 ) -> None:
     from agent_run.state import StateStore
     from support.lifecycle import _file_snapshot
-    from support.state import write_run_fixture
+    from support.state import current_query_fixture, write_run_fixture
 
     monkeypatch.chdir(git_repo)
     prepare_workspace(git_repo)
@@ -49,7 +50,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
     root = managed_state(git_repo)
     state = {
         "run_id": "run-settings", "repository": "example/project",
-        "parent": {"number": 1}, "status": "starting", "schema_version": 1,
+        "parent": {"number": 1}, "status": "starting",
         "base_resolution_pending": True, "currentness_resolution_pending": True,
         "agent_invocation_history": [], "active_agent_invocation": None,
     }
@@ -60,7 +61,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
     elif case == "applied":
         state["action_application_receipt"] = {"action_id": "already-applied"}
     # 设置查询用的原始缺损输入；非法 receipt 不经生产 application 提交。
-    write_run_fixture((root, "run-settings"), state)
+    write_run_fixture((root, "run-settings"), current_query_fixture(state))
     if case == "corrupt":
         (root / "profiles").mkdir()
         (root / "profiles/run-settings.json").write_text("broken")
@@ -406,12 +407,14 @@ class Backend(codex.CodexCliBackend):
 def worker(arguments, **options):
     with capture.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(options["prompt"], ensure_ascii=False) + "\\n")
+    thread_id = (arguments[arguments.index("resume") + 3] if "resume" in arguments
+                 else f"isolated-prompt-thread-{len(capture.read_text().splitlines())}")
     Path(arguments[arguments.index("--output-last-message") + 1]).write_text(json.dumps({
         "result_kind": "human_blocker", "summary": None,
         "human_blockers": ["测试边界：等待人工回复"]
     }), encoding="utf-8")
     return subprocess.CompletedProcess(arguments, 0,
-        '{"type":"thread.started","thread_id":"isolated-prompt-thread"}\\n', "")
+        json.dumps({"type": "thread.started", "thread_id": thread_id}) + "\\n", "")
 cli.CodexCliBackend = Backend
 codex.run_worker_process = worker
 raise SystemExit(cli.main(sys.argv[1:]))
@@ -424,13 +427,20 @@ raise SystemExit(cli.main(sys.argv[1:]))
     environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
 
     def call(repo: Path, github: Path, *arguments: str) -> str:
+        previous_prompts = len(capture.read_text().splitlines()) if capture.exists() else 0
         result = subprocess.run(
             [sys.executable, str(driver), str(builtin), str(resume_resource), str(capture), *arguments,
              "--github-fixture", str(github), "--json"], cwd=repo, env=environment,
             capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 2, result.stdout + result.stderr
-        return json.loads(capture.read_text().splitlines()[-1])
+        prompts = capture.read_text().splitlines()
+        assert len(prompts) == previous_prompts + 1, result.stdout + result.stderr
+        output = json.loads(result.stdout)
+        assert output["result"] == {"run": "started", "resume": "resumed"}[arguments[0]], result.stdout + result.stderr
+        assert output["status"] == "ready_for_human", result.stdout + result.stderr
+        assert output["action_audit"]["failure"] is None, result.stdout + result.stderr
+        return json.loads(prompts[-1])
 
     initial = call(git_repo, fixture, "run", "1", "--no-notifications")
     assert "创建时个人开发方法" in initial
@@ -447,10 +457,30 @@ raise SystemExit(cli.main(sys.argv[1:]))
     assert "创建时内部续接方法" in resumed
     assert "修改后内部续接方法" not in resumed
     assert "继续核验" in resumed
+    before_restart = load_only_run_state(git_repo)
     restarted = call(git_repo, fixture, "resume", state["run_id"], "--new-thread", "--message", "重新核验")
     assert "创建时个人开发方法" in restarted
     assert "修改后个人开发方法" not in restarted
     assert "重新核验" in restarted
+    after_restart = load_only_run_state(git_repo)
+    previous_invocations = before_restart["agent_invocation_history"]
+    saved_invocations = after_restart["agent_invocation_history"]
+    assert len(saved_invocations) == len(previous_invocations) + 1
+    assert {(entry["work_subject"], entry["started_at"]) for entry in previous_invocations} < {
+        (entry["work_subject"], entry["started_at"]) for entry in saved_invocations
+    }
+    assert saved_invocations[-1]["mode"] == "new-thread"
+    assert saved_invocations[-1]["reported_thread_id"] != previous_invocations[-1]["reported_thread_id"]
+    assert after_restart["resume_audit"]["total"] == 2
+    assert len(after_restart["resume_audit"]["history"]) == 2
+    from agent_run.state_contract import require_current_run_state
+    from agent_run.state_errors import IncompatibleRunStateError
+
+    require_current_run_state(after_restart)
+    invalid_link = deepcopy(after_restart)
+    invalid_link["active_agent_invocation"]["resume_id"] = "sha256:" + "f" * 64
+    with pytest.raises(IncompatibleRunStateError, match="Resume"):
+        require_current_run_state(invalid_link)
     second = tmp_path / "second"
     subprocess.run(["git", "clone", "--local", str(git_repo), str(second)], check=True, capture_output=True)
     other_fixture = write_fixture(second / "github.json", issues={}, repository="example/second")

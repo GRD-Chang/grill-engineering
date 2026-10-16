@@ -9,13 +9,16 @@ import os
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from support.workspace import managed_repo, managed_state
 
 from agent_run.state import StateStore
+from agent_run.sqlite_watcher import SQLiteWatcher
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_supervision import _parent_only_agents
 from support.seeding import write_fixture
@@ -62,6 +65,62 @@ raise SystemExit(main(sys.argv[5:]))
 """
 
 
+def _wait_for_action_barrier(
+    process: subprocess.Popen[str], ready_fd: int, *, control: TaskControlStore,
+    task: TaskKey, initial: dict[str, Any], expected_kind: str,
+) -> None:
+    states = StateStore(control.root)
+    run_id = initial["run_id"]
+    previous_action_id = initial["action"]["action_id"]
+    now = time.monotonic()
+    overall_deadline, progress_deadline = now + 30, now + 5
+    identity = previous_progress = previous_version = None
+    progress: tuple[Any, ...] | None = None
+    with SQLiteWatcher(states._repository.path) as watcher:
+        while True:
+            remaining = min(overall_deadline, progress_deadline) - time.monotonic()
+            assert remaining > 0, (
+                "Lifecycle preparation stalled for 5s or exceeded 30s before its barrier; "
+                f"progress={progress!r}"
+            )
+            ready, _, _ = select.select([ready_fd], [], [], min(0.01, remaining))
+            if ready:
+                assert os.read(ready_fd, 1) == b"1", (
+                    f"Lifecycle preparation pipe closed before its barrier; progress={progress!r}"
+                )
+                return
+            assert process.poll() is None, (
+                f"Lifecycle command exited before its barrier: {process.returncode}; progress={progress!r}"
+            )
+            version = watcher.version()
+            if version == previous_version:
+                continue
+            previous_version = version
+            with states._repository.use_reader(watcher.connection):
+                current = states._repository.load_fields(run_id, {"status", "parent_job"})
+                record = control.load(task)
+            assert current is not None and record is not None
+            action = record["action"]
+            if action["action_id"] == previous_action_id:
+                assert identity is None, "Lifecycle Action reverted during preparation"
+                continue
+            assert action["kind"] == expected_kind and action["run_id"] in {None, run_id}
+            current_identity = action["action_id"], action["kind"], action["payload_digest"]
+            if identity is None:
+                identity = current_identity
+            assert current_identity == identity, "Lifecycle Action changed during preparation"
+            job = current.get("parent_job") or {}
+            # 只记录当前 Action 和 Parent 的实际推进，Control 时间戳或心跳不续期。
+            progress = (
+                identity, action["status"], action["application_observed"],
+                action["executor_generation"], action["run_id"],
+                current.get("status"), job.get("phase"), getattr(job, "revision", None),
+            )
+            if progress != previous_progress:
+                previous_progress = progress
+                progress_deadline = time.monotonic() + 5
+
+
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="requires Linux pidfd")
 @pytest.mark.parametrize("action", ["resume", "approve"])
 @pytest.mark.parametrize(
@@ -92,6 +151,10 @@ def test_run_observes_existing_executor_after_other_lifecycle_actions(
         assert initial.returncode == 0, initial.stdout
         assert stdout_json(initial)["status"] == "parent_approval_pending"
 
+    control = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    initial_control = control.load(task)
+    assert initial_control is not None
     ready_read, ready_write = os.pipe()
     release_read, release_write = os.pipe()
     first = subprocess.Popen(
@@ -108,11 +171,10 @@ def test_run_observes_existing_executor_after_other_lifecycle_actions(
     os.close(release_read)
     executor_fd: int | None = None
     try:
-        ready, _, _ = select.select([ready_read], [], [], 5)
-        assert ready == [ready_read]
-        assert os.read(ready_read, 1) == b"1"
-        control = TaskControlStore(managed_state(git_repo))
-        task = TaskKey(managed_repo(git_repo), "example/project", 1)
+        _wait_for_action_barrier(
+            first, ready_read, control=control, task=task, initial=initial_control,
+            expected_kind=action,
+        )
         record = control.load(task)
         assert record is not None
         assert record["action"]["kind"] == action

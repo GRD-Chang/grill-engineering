@@ -111,6 +111,24 @@ def record_execution_timing(
     return facts
 
 
+def unassociated_invocations(
+    raw: list[dict[str, Any]], known: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Match exact facts within an Invocation identity, including duplicates.
+
+    Identity narrows the comparison; it does not make two different bodies
+    equivalent. Malformed identities retain the ordinary equality fallback.
+    """
+    def key(invocation: dict[str, Any]) -> tuple[str, str] | None:
+        subject, started = invocation.get("work_subject"), invocation.get("started_at")
+        return (subject, started) if isinstance(subject, str) and isinstance(started, str) else None
+
+    indexed: dict[tuple[str, str] | None, list[dict[str, Any]]] = {}
+    for invocation in known:
+        indexed.setdefault(key(invocation), []).append(invocation)
+    return [invocation for invocation in raw if invocation not in indexed.get(key(invocation), [])]
+
+
 def execution_totals(
     state: dict[str, Any], records: list[dict[str, Any]], at: object,
     *, work_subject: str | None = None,
@@ -126,7 +144,7 @@ def execution_totals(
         raw = [invocation for invocation in raw
                if (invocation.get("work_subject") or (invocation.get("semantic_attempt") or {}).get("work_subject")) == work_subject]
     known = [invocation for record in rounds for invocation in record.get("invocations", [])]
-    missing = [invocation for invocation in raw if invocation not in known]
+    missing = unassociated_invocations(raw, known)
     # Unassociated work prevents a complete total, but its closed segment is
     # still valid partial evidence. Parallel subjects are summed independently.
     included = [

@@ -59,9 +59,11 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
         "base": {"ref": "main", "sha": head, "repo": {"full_name": "example/project"}},
     }
     states = StateStore(git_repo / ".change-pr-state")
-    state: dict[str, Any] = {"ticket_write_intent": {
-        "action": "ensure_ticket_pr", "branch": authority["branch"],
-        "head_sha": head, "base_sha": head, "base_branch": "main",
+    state: dict[str, Any] = {"parent_job": {
+        "phase": "publishing", "ticket_write_intent": {
+            "action": "ensure_ticket_pr", "branch": authority["branch"],
+            "head_sha": head, "base_sha": head, "base_branch": "main",
+        },
     }}
     states.save_run("test", state)
     writes: list[tuple[str, ...]] = []
@@ -76,7 +78,7 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
             nonlocal fail
             saved = states.load_run("test")
             assert saved is not None
-            intent = saved["ticket_write_intent"]
+            intent = saved["parent_job"]["ticket_write_intent"]
             assert intent["pr_number"] == 12
             assert intent["prior_narrative"] == {"title": "Previous title", "body": "Previous body"}
             assert intent["target_narrative"] == {"title": authority["title"], "body": authority["body"]}
@@ -91,8 +93,8 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
 
     def ensure(current: dict[str, Any]) -> int:
         return publisher().ensure_change_pr(
-            **authority, write_intent=current["ticket_write_intent"],
-            save_intent=lambda: save_owned(states, "test", current, fields={'ticket_write_intent'}),
+            **authority, write_intent=current["parent_job"]["ticket_write_intent"],
+            save_intent=lambda: save_owned(states, "test", current, fields={'parent_job'}),
         )
 
     if fault == "response":
@@ -102,16 +104,16 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
         assert ensure(state) == 12
         # The write outcome is not installed in the durable Job: a restart
         # reads the real StateStore checkpoint made before the Gh write.
-        state.pop("ticket_write_intent")
+        state["parent_job"].pop("ticket_write_intent")
         original = states._repository.save_objects
         monkeypatch.setattr(states._repository, "save_objects", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("result save lost")))
         with pytest.raises(OSError, match="result save lost"):
-            save_owned(states, "test", state, fields={'ticket_write_intent'})
+            save_owned(states, "test", state, fields={'parent_job'})
         monkeypatch.setattr(states._repository, "save_objects", original)
         fail = False
     current = StateStore(states.root).load_run("test")
     assert current is not None
-    intent = deepcopy(current["ticket_write_intent"])
+    intent = deepcopy(current["parent_job"]["ticket_write_intent"])
     if observed == "prior":
         remote.update(intent["prior_narrative"])
     elif observed == "external":
@@ -120,13 +122,13 @@ def test_change_pr_unknown_write_reconciles_saved_narrative(
         with pytest.raises(GitHubReadError, match="neither .*saved prior nor target"):
             ensure(current)
         assert remote["body"] == "Maintainer body"
-        assert current["ticket_write_intent"] == intent
+        assert current["parent_job"]["ticket_write_intent"] == intent
         assert len(writes) == 1
     else:
         assert ensure(current) == 12
         assert len(writes) == (1 if observed == "target" else 2)
         assert remote["body"] == authority["body"]
-    assert StateStore(states.root).load_run("test")["ticket_write_intent"] == intent
+    assert StateStore(states.root).load_run("test")["parent_job"]["ticket_write_intent"] == intent
 
 
 def test_change_pr_read_failure_does_not_admit_write(

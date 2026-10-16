@@ -100,7 +100,10 @@ def _resolve_integration_work_once(
         "integration_evidence": json.dumps(scene, ensure_ascii=False, sort_keys=True, indent=2),
         "work_source": "integration",
     }
-    request = stage.adapter.development_request(state, {**job, **repair_input}, checkout)
+    # Human Response inputs retain the exact Job history reader and revision.
+    request_job = job.copy()
+    request_job.update(repair_input)
+    request = stage.adapter.development_request(state, request_job, checkout)
     request.update(repair_input)
     stage.save(state)
     if "development_summary" not in scene:

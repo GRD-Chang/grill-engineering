@@ -109,6 +109,11 @@ def owners_for_attempt(
     for work_subject, owner in _subject_variants(state):
         if work_subject != subject:
             continue
+        query_identities = owner.get("_query_attempt_ids")
+        if isinstance(query_identities, list):
+            if attempt_id in query_identities:
+                owners.append(owner)
+            continue
         owner_attempts = _owner_attempts(owner)
         if any(
             isinstance(candidate, dict)
@@ -130,7 +135,7 @@ def owners_for_attempt(
         if work_subject == subject
     ]
     if isinstance(attempt_id, str) and any(
-        _owner_attempts(owner) for owner in same_subject
+        isinstance(owner.get("_query_attempt_ids"), list) or _owner_attempts(owner) for owner in same_subject
     ):
         # An identified Attempt which is absent from a retained owner history
         # cannot safely borrow the current Candidate's Artifact.
@@ -340,6 +345,10 @@ def _owner_attempt_is_latest(owner: dict[str, Any], attempt: dict[str, Any]) -> 
         return False
     if field in owner:
         return owner.get(field) == attempt.get("ordinal")
+    if isinstance(owner.get("_query_attempt_ids"), list):
+        # A selected subset proves membership, never the absence of another
+        # retained Attempt. Missing counters cannot justify borrowed content.
+        return False
     # A legacy/read-only projection with no owner history has no competing
     # attempt from which this record could have been borrowed.
     return not _owner_attempts(owner)

@@ -7,6 +7,7 @@ import json
 import re
 from copy import deepcopy
 from typing import Any
+from agent_run.work_projection import JobProjection, history_for_append, materialize_history
 
 from agent_run.delivery_budget import delivery_budget_owner
 
@@ -177,8 +178,10 @@ def allocate_semantic_attempt(
             "ci_reviewer_invocations": ci_budget["reviewer_invocations"],
         }
     subject["pending_semantic_attempt"] = attempt
-    history = subject.setdefault("semantic_attempt_history", [])
-    if not isinstance(history, list):
+    history = subject.get("semantic_attempt_history")
+    if history is None and not (isinstance(subject, JobProjection) and "semantic_attempt_history" in subject.archives):
+        history = subject.setdefault("semantic_attempt_history", [])
+    if history is not None and not isinstance(history, list):
         raise ValueError("semantic_attempt_history must be an array")
     return attempt
 
@@ -344,9 +347,7 @@ def close_semantic_attempt(
         operation_retry, dict
     ):
         completed["publication_operation_retry"] = deepcopy(operation_retry)
-    history = subject.setdefault("semantic_attempt_history", [])
-    if not isinstance(history, list):
-        raise ValueError("semantic_attempt_history must be an array")
+    history = history_for_append(subject, "semantic_attempt_history")
     history.append(completed)
     subject.pop("pending_semantic_attempt", None)
 
@@ -380,7 +381,9 @@ def retire_semantic_attempt_owner(
 ) -> None:
     """Keep bounded audit records when a current owner is removed from state."""
 
-    history = owner.get("semantic_attempt_history", [])
+    history = materialize_history(owner, "semantic_attempt_history")
+    if history is None:
+        history = []
     if not isinstance(history, list):
         raise ValueError("semantic_attempt_history must be an array")
     if not history:
@@ -432,7 +435,8 @@ def retire_semantic_attempt_owner(
         "effective_revision",
         "pr_number",
     ):
-        value = (budget_owner if key in {"review_budget_history", "ci_recovery", "integration_development_budget"} else owner).get(key)
+        source = budget_owner if key in {"review_budget_history", "ci_recovery", "integration_development_budget"} else owner
+        value = materialize_history(source, key) if key == "review_budget_history" else source.get(key)
         if value is not None:
             archive[key] = deepcopy(value)
     retired.append(archive)

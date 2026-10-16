@@ -14,6 +14,7 @@ import pytest
 
 from support.workspace import prepare_workspace
 
+from agent_run.work_projection import materialize_history
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
@@ -136,7 +137,7 @@ def test_worker_failure_before_publication_artifact_is_not_retried(
     assert retried["status"] == "run_approval_pending"
     assert retried["run_publication"]["publication_attempts"] == 1
     assert (
-        retried["run_publication"]["semantic_attempt_history"][-1]["attempt_id"]
+        materialize_history(retried["run_publication"], "semantic_attempt_history")[-1]["attempt_id"]
         == pending_attempt_id
     )
     assert retried["run_acceptance"]["phase"] == "accepted"
@@ -871,7 +872,7 @@ def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) ->
     published = engine.publish(str(state["run_id"]))
     assert published["status"] == "run_approval_pending"
     assert "write_intent" not in published["run_publication"]
-    prior_attempt = published["run_publication"]["semantic_attempt_history"][-1]
+    prior_attempt = materialize_history(published["run_publication"], "semantic_attempt_history")[-1]
     assert prior_attempt["publication_operation_retry"] == {
         "attempts": 1,
         "limit": 5,
@@ -915,7 +916,7 @@ def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) ->
     assert recovered["diagnostics"][0]["code"] == "final_run_pr_closed"
     assert recovered["run_publication"]["phase"] == "ready_for_human"
     assert recovered["run_publication"]["pr_number"] == published["run_publication"]["pr_number"]
-    assert recovered["run_publication"]["semantic_attempt_history"][0]["attempt_id"] == prior_attempt["attempt_id"]
+    assert materialize_history(recovered["run_publication"], "semantic_attempt_history")[0]["attempt_id"] == prior_attempt["attempt_id"]
     assert resumed_agents.requests == []
     assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == ["CLOSED"]
     assert resumed_engine.publish(str(state["run_id"]))["status"] == "ready_for_human"

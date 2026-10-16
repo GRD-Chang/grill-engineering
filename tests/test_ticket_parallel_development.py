@@ -11,7 +11,9 @@ from support.control_state import (
 
 import json
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Barrier, Event, Lock, Thread
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -46,6 +48,7 @@ from support.seeding import seed_run, write_fixture
 from support.cli import run_cli, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
+from support.ticket_execution import TicketExecution
 
 
 from support.ticket_parallel import (
@@ -785,12 +788,14 @@ def test_other_ticket_reviews_while_publication_agent_is_waiting(
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     publication_entered = Event()
     release_publication = Event()
-    release_second = Event()
+    review_entered = Event()
+    release_review = Event()
     second_ready = Event()
 
-    def develop(number: int) -> None:
+    def review(number: int) -> None:
         if number == 3:
-            assert release_second.wait(timeout=10)
+            review_entered.set()
+            assert release_review.wait(timeout=10)
 
     def publication_gate(number: int) -> None:
         if number == 2:
@@ -804,7 +809,8 @@ def test_other_ticket_reviews_while_publication_agent_is_waiting(
 
     states.run_saved_observer = observe
     agents = _TicketAgents(
-        git_repo, (2, 3), develop, before_publication=publication_gate,
+        git_repo, (2, 3), lambda _number: None,
+        before_publication=publication_gate, before_review=review,
     )
     orchestrator = DeliveryRunEngine(
         controller=Controller(FixtureGitHubReader(fixture), git, states),
@@ -822,14 +828,16 @@ def test_other_ticket_reviews_while_publication_agent_is_waiting(
     thread.start()
     try:
         assert publication_entered.wait(timeout=10)
-        release_second.set()
+        # 开发和 Git 准备不占用审核并行性的保存窗口。
+        assert review_entered.wait(timeout=10)
+        release_review.set()
         assert second_ready.wait(timeout=3), "Ticket 3 could not save during Publication"
         concurrent = states.load_current_run(str(state["run_id"]))
         assert concurrent is not None
         assert concurrent["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
         assert concurrent["ticket_integration_holder"] == 2
     finally:
-        release_second.set()
+        release_review.set()
         release_publication.set()
         thread.join(timeout=10)
     assert not thread.is_alive()
@@ -1310,13 +1318,15 @@ def test_one_worker_refills_in_fifo_order(git_repo: Path) -> None:
 
 
 def test_default_capacity_starts_three_without_starting_fourth(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, states, git, fixture = _run(git_repo, (2, 3, 4, 5))
     release = Event()
     all_started = Event()
     lock = Lock()
     started: list[int] = []
+    progress: Queue[tuple[int, str]] = Queue()
+    original_deliver = TicketDeliveryEngine.deliver_ticket
 
     def hold(number: int) -> None:
         with lock:
@@ -1324,31 +1334,54 @@ def test_default_capacity_starts_three_without_starting_fourth(
             if len(started) == 3:
                 all_started.set()
         assert release.wait(timeout=10), "development gate was not released"
+        progress.put((number, "developing"))
 
-    agents = _TicketAgents(git_repo, (2, 3, 4, 5), hold)
+    def observe_lane(
+        lane: TicketDeliveryEngine, run_id: str, number: int, *, complete: bool = True,
+    ) -> dict[str, Any]:
+        result = original_deliver(lane, run_id, number, complete=complete)
+        if result["active_ticket_job"]["phase"] == "ready_for_integration":
+            progress.put((number, "ready_for_integration"))
+        return result
+
+    monkeypatch.setattr(TicketDeliveryEngine, "deliver_ticket", observe_lane)
+    agents = _TicketAgents(
+        git_repo, (2, 3, 4, 5), hold,
+        before_review=lambda number: progress.put((number, "reviewing")),
+    )
     engine = _engine(git, states, fixture, agents)
-    errors: list[BaseException] = []
 
     def advance() -> None:
-        try:
-            assert engine.develop_frontier(str(state["run_id"]), state)
-        except BaseException as error:
-            errors.append(error)
+        assert engine.develop_frontier(str(state["run_id"]), state)
 
-    thread = Thread(target=advance)
-    thread.start()
-    try:
+    with TicketExecution(advance, release=release.set, name="default-ticket-capacity") as execution:
         assert all_started.wait(timeout=10), "three development lanes did not start"
         with lock:
             assert set(started) == {2, 3, 4}
         current = states.load_current_run(str(state["run_id"]))
         assert current is not None
         assert "5" not in current["ticket_agent_invocations"]
-    finally:
         release.set()
-        thread.join(timeout=10)
-    assert not thread.is_alive()
-    assert not errors, errors
+        # Real development, Git and review are preparation for the exit check.
+        # Require progress within each window and cap the whole preparation.
+        pending = {2, 3, 4, 5}
+        deadline = monotonic() + 30
+        while pending:
+            try:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise Empty
+                number, phase = progress.get(timeout=min(10, remaining))
+            except Empty:
+                current = states.load_scheduler_current_run(str(state["run_id"]))
+                phases = {
+                    number: current["ticket_jobs"].get(str(number), {}).get("phase")
+                    for number in sorted(pending)
+                } if current else None
+                pytest.fail(f"Ticket preparation stalled at {phases!r}: {execution.errors!r}")
+            if phase == "ready_for_integration":
+                pending.discard(number)
+        execution.finish(timeout=10)
     saved = states.load_current_run(str(state["run_id"]))
     assert saved is not None
     assert all(

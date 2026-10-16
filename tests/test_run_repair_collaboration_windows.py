@@ -53,10 +53,15 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
         with monkeypatch.context() as pause:
             pause.setattr(states, "_after_run_saved", stop_after_acceptance)
             try:
-                return RunAcceptanceEngine(
+                result = RunAcceptanceEngine(
                     git=git, states=states, agents=agents,
                     github=FixtureGitHubPublisher(fixture, git),
                 ).accept(str(state["run_id"]))
+                # This scenario compares retained windows across renewals.
+                # Request the complete evidence explicitly after each step.
+                complete = states.load_history_run(str(state["run_id"]))
+                assert complete is not None and complete["status"] == result["status"]
+                return complete
             except OSError as error:
                 assert str(error) == "interrupt before Run Branch update"
                 result = states.load_current_run(str(state["run_id"]))
@@ -127,7 +132,8 @@ def test_three_real_appends_preserve_repair_budget_until_explicit_renewal(
             assert renewed["run_acceptance"]["review_budget"]["development_attempts"] == 1
             assert renewed["run_acceptance"]["review_budget"]["reviewer_invocations"] == 0
             assert renewed["run_acceptance"]["review_budget"]["window"] == previous_budget["window"] + 1
-            assert len(renewed["run_acceptance"]["review_budget_history"]) == len(previous_history) + 1
+            renewed_history = states.load_history_run(str(state["run_id"]))["run_acceptance"]["review_budget_history"]
+            assert len(renewed_history) == len(previous_history) + 1
             assert renewed["run_acceptance"]["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 2
             waiting = accept()
             job = waiting["run_acceptance"]["repair_job"]

@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.work_projection import materialize_history
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
@@ -607,7 +608,8 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
     persisted = states.load_current_run(str(state["run_id"]))
     assert persisted is not None
     assert persisted["status"] == "waiting_external"
-    assert persisted["run_acceptance"] == run
+    assert current_projection_facts(persisted)["run_acceptance"] == current_projection_facts(waiting)["run_acceptance"]
+    assert materialize_history(run, "review_budget_history") == persisted["run_acceptance"]["review_budget_history"]
     assert persisted["supervision_window"] == waiting["supervision_window"]
     assert persisted["diagnostics"][0]["code"] == "github_check_evidence_fingerprint_pending"
 
@@ -1155,7 +1157,7 @@ def test_returned_run_review_survives_currentness_read_failure(
     assert "pending_semantic_attempt" not in run
     assert run["review_budget"]["reviewer_invocations"] == 1
     assert run["validation_attempts"] == 1
-    assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt_id
+    assert materialize_history(run, "semantic_attempt_history")[-1]["attempt_id"] == attempt_id
     if drift:
         assert run["phase"] == "pending"
         assert "acceptance_record" not in run
@@ -1239,7 +1241,7 @@ def test_returned_review_finishes_before_new_integration_work(
     run = result["run_acceptance"]
     assert "pending_review_result" not in run
     assert "pending_semantic_attempt" not in run
-    assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt
+    assert materialize_history(run, "semantic_attempt_history")[-1]["attempt_id"] == attempt
     assert run["review_budget"]["reviewer_invocations"] == 1
     assert len(agents.review_requests) == 1
     if next_integration == "unchanged":
@@ -1247,7 +1249,7 @@ def test_returned_review_finishes_before_new_integration_work(
         assert run["acceptance_record"]["reviewed_default_base_sha"] == target
     else:
         assert run["phase"] == "pending"
-        assert run["semantic_attempt_history"][-1]["outcome"] == "currentness_invalidated"
+        assert materialize_history(run, "semantic_attempt_history")[-1]["outcome"] == "currentness_invalidated"
         result = engine.accept(run_id)
         run = result["run_acceptance"]
         assert result["status"] == "ready_for_human"
@@ -1271,4 +1273,14 @@ def test_returned_review_finishes_before_new_integration_work(
             assert persisted_failure[f"{stream}_json"] == failure[f"{stream}_json"]
             assert stream not in failure
             assert stream not in persisted_failure
-    assert current_projection_facts(persisted) == current_projection_facts(result)
+    unrelated_ticket_fields = {
+        "pending_ticket_retirements", "retired_ticket_generations",
+        "ticket_agent_invocations", "ticket_pause_requests",
+    }
+    for field in unrelated_ticket_fields:
+        assert persisted[field] == saved[field]
+        assert field not in result
+    assert {
+        key: value for key, value in current_projection_facts(persisted).items()
+        if key not in unrelated_ticket_fields
+    } == current_projection_facts(result)

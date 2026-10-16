@@ -47,6 +47,25 @@ def test_reused_old_running_invocation_is_not_resume_progress(tmp_path: Path) ->
     assert feedback.result is None
 
 
+def test_unloaded_job_archives_do_not_turn_preflight_failure_into_an_old_human_gate(tmp_path: Path) -> None:
+    state = {"run_id": "run", "status": "ready_for_human", "parent_job": {
+        "phase": "blocked", "blocked_reason": "agent_requires_human", "human_blocker_phase": "reviewing",
+        "human_blockers": ["Original account access is still required"],
+        "semantic_attempt_history": [{"attempt_id": "original-review"}], "review_budget_history": [],
+        "reviewer_thread_ids": ["original-reviewer"],
+    }}
+    current = deepcopy(state)
+    for field in ("semantic_attempt_history", "review_budget_history", "reviewer_thread_ids"):
+        current["parent_job"].pop(field)
+    current["parent_job"]["_query_latest_reviewer_thread"] = "original-reviewer"
+    feedback = ResumeFeedback(tmp_path, state, lambda: current)
+    feedback.failure("Resume response cannot be blank", evidence="preflight")
+    projected = feedback.project(current)
+    assert projected["_manual_resume_result"]["outcome"] == "failed"
+    assert projected["_manual_resume_result"]["evidence"] == "preflight"
+    assert feedback.result["outcome"] == "failed"
+
+
 def test_immediate_human_boundary_takes_priority_over_start(tmp_path: Path) -> None:
     state: dict[str, Any] = {"run_id": "run", "status": "active"}
     feedback = ResumeFeedback(tmp_path, state, lambda: state)
@@ -143,6 +162,49 @@ def test_noncurrent_ticket_resume_gate_reports_target(tmp_path: Path, reason: st
     assert feedback.result is not None
     assert feedback.result["outcome"] == outcome
     assert feedback.result["ticket_number"] == 2
+
+
+@pytest.mark.parametrize("changed,value", [
+    ("work_subject", "ticket:3"), ("scope", "global"),
+    ("generation", 2), ("action_kind", "review_budget_checkpoint"),
+])
+def test_bound_resume_result_does_not_cross_current_gate_identity(
+    tmp_path: Path, changed: str, value: object,
+) -> None:
+    from agent_run.notification_events import events
+
+    initial = _parallel_state()
+    initial["ticket_jobs"]["2"].pop("last_ticket_resume")
+    feedback = ResumeFeedback(tmp_path, initial, lambda: initial, ticket_number=2)
+    blocked = deepcopy(initial)
+    blocked["ticket_jobs"]["2"].update(
+        phase="blocked", blocked_reason="reviewer_requires_human", human_blockers=["Access required."],
+    )
+    result = feedback.project(blocked)["_manual_resume_result"]
+    result[changed] = value
+    assert events({**blocked, "_manual_resume_result": result}) == events(blocked)
+
+
+@pytest.mark.parametrize("sibling_progress", [False, True])
+def test_projection_does_not_donate_a_later_gate_result_to_an_earlier_gate(
+    tmp_path: Path, sibling_progress: bool,
+) -> None:
+    earlier = _parallel_state()
+    earlier["ticket_jobs"]["2"].pop("last_ticket_resume")
+    earlier["ticket_jobs"]["2"].update(
+        phase="blocked", blocked_reason="reviewer_requires_human", human_blockers=["Earlier request."],
+    )
+    feedback = ResumeFeedback(tmp_path, earlier, lambda: earlier, ticket_number=2)
+    later = deepcopy(earlier)
+    later["ticket_jobs"]["2"]["human_blockers"] = ["Later request."]
+    feedback.observe(later)
+    assert feedback.result is not None and feedback.result["outcome"] == "human_action"
+    if sibling_progress:
+        earlier = deepcopy(earlier)
+        earlier["ticket_jobs"]["3"]["phase"] = "reviewing"
+    assert "_manual_resume_result" not in feedback.project(earlier)
+    assert feedback.project(later)["_manual_resume_result"]["outcome"] == "human_action"
+    assert feedback.result["outcome"] == "human_action"
 
 
 @pytest.mark.parametrize("thread,started", [(None, "2026-09-01T01:01:00+00:00"), (" ", "2026-09-01T01:01:00+00:00"), ("thread", "invalid")])

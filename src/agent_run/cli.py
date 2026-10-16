@@ -501,8 +501,9 @@ def _main_with_parser_resources(
             if isinstance(resume_notifications, dict) and resume_notifications.get("enabled") is True:
                 resume_feedback = ResumeFeedback(
                     states.root, selected_resume,
-                    lambda: states.load_current_run(parsed.run_id),
+                    lambda: states.load_observation_run(parsed.run_id),
                     ticket_number=parsed.ticket,
+                    query=lambda observation: states.load_notification_run(parsed.run_id, observation),
                 )
                 resources.callback(resume_feedback.close)
             selected_parent = selected_resume.get("parent")
@@ -1110,7 +1111,8 @@ def _main_with_parser_resources(
         elif diagnostic_code == "incompatible_run_state":
             diagnostic_message = (
                 "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
-                "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run"
+                "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run。"
+                f"原因：{bounded_error(str(error))}"
             )
         elif diagnostic_code == "multiple_unfinished_runs":
             diagnostic_message = (
@@ -3171,6 +3173,7 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
         state, exact_root, exact_state_root = load_exact_run(
             run_id, repository=parsed.repo, state_dir=parsed.state_dir,
             fixture=parsed.github_fixture,
+            history=parsed.command == "history", include_timing=parsed.command == "status",
         )
         return _with_executor_control(
             state, repository_root=exact_root, state_root=exact_state_root
@@ -3196,6 +3199,13 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
     )
     repository_root = public.get("repository_root")
     selected_state_dir = public.get("state_dir")
+    if parsed.command in {"status", "history"} and isinstance(selected_state_dir, str):
+        selected_store = StateStore(Path(selected_state_dir))
+        queried = (selected_store.load_history_run(str(state["run_id"])) if parsed.command == "history"
+                   else selected_store.load_status_run(str(state["run_id"])))
+        if queried is None:
+            raise ValueError(f"unknown Delivery Run: {state['run_id']}")
+        state = queried
     return _with_executor_control(
         state,
         repository_root=(
@@ -3777,6 +3787,7 @@ def _human_failure_reason(error: Exception, fallback: str, *, language: str = "z
 def _list_runs(parsed: argparse.Namespace) -> int:
     records = selector_records(
         repository=parsed.repo, state_dir=parsed.state_dir, fixture=parsed.github_fixture,
+        read_only=True,
     )
     parent = getattr(parsed, "parent", None)
     if parent is not None:
@@ -4121,6 +4132,7 @@ def _profile_state_root(parsed: argparse.Namespace) -> Path:
     _state, _repository_root, state_root = load_exact_run(
         parsed.run_id, repository=parsed.repo, state_dir=parsed.state_dir,
         fixture=parsed.github_fixture,
+        include_timing=False,
     )
     assert state_root is not None  # An exact Run always has a persisted location.
     return state_root

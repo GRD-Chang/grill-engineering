@@ -840,7 +840,7 @@
   "cli.delivery_candidates": "Candidate deliveries:",
   "cli.candidates_heading": "Candidates:",
   "cli.error.workspace_required": "Cannot locate the Git repository; enter the target repository and retry. Reason: {reason}",
-  "cli.error.incompatible_run_state": "Local Run state does not satisfy the current Invocation/Generation contract; no migration, compatibility read, or mutation will be performed. Recreate or clean up the Run",
+  "cli.error.incompatible_run_state": "Local Run state does not satisfy the current Invocation/Generation contract; no migration, compatibility read, or mutation will be performed. Recreate or clean up the Run. Reason: {reason}",
   "cli.error.executor_lost": "Executor exited; delivery state is preserved and unknown work will not be replayed automatically.",
   "cli.error.action_busy": "This delivery already has an unfinished operation; {reason}",
   "cli.error.executor_unknown": "Executor ownership cannot currently be confirmed; {reason}",

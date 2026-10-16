@@ -25,14 +25,15 @@ def test_parent_approval_is_persisted_as_an_independent_history_fact(git_repo: P
     )
     awaiting = engine.deliver(run_id)
     assert awaiting["status"] == "parent_approval_pending"
-    before_approval = deepcopy(awaiting["timeline"])
+    before_approval = deepcopy(states.load_history_run(run_id)["timeline"])
 
     completed = engine.approve(run_id)
 
     assert completed["status"] == "completed"
     granted_at = completed["parent_job"]["approval_grant"]["granted_at"]
-    assert any(event.get("approval_granted_at") == granted_at for event in completed["timeline"])
-    nodes = history_records(completed, {"timeline": completed["timeline"]})
+    timeline = states.load_history_run(run_id)["timeline"]
+    assert any(event.get("approval_granted_at") == granted_at for event in timeline)
+    nodes = history_records(completed, {"timeline": timeline})
     approved = [node for node in nodes if node["status_text"] == "已批准"]
     assert len(approved) == 1
     assert approved[0]["ended_at"] == granted_at

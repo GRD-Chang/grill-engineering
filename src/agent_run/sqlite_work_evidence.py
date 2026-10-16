@@ -12,6 +12,9 @@ import json
 import sqlite3
 from typing import Any
 
+from agent_run.state_limits import consume_query_bytes, consume_query_rows
+from agent_run.sqlite_query_rows import bounded_query, bounded_rows
+
 
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 RETURN_MEMBERS = frozenset({"summary", "artifact", "human_blockers", "thread_id", "publication_fields"})
@@ -61,7 +64,7 @@ def _insert(
     if not owner or not kind:
         raise ValueError("Work evidence requires an owner and purpose")
     evidence_id = _identity(owner, kind, digest, source, member)
-    previous = connection.execute(
+    previous = bounded_query(connection,
         "SELECT evidence_id,value_digest,value_bytes,material_id,source_evidence_id,source_member "
         "FROM work_evidence WHERE run_id=? AND evidence_id=?", (run_id, evidence_id),
     ).fetchone()
@@ -70,7 +73,7 @@ def _insert(
         if previous != expected:
             raise ValueError("Immutable work evidence was changed")
         return evidence_id
-    version = connection.execute(
+    version = bounded_query(connection,
         "SELECT COALESCE(MAX(version),0)+1 FROM work_evidence WHERE run_id=? AND owner_id=? AND kind=?",
         (run_id, owner, kind),
     ).fetchone()[0]
@@ -85,7 +88,7 @@ def put_evidence(
     connection: sqlite3.Connection, run_id: str, owner_id: str, kind: str, payload: Any,
 ) -> str:
     body, digest, size = _encoded(payload)
-    previous = connection.execute(
+    previous = bounded_query(connection,
         "SELECT typeof(body),byte_length,LENGTH(CAST(body AS BLOB)) "
         "FROM work_evidence_materials WHERE material_id=?", (digest,),
     ).fetchone()
@@ -94,6 +97,8 @@ def put_evidence(
     else:
         if previous != ("text", size, size):
             raise ValueError("Immutable work evidence material was changed")
+        consume_query_rows()
+        consume_query_bytes(size)
         stored = connection.execute("SELECT body FROM work_evidence_materials WHERE material_id=?", (digest,)).fetchone()[0]
         if stored != body:
             raise ValueError("Immutable work evidence material was changed")
@@ -101,7 +106,7 @@ def put_evidence(
 
 
 def evidence_size(connection: sqlite3.Connection, run_id: str, evidence_id: str) -> int:
-    row = connection.execute(
+    row = bounded_query(connection,
         "SELECT value_bytes FROM work_evidence WHERE run_id=? AND evidence_id=?", (run_id, evidence_id),
     ).fetchone()
     if row is None or type(row[0]) is not int or not 0 <= row[0] <= MAX_EVIDENCE_BYTES:
@@ -136,13 +141,21 @@ def _get(
 ) -> Any:
     if evidence_id in visited or len(visited) >= 8:
         raise ValueError("Invalid work evidence reference cycle")
-    row = connection.execute(
-        "SELECT owner_id,kind,version,value_digest,value_bytes,material_id,source_evidence_id,source_member "
-        "FROM work_evidence WHERE run_id=? AND evidence_id=?", (run_id, evidence_id),
-    ).fetchone()
+    # Identity and actual material lengths belong to the same caller snapshot.
+    # Read their narrow headers together; the body remains behind both the
+    # ownership/length checks and the query-budget admission below.
+    columns = ("owner_id", "kind", "version", "value_digest", "value_bytes", "material_id",
+               "source_evidence_id", "source_member", "material_type", "material_bytes", "actual_bytes")
+    row = next(bounded_rows(connection,
+        "SELECT e.owner_id,e.kind,e.version,e.value_digest,e.value_bytes,e.material_id,"
+        "e.source_evidence_id,e.source_member,typeof(m.body) AS material_type,"
+        "m.byte_length AS material_bytes,LENGTH(CAST(m.body AS BLOB)) AS actual_bytes "
+        "FROM work_evidence e LEFT JOIN work_evidence_materials m ON m.material_id=e.material_id "
+        "WHERE e.run_id=? AND e.evidence_id=?", (run_id, evidence_id), columns,
+    ), None)
     if row is None:
         raise ValueError("Missing owned work evidence")
-    owner, purpose, version, digest, size, material, source, member = row
+    owner, purpose, version, digest, size, material, source, member = row[:8]
     if (not isinstance(owner, str) or not isinstance(purpose, str)
             or owner_id is not None and owner != owner_id or kind is not None and purpose != kind
             or type(version) is not int or version < 1
@@ -150,22 +163,23 @@ def _get(
             or evidence_id != _identity(owner, purpose, digest, source, member)):
         raise ValueError("Invalid work evidence identity, owner or version")
     if source is not None:
-        if material is not None or member not in RETURN_MEMBERS:
+        if material is not None or member not in RETURN_MEMBERS | {"response"}:
             raise ValueError("Invalid Agent return member reference")
-        original = _get(connection, run_id, source, owner_id=None, kind="returned_result", visited=visited | {evidence_id})
-        value = _return_member(original, member)
+        purpose = "human_response_history" if member == "response" else "returned_result"
+        original = _get(connection, run_id, source, owner_id=None, kind=purpose, visited=visited | {evidence_id})
+        value = _human_response(original) if member == "response" else _return_member(original, member)
         _, actual_digest, actual_size = _encoded(value)
         if (actual_digest, actual_size) != (digest, size):
             raise ValueError("Invalid Agent return member evidence")
         return value
     if material != digest or member is not None:
         raise ValueError("Invalid work evidence material reference")
-    metadata = connection.execute(
-        "SELECT typeof(body),byte_length,LENGTH(CAST(body AS BLOB)) "
-        "FROM work_evidence_materials WHERE material_id=?", (material,),
-    ).fetchone()
-    if metadata != ("text", size, size):
+    if row[8:] != ("text", size, size):
         raise ValueError("Missing or invalid work evidence byte length")
+    # The join returns two stored headers in one SQL row. Admit the material
+    # header and body in addition to the already metered owner header.
+    consume_query_rows(2)
+    consume_query_bytes(size)
     body = connection.execute("SELECT body FROM work_evidence_materials WHERE material_id=?", (material,)).fetchone()[0]
     if hashlib.sha256(body.encode("utf-8")).hexdigest() != digest:
         raise ValueError("Invalid work evidence material digest")
@@ -189,9 +203,64 @@ def put_job_material(
 ) -> str:
     from agent_run.sqlite_work_execution import find_result_reference
 
+    if field == "current_human_response":
+        _, digest, _ = _encoded(value)
+        retained = bounded_query(connection,
+            "SELECT evidence_id FROM work_evidence WHERE run_id=? AND owner_id=? AND kind=? "
+            "AND value_digest=? AND source_member='response' ORDER BY version DESC LIMIT 1",
+            (run_id, "job:" + job_id, field, digest),
+        ).fetchone()
+        if retained is not None:
+            if get_evidence(connection, run_id, retained[0], owner_id="job:" + job_id, kind=field) != value:
+                raise ValueError("Immutable human response was changed")
+            return str(retained[0])
+        response = bounded_query(connection,
+            "SELECT a.evidence_id FROM work_job_archives a JOIN work_jobs j USING(run_id,job_id) "
+            "WHERE a.run_id=? AND a.job_id=? AND a.history_kind='human_response_history' "
+            "ORDER BY a.position DESC LIMIT 1", (run_id, job_id),
+        ).fetchone()
+        if response is not None:
+            expected_owner = "job:" + job_id
+            owner_row = bounded_query(connection,
+                "SELECT evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id),
+            ).fetchone()
+            if owner_row is not None:
+                expected_owner = "job:" + owner_row[0]
+            original = get_evidence(connection, run_id, response[0], owner_id=expected_owner,
+                                    kind="human_response_history")
+            if _human_response(original) == value:
+                return put_human_response_member(connection, run_id, "job:" + job_id,
+                                                 response[0], source_owner_id=expected_owner,
+                                                 kind=field)
     source = find_result_reference(connection, run_id, job_id, field, value)
     if source is not None:
         evidence_id, owner, kind, member = source
         get_evidence(connection, run_id, evidence_id, owner_id=owner, kind=kind)
         return put_evidence_member(connection, run_id, "job:" + job_id, field, evidence_id, member)
     return put_evidence(connection, run_id, "job:" + job_id, field, value)
+
+
+def _human_response(original: Any) -> str:
+    if (not isinstance(original, dict) or not isinstance(original.get("response"), str)
+            or not original["response"].strip()):
+        raise ValueError("Missing original human response")
+    return str(original["response"])
+
+
+def put_human_response_member(
+    connection: sqlite3.Connection, run_id: str, owner_id: str, source_evidence_id: str,
+    *, source_owner_id: str | None = None, kind: str = "human_response",
+) -> str:
+    """Reference one exact Job response; arbitrary evidence paths are forbidden."""
+    owned = bounded_query(connection,
+        "SELECT owner_id FROM work_evidence WHERE run_id=? AND evidence_id=?",
+        (run_id, source_evidence_id),
+    ).fetchone()
+    if (owned is None or not isinstance(owned[0], str) or not owned[0].startswith("job:")
+            or source_owner_id is not None and owned[0] != source_owner_id):
+        raise ValueError("Human response belongs to another Job")
+    original = get_evidence(connection, run_id, source_evidence_id, owner_id=owned[0],
+                            kind="human_response_history")
+    _, digest, size = _encoded(_human_response(original))
+    return _insert(connection, run_id, owner_id, kind, digest, size,
+                   source=source_evidence_id, member="response")

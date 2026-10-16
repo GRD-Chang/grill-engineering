@@ -28,7 +28,11 @@ def require_mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def require_string_list(data: dict[str, Any], key: str) -> list[str]:
-    value = data.get(key, [])
+    from agent_run.work_projection import materialize_history
+
+    value = materialize_history(data, key)
+    if value is None and key not in data:
+        value = []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{key} must contain strings")
     return list(value)

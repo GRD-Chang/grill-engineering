@@ -64,7 +64,7 @@ def test_existing_action_reentry_applies_intent_exactly_once(
     if window != "unbound":
         control.bind_run(task, claim.action_id, run_id, generation=reservation.generation)
     if window == "applied":
-        initial["test_applied_intents"] = [kind]
+        initial["diagnostics"] = [{"code": "applied_lifecycle_intent", "message": kind}]
         prepare_action_application_receipt(initial, claim.action)
         persist_run_fixture(states, run_id, initial)
     selected = []
@@ -75,9 +75,9 @@ def test_existing_action_reentry_applies_intent_exactly_once(
         record = control.load(task)
         assert record["action"]["run_id"] == run_id
         state = StateStore(states.root).load_current_run(run_id)
-        state.setdefault("test_applied_intents", []).append(kind)
+        state.setdefault("diagnostics", []).append({"code": "applied_lifecycle_intent", "message": kind})
         prepare_action_application_receipt(state, action)
-        save_owned(StateStore(states.root), run_id, state, fields={'action_application_receipt', 'test_applied_intents'})
+        save_owned(StateStore(states.root), run_id, state, fields={'action_application_receipt', 'diagnostics'})
         return state, True
 
     def execute(actual_run):
@@ -86,7 +86,7 @@ def test_existing_action_reentry_applies_intent_exactly_once(
 
     lifecycle = _executor(states, task, control, claim, reservation, select, execute)
     final, _, _ = lifecycle.execute_claimed(action_id=claim.action_id, generation=reservation.generation)
-    assert final["test_applied_intents"] == [kind]
+    assert final["diagnostics"] == [{"code": "applied_lifecycle_intent", "message": kind}]
     assert selected == ([] if window == "applied" else [kind])
     # approve requires real approval authority; a receipt alone must not dispatch.
     assert executed == ([] if kind == "approve" else [run_id])

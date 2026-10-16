@@ -10,13 +10,13 @@ import pytest
 
 from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.state_limits import MAX_QUERY_BYTES
 
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
 from agent_run.state import (
     ConcurrentRunStateError,
     MAX_DIAGNOSTIC_BYTES,
     MAX_DIAGNOSTIC_ENTRIES,
-    MAX_RUN_STATE_BYTES,
     MAX_TIMELINE_CONTINUATION_EVENTS,
     MAX_TIMELINE_EVENTS,
     StateStore,
@@ -48,7 +48,9 @@ def test_shared_save_sanitizer_keeps_path_and_diagnostic_rules() -> None:
 
 def test_run_state_saves_only_sqlite_and_reopens_the_same_data(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    state = {"nested": [{"message": "中文状态", "values": [1, True, None]}]}
+    state = {"parent_job": {"review_context": {
+        "checks": [{"message": "中文状态", "values": [1, True, None]}],
+    }}}
     store.save_run("run-1", state)
     assert StateStore(store.root).load_run("run-1") == state
     assert (store.root / "state.sqlite3").is_file()
@@ -62,7 +64,7 @@ def test_legacy_json_is_rejected_without_reading_or_migrating(tmp_path: Path) ->
     path.write_bytes(b"{broken legacy state")
     before = path.read_bytes()
     for operation in (lambda: store.load_run("run-1"),
-                      lambda: store.save_run("run-1", {"version": 1}),
+                      lambda: store.save_run("run-1", {"status": "created"}),
                       lambda: store.find_run("example/project", 1)):
         with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
             operation()
@@ -103,35 +105,35 @@ def test_requirement_body_keeps_credential_redaction(tmp_path: Path, body: str) 
 
 def test_initial_save_refuses_to_replace_existing_work(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    store.save_run("run-1", {"version": 1})
+    store.save_run("run-1", {"status": "created"})
     with pytest.raises(ValueError, match="already exists"):
-        store.save_run("run-1", {"version": 2})
-    assert StateStore(store.root).load_run("run-1") == {"version": 1}
-    existing, created = store.create_run_if_absent("run-1", {"version": 3})
-    assert not created and existing == {"version": 1}
+        store.save_run("run-1", {"status": "active"})
+    assert StateStore(store.root).load_run("run-1") == {"status": "created"}
+    existing, created = store.create_run_if_absent("run-1", {"status": "completed"})
+    assert not created and existing == {"status": "created"}
 
 
 def test_owned_commit_rejects_a_concurrent_object_write(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state")
-    store.save_run("run-1", {"version": 1})
-    save_owned(store, "run-1", {"version": 2}, fields={"version"}, expected={"version": 1})
-    save_owned(StateStore(store.root), "run-1", {"version": 3}, fields={"version"})
+    store.save_run("run-1", {"status": "created"})
+    save_owned(store, "run-1", {"status": "active"}, fields={"status"}, expected={"status": "created"})
+    save_owned(StateStore(store.root), "run-1", {"status": "paused"}, fields={"status"})
     with pytest.raises(ConcurrentRunStateError, match="changed"):
-        save_owned(store, "run-1", {"version": 4}, fields={"version"}, expected={"version": 2})
-    assert store.load_run("run-1") == {"version": 3}
+        save_owned(store, "run-1", {"status": "completed"}, fields={"status"}, expected={"status": "active"})
+    assert store.load_run("run-1") == {"status": "paused"}
 
 
 def test_run_state_persistence_rejects_oversized_write_and_read(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state")
-    with pytest.raises(ValueError, match="persistence limit"):
-        store.save_run("run-large", {"payload": "x" * MAX_RUN_STATE_BYTES})
+    with pytest.raises(ValueError, match="current record"):
+        store.save_run("run-large", {"phase": "x" * (256 * 1024)})
     assert not (store.runs_directory / "run-large.json").exists()
 
     store.runs_directory.mkdir(parents=True, exist_ok=True)
     oversized = store.runs_directory / "run-external.json"
-    oversized.write_bytes(b" " * (MAX_RUN_STATE_BYTES + 1))
+    oversized.write_bytes(b" " * 4097)
     with pytest.raises(IncompatibleRunStateError, match="legacy JSON"):
         store.load_run("run-external")
 
@@ -177,27 +179,28 @@ def test_state_save_preserves_shared_input_while_redacting_its_durable_copy(
         "detail": "token=private-value",
         "environment": {"LOCAL_VALUE": "ephemeral-value"},
     }
-    state = {"first": shared, "nested": [{"second": shared}]}
+    context = {"first": shared, "nested": [{"second": shared}]}
+    state = {"parent_job": {"review_context": context}}
     before = deepcopy(state)
 
     store.save_run("run-1", state)
 
     assert state == before
-    assert state["first"] is state["nested"][0]["second"]
+    assert context["first"] is context["nested"][0]["second"]
     expected = {
         "values": [None, True, 3, 1.25, "中文状态"],
         "detail": "token=[REDACTED]",
     }
-    assert store.load_run("run-1") == {
+    assert store.load_run("run-1")["parent_job"]["review_context"] == {
         "first": expected, "nested": [{"second": expected}],
     }
 
 
 @pytest.mark.parametrize("diagnostic_first", [False, True])
 def test_repeated_text_keeps_contextual_redaction_and_resource_isolation(
-    tmp_path: Path, diagnostic_first: bool,
+    diagnostic_first: bool,
 ) -> None:
-    store = StateStore(tmp_path)
+    from agent_run.state import _sanitize_durable_errors
     message = "prefix " + "中文" * 3000 + " token=private-value"
     resource = {"method": "token=personal-instruction", "environment": "keep"}
     diagnostic = {"message": message, "token": "private-value"}
@@ -216,11 +219,9 @@ def test_repeated_text_keeps_contextual_redaction_and_resource_isolation(
     })
     before = deepcopy(state)
 
-    store.save_run("run-1", state)
+    saved = _sanitize_durable_errors(state)
 
     assert state == before
-    saved = store.load_run("run-1")
-    assert saved is not None
     assert saved["ordinary"] == "prefix " + "中文" * 3000 + " token=[REDACTED]"
     assert len(saved["diagnostics"][0]["message"].encode()) <= 8192
     assert saved["diagnostics"][0]["token"] == "[REDACTED]"
@@ -235,10 +236,8 @@ def test_repeated_text_keeps_contextual_redaction_and_resource_isolation(
     assert saved["untrusted"]["token"] == "[REDACTED]"
     resource["method"] = "updated instruction"
     state["repeated"][0] = "token=changed-private-value"
-    save_owned(store, "run-1", state, fields={"prompt_resources", "repeated"})
+    updated = _sanitize_durable_errors(state)
     assert saved["prompt_resources"]["method"] == "token=personal-instruction"
-    updated = store.load_run("run-1")
-    assert updated is not None
     assert updated["prompt_resources"]["method"] == "updated instruction"
     assert updated["repeated"] == ["token=[REDACTED]"] * 300
 
@@ -247,14 +246,14 @@ def test_scalar_leaves_keep_redaction_bounds_and_json_types(tmp_path: Path) -> N
     store = StateStore(tmp_path)
     message = "中文" * 3000
     leaves = {"empty": "", "null": None, "boolean": False, "integer": 2, "float": 1.5}
-    state = {
+    context = {
         "leaves": leaves,
         "list": [leaves, "", "token=private", None, False, 2, 1.5],
         "ordinary": message,
         "nested": {"diagnostics": message, "failure_error": message},
     }
-    store.save_run("leaves", state)
-    saved = store.load_run("leaves")
+    store.save_run("leaves", {"parent_job": {"review_context": context}})
+    saved = store.load_run("leaves")["parent_job"]["review_context"]
     assert saved is not None
     assert saved["leaves"] == leaves
     assert saved["list"] == [leaves, "", "token=[REDACTED]", None, False, 2, 1.5]
@@ -268,37 +267,37 @@ def test_saved_history_does_not_share_nested_values_with_the_callers_payload(
     tmp_path: Path, container: type[list] | type[tuple],
 ) -> None:
     store = StateStore(tmp_path)
-    shared = [{"message": "original"}]
+    shared = [{"name": "CI", "state": "passed"}]
     state = {
-        "run_id": "run-1", "status": "created", "payload": shared,
+        "run_id": "run-1", "status": "created", "parent_job": {"review_context": {"checks": shared}},
         "timeline": [{
             "at": "2026-09-12T00:00:00+00:00", "kind": "run_status",
-            "status": "created", "context": container([shared]),
+            "status": "created", "required_checks_evidence": {"checks": container(shared)},
         }],
     }
 
     store.save_run("run-1", state)
-    state["timeline"][0]["context"][0][0]["message"] = "edited history"
+    state["timeline"][0]["required_checks_evidence"]["checks"][0]["name"] = "edited history"
 
-    assert shared == [{"message": "original"}]
+    assert shared == [{"name": "CI", "state": "passed"}]
     persisted = store.load_run("run-1")
     assert persisted is not None
-    assert persisted["payload"] == [{"message": "original"}]
-    assert persisted["timeline"][0]["context"] == [[{"message": "original"}]]
+    assert persisted["parent_job"]["review_context"]["checks"] == shared
+    assert persisted["timeline"][0]["required_checks_evidence"]["checks"] == shared
 
 
 def test_unserializable_extension_keeps_the_previous_durable_state(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path)
-    store.save_run("run-1", {"version": 1})
-    unsupported = {"version": 2, "extension": {"not-json"}}
+    store.save_run("run-1", {"parent_job": {"phase": "developing"}})
+    unsupported = {"parent_job": {"phase": "reviewing", "review_context": {"not-json"}}}
 
     with pytest.raises(TypeError, match="not JSON serializable"):
-        save_owned(store, "run-1", unsupported, fields={"version", "extension"})
+        save_owned(store, "run-1", unsupported, fields={"parent_job"})
 
-    assert unsupported == {"version": 2, "extension": {"not-json"}}
-    assert store.load_run("run-1") == {"version": 1}
+    assert unsupported == {"parent_job": {"phase": "reviewing", "review_context": {"not-json"}}}
+    assert store.load_run("run-1") == {"parent_job": {"phase": "developing"}}
     assert not list(store.runs_directory.glob("*.tmp"))
 
 
@@ -337,16 +336,16 @@ def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
                 },
             }
         ],
-        "extension": {
-            "environment": {"GH_TOKEN": credential},
-            "credentials": {"token": credential},
-            "transcript": raw_output,
-            "raw-output": raw_output,
-            "full_transcript": raw_output,
-            "raw_output_bytes": raw_output,
-            "credential_bundle": {"session_cookie": credential},
-        },
-        "active_ticket_job": {
+        "parent_job": {
+            "review_context": {
+                "environment": {"GH_TOKEN": credential},
+                "credentials": {"token": credential},
+                "transcript": raw_output,
+                "raw-output": raw_output,
+                "full_transcript": raw_output,
+                "raw_output_bytes": raw_output,
+                "credential_bundle": {"session_cookie": credential},
+            },
             "candidate_commit_intent": {"token": "candidate-intent-nonce"}
         },
         "credential_availability": {
@@ -366,15 +365,16 @@ def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
     ) <= MAX_DIAGNOSTIC_BYTES
     assert credential.encode() not in persisted_bytes
     assert b"raw-output-sentinel" not in persisted_bytes
-    assert "environment" not in persisted["extension"]
-    assert "transcript" not in persisted["extension"]
-    assert "raw-output" not in persisted["extension"]
-    assert "full_transcript" not in persisted["extension"]
-    assert "raw_output_bytes" not in persisted["extension"]
-    assert persisted["extension"]["credentials"] == "[REDACTED]"
-    assert persisted["extension"]["credential_bundle"] == "[REDACTED]"
+    context = persisted["parent_job"]["review_context"]
+    assert "environment" not in context
+    assert "transcript" not in context
+    assert "raw-output" not in context
+    assert "full_transcript" not in context
+    assert "raw_output_bytes" not in context
+    assert context["credentials"] == "[REDACTED]"
+    assert context["credential_bundle"] == "[REDACTED]"
     assert (
-        persisted["active_ticket_job"]["candidate_commit_intent"]["token"]
+        persisted["parent_job"]["candidate_commit_intent"]["token"]
         == "candidate-intent-nonce"
     )
     assert persisted["credential_availability"] == {
@@ -455,13 +455,13 @@ def test_run_locator_atomic_replace_preserves_previous_index(
 
 def test_interrupted_transaction_preserves_previous_state(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
-    store.save_run("run-1", {"attempt": 1})
-    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_RUN_STATE_BYTES)
+    store.save_run("run-1", {"retired_parent_generation": 1})
+    repository = SQLiteStateRepository(tmp_path, max_bytes=MAX_QUERY_BYTES)
     with pytest.raises(OSError, match="simulated interruption"):
         with repository.atomic():
-            repository.save_objects("run-1", {"attempt": 2}, fields={"attempt"})
+            repository.save_objects("run-1", {"retired_parent_generation": 2}, fields={"retired_parent_generation"})
             raise OSError("simulated interruption")
-    assert StateStore(tmp_path).load_run("run-1") == {"attempt": 1}
+    assert StateStore(tmp_path).load_run("run-1") == {"retired_parent_generation": 1}
     assert not list(tmp_path.glob("*journal"))
 
 
@@ -710,11 +710,11 @@ def test_identity_reference_survives_state_redaction(tmp_path: Path, identity: d
     store = StateStore(tmp_path)
     store.save_run("identity", {"github_identity": identity,
                                "creation_configuration": {"github_identity": identity},
-                               "extension": {"env": {"CUSTOM_WORKER_PAT": "secret"}}})
+                               "parent_job": {"review_context": {"env": {"CUSTOM_WORKER_PAT": "secret"}}}})
     persisted = store.load_run("identity")
     assert persisted["github_identity"] == identity
     assert persisted["creation_configuration"]["github_identity"] == identity
-    assert persisted["extension"] == {}
+    assert persisted["parent_job"]["review_context"] == {}
     with pytest.raises(ValueError):
         store.save_run("identity", {"github_identity": {**identity, "token": "secret"}})
     assert store.load_run("identity") == persisted

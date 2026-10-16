@@ -9,6 +9,7 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitRepository
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.review_evidence import same_review_requirements
+from agent_run.work_projection import materialize_history
 
 _REQUEST_FACTS = (
     "acceptance_scope", "parent_issue_url", "task_issue_url", "parent", "ticket",
@@ -58,7 +59,7 @@ def prepare_review_context(
     if isinstance(artifact, dict) and previous_candidate:
         parsed = AcceptanceArtifact.parse(artifact)
         for owner in [job, *semantic_attempt_subjects(state)]:
-            for prior in reversed(owner.get("semantic_attempt_history", [])):
+            for prior in reversed(materialize_history(owner, "semantic_attempt_history", [])):
                 old = prior.get("review_context")
                 if not isinstance(old, dict) or prior.get("outcome") != "acceptance_artifact":
                     continue

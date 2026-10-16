@@ -6,6 +6,8 @@ import pytest
 
 from agent_run.graph import state_from_graph
 from agent_run.models import DeliveryGraph, Issue, ParentIssue
+from agent_run.review_budget import TICKET_POLICY, ensure_budget, new_budget
+from agent_run.work_projection import JobProjection
 
 
 def _graph(*, parent_only: bool = False) -> DeliveryGraph:
@@ -60,3 +62,24 @@ def test_closed_issue_without_ticket_completion_cannot_enter_parent_stage() -> N
     assert result["diagnostics"][0]["remaining_tickets"] == [
         {"ticket_number": 2, "reason": "ticket_closed"},
     ]
+
+
+@pytest.mark.parametrize("active_source", [False, True])
+def test_graph_refresh_keeps_exact_unread_budget_scope(active_source: bool) -> None:
+    job = JobProjection({"ticket_number": 2, "phase": "completed", "review_budget": new_budget(window=501)},
+                        job_id="ticket:2:generation:1", revision=7,
+                        archives={"review_budget_history": (1_000_000, 500)})
+    previous = {"ticket_jobs": {"2": job}}
+    if active_source:
+        previous["active_ticket_job"] = job
+
+    refreshed = state_from_graph(previous, _graph())
+    retained = refreshed["ticket_jobs"]["2"]
+
+    assert retained is not job
+    assert retained.job_id == job.job_id
+    assert retained.revision == job.revision
+    assert ensure_budget(retained, TICKET_POLICY)["window"] == 501
+    assert "review_budget_history" not in retained
+    with pytest.raises(ValueError, match="missing canonical review_budget_history"):
+        ensure_budget(dict(retained), TICKET_POLICY)

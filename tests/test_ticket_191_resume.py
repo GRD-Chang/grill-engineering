@@ -34,6 +34,8 @@ import agent_run.cli as cli_module
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run.executor_host import ExecutorSpec, HostObservation
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.state import StateStore
+from agent_run.sqlite_watcher import SQLiteWatcher
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_supervision import _interrupt_run, _parent_only_agents
 from support.seeding import write_fixture
@@ -94,14 +96,44 @@ def _wait_for_agent_barrier(process: subprocess.Popen[str], started: Path) -> No
 
 
 def _wait_for_run_status(git_repo: Path, expected: str) -> dict[str, object]:
-    deadline = time.monotonic() + 5
-    while True:
-        durable = load_only_run_state(git_repo)
-        if durable.get("status") == expected:
-            return durable
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"detached Resume Executor did not reach {expected}")
-        time.sleep(0.01)
+    states = StateStore(managed_state(git_repo))
+    run_ids = states.list_run_ids()
+    assert len(run_ids) == 1
+    run_id = run_ids[0]
+    overall_deadline = time.monotonic() + 30
+    progress_deadline = time.monotonic() + 5
+    with SQLiteWatcher(states._repository.path) as watcher:
+        previous = None
+        previous_progress = None
+        while True:
+            # Bound stalled business work separately from the whole real Git /
+            # review / publication flow under six concurrent test workers.
+            # A Control heartbeat alone cannot extend this progress deadline.
+            version = watcher.version()
+            if version != previous:
+                with states._repository.use_reader(watcher.connection):
+                    current = states._repository.load_fields(run_id, {"status", "parent_job"})
+                assert current is not None
+                previous = version
+                job = current.get("parent_job") or {}
+                progress = (current.get("status"), job.get("phase"), getattr(job, "revision", None))
+                if progress != previous_progress:
+                    previous_progress = progress
+                    progress_deadline = time.monotonic() + 5
+                if current.get("status") == expected:
+                    durable = states.load_run(run_id)
+                    assert durable is not None and durable.get("status") == expected
+                    return durable
+            if time.monotonic() >= min(overall_deadline, progress_deadline):
+                durable = states.load_run(run_id)
+                assert durable is not None
+                raise AssertionError(
+                    f"detached Resume Executor stalled for 5s or exceeded 30s before {expected}; "
+                    f"status={durable.get('status')!r}, "
+                    f"phase={durable.get('parent_job', {}).get('phase')!r}, "
+                    f"diagnostics={durable.get('diagnostics')!r}"
+                )
+            time.sleep(0.01)
 
 
 def _assert_single_resume_action(git_repo: Path) -> None:
@@ -279,8 +311,8 @@ def test_duplicate_human_blocker_resume_uses_normalized_message_identity(
         assert duplicate.returncode == 0, duplicate.stderr
         assert stdout_json(duplicate)["action"]["submission"] == "attached"
         release.touch()
-        first.communicate(timeout=5)
         durable = _wait_for_run_status(git_repo, "parent_approval_pending")
+        first.communicate(timeout=5)
         assert durable["resume_audit"]["total"] == 1
         assert durable["parent_job"]["review_budget"]["development_attempts"] == 1
         resumed_invocations = [
@@ -380,8 +412,8 @@ def test_duplicate_budget_window_resume_keeps_first_explicit_policy_identity(
         assert duplicate.returncode == 0, duplicate.stderr
         assert stdout_json(duplicate)["action"]["submission"] == "attached"
         release.touch()
-        first.communicate(timeout=5)
         durable = _wait_for_run_status(git_repo, "parent_approval_pending")
+        first.communicate(timeout=5)
         policy = durable["policy_snapshot"]
         assert policy["ticket_review_rounds"] == 3
         assert policy["invocation_deadlines"]["development"] == 1

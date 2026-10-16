@@ -178,7 +178,19 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
     )
     state, _ = controller.start(1)
     if incompatibility == "legacy":
-        state["schema_version"] = 1
+        from support.lifecycle import _file_snapshot
+
+        # The previous SQLite protocol is rejected before Controller work;
+        # removed generic Run keys cannot represent an old database anymore.
+        with store._repository.atomic():
+            store._repository._local.connection.execute(
+                "UPDATE schema_meta SET value='sqlite-work-records-v5' WHERE key='protocol'"
+            )
+        before_files = _file_snapshot(store.root)
+        with pytest.raises(IncompatibleRunStateError, match="SQLite Run state protocol"):
+            controller.resume(str(state["run_id"]))
+        assert _file_snapshot(store.root) == before_files
+        return
     elif incompatibility == "missing_prompts":
         state.pop("prompt_resources")
     elif incompatibility == "missing_language":

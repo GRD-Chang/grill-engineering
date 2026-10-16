@@ -71,14 +71,20 @@ if os.environ.get('NOTIFICATION_TEST_STATE_READ_FAILURE'):
     messages = Path(os.environ['NOTIFICATION_TEST_MESSAGES'])
     marker = messages.with_suffix('.fault')
     original_init = Notifications.__init__
-    def initialize(self, root, state, *, load_state=None):
-        def load():
+    def initialize(self, root, state, *, load_state=None, query_state=None):
+        def fail_once():
             records = notification_outbox.read_notifications(root, state['run_id']).get('records', [])
             if any(item['kind'] == 'run_start' and item['outcome'] == 'success' for item in records) and not marker.exists():
                 marker.write_text('temporary state read failure')
                 raise OSError('temporary state read failure')
+        def load():
+            fail_once()
             return load_state()
-        original_init(self, root, state, load_state=load if load_state else None)
+        def query(observation):
+            fail_once()
+            return query_state(observation)
+        original_init(self, root, state, load_state=load if load_state else None,
+                      query_state=query if query_state else None)
     Notifications.__init__ = initialize
 raise SystemExit(main(sys.argv[1:]))
 """

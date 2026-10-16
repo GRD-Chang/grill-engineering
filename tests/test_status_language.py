@@ -12,10 +12,12 @@ from rich.text import Text
 
 from agent_run import cli
 from agent_run.run_locator import RunLocatorIndex
+from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
-from support.state import persist_run_fixture
+from support.state import current_query_fixture, persist_run_fixture
 from support.workspace import prepare_workspace
 from support.lifecycle import _file_snapshot
+from support.cli import failed_invocation
 
 
 class TerminalOutput(StringIO):
@@ -25,6 +27,7 @@ class TerminalOutput(StringIO):
 
 def _save_run(repo: Path, state: dict[str, Any]) -> Path:
     workspace = prepare_workspace(repo)
+    state.update(current_query_fixture(state, language=None))
     persist_run_fixture(StateStore(workspace.state_root), state["run_id"], state)
     RunLocatorIndex.default().register(
         run_id=state["run_id"],
@@ -59,7 +62,7 @@ def test_delivery_progress_preserves_audit(
     publication: str | None, expected: str,
 ) -> None:
     state = {
-        "run_id": "run-progress", "schema_version": 1, "language": "zh",
+        "run_id": "run-progress", "language": "zh",
         "repository": "example/project", "parent": {"number": 1},
         "delivery_type": mode, "status": status, "diagnostics": [],
     }
@@ -90,12 +93,15 @@ def test_delivery_progress_preserves_audit(
     with redirect_stdout(audit_output):
         assert cli.main(["status", state["run_id"], "--json"]) == 0
     progress = json.loads(audit_output.getvalue())["progress"]
-    assert set(progress) == {
+    expected_fields = {
         "repository", "parent", "status", "phase", "current_object",
         "ticket_progress", "round_progress", "integration_resync", "integration_development", "ci_recovery",
         "run_repair", "elapsed_seconds",
         "current_agent", "execution_activity", "scheduler", "findings", "conclusion", "next_action",
     }
+    if mode != "parent_only":
+        expected_fields.add("multi_ticket")
+    assert set(progress) == expected_fields
     assert progress["ticket_progress"] == {
         "completed": completed, "total": 2 if completed else 0,
     }
@@ -183,7 +189,7 @@ def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduli
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
 ) -> None:
     state = {
-        "run_id": "run-cleanup-not-scheduled", "schema_version": 1, "language": "zh",
+        "run_id": "run-cleanup-not-scheduled", "language": "zh",
         "repository": "example/project", "parent": {"number": 1},
         "status": "completed", "run_branch": "agent-run/final-delivery",
         "run_publication": {
@@ -218,7 +224,7 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
 ) -> None:
     state = {
-        "run_id": "run-language", "schema_version": 1, "language": "zh", "repository": "example/project",
+        "run_id": "run-language", "language": "zh", "repository": "example/project",
         "parent": {"number": 1, "title": "整体需求"}, "status": "completed",
         "run_acceptance": {
             "phase": "accepted", "candidate_sha": "accepted-head",
@@ -233,6 +239,9 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
         },
         "run_publication": {"phase": "merged", "head_sha": "accepted-head"},
         "agent_invocation_history": [{
+            **failed_invocation(work_subject="run-publication:run-language", role="final_publication",
+                                phase="run_publication", status="completed"),
+            "error": None, "return_code": 0,
             "role": "final_publication", "work_subject": "run-publication:run-language",
             "status": "completed", "model": "gpt-5.6-luna", "reasoning_effort": "xhigh",
             "started_at": "2026-09-12T15:20:14.737344+00:00",
@@ -288,9 +297,25 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, status: str, command: str,
 ) -> None:
     state = {
-        "run_id": "run-action-language", "schema_version": 1, "language": "zh", "repository": "example/project",
+        "run_id": "run-action-language", "language": "zh", "repository": "example/project",
         "parent": {"number": 1}, "status": status, "diagnostics": [],
     }
+    if status == "unsupported_scope_change":
+        state.update({
+            "parent": {"number": 1, "revision": "parent-revision"},
+            "ticket_graph": {
+                "revision": "accepted-graph", "ordered_ticket_numbers": [], "tickets": {},
+            },
+            "accepted_parent_spec_revision": "parent-revision",
+            "accepted_ticket_graph_revision": "accepted-graph",
+        })
+        state = reconcile_structure(state, {
+            "parent": {"number": 1, "revision": "parent-revision"},
+            "ticket_graph": {
+                "revision": "observed-graph", "ordered_ticket_numbers": [2],
+                "tickets": {"2": {"blocked_by": []}},
+            },
+        })
     root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
@@ -317,7 +342,7 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool, language: str,
 ) -> None:
     state = {
-        "run_id": "run-repair-language", "schema_version": 1, "language": language, "repository": "example/project",
+        "run_id": "run-repair-language", "language": language, "repository": "example/project",
         "parent": {"number": 1}, "status": "ready_for_human", "diagnostics": [],
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 31,
@@ -332,7 +357,10 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
             },
         },
         "agent_invocation_history": [{
-            "role": "reviewer", "work_subject": "run-repair:run-repair-language",
+            **failed_invocation(work_subject="run-repair:run-repair-language", role="fresh_acceptance",
+                                phase="reviewing", generation=99, status="completed"),
+            "error": None, "return_code": 0,
+            "role": "fresh_acceptance", "work_subject": "run-repair:run-repair-language",
             "status": "completed", "model": "review-model", "reasoning_effort": "high",
             "started_at": "2026-09-12T15:20:00+00:00", "ended_at": "2026-09-12T15:21:00+00:00",
         }],
@@ -375,11 +403,12 @@ def test_status_json_is_identical_across_run_languages(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = {
-        "run_id": "run-json-language", "schema_version": 1,
+        "run_id": "run-json-language",
         "repository": "example/project", "parent": {"number": 1, "title": "等待人工处理 / raw title"},
         "status": "execution_failed", "diagnostics": [],
         "active_ticket_job": {"ticket_number": 2, "phase": "execution_failed"},
     }
+    state["ticket_jobs"] = {"2": state["active_ticket_job"]}
     monkeypatch.chdir(git_repo)
     outputs = []
     for language in ("zh", "en"):
@@ -398,7 +427,7 @@ def test_missing_run_language_is_reported_without_guessing_or_writing(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = {
-        "run_id": "run-missing-language", "schema_version": 1,
+        "run_id": "run-missing-language",
         "repository": "example/project", "parent": {"number": 1},
         "status": "active", "diagnostics": [],
     }
@@ -423,9 +452,9 @@ def test_ticket_ci_status_reports_cumulative_budget_without_fake_acceptance(
     budget.update(developments_used=2, failure_head="failed-head")
     job = {"ticket_number": 2, "phase": "repairing", "policy_snapshot": default_delivery_policy().snapshot(),
            "ci_recovery": budget, "ci_evidence": {"head_sha": "failed-head", "checks": []}}
-    state = {"run_id": "ticket-ci-status", "schema_version": 1, "language": language,
+    state = {"run_id": "ticket-ci-status", "language": language,
              "repository": "example/project", "parent": {"number": 1}, "status": "active",
-             "active_ticket_job": job, "diagnostics": []}
+             "active_ticket_job": job, "ticket_jobs": {"2": job}, "diagnostics": []}
     root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)

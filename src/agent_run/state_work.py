@@ -1,4 +1,5 @@
 """Normalize and validate related work before a sparse SQLite commit."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -14,14 +15,20 @@ from agent_run.ticket_state import capture_ticket_wait
 
 
 def save_work(
-    repository: SQLiteStateRepository, run_id: str, state: dict[str, Any],
-    baseline: dict[str, Any], ticket_number: int | None,
+    repository: SQLiteStateRepository,
+    run_id: str,
+    state: dict[str, Any],
+    baseline: dict[str, Any],
+    ticket_number: int | None,
 ) -> dict[str, Any]:
     """Preserve untouched objects, including history absent from this view."""
     invocation = state.get("active_agent_invocation")
     job = state.get("active_ticket_job")
-    if (isinstance(job, dict) and isinstance(invocation, dict)
-            and invocation.get("work_subject") == f"ticket:{job['ticket_number']}"):
+    if (
+        isinstance(job, dict)
+        and isinstance(invocation, dict)
+        and invocation.get("work_subject") == f"ticket:{job['ticket_number']}"
+    ):
         state["ticket_agent_invocations"][str(job["ticket_number"])] = deepcopy(invocation)
     capture_ticket_wait(state)
     from agent_run.ticket_work import reconcile
@@ -44,10 +51,11 @@ def save_work(
         # Preserve exactly unchanged fields, just as unchanged root objects
         # above are preserved. New/changed fields still traverse the original
         # sanitizer at the same path, including credential-key exceptions.
-        changed = {key: item for key, item in value.items()
-                   if key not in previous or not _same(item, previous[key])}
-        return {**{key: item for key, item in value.items() if key not in changed},
-                **sanitize({"value": changed})["value"]}
+        changed = {key: item for key, item in value.items() if key not in previous or not _same(item, previous[key])}
+        return {
+            **{key: item for key, item in value.items() if key not in changed},
+            **sanitize({"value": changed})["value"],
+        }
 
     for key, value in state.items():
         if value == baseline.get(key) and key in baseline:
@@ -55,12 +63,14 @@ def save_work(
         if key in {"ticket_jobs", "ticket_agent_invocations"}:
             previous = baseline.get(key, {})
             durable[key] = {
-                identity: (sanitize_object(item, previous.get(identity))
-                           if item != previous.get(identity) else item)
+                identity: (sanitize_object(item, previous.get(identity)) if item != previous.get(identity) else item)
                 for identity, item in value.items()
             }
         else:
             durable[key] = sanitize({key: value})[key]
+    from agent_run.work_projection import restore_work_scopes
+
+    restore_work_scopes(durable, state)
     # Timeline uses the actual committing Ticket, irrespective of selection.
     # Appending/trimming changes the list, never an existing event. Detach the
     # list without copying every old event before adding the new marker.
@@ -72,8 +82,7 @@ def save_work(
         before = _ticket_view(baseline, ticket_number)
         after = _ticket_view(durable, ticket_number)
     timelines = repository.work_timelines()
-    timeline_updates = (sqlite_timeline.append_events(after, before, timelines)
-                        if timelines else {})
+    timeline_updates = sqlite_timeline.append_events(after, before, timelines) if timelines else {}
     if not timelines:
         _append_timeline_event(after, before)
     for key in ("timeline", "timeline_continuation", "timeline_at_capacity"):
@@ -81,20 +90,31 @@ def save_work(
             durable[key] = after[key]
             state[key] = copy_json_tree(after[key])
     require_current_work_state(
-        durable, repository.work_archives(durable), repository.work_attempts(durable), timelines,
+        durable,
+        repository.work_archives(durable),
+        repository.work_attempts(durable),
+        timelines,
     )
     gates_changed = repository.save_work(run_id, durable, baseline, timeline_updates=timeline_updates)
+    restore_work_scopes(state, durable, preserve_owner_references=True)
+    for key in ("resume_audit", "human_response_audit"):
+        if key in durable:
+            state[key] = copy_json_tree(durable[key])
     if gates_changed:
         # A resumed condition can reveal another retained gate. Validate the
         # committed projection before this same transaction may publish it.
         require_current_work_state(
-            durable, repository.work_archives(durable), repository.work_attempts(durable), timelines,
+            durable,
+            repository.work_archives(durable),
+            repository.work_attempts(durable),
+            timelines,
         )
         from agent_run.sqlite_change_job_schema import GATE_FIELDS
 
         owners = [(state.get("active_ticket_job"), durable.get("active_ticket_job"))]
-        owners.extend((job, durable.get("ticket_jobs", {}).get(key))
-                      for key, job in state.get("ticket_jobs", {}).items())
+        owners.extend(
+            (job, durable.get("ticket_jobs", {}).get(key)) for key, job in state.get("ticket_jobs", {}).items()
+        )
         for target, saved in owners:
             if isinstance(target, dict) and isinstance(saved, dict):
                 for key in GATE_FIELDS:
@@ -120,10 +140,17 @@ def _ticket_view(state: dict[str, Any], number: int) -> dict[str, Any]:
         view.update(wait)
     elif job.get("phase") == "blocked":
         view["status"] = (
-            "ready_for_human" if job.get("blocked_reason") in {
-                "agent_requires_human", "reviewer_requires_human",
-            } else "blocked"
+            "ready_for_human"
+            if job.get("blocked_reason")
+            in {
+                "agent_requires_human",
+                "reviewer_requires_human",
+            }
+            else "blocked"
         )
-    elif not isinstance(state.get("active_ticket_job"), dict) or state["active_ticket_job"].get("ticket_number") != number:
+    elif (
+        not isinstance(state.get("active_ticket_job"), dict)
+        or state["active_ticket_job"].get("ticket_number") != number
+    ):
         view["status"] = "active"
     return view

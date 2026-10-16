@@ -5,6 +5,7 @@ relations as Jobs, Attempts and Invocations. Views
 join the same SQLite read snapshot, and writes join the existing authorized
 transaction; this module grants no execution or settlement permission.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -16,11 +17,16 @@ from agent_run import sqlite_change_jobs as jobs
 from agent_run import sqlite_work_execution as execution
 from agent_run import sqlite_work_evidence as evidence
 from agent_run import sqlite_run_records as roots
+from agent_run.sqlite_query_rows import bounded_query
 
 
-INVOCATION_FIELDS = frozenset({
-    "active_agent_invocation", "ticket_agent_invocations", "agent_invocation_history",
-})
+INVOCATION_FIELDS = frozenset(
+    {
+        "active_agent_invocation",
+        "ticket_agent_invocations",
+        "agent_invocation_history",
+    }
+)
 FIELDS = frozenset(jobs.FIELDS) | INVOCATION_FIELDS | roots.FIELDS
 TABLES = {**evidence.TABLES, **jobs.TABLES, **execution.TABLES, **roots.TABLES}
 INDEXES = {**evidence.INDEXES, **jobs.INDEXES, **execution.INDEXES, **roots.INDEXES}
@@ -45,7 +51,8 @@ def _base(base: dict[str, Any]) -> dict[str, Any]:
 
 def _resume_ids(state: Mapping[str, Any]) -> set[str]:
     return {
-        item["resume_id"] for item in state.get("resume_audit", {}).get("history", [])
+        item["resume_id"]
+        for item in state.get("resume_audit", {}).get("history", [])
         if isinstance(item, dict) and isinstance(item.get("resume_id"), str)
     }
 
@@ -59,34 +66,47 @@ def _related_tickets(state: Mapping[str, Any], requested: set[int] | None) -> se
     if type(holder) is int:
         numbers.add(holder)
     for field in ("ticket_work_queue", "ticket_integration_queue"):
-        numbers.update(item["ticket_number"] for item in state.get(field, [])
-                       if isinstance(item, dict) and type(item.get("ticket_number")) is int)
+        numbers.update(
+            item["ticket_number"]
+            for item in state.get(field, [])
+            if isinstance(item, dict) and type(item.get("ticket_number")) is int
+        )
     summary = state.get("unsupported_scope_change", {})
     if isinstance(summary, dict):
         summary = summary.get("graph_change_summary", {})
         if isinstance(summary, dict):
-            numbers.update(number for number in summary.get("reopened_completed_tickets", [])
-                           if type(number) is int)
+            numbers.update(number for number in summary.get("reopened_completed_tickets", []) if type(number) is int)
     return numbers
 
 
 def load_complete(
-    connection: sqlite3.Connection, run_id: str, base: dict[str, Any],
+    connection: sqlite3.Connection,
+    run_id: str,
+    base: dict[str, Any],
 ) -> dict[str, Any]:
     state = _base(base)
     state.update(roots.load(connection, run_id))
     state.update(jobs.load_jobs(connection, run_id, include_history=True))
     invocations, _ = execution.load_invocations(
-        connection, run_id, current_only=False, history=True,
+        connection,
+        run_id,
+        current_only=False,
+        history=True,
     )
     state.update(invocations)
     return state
 
 
 def load_objects(
-    connection: sqlite3.Connection, run_id: str, base: dict[str, Any], *,
-    excluded_fields: set[str], related_tickets: bool,
-    ticket_numbers: set[int] | None, scheduler_tickets: bool, max_bytes: int,
+    connection: sqlite3.Connection,
+    run_id: str,
+    base: dict[str, Any],
+    *,
+    excluded_fields: set[str],
+    related_tickets: bool,
+    ticket_numbers: set[int] | None,
+    scheduler_tickets: bool,
+    max_bytes: int,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     state = _base(base)
     fields = set(FIELDS) - excluded_fields
@@ -95,47 +115,73 @@ def load_objects(
     state.update(roots.load(connection, run_id, fields=(fields - maps if scoped else fields) & roots.FIELDS))
     if related_tickets or ticket_numbers is not None or scheduler_tickets:
         fields.update({"ticket_jobs", "ticket_agent_invocations"})
-    selected_number = (jobs.selected_ticket_number(connection, run_id)
-                       if "active_ticket_job" in fields else None)
-    selection = ({"active_ticket_job": {"ticket_number": selected_number}}
-                 if selected_number is not None else {})
-    numbers = (_related_tickets({**state, **selection}, ticket_numbers)
-               if related_tickets or ticket_numbers is not None else None)
-    selected = jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
-                              ticket_numbers=(set() if scheduler_tickets else
-                                              ticket_numbers if ticket_numbers is not None else numbers),
-                              include_history=not scheduler_tickets and ticket_numbers is None)
+    selected_number = jobs.selected_ticket_number(connection, run_id) if "active_ticket_job" in fields else None
+    selection = {"active_ticket_job": {"ticket_number": selected_number}} if selected_number is not None else {}
+    numbers = (
+        _related_tickets({**state, **selection}, ticket_numbers)
+        if related_tickets or ticket_numbers is not None
+        else None
+    )
+    if numbers is not None:
+        for (key,) in bounded_query(connection, "SELECT r.reference_key FROM work_invocation_current r "
+            "JOIN work_invocations v USING(run_id,work_subject,started_at) "
+            "WHERE r.run_id=? AND r.reference_kind='ticket' AND v.status IN ('running','resuming')",
+            (run_id,),
+        ):
+            numbers.add(int(key))
+    selected = jobs.load_jobs(
+        connection,
+        run_id,
+        fields=fields & jobs.FIELDS,
+        ticket_numbers=set() if scheduler_tickets else numbers,
+        include_history=False,
+        current_only=True,
+        filter_tickets=not scheduler_tickets,
+    )
     state.update(selected)
     if scoped:
-        state.update(roots.load(connection, run_id, fields=maps,
-                                keyed_changes={field: {str(number) for number in numbers or ()} for field in maps
-                                               if not scheduler_tickets or field != "retired_ticket_generations"}))
+        state.update(
+            roots.load(
+                connection,
+                run_id,
+                fields=maps,
+                keyed_changes={
+                    field: {str(number) for number in numbers or ()}
+                    for field in maps
+                    if not scheduler_tickets or field != "retired_ticket_generations"
+                },
+            )
+        )
     invocations, positions = execution.load_invocations(
-        connection, run_id,
-        ticket_numbers=None if scheduler_tickets or ticket_numbers is not None else numbers,
-        current_only=True, resume_ids=_resume_ids(state), history=True,
+        connection,
+        run_id,
+        ticket_numbers=None if scheduler_tickets else numbers,
+        current_only=True,
+        resume_ids=_resume_ids(state),
+        history=True,
     )
     state.update((key, value) for key, value in invocations.items() if key in fields)
     return state, positions
 
 
 def load_work(
-    connection: sqlite3.Connection, run_id: str, base: dict[str, Any], ticket_number: int | None,
+    connection: sqlite3.Connection,
+    run_id: str,
+    base: dict[str, Any],
+    ticket_number: int | None,
 ) -> tuple[dict[str, Any], dict[str, tuple[int, int]], dict[str, dict[str, Any]]]:
     state = _base(base)
     state.update(roots.load(connection, run_id))
     targets = {ticket_number} if ticket_number is not None else set()
-    state.update(jobs.load_jobs(connection, run_id, ticket_numbers=targets, include_history=False))
+    state.update(jobs.load_jobs(connection, run_id, ticket_numbers=targets, include_history=False, current_only=True))
     current, _ = execution.load_invocations(
-        connection, run_id, current_only=True, resume_ids=_resume_ids(state), history=ticket_number is None,
+        connection,
+        run_id,
+        current_only=True,
+        resume_ids=_resume_ids(state),
+        history=True,
+        history_ticket_numbers=targets if ticket_number is not None else None,
     )
-    if ticket_number is not None:
-        target, _ = execution.load_invocations(
-            connection, run_id, ticket_numbers=targets, current_only=True,
-            resume_ids=_resume_ids(state), history=True,
-        )
-        if "agent_invocation_history" in target:
-            current["agent_invocation_history"] = target["agent_invocation_history"]
     state.update(current)
     archives = jobs.read_job_archives(connection, run_id, state)
     related = jobs.read_related_attempts(connection, run_id, state, archives)
@@ -143,36 +189,63 @@ def load_work(
 
 
 def load_fields(
-    connection: sqlite3.Connection, run_id: str, base: dict[str, Any], fields: set[str],
-    *, ticket_numbers: set[int] | None = None, root_keys: Mapping[str, set[str]] | None = None,
+    connection: sqlite3.Connection,
+    run_id: str,
+    base: dict[str, Any],
+    fields: set[str],
+    *,
+    ticket_numbers: set[int] | None = None,
+    root_keys: Mapping[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     state = _base(base)
     state.update(roots.load(connection, run_id, fields=fields & roots.FIELDS, keyed_changes=root_keys))
-    state.update(jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
-                               ticket_numbers=ticket_numbers, include_history=True))
+    state.update(
+        jobs.load_jobs(
+            connection,
+            run_id,
+            fields=fields & jobs.FIELDS,
+            ticket_numbers=ticket_numbers,
+            include_history=False,
+            current_only=True,
+            filter_tickets=True,
+        )
+    )
     if fields & INVOCATION_FIELDS:
         current, _ = execution.load_invocations(
-            connection, run_id, ticket_numbers=ticket_numbers,
-            current_only="agent_invocation_history" not in fields, history="agent_invocation_history" in fields,
+            connection,
+            run_id,
+            ticket_numbers=ticket_numbers,
+            current_only="agent_invocation_history" not in fields,
+            history="agent_invocation_history" in fields,
         )
         state.update((key, value) for key, value in current.items() if key in fields)
     return state
 
 
 def save(
-    connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any], baseline: Mapping[str, Any],
-    *, fields: set[str], keyed_changes: Mapping[str, set[str]] | None = None,
+    connection: sqlite3.Connection,
+    run_id: str,
+    state: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    *,
+    fields: set[str],
+    keyed_changes: Mapping[str, set[str]] | None = None,
 ) -> None:
     # Inputs precede Job bindings; closeout/requeue references follow their
     # source Job changes in this same transaction. Remove a retired reference
     # first when the transaction explicitly completes that transition.
     deferred = fields & {"requeue_transition", "run_abandonment", "delivery_cleanup"}
     removed = {field for field in deferred if state.get(field) is None}
-    roots.save(connection, run_id, state, baseline, fields=(fields & roots.FIELDS) - deferred | removed,
-               keyed_changes=keyed_changes)
+    roots.save(
+        connection,
+        run_id,
+        state,
+        baseline,
+        fields=(fields & roots.FIELDS) - deferred | removed,
+        keyed_changes=keyed_changes,
+    )
     if fields & jobs.FIELDS:
-        jobs.save_jobs(connection, run_id, state, baseline,
-                       fields=fields & jobs.FIELDS, keyed_changes=keyed_changes)
+        jobs.save_jobs(connection, run_id, state, baseline, fields=fields & jobs.FIELDS, keyed_changes=keyed_changes)
     if deferred - removed:
         roots.save(connection, run_id, state, baseline, fields=deferred - removed)
     if fields & INVOCATION_FIELDS:
@@ -191,33 +264,54 @@ def save(
         # Consuming an Attempt can release its old Invocation details even
         # when this commit has no new Invocation facts of its own.
         from agent_run.sqlite_work_execution_retention import compact_details
+
         compact_details(connection, run_id)
-    if connection.execute("SELECT 1 FROM run_requeue_transition WHERE run_id=?", (run_id,)).fetchone():
+    if bounded_query(connection, "SELECT 1 FROM run_requeue_transition WHERE run_id=?", (run_id,)).fetchone():
         roots.load_requeue(connection, run_id)
 
 
 def project_saved_gates(
-    connection: sqlite3.Connection, run_id: str, state: dict[str, Any], *,
-    fields: set[str], keyed_changes: Mapping[str, set[str]] | None = None,
+    connection: sqlite3.Connection,
+    run_id: str,
+    state: dict[str, Any],
+    *,
+    fields: set[str],
+    keyed_changes: Mapping[str, set[str]] | None = None,
 ) -> tuple[bool, set[str]]:
     """Read committed owner gates, then mirror only the selected owner."""
     from agent_run.sqlite_change_job_gates import reconcile_selected_gate
 
-    owners, revealed = jobs.project_current_gates(connection, run_id, state, fields=fields, keyed_changes=keyed_changes)
+    owners, revealed = jobs.project_current_gates(
+        connection, run_id, state, fields=fields, keyed_changes=keyed_changes
+    )
     return bool(owners), reconcile_selected_gate(state, revealed)
 
 
 def baseline_for_save(
-    connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any], fields: set[str],
+    connection: sqlite3.Connection,
+    run_id: str,
+    state: Mapping[str, Any],
+    fields: set[str],
     keyed_changes: Mapping[str, set[str]] | None,
     archive_scope: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
-    numbers = {int(number) for field in ("ticket_jobs", "ticket_agent_invocations")
-               for number in (keyed_changes or {}).get(field, set())}
+    numbers = {
+        int(number)
+        for field in ("ticket_jobs", "ticket_agent_invocations")
+        for number in (keyed_changes or {}).get(field, set())
+    }
     baseline = roots.load(connection, run_id, fields=fields & roots.FIELDS, keyed_changes=keyed_changes)
-    baseline.update(jobs.load_jobs(connection, run_id, fields=fields & jobs.FIELDS,
-                              ticket_numbers=numbers if numbers else None, include_history=True, archive_scope=archive_scope)
-                    )
+    baseline.update(
+        jobs.load_jobs(
+            connection,
+            run_id,
+            fields=fields & jobs.FIELDS,
+            ticket_numbers=numbers if numbers else None,
+            include_history=True,
+            archive_scope=archive_scope,
+            repair_budget_scopes=jobs.projection_repair_budget_scopes(state),
+        )
+    )
     if archive_scope is None:
         # A direct owned patch carries no proof that omitted history was read.
         # Only an explicit projection scope may describe a loaded deletion.
@@ -240,8 +334,12 @@ def baseline_for_save(
         # Only the caller's referenced Invocation identities participate in an
         # object commit. The writer checks every changed row against SQLite.
         invocations, _ = execution.load_invocations(
-            connection, run_id, ticket_numbers=numbers if numbers else None,
-            current_only=True, resume_ids=_resume_ids(state), history=True,
+            connection,
+            run_id,
+            ticket_numbers=numbers if numbers else None,
+            current_only=True,
+            resume_ids=_resume_ids(state),
+            history=True,
         )
         baseline.update(invocations)
     return baseline
@@ -252,7 +350,9 @@ def append_archive(connection: sqlite3.Connection, run_id: str, field: str, item
 
 
 def object_scope(
-    connection: sqlite3.Connection, run_id: str, state: Mapping[str, Any],
+    connection: sqlite3.Connection,
+    run_id: str,
+    state: Mapping[str, Any],
 ) -> tuple[dict[str, tuple[int, int]], dict[str, dict[str, Any]]]:
     archives = jobs.read_job_archives(connection, run_id, state)
     return archives, jobs.read_related_attempts(connection, run_id, state, archives)

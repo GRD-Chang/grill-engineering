@@ -29,6 +29,41 @@ from agent_run.object_state import save_owned
 from support.seeding import write_fixture
 
 
+@pytest.mark.parametrize("changed", [None, "phase", "deadline"])
+def test_ticket_timeout_compares_current_owner_facts_across_archive_scopes(
+    monkeypatch: pytest.MonkeyPatch, changed: str | None,
+) -> None:
+    from copy import deepcopy
+    from agent_run.work_projection import JobProjection
+
+    window = {"identity": "current-checks", "deadline": 30}
+    job = {"ticket_number": 3, "ticket_branch_generation": 1, "phase": "waiting_checks",
+           "external_wait": {"supervision_window": window}}
+    selected = JobProjection(deepcopy(job), job_id="ticket:3:generation:1", revision=64,
+                             archives={"reviewer_thread_ids": (15, 1)})
+    selected["reviewer_thread_ids"] = ["original-reviewer"]
+    if changed == "phase":
+        selected["phase"] = "completed"
+    if changed == "deadline":
+        selected["external_wait"]["supervision_window"]["deadline"] = 60
+    current = {"active_ticket_job": selected}
+    scoped = SimpleNamespace(load_current_run=lambda _run_id: current)
+    paused = []
+    monkeypatch.setattr("agent_run.ticket_state.TicketState", lambda *_args: scoped)
+    monkeypatch.setattr("agent_run.ticket_supervision.pause_ticket_supervision", lambda owner, value: paused.append((owner, value)))
+    state = {"active_ticket_job": job, "multi_ticket_protocol": 4,
+             "supervision_wait": window, "diagnostics": [{"code": "supervision_timeout"}]}
+    driver = SimpleNamespace(states=object())
+    if changed is not None:
+        with pytest.raises(TaskControlBusyError, match="Ticket changed before supervision timeout"):
+            RunDriver._pause_ticket_supervision(driver, "run-1", state)
+        assert not paused
+    else:
+        assert RunDriver._pause_ticket_supervision(driver, "run-1", state)
+        assert paused == [(scoped, current)]
+        assert current["supervision_wait"] == window
+
+
 @pytest.mark.parametrize(
     ("state", "expected_kind", "expected_step"),
     [

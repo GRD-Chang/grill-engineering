@@ -17,6 +17,7 @@ import pytest
 from agent_run.object_state import object_store, save_owned
 from agent_run.executor_host import _process_start_token
 from agent_run.run_lifecycle import prepare_action_application_receipt
+from agent_run.review_budget import new_budget
 from agent_run.sqlite_runtime import require_wal_runtime
 from agent_run.state import StateStore
 from agent_run.state_commits import lifecycle_commits
@@ -78,12 +79,18 @@ def test_process_exit_commits_control_and_business_together(
 ) -> None:
     root = tmp_path / "state"
     control, task, action, _ = _reserved(root)
-    old = {"run_id": "run-1", "repository": "example/project", "parent": {"number": 1},
-           "job": {"phase": "developing"}, "budget": 1, "invocations": ["running"]}
+    old = {
+        "run_id": "run-1", "repository": "example/project", "parent": {"number": 1},
+        "parent_job": {"phase": "developing", "review_budget": new_budget(development_attempts=1)},
+        "active_agent_invocation": {"work_subject": "parent-only:run-1", "generation": 1,
+                                    "started_at": "2026-10-16T00:00:00+00:00", "status": "running"},
+    }
     if not creation:
         StateStore(root).save_run("run-1", old)
     before = deepcopy(control.load(task))
-    new = {**old, "job": {"phase": "candidate"}, "budget": 2, "invocations": ["completed"]}
+    new = deepcopy(old)
+    new["parent_job"].update(phase="candidate", review_budget=new_budget(development_attempts=2))
+    new["active_agent_invocation"].update(status="completed", ended_at="2026-10-16T00:01:00+00:00")
     prepare_action_application_receipt(new, action)
     script = """
 import json, os, sqlite3, sys
@@ -93,13 +100,14 @@ from agent_run.state import StateStore
 from agent_run.object_state import save_owned
 root, creation, committed, encoded = sys.argv[1:5]
 connect = sqlite3.connect
-class CutConnection(sqlite3.Connection):
-    def commit(self):
-        if committed == "yes":
-            super().commit()
-        os._exit(71)
 def open_connection(*args, **kwargs):
-    kwargs.setdefault("factory", CutConnection)
+    base = kwargs.get("factory", sqlite3.Connection)
+    class CutConnection(base):
+        def commit(self):
+            if committed == "yes":
+                super().commit()
+            os._exit(71)
+    kwargs["factory"] = CutConnection
     return connect(*args, **kwargs)
 sqlite3.connect = open_connection
 states = StateStore(Path(root))
@@ -107,7 +115,7 @@ state = json.loads(encoded)
 if creation == "yes":
     states.save_run("run-1", state)
 else:
-    save_owned(states, "run-1", state, fields={"job", "budget", "invocations", "action_application_receipt"})
+    save_owned(states, "run-1", state, fields={"parent_job", "active_agent_invocation", "action_application_receipt"})
 """
     child = subprocess.run(
         [sys.executable, "-c", script, str(root), "yes" if creation else "no",
@@ -132,7 +140,8 @@ else:
 def test_invalid_application_rolls_back_business_and_control(tmp_path: Path) -> None:
     control, task, action, _ = _reserved(tmp_path)
     before = control.load(task)
-    state = {"run_id": "run-1", "repository": "example/project", "parent": {"number": 1}, "budget": 2}
+    state = {"run_id": "run-1", "repository": "example/project", "parent": {"number": 1},
+             "parent_job": {"phase": "candidate", "review_budget": new_budget(development_attempts=2)}}
     prepare_action_application_receipt(state, action)
     state["action_application_receipt"]["executor_generation"] += 1
     with pytest.raises(ValueError, match="ownership"):
@@ -150,10 +159,10 @@ def test_outer_control_rollback_invalidates_provisional_projection_and_notificat
     claim = control.claim_action(task, kind="run", payload={})
     action = claim.action
     generation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id).generation
-    save_owned(store, run_id, {"counter": 1}, fields={"counter"})
+    save_owned(store, run_id, {"updated_at": "2026-10-16T00:00:00+00:00"}, fields={"updated_at"})
     objects = object_store(store)
     projection = objects.load_run(run_id)
-    projection["counter"] = 2
+    projection["updated_at"] = "2026-10-16T00:01:00+00:00"
     notifications = []
     store.run_saved_observer = notifications.append
     with pytest.raises(OSError, match="outer commit"):
@@ -162,14 +171,14 @@ def test_outer_control_rollback_invalidates_provisional_projection_and_notificat
         ):
             objects.save_run(run_id, projection)
             raise OSError("outer commit failed")
-    assert store.load_run(run_id)["counter"] == 1
+    assert store.load_run(run_id)["updated_at"] == "2026-10-16T00:00:00+00:00"
     assert notifications == []
     with pytest.raises(ValueError, match="fresh read"):
         objects.save_run(run_id, projection)
     refreshed = objects.load_run(run_id)
-    refreshed["counter"] = 2
+    refreshed["updated_at"] = "2026-10-16T00:01:00+00:00"
     objects.save_run(run_id, refreshed)
-    assert store.load_run(run_id)["counter"] == 2
+    assert store.load_run(run_id)["updated_at"] == "2026-10-16T00:01:00+00:00"
 
 
 def test_lifecycle_commit_does_not_wait_for_business_fifo(tmp_path: Path) -> None:

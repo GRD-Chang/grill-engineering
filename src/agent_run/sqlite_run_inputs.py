@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_change_job_codec import presence, present
 from agent_run.sqlite_work_evidence import _json, get_evidence, put_evidence
 
@@ -25,7 +26,7 @@ def input_version_for_revision(c: sqlite3.Connection, run_id: str, kind: str, re
     tables = {"parent": "run_parent_versions", "graph": "run_graph_versions", "ticket_graph": "run_graph_versions"}
     if kind not in tables:
         raise ValueError("Unknown Run input kind")
-    rows = c.execute(f"SELECT version_id FROM {tables[kind]} WHERE run_id=? AND revision=? LIMIT 2",
+    rows = bounded_query(c, f"SELECT version_id FROM {tables[kind]} WHERE run_id=? AND revision=? LIMIT 2",
                      (run_id, revision)).fetchall()
     if len(rows) > 1:
         raise ValueError("Ambiguous immutable Run input revision")
@@ -40,7 +41,7 @@ def save_parent(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
     number = value.get("number")
     if number is not None and (type(number) is not int or number < 1):
         raise ValueError("Invalid Run Parent number")
-    current_number = c.execute("SELECT parent_number FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
+    current_number = bounded_query(c, "SELECT parent_number FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
     if current_number is not None and number is not None and number != current_number:
         raise ValueError("Cannot change the Run Parent identity")
     if number is not None and current_number is None:
@@ -61,7 +62,7 @@ def save_parent(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
         if previous is not None and previous != version:
             raise ValueError("One Parent revision identifies different immutable requirements")
     expected = (mask, revision, *refs)
-    row = c.execute("SELECT presence,revision,title_id,body_id FROM run_parent_versions WHERE run_id=? AND version_id=?",
+    row = bounded_query(c, "SELECT presence,revision,title_id,body_id FROM run_parent_versions WHERE run_id=? AND version_id=?",
                     (run_id, version)).fetchone()
     if row is not None and row != expected:
         raise ValueError("Immutable Parent input was changed")
@@ -71,14 +72,14 @@ def save_parent(c: sqlite3.Connection, run_id: str, value: Any) -> str | None:
 
 
 def load_parent(c: sqlite3.Connection, run_id: str, version: str) -> dict[str, Any]:
-    row = c.execute("SELECT presence,revision,title_id,body_id FROM run_parent_versions WHERE run_id=? AND version_id=?",
+    row = bounded_query(c, "SELECT presence,revision,title_id,body_id FROM run_parent_versions WHERE run_id=? AND version_id=?",
                     (run_id, version)).fetchone()
     if row is None or version != identity((row[0].hex(), *row[1:])):
         raise ValueError("Missing or invalid immutable Parent input")
     keys = present(row[0], _PARENT)
     result: dict[str, Any] = {}
     if "number" in keys:
-        result["number"] = c.execute("SELECT parent_number FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
+        result["number"] = bounded_query(c, "SELECT parent_number FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
     if "revision" in keys:
         result["revision"] = row[1]
     for key, evidence_id in zip(("title", "body"), row[2:], strict=True):

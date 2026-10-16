@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.delivery_facts import role_family
-from agent_run.execution_timing import aggregate_invocation_timing, invocation_links_complete
+from agent_run.execution_timing import aggregate_invocation_timing, invocation_links_complete, unassociated_invocations
 
 
 def ticket_effort(
@@ -30,8 +30,8 @@ def ticket_effort(
     for role in ("development", "review"):
         selected = [record for record in subject_records if role_family(str(record.get("role"))) == role]
         known = [invocation for record in selected for invocation in record.get("invocations", [])]
-        missing = [invocation for invocation in raw if invocation not in known
-                   and role_family(str((invocation.get("semantic_attempt") or {}).get("role")
+        missing = [invocation for invocation in unassociated_invocations(raw, known)
+                   if role_family(str((invocation.get("semantic_attempt") or {}).get("role")
                                        or invocation.get("role") or invocation.get("invocation_role"))) == role]
         if not selected and not missing:
             continue

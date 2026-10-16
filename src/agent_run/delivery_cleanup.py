@@ -13,6 +13,7 @@ from agent_run.git import (
 )
 from agent_run.state import StateStore
 from agent_run.object_state import ObjectStateStore, object_store, save_owned
+from agent_run.work_projection import materialize_history
 
 
 MAX_AUTOMATIC_ATTEMPTS = 3
@@ -191,7 +192,7 @@ class DeliveryCleanupEngine:
                     )
         run = state.get("run_acceptance")
         if isinstance(run, dict):
-            repairs = run.get("completed_repair_jobs", [])
+            repairs = materialize_history(run, "completed_repair_jobs", [])
             if isinstance(repairs, list):
                 for job in reversed(repairs):
                     if (

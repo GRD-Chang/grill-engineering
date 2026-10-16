@@ -410,11 +410,15 @@ def test_completed_ticket_budget_scope_is_bound_to_actual_sql_projection(git_rep
     assert scoped is not None
     assert "review_budget_history" not in scoped["ticket_jobs"]["2"]
     require_completed_ticket_integration_records(scoped)
-    with pytest.raises(ValueError, match="review_budget_history"):
-        ensure_budget(scoped["ticket_jobs"]["2"], TICKET_POLICY)
-    # A plain dictionary copy carries no SQL archive proof.
+    # Current budget validation consumes its exact stored window count only.
+    assert ensure_budget(scoped["ticket_jobs"]["2"], TICKET_POLICY) == scoped["ticket_jobs"]["2"]["review_budget"]
+    assert "review_budget_history" not in scoped["ticket_jobs"]["2"]
+    # Plain Job dictionaries carry no query metadata. A shallow Run copy
+    # alone still contains the original scoped Job objects.
+    plain = dict(scoped)
+    plain["ticket_jobs"] = {key: dict(job) for key, job in scoped["ticket_jobs"].items()}
     with pytest.raises(IncompatibleRunStateError, match="review_budget"):
-        require_completed_ticket_integration_records(dict(scoped))
+        require_completed_ticket_integration_records(plain)
     full = states.load_current_run(run_id)
     assert full is not None
     require_completed_ticket_integration_records(full)
@@ -431,7 +435,7 @@ def test_completed_ticket_budget_scope_is_bound_to_actual_sql_projection(git_rep
 @pytest.mark.parametrize("field", ["human_blocker_history", "reviewer_thread_ids"])
 @pytest.mark.parametrize("reader", ["full", "metadata"])
 @pytest.mark.parametrize("damage", ["short", "long", "blob"])
-def test_archive_size_damage_is_rejected_without_expanding_sibling_reports(
+def test_archive_size_damage_is_rejected_by_read_or_stale_append(
     tmp_path: Path, field: str, reader: str, damage: str,
 ) -> None:
     from agent_run.sqlite_encoding import encode_json
@@ -452,8 +456,18 @@ def test_archive_size_damage_is_rejected_without_expanding_sibling_reports(
         expression = {"short": "logical_bytes-1", "long": "logical_bytes+1", "blob": "CAST(logical_bytes AS BLOB)"}[damage]
         table = "work_job_archives" if reader == "full" else "work_job_archive_roots"
         connection.execute(f"UPDATE {table} SET logical_bytes={expression} WHERE history_kind=?", (field,))
+        if reader == "metadata":
+            # Query metadata describes its original read; it is not a live
+            # cache or a second proof of every historical report's contents.
+            assert jobs.read_job_archives(connection, "r", sparse) == metadata
+            proposed = deepcopy(sparse)
+            owner = proposed["ticket_jobs"]["2"]
+            owner.setdefault(field, []).append("next-review" if field == "reviewer_thread_ids" else {"message": "next"})
+            with pytest.raises(ValueError, match="Job history size"):
+                jobs.save_jobs(connection, "r", proposed, sparse)
+            assert connection.execute("SELECT COUNT(*) FROM work_job_archives WHERE history_kind=?", (field,)).fetchone() == (len(values),)
         with pytest.raises(ValueError, match="Job history size"):
-            jobs.load_jobs(connection, "r") if reader == "full" else jobs.read_job_archives(connection, "r", sparse)
+            jobs.load_jobs(connection, "r")
     finally:
         connection.close()
 

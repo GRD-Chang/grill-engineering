@@ -4,7 +4,7 @@ from copy import deepcopy
 from typing import Any, Protocol
 
 from agent_run.git import GitError, GitRepository
-from agent_run.review_budget import ReviewBudgetPolicy, ensure_budget
+from agent_run.review_budget import ReviewBudgetPolicy, archived_budget_windows, ensure_budget
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.ticket_ci_repair_contract import (
     require_ci_repair_publication_authorization,
@@ -56,7 +56,8 @@ def prepare_ticket_ci_publication_authorization(
         or not isinstance(job.get("required_checks_origin"), dict)
         or not isinstance(job.get("ci_evidence"), dict)
         or not isinstance(job.get("review_budget"), dict)
-        or not isinstance(job.get("review_budget_history"), list)
+        or (not isinstance(job.get("review_budget_history"), list)
+            and archived_budget_windows(job) is None)
         or not isinstance(job.get("development_summary"), str)
     ):
         return False
@@ -101,8 +102,8 @@ def prepare_ticket_ci_publication_authorization(
         "repair_delta": delta,
         "development_summary": job["development_summary"],
     }
-    proposed = {**job, "publication_authority": "ci_repair",
-                "ci_repair_publication_receipt": receipt}
+    proposed = job.copy()
+    proposed.update(publication_authority="ci_repair", ci_repair_publication_receipt=receipt)
     proposed.pop("acceptance_record", None)
     proposed.pop("fallback_publication_receipt", None)
     try:

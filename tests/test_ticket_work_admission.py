@@ -173,7 +173,8 @@ def test_capacity_requires_positive_integer(invalid: Any) -> None:
 ])
 def test_invalid_queue_is_rejected(git_repo: Path, corruption: str) -> None:
     state, states, _, _ = ticket_run(git_repo, (2, 3), workers=1)
-    original = deepcopy(state)
+    # 回滚比较使用完整落盘快照；工作视图的未读 Timeline 不代表空历史。
+    original = StateStore(states.root).load_current_run(state["run_id"])
     entry = {"ticket_number": 2, "generation": generation(state, 2),
              "role": "development", "lease_id": "lease-2"}
     state["ticket_work_queue"] = [entry]

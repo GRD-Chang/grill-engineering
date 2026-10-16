@@ -242,7 +242,7 @@ def test_exhausted_integration_development_public_resume_preserves_scene_and_rev
     resumed, _ = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         state["run_id"], explicit_resume=True, resume_budget_checkpoint=True,
     )
-    current = resumed["run_acceptance"]
+    current = states.load_history_run(state["run_id"])["run_acceptance"]
     assert current["run_integration_conflict"] == before["run_integration_conflict"]
     assert current["integration_work_history"] == before["integration_work_history"]
     assert current["review_budget"]["development_attempts"] == 0
@@ -317,7 +317,7 @@ def test_public_resume_renews_review_only_and_retains_integration_development(
     resumed, _ = Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         state["run_id"], explicit_resume=True, resume_budget_checkpoint=True,
     )
-    current = resumed["run_acceptance"]
+    current = states.load_history_run(state["run_id"])["run_acceptance"]
     assert current["review_budget"]["reviewer_invocations"] == 0
     assert current["review_budget"]["development_attempts"] == 2
     assert current["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 4
@@ -516,7 +516,8 @@ def test_run_integration_return_is_reused_before_git_closeout(
     assert result["status"] == "run_publication_pending"
     assert agents.events == ["development", "review"]
     assert result["run_acceptance"]["review_budget"]["development_attempts"] == 1
-    closed = next(item for item in result["run_acceptance"]["semantic_attempt_history"] if item["attempt_id"] == attempt_id)
+    retained = reloaded.load_history_run(state["run_id"])["run_acceptance"]
+    closed = next(item for item in retained["semantic_attempt_history"] if item["attempt_id"] == attempt_id)
     assert closed["outcome"] == "integration_conflict_resolved"
     assert "returned_result" not in closed
     assert _git(git_repo, "show", f"{result['run_branch']}:market.csv") == "code,value\nA,1"
@@ -667,7 +668,7 @@ def test_saved_local_review_is_invalidated_before_conflicting_merge_tree_check(
         default_head_sha=git.resolve("main"),
     )
     stale = engine.accept(run_id)
-    run = stale["run_acceptance"]
+    run = engine.states.load_history_run(run_id)["run_acceptance"]
     assert run["phase"] == "pending"
     assert run["semantic_attempt_history"][-1]["attempt_id"] == attempt["attempt_id"]
     assert run["semantic_attempt_history"][-1]["outcome"] == "currentness_invalidated"

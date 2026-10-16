@@ -368,9 +368,6 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
-        if any((explicit_resume, resume_human_blocker, resume_budget_checkpoint,
-                new_thread, human_response is not None)):
-            existing = self._load_change_job_history(run_id, existing, ticket_number=ticket_number)
         if explicit_resume:
             require_resume_checkout(
                 existing, self.states.root, self.publisher.git, ticket_number=ticket_number
@@ -628,7 +625,6 @@ class Controller:
             and is_github_refresh_wait(existing)
         ):
             raise RequeueError("requeue is only allowed in requeue_required state")
-        existing = self._load_change_job_history(run_id, existing)
         if prepare_state is not None:
             # Keep the accepted Action in memory until qualification succeeds
             # or an external wait is durably recorded. Refusal consumes no work.
@@ -700,7 +696,7 @@ class Controller:
     def finalize_requeue(self, run_id: str) -> dict[str, Any]:
         """Commit a prepared replacement only after old assets are retired."""
         try:
-            state = self._load_change_job_history(run_id, self._load_run(run_id))
+            state = self._load_run(run_id)
             state = self._load_bound_run(run_id, state=state)
         except GitHubReadError as error:
             return self._wait_for_github_read(
@@ -1010,20 +1006,6 @@ class Controller:
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         require_current_run_state(state)
-        return state
-
-    def _load_change_job_history(
-        self, run_id: str, state: dict[str, Any], *, ticket_number: int | None = None,
-    ) -> dict[str, Any]:
-        """Load exact target evidence before an explicit resume or retirement."""
-        selected = state.get("active_ticket_job")
-        target = (ticket_number if ticket_number is not None else
-                  selected.get("ticket_number") if isinstance(selected, dict) else None)
-        loader = getattr(self.states, "load_current_run_for_ticket", None)
-        if type(target) is int and callable(loader):
-            loaded = cast(dict[str, Any] | None, loader(run_id, target))
-            if loaded is not None:
-                return loaded
         return state
 
     def _require_ticket_labels(
@@ -1874,7 +1856,9 @@ def _is_replayed_human_response(
 ) -> bool:
     if _latest_unconsumed_response_audit(state) is None:
         return False
-    history = subject.get("human_response_history")
+    from agent_run.work_projection import materialize_history
+
+    history = materialize_history(subject, "human_response_history")
     latest = history[-1] if isinstance(history, list) and history else None
     return (
         isinstance(latest, dict)
@@ -2442,7 +2426,11 @@ def _carry_development_thread_context(
         not isinstance(thread_id, str) or not thread_id.strip()
     ):
         raise ValueError("budget checkpoint has an invalid Development Thread ID")
-    history = job.get("development_thread_history", [])
+    from agent_run.work_projection import materialize_history
+
+    history = materialize_history(job, "development_thread_history")
+    if history is None and "development_thread_history" not in job:
+        history = []
     if not isinstance(history, list) or not all(
         isinstance(item, str) and item.strip() for item in history
     ):

@@ -40,7 +40,7 @@ from agent_run.runner_credentials import RunnerCredentialError
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.run_publication_approval import prepare_run_approval
-from agent_run.object_state import ObjectStateStore, object_store, save_owned
+from agent_run.object_state import ObjectStateStore, object_store, save_owned, _ticket_current
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError
 
@@ -811,7 +811,7 @@ class RunDriver:
 
         scoped = TicketState(self.states, run_id, int(job["ticket_number"]))
         current = scoped.load_current_run(run_id)
-        if current is None or current["active_ticket_job"] != job:
+        if current is None or _ticket_current(current["active_ticket_job"]) != _ticket_current(job):
             raise TaskControlBusyError("Ticket changed before supervision timeout")
         current["supervision_wait"] = state["supervision_wait"]
         current["diagnostics"] = state["diagnostics"]

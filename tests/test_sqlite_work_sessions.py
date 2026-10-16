@@ -15,7 +15,7 @@ from agent_run.sqlite_watcher import SQLiteWatcher
 
 
 def _repository(path: Path) -> SQLiteStateRepository:
-    return SQLiteStateRepository(path, max_bytes=4 * 1024 * 1024)
+    return SQLiteStateRepository(path)
 
 
 def _capture_connections(monkeypatch: pytest.MonkeyPatch) -> list[sqlite3.Connection]:
@@ -37,52 +37,82 @@ def _assert_closed(connections: list[sqlite3.Connection]) -> None:
 
 def test_work_session_is_lazy_nested_and_closes_idle_connections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     created = _capture_connections(monkeypatch)
     with repository.work_session():
         assert created == []
-        assert repository.load_work("run-1", 2) == {"value": 1}
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
         assert len(created) == 1 and not created[0].in_transaction
-        assert getattr(created[0], "schema_facts") is None
-        assert getattr(created[0], "run_rows") is None
         assert created[0].execute("PRAGMA query_only").fetchone() == (1,)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             created[0].execute("UPDATE runs SET status='altered'")
         with repository.work_session():
-            assert repository.load_work("run-1", 2) == {"value": 1}
+            assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
             with repository.atomic():
                 baseline = repository.load_work("run-1", 2)
                 assert baseline is not None
-                repository.save_work("run-1", {"value": 2}, baseline)
+                repository.save_work("run-1", {"retired_parent_generation": 2}, baseline)
         assert len(created) == 2
         assert not repository.in_transaction
         assert all(not connection.in_transaction for connection in created)
-        assert repository.load_work("run-1", 2) == {"value": 2}
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 2}
         assert len(created) == 2
     _assert_closed(created)
 
 
 def test_work_session_rechecks_external_commits_between_transactions(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     with repository.work_session():
-        assert repository.load("run-1") == {"value": 1}
+        assert repository.load("run-1") == {"retired_parent_generation": 1}
         with repository.atomic():
-            assert repository.load_work("run-1", 2) == {"value": 1}
-        _repository(tmp_path).save_objects("run-1", {"value": 2}, fields={"value"})
-        assert repository.load("run-1") == {"value": 2}
+            assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
+        _repository(tmp_path).save_objects("run-1", {"retired_parent_generation": 2}, fields={"retired_parent_generation"})
+        assert repository.load("run-1") == {"retired_parent_generation": 2}
         with repository.atomic():
             baseline = repository.load_work("run-1", 2)
-            assert baseline == {"value": 2}
-            repository.save_work("run-1", {"value": 3}, baseline)
-    assert _repository(tmp_path).load("run-1") == {"value": 3}
+            assert baseline == {"retired_parent_generation": 2}
+            repository.save_work("run-1", {"retired_parent_generation": 3}, baseline)
+    assert _repository(tmp_path).load("run-1") == {"retired_parent_generation": 3}
+
+
+def test_work_session_reader_retains_prepared_sql_and_restores_query_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.save("run-1", {"retired_parent_generation": 1})
+    created = _capture_connections(monkeypatch)
+    with repository.work_session():
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
+        reader = created[0]
+        prepared = []
+
+        def authorize(action, argument1, argument2, database, source):
+            if action == sqlite3.SQLITE_FUNCTION and argument2 == "upper":
+                prepared.append(argument2)
+            return sqlite3.SQLITE_OK
+
+        reader.set_authorizer(authorize)
+        assert reader.execute("SELECT upper(?)", ("run-1",)).fetchone() == ("RUN-1",)
+        assert prepared == ["upper"]
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
+        assert reader.execute("SELECT upper(?)", ("run-2",)).fetchone() == ("RUN-2",)
+        assert prepared == ["upper"]
+
+        reader.execute("PRAGMA query_only=OFF")
+        assert reader.execute("PRAGMA query_only").fetchone() == (0,)
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
+        assert reader.execute("PRAGMA query_only").fetchone() == (1,)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("CREATE TEMP TABLE unexpected(value)")
+    _assert_closed(created)
 
 
 def test_work_session_writer_reestablishes_and_enforces_foreign_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     created = _capture_connections(monkeypatch)
     with repository.work_session():
         with repository.atomic():
@@ -94,14 +124,14 @@ def test_work_session_writer_reestablishes_and_enforces_foreign_keys(
             with repository.atomic():
                 assert repository._local.connection is writer
                 assert writer.execute("PRAGMA foreign_keys").fetchone() == (1,)
-                writer.execute("INSERT INTO run_material_refs(run_id,material_id) VALUES('missing','missing')")
+                writer.execute("INSERT INTO run_frontier VALUES('missing',0,2)")
     _assert_closed(created)
-    assert repository.load("run-1") == {"value": 1}
+    assert repository.load("run-1") == {"retired_parent_generation": 1}
 
 
 def test_work_session_rolls_back_and_closes_on_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     created = _capture_connections(monkeypatch)
     with pytest.raises(ValueError, match="injected"):
         with repository.work_session():
@@ -109,11 +139,11 @@ def test_work_session_rolls_back_and_closes_on_exception(tmp_path: Path, monkeyp
             with repository.atomic():
                 baseline = repository.load_work("run-1", 2)
                 assert baseline is not None
-                repository.save_work("run-1", {"value": 2}, baseline)
+                repository.save_work("run-1", {"retired_parent_generation": 2}, baseline)
                 raise ValueError("injected")
     _assert_closed(created)
     assert not repository.in_transaction
-    assert repository.load("run-1") == {"value": 1}
+    assert repository.load("run-1") == {"retired_parent_generation": 1}
 
 
 @pytest.mark.parametrize("damage", ["protocol", "schema", "material"])
@@ -144,49 +174,49 @@ def test_work_session_discards_connections_after_database_identity_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remove: bool,
 ) -> None:
     repository = _repository(tmp_path / "original")
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     replacement = _repository(tmp_path / "replacement")
-    replacement.save("run-1", {"value": 2})
+    replacement.save("run-1", {"retired_parent_generation": 2})
     created = _capture_connections(monkeypatch)
     with repository.work_session():
-        assert repository.load_work("run-1", 2) == {"value": 1}
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
         with repository.atomic():
-            assert repository.load_work("run-1", 2) == {"value": 1}
+            assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
         old = list(created)
         if remove:
             repository.path.unlink()
             assert repository.load_work("run-1", 2) is None
             assert not repository.path.exists()
             _assert_closed(old)
-            repository.save("run-1", {"value": 2})
+            repository.save("run-1", {"retired_parent_generation": 2})
         else:
             replacement.path.replace(repository.path)
-        assert repository.load_work("run-1", 2) == {"value": 2}
+        assert repository.load_work("run-1", 2) == {"retired_parent_generation": 2}
         _assert_closed(old)
         with repository.atomic():
             baseline = repository.load_work("run-1", 2)
             assert baseline is not None
-            repository.save_work("run-1", {"value": 3}, baseline)
+            repository.save_work("run-1", {"retired_parent_generation": 3}, baseline)
     _assert_closed(created)
-    assert _repository(repository.root).load("run-1") == {"value": 3}
+    assert _repository(repository.root).load("run-1") == {"retired_parent_generation": 3}
 
 
 def test_work_session_uses_watcher_reader_without_owning_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 1})
+    repository.save("run-1", {"retired_parent_generation": 1})
     with SQLiteWatcher(repository.path) as watcher:
         assert watcher.version() is not None
         assert watcher.connection is not None
         created = _capture_connections(monkeypatch)
         with repository.work_session(), repository.use_reader(watcher.connection):
-            assert repository.load_work("run-1", 2) == {"value": 1}
+            assert repository.load_work("run-1", 2) == {"retired_parent_generation": 1}
         assert created == []
         assert watcher.connection.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_work_sessions_keep_threads_and_transactions_independent(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
-    repository.save("run-1", {"value": 0})
+    repository.save("run-1", {"retired_parent_generation": 0})
     barrier = threading.Barrier(2, timeout=5)
     def increment():
         with repository.work_session():
@@ -196,12 +226,12 @@ def test_work_sessions_keep_threads_and_transactions_independent(tmp_path: Path)
                 baseline = repository.load_work("run-1", 2)
                 assert baseline is not None
                 updated = deepcopy(baseline)
-                updated["value"] += 1
+                updated["retired_parent_generation"] += 1
                 repository.save_work("run-1", updated, baseline)
             barrier.wait()
-            assert repository.load_work("run-1", 2) == {"value": 2}
+            assert repository.load_work("run-1", 2) == {"retired_parent_generation": 2}
     with ThreadPoolExecutor(max_workers=2) as workers:
         futures = [workers.submit(increment) for _ in range(2)]
         for future in futures:
             future.result(timeout=10)
-    assert repository.load("run-1") == {"value": 2}
+    assert repository.load("run-1") == {"retired_parent_generation": 2}

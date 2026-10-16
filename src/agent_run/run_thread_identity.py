@@ -3,6 +3,7 @@ from __future__ import annotations
 """Authoritative Thread identities that a Run role may not reuse."""
 
 from typing import Any
+from agent_run.work_projection import materialize_history
 
 
 def prior_thread_identities(
@@ -15,12 +16,12 @@ def prior_thread_identities(
     if isinstance(development_thread, str):
         identities.add(development_thread)
     identities.update(_string_list(run, "development_thread_history"))
-    if run.get("discarded_repair_thread_ids") is not None:
+    if materialize_history(run, "discarded_repair_thread_ids") is not None:
         identities.update(_string_list(run, "discarded_repair_thread_ids"))
 
     repair_job = run.get("repair_job")
     if isinstance(repair_job, dict):
-        reviewer_threads = repair_job.get("reviewer_thread_ids", [])
+        reviewer_threads = materialize_history(repair_job, "reviewer_thread_ids")
         if isinstance(reviewer_threads, list):
             identities.update(
                 thread for thread in reviewer_threads if isinstance(thread, str)
@@ -33,7 +34,7 @@ def prior_thread_identities(
         if isinstance(development_thread, str):
             identities.add(development_thread)
         for key in ("development_thread_history", "reviewer_thread_ids"):
-            values = job.get(key, [])
+            values = materialize_history(job, key)
             if isinstance(values, list):
                 identities.update(value for value in values if isinstance(value, str))
     return identities
@@ -47,7 +48,7 @@ def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _string_list(data: dict[str, Any], key: str) -> list[str]:
-    value = data.get(key)
+    value = materialize_history(data, key)
     if not isinstance(value, list) or not all(
         isinstance(item, str) for item in value
     ):

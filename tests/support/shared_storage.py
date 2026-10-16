@@ -25,7 +25,7 @@ from agent_run.executor_host import FakeExecutorHost, _process_start_token
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_lifecycle import prepare_action_application_receipt
-from agent_run.sqlite_rows import ReadConnection
+from agent_run.sqlite_state import ReadConnection
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_payloads import human_blocker_step
@@ -87,6 +87,16 @@ def interrupt_shared_storage(
     persist_run_fixture(states, run_id, state)
     control.record_application(task, action_id=action_id, generation=generation, run_id=run_id, payload_digest=claim.action["payload_digest"])
     control.complete_action(task, action_id=action_id, generation=generation, result_status="active")
+    # 与真实 CLI 一样，业务保存先进入当前 Executor 的 Control 边界。
+    # 两个 Repository 按同一 root 共享线程内事务，嵌套保存不另开写连接。
+    states._set_write_guard(
+        lambda: control.assert_executor_current(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ),
+        transaction=lambda: control._executor_current_transaction(
+            task, action_id=action_id, generation=generation, run_id=run_id,
+        ),
+    )
 
     script = repo / "held-worker.py"
     script.write_text('''import json, os, pathlib, signal, sys, time

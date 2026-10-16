@@ -12,16 +12,17 @@ import argparse
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from agent_run.executor_admission import executor_failure_scope, report_executor_failure
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notifications import Notifications
-from agent_run.object_state import ObjectStateStore
+from agent_run.object_state import ObjectStateStore, object_store
 from agent_run.messages import error_detail, selected_language
 from agent_run.runner_lease import retain_lease_for_systemd_exit, runner_usage_lease
 from agent_run.state import ConcurrentRunStateError, SimulatedProcessCrash, StateStore
+from agent_run.state_observation import CurrentRunObserver
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.task_control import ActionReconciliationError, TaskControlError, TaskKey
 from agent_run.ticket_eligibility import TicketEligibilityError
@@ -90,32 +91,32 @@ class DeliveryExecutor:
             if self.state_store_factory
             else self.states
         )
-        state = states.load_current_run(run_id)
+        # The driver first selects a typed operation; each operation reloads
+        # its exact owner before changing work. Never bootstrap by expanding
+        # every old Job and Invocation in the Run.
+        state = cast(ObjectStateStore, object_store(states)).load_scheduler_current_run(run_id)
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
         def observation_state() -> dict[str, Any] | None:
-            # Presentation reads happen outside business transactions. Its
-            # complete facts retain sibling gates and completed Ticket events.
-            if isinstance(states, ObjectStateStore):
-                return states.load_full_run(run_id)
-            return states.load_current_run(run_id)
+            return states.load_observation_run(run_id)
 
         feedback = self.resume_feedback
         if feedback is not None:
             if action_id is not None:
                 feedback.identity = action_id
             feedback.observe(observation_state() or state)
-        def notification_state() -> dict[str, Any] | None:
-            current = observation_state()
+        def notification_state(observation: dict[str, Any]) -> dict[str, Any] | None:
+            current = states.load_notification_run(run_id, observation)
             return feedback.project(current) if feedback and current is not None else current
 
         notifications = Notifications(states.root, feedback.project(state) if feedback else state,
-                                      load_state=notification_state)
+                                      query_state=notification_state)
         if feedback is not None:
             feedback.attach(notifications, action_id)
         states.run_saved_observer = (
-            lambda saved: feedback.observe(observation_state() or saved)
-        ) if feedback else notifications.observe
+            CurrentRunObserver(feedback.observe if feedback else notifications.observe)
+            if feedback or notifications.enabled else None
+        )
         driver: _RunDriver | None = None
 
         def record_failure(error: BaseException) -> bool:
@@ -136,7 +137,7 @@ class DeliveryExecutor:
                 return self.record_execution_failure(states, run_id, str(error), binding)
             return False
 
-        with executor_failure_scope(record_failure):
+        with states.work_session(), executor_failure_scope(record_failure):
             try:
                 driver = self.driver_factory(states, binding)
                 if control_operation is None:

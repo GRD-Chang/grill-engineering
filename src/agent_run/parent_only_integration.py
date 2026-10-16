@@ -304,7 +304,9 @@ def resolve_parent_conflict(
             "work_source": "integration",
         }
     # Select this invocation's evidence before the adapter reads historical repair input.
-    request = stage.adapter.development_request(state, {**job, **conflict_input}, checkout)
+    request_job = job.copy()
+    request_job.update(conflict_input)
+    request = stage.adapter.development_request(state, request_job, checkout)
     request.update(conflict_input)
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     if attempt is None:

@@ -10,9 +10,27 @@ from uuid import uuid4
 from agent_run.execution_timing import invocation_started, parse_optional_timestamp
 from agent_run.notifications import Notifications
 from agent_run.operator_action_facts import operator_action_facts
+from agent_run.sqlite_job_history import FIELDS as JOB_ARCHIVES
 
 _BASELINE_FIELDS = ("status", "diagnostics", "active_agent_invocation", "human_blockers",
                     "parent_job", "ticket_jobs", "ticket_agent_invocations", "run_acceptance", "run_publication")
+
+
+def _current_job(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    return {key: _current_job(item) if key == "repair_job" else deepcopy(item)
+            for key, item in value.items() if key not in JOB_ARCHIVES and not key.startswith("_query_")}
+
+
+def _current_facts(state: dict[str, Any]) -> dict[str, Any]:
+    result = {key: deepcopy(state.get(key)) for key in _BASELINE_FIELDS
+              if key not in {"parent_job", "ticket_jobs", "run_acceptance", "run_publication"}}
+    for key in ("parent_job", "run_acceptance", "run_publication"):
+        result[key] = _current_job(state.get(key))
+    jobs = state.get("ticket_jobs")
+    result["ticket_jobs"] = {key: _current_job(job) for key, job in jobs.items()} if isinstance(jobs, dict) else jobs
+    return result
 
 
 class ResumeFeedback:
@@ -25,12 +43,14 @@ class ResumeFeedback:
 
     def __init__(self, root: Path, state: dict[str, Any],
                  load: Callable[[], dict[str, Any] | None], *,
-                 ticket_number: int | None = None) -> None:
+                 ticket_number: int | None = None,
+                 query: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None) -> None:
         self.ticket_number = ticket_number
         self.root = root
         self.state = state
-        self.baseline = deepcopy({key: state.get(key) for key in _BASELINE_FIELDS})
+        self.baseline = _current_facts(state)
         self.load = load
+        self.query = query
         self.identity = uuid4().hex
         self.result: dict[str, Any] | None = None
         self.sender: Notifications | None = None
@@ -71,7 +91,12 @@ class ResumeFeedback:
         self, state: dict[str, Any], *, outcome_observed: bool = False,
     ) -> dict[str, Any] | None:
         result = self.result
-        fresh = outcome_observed or any(state.get(key) != self.baseline.get(key) for key in _BASELINE_FIELDS)
+        if result is not None and result.get("scope") is not None and result.get("action_kind") is not None:
+            # A sender may hold an older snapshot while the observer has
+            # already reached a later gate. Derive bound outcomes again from
+            # this frame; cached progress and preflight results remain valid.
+            result = None
+        fresh = outcome_observed or _current_facts(state) != self.baseline
         gates = operator_action_facts(state)
         relevant = [item for item in gates if self.work_subject is None
                     or item["work_subject"] == self.work_subject
@@ -79,7 +104,7 @@ class ResumeFeedback:
         gate = next((item for item in relevant if item["scope"] == "global"), None)
         if gate is None:
             gate = next((item for item in relevant if item["scope"] == "local"
-                         and item["subject"] != (self.baseline.get("ticket_jobs") or {}).get(
+                         and _current_job(item["subject"]) != (self.baseline.get("ticket_jobs") or {}).get(
                              item["work_subject"].removeprefix("ticket:"))), None)
         if fresh and gate is not None and gate["action_kind"] != "operator_stopped":
             failed = gate["action_kind"] in {"execution_failure", "supervision_timeout", "deterministic_contradiction"}
@@ -124,8 +149,12 @@ class ResumeFeedback:
         # a successfully selected valid Run supplies a recipient and language.
         try:
             state = self.load() or self.state
+            query = self.query
             sender = Notifications(self.root, self.project(state),
-                                   load_state=lambda: self.project(current) if (current := self.load()) else None)
+                                   load_state=lambda: self.project(current) if (current := self.load()) else None,
+                                   query_state=(lambda observation: self.project(current)
+                                                if (current := query(observation)) else None)
+                                   if query is not None else None)
             sender.close()
         except Exception:
             # Notification failures must not replace the CLI's actual outcome.

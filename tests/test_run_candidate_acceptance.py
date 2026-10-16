@@ -55,7 +55,12 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(git_repo: Path) -> N
     )
 
     assert result["status"] == "run_publication_pending"
-    run = result["run_acceptance"]
+    assert result["run_acceptance"]["phase"] == "accepted"
+    # The stage returns its current scheduling view. Retained review/thread
+    # evidence is an explicit complete query rather than a side effect of it.
+    saved = states.load_current_run(str(state["run_id"]))
+    assert saved is not None
+    run = saved["run_acceptance"]
     assert run["phase"] == "accepted"
     assert run["modification_attempts"] == 1
     assert run["reviewer_thread_ids"] == [

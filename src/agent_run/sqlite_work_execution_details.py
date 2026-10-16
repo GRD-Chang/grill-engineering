@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_work_execution_schema import (
     DETAIL_FIELDS, SUMMARY_FIELDS, TIMING_FIELDS, presence, present_fields,
     restore_scalars, scalar_values,
@@ -20,6 +21,18 @@ DETAIL_COLUMNS = (
     *(column for _, prefix, fields in SUMMARY_SPECS
       for column in (prefix + "presence", *(prefix + key for key in fields))),
 )
+
+
+def _check_arrays(c: sqlite3.Connection, identity: tuple[str, str, str]) -> None:
+    total = 0
+    for table, columns in (("work_invocation_segments", ("presence", "started", "ended")),
+                           ("work_invocation_waits", ("presence", "kind", "started", "ended"))):
+        expression = "+".join(f"COALESCE(LENGTH(CAST({name} AS BLOB)),0)+16" for name in columns)
+        total += bounded_query(c, f"SELECT COALESCE(SUM({expression}),0) FROM {table} "
+                               "WHERE run_id=? AND work_subject=? AND started_at=?", identity).fetchone()[0]
+    from agent_run.state_limits import MAX_CURRENT_BYTES
+    if total > MAX_CURRENT_BYTES:
+        raise ValueError("Invocation detail collection exceeds current record byte limit")
 
 
 def summary_values(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -60,12 +73,14 @@ def save_arrays(
             included = presence(entry, tuple(fields))
             row = (*identity, position, included, *scalar_values(entry, fields))
             c.execute(f"INSERT INTO {table} VALUES ({','.join('?' for _ in row)})", row)
+    _check_arrays(c, identity)
 
 
 def restore_details(
     c: sqlite3.Connection, identity: tuple[str, str, str], row: Mapping[str, Any],
     record: dict[str, Any], included: set[str],
 ) -> None:
+    _check_arrays(c, identity)
     for field, table, fields, columns in (
         ("execution_segments", "work_invocation_segments", {"started_at": str, "ended_at": str}, "started,ended"),
         ("recovery_wait_intervals", "work_invocation_waits", {"kind": str, "started_at": str, "ended_at": str}, "kind,started,ended"),
@@ -76,8 +91,7 @@ def restore_details(
             record[field] = None
             continue
         values: list[dict[str, Any]] = []
-        for position, mask, *scalars in c.execute(
-            f"SELECT position,presence,{columns} FROM {table} WHERE run_id=? AND work_subject=? AND started_at=? ORDER BY position",
+        for position, mask, *scalars in bounded_query(c, f"SELECT position,presence,{columns} FROM {table} WHERE run_id=? AND work_subject=? AND started_at=? ORDER BY position",
             identity,
         ):
             if position != len(values):

@@ -188,11 +188,12 @@ def test_ordinary_control_projection_omits_completed_sibling_and_retirement_arch
     assert reopened["updated_at"] == scoped["updated_at"]
 
 
-def test_executor_notification_reads_complete_facts_after_scoped_commit(
+def test_executor_notification_reads_same_source_facts_after_scoped_commit(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_run.executor import DeliveryExecutor
     from agent_run.notifications import Notifications
+    from agent_run.notification_events import events
     from agent_run.object_state import object_store
 
     state, states, git, fixture = ticket_run(git_repo, (2, 3))
@@ -203,16 +204,20 @@ def test_executor_notification_reads_complete_facts_after_scoped_commit(
     assert complete is not None
     complete["notifications"] = {"enabled": True, "mode": "concise"}
     persist_run_fixture(states, run_id, complete)
+    completion = next(event for event in events(complete) if event["kind"] == "ticket_completed")
     observations = []
 
     def observe(_sender, current, **_kwargs):
+        assert not states._repository.in_transaction
+        assert states._lock_depth == 0
         observations.append(deepcopy(current))
 
     monkeypatch.setattr(Notifications, "_observe", observe)
     scoped = object_store(states)
 
     def advance(current):
-        assert set(current["ticket_jobs"]) == {"2"}
+        assert current["ticket_jobs"]["3"]["phase"] == "completed"
+        assert "semantic_attempt_history" not in current["ticket_jobs"]["3"]
         current["updated_at"] = "2026-10-13T00:00:00+00:00"
         scoped.save_run(run_id, current)
         return current
@@ -221,8 +226,65 @@ def test_executor_notification_reads_complete_facts_after_scoped_commit(
         states=scoped, driver_factory=lambda *_: SimpleNamespace(advance=advance),
     ).execute(run_id)
     assert len(observations) >= 2
-    assert all(current["ticket_jobs"] == complete["ticket_jobs"] for current in observations)
-    assert all(current["agent_invocation_history"] == complete["agent_invocation_history"]
+    assert all(current["ticket_jobs"]["3"]["phase"] == "completed" for current in observations)
+    assert all(next(event for event in events(current) if event["kind"] == "ticket_completed") == completion
                for current in observations)
     assert observations[-1]["updated_at"] == "2026-10-13T00:00:00+00:00"
     assert scoped.run_saved_observer is None
+
+
+@pytest.mark.parametrize("scope", ["current", "changed", "plain"])
+def test_ticket_materialized_response_history_uses_its_exact_baseline(
+    git_repo: Path, scope: str,
+) -> None:
+    from agent_run.human_responses import append_human_response, current_human_response_history
+    from agent_run.object_state import object_store
+    from agent_run.state import ConcurrentRunStateError
+
+    state, states, git, fixture = ticket_run(git_repo, (2,))
+    run_id = state["run_id"]
+    ticket_engine(
+        git, states, fixture, TicketAgents(git_repo, (2,), lambda _: None), development_only=True,
+    ).deliver_ticket(run_id, 2)
+    state = states.load_history_run(run_id)
+    job = state["ticket_jobs"]["2"]
+    generation = job["ticket_branch_generation"]
+    append_human_response(job, ["Original question"], "Original answer", generation=generation)
+    state["active_ticket_job"] = job
+    persist_run_fixture(states, run_id, state)
+    before = states.load_history_run(run_id)
+    original = deepcopy(before["ticket_jobs"]["2"]["human_response_history"])
+
+    scoped = object_store(states)
+    projection = scoped.load_current_run(run_id)
+    assert projection is not None
+    selected = projection["ticket_jobs"]["2"]
+    assert "human_response_history" not in selected
+    assert current_human_response_history(selected, generation=generation) == original
+    append_human_response(selected, ["Next question"], "New answer", generation=generation)
+    if scope == "plain":
+        selected = dict(selected)
+        projection["ticket_jobs"]["2"] = selected
+    projection["active_ticket_job"] = selected
+
+    if scope == "changed":
+        concurrent = states.load_history_run(run_id)
+        owner = concurrent["ticket_jobs"]["2"]
+        append_human_response(owner, ["Concurrent question"], "Concurrent answer", generation=generation)
+        concurrent["active_ticket_job"] = owner
+        save_owned(states, run_id, concurrent, fields={"ticket_jobs", "active_ticket_job"})
+    if scope != "current":
+        with pytest.raises(ConcurrentRunStateError, match="changed before"):
+            scoped.save_run(run_id, projection)
+    else:
+        scoped.save_run(run_id, projection)
+
+    reopened = states.load_history_run(run_id)
+    history = reopened["ticket_jobs"]["2"]["human_response_history"]
+    assert history[: len(original)] == original
+    assert history == {
+        "current": [*original, {"generation": generation, "human_blockers": ["Next question"], "response": "New answer"}],
+        "changed": [*original, {"generation": generation, "human_blockers": ["Concurrent question"], "response": "Concurrent answer"}],
+        "plain": original,
+    }[scope]
+    assert reopened["agent_invocation_history"] == before["agent_invocation_history"]

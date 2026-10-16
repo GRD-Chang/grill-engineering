@@ -150,7 +150,9 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
                    and any(check.get("status") == "fail" for check in
                            ((record.get("acceptance_artifact") or {}).get("checks") or {}).values()
                            if isinstance(check, dict))), None)
-    if failed:
+    if "_notification_first_failed_review" in state:
+        replaced_results.add(state["_notification_first_failed_review"])
+    elif failed:
         replaced_results.add(failed.get("attempt_id"))
     if any(event["kind"] == "acceptance_passed" for event in key_events):
         owner = state.get("parent_job" if state.get("delivery_type") == "parent_only" else "run_acceptance") or {}
@@ -174,6 +176,8 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     result.extend(key_events)
     progress = ticket_progress(state)
     for number, job in (state.get("ticket_jobs") or {}).items():
+        if number in state.get("_notification_completed", []):
+            continue
         if isinstance(job, dict) and job.get("phase") == "completed":
             result.append(event_envelope(state, "ticket_completed", [number, job.get("generation")],
                                 event_copy(state, "ticket_completed", title=event_subject(state, f"ticket:{number}").get("task_title") or "#" + str(number)), "green",
@@ -205,7 +209,8 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     result = apply_resume_result(state, result)
     if (state.get("notifications") or {}).get("mode", "detailed") == "concise":
         result = [event for event in result if event["kind"] in {"run_start", "parent_started", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "approval_update", "resume", "boundary"}]
-    return list({event["id"]: event for event in result}.values())
+    overrides = state.get("_notification_card_facts", {})
+    return list({event["id"]: {**event, **overrides.get(event["id"], {})} for event in result}.values())
 
 
 def recovery_events(state: dict[str, Any], pending: list[dict[str, Any]]) -> list[dict[str, Any]]:

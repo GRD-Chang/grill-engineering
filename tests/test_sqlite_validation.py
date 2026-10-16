@@ -20,7 +20,7 @@ def test_missing_invocation_identity_is_not_silently_omitted(tmp_path: Path, ref
     invocation = {"work_subject": "ticket:2", "started_at": "original", "status": "completed"}
     field = {"history": "agent_invocation_history", "active": "active_agent_invocation", "ticket": "ticket_agent_invocations"}[reference]
     value = [invocation] if reference == "history" else {"2": invocation} if reference == "ticket" else invocation
-    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository = SQLiteStateRepository(tmp_path)
     repository.save("run-1", {field: value})
     with closing(sqlite3.connect(repository.path)) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
@@ -105,7 +105,7 @@ def test_rollbacks_and_other_store_changes_are_not_labelled_validated(git_repo: 
     assert states.load_current_run(run_id)["status"] == state["status"]
     changed = deepcopy(state)
     changed["policy_snapshot"] = None
-    SQLiteStateRepository(states.root, max_bytes=4 * 1024 * 1024).save_objects(run_id, changed, fields={"policy_snapshot"})
+    SQLiteStateRepository(states.root).save_objects(run_id, changed, fields={"policy_snapshot"})
     with pytest.raises(ValueError):
         states.load_current_run(run_id)
     with pytest.raises(ValueError):
@@ -116,8 +116,10 @@ def test_large_projection_changes_and_caller_mutations_remain_independent(git_re
     state, states, _, _ = ticket_run(git_repo, (2,))
     run_id = state["run_id"]
     assert states.load_current_run(run_id) is not None
-    state["extension"] = {"body": "large exact evidence " * 30000}
-    save_owned(states, run_id, state, fields={"extension"})
+    job = state["ticket_jobs"].setdefault("2", {"ticket_number": 2})
+    job["review_context"] = {"body": "large exact evidence " * 30000}
+    state["active_ticket_job"] = job
+    save_owned(states, run_id, state, fields={"ticket_jobs", "active_ticket_job"})
     first = states.load_current_run(run_id)
     first["policy_snapshot"] = None
     assert states.load_current_run(run_id)["policy_snapshot"] == state["policy_snapshot"]

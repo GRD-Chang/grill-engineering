@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from agent_run.sqlite_timeline import TimelineScope
+
 
 ProjectionKey = tuple[str, str, frozenset[str]]
 
@@ -52,6 +54,7 @@ class ObjectProjection(dict[str, Any]):
         self._invalidated_baselines: set[ProjectionKey] = set()
         self.archive_scope: dict[str, tuple[int, int]] = {}
         self.attempt_scope: dict[str, dict[str, Any]] = {}
+        self.timelines: dict[str, TimelineScope] = {}
 
     def baseline(self, key: ProjectionKey) -> ProjectionBaseline | None:
         return self._loaded_baselines.get(key)
@@ -73,6 +76,7 @@ class ObjectProjection(dict[str, Any]):
         copied._invalidated_baselines = set(self._invalidated_baselines)
         copied.archive_scope = dict(self.archive_scope)
         copied.attempt_scope = deepcopy(self.attempt_scope)
+        copied.timelines = deepcopy(self.timelines)
         return copied
 
     def refresh_scope(self) -> None:
@@ -116,6 +120,7 @@ class ObjectProjection(dict[str, Any]):
         copied._invalidated_baselines = set(self._invalidated_baselines)
         copied.archive_scope = dict(self.archive_scope)
         copied.attempt_scope = deepcopy(self.attempt_scope, memo)
+        copied.timelines = deepcopy(self.timelines, memo)
         return copied
 
     def update(self, *args: Any, **kwargs: Any) -> None:
@@ -127,4 +132,5 @@ class ObjectProjection(dict[str, Any]):
             self._invalidated_baselines.update(args[0]._invalidated_baselines)
             self.archive_scope = dict(args[0].archive_scope)
             self.attempt_scope = deepcopy(args[0].attempt_scope)
+            self.timelines = deepcopy(args[0].timelines)
         self.refresh_scope()

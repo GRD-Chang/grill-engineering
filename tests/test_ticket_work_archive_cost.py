@@ -5,6 +5,7 @@ import gc
 import json
 import sqlite3
 import tracemalloc
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 
@@ -30,14 +31,14 @@ def test_attempt_history_summary_reads_have_constant_sql_cost_and_exact_bytes(tm
     from agent_run.sqlite_work_execution import attempt_history_metadata
     from support.work_records import attempt
 
-    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository = SQLiteStateRepository(tmp_path)
     costs = []
     for count in (1, 128):
         run_id = f"run-{count}"
         history = [attempt(f"parent-only:{run_id}", ordinal=ordinal,
                            context={"body": "证据\x00\n", "ordinal": ordinal}) for ordinal in range(1, count + 1)]
         repository.save(run_id, {"parent_job": {"semantic_attempt_history": history}})
-        with sqlite3.connect(repository.path) as connection:
+        with closing(sqlite3.connect(repository.path)) as connection, connection:
             job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id=?", (run_id,)).fetchone()[0]
             steps = []
             statements = []
@@ -57,37 +58,53 @@ def test_attempt_history_summary_tracks_version_changes_and_trimmed_positions(tm
     from agent_run.sqlite_work_execution import attempt_history_metadata
     from support.work_records import attempt
 
-    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository = SQLiteStateRepository(tmp_path)
     history = [attempt("parent-only:run-1", ordinal=ordinal) for ordinal in range(1, 4)]
     repository.save("run-1", {"parent_job": {"semantic_attempt_history": history}})
     retained = deepcopy(history[1:])
     retained[-1]["budget_consumed"] = True
     repository.save_objects("run-1", {"parent_job": {"semantic_attempt_history": retained}}, fields={"parent_job"})
-    assert SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1") == {
+    assert SQLiteStateRepository(tmp_path).load("run-1") == {
         "parent_job": {"semantic_attempt_history": retained},
     }
-    with sqlite3.connect(repository.path) as connection:
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
         job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id='run-1'").fetchone()[0]
         assert attempt_history_metadata(connection, "run-1", job_id) == (len(encode_json(retained).encode()), 2)
 
 
-@pytest.mark.parametrize("damage", ["count", "bytes", "proof"])
-def test_attempt_history_summary_corruption_is_rejected_before_skipping_history(tmp_path: Path, damage: str) -> None:
+@pytest.mark.parametrize("damage", ["count", "bytes", "presence"])
+def test_impossible_attempt_history_metadata_is_rejected_before_skipping_history(tmp_path: Path, damage: str) -> None:
     from agent_run.sqlite_state import SQLiteStateRepository
     from agent_run.sqlite_work_execution import attempt_history_metadata
     from support.work_records import attempt
 
-    repository = SQLiteStateRepository(tmp_path, max_bytes=65536)
+    repository = SQLiteStateRepository(tmp_path)
     repository.save("run-1", {"parent_job": {"semantic_attempt_history": [attempt("parent-only:run-1")]}})
-    with sqlite3.connect(repository.path) as connection:
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
         job_id = connection.execute("SELECT job_id FROM work_jobs WHERE run_id='run-1'").fetchone()[0]
-        field, value = {"count": ("history_count", "history_count+1"),
-                        "bytes": ("history_bytes", "history_bytes+1"), "proof": ("history_proof", "'foreign'")}[damage]
-        connection.execute(f"UPDATE work_job_attempt_roots SET {field}={value} WHERE run_id='run-1'")
-    with sqlite3.connect(repository.path) as connection, pytest.raises(ValueError, match="Attempt history summary"):
+        field, value = {"count": ("history_count", 0), "bytes": ("history_bytes", 2),
+                        "presence": ("history_present", 0)}[damage]
+        connection.execute(f"UPDATE work_job_attempt_roots SET {field}=? WHERE run_id='run-1'", (value,))
+    with closing(sqlite3.connect(repository.path)) as connection, connection, pytest.raises(ValueError, match="Attempt history summary"):
         attempt_history_metadata(connection, "run-1", job_id)
     with pytest.raises(ValueError, match="Attempt history summary"):
-        SQLiteStateRepository(tmp_path, max_bytes=65536).load("run-1")
+        SQLiteStateRepository(tmp_path).load("run-1")
+
+
+@pytest.mark.parametrize("field", ["history_count", "history_bytes"])
+def test_complete_query_independently_checks_attempt_history_metadata(tmp_path: Path, field: str) -> None:
+    from agent_run.sqlite_state import SQLiteStateRepository
+    from support.work_records import attempt
+
+    repository = SQLiteStateRepository(tmp_path)
+    repository.save("run-1", {"parent_job": {"semantic_attempt_history": [attempt("parent-only:run-1")]}})
+    with closing(sqlite3.connect(repository.path)) as connection, connection:
+        connection.execute(f"UPDATE work_job_attempt_roots SET {field}={field}+1 WHERE run_id='run-1'")
+    # A current view does not prove an unread archive by reconstructing it.
+    current = SQLiteStateRepository(tmp_path).load_work("run-1", None)
+    assert "semantic_attempt_history" not in current["parent_job"]
+    with pytest.raises(ValueError, match="Semantic Attempt size, history positions or count"):
+        SQLiteStateRepository(tmp_path).load("run-1")
 
 
 def _prepare_cost_run(git_repo: Path, monkeypatch: pytest.MonkeyPatch, *, retry_pending: bool) -> tuple[str, StateStore, dict]:
@@ -124,10 +141,9 @@ def _prepare_cost_run(git_repo: Path, monkeypatch: pytest.MonkeyPatch, *, retry_
     return run_id, states, original
 
 
-@pytest.mark.parametrize("aggregate", [True, False])
 @pytest.mark.parametrize("retry_pending", [True, False])
 def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool, retry_pending: bool,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, retry_pending: bool,
 ) -> None:
     run_id, states, original = _prepare_cost_run(git_repo, monkeypatch, retry_pending=retry_pending)
     sibling = original["ticket_jobs"]["3"]
@@ -183,7 +199,6 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
         # All measurements start with a fresh repository, excluding setup and
         # the deliberately complete query. Both SQL paths exercise real disk.
         work_states = StateStore(states.root)
-        work_states._repository._aggregate_rows = aggregate
         admission = TicketWorkAdmission(work_states, run_id)
         decoded.clear()
         encoded.clear()
@@ -232,17 +247,20 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
         thin = work_states.load_work_run(run_id, 2)
         assert thin is not None
         archives = work_states._repository.work_archives()
-        # The explicit archive scope never makes a partial tree acceptable at
-        # the complete boundary, and failures cannot leak a budget exemption.
+        # The domain projection validates current facts using this query's
+        # actual unread-history metadata. A plain JSON copy has no such scope.
+        require_current_run_state(thin)
         with pytest.raises(ValueError, match="review_budget_history"):
-            require_current_run_state(thin)
+            require_current_run_state(json.loads(json.dumps(thin)))
         invalid = deepcopy(thin)
         invalid["ticket_jobs"]["3"]["review_budget"]["development_attempts"] = 999
         invalid["active_ticket_job"]["review_budget"]["development_attempts"] = 999
         with pytest.raises(ValueError, match="review_budget"):
             require_current_work_state(invalid, archives, work_states._repository.work_attempts())
+        bounded_sibling = thin["ticket_jobs"]["3"]
+        assert ensure_budget(bounded_sibling, ticket_budget_policy_for_job(bounded_sibling)) == job["review_budget"]
         with pytest.raises(ValueError, match="review_budget_history"):
-            ensure_budget(thin["ticket_jobs"]["3"], ticket_budget_policy_for_job(thin["ticket_jobs"]["3"]))
+            ensure_budget(dict(bounded_sibling), ticket_budget_policy_for_job(bounded_sibling))
         # Other pause probes or a complete public query must not replace the
         # scope of an older work snapshot that is still being advanced.
         snapshot = lane.load_current_run(run_id)
@@ -264,7 +282,11 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
         plain = dict(snapshot)
         with pytest.raises(ValueError, match="canonical timeline"):
             lane.validate_work_projection(plain)
-        plain.update((field, json.loads(scope.encoded)) for field, scope in snapshot.timelines.items())
+        # Only an explicit domain query can supply the omitted timeline.
+        complete = states.load_current_run(run_id)
+        assert complete is not None
+        plain = json.loads(json.dumps(snapshot))
+        plain.update((field, complete[field]) for field in snapshot.timelines)
         with pytest.raises(ValueError, match="review_budget_history"):
             lane.validate_work_projection(plain)
     # The small current window number grows by one digit; unrelated retained
@@ -273,13 +295,12 @@ def test_sibling_archives_do_not_grow_ticket_commit_or_lease_check_cost(
     assert costs[1][1] <= costs[0][1] + 256, costs
     assert costs[1][2] <= costs[0][2] + 128 * 1024, costs
     assert costs[1][3] <= costs[0][3] + 256, costs
-    print(f"native={aggregate},retry={retry_pending}: decoded/encoded/peak bytes/SQL VM steps for sibling archives 1→10: {costs}")
+    print(f"retry={retry_pending}: decoded/encoded/peak bytes/SQL VM steps for sibling archives 1→10: {costs}")
 
 
-@pytest.mark.parametrize("aggregate", [True, False])
 @pytest.mark.parametrize("damage", ["position", "missing", "refs"])
 def test_related_attempt_damage_is_rejected_by_complete_and_work_queries(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool, damage: str,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, damage: str,
 ) -> None:
     run_id, states, original = _prepare_cost_run(git_repo, monkeypatch, retry_pending=True)
     persist_run_fixture(states, run_id, original)
@@ -305,6 +326,5 @@ def test_related_attempt_damage_is_rejected_by_complete_and_work_queries(
     reopened = StateStore(states.root)
     with pytest.raises(ValueError, match="Semantic Attempt|work evidence"):
         reopened.load_current_run(run_id)
-    reopened._repository._aggregate_rows = aggregate
     with pytest.raises(ValueError, match="Attempt|work evidence|publication_operation_retry"):
         reopened.load_work_run(run_id, 2)

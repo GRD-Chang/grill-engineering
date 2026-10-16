@@ -31,7 +31,7 @@ def exit_properties(spec: ExecutorSpec, control: TaskControlStore, python: Path,
                     carrier: Path) -> tuple[str, ...]:
     """Arm only an enabled Run (or the admitted creation payload), never defaults."""
     record = control.load(spec.task) or {}
-    state = StateStore(control.root).load_current_run(spec.run_id) if spec.run_id else None
+    state = StateStore(control.root).load_observation_run(spec.run_id) if spec.run_id else None
     config = (state if state is not None else (record.get("action") or {}).get("payload", {})).get("notifications", {})
     if not isinstance(config, dict) or config.get("enabled") is not True:
         return ()
@@ -103,7 +103,7 @@ def observe_exit(spec: ExecutorSpec, *, service_result: str, exit_code: str,
     if not isinstance(run_id, str):
         return
     states = StateStore(spec.state_root)
-    state = states.load_current_run(run_id)
+    state = states.load_observation_run(run_id)
     if state is None or (state.get("notifications") or {}).get("enabled") is not True:
         return
     evidence = {
@@ -124,7 +124,8 @@ def observe_exit(spec: ExecutorSpec, *, service_result: str, exit_code: str,
             document["executor_exit"] = evidence
     from agent_run.notifications import Notifications
 
-    Notifications(spec.state_root, state, load_state=lambda: states.load_current_run(run_id)).close()
+    Notifications(spec.state_root, state,
+                  query_state=lambda observation: states.load_notification_run(run_id, observation)).close()
 
 
 def main(arguments: list[str] | None = None) -> int:

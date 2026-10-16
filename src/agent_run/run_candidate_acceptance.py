@@ -15,6 +15,7 @@ from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state_contract import require_candidate_acceptance_history
+from agent_run.work_projection import history_for_append
 
 
 @dataclass
@@ -68,8 +69,9 @@ class CandidateRunAcceptance:
             "repair_source": source["repair_source"],
             "artifact": deepcopy(artifact),
         }
-        history = require_candidate_acceptance_history(
-            job.get("candidate_acceptance_history", []),
+        history = history_for_append(job, "candidate_acceptance_history")
+        require_candidate_acceptance_history(
+            history,
             "run_acceptance.repair_job.candidate_acceptance",
         )
         artifact_outcome = AcceptanceArtifact.parse(artifact).outcome
@@ -99,7 +101,7 @@ class CandidateRunAcceptance:
         require_candidate_acceptance_history(
             [entry], "run_acceptance.repair_job.candidate_acceptance"
         )
-        job["candidate_acceptance_history"] = [*history, entry]
+        history.append(entry)
         return record
 
     def is_current(

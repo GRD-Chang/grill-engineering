@@ -16,6 +16,9 @@ from agent_run.run_currentness import ticket_completion_records
 def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     result: list[dict[str, Any]] = []
+    queried_starts = state.get("_notification_starts")
+    if isinstance(queried_starts, list):
+        result.extend(queried_starts)
     parent_only = state.get("delivery_type") == "parent_only"
     started = [record for record in records if record.get("started_at") and not record.get("event_record")
                and any(invocation_started(invocation) for invocation in record.get("invocations", []))]
@@ -23,7 +26,7 @@ def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dic
     for record in started:
         subject = str(record.get("work_subject") or "")
         eligible = subject == f"parent-only:{state.get('run_id')}" if parent_only else subject.startswith("ticket:")
-        if not eligible or role_family(str(record.get("role"))) != "development" or subject in subjects:
+        if queried_starts is not None or not eligible or role_family(str(record.get("role"))) != "development" or subject in subjects:
             continue
         subjects.add(subject)
         facts = event_subject(state, subject)
@@ -37,12 +40,12 @@ def milestones(state: dict[str, Any], records: list[dict[str, Any]]) -> list[dic
         reviews = [record for record in started if record.get("work_subject") == f"run-acceptance:{state.get('run_id')}"
                    and role_family(str(record.get("role"))) == "review"]
         run = state.get("run_acceptance") or {}
-        if reviews or run.get("acceptance_generation"):
+        if queried_starts is None and (reviews or run.get("acceptance_generation")):
             first = reviews[0] if reviews else {}
             result.append(event_envelope(state, "acceptance_started", state.get("run_id"), event_copy(state, "acceptance_started"),
                                 attempt_id=first.get("attempt_id"), live=first.get("activity") == "running",
                                 started_at=first.get("started_at")))
-        if run.get("phase") == "repairing" or run.get("repair_job") or run.get("completed_repair_jobs"):
+        if run.get("phase") == "repairing" or run.get("repair_job") or run.get("completed_repair_jobs") or state.get("_notification_had_repair"):
             active = state.get("active_agent_invocation") or {}
             repairing = (active.get("work_subject") == f"run-repair:{state.get('run_id')}"
                          and active.get("role") == "development" and active.get("status") == "running"

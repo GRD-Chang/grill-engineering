@@ -5,14 +5,15 @@ import sqlite3
 from collections.abc import Iterator, Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query, integer_aggregate
 from agent_run.sqlite_change_job_schema import (
     BOOLEAN_FIELDS, EVIDENCE_FIELDS, INPUT_BOUND_RECORDS, INTEGER_FIELDS, JOB_FIELDS, RECORDS, TEXT_FIELDS, THREAD_FIELDS,
     column, record_table,
 )
 from agent_run.sqlite_encoding import encode_json
 from agent_run.sqlite_mutations import _same
+from agent_run.state_limits import MAX_CURRENT_BYTES
 
-MAX_CURRENT_BYTES = 256 * 1024
 _CORE = sorted(TEXT_FIELDS | INTEGER_FIELDS | BOOLEAN_FIELDS | EVIDENCE_FIELDS |
                {"had_candidate", "had_acceptance", "had_publication"})
 
@@ -50,7 +51,7 @@ def put_material(c: sqlite3.Connection, run_id: str, owner_id: str, field: str, 
     if query != field:
         source = find_result_reference(c, run_id, owner_id, query, review_record if review_record is not None else value)
         if source is None and field in {"repair_input_artifact", "unresolved_acceptance_artifact"}:
-            parent = c.execute("SELECT budget_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, owner_id)).fetchone()
+            parent = bounded_query(c, "SELECT budget_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, owner_id)).fetchone()
             if parent is not None and parent[0] != owner_id:
                 source = find_result_reference(c, run_id, parent[0], query, review_record if review_record is not None else value)
         if source is not None:
@@ -74,8 +75,7 @@ def history_rows(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *,
                  owner_id: str) -> Iterator[tuple[str | None, str | None, int]]:
     """Validate archive lengths from owned headers without loading report bodies."""
     from agent_run.sqlite_work_evidence import MAX_EVIDENCE_BYTES
-    rows = c.execute(
-        "SELECT a.position,a.evidence_id,a.thread_id,a.logical_bytes,e.owner_id,e.kind,e.value_bytes "
+    rows = bounded_query(c, "SELECT a.position,a.evidence_id,a.thread_id,a.logical_bytes,e.owner_id,e.kind,e.value_bytes "
         "FROM work_job_archives a LEFT JOIN work_evidence e USING(run_id,evidence_id) "
         "WHERE a.run_id=? AND a.job_id=? AND a.history_kind=? ORDER BY a.position", (run_id, job_id, field))
     for ordinal, row in enumerate(rows):
@@ -103,6 +103,26 @@ def _typed(value: Any, kind: str, field: str) -> Any:
     return int(value) if kind == "BOOLEAN" else value
 
 
+def check_core_size(c: sqlite3.Connection, run_id: str, job_id: str) -> None:
+    """Admit the complete current Job, including its explicit string lists.
+
+    Length aggregation stays inside SQLite; only the selected fields are
+    subsequently transferred and charged to the caller's shared query budget.
+    """
+    columns = [column(key) for key in _CORE] + [
+        "presence", "stage", "evidence_owner_id", "budget_owner_id", "repair_job_id", "cycle_evidence_id", "revision",
+    ]
+    lengths = "+".join(f"COALESCE(LENGTH(CAST(j.{name} AS BLOB)),0)+16" for name in columns)
+    row = integer_aggregate(c,
+        f"SELECT {lengths}+COALESCE((SELECT SUM(LENGTH(CAST(s.text_value AS BLOB))+"
+        "LENGTH(CAST(s.list_name AS BLOB))+48) FROM work_job_record_strings s "
+        "WHERE s.run_id=j.run_id AND s.job_id=j.job_id AND s.record_kind='job'),0) "
+        "FROM work_jobs j WHERE j.run_id=? AND j.job_id=?", (run_id, job_id),
+    )
+    if row is not None and (type(row[0]) is not int or row[0] > MAX_CURRENT_BYTES):
+        raise ValueError(f"Change Job current record exceeds {MAX_CURRENT_BYTES} bytes")
+
+
 def save_core(c: sqlite3.Connection, run_id: str, job_id: str, job: Mapping[str, Any], *,
               owner_id: str, stage: Any, budget_owner_id: str | None, repair_job_id: str | None,
               cycle_evidence_id: str | None = None, changed: set[str] | None = None) -> None:
@@ -123,19 +143,18 @@ def save_core(c: sqlite3.Connection, run_id: str, job_id: str, job: Mapping[str,
             kind = "BOOLEAN" if key in BOOLEAN_FIELDS or key.startswith("had_") else "INTEGER" if key in INTEGER_FIELDS else "TEXT"
             value = _typed(value, kind, key)
         values.append(value)
-    size = sum(len(value.encode()) if isinstance(value, str) else 16 for value in values) + len(job) * 16
-    if size > MAX_CURRENT_BYTES:
-        raise ValueError(f"Change Job current record exceeds {MAX_CURRENT_BYTES} bytes")
     assignments = "".join(f"{column(key)}=?," for key in selected)
     c.execute(f"UPDATE work_jobs SET {assignments}stage=?,presence=?,budget_owner_id=?,repair_job_id=?,cycle_evidence_id=?,revision=revision+1 "
               "WHERE run_id=? AND job_id=?", (*values, stage, presence(job, JOB_FIELDS), budget_owner_id, repair_job_id,
                                              cycle_evidence_id, run_id, job_id))
+    check_core_size(c, run_id, job_id)
 
 
 def load_core(c: sqlite3.Connection, run_id: str, job_id: str, *, fields: set[str] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    check_core_size(c, run_id, job_id)
     selected = [key for key in _CORE if fields is None or key in fields]
     columns = "".join("," + column(key) for key in selected)
-    row = c.execute(f"SELECT presence,stage,evidence_owner_id,budget_owner_id,repair_job_id,cycle_evidence_id,revision{columns} "
+    row = bounded_query(c, f"SELECT presence,stage,evidence_owner_id,budget_owner_id,repair_job_id,cycle_evidence_id,revision{columns} "
                     "FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None:
         raise ValueError("Missing Change Job identity")
@@ -191,7 +210,7 @@ def _input_versions(c: sqlite3.Connection, run_id: str, field: str, record: Mapp
         return {}
     # Direct Job-layer tests and small storage consumers can omit Run inputs.
     # A real Run supplies them before saving its review/publication relations.
-    has_inputs = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_root'").fetchone()
+    has_inputs = bounded_query(c, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_root'").fetchone()
     boundary = record.get("acceptance_boundary", {}) if field == "merge_intent" else record
     result: dict[str, str | None] = {}
     for kind, key in (("parent", "parent_revision"), ("graph", "ticket_graph_revision")):
@@ -201,20 +220,24 @@ def _input_versions(c: sqlite3.Connection, run_id: str, field: str, record: Mapp
             from agent_run.sqlite_run_inputs import input_version_for_revision
             identity = input_version_for_revision(c, run_id, kind, revision)
             table = "run_parent_versions" if kind == "parent" else "run_graph_versions"
-            if identity is None and c.execute(f"SELECT 1 FROM {table} WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+            if identity is None and bounded_query(c, f"SELECT 1 FROM {table} WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
                 raise ValueError(f"Missing immutable {kind} input version")
         result[f"{kind}_version_id"] = identity
     return result
 
 
 def _check_record_size(c: sqlite3.Connection, run_id: str, job_id: str, field: str, columns: list[str]) -> None:
+    from agent_run.sqlite_change_job_budget import record_list_bytes
+
     lengths = "+".join(f"COALESCE(LENGTH(CAST(r.{name} AS BLOB)),0)+16" for name in ["presence", "nulls", *columns])
-    size = c.execute(
-        f"SELECT {lengths}+COALESCE((SELECT SUM(LENGTH(CAST(s.text_value AS BLOB))+16) "
+    size = integer_aggregate(c, f"SELECT {lengths}+COALESCE((SELECT SUM(LENGTH(CAST(s.text_value AS BLOB))+16) "
         "FROM work_job_record_strings s WHERE s.run_id=r.run_id AND s.job_id=r.job_id AND s.record_kind=?),0) "
         f"FROM {record_table(field)} r WHERE r.run_id=? AND r.job_id=?", (field, run_id, job_id),
-    ).fetchone()
-    if size is not None and (type(size[0]) is not int or size[0] > MAX_CURRENT_BYTES):
+    )
+    children = record_list_bytes(c, run_id, job_id, field) if any(
+        kind in {"EVENTS", "ARTIFACTS"} for kind in RECORDS[field].values()
+    ) else 0
+    if size is not None and (type(size[0]) is not int or size[0] + children > MAX_CURRENT_BYTES):
         raise ValueError("Change Job record exceeds byte limit")
 
 
@@ -271,7 +294,7 @@ def load_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *, 
     columns = [column(path) for path, kind in schema.items() if kind not in {"STRINGS", "ARTIFACTS", "EVENTS"}]
     inputs = ",parent_version_id,graph_version_id" if field in INPUT_BOUND_RECORDS else ""
     _check_record_size(c, run_id, job_id, field, columns + (["parent_version_id", "graph_version_id"] if inputs else []))
-    row = c.execute(f"SELECT presence,nulls,{','.join(columns)}{inputs} FROM {record_table(field)} WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
+    row = bounded_query(c, f"SELECT presence,nulls,{','.join(columns)}{inputs} FROM {record_table(field)} WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None:
         return None
     keys = present(row[0], _shape(schema))
@@ -291,7 +314,7 @@ def load_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *, 
             continue
         if kind == "STRINGS":
             item = []
-            for position, text in c.execute("SELECT position,text_value FROM work_job_record_strings WHERE run_id=? AND job_id=? AND record_kind=? AND list_name=? ORDER BY position", (run_id, job_id, field, path)):
+            for position, text in bounded_query(c, "SELECT position,text_value FROM work_job_record_strings WHERE run_id=? AND job_id=? AND record_kind=? AND list_name=? ORDER BY position", (run_id, job_id, field, path)):
                 if type(position) is not int or position != len(item) or not isinstance(text, str):
                     raise ValueError("Invalid Change Job record strings")
                 item.append(text)

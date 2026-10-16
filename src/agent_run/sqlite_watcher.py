@@ -5,7 +5,10 @@ import sqlite3
 from pathlib import Path
 from types import TracebackType
 
-from agent_run.sqlite_rows import ReadConnection
+from agent_run.sqlite_runtime import STATEMENT_CACHE_SIZE
+from agent_run.sqlite_query_rows import QueryConnection
+
+ReadConnection = QueryConnection
 
 
 class SQLiteWatcher:
@@ -59,6 +62,7 @@ class SQLiteWatcher:
                 self.connection = sqlite3.connect(
                     self.path.resolve().as_uri() + "?mode=ro", uri=True,
                     timeout=5.0, isolation_level=None, factory=ReadConnection,
+                    cached_statements=STATEMENT_CACHE_SIZE,
                 )
                 self.connection.execute("PRAGMA query_only = ON")
                 self._identity = identity

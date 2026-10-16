@@ -20,11 +20,19 @@ from agent_run.ticket_pause import TicketStopRequested, can_pause_ticket, pause_
 from agent_run.worker_control import worker_lease
 
 
-RUN_STOP_STATUSES = frozenset({
-    "operator_stopped", "abandoned", "abandonment_pending", "completed",
-    "execution_failed", "supervision_timeout", "requeue_required",
-    "unsupported_scope_change", "deterministic_contradiction",
-})
+RUN_STOP_STATUSES = frozenset(
+    {
+        "operator_stopped",
+        "abandoned",
+        "abandonment_pending",
+        "completed",
+        "execution_failed",
+        "supervision_timeout",
+        "requeue_required",
+        "unsupported_scope_change",
+        "deterministic_contradiction",
+    }
+)
 _WAIT_FIELDS = ("supervision_window", "supervision_wait", "credential_availability")
 _SCHEDULER_JOB_FIELDS = frozenset({"selection_reason", "source_revision_changed"})
 
@@ -32,7 +40,9 @@ _SCHEDULER_JOB_FIELDS = frozenset({"selection_reason", "source_revision_changed"
 def _execution_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if job is None:
         return None
-    return {key: value for key, value in job.items() if key not in _SCHEDULER_JOB_FIELDS}
+    from agent_run.sqlite_job_history import FIELDS
+
+    return {key: value for key, value in job.items() if key not in _SCHEDULER_JOB_FIELDS | FIELDS}
 
 
 def _demand_identity(state: dict[str, Any], number: str) -> tuple[Any, Any, Any, Any]:
@@ -53,8 +63,11 @@ class _WorkProjection(dict[str, Any]):
     """Keep unloaded archive scope with its own snapshot, never save authority."""
 
     def __init__(
-        self, state: dict[str, Any], owner: tuple[str, int],
-        archives: dict[str, tuple[int, int]], attempts: dict[str, dict[str, Any]],
+        self,
+        state: dict[str, Any],
+        owner: tuple[str, int],
+        archives: dict[str, tuple[int, int]],
+        attempts: dict[str, dict[str, Any]],
         timelines: dict[str, TimelineScope],
     ) -> None:
         super().__init__(state)
@@ -95,12 +108,22 @@ class TicketState:
 
         if isinstance(state, _WorkProjection):
             active = state.get("active_ticket_job")
-            if (state.owner != (self.run_id, self.ticket_number)
-                    or state.get("run_id") != self.run_id
-                    or not isinstance(active, dict)
-                    or active.get("ticket_number") != self.ticket_number):
+            if (
+                state.owner != (self.run_id, self.ticket_number)
+                or state.get("run_id") != self.run_id
+                or not isinstance(active, dict)
+                or active.get("ticket_number") != self.ticket_number
+            ):
                 raise ValueError("Work projection belongs to another Ticket")
-            require_current_work_state(state, state.archives, state.attempts, state.timelines)
+            attempts = {}
+            for path, attempt in state.attempts.items():
+                owner: Any = state
+                for part in object_path(path):
+                    owner = owner.get(part) if isinstance(owner, dict) else None
+                if isinstance(owner, dict) and owner.get("publication_operation_retry") is None:
+                    continue
+                attempts[path] = attempt
+            require_current_work_state(state, state.archives, attempts, state.timelines)
         else:
             require_current_work_state(state, {})
 
@@ -110,7 +133,10 @@ class TicketState:
         return self.states.ticket_pause_requested(run_id, ticket_number)
 
     def load_current_run(
-        self, run_id: str, *, complete: bool = False,
+        self,
+        run_id: str,
+        *,
+        complete: bool = False,
     ) -> dict[str, Any] | None:
         if run_id != self.run_id:
             raise ValueError("Ticket state belongs to another Run")
@@ -122,13 +148,21 @@ class TicketState:
         if state is None:
             return None
         if not complete:
-            state = _WorkProjection(state, (self.run_id, self.ticket_number), {
-                path: size for path, size in self.states._repository.work_archives().items()
-                if object_path(path)[:1] != ("active_ticket_job",)
-            }, {
-                path: attempt for path, attempt in self.states._repository.work_attempts().items()
-                if object_path(path)[:1] != ("active_ticket_job",)
-            }, self.states._repository.work_timelines())
+            state = _WorkProjection(
+                state,
+                (self.run_id, self.ticket_number),
+                {
+                    path: size
+                    for path, size in self.states._repository.work_archives().items()
+                    if object_path(path)[:1] != ("active_ticket_job",)
+                },
+                {
+                    path: attempt
+                    for path, attempt in self.states._repository.work_attempts().items()
+                    if object_path(path)[:1] != ("active_ticket_job",)
+                },
+                self.states._repository.work_timelines(),
+            )
         number = str(self.ticket_number)
         selected = state.get("active_ticket_job")
         selected_number = selected.get("ticket_number") if isinstance(selected, dict) else None
@@ -152,7 +186,13 @@ class TicketState:
             state["terminal_kind"] = None
             for key in _WAIT_FIELDS:
                 state.pop(key, None)
-        if state["status"] in {"active", "ticket_delivery_pending", "waiting_checks", "waiting_external", "waiting_merge"}:
+        if state["status"] in {
+            "active",
+            "ticket_delivery_pending",
+            "waiting_checks",
+            "waiting_external",
+            "waiting_merge",
+        }:
             wait = job.get("external_wait")
             if isinstance(wait, dict):
                 state.update(copy_json_tree(wait))
@@ -173,17 +213,23 @@ class TicketState:
                 raise ValueError("Delivery Run disappeared during Ticket execution")
             latest, baseline = loaded
             from agent_run.invocation_settlement import current_settlement, commit_settlement
+
             permission = current_settlement()
             released = lease is not None and not any(
                 item["ticket_number"] == self.ticket_number and item["lease_id"] == lease
                 for item in latest["ticket_work_queue"]
             )
             if permission is not None and (
-                permission.limited or latest.get("status") in RUN_STOP_STATUSES
-                or released or number in latest["ticket_pause_requests"]
+                permission.limited
+                or latest.get("status") in RUN_STOP_STATUSES
+                or released
+                or number in latest["ticket_pause_requests"]
             ):
                 durable = commit_settlement(
-                    self.states, run_id, state, ticket_number=self.ticket_number,
+                    self.states,
+                    run_id,
+                    state,
+                    ticket_number=self.ticket_number,
                 )
                 self._last_job = copy_json_tree(durable["ticket_jobs"].get(number))
                 self._last_invocation = copy_json_tree(durable["ticket_agent_invocations"].get(number))
@@ -203,18 +249,17 @@ class TicketState:
 
                 if job.get("ticket_branch_generation") != generation(latest, self.ticket_number):
                     raise TaskControlBusyError("Ticket allocation generation changed")
-            if (number in latest["ticket_pause_requests"] and current is None
-                    and job.get("phase") is not None):
+            if number in latest["ticket_pause_requests"] and current is None and job.get("phase") is not None:
                 # Stop can cancel a waiter before its Job has been created.
                 # Persist that same authorized allocation directly as paused;
                 # no Invocation or Agent work is started for this closeout.
                 pause_ticket(state, job)
-            if (number in latest["ticket_pause_requests"]
-                    and not (job.get("phase") == "blocked"
-                             and job.get("blocked_reason") == "ticket_paused")
-                    and (not isinstance(current, dict) or can_pause_ticket(current))
-                    and not (isinstance(proposed_invocation, dict)
-                             and proposed_invocation.get("status") == "failed")):
+            if (
+                number in latest["ticket_pause_requests"]
+                and not (job.get("phase") == "blocked" and job.get("blocked_reason") == "ticket_paused")
+                and (not isinstance(current, dict) or can_pause_ticket(current))
+                and not (isinstance(proposed_invocation, dict) and proposed_invocation.get("status") == "failed")
+            ):
                 raise TicketStopRequested("Ticket stop requested before commit")
             if _execution_job(current) != _execution_job(self._last_job):
                 raise TaskControlBusyError("Ticket Job changed while its lane ran")
@@ -237,7 +282,8 @@ class TicketState:
                 and isinstance(invocation, dict)
                 and invocation.get("work_subject") == f"ticket:{self.ticket_number}"
                 and invocation.get("status") == "failed"
-                and diagnostics and diagnostics[0].get("code") == "agent_invocation_failed"
+                and diagnostics
+                and diagnostics[0].get("code") == "agent_invocation_failed"
             ):
                 # The shared Invocation recorder reports execution failure.
                 # Commit its Ticket owner as paused in the same transaction,
@@ -248,15 +294,15 @@ class TicketState:
                     job["execution_resume_phase"] = job["phase"]
                     job["phase"] = "blocked"
                     job["blocked_reason"] = "ticket_execution_failed"
-                    job["execution_failure"] = bounded_error(str(
-                        invocation.get("error") or diagnostics[0]["message"]
-                    ))
+                    job["execution_failure"] = bounded_error(str(invocation.get("error") or diagnostics[0]["message"]))
                     if "prior_human_blockers" in job:
                         job.pop("human_blockers", None)
                     state["status"] = "blocked"
                     state["terminal_kind"] = None
             holder = state["ticket_integration_holder"]
-            if holder != self._last_holder and (holder == self.ticket_number or self._last_holder == self.ticket_number):
+            if holder != self._last_holder and (
+                holder == self.ticket_number or self._last_holder == self.ticket_number
+            ):
                 if latest["ticket_integration_holder"] != self._last_holder:
                     raise TaskControlBusyError("Ticket integration seat changed")
                 if holder == self.ticket_number and latest["ticket_integration_queue"]:
@@ -268,6 +314,26 @@ class TicketState:
             if state.get("status") not in {"waiting_checks", "waiting_external", "waiting_merge"}:
                 job.pop("external_wait", None)
             saved_job = copy_json_tree(job)
+            from agent_run.work_projection import JobProjection, JobHistoryAppend, materialize_history
+            from agent_run.sqlite_job_history import FIELDS as ARCHIVE_FIELDS
+
+            if isinstance(current, JobProjection) and not isinstance(saved_job, JobProjection):
+                known = current.copy()
+                known.clear()
+                known.update(saved_job)
+                # 完整调用方修改已读档案时，按准确旧版本补读 lane 基线。
+                # 常规薄 Job 保留查询范围，不进入此完整输入分支。
+                for field in ARCHIVE_FIELDS & saved_job.keys():
+                    if field in current.archives and not isinstance(saved_job[field], JobHistoryAppend):
+                        actual = current.materialize(field)
+                        previous = (
+                            materialize_history(self._last_job, field)
+                            if isinstance(self._last_job, dict) else None
+                        )
+                        if actual != previous and actual != saved_job[field]:
+                            raise TaskControlBusyError(f"Ticket history changed while its lane ran: {field}")
+                        known.loaded_histories.add(field)
+                saved_job = known
             if isinstance(current, dict):
                 for field in _SCHEDULER_JOB_FIELDS:
                     if field in current:
@@ -305,24 +371,42 @@ class TicketState:
                     latest[key] = copy_json_tree(state.get(key))
             _merge_ticket_cleanup(latest, state, job)
             durable = self.states._save_work_and_notify_unlocked(
-                run_id, latest, baseline, ticket_number=self.ticket_number,
+                run_id,
+                latest,
+                baseline,
+                ticket_number=self.ticket_number,
             )
             state["ticket_work_queue"] = copy_json_tree(latest["ticket_work_queue"])
-            state["resume_audit"] = copy_json_tree(latest["resume_audit"])
+            from agent_run.sqlite_run_resume import load as load_resume
+
+            # The new Invocation can replace a Resume successor in this same
+            # transaction. Read its final current references so the next save
+            # cannot append a previously committed successor as new history.
+            current_resume = load_resume(
+                self.states._repository._local.connection, run_id, current_only=True
+            )
+            state.update(copy_json_tree(current_resume))
             # The next save may no longer load a previous role's Invocation.
             # Keep only the current invocation and retained Resume references
             # in the lane, so an old snapshot cannot be appended a second time.
             resumed = {
-                event["resume_id"] for event in latest["resume_audit"]["history"]
+                event["resume_id"]
+                for event in state["resume_audit"]["history"]
                 if event.get("successor_invocation_started_at") is not None
             }
-            identity = ((invocation.get("work_subject"), invocation.get("started_at"))
-                        if isinstance(invocation, dict) else None)
-            state["agent_invocation_history"] = copy_json_tree([
-                entry for entry in latest["agent_invocation_history"]
-                if (entry.get("work_subject"), entry.get("started_at")) == identity
-                or entry.get("resume_id") in resumed
-            ])
+            identity = (
+                (invocation.get("work_subject"), invocation.get("started_at"))
+                if isinstance(invocation, dict)
+                else None
+            )
+            state["agent_invocation_history"] = copy_json_tree(
+                [
+                    entry
+                    for entry in latest["agent_invocation_history"]
+                    if (entry.get("work_subject"), entry.get("started_at")) == identity
+                    or entry.get("resume_id") in resumed
+                ]
+            )
             # The lane also validates its in-memory projection between saves.
             # Keep its canonical Invocation synchronized with the active one,
             # just as StateStore does for a direct Controller save.
@@ -335,18 +419,41 @@ class TicketState:
             # characters). Compare subsequent writes with the durable baseline,
             # rather than the unsanitized in-memory payload we just saved.
             if durable is not None:
-                baseline = copy_json_tree({
-                    "job": durable["ticket_jobs"][number],
-                    "invocation": durable["ticket_agent_invocations"].get(number),
-                })
+                baseline = copy_json_tree(
+                    {
+                        "job": durable["ticket_jobs"][number],
+                        "invocation": durable["ticket_agent_invocations"].get(number),
+                    }
+                )
             else:
                 # Custom save hooks may retain the older void-return seam.
                 from agent_run.state import _sanitize_durable_errors
-                baseline = _sanitize_durable_errors({
-                    "job": latest["ticket_jobs"][number], "invocation": invocation,
-                })
+
+                normalized = _sanitize_durable_errors(
+                    {
+                        "ticket_jobs": {number: latest["ticket_jobs"][number]},
+                        "ticket_agent_invocations": {number: invocation},
+                    }
+                )
+                from agent_run.work_projection import restore_work_scopes
+
+                restore_work_scopes(normalized, latest)
+                baseline = {
+                    "job": normalized["ticket_jobs"][number],
+                    "invocation": normalized["ticket_agent_invocations"][number],
+                }
             self._last_job = baseline["job"]
             self._last_invocation = baseline["invocation"] if isinstance(invocation, dict) else None
+            from agent_run.work_projection import restore_work_scopes
+
+            restore_work_scopes(
+                state,
+                {
+                    "active_ticket_job": baseline["job"],
+                    "ticket_jobs": {number: baseline["job"]},
+                },
+                preserve_owner_references=True,
+            )
 
         self.states._commit_run(commit)
 
@@ -376,7 +483,9 @@ class TicketState:
             if state is None:
                 raise error
             wait_for_github_convergence(
-                state, code=error.code, message=str(error),
+                state,
+                code=error.code,
+                message=str(error),
                 waiting_for=f"ticket-{self.ticket_number}",
             )
             ensure_supervision_window(state)
@@ -384,7 +493,8 @@ class TicketState:
             from agent_run.ticket_work import TicketWorkAdmission, generation
 
             TicketWorkAdmission(self.states, self.run_id).cancel_waiter(
-                self.ticket_number, generation(state, self.ticket_number),
+                self.ticket_number,
+                generation(state, self.ticket_number),
             )
             return
 
@@ -417,15 +527,18 @@ class TicketState:
                     job.pop("human_blockers", None)
             invocation = latest["ticket_agent_invocations"].get(number)
             if isinstance(invocation, dict) and invocation.get("status") in {
-                "running", "resuming",
+                "running",
+                "resuming",
             }:
                 invocation = dict(invocation)
-                invocation.update({
-                    "status": "failed",
-                    "interruption_observed_at": datetime.now(UTC).isoformat(),
-                    "error": "ticket_paused" if stopping else "ticket_execution_failed",
-                    "execution_interrupted": True,
-                })
+                invocation.update(
+                    {
+                        "status": "failed",
+                        "interruption_observed_at": datetime.now(UTC).isoformat(),
+                        "error": "ticket_paused" if stopping else "ticket_execution_failed",
+                        "execution_interrupted": True,
+                    }
+                )
                 latest["ticket_agent_invocations"][number] = invocation
                 _sync_invocation_history(latest, invocation)
             reconcile(latest, job)
@@ -435,13 +548,18 @@ class TicketState:
                 if isinstance(invocation, dict):
                     latest["active_agent_invocation"] = invocation
                 latest["status"] = "blocked"
-                latest["diagnostics"] = [{
-                    "code": job["blocked_reason"],
-                    "message": job.get("execution_failure", "Ticket paused; explicit resume is required"),
-                    "ticket_number": self.ticket_number,
-                }]
+                latest["diagnostics"] = [
+                    {
+                        "code": job["blocked_reason"],
+                        "message": job.get("execution_failure", "Ticket paused; explicit resume is required"),
+                        "ticket_number": self.ticket_number,
+                    }
+                ]
             self.states._save_work_and_notify_unlocked(
-                self.run_id, latest, baseline, ticket_number=self.ticket_number,
+                self.run_id,
+                latest,
+                baseline,
+                ticket_number=self.ticket_number,
             )
 
         self.states._commit_run(commit)
@@ -457,20 +575,25 @@ class TicketState:
                 raise ValueError("Delivery Run disappeared during credential failure")
             if latest.get("status") in RUN_STOP_STATUSES or latest.get("terminal_kind") == "permanent_blocked":
                 return
-            latest.update({
-                "status": "execution_failed", "terminal_kind": "execution_failed",
-                "diagnostics": [run_failure_diagnostic(
-                    latest, code="runner_credential_failed", message=str(error),
-                )],
-            })
+            latest.update(
+                {
+                    "status": "execution_failed",
+                    "terminal_kind": "execution_failed",
+                    "diagnostics": [
+                        run_failure_diagnostic(
+                            latest,
+                            code="runner_credential_failed",
+                            message=str(error),
+                        )
+                    ],
+                }
+            )
             save_owned(self.states, self.run_id, latest, fields={"status", "terminal_kind", "diagnostics"})
 
         self.states._commit_run(commit)
 
 
-def _merge_invocation_history(
-    latest: dict[str, Any], lane: dict[str, Any], ticket_number: int
-) -> None:
+def _merge_invocation_history(latest: dict[str, Any], lane: dict[str, Any], ticket_number: int) -> None:
     subject = f"ticket:{ticket_number}"
     history = latest["agent_invocation_history"]
     for entry in lane.get("agent_invocation_history", []):
@@ -478,9 +601,7 @@ def _merge_invocation_history(
             continue
         identity = (entry.get("work_subject"), entry.get("started_at"))
         for index, previous in enumerate(history):
-            if isinstance(previous, dict) and (
-                previous.get("work_subject"), previous.get("started_at")
-            ) == identity:
+            if isinstance(previous, dict) and (previous.get("work_subject"), previous.get("started_at")) == identity:
                 history[index] = copy_json_tree(entry)
                 break
         else:
@@ -492,17 +613,17 @@ def _merge_resume_successors(latest: dict[str, Any], lane: dict[str, Any], ticke
 
     current = latest["resume_audit"]["history"]
     by_id = {
-        event.get("resume_id"): event for event in lane["resume_audit"]["history"]
-        if isinstance(event, dict) and event.get("successor_invocation_started_at")
+        event.get("resume_id"): event
+        for event in lane["resume_audit"]["history"]
+        if isinstance(event, dict)
+        and event.get("successor_invocation_started_at")
         and event.get("work_subject") == f"ticket:{ticket_number}"
     }
     changed = False
     for event in current:
         if isinstance(event, dict) and event.get("resume_id") in by_id:
             source = by_id[event["resume_id"]]
-            if event.get("successor_invocation_started_at") != source.get(
-                "successor_invocation_started_at"
-            ):
+            if event.get("successor_invocation_started_at") != source.get("successor_invocation_started_at"):
                 if event.get("successor_invocation_started_at") is not None:
                     raise TaskControlBusyError("Resume already belongs to another Invocation")
                 for key in ("work_subject", "generation", "semantic_attempt_id", "successor_invocation_started_at"):
@@ -535,7 +656,8 @@ def _clear_progressed_wait(state: dict[str, Any], previous: dict[str, Any] | Non
     window = state.get("supervision_window")
     old_wait = previous.get("external_wait") if isinstance(previous, dict) else None
     if (
-        isinstance(window, dict) and isinstance(old_wait, dict)
+        isinstance(window, dict)
+        and isinstance(old_wait, dict)
         and window == old_wait.get("supervision_window")
         and state.get("status") in {"waiting_checks", "waiting_external", "waiting_merge"}
         and not supervision_window_matches(state, window)
@@ -561,7 +683,8 @@ def capture_ticket_wait(state: dict[str, Any]) -> None:
         job.pop("external_wait", None)
         return
     job["external_wait"] = {
-        key: copy_json_tree(state[key]) for key in (*_WAIT_FIELDS, "status", "terminal_kind", "diagnostics")
+        key: copy_json_tree(state[key])
+        for key in (*_WAIT_FIELDS, "status", "terminal_kind", "diagnostics")
         if key in state
     }
     state["ticket_jobs"][str(job["ticket_number"])] = job

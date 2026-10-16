@@ -139,6 +139,9 @@ jobs:
   quality:
     name: quality
     needs: [selection, product-tests]
+    permissions:
+      contents: read
+      actions: read
     # 保留必需检查；本 job 只验证选择、作业结果及同候选完整证据。
     if: always()
     runs-on: ubuntu-22.04
@@ -165,3 +168,18 @@ jobs:
           PRODUCT_SELECTED: ${{ needs.selection.outputs.product }}
           CHECKS_SELECTED: ${{ needs.selection.outputs.product == 'true' }}
         run: python3 -B .github/ci/ci_evidence.py verify --results "$RUNNER_TEMP/test-diagnostics"
+
+      - name: Report CI costs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/ci/ci_costs.py --output "$RUNNER_TEMP/ci-costs"
+
+      - name: Upload CI costs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-costs
+          path: ${{ runner.temp }}/ci-costs/
+          overwrite: true
+          retention-days: 7

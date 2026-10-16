@@ -51,7 +51,7 @@ def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
     engine.publish(run_id)
     waiting = engine.approve(run_id)
     assert waiting["status"] == "waiting_external"
-    pending = states.load_current_run(run_id)
+    pending = states.load_history_run(run_id)
     original = deepcopy(pending["run_publication"])
     assert original["approval_grant"]["base_sha"] != git.resolve("main")
 
@@ -79,10 +79,13 @@ def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
         assert lagging["run_publication"]["approval_grant"] == original["approval_grant"]
         assert lagging["run_publication"]["merge_intent"] == original["merge_intent"]
         assert lagging["run_publication"].get("approval_update") is None
-        assert lagging["run_acceptance"] == pending["run_acceptance"]
+        assert current_projection_facts(lagging)["run_acceptance"] == current_projection_facts(pending)["run_acceptance"]
+        durable = states.load_history_run(run_id)
+        assert durable is not None
+        assert durable["run_acceptance"] == pending["run_acceptance"]
         assert current_projection_facts(lagging)["ticket_jobs"] == current_projection_facts(pending)["ticket_jobs"]
-        assert states.load_current_run(run_id)["ticket_jobs"] == pending["ticket_jobs"]
-        assert lagging["agent_invocation_history"] == pending["agent_invocation_history"]
+        assert durable["ticket_jobs"] == pending["ticket_jobs"]
+        assert durable["agent_invocation_history"] == pending["agent_invocation_history"]
         assert 1 not in publisher.data["delivery"]["closed_issues"]
 
     resumed = RunPublicationEngine(
@@ -93,7 +96,8 @@ def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
     assert resumed["status"] == "completed"
     assert resumed["run_publication"]["approval_grant"] == original["approval_grant"]
     assert resumed["run_publication"]["merge_intent"]["attempts"] == 1
-    assert resumed["run_acceptance"] == pending["run_acceptance"]
+    assert current_projection_facts(resumed)["run_acceptance"] == current_projection_facts(pending)["run_acceptance"]
+    assert states.load_history_run(run_id)["run_acceptance"] == pending["run_acceptance"]
 
 
 def test_unapplied_merge_with_external_default_advance_enters_update(git_repo: Path) -> None:

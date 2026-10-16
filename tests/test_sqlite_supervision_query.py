@@ -9,14 +9,14 @@ import sqlite3
 
 import pytest
 
-from agent_run.state import MAX_RUN_STATE_BYTES, StateStore
+from agent_run.state import StateStore
 from agent_run.sqlite_change_job_codec import presence
 from agent_run.sqlite_run_schema import FIELDS
 
 
 def _facts() -> dict:
     return {"status": "active", "ticket_integration_holder": None,
-            "ticket_integration_queue": [], "review_context": {"body": "unrelated" * 200}}
+            "ticket_integration_queue": [], "parent_job": {"review_context": {"body": "unrelated" * 200}}}
 
 
 @pytest.mark.parametrize("status", ["active", "ticket_delivery_pending", "operator_stopped", "unknown" * 200])
@@ -47,11 +47,11 @@ def test_supervision_ignores_unrelated_material_and_never_repairs_missing_run(tm
     assert states.has_ticket_supervision_work("absent") is False
     with states._repository.atomic():
         c = states._repository._local.connection
-        c.execute("UPDATE run_materials SET byte_length=byte_length+1")
+        c.execute("UPDATE work_evidence_materials SET byte_length=byte_length+1")
         c.execute("UPDATE runs SET status='completed'")
         # The indexed status column is the single source, with no stale node.
         assert states.has_ticket_supervision_work("run-1") is True
-        with pytest.raises(ValueError, match="material"):
+        with pytest.raises(ValueError, match="material|evidence"):
             states._repository.load("run-1")
 
 
@@ -60,7 +60,9 @@ def test_supervision_query_cost_does_not_scan_unrelated_history(tmp_path: Path) 
     states._repository.save("run-1", _facts())
     costs = []
     for count in (1, 1000):
-        states._repository.save_objects("run-1", {"unrelated_history": [{"fact": n} for n in range(count)]}, fields={"unrelated_history"})
+        states._repository.save_objects("run-1", {"agent_invocation_history": [
+            {"work_subject": "ticket:3", "started_at": str(number), "status": "completed"}
+            for number in range(count)]}, fields={"agent_invocation_history"})
         steps = [0]
         def progress() -> int:
             steps[0] += 1
@@ -77,7 +79,7 @@ def test_supervision_query_cost_does_not_scan_unrelated_history(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("damage", ["root", "missing_status", "status_blob", "holder_text", "holder_real",
-                                   "queue_null", "missing_size", "oversize", "protocol", "schema"])
+                                   "queue_null", "oversize", "protocol", "schema"])
 def test_supervision_rejects_current_relational_damage(tmp_path: Path, damage: str) -> None:
     states = StateStore(tmp_path)
     states._repository.save("run-1", _facts())
@@ -96,10 +98,8 @@ def test_supervision_rejects_current_relational_damage(tmp_path: Path, damage: s
             c.execute("UPDATE run_root SET value_ticket_integration_holder=2.5")
         elif damage == "queue_null":
             c.execute("UPDATE run_root SET nulls=?", (presence({"ticket_integration_holder", "ticket_integration_queue"}, FIELDS),))
-        elif damage == "missing_size":
-            c.execute("DELETE FROM run_sizes")
         elif damage == "oversize":
-            c.execute("UPDATE run_sizes SET logical_bytes=?", (MAX_RUN_STATE_BYTES + 1,))
+            c.execute("UPDATE runs SET status=?", ("X" * (300 * 1024),))
         elif damage == "protocol":
             c.execute("UPDATE schema_meta SET value='unsupported'")
         else:

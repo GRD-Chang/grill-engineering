@@ -25,6 +25,7 @@ from agent_run.semantic_attempt import (
 
 from agent_run.run_integration_development import resolve_run_integration_work
 from agent_run.resume_materials import require_change_checkout
+from agent_run.work_projection import materialize_history
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
@@ -202,7 +203,7 @@ def _own_run_ref_write(state: dict[str, Any], candidate: str) -> bool:
     run = state.get("run_acceptance")
     if isinstance(run, dict) and run.get("published_integration_head_sha") == candidate:
         return True
-    completed = run.get("completed_repair_jobs") if isinstance(run, dict) else None
+    completed = materialize_history(run, "completed_repair_jobs") if isinstance(run, dict) else None
     return isinstance(completed, list) and any(
         isinstance(job, dict)
         and job.get("phase") == "completed"

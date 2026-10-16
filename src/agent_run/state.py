@@ -28,7 +28,6 @@ MAX_TIMELINE_EVENTS = 256
 MAX_TIMELINE_CONTINUATION_EVENTS = 256
 MAX_DIAGNOSTIC_ENTRIES = 32
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
-MAX_RUN_STATE_BYTES = 4 * 1024 * 1024
 _T = TypeVar("_T")
 
 
@@ -49,7 +48,7 @@ class StateStore:
         self._write_guard: Callable[[], None] | None = None
         self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
-        self._repository = SQLiteStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+        self._repository = SQLiteStateRepository(root)
         self._coordinator = coordinator_for(root)
         self._commit_context = threading.local()
 
@@ -112,6 +111,11 @@ class StateStore:
                 raise MissingRunMaterialsError(f"{self._repository.path} Run {run_id}: {error}") from error
         return state
 
+    def load_dispatch_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read only dispatch facts; work admission still requires a fresh load."""
+        self._reject_legacy_run(run_id)
+        return self._read_run_materials(run_id, lambda: self._repository.load_dispatch(run_id))
+
     def validate_work_projection(self, state: dict[str, Any]) -> None:
         """Complete-StateStore consumers retain the complete Run contract."""
         from agent_run.state_contract import require_current_run_state
@@ -165,11 +169,11 @@ class StateStore:
 
         durable = save_work(self._repository, run_id, state, baseline, ticket_number)
         notifications = self._commit_context.notifications
-        # Existing observers consume a complete Run. Resolve their query only
-        # after admission, Control and database locks have all been released;
-        # it is never reused as the work commit's authorization or baseline.
+        # Resolve current observations only after admission, Control and
+        # database locks have been released. History and timing totals belong
+        # to explicit queries, never to an ordinary saved-state observation.
         notifications.append(
-            (lambda: self.load_current_run(run_id))
+            (lambda: self.load_observation_run(run_id))
             if self.run_saved_observer is not None else None
         )
         return durable
@@ -386,14 +390,49 @@ class StateStore:
 
         state = self.load_run(run_id)
         if state is not None:
-            # The remaining generic-node cache cannot prove current Run/Job
-            # relations. Validate the assembled facts on each boundary.
+            # Complete reads verify the assembled current Run/Job facts.
             self._validate_current_run(run_id, state)
+        return state
+
+    def load_status_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read current display facts and exact execution statistics, read-only."""
+        return self._load_current_query(run_id, include_timing=True)
+
+    def load_observation_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read bounded current facts, without expanding historical statistics."""
+        return self._load_current_query(run_id, include_timing=False)
+
+    def _load_current_query(self, run_id: str, *, include_timing: bool) -> dict[str, Any] | None:
+        from agent_run.query_state_contract import require_loaded_query_state
+
+        self._reject_legacy_run(run_id)
+        state = self._read_run_materials(run_id, lambda: self._repository.load_status(run_id, include_timing=include_timing))
+        if state is not None:
+            require_loaded_query_state(state)
+        return state
+
+    def load_history_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read the complete bounded public history in one read-only snapshot."""
+        self._reject_legacy_run(run_id)
+        state = self._read_run_materials(run_id, lambda: self._repository.load_history(run_id))
+        if state is not None:
+            self._validate_current_run(run_id, state)
+        return state
+
+    def load_notification_run(self, run_id: str, observation: dict[str, Any]) -> dict[str, Any] | None:
+        """Read exact notification facts selected by delivery receipts."""
+        from agent_run.query_state_contract import require_loaded_query_state
+
+        self._reject_legacy_run(run_id)
+        state = self._read_run_materials(run_id, lambda: self._repository.load_notifications(run_id, observation))
+        if state is not None:
+            require_loaded_query_state(state)
         return state
 
     @contextmanager
     def current_run_reader(
         self, run_id: str, *, work_only: bool = False, thin_timeline: bool = False,
+        dispatch_only: bool = False,
     ) -> Iterator[Callable[[], dict[str, Any] | None]]:
         """Retain one read-only scheduling view while SQLite reports no commit.
 
@@ -402,6 +441,15 @@ class StateStore:
         holds no transaction between polls and closes on every scope exit.
         """
         from agent_run.sqlite_watcher import SQLiteWatcher
+
+        if dispatch_only and (work_only or thin_timeline):
+            raise ValueError("Dispatch polling has its own explicit query scope")
+
+        def load() -> dict[str, Any] | None:
+            if dispatch_only:
+                return self.load_dispatch_run(run_id)
+            return self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
+                self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
 
         previous: dict[str, Any] | None = None
         previous_version: tuple[int, int] | None = None
@@ -413,29 +461,20 @@ class StateStore:
                 watcher.require_active()
                 self._reject_legacy_run(run_id)
                 if self._repository.in_transaction:
-                    return self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
-                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
+                    return load()
                 version = watcher.version()
                 if (retained and version == previous_version
                         and previous_limit == self._repository.max_bytes):
                     return previous
                 with self._repository.use_reader(watcher.connection):
-                    current = self.load_work_run(run_id, thin_timeline=True) if work_only and thin_timeline else (
-                        self.load_work_run(run_id) if work_only else self.load_current_run(run_id))
+                    current = load()
                 # Sampled before reading: a concurrent commit during the read
                 # can only cause an extra refresh, never label old facts new.
                 previous_version = version
                 previous_limit = self._repository.max_bytes
-                size = None
-                if (work_only and getattr(self.load_work_run, "__func__", None) is _DEFAULT_LOAD_WORK_RUN
-                        and getattr(self._repository.load_work, "__func__", None) is _DEFAULT_REPOSITORY_LOAD_WORK):
-                    # The default work read already computed this exact view's
-                    # logical size, with current source/material proofs. Reuse
-                    # only its scalar result, not a prior budget or Run size.
-                    size = getattr(self._repository._local, "work_projection_bytes", None)
-                retained = current is None or (
-                    size if size is not None else self._repository._check_size(current)
-                ) <= 512 * 1024
+                from agent_run.state_limits import check_response
+
+                retained = current is None or check_response(current) <= 512 * 1024
                 previous = current if retained else None
                 return current
 
@@ -449,7 +488,7 @@ class StateStore:
 
         try:
             if isinstance(state, ObjectProjection) and state.archive_scope:
-                require_current_work_state(state, state.archive_scope, state.attempt_scope)
+                require_current_work_state(state, state.archive_scope, state.attempt_scope, state.timelines)
             else:
                 require_current_run_state(state)
         except MissingRunMaterialsError as error:
@@ -894,12 +933,10 @@ def _thread_id_for_role(
     *,
     hide_pending_development: bool = False,
 ) -> object:
-    reviewer_ids = subject.get("reviewer_thread_ids")
     if role == "reviewer":
-        if isinstance(reviewer_ids, list) and reviewer_ids:
-            latest = reviewer_ids[-1]
-            return latest if isinstance(latest, str) else None
-        return None
+        from agent_run.work_projection import latest_thread_identity
+
+        return latest_thread_identity(subject, "reviewer_thread_ids")
     if role == "development":
         if hide_pending_development and isinstance(subject.get("pending_attempt"), int):
             return None
@@ -915,6 +952,9 @@ def _thread_id_for_role(
         thread_id = subject.get(key)
         if isinstance(thread_id, str):
             return thread_id
+    from agent_run.work_projection import materialize_history
+
+    reviewer_ids = materialize_history(subject, "reviewer_thread_ids")
     if isinstance(reviewer_ids, list) and reviewer_ids:
         latest = reviewer_ids[-1]
         return latest if isinstance(latest, str) else None

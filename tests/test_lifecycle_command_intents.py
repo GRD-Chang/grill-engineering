@@ -141,11 +141,11 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
     actual = StateStore(tmp_path / "actual-state")
     initial, _ = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), actual).start(1)
     run_id = str(initial["run_id"])
-    initial["response_store_marker"] = "actual"
+    initial["diagnostics"] = [{"code": "fixture_origin", "message": "actual"}]
     persist_run_fixture(actual, run_id, initial)
     unrelated = StateStore(tmp_path / "unrelated-state")
     other = deepcopy(initial)
-    other["response_store_marker"] = "unrelated"
+    other["diagnostics"] = [{"code": "fixture_origin", "message": "unrelated"}]
     unrelated.save_run(run_id, other)
     task = TaskKey(git_repo, "example/project", 1)
     control = TaskControlStore(actual.root)
@@ -201,7 +201,7 @@ def test_public_result_reads_the_receipt_store_after_executor_exit(
         final, _, receipt = lifecycle.execute_claimed(action_id=claim.action_id, generation=reservation.generation)
     assert query_roots == [actual.root]
     assert final == actual.load_current_run(run_id)
-    assert final["response_store_marker"] == "actual"
+    assert final["diagnostics"] == [{"code": "fixture_origin", "message": "actual"}]
     assert receipt.action_id == claim.action_id
     observed = control.snapshot(task, receipt.action_id)
     assert observed is not None

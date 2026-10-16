@@ -66,6 +66,20 @@ def status_timing(state: dict[str, Any], invocation: dict[str, Any] | None = Non
     from agent_run.history_facts import history_records
     from agent_run.execution_timing import execution_totals
 
+    queried = state.get("_query_timing")
+    if isinstance(queried, dict):
+        from agent_run.execution_timing import record_execution_timing
+        from agent_run.history_facts import _record_activity
+
+        totals = dict(queried["totals"])
+        identity = (invocation.get("semantic_attempt") or {}).get("attempt_id") if invocation else None
+        record = next((item for item in queried["records"] if item.get("attempt_id") == identity), None)
+        if record is not None:
+            timing_state = {**state, "resume_audit": {"history": queried["resumes"]}}
+            record = {**record, "activity": _record_activity(state, record, record["invocations"])}
+            totals["round_seconds"] = record_execution_timing(timing_state, record).get("execution_seconds")
+        return totals
+
     audit = {"semantic_agent_attempts": semantic_attempt_history(state),
              "agent_invocations": state.get("agent_invocation_history", [])}
     records = history_records(state, audit)

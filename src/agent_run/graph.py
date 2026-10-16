@@ -280,13 +280,13 @@ def _retained_ticket_jobs(
     if isinstance(previous_jobs, dict):
         for key, value in previous_jobs.items():
             if key in allowed and isinstance(value, dict):
-                retained[key] = dict(value)
+                retained[key] = value.copy()
     previous_active = previous.get("active_ticket_job")
     if isinstance(previous_active, dict):
         number = previous_active.get("ticket_number")
         key = str(number)
         if isinstance(number, int) and key in allowed:
-            retained[key] = dict(previous_active)
+            retained[key] = previous_active.copy()
     return retained
 
 

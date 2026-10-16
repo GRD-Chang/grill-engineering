@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_encoding import encode_json
 from agent_run.sqlite_work_evidence import get_evidence, put_evidence
 
@@ -49,7 +50,7 @@ def put_completions(
     if len(raw) > MAX_COMPLETION_BYTES:
         raise ValueError("Ticket completion set exceeds byte limit")
     identity = hashlib.sha256(raw).hexdigest()
-    existing = c.execute("SELECT 1 FROM work_completion_sets WHERE run_id=? AND set_id=?", (run_id, identity)).fetchone()
+    existing = bounded_query(c, "SELECT 1 FROM work_completion_sets WHERE run_id=? AND set_id=?", (run_id, identity)).fetchone()
     if existing is None:
         c.execute("INSERT INTO work_completion_sets VALUES (?,?,?,?)", (run_id, identity, len(records), len(raw)))
         for position, item in enumerate(records):
@@ -68,28 +69,26 @@ def put_completions(
 def get_completions(
     c: sqlite3.Connection, run_id: str, owner_id: str, purpose: str, identity: str,
 ) -> list[dict[str, Any]]:
-    if c.execute("SELECT 1 FROM work_completion_refs WHERE run_id=? AND owner_id=? AND purpose=? AND set_id=?",
+    if bounded_query(c, "SELECT 1 FROM work_completion_refs WHERE run_id=? AND owner_id=? AND purpose=? AND set_id=?",
                  (run_id, owner_id, purpose, identity)).fetchone() is None:
         raise ValueError("Missing owned Ticket completion reference")
     return _load(c, run_id, identity)
 
 
 def _load(c: sqlite3.Connection, run_id: str, identity: str) -> list[dict[str, Any]]:
-    header = c.execute("SELECT item_count,logical_bytes FROM work_completion_sets WHERE run_id=? AND set_id=?", (run_id, identity)).fetchone()
+    header = bounded_query(c, "SELECT item_count,logical_bytes FROM work_completion_sets WHERE run_id=? AND set_id=?", (run_id, identity)).fetchone()
     if (header is None or any(type(value) is not int for value in header)
             or not 0 <= header[0] <= MAX_COMPLETION_BYTES // 2 or not 2 <= header[1] <= MAX_COMPLETION_BYTES):
         raise ValueError("Invalid Ticket completion set size")
     lengths = "+".join(f"COALESCE(LENGTH(CAST(t.{key} AS BLOB)),0)" for key in _FIELDS[:-1])
-    count, actual = c.execute(
-        f"SELECT COUNT(*),COALESCE(SUM({lengths}+COALESCE(e.value_bytes,0)),0) "
+    count, actual = bounded_query(c, f"SELECT COUNT(*),COALESCE(SUM({lengths}+COALESCE(e.value_bytes,0)),0) "
         "FROM work_ticket_completions t LEFT JOIN work_evidence e ON e.run_id=t.run_id AND e.evidence_id=t.receipt_evidence_id "
         "WHERE t.run_id=? AND t.set_id=?", (run_id, identity),
     ).fetchone()
     if count != header[0] or actual > MAX_COMPLETION_BYTES:
         raise ValueError("Invalid Ticket completion set size")
     result = []
-    for ordinal, row in enumerate(c.execute(
-        f"SELECT position,presence,{_COLUMNS},receipt_evidence_id FROM work_ticket_completions "
+    for ordinal, row in enumerate(bounded_query(c, f"SELECT position,presence,{_COLUMNS},receipt_evidence_id FROM work_ticket_completions "
         "WHERE run_id=? AND set_id=? ORDER BY position", (run_id, identity),
     )):
         position, mask, *values = row

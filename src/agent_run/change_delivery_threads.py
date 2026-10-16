@@ -71,7 +71,6 @@ def latest_reviewer_thread(subject: dict[str, Any]) -> str | None:
     resume_thread = subject.get("review_resume_thread_id")
     if isinstance(resume_thread, str) and resume_thread.strip():
         return resume_thread
-    threads = subject.get("reviewer_thread_ids")
-    if isinstance(threads, list) and threads and isinstance(threads[-1], str):
-        return threads[-1]
-    return None
+    from agent_run.work_projection import latest_thread_identity
+
+    return latest_thread_identity(subject, "reviewer_thread_ids")

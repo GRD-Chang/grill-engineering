@@ -143,7 +143,7 @@ def test_shared_credential_failure_is_durable_before_sibling_can_write(
     sibling = TicketState(states, run_id, 2)
     old = sibling.load_current_run(run_id)
     assert old is not None
-    original_job = deepcopy(old['ticket_jobs']['2'])
+    original_job = deepcopy(states.load_history_run(run_id)['ticket_jobs']['2'])
     selected = states.load_current_run(run_id)['active_ticket_job']['ticket_number']
 
     def fail(**_kwargs: Any) -> None:

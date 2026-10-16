@@ -8,6 +8,19 @@ from __future__ import annotations
 from typing import Any
 
 
+class TicketDispatchJob(dict[str, Any]):
+    """Read-only scheduling fields and readiness derived by this query.
+
+    Readiness does not retain the necessary returns that its query validated.
+    This view carries no revision or baseline granting permission to save or
+    execute, and never materializes omitted histories.
+    """
+
+    def __init__(self, fields: dict[str, Any], *, program_ready: bool) -> None:
+        super().__init__(fields)
+        self.program_ready = program_ready
+
+
 INTEGRATION_SCENE_KEYS = (
     "integration_conflict", "parent_integration_conflict",
     "run_repair_integration_conflict", "run_integration_conflict",
@@ -111,6 +124,8 @@ def ticket_program_ready(job: dict[str, Any]) -> bool:
     This does not choose the next role or bypass a gate. The Ticket stage
     still owns currentness validation and the allowed business successor.
     """
+    if isinstance(job, TicketDispatchJob):
+        return job.program_ready
     from agent_run.agent_return import has_returned_agent_result
 
     return (

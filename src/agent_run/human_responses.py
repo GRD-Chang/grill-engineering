@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from agent_run.work_projection import history_for_append, materialize_history
 
 
 def append_human_response(
@@ -15,12 +16,7 @@ def append_human_response(
     """Append an operator response to the subject's current generation only."""
     if response is None:
         return
-    history = subject.get("human_response_history")
-    if history is None:
-        history = []
-        subject["human_response_history"] = history
-    if not isinstance(history, list):
-        raise ValueError("human_response_history must be an array")
+    history = history_for_append(subject, "human_response_history")
     if subject.get("human_response_generation") != generation:
         # A replacement Job Generation must never receive an older generation's
         # maintainer context.  Histories are immutable within their generation.
@@ -42,7 +38,7 @@ def current_human_response_history(
     """Return the immutable response sequence only when it matches `generation`."""
     if subject.get("human_response_generation") != generation:
         return None
-    history = subject.get("human_response_history")
+    history = materialize_history(subject, "human_response_history")
     if not isinstance(history, list):
         return None
     if not all(

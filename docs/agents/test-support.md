@@ -28,6 +28,12 @@
 `run_scenarios._completed_run` 创建单个 completed Ticket，其 reviewed Candidate、Integration、
 PR merge identity 与 Run ref 对齐；`_accepted_run` 在这个基础上运行真实 Run Acceptance。
 历史 Ticket 保留准确 `ticket_branch` 归属，分支及 checkout 已清理；后续公开恢复可真实对账清理，不必重跑 Ticket 交付。
+
+原始替换 fixture 接收工作投影时，先从同一 Run 补读其明确声明未读的 Timeline，
+再清除已展开的范围标记，避免丢失前缀或把完整输入继续标成未读。
+这是测试准备中的完整化，不用于测量日常保存；没有声明未读范围的缺失或损坏字段
+继续保留原故障含义。需要删除历史字段或复制成另一个 Run 时，先显式读取完整状态。
+该边界由 `test_state_fixture_timelines.py` 验证，生产保存仍拒绝覆盖未读历史。
 两者使用调用方独立仓库与 StateStore，不缓存可变 Run、Locator 或工作目录。
 `test_run_scenarios.py` 从落盘状态与 Git 独立读取验证 parents/tree/ref 和 currentness。
 `prepare_run_repair` 只提供 Candidate 创建前的有限前置，不校正任意输入。

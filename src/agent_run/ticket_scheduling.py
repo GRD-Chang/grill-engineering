@@ -119,7 +119,7 @@ def develop_frontier(
     with (
         executor_cancellation_scope(),
         session() if callable(session) else nullcontext(),
-        engine.states.current_run_reader(run_id, work_only=True, thin_timeline=True) as read_current,
+        engine.states.current_run_reader(run_id, dispatch_only=True) as read_current,
         ThreadPoolExecutor(max_workers=pipeline_limit + 1, thread_name_prefix="ticket") as pool,
         close_admission_on_failure(),
     ):

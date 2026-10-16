@@ -30,6 +30,7 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -50,7 +51,9 @@ from agent_run.run_lifecycle import (
     RunLifecycle,
     prepare_action_application_receipt,
 )
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.sqlite_watcher import SQLiteWatcher
 from agent_run.state_contract import require_current_run_state
 from agent_run.systemd_executor_host import (
     FakeSystemdTransport,
@@ -65,6 +68,7 @@ from agent_run.task_control import (
     TaskKey,
 )
 from support.seeding import seed_idle_control, seed_run, write_fixture
+from support.published_run import prepare_published_run
 from support.cli_fixtures import run_agents
 from support.cli_supervision import _parent_only_agents
 from support.cli import load_only_run_state, run_cli, snapshot_run_states, stdout_json
@@ -2420,6 +2424,56 @@ def test_status_and_history_do_not_touch_run_or_task_control(
         assert snapshot_control(control, task) == control_before
 
 
+def _seed_read_only_executor_run(
+    git_repo: Path, environment: dict[str, str]
+) -> tuple[Path, str]:
+    """准备待批准 Run、完成调用和准确控制身份，供只读投影矩阵查询。"""
+    with patch.dict(os.environ, environment):
+        fixture, state = prepare_published_run(git_repo)
+        RunLocatorIndex.default().register(
+            run_id=str(state["run_id"]), repository_root=managed_repo(git_repo),
+            state_dir=managed_state(git_repo), repository="example/project",
+            parent_number=1,
+        )
+    run_id = str(state["run_id"])
+    states = StateStore(managed_state(git_repo, extra_env=environment))
+    control = TaskControlStore(states.root)
+    task = TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1)
+    claim = control.claim_action(task, kind="run", payload={"parent": 1})
+    assert claim.action_id is not None and claim.action is not None
+    action_id = claim.action_id
+    control.bind_run(task, action_id, run_id, state_dir=states.root)
+    reservation = control.begin_executor(task, action_id=action_id, run_id=run_id)
+    control.mark_handshake(
+        task, action_id=action_id, generation=reservation.generation,
+        pid=123, process_start_token="read-only-fixture-process",
+    )
+    prepare_action_application_receipt(state, claim.action)
+    persist_run_fixture(states, run_id, state)
+    control.record_application(
+        task, action_id=action_id, run_id=run_id,
+        generation=reservation.generation,
+        payload_digest=str(claim.action["payload_digest"]),
+    )
+    control.complete_action(
+        task, action_id=action_id, generation=reservation.generation,
+        result_status=str(state["status"]),
+    )
+    control.finish_executor(
+        task, action_id=action_id, generation=reservation.generation,
+        result_status=str(state["status"]),
+    )
+    persisted = states.load_current_run(run_id)
+    assert persisted is not None
+    require_current_run_state(persisted)
+    assert persisted["active_agent_invocation"]["status"] == "completed"
+    assert persisted["active_agent_invocation"] in persisted["agent_invocation_history"]
+    assert control.inspect_run(task, persisted) is not None
+    query_fixture = git_repo / "github.json"
+    query_fixture.write_bytes(fixture.read_bytes())
+    return query_fixture, run_id
+
+
 @pytest.mark.parametrize(
     ("control_case", "reason"),
     [
@@ -2432,20 +2486,8 @@ def test_status_and_history_do_not_touch_run_or_task_control(
 def test_status_and_history_mark_unavailable_task_control_unknown_without_writes(
     git_repo: Path, tmp_path: Path, control_case: str, reason: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "read-only-corrupt-control")
-    first = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-    assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
-    run_id = stdout_json(first)["run_id"]
+    fixture, run_id = _seed_read_only_executor_run(git_repo, environment)
     control, task = only_control(managed_state(git_repo, extra_env=environment))
     if control_case == "missing":
         delete_control_fixture(control, task)
@@ -2533,20 +2575,8 @@ def test_status_and_history_project_only_read_only_host_proof(
     host_status: str,
     expected_activity: str,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / f"projection-{host_status}")
-    first = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-        extra_env=environment,
-    )
-    assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
-    run_id = stdout_json(first)["run_id"]
+    _, run_id = _seed_read_only_executor_run(git_repo, environment)
     control, task = only_control(managed_state(git_repo, extra_env=environment))
     record = control.load(task)
     assert record is not None
@@ -2695,7 +2725,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
     assert first.returncode == 0, f"{stdout}\n{stderr}"
 
 
-def test_old_run_without_lifecycle_protocol_is_read_only_but_not_mutable(
+def test_old_run_without_lifecycle_protocol_is_rejected_without_mutation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": {**ticket(), "number": 2}})
@@ -2710,8 +2740,10 @@ def test_old_run_without_lifecycle_protocol_is_read_only_but_not_mutable(
 
     for command in ("status", "history"):
         inspected = run_cli(git_repo, fixture, command, run_id, "--json")
-        assert inspected.returncode == 0, f"{inspected.stdout}\n{inspected.stderr}"
+        assert inspected.returncode == 2, f"{inspected.stdout}\n{inspected.stderr}"
+        assert stdout_json(inspected)["status"] == "incompatible_run_state"
         assert snapshot_run(state_ref) == before
+        assert _file_snapshot(git_repo) == persistent_before
 
     rejected = run_cli(git_repo, fixture, "resume", run_id)
     assert rejected.returncode == 2
@@ -2925,15 +2957,59 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         assert control_during_observation_exit["executor"]["status"] == "running"
         assert control_during_observation_exit["executor"]["pid"] != owner.pid
 
+        # gate 仍未释放，公开 run 只能附着原 Executor，不能应用新业务动作。
+        attached = subprocess.run(
+            [*command, "--json"], cwd=git_repo, env={**os.environ, **environment},
+            capture_output=True, text=True, timeout=30,
+        )
+        assert attached.returncode == 0, f"{attached.stdout}\n{attached.stderr}"
+        attached_output = stdout_json(attached)
+        assert attached_output["run_id"] == custom_run_id
+        assert attached_output["action"]["submission"] == "attached"
+        audit = attached_output["action_audit"]
+        assert audit["attached"] is True
+        assert audit["action_id"] == control_during_observation_exit["action"]["action_id"]
+        assert audit["run_id"] == custom_run_id
+        assert audit["executor_generation"] == control_during_observation_exit["executor"]["generation"]
+        attached_control = control.load(task)
+        assert attached_control["action"] == control_during_observation_exit["action"]
+        assert attached_control["action_history"] == control_during_observation_exit["action_history"]
+        assert attached_control["executor"] == control_during_observation_exit["executor"]
+        assert snapshot_run(custom_run_ref) == state_before_interrupt
+
         release.touch()
-        deadline = time.monotonic() + 10
-        while True:
-            final_control = control.load(task)
-            if final_control["executor"]["status"] == "exited":
-                break
-            if time.monotonic() >= deadline:
-                raise AssertionError("detached fixture Executor did not finish")
-            time.sleep(0.01)
+        business_deadline = time.monotonic() + 30
+        observed_store = StateStore(custom_state)
+        # 完整后继业务与纯退出分别有界；Control 提交不重置任何截止时间。
+        with SQLiteWatcher(control.root / "state.sqlite3") as watcher:
+            previous_version = None
+            status = None
+            while status != "run_approval_pending":
+                version = watcher.version()
+                if version != previous_version:
+                    previous_version = version
+                    with observed_store._repository.use_reader(watcher.connection):
+                        current = observed_store._repository.load_fields(custom_run_id, {"status"})
+                    status = current.get("status") if current else None
+                if status == "run_approval_pending":
+                    break
+                if time.monotonic() >= business_deadline:
+                    raise AssertionError(f"detached fixture Run did not finish business: {status}")
+                time.sleep(0.01)
+
+            deadline = time.monotonic() + 10
+            previous_version = None
+            final_control = attached_control
+            while True:
+                version = watcher.version()
+                if version != previous_version:
+                    previous_version = version
+                    final_control = control.load(task)
+                if final_control["executor"]["status"] == "exited":
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f"detached fixture Executor did not exit after business: {final_control}")
+                time.sleep(0.01)
     finally:
         release.touch()
         if owner.poll() is None:

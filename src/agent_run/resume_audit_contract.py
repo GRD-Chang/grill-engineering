@@ -51,9 +51,7 @@ def resume_identity(run_id: str, event: dict[str, Any]) -> str:
             "sequence": event.get("sequence"),
             "requested_at": event.get("requested_at"),
             "kind": event.get("kind"),
-            "source_invocation_started_at": event.get(
-                "source_invocation_started_at"
-            ),
+            "source_invocation_started_at": event.get("source_invocation_started_at"),
             "new_thread": event.get("new_thread"),
         }
     )
@@ -65,9 +63,18 @@ def resume_event_digest(event: dict[str, Any]) -> str:
 
 
 def resume_history_digest(history: list[dict[str, Any]]) -> str | None:
-    digest: str | None = None
+    from agent_run.work_projection import ResumeHistory
+    digest: str | None
+
+    if isinstance(history, ResumeHistory):
+        # 已提交前缀保留其真实链；新增事件可直接在该链后追加。
+        # 旧事件 successor 的变化由同事务 writer 流式重算完整标量链。
+        digest = history.scope.digest
+        for event in history:
+            if event.get("sequence", 0) > history.scope.total:
+                digest = canonical_fingerprint({"previous": digest, "event_digest": event.get("event_digest")})
+        return digest
+    digest = None
     for event in history:
-        digest = canonical_fingerprint(
-            {"previous": digest, "event_digest": event.get("event_digest")}
-        )
+        digest = canonical_fingerprint({"previous": digest, "event_digest": event.get("event_digest")})
     return digest

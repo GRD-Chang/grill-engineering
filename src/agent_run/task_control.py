@@ -110,7 +110,7 @@ class TaskControlStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
         self.directory = self.root / "task-control"
-        self._repository = SQLiteStateRepository(self.root, max_bytes=4 * 1024 * 1024)
+        self._repository = SQLiteStateRepository(self.root)
 
     def path_for(self, task: TaskKey) -> Path:
         return self.directory / f"{task.fingerprint}.json"

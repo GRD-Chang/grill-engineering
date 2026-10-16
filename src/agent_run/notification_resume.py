@@ -109,6 +109,12 @@ def _apply_result(state: dict[str, Any], projected: list[dict[str, Any]],
                    if (work_subject is None or fact["work_subject"] == work_subject)
                    and all(result.get(key) is None or result[key] == fact[key]
                            for key in ("scope", "action_kind", "generation"))]
+        # Feedback can advance while a sender still holds an earlier SQL
+        # snapshot. A bound gate result needs that exact current gate; emitting
+        # it alone would consume its Resume identity before the gate appears.
+        if (work_subject is not None and result.get("scope") is not None
+                and result.get("action_kind") is not None and len(targets) != 1):
+            return projected
         if len(targets) == 1:
             next_step = render_next_action(targets[0]["action"], state, language=language, human=True)
         elif work_subject is None:

@@ -111,10 +111,11 @@ import agent_run.notifications as notifications
 from agent_run.cli import main
 original_close = notifications.Notifications.close
 original_send = notifications.send
-original_observe = notifications.Notifications.observe
+original_observe = notifications.Notifications._observe
 real_delivery_titles = set()
 # Capture lifecycle assertions without waiting for transport under the
-# StateStore/Task Control transaction that invokes this observer.
+# StateStore/Task Control transaction. Inspect the exact notification query
+# after it has loaded the facts; the commit observer is only a current view.
 def observe(self, *args, **kwargs):
     state = args[0]
     for event in notifications.events(state):
@@ -124,7 +125,7 @@ def observe(self, *args, **kwargs):
             active = state.get('active_agent_invocation') or {}
             assert active.get('reported_thread_id') and active.get('status') == 'running', active
     original_observe(self, *args, **kwargs)
-notifications.Notifications.observe = observe
+notifications.Notifications._observe = observe
 # Detailed-stage combinations are asserted against persisted lifecycle facts.
 # Keep the start, completed-ticket effort and approval/completion cards on the
 # real executable transport; concise mode still delivers every card for its

@@ -82,4 +82,7 @@ def test_scheduler_and_object_save_keep_selected_archive_outside_read_scope(
         assert reopened["active_ticket_job"] == reopened["ticket_jobs"]["2"] == prepared["ticket_jobs"]["2"]
         assert reopened["ticket_jobs"]["3"] == prepared["ticket_jobs"]["3"]
         assert reopened["ticket_jobs"]["4"]["development_summary"] == "Continuing independent work"
-    assert max(costs) <= min(costs) + 256, costs
+    # Empty history may take a different fixed query path. Bound increases
+    # as history grows; a lower cost must not count as a growth regression.
+    assert max(costs[1:]) <= costs[0] + 256, costs
+    assert costs[2] <= costs[1] + 256, costs

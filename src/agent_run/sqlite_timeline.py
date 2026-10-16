@@ -1,182 +1,265 @@
-"""Current-read proofs for append-only shared Timeline fields."""
+"""明确 Timeline 事件和有界流；只读范围不再依赖路径节点或快照证明。"""
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from collections.abc import Callable, Mapping
-import json
-from sys import getsizeof
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+import hashlib
+from copy import deepcopy
+import sqlite3
+from typing import Any
 
-from agent_run.sqlite_encoding import scalar_value
-
-if TYPE_CHECKING:
-    from agent_run.sqlite_state import _RunView
-    from agent_run.sqlite_work_objects import DecodeContext, ParsedRow
+from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS
+from agent_run.sqlite_change_job_codec import presence, present, _typed
+from agent_run.sqlite_encoding import encode_json
+from agent_run.sqlite_work_evidence import get_evidence, put_evidence
+from agent_run.state_limits import consume_query_rows, require_record_size
 
 FIELDS = frozenset({"timeline", "timeline_continuation"})
+INTEGER_FIELDS = frozenset(
+    {
+        "ticket",
+        "attempt",
+        "pr_number",
+        "semantic_attempt_ordinal",
+        "budget_window",
+        "output_attempt",
+        "publication_operation_retry_attempts",
+        "publication_operation_retry_limit",
+        "explicit_resume_sequence",
+        "history_generation",
+        "history_budget_window",
+    }
+)
+EVIDENCE_FIELDS = frozenset(
+    {"human_blockers", "graph_change_summary", "required_checks_evidence", "external_wait_reason"}
+)
+TEXT_FIELDS = (
+    frozenset(
+        {
+            "at",
+            "kind",
+            "status",
+            "worker",
+            "thread_id",
+            "phase",
+            "commit_sha",
+            "approval_granted_at",
+            "required_checks_result",
+            "required_checks_observed_at",
+            "accepted_graph_revision",
+            "observed_graph_revision",
+            "next_action",
+            "semantic_attempt_id",
+            "semantic_attempt_role",
+            "agent_invocation_started_at",
+            "agent_invocation_status",
+            "explicit_resume_kind",
+            "explicit_resume_thread_id",
+            "explicit_resume_attempt_id",
+            "result",
+            *CHECKS_HISTORY_FIELDS,
+        }
+    )
+    - INTEGER_FIELDS
+    - EVIDENCE_FIELDS
+)
+EVENT_FIELDS = TEXT_FIELDS | INTEGER_FIELDS | EVIDENCE_FIELDS
+_COLUMNS = sorted(EVENT_FIELDS)
+TABLES = {
+    "run_timeline_events": "CREATE TABLE run_timeline_events (run_id TEXT NOT NULL, event_id TEXT NOT NULL, presence BLOB NOT NULL, "
+    + ", ".join("value_" + key + (" INTEGER" if key in INTEGER_FIELDS else " TEXT") for key in _COLUMNS)
+    + ", PRIMARY KEY(run_id,event_id), FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE)",
+    "run_timeline_slots": "CREATE TABLE run_timeline_slots (run_id TEXT NOT NULL, stream TEXT NOT NULL, position INTEGER NOT NULL, "
+    "event_id TEXT NOT NULL, PRIMARY KEY(run_id,stream,position), "
+    "FOREIGN KEY(run_id,event_id) REFERENCES run_timeline_events(run_id,event_id) ON DELETE CASCADE)",
+}
+INDEXES = {
+    "run_timeline_event_reference": "CREATE INDEX run_timeline_event_reference ON run_timeline_slots(run_id,event_id)"
+}
 
 
 def limit(key: str) -> int:
-    # Import lazily: StateStore owns these budgets and imports this reader.
-    from agent_run.state import MAX_TIMELINE_EVENTS, MAX_TIMELINE_CONTINUATION_EVENTS
-    return MAX_TIMELINE_EVENTS if key == "timeline" else MAX_TIMELINE_CONTINUATION_EVENTS
+    if key not in FIELDS:
+        raise ValueError("Unsupported Timeline stream")
+    return 256
 
 
 @dataclass(frozen=True)
 class TimelineScope:
-    """Canonical text references proved again in this read, never save authority."""
-    encoded: str
-    entries: tuple[str, ...]
-    references: tuple[frozenset[str], ...]
-
-    @property
-    def count(self) -> int:
-        return len(self.entries)
+    count: int
+    latest: dict[str, Any] | None
 
     def tail(self) -> dict[str, Any] | None:
-        return json.loads(self.entries[-1]) if self.entries else None
+        return deepcopy(self.latest) if self.latest is not None else None
 
 
-@dataclass(frozen=True)
-class ScopeSource:
-    """Immutable metadata referring to an existing complete bounded view."""
-    scope: TimelineScope
-    headers: Mapping[str, tuple[str, str]]
-    references: Mapping[str, frozenset[str]]
-    refunion: frozenset[str]
+def _owner(run_id: str, event_id: str) -> str:
+    return f"run:{run_id}:timeline:{event_id}"
 
 
-def scopes_from_view(view: _RunView) -> Mapping[str, ScopeSource]:
-    if view.fields is None or "timeline" not in view.fields:
-        return MappingProxyType({})
-    # Keep the original logical and physical view bounds after adding only
-    # pointer containers. All strings/entry closures below already belong to
-    # the view; no decoded body or additional canonical text is retained.
-    physical = view.physical_bytes
-    if physical is None:
-        physical = sum(len(raw.encode("utf-8")) + len(encoded.encode("utf-8"))
-                       for raw, (_, encoded) in view.objects.items())
-        physical += sum(len(text.encode("utf-8")) for text in view.materials.values())
-    available = 512 * 1024 - max(view.logical_bytes, physical)
-    sources: dict[str, ScopeSource] = {}
-    used = getsizeof(sources) + getsizeof(MappingProxyType(sources)) + getsizeof(view.field_node_counts)
-    used += sum(getsizeof(key) + getsizeof(count) for key, count in view.field_node_counts.items())
-    for key in FIELDS.intersection(view.fields):
-        root = f'["{key}"]'
-        item = view.objects.get(root)
-        if item is None or item[0] != "list" or not view.fields[key].startswith("["):
+def _read(c: sqlite3.Connection, run_id: str, event_id: str) -> dict[str, Any]:
+    columns = ["presence", *("value_" + key for key in _COLUMNS)]
+    require_record_size(c, "run_timeline_events", columns, "run_id=? AND event_id=?", (run_id, event_id))
+    row = c.execute(
+        "SELECT " + ",".join(columns) + " FROM run_timeline_events WHERE run_id=? AND event_id=?", (run_id, event_id)
+    ).fetchone()
+    if row is None:
+        raise ValueError("Missing Timeline event")
+    consume_query_rows(1)
+    keys = present(row[0], EVENT_FIELDS)
+    result = {}
+    for key, value in zip(_COLUMNS, row[1:], strict=True):
+        if key not in keys:
+            if value is not None:
+                raise ValueError("Unexpected Timeline event column")
             continue
-        count = scalar_value(item[1])
-        if (type(count) is not int or not 0 <= count <= limit(key)
-                or view.field_node_counts.get(key) != count + 1):
-            continue
-        prefix = root[:-1] + ","
-        headers = {raw: node for raw, node in view.objects.items()
-                   if raw == root or raw.startswith(prefix)}
-        if len(headers) != count + 1:
-            continue
-        entries, refs = [], []
-        for position in range(count):
-            path = f'["{key}",{position}]'
-            child = headers.get(path)
-            text, closure = view.snapshots.get(path), view.snapshot_refs.get(path)
-            if (child is None or child[0] != "snapshot" or text is None or not text.startswith("{")
-                    or closure is None or not closure <= view.materials.keys()):
-                break
-            identity = scalar_value(child[1])
-            if not isinstance(identity, str) or identity not in closure:
-                break
-            entries.append(text)
-            refs.append(closure)
+        if key in EVIDENCE_FIELDS:
+            result[key] = (
+                None if value is None else get_evidence(c, run_id, value, owner_id=_owner(run_id, event_id), kind=key)
+            )
         else:
-            # Preserve the existing path string keys and immutable closures.
-            references = {raw: view.snapshot_refs[raw] for raw in headers if raw != root}
-            scope = TimelineScope(view.fields[key], tuple(entries), tuple(refs))
-            union = frozenset().union(*refs)
-            source = ScopeSource(scope, MappingProxyType(headers), MappingProxyType(references), union)
-            cost = sum(getsizeof(value) for value in (source, scope, headers, references,
-                source.headers, source.references, scope.entries, scope.references, union,
-                source.__dict__, scope.__dict__))
-            # A one-entry dictionary's growth is a conservative bound for
-            # each of the at most two source-map entries.
-            cost += getsizeof({key: source}) - getsizeof({})
-            if used + cost <= available:
-                sources[key] = source
-                used += cost
-    return MappingProxyType(sources)
+            result[key] = _typed(value, "INTEGER" if key in INTEGER_FIELDS else "TEXT", key)
+    if hashlib.sha256(encode_json(result).encode()).hexdigest() != event_id:
+        raise ValueError("Immutable Timeline event changed")
+    return result
 
 
-def prove(
-    rows: list[ParsedRow], context: DecodeContext, restore: Callable[[str], Any],
-    *, sources: Mapping[str, ScopeSource] | None = None,
-) -> dict[str, TimelineScope]:
-    """Keep every present Timeline complete unless all its current facts agree."""
-    grouped: dict[str, dict[str, tuple[str, str]]] = {}
-    for path, parsed, kind, encoded in rows:
-        if parsed and parsed[0] in FIELDS:
-            key = str(parsed[0])
-            group = grouped.setdefault(key, {})
-            if path in group:
-                return {}
-            group[path] = kind, encoded
-    if "timeline" not in grouped:
-        return {}
-    scopes = {}
-    for key, objects in grouped.items():
-        prior = sources.get(key) if sources is not None else None
-        if (prior is not None and objects == prior.headers
-                and prior.refunion <= context.materials.keys()
-                and all((actual := context.object_refs.get(path)) is not None
-                        and len(actual) == len(refs) and refs.issubset(actual)
-                        for path, refs in prior.references.items())):
-            scopes[key] = prior.scope
-            continue
-        # Field names are the two fixed ASCII protocol keys; indices are
-        # bounded nonnegative ints. This is the exact canonical path spelling.
-        root = f'["{key}"]'
-        item = objects.get(root)
-        if item is None or item[0] != "list":
-            return {}
-        count = scalar_value(item[1])
-        if type(count) is not int or not 0 <= count <= limit(key) or len(objects) != count + 1:
-            return {}
-        texts, references = [], []
-        for position in range(count):
-            path = f'["{key}",{position}]'
-            child = objects.get(path)
-            if child is None or child[0] != "snapshot":
-                return {}
-            identity = scalar_value(child[1])
-            if not isinstance(identity, str):
-                return {}
-            text = context.snapshot_encodings.get(identity, context.restored_encodings.get(identity))
-            if text is None:
-                # Only the standard current-read decoder may establish new
-                # canonical text and its transitive material closure.
-                restore(identity)
-                text = context.restored_encodings.get(identity)
-            refs = context.snapshot_refs.get(identity)
-            actual = context.object_refs.get(path)
-            if (text is None or not text.startswith("{") or refs is None
-                    or actual is None or len(actual) != len(refs) or not refs.issubset(actual)):
-                return {}
-            texts.append(text)
-            references.append(refs)
-        encoded = "[" + ",".join(texts) + "]"
-        # count+1 exact consecutive nodes excluded descendant overrides;
-        # every entry now carries this read's actual material/reference proof.
-        scopes[key] = TimelineScope(encoded, tuple(texts), tuple(references))
-    return scopes
+def load_tail(c: sqlite3.Connection, run_id: str, field: str = "timeline", limit: int = 1) -> list[dict[str, Any]]:
+    if field not in FIELDS or type(limit) is not int or not 0 <= limit <= 256:
+        raise ValueError("Invalid Timeline query limit")
+    rows = c.execute(
+        "SELECT event_id FROM run_timeline_slots WHERE run_id=? AND stream=? ORDER BY position DESC LIMIT ?",
+        (run_id, field, limit),
+    ).fetchall()
+    return [_read(c, run_id, event_id) for event_id, in reversed(rows)]
+
+
+def load(c: sqlite3.Connection, run_id: str, field: str) -> list[dict[str, Any]]:
+    rows = c.execute(
+        "SELECT position,event_id FROM run_timeline_slots WHERE run_id=? AND stream=? ORDER BY position LIMIT 257",
+        (run_id, field),
+    ).fetchall()
+    if len(rows) > limit(field) or any(
+        type(position) is not int or position != index for index, (position, _) in enumerate(rows)
+    ):
+        raise ValueError("Invalid Timeline positions or capacity")
+    return [_read(c, run_id, event_id) for _, event_id in rows]
+
+
+def scope(c: sqlite3.Connection, run_id: str, field: str) -> TimelineScope:
+    position = c.execute(
+        "SELECT MAX(position) FROM run_timeline_slots WHERE run_id=? AND stream=?", (run_id, field)
+    ).fetchone()[0]
+    count = 0 if position is None else position + 1
+    if type(count) is not int or not 0 <= count <= limit(field):
+        raise ValueError("Invalid Timeline capacity")
+    tail = load_tail(c, run_id, field)
+    return TimelineScope(count, tail[-1] if tail else None)
+
+
+def _put(c: sqlite3.Connection, run_id: str, event: Mapping[str, Any]) -> str:
+    if not isinstance(event, Mapping) or event.keys() - EVENT_FIELDS:
+        raise ValueError("Unsupported Timeline event fields")
+    event_id = hashlib.sha256(encode_json(event).encode()).hexdigest()
+    if c.execute("SELECT 1 FROM run_timeline_events WHERE run_id=? AND event_id=?", (run_id, event_id)).fetchone():
+        if _read(c, run_id, event_id) != event:
+            raise ValueError("Immutable Timeline event changed")
+        return event_id
+    values = []
+    for key in _COLUMNS:
+        value = event.get(key)
+        if key in EVIDENCE_FIELDS:
+            value = put_evidence(c, run_id, _owner(run_id, event_id), key, value) if value is not None else None
+        else:
+            value = _typed(value, "INTEGER" if key in INTEGER_FIELDS else "TEXT", key)
+        values.append(value)
+    c.execute(
+        "INSERT INTO run_timeline_events VALUES (" + ",".join("?" for _ in range(len(values) + 3)) + ")",
+        (run_id, event_id, presence(event, EVENT_FIELDS), *values),
+    )
+    require_record_size(
+        c,
+        "run_timeline_events",
+        ["presence", *("value_" + key for key in _COLUMNS)],
+        "run_id=? AND event_id=?",
+        (run_id, event_id),
+    )
+    return event_id
+
+
+def _collect_event(c: sqlite3.Connection, run_id: str, event_id: str) -> None:
+    if c.execute(
+        "SELECT 1 FROM run_timeline_slots WHERE run_id=? AND event_id=? LIMIT 1", (run_id, event_id)
+    ).fetchone():
+        return
+    owner = _owner(run_id, event_id)
+    materials = [
+        row[0]
+        for row in c.execute(
+            "SELECT material_id FROM work_evidence WHERE run_id=? AND owner_id=? AND material_id IS NOT NULL",
+            (run_id, owner),
+        )
+    ]
+    c.execute("DELETE FROM run_timeline_events WHERE run_id=? AND event_id=?", (run_id, event_id))
+    c.execute(
+        "DELETE FROM work_evidence WHERE run_id=? AND owner_id=? AND NOT EXISTS (SELECT 1 FROM work_evidence r WHERE r.run_id=work_evidence.run_id AND r.source_evidence_id=work_evidence.evidence_id)",
+        (run_id, owner),
+    )
+    c.executemany(
+        "DELETE FROM work_evidence_materials WHERE material_id=? AND NOT EXISTS (SELECT 1 FROM work_evidence WHERE material_id=work_evidence_materials.material_id)",
+        ((identity,) for identity in materials),
+    )
+
+
+def append(c: sqlite3.Connection, run_id: str, field: str, events: list[dict[str, Any]]) -> None:
+    count = scope(c, run_id, field).count
+    for event in events:
+        released = None
+        if count == limit(field):
+            if field != "timeline_continuation":
+                raise ValueError("Timeline reached its event limit")
+            released = c.execute(
+                "SELECT event_id FROM run_timeline_slots WHERE run_id=? AND stream=? AND position=0", (run_id, field)
+            ).fetchone()
+            c.execute("DELETE FROM run_timeline_slots WHERE run_id=? AND stream=? AND position=0", (run_id, field))
+            c.execute("UPDATE run_timeline_slots SET position=-position WHERE run_id=? AND stream=?", (run_id, field))
+            c.execute(
+                "UPDATE run_timeline_slots SET position=-position-1 WHERE run_id=? AND stream=?", (run_id, field)
+            )
+            count -= 1
+        c.execute("INSERT INTO run_timeline_slots VALUES (?,?,?,?)", (run_id, field, count, _put(c, run_id, event)))
+        count += 1
+        if released is not None:
+            _collect_event(c, run_id, released[0])
+
+
+def save(c: sqlite3.Connection, run_id: str, field: str, value: Any) -> None:
+    if not isinstance(value, list) or len(value) > limit(field):
+        raise ValueError("Invalid Timeline stream or capacity")
+    previous = [
+        row[0]
+        for row in c.execute("SELECT event_id FROM run_timeline_slots WHERE run_id=? AND stream=?", (run_id, field))
+    ]
+    c.execute("DELETE FROM run_timeline_slots WHERE run_id=? AND stream=?", (run_id, field))
+    append(c, run_id, field, value)
+    for event_id in previous:
+        _collect_event(c, run_id, event_id)
 
 
 def append_events(
-    state: dict[str, Any], previous: dict[str, Any], scopes: dict[str, TimelineScope],
+    state: dict[str, Any],
+    previous: dict[str, Any],
+    scopes: dict[str, TimelineScope],
 ) -> dict[str, dict[str, Any]]:
     """Use the same marker and duplicate rules without expanding old events."""
     from agent_run.state import (
-        MAX_TIMELINE_EVENTS, _timeline_change, _timeline_capacity_event,
-        _continuation_kind, _event_matches_marker, _timeline_event,
+        MAX_TIMELINE_EVENTS,
+        _timeline_change,
+        _timeline_capacity_event,
+        _continuation_kind,
+        _event_matches_marker,
+        _timeline_event,
     )
 
     marker, previous_marker = _timeline_change(state, previous)

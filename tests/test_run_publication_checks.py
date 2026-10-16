@@ -226,7 +226,8 @@ def test_final_run_publish_and_approve_share_exact_head_observation(
     status = json.loads(capsys.readouterr().out)
     assert status["worker"] is None
     assert status["progress"]["current_agent"] is None
-    assert waiting["timeline"][-1].get("worker") is None
+    timeline = states.load_history_run(state["run_id"])["timeline"]
+    assert timeline[-1].get("worker") is None
     assert second_observation["pr_number"] == published["run_publication"]["pr_number"]
     assert second_observation["head_sha"] == run_head
     assert second_observation["result"] == "pending"

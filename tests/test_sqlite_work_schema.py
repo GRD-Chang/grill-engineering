@@ -1,4 +1,4 @@
-"""工作查询的同源结构证明仍拒绝当前损坏，兼容结构保持完整核验。"""
+"""工作查询拒绝当前领域结构损坏，兼容结构保持完整核验。"""
 from contextlib import closing
 from pathlib import Path
 import sqlite3
@@ -9,15 +9,13 @@ from agent_run.sqlite_state import SQLiteStateRepository
 from agent_run.state_errors import IncompatibleRunStateError
 
 
-@pytest.mark.parametrize("aggregate", [True, False])
 @pytest.mark.parametrize("damage", ["protocol_blob", "material_blob", "extra_table", "missing_index", "missing_table", "trigger"])
 def test_work_query_rejects_current_storage_after_successful_read(
-    tmp_path: Path, aggregate: bool, damage: str,
+    tmp_path: Path, damage: str,
 ) -> None:
-    repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
+    repository = SQLiteStateRepository(tmp_path)
     original = {"phase": "pending", "parent": {"body": "read evidence"}}
     repository.save("run-1", original)
-    repository._aggregate_rows = aggregate
     assert repository.load_work("run-1", 2) == original
     with closing(sqlite3.connect(repository.path)) as connection:
         if damage == "protocol_blob":
@@ -44,23 +42,52 @@ def test_work_query_rejects_current_storage_after_successful_read(
         repository.load_work("run-1", 2)
 
 
-@pytest.mark.parametrize("aggregate", [True, False])
-def test_work_query_validates_compatible_noncanonical_ddl(tmp_path: Path, aggregate: bool) -> None:
-    repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
+def test_work_query_validates_compatible_noncanonical_ddl(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path)
     original = {"parent": {"body": "read evidence"}}
     repository.save("run-1", original)
     with closing(sqlite3.connect(repository.path)) as connection:
         connection.execute("PRAGMA writable_schema=ON")
-        connection.execute("UPDATE sqlite_master SET sql=sql||' ' WHERE type='table' AND name='run_objects'")
+        connection.execute("UPDATE sqlite_master SET sql=sql||' ' WHERE type='table' AND name='work_jobs'")
         connection.commit()
-    repository._aggregate_rows = aggregate
     assert repository.load_work("run-1", 2) == original
 
 
-@pytest.mark.parametrize("aggregate", [True, False])
-def test_work_query_returns_none_for_empty_database(tmp_path: Path, aggregate: bool) -> None:
-    repository = SQLiteStateRepository(tmp_path, max_bytes=8192)
+def test_work_query_returns_none_for_empty_database(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path)
     with closing(sqlite3.connect(repository.path)):
         pass
-    repository._aggregate_rows = aggregate
     assert repository.load_work("run-1", 2) is None
+
+
+def test_schema_check_reads_all_required_facts_without_unrelated_index_definitions(tmp_path: Path) -> None:
+    from agent_run.sqlite_state_connection import _CANONICAL_INDEXES, _CANONICAL_TABLES
+
+    repository = SQLiteStateRepository(tmp_path)
+    repository.save("run-1", {})
+    with closing(sqlite3.connect(repository.path)) as writer:
+        writer.execute("CREATE INDEX compatible_extra_index ON runs(updated_at)")
+        writer.commit()
+        seen_tables, seen_indexes = set(), set()
+
+        def inspect(_cursor, row):
+            if len(row) >= 3 and row[0] == "table":
+                seen_tables.add(row[1])
+            if len(row) >= 3 and row[0] == "index":
+                assert row[1] in _CANONICAL_INDEXES, "Unneeded index definition entered Python"
+                seen_indexes.add(row[1])
+            return row
+
+        with closing(sqlite3.connect(repository.path.resolve().as_uri() + "?mode=ro", uri=True,
+                                     isolation_level=None)) as reader:
+            reader.row_factory = inspect
+            assert repository._check_schema(reader)
+            assert seen_tables == set(_CANONICAL_TABLES)
+            assert seen_indexes == set(_CANONICAL_INDEXES)
+            # The same prepared reader must revalidate current facts after a
+            # commit, including a required name with the wrong definition.
+            writer.execute("DROP INDEX work_invocation_resume")
+            writer.execute("CREATE INDEX work_invocation_resume ON work_invocations(run_id)")
+            writer.commit()
+            with pytest.raises(IncompatibleRunStateError, match="indexes"):
+                repository._check_schema(reader)

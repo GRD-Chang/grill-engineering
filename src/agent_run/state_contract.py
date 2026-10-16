@@ -65,11 +65,12 @@ from agent_run.task_control import TASK_CONTROL_PROTOCOL
 from agent_run.sqlite_encoding import encode_json, object_path
 from agent_run.sqlite_job_history import FIELDS as JOB_ARCHIVES
 from agent_run.sqlite_timeline import TimelineScope, FIELDS as TIMELINE_FIELDS, limit as timeline_limit
+from agent_run.work_projection import JobProjection, JobHistoryAppend, ResumeHistory
 
 def require_current_work_state(
     state: dict[str, Any], archived_histories: Mapping[str, tuple[int, int]],
     related_attempts: Mapping[str, dict[str, Any]] | None = None,
-    timelines: Mapping[str, TimelineScope] | None = None,
+    timelines: Mapping[str, TimelineScope] | None = None, *, parent_scope: bool = False,
 ) -> None:
     """Validate loaded facts; account for unloaded Job archives and Timeline.
 
@@ -85,17 +86,23 @@ def require_current_work_state(
     budget_owners = {}
     for encoded, (size, count) in archived_histories.items():
         path = object_path(encoded)
-        if not (len(path) == 2 and path[0] == "active_ticket_job" and path[1] in JOB_ARCHIVES
-                or len(path) == 3 and path[0] == "ticket_jobs" and isinstance(path[1], str) and path[2] in JOB_ARCHIVES):
+        owner_path = path[:-1]
+        valid_owner = (owner_path == ("active_ticket_job",) or len(owner_path)==2 and owner_path[0]=="ticket_jobs" and isinstance(owner_path[1],str)
+                       or owner_path in {("parent_job",),("run_acceptance",),("run_publication",),("run_acceptance","repair_job")})
+        if not valid_owner or not path or path[-1] not in JOB_ARCHIVES:
             raise IncompatibleRunStateError("invalid scoped Job archive identity")
         owner: Any = state
         for part in path[:-1]:
             owner = owner.get(part) if isinstance(owner, dict) else None
-        if (not isinstance(owner, dict) or path[-1] in owner or type(size) is not int or size < 2
+        delta = owner.get(path[-1]) if isinstance(owner,dict) else None
+        if isinstance(owner,JobProjection) and path[-1] in owner.loaded_histories:
+            continue
+        allowed_append = isinstance(delta,JobHistoryAppend) and (delta.base_bytes,delta.base_count)==(size,count)
+        if (not isinstance(owner, dict) or path[-1] in owner and not allowed_append or type(size) is not int or size < 2
                 or type(count) is not int or count < 0):
-            raise IncompatibleRunStateError("scoped Job archive was loaded, modified or lost its owner")
+            raise IncompatibleRunStateError(f"scoped Job archive was loaded, modified or lost its owner: {encoded}")
         if path[-1] == "review_budget_history":
-            budget_owners[id(owner)] = count
+            budget_owners[id(owner)] = count + (len(delta) if isinstance(delta,JobHistoryAppend) else 0)
     attempt_owners = {}
     for encoded, attempt in (related_attempts or {}).items():
         path = object_path(encoded)
@@ -110,7 +117,7 @@ def require_current_work_state(
             raise IncompatibleRunStateError("invalid scoped Publication Attempt association")
         attempt_owners[id(related_owner)] = attempt
     with scoped_budget_validation(budget_owners), scoped_publication_attempts(attempt_owners):
-        _validate_current_run_state(state, timelines)
+        _validate_current_run_state(state, timelines, parent_scope=parent_scope)
 
 
 _DEFAULT_WORK_VALIDATION = require_current_work_state
@@ -146,8 +153,13 @@ def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = Fal
 
     from agent_run.object_projection import ObjectProjection
 
-    if not parent_scope and isinstance(state, ObjectProjection) and state.archive_scope:
-        require_current_work_state(state, state.archive_scope, state.attempt_scope)
+    if isinstance(state, ObjectProjection):
+        from agent_run.object_projection import current_attempt_scope
+        from agent_run.sqlite_change_job_queries import projection_archives
+
+        archives = projection_archives(state, state.archive_scope)
+        attempts = current_attempt_scope(state, archives, state.attempt_scope)
+        require_current_work_state(state, archives, attempts, state.timelines, parent_scope=parent_scope)
         return
     if parent_scope:
         # This is a validation scope, never a replacement authority record.
@@ -163,34 +175,35 @@ def _validate_current_run_state(
     try:
         _require_current_run_state(state, timelines, parent_scope=parent_scope)
     except (ValueError, KeyError, TypeError) as error:
-        # Protocol identity must be explicit. This is diagnosis of damaged new
-        # Runs, never a legacy migration or permission to fill defaults.
-        if "schema_version" in state or any(
-            type(state.get(key)) is not type(expected) or state.get(key) != expected
-            for key, expected in (
-                ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
-                ("branch_authority_protocol", 3),
-                ("review_budget_protocol", 2),
-                ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
-                ("semantic_attempt_protocol", 1),
-                ("multi_ticket_protocol", 4),
-            )
-        ):
-            raise
-        detail = str(error)
-        if error.__cause__ is not None:
-            detail += f" ({error.__cause__})"
-        raise MissingRunMaterialsError(
-            f"Run {state.get('run_id', '<missing run_id>')}: 恢复状态材料缺损：{detail}；"
-            "请从可信备份补足对应字段及原工作身份、需求、基线、成果和历史，"
-            "不要猜测验收、批准或外部写入结果；补足后使用同一 agent-run resume 重新核验。"
-        ) from error
+        raise_materials_error(state, error)
 
 
-def _require_current_run_state(
-    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
-) -> None:
+def raise_materials_error(state: Mapping[str, Any], error: Exception) -> None:
+    """完整与当前查询共享协议不兼容/当前材料损坏的诊断边界。"""
+    if "schema_version" in state or any(
+        type(state.get(key)) is not type(expected) or state.get(key) != expected
+        for key, expected in (
+            ("lifecycle_action_protocol", TASK_CONTROL_PROTOCOL),
+            ("branch_authority_protocol", 3),
+            ("review_budget_protocol", 2),
+            ("delivery_policy_protocol", DELIVERY_POLICY_PROTOCOL),
+            ("semantic_attempt_protocol", 1),
+            ("multi_ticket_protocol", 4),
+        )
+    ):
+        raise error
+    detail = str(error)
+    if error.__cause__ is not None:
+        detail += f" ({error.__cause__})"
+    raise MissingRunMaterialsError(
+        f"Run {state.get('run_id', '<missing run_id>')}: 恢复状态材料缺损：{detail}；"
+        "请从可信备份补足对应字段及原工作身份、需求、基线、成果和历史，"
+        "不要猜测验收、批准或外部写入结果；补足后使用同一 agent-run resume 重新核验。"
+    ) from error
 
+
+def require_query_state_current(state: dict[str,Any]) -> None:
+    """共享的当前协议与输入身份校验，不扫描未读取档案，不授予执行权。"""
     try:
         validate_resources(state.get("prompt_resources"))
         if state.get("language") not in ("zh", "en"):
@@ -239,6 +252,19 @@ def _require_current_run_state(
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Multi Ticket protocol"
         )
+    if (not isinstance(state.get("run_id"),str) or not state["run_id"]
+            or not isinstance(state.get("repository"),str) or not state["repository"]):
+        raise IncompatibleRunStateError("Run has an invalid current identity")
+    parent=state.get("parent")
+    if not isinstance(parent,dict) or type(parent.get("number")) is not int or parent["number"]<1:
+        raise IncompatibleRunStateError("Run has an invalid Parent identity")
+
+
+def _require_current_run_state(
+    state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+) -> None:
+
+    require_query_state_current(state)
     for key, expected in (
         ("run_id", str),
         ("repository", str),
@@ -378,6 +404,11 @@ def _require_current_run_state(
         raise IncompatibleRunStateError(
             "legacy state has an invalid active Ticket Job"
         )
+    require_currentness_boundaries(state)
+
+
+def require_currentness_boundaries(state: dict[str, Any]) -> None:
+    """核验当前已观察/接受边界，不读取任何历史。"""
     for key in (
         "accepted_ticket_graph_revision",
         "accepted_parent_spec_revision",
@@ -1240,10 +1271,16 @@ def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid resume_audit.history"
         )
-    if total != len(history):
-        raise IncompatibleRunStateError(
-            "legacy state has inconsistent Resume audit counters"
-        )
+    scoped = isinstance(history,ResumeHistory)
+    if isinstance(history,ResumeHistory):
+        scope=history.scope
+        identities={(event.get("sequence"),event.get("resume_id")) for event in history if isinstance(event,dict)}
+        added=sorted(sequence for sequence,_ in identities if type(sequence) is int and sequence>scope.total)
+        if (scope.run_id!=run_id or not scope.identities<=identities or total!=scope.total+len(added)
+                or added!=list(range(scope.total+1,total+1)) or digest!=resume_history_digest(history)):
+            raise IncompatibleRunStateError("invalid current Resume audit scope")
+    elif total != len(history):
+        raise IncompatibleRunStateError("legacy state has inconsistent Resume audit counters")
     if (total == 0 and digest is not None) or (
         total > 0
         and (
@@ -1260,7 +1297,7 @@ def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}"
             )
-        expected_sequence = index + 1
+        expected_sequence = event.get("sequence") if scoped else index + 1
         if event.get("sequence") != expected_sequence:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.sequence"
@@ -1315,7 +1352,7 @@ def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.generation"
             )
-    if digest != resume_history_digest(history):
+    if not scoped and digest != resume_history_digest(history):
         raise IncompatibleRunStateError(
             "legacy state has an inconsistent resume_audit.rolling_digest"
         )

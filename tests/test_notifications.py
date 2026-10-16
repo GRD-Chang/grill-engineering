@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,55 @@ def test_delivery_deduplicates_and_notifies_a_new_blocker_occurrence(tmp_path: P
     sender.close()
     assert len(calls) == first + 1
     assert read_notifications(tmp_path, "run-test")["pending"] == []
+
+
+@pytest.mark.parametrize("outcome,reason", [
+    ("human_action", "agent_requires_human"), ("failed", "ticket_execution_failed"),
+])
+def test_later_resume_feedback_cannot_consume_identity_on_an_earlier_read_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, reason: str,
+) -> None:
+    from agent_run.notification_events import events
+
+    calls: list[dict[str, Any]] = []
+
+    def sent(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    earlier = state("active")
+    earlier.update(multi_ticket_protocol=4, delivery_type="ticket_run",
+                   ticket_graph={"tickets": {"2": {"number": 2, "title": "Ticket"}}},
+                   ticket_jobs={"2": {"ticket_number": 2, "ticket_branch_generation": 1, "phase": "developing"}})
+    blocked = deepcopy(earlier)
+    blocked["ticket_jobs"]["2"].update(
+        phase="blocked", blocked_reason=reason, human_blocker_phase="developing",
+        human_blockers=["Access remains unavailable."],
+    )
+    slot = next(event["id"] for event in events(blocked) if event.get("current"))
+    Notifications(tmp_path, blocked).close()
+    initial_calls = len(calls)
+    result = {"id": "exact-resume", "outcome": outcome, "evidence": "controller_boundary",
+              "work_subject": "ticket:2", "ticket_number": 2, "generation": 1,
+              "scope": "local", "action_kind": "human_blocker" if outcome == "human_action" else "execution_failure"}
+    # The sender's read began before the feedback thread observed the next
+    # durable gate. Combining the result with that older frame proves no gate.
+    Notifications(tmp_path, {**earlier, "_manual_resume_result": result}).close()
+    document = read_notifications(tmp_path, "run-test")
+    assert document["resume_results"] == []
+    assert len(calls) == initial_calls
+
+    current = {**blocked, "_manual_resume_result": result}
+    Notifications(tmp_path, current).close()
+    Notifications(tmp_path, current).close()
+    document = read_notifications(tmp_path, "run-test")
+    occurrences = [record for record in document["records"] if record.get("slot_id") == slot]
+    assert len(occurrences) == 2
+    assert len(calls) == initial_calls + 1
+    assert document["resume_results"] == [f"exact-resume:{outcome}"]
+    assert all(record["attempts"] == 1 and record["outcome"] == "success" for record in occurrences)
+    assert document["pending"] == []
 
 
 def test_slow_send_does_not_block_observation_and_close_cancels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

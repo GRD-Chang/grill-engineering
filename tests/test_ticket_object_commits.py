@@ -187,6 +187,8 @@ def test_reverse_parallel_returns_keep_candidate_thread_attempt_and_budget_owner
     observations: list[dict[str, Any]] = []
 
     def observe(current: dict[str, Any]) -> None:
+        assert not states._repository.in_transaction
+        assert states._lock_depth == 0
         if current["ticket_jobs"].get("3", {}).get("phase") == "ready_for_integration":
             observations.append(deepcopy(current))
             sibling_ready.set()
@@ -209,11 +211,17 @@ def test_reverse_parallel_returns_keep_candidate_thread_attempt_and_budget_owner
         sibling = deepcopy(middle["ticket_jobs"]["3"])
         assert middle["ticket_jobs"]["2"]["phase"] == "developing"
         assert [item["ticket_number"] for item in middle["ticket_integration_queue"]] == [3]
-        history = observations[0]["agent_invocation_history"]
+        history = StateStore(states.root).load_history_run(run_id)["agent_invocation_history"]
         assert {(entry["work_subject"], entry["role"]) for entry in history} == {
             ("ticket:2", "development"), ("ticket:3", "development"),
             ("ticket:3", "fresh_acceptance"),
         }
+        assert history == middle["agent_invocation_history"]
+        observed = observations[0]
+        current_invocations = observed["agent_invocation_history"]
+        assert len(current_invocations) <= len(observed["ticket_agent_invocations"]) + 1
+        assert all(entry in history for entry in current_invocations)
+        assert observed["ticket_jobs"]["3"]["development_thread_id"] == sibling["development_thread_id"]
     finally:
         agents.release.set()
         worker.join(10)

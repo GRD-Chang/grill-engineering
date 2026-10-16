@@ -22,6 +22,7 @@ from agent_run.integration_record_contract import (
 from agent_run.external_supervision import supervision_window_matches, waiting_boundary
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.state_contract import require_candidate_acceptance_history
+from agent_run.work_projection import materialize_history
 
 
 class RunCurrentnessReader(Protocol):
@@ -238,11 +239,11 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
             )
             detach_active_invocation(state, pending)
         candidate_history = require_candidate_acceptance_history(
-            repair_job.get("candidate_acceptance_history", []),
+            materialize_history(repair_job, "candidate_acceptance_history", []),
             "run_acceptance.repair_job.candidate_acceptance",
         )
         run_history = require_candidate_acceptance_history(
-            run.get("candidate_acceptance_history", []),
+            materialize_history(run, "candidate_acceptance_history", []),
             "run_acceptance.candidate_acceptance",
         )
     cycle = run.get("repair_cycle")
@@ -259,7 +260,7 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
             if isinstance(value, str) and value not in discarded:
                 discarded.append(value)
         for key in ("development_thread_history", "reviewer_thread_ids"):
-            values = repair_job.get(key)
+            values = materialize_history(repair_job, key)
             if isinstance(values, list):
                 for value in values:
                     if isinstance(value, str) and value not in discarded:
@@ -318,7 +319,7 @@ def _mapping(value: object, name: str) -> dict[str, Any]:
 
 
 def _string_list(mapping: dict[str, Any], key: str) -> list[str]:
-    value = mapping.get(key, [])
+    value = materialize_history(mapping, key, [])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{key} must contain strings")
     return list(value)

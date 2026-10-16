@@ -16,8 +16,7 @@ from agent_run.messages import error_message
 from agent_run.models import same_repository
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, LocatorEntry, RunLocatorError, RunLocatorIndex
 from agent_run.state import StateStore
-from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
-from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state, require_query_state_current
 from agent_run.workspace_cli import open_workspace, selected_repository_root
 
 
@@ -25,7 +24,7 @@ def load_selected_state(
     states: StateStore, run_id: str, *, repository: str | None,
     read_only: bool = False,
 ) -> dict[str, Any] | None:
-    state = states.load_run(run_id)
+    state = states.load_observation_run(run_id) if read_only else states.load_run(run_id)
     if state is None or state.get("run_id") != run_id:
         return None
     _require_supported_state(state, read_only=read_only)
@@ -34,15 +33,7 @@ def load_selected_state(
 
 
 def _require_supported_state(state: dict[str, Any], *, read_only: bool) -> None:
-    try:
-        require_current_run_state(state)
-    except IncompatibleRunStateError:
-        legacy = (
-            "schema_version" in state
-            or state.get("lifecycle_action_protocol") != TASK_CONTROL_PROTOCOL
-        )
-        if not (read_only and legacy):
-            raise
+    (require_query_state_current if read_only else require_current_run_state)(state)
 
 
 def selector_records(
@@ -222,7 +213,7 @@ def _read_locator_entry(
         else:
             # Identity must be checked before validating the lifecycle payload:
             # a broken payload cannot hide a contradictory routing identity.
-            state = states.load_run(run_id)
+            state = states.load_observation_run(run_id) if read_only else states.load_run(run_id)
         if state is None:
             state_error = state_error or error_message("cli.error.run_id_mismatch")
     except (OSError, ValueError) as error:
@@ -445,7 +436,7 @@ def validate_repository_name(repository: str) -> None:
 
 def load_exact_run(
     run_id: str, *, repository: str | None, state_dir: str | None,
-    fixture: str | None,
+    fixture: str | None, history: bool = False, include_timing: bool = True,
 ) -> tuple[dict[str, Any], Path | None, Path | None]:
     repository_root: Path | None = None
     state_root: Path | None = None
@@ -484,6 +475,13 @@ def load_exact_run(
                 repository_root = next(iter(roots))
     if state is None:  # pragma: no cover - exact loader raises before this point
         raise ValueError(f"unknown Delivery Run: {run_id}")
+    if state_root is not None and (history or include_timing):
+        states = StateStore(state_root)
+        queried = states.load_history_run(run_id) if history else states.load_status_run(run_id)
+        if queried is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        validate_repository_selector(repository, queried, run_id, str(state_root))
+        state = queried
     return state, repository_root, state_root
 
 

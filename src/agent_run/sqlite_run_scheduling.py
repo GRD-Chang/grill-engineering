@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query, integer_aggregate
 from agent_run.sqlite_run_inputs import owner
 from agent_run.sqlite_work_evidence import get_evidence, put_evidence
 
@@ -34,7 +35,7 @@ def _key(value: Any) -> int:
 def _bounded(c: sqlite3.Connection, source: str, columns: str, params: tuple[Any, ...]) -> None:
     names = columns.split(",")
     size = "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)+16" for name in names)
-    count, byte_count = c.execute(f"SELECT COUNT(*),COALESCE(SUM({size}),0) FROM {source}", params).fetchone()
+    count, byte_count = integer_aggregate(c, f"SELECT COUNT(*),COALESCE(SUM({size}),0) FROM {source}", params)
     if count > MAX_SCHEDULING_ITEMS or byte_count > MAX_SCHEDULING_BYTES:
         raise ValueError("Run scheduling record exceeds byte or item limit")
 
@@ -111,7 +112,7 @@ def load(c: sqlite3.Connection, run_id: str, field: str, *, keys: set[str] | Non
             params += tuple(_key(key) for key in sorted(keys))
         _bounded(c, query.split(" FROM ", 1)[1], "ticket_number," + column, params)
         query += " ORDER BY ticket_number LIMIT ?"
-        rows = c.execute(query, (*params, MAX_SCHEDULING_ITEMS + 1)).fetchall()
+        rows = bounded_query(c, query, (*params, MAX_SCHEDULING_ITEMS + 1)).fetchall()
         if len(rows) > MAX_SCHEDULING_ITEMS:
             raise ValueError("Run scheduling query exceeds item limit")
         map_result = {}
@@ -130,7 +131,7 @@ def load(c: sqlite3.Connection, run_id: str, field: str, *, keys: set[str] | Non
     columns = {"frontier": "ticket_number", "ticket_work_queue": "ticket_number,generation,role,lease_id",
                "ticket_integration_queue": "ticket_number,ready_at,ready_at_present"}[field]
     _bounded(c, table + " WHERE run_id=?", columns, (run_id,))
-    rows = c.execute(f"SELECT position,{columns} FROM {table} WHERE run_id=? ORDER BY position LIMIT ?",
+    rows = bounded_query(c, f"SELECT position,{columns} FROM {table} WHERE run_id=? ORDER BY position LIMIT ?",
                      (run_id, MAX_SCHEDULING_ITEMS + 1)).fetchall()
     if len(rows) > MAX_SCHEDULING_ITEMS:
         raise ValueError("Run scheduling query exceeds item limit")

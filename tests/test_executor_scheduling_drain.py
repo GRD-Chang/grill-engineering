@@ -1,6 +1,8 @@
 """Dispatch failure must close Resume before waiting for existing workers."""
 from pathlib import Path
+from contextlib import nullcontext
 from threading import Event, Thread
+from time import monotonic
 from typing import Any
 from types import SimpleNamespace
 
@@ -16,7 +18,9 @@ from agent_run.delivery import TicketDeliveryEngine
 from agent_run.executor_host import ExecutorSpec, FakeExecutorHost
 from agent_run.run_lifecycle import LifecycleRequest, RunLifecycle
 from agent_run.task_control import ActionBusyError, TaskControlBusyError, TaskControlStore, TaskKey
+from support.ticket_execution import TicketExecution
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.state import persist_run_fixture
 
 
 @pytest.mark.parametrize("source", ["lane", "supervision", "global_state"])
@@ -25,6 +29,8 @@ def test_failed_scheduler_rejects_resume_before_siblings_finish(
 ) -> None:
     state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=2)
     run_id = state["run_id"]
+    state["notifications"] = {"enabled": True, "mode": "detailed"}
+    persist_run_fixture(states, run_id, state)
     task = TaskKey(git_repo, "example/project", 1)
     control = TaskControlStore(states.root)
     entered, release, draining, reported = Event(), Event(), Event(), Event()
@@ -34,17 +40,20 @@ def test_failed_scheduler_rejects_resume_before_siblings_finish(
     observed: list[dict[str, Any]] = []
     recorded: list[str] = []
     controller = Controller(FixtureGitHubReader(fixture), git, states)
+    original_observe = Notifications._observe
 
     def record(_states: Any, _run_id: str, message: str, _binding: Any) -> bool:
         recorded.append(message)
         return controller.record_execution_failure(_run_id, message)
 
-    def observe(_self: Any, value: dict[str, Any], **_kwargs: Any) -> None:
+    def observe(sender: Any, value: dict[str, Any], **kwargs: Any) -> None:
         observed.extend(events(value))
         if value["status"] == "execution_failed":
             reported.set()
+        original_observe(sender, value, **kwargs)
 
-    monkeypatch.setattr(Notifications, "observe", observe)
+    monkeypatch.setattr(Notifications, "_observe", observe)
+    monkeypatch.setattr("agent_run.notifications.send", lambda *_args, **_kwargs: {"outcome": "success", "reason": None})
 
     def close_admission(*args: Any, **kwargs: Any) -> bool:
         closed = original_close(*args, **kwargs)
@@ -141,7 +150,9 @@ def test_executor_records_exhausted_control_contention(
 
     failure = TaskControlBusyError("control lock deadline expired")
     state = {"run_id": "run-1", "status": "active"}
-    states = SimpleNamespace(root=tmp_path, load_current_run=lambda _: state)
+    states = SimpleNamespace(
+        root=tmp_path, load_scheduler_current_run=lambda _: state, work_session=nullcontext,
+    )
     recorded: list[tuple[str, str, Any]] = []
 
     def advance(_state: Any) -> None:
@@ -204,7 +215,10 @@ def test_reconciliation_does_not_manufacture_execution_failure(tmp_path: Path, k
 
     failure = {"revoked": ActionReconciliationError, "concurrent": ConcurrentRunStateError,
                "graph": TicketGraphDriftError}[kind]("ownership or facts changed")
-    states = SimpleNamespace(root=tmp_path, load_current_run=lambda _: {"run_id": "run-1", "status": "active"})
+    states = SimpleNamespace(
+        root=tmp_path, load_scheduler_current_run=lambda _: {"run_id": "run-1", "status": "active"},
+        work_session=nullcontext,
+    )
     recorded: list[str] = []
 
     def advance(_state: Any) -> None:
@@ -258,36 +272,49 @@ def test_supervision_snapshot_race_keeps_dispatch_alive(git_repo: Path, monkeypa
 
     monkeypatch.setattr(delivery, "SUPERVISION_POLL_SECONDS", 0.01)
     state, states, git, fixture = ticket_run(git_repo, (2, 3), workers=2)
-    started, release, refreshed = Event(), Event(), Event()
-    errors: list[BaseException] = []
+    release, refreshed = Event(), Event()
+    prepared = {number: Event() for number in (2, 3)}
     observations = 0
+    original_deliver = TicketDeliveryEngine.deliver_ticket
 
-    def develop(_number: int) -> None:
-        started.set()
-        assert release.wait(5)
+    def prepare_lane(
+        lane: TicketDeliveryEngine, run_id: str, number: int, *, complete: bool = True,
+    ) -> dict[str, Any]:
+        result = original_deliver(lane, run_id, number, complete=complete)
+        if result["active_ticket_job"]["phase"] == "ready_for_integration":
+            # Finish real development, Git and review before the dispatch
+            # race's short refresh/exit windows. Keep its future in flight.
+            prepared[number].set()
+            assert release.wait(10), f"Ticket {number} ready_for_integration gate was not released"
+        return result
 
     def supervise(_lanes: frozenset[int]) -> None:
         nonlocal observations
-        assert started.wait(5)
+        if not all(ready.is_set() for ready in prepared.values()):
+            return
         observations += 1
         if observations == 1:
             raise ConcurrentRunStateError("live Resume replaced snapshot")
         refreshed.set()
 
-    engine = ticket_engine(git, states, fixture, TicketAgents(git_repo, (2, 3), develop))
+    monkeypatch.setattr(TicketDeliveryEngine, "deliver_ticket", prepare_lane)
+    engine = ticket_engine(git, states, fixture, TicketAgents(git_repo, (2, 3), lambda _: None))
 
     def run() -> None:
-        try:
-            engine.develop_frontier(state["run_id"], state, supervise=supervise)
-        except BaseException as error:
-            errors.append(error)
+        assert engine.develop_frontier(state["run_id"], state, supervise=supervise)
 
-    thread = Thread(target=run)
-    thread.start()
-    try:
+    with TicketExecution(run, release=release.set, name="supervision-snapshot-race") as execution:
+        errors, thread = execution.errors, execution.thread
+        deadline = monotonic() + 10
+        for number, ready in prepared.items():
+            if not ready.wait(max(0.0, deadline - monotonic())):
+                current = states.load_scheduler_current_run(state["run_id"])
+                phase = current["ticket_jobs"].get(str(number), {}).get("phase") if current else None
+                pytest.fail(f"Ticket {number} preparation stalled at phase={phase!r}: {errors!r}")
         assert refreshed.wait(5), errors
         assert thread.is_alive() and not release.is_set()
-    finally:
-        release.set()
-        thread.join(5)
-    assert not thread.is_alive() and not errors, errors
+        execution.finish(timeout=5)
+    assert observations >= 2
+    saved = states.load_current_run(state["run_id"])
+    assert saved is not None
+    assert all(saved["ticket_jobs"][str(number)]["phase"] == "ready_for_integration" for number in (2, 3))

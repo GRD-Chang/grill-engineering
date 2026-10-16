@@ -142,6 +142,9 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
     persisted = states.load_current_run(str(state["run_id"]))
     assert persisted is not None
     assert persisted["status"] == "waiting_external"
+    from agent_run.work_projection import materialize_history
+
+    materialize_history(run, "review_budget_history")
     assert persisted["run_acceptance"] == run
     assert persisted["supervision_window"]["kind"] == "github_convergence"
     assert persisted["diagnostics"][0]["code"] == "github_pull_request_observation_pending"

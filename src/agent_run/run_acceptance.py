@@ -113,11 +113,8 @@ class RunAcceptanceEngine:
         self._repair_lifecycle = RunRepairLifecycle(self, self._repair_promotion)
 
     def accept(self, run_id: str) -> dict[str, Any]:
-        self._accept(run_id)
-        state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]
-        if state is None:
-            raise ValueError(f"unknown Delivery Run: {run_id}")
-        return state
+        with self.states.work_session():
+            return self._accept(run_id)
 
     def _accept(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
@@ -580,10 +577,6 @@ class RunAcceptanceEngine:
         if isinstance(run_integration, dict):
             request["run_integration_record"] = dict(run_integration)
         previous = previous_review_context(run)
-        if previous is None:
-            history = run.get("review_budget_history")
-            if isinstance(history, list) and history and isinstance(history[-1], dict):
-                previous = previous_review_context(history[-1])
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]
@@ -659,7 +652,9 @@ class RunAcceptanceEngine:
 
     @staticmethod
     def _string_list(data: dict[str, Any], key: str) -> list[str]:
-        value = data.get(key)
+        from agent_run.work_projection import materialize_history
+
+        value = materialize_history(data, key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ValueError(f"{key} must contain strings")
         return list(value)

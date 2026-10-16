@@ -14,6 +14,7 @@ from agent_run.semantic_attempt import (
     pending_semantic_attempt,
 )
 from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.work_projection import materialize_history
 
 
 def review_ordinal(job: dict[str, Any]) -> int:
@@ -138,7 +139,7 @@ def require_pending_run_review(run: dict[str, Any]) -> None:
             run.get("phase") != "reviewing"
             or record.get("acceptance_scope") != "run"
             or record.get("reviewed_base_sha") != record["reviewed_default_base_sha"]
-            or record["reviewer_thread_id"] not in run.get("reviewer_thread_ids", [])
+            or record["reviewer_thread_id"] not in (materialize_history(run, "reviewer_thread_ids") or [])
             or attempt is None
             or attempt.get("budget_consumed") is not True
             or attempt["currentness_boundary_fingerprint"] != canonical_fingerprint(boundary)

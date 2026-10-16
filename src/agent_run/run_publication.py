@@ -37,8 +37,9 @@ class RunPublicationEngine:
         self.currentness_reader = currentness_reader
 
     def publish(self, run_id: str) -> dict[str, Any]:
-        self._flow().publish(run_id)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._flow().publish(run_id)
+            return self._control_result(run_id)
 
     def _control_result(self, run_id: str) -> dict[str, Any]:
         state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]
@@ -47,7 +48,8 @@ class RunPublicationEngine:
         return state
 
     def advance(self, run_id: str, *, allow_agent: bool = False) -> DeliveryStep:
-        return self._flow().advance(run_id, allow_agent=allow_agent)
+        with self.states.work_session():
+            return self._flow().advance(run_id, allow_agent=allow_agent)
 
     def approve(
         self,
@@ -55,8 +57,9 @@ class RunPublicationEngine:
         *,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        self._approval().approve(run_id, prepare_state=prepare_state)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._approval().approve(run_id, prepare_state=prepare_state)
+            return self._control_result(run_id)
 
     def has_current_approval_grant(self, run_id: str) -> bool:
         return self._approval().has_current_approval_grant(run_id)
@@ -67,8 +70,9 @@ class RunPublicationEngine:
         *,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        self._approval().recover_closeout(run_id, prepare_state=prepare_state)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._approval().recover_closeout(run_id, prepare_state=prepare_state)
+            return self._control_result(run_id)
 
     def revise(
         self,
@@ -77,12 +81,14 @@ class RunPublicationEngine:
         *,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        self._approval().revise(run_id, feedback, prepare_state=prepare_state)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._approval().revise(run_id, feedback, prepare_state=prepare_state)
+            return self._control_result(run_id)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
-        self._approval().abandon(run_id, discard_worktree=discard_worktree)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._approval().abandon(run_id, discard_worktree=discard_worktree)
+            return self._control_result(run_id)
 
     def _flow(self) -> RunPublicationFlow:
         return RunPublicationFlow(

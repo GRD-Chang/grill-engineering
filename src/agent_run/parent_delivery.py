@@ -55,8 +55,9 @@ class ParentDeliveryEngine:
         self.agents = agents
 
     def deliver(self, run_id: str) -> dict[str, Any]:
-        self._deliver(run_id)
-        return self._control_result(run_id)
+        with self.states.work_session():
+            self._deliver(run_id)
+            return self._control_result(run_id)
 
     def _control_result(self, run_id: str) -> dict[str, Any]:
         state = cast(dict[str, Any] | None, object_store(self.states).load_scheduler_current_run(run_id))  # type: ignore[attr-defined]

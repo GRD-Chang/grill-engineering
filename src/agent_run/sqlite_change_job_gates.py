@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query, current_collection_size
 from agent_run.sqlite_change_job_codec import present
 from agent_run.sqlite_change_job_schema import JOB_FIELDS
 from agent_run.sqlite_encoding import encode_json
@@ -18,6 +19,12 @@ CURRENTNESS_REASONS = frozenset({
 })
 _PHASES = frozenset({"blocked", "paused", "ready_for_human", "execution_failed", "publication_pending"})
 _RESUME_FIELDS = ("execution_resume_phase", "pause_resume_phase", "human_blocker_phase")
+
+
+def _check_gates(c: sqlite3.Connection, run_id: str, job_id: str) -> None:
+    columns = ("gate_id", "gate_kind", "reason", "public_phase", "resume_field", "attempt_id", "priority")
+    current_collection_size(c, "SELECT " + ",".join(columns)
+                            + " FROM work_job_gates WHERE run_id=? AND job_id=?", (run_id, job_id), columns)
 
 
 def gate(job: Mapping[str, Any]) -> tuple[str, str | None, str, str | None, str | None, int] | None:
@@ -64,18 +71,20 @@ def save_gate(c: sqlite3.Connection, run_id: str, job_id: str, job: Mapping[str,
         c.execute("INSERT INTO work_job_gates VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,job_id,gate_id) "
                   "DO UPDATE SET public_phase=excluded.public_phase,resume_field=excluded.resume_field,priority=excluded.priority",
                   (run_id, job_id, identity, *after))
+        _check_gates(c, run_id, job_id)
         for key in (after[3], *_RESUME_FIELDS):
             saved = job.get(key) if key is not None else None
             if isinstance(saved, str) and saved not in _PHASES:
                 return saved
         return stage
-    if c.execute("SELECT 1 FROM work_job_gates WHERE run_id=? AND job_id=? LIMIT 1", (run_id, job_id)).fetchone():
+    if bounded_query(c, "SELECT 1 FROM work_job_gates WHERE run_id=? AND job_id=? LIMIT 1", (run_id, job_id)).fetchone():
         return stage
     return job.get("phase", stage)
 
 
 def load_gate(c: sqlite3.Connection, run_id: str, job_id: str, job: dict[str, Any], stage: Any) -> None:
-    row = c.execute("SELECT reason,public_phase,resume_field FROM work_job_gates WHERE run_id=? AND job_id=? "
+    _check_gates(c, run_id, job_id)
+    row = bounded_query(c, "SELECT reason,public_phase,resume_field FROM work_job_gates WHERE run_id=? AND job_id=? "
                     "ORDER BY priority DESC,gate_id LIMIT 1", (run_id, job_id)).fetchone()
     if row is None:
         return
@@ -92,7 +101,7 @@ def load_gate(c: sqlite3.Connection, run_id: str, job_id: str, job: dict[str, An
 
 def gate_projection(c: sqlite3.Connection, run_id: str, job_id: str) -> dict[str, Any]:
     """Read one owner's stage and highest condition without any evidence body."""
-    row = c.execute("SELECT presence,stage FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
+    row = bounded_query(c, "SELECT presence,stage FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None:
         raise ValueError("Missing Change Job gate owner")
     result = {"phase": row[1]} if "phase" in present(row[0], JOB_FIELDS) else {}

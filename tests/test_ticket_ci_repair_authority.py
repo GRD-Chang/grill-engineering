@@ -163,6 +163,21 @@ def test_first_ticket_ci_repair_has_narrow_authority_without_review() -> None:
             )
 
 
+def test_ticket_ci_repair_keeps_accurate_unread_budget_scope() -> None:
+    from agent_run.work_projection import JobProjection
+
+    values = _reviewed_failed_job()
+    assert values.pop("review_budget_history") == []
+    budget = deepcopy(values["review_budget"])
+    job = JobProjection(values, job_id="ticket:2:generation:1", revision=7,
+                        archives={"review_budget_history": (2, 0)})
+
+    assert prepare_ticket_ci_publication_authorization(_stage(), {}, job)
+    assert job["review_budget"] == budget
+    assert "review_budget_history" not in job
+    require_active_ticket_publication_authorization(job, candidate_tree="repaired-tree")
+
+
 def test_first_ticket_ci_repair_rejects_later_round_and_missing_prior_head() -> None:
     job = _reviewed_failed_job()
     job["ci_recovery"]["developments_used"] = 2

@@ -7,6 +7,11 @@ import time
 from agent_run.state_errors import IncompatibleRunStateError
 
 
+# Current projections use more than sqlite3's default 128 statement slots.
+# Keep this per-connection cache bounded; closing its scope releases all SQL.
+STATEMENT_CACHE_SIZE = 256
+
+
 def enable_wal(connection: sqlite3.Connection, *, timeout: float) -> None:
     """Let simultaneous first creators finish the WAL mode transition."""
     deadline = time.monotonic() + timeout

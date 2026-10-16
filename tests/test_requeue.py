@@ -576,7 +576,9 @@ def test_requeue_transition_restores_its_exact_gate_after_graph_read_recovers(
             "message": "Change Job Generation is stale; run requeue",
         }
     ]
-    assert states.load_run(str(state["run_id"])) == recovered
+    from agent_run.object_state import current_projection_facts
+
+    assert current_projection_facts(states.load_run(str(state["run_id"]))) == current_projection_facts(recovered)
 
 
 

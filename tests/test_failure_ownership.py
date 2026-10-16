@@ -24,19 +24,20 @@ from agent_run.object_state import save_owned
 from support.cli import run_cli, stdout_json
 from support.state_commits import observe_run_commits
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
-from support.state import persist_run_fixture
 
 
 def _select_completed(states: StateStore, run_id: str) -> None:
     state = states.load_current_run(run_id)
     assert state is not None
     assert state["ticket_jobs"]["2"]["phase"] == "completed"
+    fields = {"active_ticket_job", "active_agent_invocation", "status", "terminal_kind", "diagnostics"}
+    expected = {key: deepcopy(state.get(key)) for key in fields}
     state["active_ticket_job"] = state["ticket_jobs"]["2"]
     state["active_agent_invocation"] = state["ticket_agent_invocations"]["2"]
     state["status"] = "ticket_completed"
     state["terminal_kind"] = None
     state["diagnostics"] = []
-    persist_run_fixture(states, run_id, state)
+    save_owned(states, run_id, state, fields=fields, expected=expected)
 
 
 @pytest.mark.parametrize("failure", ["worker", "save"])
@@ -71,12 +72,12 @@ def test_failure_while_observing_completed_ticket_preserves_independent_delivery
     def before_save(saved_run: str, value: dict[str, Any]) -> None:
         nonlocal injected
         if (failure == "save" and not injected
-                and value["ticket_jobs"].get("3", {}).get("phase") == "committing_candidate"):
+                and value.get("ticket_jobs", {}).get("3", {}).get("phase") == "committing_candidate"):
             injected = True
             raise OSError("B result save failed once")
 
     def observed(value: dict[str, Any]) -> None:
-        if not failed.is_set() and value["ticket_jobs"].get("3", {}).get("blocked_reason") == "ticket_execution_failed":
+        if not failed.is_set() and value.get("ticket_jobs", {}).get("3", {}).get("blocked_reason") == "ticket_execution_failed":
             assert value["active_ticket_job"]["ticket_number"] == 2
             failed.set()
 

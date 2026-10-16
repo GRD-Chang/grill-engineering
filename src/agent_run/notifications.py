@@ -31,7 +31,8 @@ class Notifications:
     """
 
     def __init__(self, root: Path, state: dict[str, Any], *,
-                 load_state: Callable[[], dict[str, Any] | None] | None = None) -> None:
+                 load_state: Callable[[], dict[str, Any] | None] | None = None,
+                 query_state: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None) -> None:
         self.root = root
         self.run_id = str(state["run_id"])
         self.binding = (state.get("repository"), (state.get("parent") or {}).get("number"))
@@ -39,6 +40,7 @@ class Notifications:
         self.config = dict(config) if isinstance(config, dict) else {}
         self.enabled = isinstance(self.config, dict) and self.config.get("enabled") is True
         self.load_state = load_state
+        self.query_state = query_state
         self.condition = threading.Condition()
         self.cancel = threading.Event()
         self.thread: threading.Thread | None = None
@@ -69,12 +71,25 @@ class Notifications:
             self.condition.notify_all()
 
     def _current(self, fallback: dict[str, Any]) -> dict[str, Any]:
-        state = self.load_state() if self.load_state else fallback
+        state = (self.query_state(self.document) if self.query_state is not None
+                 else self.load_state() if self.load_state else fallback)
         if (state is None or state.get("run_id") != self.run_id
                 or (state.get("repository"), (state.get("parent") or {}).get("number")) != self.binding
                 or state.get("notifications", {}) != self.config):
             raise ValueError("无法核验通知所属 Run 或接收人绑定")
         return state
+
+    @staticmethod
+    def _omission_is_known(state: dict[str, Any], event: dict[str, Any]) -> bool:
+        """Unloaded history cannot revoke a pending notification's evidence."""
+        scope = state.get("_notification_scope")
+        if not isinstance(scope, dict):
+            return True
+        if event.get("attempt_id"):
+            return event["attempt_id"] in scope["attempt_ids"]
+        if event.get("resume_id"):
+            return event["resume_id"] in scope["resume_ids"]
+        return event.get("kind") == "executor_exit"
 
     def observe(self, state: dict[str, Any], *, recovering: bool = False) -> None:
         if not self.enabled or self.closed or state.get("run_id") != self.run_id:
@@ -108,7 +123,8 @@ class Notifications:
         for item in list(pending):
             event = item["event"]
             if ((event.get("current") and event.get("slot_id") not in current)
-                    or (item.get("important") and not event.get("current") and event["id"] not in ids)):
+                    or (item.get("important") and not event.get("current") and event["id"] not in ids
+                        and self._omission_is_known(state, event))):
                 outbox.cancel_item(document, item, "no_longer_current")
         added = False
         for event in projected:
@@ -135,8 +151,14 @@ class Notifications:
             if event["kind"] in {"ticket_started", "parent_started", "acceptance_started", "acceptance_repair"}:
                 document["milestones"].append(identity)
             added = True
-        document["seen"] = list(dict.fromkeys(
+        visible = list(dict.fromkeys(
             identity for event in projected for identity in [event["id"], *event.get("supersedes", [])]))
+        scope = state.get("_notification_scope")
+        if isinstance(scope, dict):
+            document["seen"] = [*([identity for identity in document["seen"] if identity not in visible]), *visible][-outbox.MAX_RECORDS:]
+            document["observation"] = scope["receipt"]
+        else:
+            document["seen"] = visible
         document["active"] = sorted(current)
         document["resume_results"] = document["resume_results"][-outbox.MAX_RECORDS:]
         milestone_limit = len((state.get("ticket_graph") or {}).get("tickets") or {}) + 2

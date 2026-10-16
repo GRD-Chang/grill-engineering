@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -136,15 +137,17 @@ def test_active_conflict_rejects_inconsistent_owner_and_context(git_repo: Path, 
             for invocation in [state["active_agent_invocation"], *state["agent_invocation_history"],
                                *state.get("ticket_agent_invocations", {}).values()]:
                 invocation["role"] = "publication"
+        # 此专用场景包含完整记录；重建负向输入时去掉非持久的查询范围。
+        raw_state = json.loads(json.dumps(state))
         if damage in {"paths", "role", "pending_mismatch", "subject"}:
             # These facts are now rejected by their typed relation or exact
             # Attempt binding before a corrupt Run can become durable.
             with pytest.raises(ValueError, match="must contain strings|identity"):
-                write_run_fixture((store.root, state["run_id"]), state)
+                write_run_fixture((store.root, state["run_id"]), raw_state)
             assert StateStore(store.root).load_current_run(state["run_id"]) == before
             raise InterruptedError("stop before business closeout")
         # 损坏注入绕过业务校验，仅用于读取拒绝断言。
-        write_run_fixture((store.root, state["run_id"]), state)
+        write_run_fixture((store.root, state["run_id"]), raw_state)
         with pytest.raises(IncompatibleRunStateError) as caught:
             StateStore(store.root).load_current_run(state["run_id"])
         if damage != "budget":
@@ -169,8 +172,10 @@ def test_candidate_conflict_requires_its_production_entry_conditions(git_repo: P
             job.pop("parent_integration")
         else:
             job["integrated_sha"] = job["candidate_sha"]
+        # 此专用场景包含完整记录；重建负向输入时去掉非持久的查询范围。
+        raw_state = json.loads(json.dumps(state))
         # 损坏注入绕过业务校验，仅用于读取拒绝断言。
-        write_run_fixture((store.root, state["run_id"]), state)
+        write_run_fixture((store.root, state["run_id"]), raw_state)
         with pytest.raises(IncompatibleRunStateError, match="owner, generation, phase or conflict context"):
             StateStore(store.root).load_current_run(state["run_id"])
         raise InterruptedError("invalid candidate")

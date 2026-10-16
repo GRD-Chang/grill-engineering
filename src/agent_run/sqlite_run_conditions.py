@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_change_job_codec import _assign, _flatten, _shape, _typed, presence, present
 from agent_run.sqlite_run_graph import load_graph, save_graph
 from agent_run.sqlite_run_inputs import identity, owner
@@ -21,7 +22,7 @@ def _bounded(values: list[Any]) -> None:
 
 
 def _check_bytes(c: sqlite3.Connection, table: str, columns: list[str], predicate: str, params: tuple[Any, ...]) -> None:
-    size = c.execute("SELECT " + "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)" for name in columns)
+    size = bounded_query(c, "SELECT " + "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)" for name in columns)
                      + f" FROM {table} WHERE {predicate}", params).fetchone()
     if size is not None and (type(size[0]) is not int or size[0] + 16 * len(columns) > MAX_CONDITION_BYTES):
         raise ValueError("Run condition current record exceeds byte limit")
@@ -29,7 +30,7 @@ def _check_bytes(c: sqlite3.Connection, table: str, columns: list[str], predicat
 
 def _read(c: sqlite3.Connection, table: str, columns: list[str], predicate: str, params: tuple[Any, ...]) -> Any:
     _check_bytes(c, table, columns, predicate, params)
-    return c.execute("SELECT " + ",".join(columns) + f" FROM {table} WHERE {predicate}", params).fetchone()
+    return bounded_query(c, "SELECT " + ",".join(columns) + f" FROM {table} WHERE {predicate}", params).fetchone()
 
 
 def _list(c: sqlite3.Connection, run_id: str, container: str, path: str, value: Any, kind: str) -> None:
@@ -51,7 +52,7 @@ def _list(c: sqlite3.Connection, run_id: str, container: str, path: str, value: 
 
 
 def _load_list(c: sqlite3.Connection, run_id: str, container: str, path: str, kind: str) -> list[Any]:
-    rows = c.execute("SELECT position,ticket_number,blocker_number FROM run_condition_tickets "
+    rows = bounded_query(c, "SELECT position,ticket_number,blocker_number FROM run_condition_tickets "
                      "WHERE run_id=? AND condition_kind=? AND list_name=? ORDER BY position LIMIT 4097", (run_id, container, path)).fetchall()
     if len(rows) > 4096:
         raise ValueError("Run condition query exceeds item limit")
@@ -162,7 +163,7 @@ def save_diagnostics(c: sqlite3.Connection, run_id: str, container: str, value: 
             raise ValueError("Run diagnostic must be an object")
         diagnostic_id = identity(item)
         record = "diagnostic:" + diagnostic_id
-        previous = c.execute("SELECT diagnostic_id FROM run_diagnostic_versions WHERE run_id=? AND diagnostic_id=?",
+        previous = bounded_query(c, "SELECT diagnostic_id FROM run_diagnostic_versions WHERE run_id=? AND diagnostic_id=?",
                              (run_id, diagnostic_id)).fetchone()
         if previous is not None:
             if _load_diagnostic(c, run_id, diagnostic_id) != item:
@@ -197,7 +198,7 @@ def _load_diagnostic(c: sqlite3.Connection, run_id: str, diagnostic_id: str) -> 
 
 
 def load_diagnostics(c: sqlite3.Connection, run_id: str, container: str) -> list[dict[str, Any]]:
-    rows = c.execute("SELECT position,diagnostic_id FROM run_diagnostic_slots WHERE run_id=? AND container=? ORDER BY position LIMIT 33",
+    rows = bounded_query(c, "SELECT position,diagnostic_id FROM run_diagnostic_slots WHERE run_id=? AND container=? ORDER BY position LIMIT 33",
                      (run_id, container)).fetchall()
     if len(rows) > 32:
         raise ValueError("Run diagnostics exceed item limit")

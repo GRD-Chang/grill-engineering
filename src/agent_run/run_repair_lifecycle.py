@@ -38,6 +38,7 @@ from agent_run.semantic_attempt import (
     detach_active_invocation,
     pending_semantic_attempt,
 )
+from agent_run.work_projection import materialize_history
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
@@ -165,7 +166,7 @@ class RunRepairLifecycle:
                 self.owner._remove_empty_directories(checkout)
         assert job is not None
         if job["phase"] == "completed":
-            completed_repairs = run.get("completed_repair_jobs", [])
+            completed_repairs = materialize_history(run, "completed_repair_jobs", [])
             if not isinstance(completed_repairs, list) or not all(
                 isinstance(completed, dict) for completed in completed_repairs
             ):

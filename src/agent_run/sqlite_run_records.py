@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_change_job_codec import _typed, presence, present
 from agent_run.sqlite_mutations import _same
 from agent_run import sqlite_run_conditions as conditions
@@ -24,25 +25,29 @@ TABLES = {**ROOT_TABLES, **closeout.TABLES}
 INDEXES = {**INDEXES, **closeout.INDEXES}
 
 
-def _root(c: sqlite3.Connection, run_id: str) -> tuple[set[str], set[str], dict[str, Any]]:
+def _root(c: sqlite3.Connection, run_id: str, *, fields: set[str] | None = None) -> tuple[set[str], set[str], dict[str, Any]]:
     # Prove the actual stored bytes before transferring any potentially
     # damaged text/BLOB into Python. Metadata is the same current record.
     byte_columns = ["r." + column(key) for key in _COLUMNS] + ["i." + key for key in sorted(METADATA)]
     byte_columns += ["r.presence", "r.nulls"]
-    size = c.execute("SELECT " + "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)" for name in byte_columns)
+    size = bounded_query(c, "SELECT " + "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)" for name in byte_columns)
                      + " FROM run_root r JOIN runs i USING(run_id) WHERE r.run_id=?", (run_id,)).fetchone()
     if size is None:
         raise ValueError("Missing relational Run root")
     if type(size[0]) is not int or size[0] + 16 * len(byte_columns) > MAX_CURRENT_BYTES:
         raise ValueError("Run current record exceeds byte limit")
-    row = c.execute("SELECT presence,nulls," + ",".join(column(key) for key in _COLUMNS)
+    selected = [key for key in _COLUMNS if fields is None or key in fields
+                or key == "parent_version_id" and "parent" in fields
+                or key == "graph_snapshot_id" and "ticket_graph" in fields]
+    columns = "".join("," + column(key) for key in selected)
+    row = bounded_query(c, "SELECT presence,nulls" + columns
                     + " FROM run_root WHERE run_id=?", (run_id,)).fetchone()
     if row is None:
         raise ValueError("Missing relational Run root")
     keys, nulls = present(row[0], FIELDS), present(row[1], FIELDS)
     if nulls - keys:
         raise ValueError("Invalid relational Run null fields")
-    return keys, nulls, dict(zip(_COLUMNS, row[2:], strict=True))
+    return keys, nulls, dict(zip(selected, row[2:], strict=True))
 
 
 def _requeue(c: sqlite3.Connection, run_id: str, value: Any) -> None:
@@ -65,7 +70,7 @@ def _requeue(c: sqlite3.Connection, run_id: str, value: Any) -> None:
     else:
         kind, field, number = "run_repair", "repair_generation", None
     job_id = job_identity(kind, {field: generation}, ticket_number=number)
-    row = c.execute("SELECT 1 FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
+    row = bounded_query(c, "SELECT 1 FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None or not _same(_retired_record(subject, _load_owner(c, run_id, job_id)), retired):
         raise ValueError("Run requeue source no longer matches its exact Job")
     base, nonce = value.get("base_sha"), value.get("close_nonce")
@@ -85,10 +90,10 @@ def load_requeue(c: sqlite3.Connection, run_id: str) -> dict[str, Any]:
 
     columns = ("presence", "base_sha", "close_nonce", "source_job_id", "source_record_id")
     lengths = "+".join(f"COALESCE(LENGTH(CAST({name} AS BLOB)),0)+16" for name in columns)
-    size = c.execute(f"SELECT {lengths} FROM run_requeue_transition WHERE run_id=?", (run_id,)).fetchone()
+    size = bounded_query(c, f"SELECT {lengths} FROM run_requeue_transition WHERE run_id=?", (run_id,)).fetchone()
     if size is not None and (type(size[0]) is not int or size[0] > MAX_CURRENT_BYTES):
         raise ValueError("Run requeue current record exceeds byte limit")
-    row = c.execute("SELECT presence,base_sha,close_nonce,source_job_id,source_record_id FROM run_requeue_transition WHERE run_id=?",
+    row = bounded_query(c, "SELECT presence,base_sha,close_nonce,source_job_id,source_record_id FROM run_requeue_transition WHERE run_id=?",
                     (run_id,)).fetchone()
     if row is None:
         raise ValueError("Missing Run requeue transition")
@@ -119,7 +124,7 @@ def save(c: sqlite3.Connection, run_id: str, state: Mapping[str, Any], baseline:
               or field in state and not _same(state[field], baseline[field])}
     if not fields:
         return
-    keys, nulls, _ = _root(c, run_id)
+    keys, nulls, _ = _root(c, run_id, fields=set())
     for field in fields & FIELDS:
         if field not in state and field not in baseline:
             continue
@@ -166,17 +171,17 @@ def save(c: sqlite3.Connection, run_id: str, state: Mapping[str, Any], baseline:
             continue
         c.execute(f"UPDATE run_root SET {column(target)}=? WHERE run_id=?", (encoded, run_id))
     c.execute("UPDATE run_root SET presence=?,nulls=? WHERE run_id=?", (presence(keys, FIELDS), presence(nulls, FIELDS), run_id))
-    _root(c, run_id)
+    _root(c, run_id, fields=set())
 
 
 def load(c: sqlite3.Connection, run_id: str, *, fields: set[str] | None = None,
          keyed_changes: Mapping[str, set[str]] | None = None) -> dict[str, Any]:
-    keys, nulls, values = _root(c, run_id)
+    keys, nulls, values = _root(c, run_id, fields=fields)
     selected = keys & (FIELDS if fields is None else fields)
     result: dict[str, Any] = {}
     metadata = sorted(selected & METADATA)
     if metadata:
-        row = c.execute("SELECT " + ",".join(metadata) + " FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        row = bounded_query(c, "SELECT " + ",".join(metadata) + " FROM runs WHERE run_id=?", (run_id,)).fetchone()
         for key, value in zip(metadata, row, strict=True):
             _typed(value, "TEXT", key)
             result[key] = value
@@ -215,22 +220,22 @@ def load(c: sqlite3.Connection, run_id: str, *, fields: set[str] | None = None,
 
 
 def has_supervision_work(c: sqlite3.Connection, run_id: str) -> bool:
-    keys, nulls, values = _root(c, run_id)
+    keys, nulls, values = _root(c, run_id, fields={"ticket_integration_holder"})
     required = {"status", "ticket_integration_holder", "ticket_integration_queue"}
     if required - keys or (required - {"ticket_integration_holder"}) & nulls:
         raise ValueError("Missing Run Ticket supervision facts")
-    status = c.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
+    status = bounded_query(c, "SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()[0]
     holder = values["ticket_integration_holder"]
     if not isinstance(status, str) or holder is not None and (type(holder) is not int or holder < 1):
         raise ValueError("Invalid Run Ticket supervision status or holder")
-    count = c.execute("SELECT COUNT(*) FROM run_integration_queue WHERE run_id=?", (run_id,)).fetchone()[0]
+    count = bounded_query(c, "SELECT COUNT(*) FROM run_integration_queue WHERE run_id=?", (run_id,)).fetchone()[0]
     if count > scheduling.MAX_SCHEDULING_ITEMS:
         raise ValueError("Run integration queue exceeds item limit")
     return status not in {"active", "ticket_delivery_pending"} or holder is not None or count != 0
 
 
 def pause_requested(c: sqlite3.Connection, run_id: str, number: int) -> bool:
-    keys, nulls, _ = _root(c, run_id)
+    keys, nulls, _ = _root(c, run_id, fields=set())
     if "ticket_pause_requests" not in keys or "ticket_pause_requests" in nulls:
         raise ValueError("Missing Run Ticket pause request map")
     return bool(scheduling.load(c, run_id, "ticket_pause_requests", keys={str(number)}))

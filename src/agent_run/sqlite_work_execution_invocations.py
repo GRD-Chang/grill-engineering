@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query, current_collection_size
 from agent_run.semantic_attempt import canonical_fingerprint, semantic_attempt_subjects
 from agent_run.sqlite_encoding import copy_json_tree, encode_json
 from agent_run.sqlite_mutations import _same
@@ -33,6 +34,10 @@ _FIXED_COLUMNS = (
 )
 
 
+def invocation_identity(invocation: Mapping[str, Any]) -> str:
+    return encode_json((str(invocation.get("work_subject")), str(invocation.get("started_at"))))
+
+
 def identity(value: Mapping[str, Any]) -> tuple[str, str]:
     subject, started = value.get("work_subject"), value.get("started_at")
     if not isinstance(subject, str) or not subject or not isinstance(started, str) or not started:
@@ -41,7 +46,7 @@ def identity(value: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _row(c: sqlite3.Connection, run_id: str, key: tuple[str, str]) -> dict[str, Any] | None:
-    row = c.execute("SELECT " + ",".join(_COLUMNS) + " FROM work_invocations WHERE run_id=? "
+    row = bounded_query(c, "SELECT " + ",".join(_COLUMNS) + " FROM work_invocations WHERE run_id=? "
                     "AND work_subject=? AND started_at=?", (run_id, *key)).fetchone()
     return None if row is None else dict(zip(_COLUMNS, row, strict=True))
 
@@ -68,7 +73,7 @@ def load_invocation(c: sqlite3.Connection, run_id: str, key: tuple[str, str]) ->
         raise ValueError("Unexpected Invocation Semantic Attempt")
     raw = row["raw_result_evidence_id"]
     if raw is not None:
-        owned = c.execute("SELECT owner_id,kind FROM work_evidence WHERE run_id=? AND evidence_id=?", (run_id, raw)).fetchone()
+        owned = bounded_query(c, "SELECT owner_id,kind FROM work_evidence WHERE run_id=? AND evidence_id=?", (run_id, raw)).fetchone()
         if row["attempt_id"] is None or owned != ("attempt:" + row["attempt_id"], "returned_result"):
             raise ValueError("Invocation raw result belongs to another Attempt")
     restore_details(c, (run_id, *key), row, record, included)
@@ -153,6 +158,8 @@ def _save_record(
     c.execute("INSERT INTO work_invocations(" + columns + ") VALUES(" + ",".join("?" for _ in values)
               + ") ON CONFLICT(run_id,work_subject,started_at) DO UPDATE SET "
               + ",".join(f"{column}=excluded.{column}" for column in row), tuple(values.values()))
+    current_collection_size(c, "SELECT " + ",".join(_COLUMNS) + " FROM work_invocations "
+                            "WHERE run_id=? AND work_subject=? AND started_at=?", (run_id, *key), _COLUMNS)
     save_arrays(c, (run_id, *key), record, before)
 
 
@@ -221,7 +228,7 @@ def _update_current(
         value, before = current.get((kind, key)), previous.get((kind, key))
         if _same(value, before):
             continue
-        existing = c.execute("SELECT work_subject,started_at FROM work_invocation_current "
+        existing = bounded_query(c, "SELECT work_subject,started_at FROM work_invocation_current "
                              "WHERE run_id=? AND reference_kind=? AND reference_key=?", (run_id, kind, key)).fetchone()
         expected = identity(before) if before is not None else None
         incoming = identity(value) if value is not None else None
@@ -251,16 +258,14 @@ def bind_returns(c: sqlite3.Connection, run_id: str, state: Mapping[str, Any]) -
         if isinstance((attempt := owner.get("pending_semantic_attempt")), dict) and "returned_result" in attempt
     }
     for attempt_id, attempt in pending.items():
-        invocations = c.execute(
-            "SELECT DISTINCT v.work_subject,v.started_at,v.raw_result_evidence_id "
+        invocations = bounded_query(c, "SELECT DISTINCT v.work_subject,v.started_at,v.raw_result_evidence_id "
             "FROM work_invocation_current r JOIN work_invocations v USING(run_id,work_subject,started_at) "
             "WHERE r.run_id=? AND v.attempt_id=?", (run_id, attempt_id),
         ).fetchall()
         if not invocations:
             continue
         result = attempt["returned_result"]
-        row = c.execute(
-            "SELECT v.returned_result_evidence_id FROM work_attempt_current p JOIN work_attempt_versions v "
+        row = bounded_query(c, "SELECT v.returned_result_evidence_id FROM work_attempt_current p JOIN work_attempt_versions v "
             "USING(run_id,attempt_id,version_id) WHERE p.run_id=? AND p.attempt_id=?", (run_id, attempt_id),
         ).fetchone()
         if row is None or row[0] is None or not _same(get_evidence(c, run_id, row[0], owner_id="attempt:" + attempt_id, kind="returned_result"), result):
@@ -284,14 +289,14 @@ def save_invocations(c: sqlite3.Connection, run_id: str, state: Mapping[str, Any
     # A selected-object commit supplies a delta, not the complete audit list.
     # Retain every prior identity and its original global position; detail
     # compaction below releases only bounded execution detail, never a call.
-    position = c.execute("SELECT COALESCE(MAX(position),-1)+1 FROM work_invocation_history WHERE run_id=?", (run_id,)).fetchone()[0]
+    position = bounded_query(c, "SELECT COALESCE(MAX(position),-1)+1 FROM work_invocation_history WHERE run_id=?", (run_id,)).fetchone()[0]
     for record in history:
         key = identity(record)
-        existing = c.execute("SELECT position FROM work_invocation_history WHERE run_id=? AND work_subject=? AND started_at=?", (run_id, *key)).fetchone()
+        existing = bounded_query(c, "SELECT position FROM work_invocation_history WHERE run_id=? AND work_subject=? AND started_at=?", (run_id, *key)).fetchone()
         if existing is None:
             c.execute("INSERT INTO work_invocation_history VALUES (?,?,?,?)", (run_id, *key, position))
             position += 1
-    roots = c.execute("SELECT active_present,tickets_present,history_present FROM work_invocation_roots WHERE run_id=?", (run_id,)).fetchone() or (0, 0, 0)
+    roots = bounded_query(c, "SELECT active_present,tickets_present,history_present FROM work_invocation_roots WHERE run_id=?", (run_id,)).fetchone() or (0, 0, 0)
     flags = [int(field in state) if field in state or field in baseline else old for field, old in zip(_ROOT_FIELDS, roots, strict=True)]
     if any(field in state or field in baseline for field in _ROOT_FIELDS):
         c.execute("INSERT INTO work_invocation_roots VALUES (?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
@@ -305,8 +310,9 @@ def save_invocations(c: sqlite3.Connection, run_id: str, state: Mapping[str, Any
 def load_invocations(
     c: sqlite3.Connection, run_id: str, *, ticket_numbers: set[int] | None = None,
     current_only: bool = True, resume_ids: set[str] | frozenset[str] = frozenset(), history: bool = False,
+    history_ticket_numbers: set[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    roots = c.execute("SELECT active_present,tickets_present,history_present FROM work_invocation_roots WHERE run_id=?", (run_id,)).fetchone()
+    roots = bounded_query(c, "SELECT active_present,tickets_present,history_present FROM work_invocation_roots WHERE run_id=?", (run_id,)).fetchone()
     if roots is None:
         return {}, {}
     result: dict[str, Any] = {}
@@ -317,8 +323,10 @@ def load_invocations(
     selected = set()
     cache: dict[tuple[str, str], dict[str, Any]] = {}
     selected_tickets = None if ticket_numbers is None else {str(number) for number in ticket_numbers}
-    for subject, started, kind, number, pending in c.execute(
-        "SELECT r.work_subject,r.started_at,r.reference_kind,r.reference_key,v.resume_pending "
+    history_tickets = selected_tickets if history_ticket_numbers is None else {
+        str(number) for number in history_ticket_numbers
+    }
+    for subject, started, kind, number, pending in bounded_query(c, "SELECT r.work_subject,r.started_at,r.reference_kind,r.reference_key,v.resume_pending "
         "FROM work_invocation_current r LEFT JOIN work_invocations v USING(run_id,work_subject,started_at) WHERE r.run_id=?", (run_id,),
     ):
         if kind == "ticket" and selected_tickets is not None and subject.startswith("ticket:") and subject.removeprefix("ticket:") not in selected_tickets:
@@ -334,7 +342,9 @@ def load_invocations(
             result["active_agent_invocation"] = current
         elif kind == "ticket" and roots[1]:
             result["ticket_agent_invocations"][number] = current
-        selected.add(key)
+        if (kind != "ticket" or history_tickets is None or not subject.startswith("ticket:")
+                or subject.removeprefix("ticket:") in history_tickets):
+            selected.add(key)
     positions: dict[str, int] = {}
     if history and roots[2]:
         predicates, parameters = [], [run_id]
@@ -355,8 +365,7 @@ def load_invocations(
             parameters.extend(sorted(resume_ids))
         result["agent_invocation_history"] = []
         if predicates:
-            for subject, started, position in c.execute(
-                "SELECT h.work_subject,h.started_at,h.position FROM work_invocation_history h "
+            for subject, started, position in bounded_query(c, "SELECT h.work_subject,h.started_at,h.position FROM work_invocation_history h "
                 "LEFT JOIN work_invocations v USING(run_id,work_subject,started_at) WHERE h.run_id=? AND ("
                 + " OR ".join(predicates) + ") ORDER BY h.position", parameters,
             ):

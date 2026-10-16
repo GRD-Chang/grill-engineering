@@ -8,11 +8,71 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from agent_run.state import MAX_RUN_STATE_BYTES, StateStore
+from agent_run.state import StateStore
+from agent_run.state_limits import MAX_QUERY_BYTES
 from agent_run.sqlite_state import SQLiteStateRepository
 
 
 RunRef = tuple[Path, str]
+
+
+def current_query_fixture(
+    state: Mapping[str, Any], *, language: str | None = "zh",
+) -> dict[str, Any]:
+    """补齐只读查询场景的当前协议输入，不替代执行场景的 Controller 准备。"""
+    from copy import deepcopy
+    from agent_run.delivery_policy import DELIVERY_POLICY_PROTOCOL, DeliveryPolicy
+    from agent_run.prompt_resources import builtin_resources
+    from agent_run.task_control import TASK_CONTROL_PROTOCOL
+
+    result = deepcopy(dict(state))
+    if language is not None:
+        result.setdefault("language", language)
+    graph = result.get("ticket_graph")
+    if isinstance(graph, dict) and isinstance(graph.get("tickets"), dict):
+        numbers = graph["tickets"]
+        if all(isinstance(number, str) and number.isdecimal() and int(number) > 0 for number in numbers):
+            graph.setdefault("ordered_ticket_numbers", sorted(int(number) for number in numbers))
+    defaults = {
+        "prompt_resources": builtin_resources(result.get("language", "zh")),
+        "branch_authority_protocol": 3, "review_budget_protocol": 2,
+        "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
+        "multi_ticket_protocol": 4, "semantic_attempt_protocol": 1,
+        "human_response_audit_protocol": 1,
+        "lifecycle_action_protocol": TASK_CONTROL_PROTOCOL,
+        "policy_snapshot": DeliveryPolicy().snapshot(),
+    }
+    return defaults | result
+
+
+def resume_audit_for_successors(
+    run_id: str, invocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """安排真实身份、摘要与顺序，关联已执行的 Resume 后继调用。"""
+    from agent_run.resume_audit_contract import (
+        resume_event_digest, resume_history_digest, resume_identity,
+    )
+
+    events = []
+    for sequence, invocation in enumerate(invocations, 1):
+        attempt = invocation.get("semantic_attempt") or {}
+        event = {
+            "sequence": sequence, "requested_at": "2026-10-15T00:00:00+00:00",
+            "kind": "operator_stopped", "source_status": "operator_stopped",
+            "failure_code": None, "work_subject": invocation["work_subject"],
+            "generation": invocation.get("generation", 1),
+            "semantic_attempt_id": attempt.get("attempt_id"),
+            "source_invocation_started_at": None, "source_invocation_status": None,
+            "thread_id": invocation.get("reported_thread_id"), "new_thread": False,
+            "human_response_supplied": False,
+            "successor_invocation_started_at": invocation["started_at"],
+        }
+        event["resume_id"] = resume_identity(run_id, event)
+        event["event_digest"] = resume_event_digest(event)
+        invocation["resume_id"] = event["resume_id"]
+        events.append(event)
+    return {"total": len(events), "compacted": 0,
+            "rolling_digest": resume_history_digest(events), "history": events}
 
 
 class _FixtureStateRepository(SQLiteStateRepository):
@@ -58,6 +118,20 @@ def snapshot_runs(root: Path) -> dict[str, bytes]:
     return {reference[1]: snapshot_run(reference) for reference in run_refs(root)}
 
 
+def _complete_fixture_timelines(state: dict[str, Any], previous: Mapping[str, Any] | None) -> None:
+    """将声明未读的历史补成原始 fixture 输入，不补造故意缺失的字段。"""
+    from copy import deepcopy
+    from agent_run.object_projection import ObjectProjection
+
+    if not isinstance(state, ObjectProjection):
+        return
+    for field in state.timelines.keys() - state.keys():
+        if previous is None or field not in previous:
+            raise ValueError("Fixture requires its actual unread Timeline")
+        state[field] = deepcopy(previous[field])
+    state.timelines.clear()
+
+
 def write_run_fixture(reference: RunRef, state: dict[str, Any]) -> None:
     """在准备阶段设置原始故障/历史 fixture，保留故意非法的输入。
 
@@ -65,19 +139,23 @@ def write_run_fixture(reference: RunRef, state: dict[str, Any]) -> None:
     本例指定的 Run，处于同一真实事务；生产的首次创建拒绝覆盖已有身份。
     """
     root, run_id = reference
-    repository = _FixtureStateRepository(root, max_bytes=MAX_RUN_STATE_BYTES)
+    repository = _FixtureStateRepository(root, max_bytes=MAX_QUERY_BYTES)
     with repository.atomic():
+        timelines = getattr(state, "timelines", {})
+        if timelines:
+            previous = repository.load_fields(run_id, set(timelines))
+            _complete_fixture_timelines(state, previous)
         connection = repository._local.connection
         released = [row[0] for row in connection.execute(
-            "SELECT material_id FROM run_material_refs WHERE run_id=?", (run_id,),
+            "SELECT DISTINCT material_id FROM work_evidence WHERE run_id=? AND material_id IS NOT NULL", (run_id,),
         )]
         connection.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
         repository.save(run_id, state)
         # Replacing test preparation must not accumulate orphaned evidence.
         # Shared materials still referenced by any other Run remain intact.
         connection.executemany(
-            "DELETE FROM run_materials WHERE material_id=? AND NOT EXISTS "
-            "(SELECT 1 FROM run_material_refs WHERE material_id=run_materials.material_id)",
+            "DELETE FROM work_evidence_materials WHERE material_id=? AND NOT EXISTS "
+            "(SELECT 1 FROM work_evidence WHERE material_id=work_evidence_materials.material_id)",
             ((identity,) for identity in released),
         )
 
@@ -98,6 +176,7 @@ def persist_run_fixture(store: StateStore, run_id: str, state: dict[str, Any]) -
         store.save_run(run_id, state)
         return
     previous = store.load_run(run_id)
+    _complete_fixture_timelines(state, previous)
     invocation, job = state.get("active_agent_invocation"), state.get("active_ticket_job")
     if (isinstance(invocation, dict) and isinstance(job, dict)
             and invocation.get("work_subject") == f"ticket:{job.get('ticket_number')}"):

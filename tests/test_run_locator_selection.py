@@ -22,7 +22,7 @@ from support.state import include_in_state_snapshot, read_run, snapshot_run, wri
 
 def test_discovery_reports_incompatible_sqlite_protocol_without_writes(tmp_path: Path) -> None:
     states = StateStore(tmp_path)
-    states.save_run("run-1", {"version": 1})
+    states.save_run("run-1", {"status": "created"})
     database = tmp_path / "state.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE schema_meta SET value = 'sqlite-run-objects-v1'")

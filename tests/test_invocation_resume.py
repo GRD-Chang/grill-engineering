@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from agent_run.object_state import current_projection_facts
+from agent_run.work_projection import materialize_history
 from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
@@ -400,7 +402,12 @@ def test_parent_only_resume_accepts_generation_one(
     else:
         assert parent["publication_thread_id"] == "failed-thread"
         assert "publication_new_thread" not in parent
-    assert store.load_run(run_id) == resumed
+    persisted = store.load_history_run(run_id)
+    assert persisted is not None
+    assert current_projection_facts(persisted) == current_projection_facts(resumed)
+    for field in parent.archives:
+        materialize_history(parent, field)
+    assert persisted["parent_job"] == parent
 
 
 def test_resume_reopens_a_development_invocation_after_credential_failure(

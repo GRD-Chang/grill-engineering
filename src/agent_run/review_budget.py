@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping, TypedDict, cast
 
 from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.work_projection import (
+    JobHistoryAppend, JobProjection, history_for_append, materialize_history, previous_review_artifact,
+)
 
 _ARCHIVED_WINDOWS: ContextVar[Mapping[int, int]] = ContextVar("archived_budget_windows", default={})
 
@@ -31,7 +34,10 @@ def scoped_budget_validation(owners: Mapping[int, int]) -> Iterator[None]:
 
 
 def archived_budget_windows(owner: dict[str, Any]) -> int | None:
-    """Return an exemption only inside the current explicit work validator."""
+    """Read the exact archive scope, retaining the complete plain-dict rule."""
+    if (isinstance(owner, JobProjection) and "review_budget_history" in owner.archives
+            and "review_budget_history" not in owner.loaded_histories):
+        return owner.archives["review_budget_history"][1]
     return _ARCHIVED_WINDOWS.get().get(id(owner))
 
 
@@ -143,7 +149,7 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     to infer a new budget from legacy counters.
     """
 
-    archived = _ARCHIVED_WINDOWS.get().get(id(job))
+    archived = archived_budget_windows(job)
     if archived is not None:
         return require_current_budget(job, policy, archived_windows=archived)
     if "review_budget" not in job:
@@ -170,14 +176,26 @@ def require_current_budget(
     The archive's full contents remain subject to ensure_budget at complete
     query/write boundaries. A scoped work view never synthesizes old windows.
     """
-    if "review_budget_history" in job:
+    suffix = job.get("review_budget_history")
+    if "review_budget_history" in job and not isinstance(suffix, JobHistoryAppend):
         raise ValueError("scoped budget validation requires an unloaded archive")
     raw = job.get("review_budget")
     if not isinstance(raw, dict):
         raise ValueError("review_budget must be an object")
     budget = cast(ReviewBudget, raw)
     _validate_budget_projection(budget, "review_budget", policy)
-    if type(archived_windows) is not int or archived_windows != budget["window"] - 1:
+    if type(archived_windows) is not int or archived_windows < 0:
+        raise ValueError("invalid review_budget_history scope")
+    appended = 0
+    if isinstance(suffix, JobHistoryAppend):
+        if suffix.base_count != archived_windows:
+            raise ValueError("review_budget_history append belongs to another prefix")
+        if (isinstance(job, JobProjection)
+                and suffix.base_bytes != job.archives["review_budget_history"][0]):
+            raise ValueError("review_budget_history append belongs to another prefix")
+        appended = len(suffix)
+        _validate_budget_history(suffix, budget["window"], policy, start_window=archived_windows + 1)
+    if archived_windows + appended != budget["window"] - 1:
         raise ValueError("review_budget_history must contain exactly one snapshot per prior window")
     return budget
 
@@ -259,13 +277,14 @@ def _validate_budget_history(
     history: list[dict[str, Any]],
     current_window: int,
     policy: ReviewBudgetPolicy,
+    *, start_window: int = 1,
 ) -> None:
-    expected_history_length = current_window - 1
+    expected_history_length = current_window - start_window
     if len(history) != expected_history_length:
         raise ValueError(
             "review_budget_history must contain exactly one snapshot per prior window"
         )
-    for index, snapshot in enumerate(history, start=1):
+    for index, snapshot in enumerate(history, start=start_window):
         location = f"review_budget_history[{index - 1}]"
         if not snapshot:
             raise ValueError(f"{location} must preserve a complete old Job snapshot")
@@ -345,6 +364,7 @@ def _window_audit(job: dict[str, Any], *, include_budget: bool = True) -> dict[s
     projected evidence and Attempts. Intent, checkout, active selection, and
     live integration/CI windows are not a budget ledger.
     """
+    materialize_history(job, "semantic_attempt_history")
     snapshot = {key: deepcopy(value) for key, value in job.items() if key in _WINDOW_EVIDENCE_FIELDS}
     if include_budget:
         snapshot["review_budget"] = deepcopy(job["review_budget"])
@@ -358,9 +378,7 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     """Open a new numbered window while retaining historical state elsewhere."""
 
     current = ensure_budget(job, policy)
-    history = job["review_budget_history"]
-    if not isinstance(history, list):
-        raise ValueError("review_budget_history must be a list")
+    history = history_for_append(job, "review_budget_history")
     history.append(_window_audit(job))
     next_window = int(current["window"]) + 1
     job["review_budget"] = new_budget(window=next_window)
@@ -384,7 +402,7 @@ def renew_run_budget(job: dict[str, Any], policy: ReviewBudgetPolicy, *, reason:
     if reason not in {"modification_budget_exhausted", "review_budget_exhausted"}:
         raise ValueError("unknown Parent allowance renewal")
     current = deepcopy(ensure_budget(job, policy))
-    job["review_budget_history"].append(_window_audit(job))
+    history_for_append(job, "review_budget_history").append(_window_audit(job))
     current["window"] += 1
     current["checkpoint_reason"] = None
     if reason == "modification_budget_exhausted":
@@ -413,15 +431,10 @@ def previous_review_context(job: dict[str, Any]) -> dict[str, Any] | None:
             return None
         # Full Run Review retains its last exact baseline after an explicit
         # allowance renewal. Ticket/Parent-only windows keep their old rule.
-        history = owner.get("review_budget_history")
-        for snapshot in reversed(history if isinstance(history, list) else []):
-            old_budget = snapshot.get("review_budget") if isinstance(snapshot, dict) else None
-            previous = old_budget.get("review_artifacts") if isinstance(old_budget, dict) else None
-            if isinstance(previous, list) and previous:
-                artifacts = previous
-                break
-        else:
+        prior = previous_review_artifact(owner)
+        if prior is None:
             return None
+        artifacts = [prior]
     latest = artifacts[-1]
     if not isinstance(latest, dict):
         return None

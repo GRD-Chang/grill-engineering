@@ -37,10 +37,11 @@ from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
 from agent_run.ticket_integration import delivery_base_sha, delivery_candidate_sha
+from agent_run.work_projection import materialize_history
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
-    raw_records = job.get("superseded_integrations", [])
+    raw_records = materialize_history(job, "superseded_integrations", [])
     if not isinstance(raw_records, list) or not all(
         isinstance(record, dict) for record in raw_records
     ):

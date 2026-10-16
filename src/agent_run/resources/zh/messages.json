@@ -840,7 +840,7 @@
   "cli.delivery_candidates": "候选交付:",
   "cli.candidates_heading": "候选：",
   "cli.error.workspace_required": "无法定位当前 Git 仓库；请进入目标仓库目录后重试。原因：{reason}",
-  "cli.error.incompatible_run_state": "本地 Run state 不符合当前唯一 Invocation/Generation 契约；不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run",
+  "cli.error.incompatible_run_state": "本地 Run state 不符合当前唯一 Invocation/Generation 契约；不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run。原因：{reason}",
   "cli.error.executor_lost": "Executor 已退出；已保留当前交付状态，不会自动重放未知工作。",
   "cli.error.action_busy": "当前交付已有未完成操作；{reason}",
   "cli.error.executor_unknown": "运行进程归属暂时无法确认；{reason}",

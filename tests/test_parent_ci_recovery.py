@@ -30,6 +30,17 @@ from support.run_scenarios import _accepted_run, _completed_run
 from support.seeding import write_fixture
 
 
+def _parent_current_facts(state: dict[str, Any]) -> dict[str, Any]:
+    facts = current_projection_facts(state)
+    # Parent work intentionally does not query these unrelated Ticket maps.
+    # A full read must still prove they are empty before comparing scopes.
+    for field in ("pending_ticket_retirements", "retired_ticket_generations",
+                  "ticket_agent_invocations", "ticket_pause_requests"):
+        if field in facts:
+            assert facts.pop(field) == {}
+    return facts
+
+
 class ParentCIAgents(PassAgents):
     def develop(self, request: dict[str, Any]) -> DevelopmentResult:
         if request.get("repair_source") == "required_checks":
@@ -287,7 +298,7 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     assert first_repair["run_acceptance"]["ci_recovery"]["developments_used"] == 2
     assert first_repair["run_acceptance"]["completed_repair_jobs"]
     assert "repair_job" not in first_repair["run_acceptance"]
-    assert current_projection_facts(StateStore(states.root).load_current_run(run_id)) == current_projection_facts(first_repair)
+    assert _parent_current_facts(StateStore(states.root).load_current_run(run_id)) == _parent_current_facts(first_repair)
     failed_again = publication.publish(run_id)
     assert failed_again["status"] == "run_acceptance_pending"
     assert failed_again["run_publication"]["pr_number"] == final_pr
@@ -301,7 +312,7 @@ def test_run_second_failed_final_head_keeps_cumulative_allowance_and_same_pr(git
     assert run["review_budget"]["development_attempts"] == 0
     assert all(key not in run["repair_job"] for key in
                ("review_budget", "review_budget_history", "ci_recovery", "integration_resync"))
-    assert current_projection_facts(StateStore(states.root).load_current_run(run_id)) == current_projection_facts(second_repair)
+    assert _parent_current_facts(StateStore(states.root).load_current_run(run_id)) == _parent_current_facts(second_repair)
     ordinary = deepcopy(run["review_budget"])
     ticket_budget = deepcopy(second_repair["ticket_jobs"]["2"]["review_budget"])
     fixture = git_repo / "github.json"

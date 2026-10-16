@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from agent_run.work_projection import materialize_history
 from agent_run.agents import ReviewResult
 from agent_run.object_state import save_owned
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -78,7 +79,7 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
         reviewer = Reviewer()
         publication = deepcopy(result["run_publication"])
         budget = deepcopy(result["run_acceptance"]["review_budget"])
-        attempts = deepcopy(result["run_acceptance"]["semantic_attempt_history"])
+        attempts = deepcopy(materialize_history(result["run_acceptance"], "semantic_attempt_history"))
         invocations = deepcopy(result["agent_invocation_history"])
         for _ in range(2):
             reopened = StateStore(states.root)
@@ -89,7 +90,7 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
             assert reused["run_publication"] == publication
             assert reused["run_acceptance"]["acceptance_record"] == original
             assert reused["run_acceptance"]["review_budget"] == budget
-            assert reused["run_acceptance"]["semantic_attempt_history"] == attempts
+            assert materialize_history(reused["run_acceptance"], "semantic_attempt_history") == attempts
             assert reused["agent_invocation_history"] == invocations
             assert reviewer.requests == []
             assert len(agents.requests) == 1
@@ -99,7 +100,7 @@ def test_final_delivery_reuses_only_applicable_complete_review(git_repo: Path, d
         assert agents.requests == []
         assert publisher.data["delivery"].get("pull_requests", []) == []
         assert result["run_acceptance"]["phase"] == "pending"
-    assert result["run_acceptance"]["semantic_attempt_history"] == state["run_acceptance"]["semantic_attempt_history"]
+    assert materialize_history(result["run_acceptance"], "semantic_attempt_history") == materialize_history(state["run_acceptance"], "semantic_attempt_history")
 
 
 def test_candidate_promotion_proves_actual_result_and_preserves_original_review(git_repo: Path) -> None:
@@ -172,6 +173,6 @@ def test_completed_acceptance_resumes_pending_publication_handoff(git_repo: Path
     assert result["terminal_kind"] == "run_acceptance_passed"
     assert result["run_acceptance"]["acceptance_record"] == accepted["acceptance_record"]
     assert result["run_acceptance"]["review_budget"] == accepted["review_budget"]
-    assert result["run_acceptance"]["semantic_attempt_history"] == accepted["semantic_attempt_history"]
+    assert materialize_history(result["run_acceptance"], "semantic_attempt_history") == accepted["semantic_attempt_history"]
     assert reviewer.requests == []
     assert reopened.load_current_run(run_id)["status"] == "run_publication_pending"

@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from typing import Any
 
 from agent_run.object_projection import ObjectProjection
+from agent_run.work_projection import JobProjection
 from agent_run.review_budget import scoped_budget_validation
 from agent_run.sqlite_encoding import encode_json
 from agent_run.state_errors import IncompatibleRunStateError
@@ -55,6 +56,11 @@ def _require_completed_ticket_integration_records(state: dict[str, Any]) -> None
     for key, job in jobs.items():
         if not isinstance(job, dict) or job.get("phase") != "completed":
             continue
+        if isinstance(job, JobProjection):
+            from agent_run.sqlite_change_job_queries import job_identity
+
+            if job.job_id != job_identity("ticket", job, ticket_number=int(key)):
+                raise IncompatibleRunStateError("completed Ticket review_budget archive has another owner identity")
         location = f"ticket_jobs[{key}].deterministic_integration_record"
         record = job.get("deterministic_integration_record")
         if not isinstance(record, dict):

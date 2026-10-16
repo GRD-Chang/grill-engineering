@@ -16,10 +16,11 @@ from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend, re
 from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from support.cli_fixtures import run_agents
+from support.published_run import prepare_completed_run
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import load_only_run_state, run_cli, stdout_json
-from support.cli_payloads import parent_publication, passing_acceptance, ticket
+from support.cli_payloads import parent_publication, passing_acceptance
 
 from support.state import run_refs
 
@@ -715,7 +716,14 @@ def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) ->
 
 
 def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    # Ticket 交付是前置；短等待窗口从真实 Run Review 的就绪状态开始。
+    fixture, prepared = prepare_completed_run(git_repo)
+    assert prepared["status"] == "run_acceptance_pending"
+    run_id = str(prepared["run_id"])
+    profiles = AgentProfileStore(managed_state(git_repo)).load(run_id)
+    assert profiles is not None
+    assert profiles["profile_revision"] == 1
+    assert profiles["bindings"] == []
     started_file = git_repo / "output-repair.started"
     release_file = git_repo / "output-repair.release"
     agent_fixture = run_agents(git_repo / "agents.json")
@@ -768,7 +776,7 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
 
         run_records = run_refs(managed_state(git_repo))
         assert len(run_records) == 1
-        run_id = run_records[0][1]
+        assert run_records[0][1] == run_id
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         invocation_before = active_before["agent_invocation"]

@@ -147,7 +147,7 @@ TABLES = {
         "CREATE TABLE work_job_attempt_roots (run_id TEXT NOT NULL, job_id TEXT NOT NULL, "
         "pending_present INTEGER NOT NULL, history_present INTEGER NOT NULL, pending_attempt_id TEXT, "
         "history_count INTEGER NOT NULL CHECK(history_count >= 0), "
-        "history_bytes INTEGER NOT NULL CHECK(history_bytes >= 2), history_proof TEXT NOT NULL, "
+        "history_bytes INTEGER NOT NULL CHECK(history_bytes >= 2), "
         "PRIMARY KEY(run_id,job_id), " + _JOB_FK + ", "
         "FOREIGN KEY(run_id,pending_attempt_id) REFERENCES work_attempts(run_id,attempt_id))"
     ),
@@ -202,6 +202,7 @@ TABLES = {
 INDEXES = {
     "work_attempt_owner_role": "CREATE INDEX work_attempt_owner_role ON work_attempts(run_id,job_id,role,generation,ordinal)",
     "work_attempt_result_content": "CREATE INDEX work_attempt_result_content ON work_attempt_result_members(run_id,result_field,value_fingerprint,attempt_id)",
+    "work_invocation_attempt": "CREATE INDEX work_invocation_attempt ON work_invocations(run_id,attempt_id,started_at)",
     "work_invocation_resume": "CREATE INDEX work_invocation_resume ON work_invocations(run_id,resume_id)",
     "work_invocation_history_subject": "CREATE INDEX work_invocation_history_subject ON work_invocation_history(run_id,work_subject,position)",
     "work_invocation_detail_retained": "CREATE INDEX work_invocation_detail_retained ON work_invocations(run_id,work_subject,started_at) WHERE details_retained=1",

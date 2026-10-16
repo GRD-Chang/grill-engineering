@@ -20,7 +20,7 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
-from agent_run.state import MAX_RUN_STATE_BYTES
+from agent_run.state_limits import MAX_QUERY_BYTES
 from agent_run.sqlite_state import SQLiteStateRepository
 from support.environment import _apply_test_environment
 from support.seeding import seed_run, write_fixture
@@ -78,7 +78,7 @@ def _git_refs(repo: Path) -> str:
 
 
 def _sql_snapshot(reference: tuple[Path, str]) -> tuple[str, ...]:
-    with closing(sqlite3.connect(SQLiteStateRepository(reference[0], max_bytes=MAX_RUN_STATE_BYTES).path)) as connection:
+    with closing(sqlite3.connect(SQLiteStateRepository(reference[0], max_bytes=MAX_QUERY_BYTES).path)) as connection:
         return tuple(connection.iterdump())
 
 
@@ -110,7 +110,7 @@ def test_noncanonical_run_repair_mode_is_rejected_before_mutation(
         fixture_before = fixture.read_bytes()
         refs_before = _git_refs(managed_repo(git_repo))
         with pytest.raises(ValueError, match="repair_mode must be text"):
-            SQLiteStateRepository(state_ref[0], max_bytes=MAX_RUN_STATE_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
+            SQLiteStateRepository(state_ref[0], max_bytes=MAX_QUERY_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
         assert _sql_snapshot(state_ref) == before
         assert fixture.read_bytes() == fixture_before
         assert _git_refs(managed_repo(git_repo)) == refs_before
@@ -455,7 +455,7 @@ def test_storage_rejects_retired_integrated_revalidation_merge_before_mutation(
     # The retired field has no relation in the current protocol. The actual
     # persistence API now rejects it before any saved recovery state exists.
     with pytest.raises(ValueError, match="Unsupported run_repair Job fields.*integrated_revalidation_merge"):
-        SQLiteStateRepository(state_ref[0], max_bytes=MAX_RUN_STATE_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
+        SQLiteStateRepository(state_ref[0], max_bytes=MAX_QUERY_BYTES).save_objects(run_id, state, fields={"run_acceptance"})
 
     assert _sql_snapshot(state_ref) == before
     assert fixture.read_text(encoding="utf-8") == fixture_before

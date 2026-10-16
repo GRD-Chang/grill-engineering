@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_change_job_codec import _typed, presence, present
 from agent_run.sqlite_mutations import _same
 from agent_run.sqlite_run_inputs import identity
@@ -57,7 +58,7 @@ INDEXES: dict[str, str] = {}
 
 def _bounds(c: sqlite3.Connection, table: str, columns: list[str], predicate: str, params: tuple[Any, ...]) -> None:
     size = "+".join("COALESCE(LENGTH(CAST(" + name + " AS BLOB)),0)" for name in columns)
-    count, byte_count = c.execute(f"SELECT COUNT(*),COALESCE(SUM({size}),0) FROM {table} WHERE {predicate}", params).fetchone()
+    count, byte_count = bounded_query(c, f"SELECT COUNT(*),COALESCE(SUM({size}),0) FROM {table} WHERE {predicate}", params).fetchone()
     if count > 4096 or byte_count + 16 * len(columns) * count > 256 * 1024:
         raise ValueError("Run closeout current record exceeds byte or item limit")
 
@@ -111,15 +112,15 @@ def _save_receipt(c: sqlite3.Connection, run_id: str, value: Any) -> str:
     if not isinstance(value, Mapping):
         raise ValueError("Run closeout receipt must be an object")
     receipt_id = identity(value)
-    if c.execute("SELECT 1 FROM run_close_receipts WHERE run_id=? AND receipt_id=?", (run_id, receipt_id)).fetchone():
+    if bounded_query(c, "SELECT 1 FROM run_close_receipts WHERE run_id=? AND receipt_id=?", (run_id, receipt_id)).fetchone():
         if not _same(_load_receipt(c, run_id, receipt_id), value):
             raise ValueError("Immutable Run closeout receipt was changed")
         return receipt_id
     source_job = source_kind = None
-    source = c.execute("SELECT job_id FROM work_job_slots WHERE run_id=? AND container='ticket_jobs' AND slot=?",
+    source = bounded_query(c, "SELECT job_id FROM work_job_slots WHERE run_id=? AND container='ticket_jobs' AND slot=?",
                        (run_id, str(value.get("ticket_number")))).fetchone()
     if source is not None:
-        owner_row = c.execute("SELECT evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, source[0])).fetchone()
+        owner_row = bounded_query(c, "SELECT evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, source[0])).fetchone()
         for kind in ("ticket_close_ownership", "ticket_close_intent"):
             if _same(load_record(c, run_id, source[0], kind, owner_id=owner_row[0]), value):
                 source_job, source_kind = source[0], kind
@@ -136,14 +137,14 @@ def _load_receipt(c: sqlite3.Connection, run_id: str, receipt_id: str) -> dict[s
     columns = ",".join("value_" + key for key in _columns(_CLOSE))
     _bounds(c, "run_close_receipts", ["source_job_id", "source_record_kind", "presence", "nulls", *columns.split(",")],
             "run_id=? AND receipt_id=?", (run_id, receipt_id))
-    row = c.execute(f"SELECT source_job_id,source_record_kind,presence,nulls,{columns} FROM run_close_receipts WHERE run_id=? AND receipt_id=?",
+    row = bounded_query(c, f"SELECT source_job_id,source_record_kind,presence,nulls,{columns} FROM run_close_receipts WHERE run_id=? AND receipt_id=?",
                     (run_id, receipt_id)).fetchone()
     if row is None:
         raise ValueError("Missing exact Run closeout receipt")
     if row[0] is not None:
         if row[1] not in {"ticket_close_ownership", "ticket_close_intent"}:
             raise ValueError("Invalid Run closeout receipt source")
-        owner_row = c.execute("SELECT evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, row[0])).fetchone()
+        owner_row = bounded_query(c, "SELECT evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, row[0])).fetchone()
         value = load_record(c, run_id, row[0], row[1], owner_id=owner_row[0]) if owner_row else None
     else:
         value = _decode(c, run_id, _CLOSE, row[2:])
@@ -203,7 +204,7 @@ def load(c: sqlite3.Connection, run_id: str, field: str) -> dict[str, Any]:
     schema = _SCHEMAS[kind]
     _bounds(c, "run_closeout_headers", ["presence", "nulls", "value_phase", "value_kind", "value_status", "value_last_error"],
             "run_id=? AND kind=?", (run_id, kind))
-    row = c.execute("SELECT presence,nulls,value_phase,value_kind,value_status,value_last_error FROM run_closeout_headers WHERE run_id=? AND kind=?",
+    row = bounded_query(c, "SELECT presence,nulls,value_phase,value_kind,value_status,value_last_error FROM run_closeout_headers WHERE run_id=? AND kind=?",
                     (run_id, kind)).fetchone()
     if row is None:
         raise ValueError("Missing Run closeout header")
@@ -213,7 +214,7 @@ def load(c: sqlite3.Connection, run_id: str, field: str) -> dict[str, Any]:
         if isinstance(result.get("items"), dict):
             _bounds(c, "run_cleanup_items", ["branch", "presence", "nulls", *("value_" + key for key in _columns(_SCHEMAS["cleanup_item"]))],
                     "run_id=?", (run_id,))
-            rows = c.execute("SELECT branch,presence,nulls," + ",".join("value_" + key for key in _columns(_SCHEMAS["cleanup_item"]))
+            rows = bounded_query(c, "SELECT branch,presence,nulls," + ",".join("value_" + key for key in _columns(_SCHEMAS["cleanup_item"]))
                              + " FROM run_cleanup_items WHERE run_id=? ORDER BY branch LIMIT 4097", (run_id,)).fetchall()
             if len(rows) > 4096:
                 raise ValueError("Run cleanup query exceeds item limit")
@@ -227,7 +228,7 @@ def load(c: sqlite3.Connection, run_id: str, field: str) -> dict[str, Any]:
         table = "run_abandonment_tickets" if ticket else "run_abandonment_prs"
         predicate, params = ("run_id=?", (run_id,)) if ticket else ("run_id=? AND container=?", (run_id, container))
         _bounds(c, table, ["presence", "nulls", *("value_" + key for key in _columns(child_schema))], predicate, params)
-        rows = c.execute("SELECT position,presence,nulls," + ",".join("value_" + key for key in _columns(child_schema))
+        rows = bounded_query(c, "SELECT position,presence,nulls," + ",".join("value_" + key for key in _columns(child_schema))
                          + f" FROM {table} WHERE {predicate} ORDER BY position LIMIT 4097", params).fetchall()
         if len(rows) > 4096 or any(item[0] != position for position, item in enumerate(rows)):
             raise ValueError("Invalid Run abandonment obligation positions")
