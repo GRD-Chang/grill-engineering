@@ -36,10 +36,17 @@ def _bounded_rows(
     """Prove byte size before fetching text in the caller's SQL snapshot."""
     byte_size = " + ".join(f"coalesce(length(CAST({column} AS BLOB)), 0)" for column in columns)
     remaining = MAX_CONTROL_BYTES
-    for (size,) in connection.execute(f"SELECT {byte_size} FROM {source} LIMIT ?", (*parameters, limit)):
+    sizes = connection.execute(f"SELECT {byte_size} FROM {source} LIMIT ?", (*parameters, limit))
+    found = False
+    for (size,) in sizes:
+        found = True
         remaining -= size
         if remaining < 0:
             raise ValueError("Control record exceeds its byte limit")
+    if not found:
+        # The exhausted cursor already proves this relation is empty in the
+        # caller's snapshot. No text projection or second SELECT is needed.
+        return sizes
     return connection.execute(f"SELECT {', '.join(columns)} FROM {source} LIMIT ?", (*parameters, limit))
 
 

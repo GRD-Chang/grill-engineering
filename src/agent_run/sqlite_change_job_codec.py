@@ -226,7 +226,7 @@ def _input_versions(c: sqlite3.Connection, run_id: str, field: str, record: Mapp
     return result
 
 
-def _check_record_size(c: sqlite3.Connection, run_id: str, job_id: str, field: str, columns: list[str]) -> None:
+def _check_record_size(c: sqlite3.Connection, run_id: str, job_id: str, field: str, columns: list[str]) -> bool:
     from agent_run.sqlite_change_job_budget import record_list_bytes
 
     lengths = "+".join(f"COALESCE(LENGTH(CAST(r.{name} AS BLOB)),0)+16" for name in ["presence", "nulls", *columns])
@@ -234,11 +234,14 @@ def _check_record_size(c: sqlite3.Connection, run_id: str, job_id: str, field: s
         "FROM work_job_record_strings s WHERE s.run_id=r.run_id AND s.job_id=r.job_id AND s.record_kind=?),0) "
         f"FROM {record_table(field)} r WHERE r.run_id=? AND r.job_id=?", (field, run_id, job_id),
     )
+    if size is None:
+        return False
     children = record_list_bytes(c, run_id, job_id, field) if any(
         kind in {"EVENTS", "ARTIFACTS"} for kind in RECORDS[field].values()
     ) else 0
-    if size is not None and (type(size[0]) is not int or size[0] + children > MAX_CURRENT_BYTES):
+    if type(size[0]) is not int or size[0] + children > MAX_CURRENT_BYTES:
         raise ValueError("Change Job record exceeds byte limit")
+    return True
 
 
 def save_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, value: Any, *, owner_id: str) -> None:
@@ -293,7 +296,8 @@ def load_record(c: sqlite3.Connection, run_id: str, job_id: str, field: str, *, 
     schema = RECORDS[field]
     columns = [column(path) for path, kind in schema.items() if kind not in {"STRINGS", "ARTIFACTS", "EVENTS"}]
     inputs = ",parent_version_id,graph_version_id" if field in INPUT_BOUND_RECORDS else ""
-    _check_record_size(c, run_id, job_id, field, columns + (["parent_version_id", "graph_version_id"] if inputs else []))
+    if not _check_record_size(c, run_id, job_id, field, columns + (["parent_version_id", "graph_version_id"] if inputs else [])):
+        return None
     row = bounded_query(c, f"SELECT presence,nulls,{','.join(columns)}{inputs} FROM {record_table(field)} WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()
     if row is None:
         return None

@@ -56,6 +56,7 @@ from agent_run.run_repair_delivery import RunRepairAdapter
 from agent_run.review_budget import TICKET_POLICY
 
 from support.seeding import write_fixture
+from support.ticket_scenarios import published_ticket
 
 from support.state import read_run, write_run_fixture
 from support.state import persist_run_fixture
@@ -3106,13 +3107,8 @@ def test_ticket_required_check_failure_uses_exact_head_repair_evidence(
 def test_ticket_required_check_head_drift_blocks_before_failed_evidence(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = LiveHeadDriftsBeforeFailedEvidencePublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = ["fail"]
     agents = CheckRepairAgents(checkout)
 
@@ -3127,7 +3123,8 @@ def test_ticket_required_check_head_drift_blocks_before_failed_evidence(
     assert "required_checks_evidence" not in job
     assert "ci_evidence" not in job
     assert publisher.failed_evidence_calls == 0
-    assert agents.development_thread_ids == [None]
+    assert agents.development_thread_ids == []
+    assert job["modification_attempts"] == state["active_ticket_job"]["modification_attempts"] == 1
     assert blocked["diagnostics"][0]["code"] == "published_head_mismatch"
 
 
@@ -3257,13 +3254,8 @@ def test_ticket_unknown_category_required_check_failure_reaches_development(
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = ["fail", "pass"]
     publisher.failed_check_evidence = {
         "pr_number": publisher.pr_number,
@@ -3279,12 +3271,16 @@ def test_ticket_unknown_category_required_check_failure_reaches_development(
     job = completed["active_ticket_job"]
     assert job["ci_recovery"]["developments_used"] == 1
     assert job["review_budget"]["development_attempts"] == 1
-    assert len(agents.development_requests) == 2
-    request = agents.development_requests[1]
+    assert len(agents.development_requests) == 1
+    assert job["modification_attempts"] == (
+        state["active_ticket_job"]["modification_attempts"] + len(agents.development_requests)
+    ) == 2
+    request = agents.development_requests[0]
     assert request["work_source"] == "ci"
     assert request["ci_evidence"]["checks"] == checks
     assert request["ci_evidence"]["head_sha"] == job["required_checks_origin"]["head_sha"]
-    assert agents.review_count == 1
+    assert agents.review_count == 0
+    assert job["validation_attempts"] == state["active_ticket_job"]["validation_attempts"] == 1
     assert "acceptance_record" not in job
 
 
@@ -3296,13 +3292,8 @@ def test_ticket_mixed_pending_required_checks_are_supervised(
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = ["fail"]
     original_snapshot = publisher.required_checks_snapshot
 
@@ -3327,7 +3318,8 @@ def test_ticket_mixed_pending_required_checks_are_supervised(
     assert job["phase"] == "waiting_checks"
     assert job["review_budget"]["development_attempts"] == 1
     assert job["review_budget"]["final_ci_fix_used"] is False
-    assert len(agents.development_requests) == 1
+    assert agents.development_requests == []
+    assert job["modification_attempts"] == state["active_ticket_job"]["modification_attempts"] == 1
     assert "next_attempt_kind" not in job
     assert completed["diagnostics"][0]["code"] == (
         "github_checks_observation_pending"
@@ -3367,13 +3359,8 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = ["fail"]
     publisher.failed_check_evidence = {
         **publisher.failed_check_evidence,
@@ -3404,7 +3391,8 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
     assert completed["status"] == "waiting_external"
     assert job["phase"] == "waiting_checks"
     assert job["review_budget"]["final_ci_fix_used"] is False
-    assert len(agents.development_requests) == 1
+    assert agents.development_requests == []
+    assert job["modification_attempts"] == state["active_ticket_job"]["modification_attempts"] == 1
     assert "next_attempt_kind" not in job
     assert completed["diagnostics"][0]["code"] == (
         "github_check_evidence_observation_pending"
@@ -3422,13 +3410,8 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
 def test_ticket_failed_required_check_evidence_read_is_supervised(
     git_repo: Path, error: BaseException
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = CheckEvidenceFailsOncePublisher(git_repo, error)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     agents = CheckRepairAgents(checkout)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
@@ -3444,13 +3427,16 @@ def test_ticket_failed_required_check_evidence_read_is_supervised(
     assert job["required_checks_evidence"]["result"] == "fail"
     assert job["phase"] == "waiting_checks"
     assert "ci_evidence" not in job
-    assert agents.development_thread_ids == [None]
+    assert agents.development_thread_ids == []
 
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["modification_attempts"] == 2
-    assert agents.development_thread_ids == [None, "development-thread-1"]
+    assert agents.development_thread_ids == ["development-thread-1"]
+    assert completed["active_ticket_job"]["modification_attempts"] == (
+        state["active_ticket_job"]["modification_attempts"] + len(agents.development_requests)
+    )
 
 
 def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> None:
@@ -3642,13 +3628,8 @@ def test_publication_replacement_thread_is_rejected(
 def test_required_checks_reject_live_base_sha_drift_before_progress(
     git_repo: Path, check_result: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = LiveBaseDriftPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = [check_result]
 
     result = TicketDeliveryEngine(
@@ -4225,14 +4206,10 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
                 run_id, state, baseline, ticket_number=ticket_number,
             )
 
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = SnapshotRecordingStateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = PassAgents(checkout)
     publisher = CheckReadFailsOncePublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher, states=states)
+    agents = PassAgents(checkout)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
         states=states,
@@ -4256,29 +4233,26 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
     ]
     assert "repair_source" not in job
     assert job["modification_attempts"] == 1
-    assert agents.development_thread_ids == [None]
-    assert agents.review_count == 1
-    assert len(agents.publication_requests) == 1
+    assert agents.development_thread_ids == []
+    assert agents.review_count == 0
+    assert agents.publication_requests == []
+    assert job["validation_attempts"] == state["active_ticket_job"]["validation_attempts"] == 1
+    assert job["publication_attempts"] == state["active_ticket_job"]["publication_attempts"] == 1
 
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["modification_attempts"] == 1
-    assert agents.development_thread_ids == [None]
-    assert agents.review_count == 1
+    assert agents.development_thread_ids == []
+    assert agents.review_count == 0
 
 
 def test_repeated_required_checks_reads_share_supervision_without_publication_retry(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = PassAgents(checkout)
     publisher = CheckReadFailsNTimesPublisher(git_repo, failures=5)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
+    agents = PassAgents(checkout)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     )
@@ -4297,7 +4271,7 @@ def test_repeated_required_checks_reads_share_supervision_without_publication_re
     assert completed["status"] == "ticket_completed"
     assert publisher.merged_sha is not None
     assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
-    assert len(agents.publication_requests) == 1
+    assert agents.publication_requests == []
     assert completed["active_ticket_job"]["publication_attempts"] == 1
     assert completed["active_ticket_job"]["review_budget"] == waiting_states[0][
         "active_ticket_job"
@@ -4307,14 +4281,9 @@ def test_repeated_required_checks_reads_share_supervision_without_publication_re
 def test_same_head_snapshot_timeout_preserves_observation_without_progress(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = PassAgents(checkout)
     publisher = SnapshotReadFailsAfterPendingPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
+    agents = PassAgents(checkout)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
         states=states,
@@ -4344,14 +4313,9 @@ def test_same_head_snapshot_timeout_preserves_observation_without_progress(
 def test_required_checks_snapshot_state_change_cannot_publish_as_pass(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = PassAgents(checkout)
     publisher = SnapshotChangesAfterInitialPassPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
+    agents = PassAgents(checkout)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
         states=states,
@@ -4384,15 +4348,10 @@ def test_required_checks_snapshot_state_change_cannot_publish_as_pass(
 def test_published_head_gate_fails_closed_on_required_checks_contradictions(
     git_repo: Path, result: str, checks: list[dict[str, str]]
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ContradictorySnapshotPublisher(
         git_repo, result=result, checks=checks
     )
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
 
     blocked = TicketDeliveryEngine(
         git=GitRepository(git_repo),
@@ -4410,13 +4369,8 @@ def test_published_head_gate_fails_closed_on_required_checks_contradictions(
 def test_active_ticket_authorization_is_checked_before_resume_mutation(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
     publisher.checks = ["pending", "pass"]
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),

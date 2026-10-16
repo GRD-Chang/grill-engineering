@@ -14,6 +14,7 @@ from support.resume import (
     _block_parent_for_human,
     _establish_ordinary_run_boundary,
     _fail_parent_run,
+    _prepare_terminal_resume_boundary,
     _resumed_parent_agents,
     _tree_snapshot,
 )
@@ -41,6 +42,7 @@ from support.cli_supervision import _interrupt_run, _parent_only_agents
 from support.seeding import write_fixture
 from support.cli import PROJECT_ROOT, issue, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_round_agents, passing_acceptance, ticket
+from support.inprocess_cli import invoke_cli_inprocess
 
 from support.state import only_run_ref, snapshot_run
 
@@ -536,7 +538,7 @@ def test_resume_cannot_recreate_control_from_terminal_receipt(
     boundary: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    _establish_ordinary_run_boundary(git_repo, fixture, boundary)
+    _prepare_terminal_resume_boundary(git_repo, fixture, boundary)
     state_before = load_only_run_state(git_repo)
     control_store = TaskControlStore(managed_state(git_repo))
     task = TaskKey(managed_repo(git_repo), "example/project", 1)
@@ -684,7 +686,8 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
     marker = git_repo / "unexpected-successor.txt"
     assert not marker.exists()
 
-    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    # 每种边界仍由上面的真实 CLI/Executor 流程产生；参数组合只验证
+    # 拒绝和只读事实，使用进程内 CLI，逐组核对同一快照。
     for run_arguments in (
         (),
         ("--development-model", "future-model", "--development-effort", "high"),
@@ -693,7 +696,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
         try:
             with monkeypatch.context() as argument_patch:
                 capsys.readouterr()
-                rejected = run_cli(
+                rejected = invoke_cli_inprocess(
                     git_repo,
                     fixture,
                     "run",
@@ -701,6 +704,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
                     *run_arguments,
                     "--agent-fixture",
                     str(unused_agents),
+                    "--json",
                 )
 
                 expected_return_code = (

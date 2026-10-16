@@ -3,34 +3,52 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 import pytest
-from support.workspace import managed_state
+from support.workspace import managed_repo, managed_state
 import agent_run.cli as cli_module
+from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_operator_stop
-from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.controller import Controller
+from agent_run.executor_host import _process_start_token
+from agent_run.git import GitRepository
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.publication_operation_retry import record_publication_operation_failure
+from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
+from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli_supervision import _parent_only_agents
 from support.cli_fixtures import run_agents
 from support.cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from support.cli_payloads import passing_acceptance, ticket
+from support.seeding import seed_run
 
 from support.state import include_in_state_snapshot
 from support.state import persist_run_fixture
 
 
-def _fail_parent_run(git_repo: Path, fixture: Path) -> None:
-    failed_agents = git_repo / "failed-agents.json"
-    failed_agents.write_text(
+def _parent_resume_agents(git_repo: Path, boundary: str) -> Path:
+    outcome: dict[str, object]
+    if boundary == "execution_failed":
+        filename = "failed-agents.json"
+        outcome = {"error_after_writes": "fixture process failed"}
+    elif boundary == "ready_for_human":
+        filename = "human-blocked-agents.json"
+        outcome = {"human_blockers": ["Maintainer approval is required."]}
+    else:
+        raise ValueError(f"unsupported Parent resume boundary: {boundary}")
+    agents = git_repo / filename
+    agents.write_text(
         json.dumps(
             {
                 "developments": [
                     {
                         "expected_thread_id": None,
                         "thread_id": "parent-development",
-                        "error_after_writes": "fixture process failed",
+                        **outcome,
                     }
                 ],
                 "publications": [],
@@ -39,13 +57,17 @@ def _fail_parent_run(git_repo: Path, fixture: Path) -> None:
         ),
         encoding="utf-8",
     )
+    return agents
+
+
+def _fail_parent_run(git_repo: Path, fixture: Path) -> None:
     blocked = run_cli(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
-        str(failed_agents),
+        str(_parent_resume_agents(git_repo, "execution_failed")),
     )
     assert blocked.returncode == 2, blocked.stderr
 
@@ -64,33 +86,87 @@ def _resumed_parent_agents(git_repo: Path) -> Path:
 
 
 def _block_parent_for_human(git_repo: Path, fixture: Path) -> None:
-    blocked_agents = git_repo / "human-blocked-agents.json"
-    blocked_agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-development",
-                        "human_blockers": ["Maintainer approval is required."],
-                    }
-                ],
-                "publications": [],
-                "reviews": [],
-            }
-        ),
-        encoding="utf-8",
-    )
     blocked = run_cli(
         git_repo,
         fixture,
         "run",
         "1",
         "--agent-fixture",
-        str(blocked_agents),
+        str(_parent_resume_agents(git_repo, "ready_for_human")),
     )
     assert blocked.returncode == 2, blocked.stderr
     assert load_only_run_state(git_repo)["status"] == "ready_for_human"
+
+
+def _prepare_terminal_resume_boundary(
+    git_repo: Path, fixture: Path, boundary: str,
+) -> None:
+    """为 Control 拒绝矩阵准备已退出的真实 Parent 工作与匹配回执。
+
+    只省去被测动作之前的 CLI/Executor 进程监督；Controller、Parent
+    Delivery、Git checkout、预算和 Control API 均真实执行。三种边界的
+    完整进程流程仍由 test_ordinary_run_preserves_explicit_authorization_boundaries
+    覆盖；本函数不缓存或复制其他用例的可变状态。
+    """
+    if boundary not in {"execution_failed", "ready_for_human", "operator_stopped"}:
+        raise ValueError(f"unsupported terminal resume boundary: {boundary}")
+    started = seed_run(git_repo, fixture)
+    assert started.returncode == 0, started.stderr
+    state = load_only_run_state(git_repo)
+    run_id = str(state["run_id"])
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
+    control = TaskControlStore(states.root)
+    task = TaskKey(git.root, str(state["repository"]), 1)
+    claim = control.claim_action(task, kind="run", payload={"parent": 1})
+    assert claim.action_id is not None and claim.action is not None
+    generation = control.begin_executor(
+        task, action_id=claim.action_id, run_id=run_id, runner_binding="0" * 16,
+    ).generation
+    control.bind_run(
+        task, claim.action_id, run_id, generation=generation, state_dir=states.root,
+    )
+    control.mark_handshake(
+        task, action_id=claim.action_id, generation=generation,
+        pid=os.getpid(), process_start_token=_process_start_token(os.getpid()),
+    )
+    prepare_action_application_receipt(state, claim.action)
+    persist_run_fixture(states, run_id, state)
+    control.record_application(
+        task, action_id=claim.action_id, run_id=run_id, generation=generation,
+        payload_digest=str(claim.action["payload_digest"]), state_dir=states.root,
+    )
+    agents = (
+        _parent_only_agents(git_repo / "initial-agents.json")
+        if boundary == "operator_stopped"
+        else _parent_resume_agents(git_repo, boundary)
+    )
+    engine = ParentDeliveryEngine(
+        git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+        agents=FixtureAgentBackend(agents),
+    )
+    if boundary == "execution_failed":
+        with pytest.raises(ValueError, match="fixture process failed") as failed:
+            engine.deliver(run_id)
+        assert Controller(FixtureGitHubReader(fixture), git, states).record_execution_failure(
+            run_id, str(failed.value),
+        )
+    else:
+        result = engine.deliver(run_id)
+        if boundary == "operator_stopped":
+            assert result["status"] == "parent_approval_pending"
+            current = states.load_current_run(run_id)
+            assert current is not None
+            record_operator_stop(
+                current, save=lambda stopped: persist_run_fixture(states, run_id, stopped),
+            )
+        else:
+            assert result["status"] == boundary
+    assert load_only_run_state(git_repo)["status"] == boundary
+    control.finish_executor(
+        task, action_id=claim.action_id, generation=generation, result_status=boundary,
+        failure="fixture process failed" if boundary == "execution_failed" else None,
+    )
 
 
 def _establish_ordinary_run_boundary(

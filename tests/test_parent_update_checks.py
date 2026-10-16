@@ -14,7 +14,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher
 from support.cli import load_only_run_state
 from support.cli_payloads import parent_publication, passing_acceptance
 from support.inprocess_cli import invoke_cli_inprocess
-from support.parent_approval_update import append_remote, ready_parent, update_agents
+from support.parent_approval_update import append_remote, ready_parent_for_rules, update_agents
 from support.workspace import managed_repo
 
 
@@ -22,7 +22,7 @@ from support.workspace import managed_repo
 def test_source_change_during_checks_reconciles_only_allowed_append(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, change: str,
 ) -> None:
-    fixture, before = ready_parent(git_repo)
+    fixture, before = ready_parent_for_rules(git_repo)
     append_remote(git_repo, fixture, "main", "target.txt", "target\n")
     agents = update_agents(git_repo)
     script = json.loads(agents.read_text())

@@ -13,7 +13,8 @@ from agent_run.runner_credentials import RunnerCredentialError
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
 from support.parent_approval_update import (
-    append_remote, control_record, paused_update, ready_parent, update_agents,
+    append_remote, control_record, paused_update, ready_parent,
+    ready_parent_for_rules, update_agents,
 )
 from support.workspace import managed_repo, managed_state
 
@@ -188,7 +189,7 @@ def test_another_target_append_during_update_reviews_the_latest_combination(
     from agent_run.agents import ReviewResult
     from support.cli_payloads import passing_acceptance
 
-    fixture, before = ready_parent(git_repo)
+    fixture, before = ready_parent_for_rules(git_repo)
     append_remote(git_repo, fixture, "main", "first.txt", "first update\n")
     agents = update_agents(git_repo)
     script = json.loads(agents.read_text())

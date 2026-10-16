@@ -124,12 +124,46 @@ def test_response_checks_large_string_keys_before_visiting_values() -> None:
         limits.check_response(state, max_bytes=64)
 
 
+@pytest.mark.parametrize("invalid, error", [
+    (float("nan"), ValueError),
+    (object(), TypeError),
+    ("\ud800", UnicodeEncodeError),
+])
+def test_response_reports_invalid_scalar_before_advancing_custom_iterator(
+    invalid: Any, error: type[Exception],
+) -> None:
+    class UnreadTail(dict[str, Any]):
+        def items(self) -> Any:
+            yield "prefix", ["", "汉😀", 17, -0.0, None, True]
+            yield "invalid", invalid
+            raise AssertionError("Response meter advanced past an invalid scalar")
+
+    with pytest.raises(error):
+        limits.check_response(UnreadTail(stored=None))
+
+
+def test_response_rejects_a_dense_scalar_prefix_before_visiting_an_invalid_tail() -> None:
+    prefix = ["", "汉😀", 17, -0.0, None, True] * 512
+    state = {"prefix": prefix, "invalid_tail": object()}
+    with pytest.raises(limits.QueryLimitError, match="response"):
+        limits.check_response(state, max_bytes=json_size({"prefix": prefix}) - 1)
+
+
+def test_response_checks_string_opening_quote_before_an_invalid_utf8_body() -> None:
+    prefix = len(b'{"invalid":')
+    with pytest.raises(limits.QueryLimitError, match="response"):
+        limits.check_response({"invalid": "\ud800"}, max_bytes=prefix)
+    with pytest.raises(UnicodeEncodeError):
+        limits.check_response({"invalid": "\ud800"}, max_bytes=prefix + 1)
+
+
 def test_response_native_blocks_and_peak_memory_stay_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = {
         "rows": [{"ordinal": index, "value": "\x00😀汉" * 32} for index in range(4096)],
         "body": "\x00😀汉" * 65_536,
+        "scalars": (["😀"] + [""] * 3000 + [None, True, 17, -0.0]) * 4,
     }
     expected = json_size(state)
     original_encode = json.JSONEncoder.encode

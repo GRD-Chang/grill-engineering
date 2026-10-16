@@ -31,6 +31,7 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.parent_scenarios import prepare_approval_ready_parent
 from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.published_run import (
     prepare_accepted_run, prepare_completed_run, prepare_published_run,
@@ -2548,29 +2549,7 @@ def test_parent_only_approve_routes_platform_failure_without_old_grant(
     fixture = write_fixture(
         git_repo / "github.json", issues={}, supervision_clock_multiplier=40,
     )
-    agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [passing_acceptance("parent-reviewer-1", "candidate passed")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     before_state = load_only_run_state(git_repo)
     before = before_state["parent_job"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -2618,31 +2597,8 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed")
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
     before_approval = load_only_run_state(git_repo)
     agents.write_text(
         json.dumps(
@@ -2716,31 +2672,7 @@ def test_parent_only_approve_updates_default_base_drift_before_merge(
     git_repo: Path, check_result: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed"),
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     before = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"].update(
@@ -2784,31 +2716,7 @@ def test_parent_only_approve_times_out_on_inconsistent_head_observation(
     fixture = write_fixture(
         git_repo / "github.json", issues={}, supervision_clock_multiplier=60,
     )
-    agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed")
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     before = load_only_run_state(git_repo)["parent_job"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
     # Only the PR observation changes; remote history has not been rewritten.
@@ -2854,31 +2762,7 @@ def test_parent_only_final_merge_rechecks_complete_pr_identity(
     git_repo: Path, identity_override: dict[str, str]
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed")
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["required_checks"] = ["pass"]
@@ -2918,31 +2802,9 @@ def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
         issues={},
         supervision_clock_multiplier=540,
     )
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance("parent-reviewer-1", "candidate passed")
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    agents.write_text(json.dumps({}), encoding="utf-8")
     before_state = load_only_run_state(git_repo)
     before = before_state["parent_job"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -3049,29 +2911,7 @@ def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-only-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [passing_acceptance("parent-reviewer-1", "candidate passed")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Clarified parent requirement."
     fixture.write_text(json.dumps(data), encoding="utf-8")

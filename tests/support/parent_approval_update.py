@@ -13,6 +13,7 @@ from typing import Any, Iterator
 from support.cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import parent_publication, passing_acceptance
 from support.cli_supervision import _interrupt_run, _parent_only_agents
+from support.parent_scenarios import prepare_approval_ready_parent
 from support.seeding import write_fixture
 from support.workspace import managed_repo, managed_state
 
@@ -24,12 +25,23 @@ def git_command(root: Path, *arguments: str) -> str:
 
 
 def ready_parent(repo: Path, *options: str) -> tuple[Path, dict[str, Any]]:
+    """真实 CLI run 前序，保留 Invocation、Executor 与 Action 历史保障。"""
     fixture = write_fixture(repo / "github.json", issues={})
     agents = _parent_only_agents(repo / "initial-agents.json")
     result = run_cli(repo, fixture, "run", "1", "--agent-fixture", str(agents), *options)
     assert result.returncode == 0, result.stdout + result.stderr
     assert stdout_json(result)["status"] == "parent_approval_pending"
     return fixture, load_only_run_state(repo)
+
+
+def ready_parent_for_rules(repo: Path) -> tuple[Path, dict[str, Any]]:
+    """规则测试的合法审批起点；预算是历史累计事实，无虚构调用历史。
+
+    返回同一 fixture 与其真实持久状态，后续审批、更新、通知及检查照常执行。
+    涉及 Invocation / Executor 历史的用例继续调用 ready_parent。
+    """
+    fixture = write_fixture(repo / "github.json", issues={})
+    return fixture, prepare_approval_ready_parent(repo, fixture)
 
 
 def append_remote(

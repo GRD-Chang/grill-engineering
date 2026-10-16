@@ -15,6 +15,7 @@ import pytest
 
 from support.workspace import managed_state
 from support.inprocess_cli import invoke_cli_inprocess
+from support.notification_scenarios import prepare_blocked_run_acceptance
 
 from agent_run.notification_cards import card
 from agent_run.notification_events import events, recovery_events
@@ -291,7 +292,9 @@ raise SystemExit(main(sys.argv[1:]))
     }
     runs_before = snapshot_runs(state_root)
     for command in ("status", "history"):
-        queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
+        # 查询组合消费同一份真实交付事实；完整 CLI/Executor 与发送进程边界
+        # 由本用例的 run/approve 保留，辅助查询无需再启动解释器。
+        queried = invoke_cli_inprocess(git_repo, fixture, command, output["run_id"], "--json")
         assert queried.returncode == 0, queried.stderr
         assert "notifications" in stdout_json(queried)
         if command == "history" and scope == "ticket" and drain:
@@ -375,8 +378,9 @@ raise SystemExit(main(sys.argv[1:]))
 def test_cli_blocked_acceptance_resume_projects_same_round(
     git_repo: Path, scope: str,
 ) -> None:
-    # Each scope owns a different persisted blocked-result path, so all three
-    # need a real run/resume boundary. Notification rendering stays in process.
+    # 三类实际 Reviewer 的 blocked/resume 路径全部保留。Run 范围只需
+    # 已完成 Ticket 的合法起点；其 Reviewer 与后续 CLI resume 均真实执行，
+    # Ticket/Parent-only 范围继续保留完整 CLI run/resume。
     fixture = write_fixture(git_repo / "github.json", issues={} if scope == "parent" else {"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text())
@@ -388,9 +392,12 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
         status="blocked", evidence="External test account unavailable; restore access.", findings=[],
     )
     agents.write_text(json.dumps(data))
-    blocked = run_cli(git_repo, fixture, "run", "1", "--notification-mode", "detailed", "--agent-fixture", str(agents))
-    assert blocked.returncode == 2, blocked.stdout + blocked.stderr
-    state = load_only_run_state(git_repo)
+    if scope == "run":
+        fixture, state = prepare_blocked_run_acceptance(git_repo, agents)
+    else:
+        blocked = run_cli(git_repo, fixture, "run", "1", "--notification-mode", "detailed", "--agent-fixture", str(agents))
+        assert blocked.returncode == 2, blocked.stdout + blocked.stderr
+        state = load_only_run_state(git_repo)
     assert state["status"] == "ready_for_human"
     expected_number = 3 if scope == "ticket" else 1
     expected_title = state["ticket_graph"]["tickets"]["3"]["title"] if scope == "ticket" else state["parent"]["title"]

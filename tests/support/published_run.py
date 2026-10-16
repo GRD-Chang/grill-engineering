@@ -6,12 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agent_run.agent_profiles import AgentProfileStore
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.managed_workspace import ManagedWorkspace
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from support.seeding import seed_idle_control, seed_run
+from support.seeding import seed_idle_control
 from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.run_publication import InvocationRunPublicationAgents
 
@@ -25,7 +28,7 @@ def prepare_completed_run(
         workspace.repository_root, ticket_number=ticket_number,
         state_root=workspace.state_root,
     )
-    return _register_historical_run(repo, state, ticket_number, delivery)
+    return _register_historical_run(workspace, state, ticket_number, delivery)
 
 
 def prepare_accepted_run(
@@ -41,15 +44,26 @@ def prepare_accepted_run(
         workspace.repository_root, ticket_number=ticket_number,
         state_root=workspace.state_root,
     )
-    return _register_historical_run(repo, state, ticket_number, delivery)
+    return _register_historical_run(workspace, state, ticket_number, delivery)
 
 
 def _register_historical_run(
-    repo: Path, state: dict[str, Any], ticket_number: int,
+    workspace: ManagedWorkspace, state: dict[str, Any], ticket_number: int,
     delivery: dict[str, Any] | None,
 ) -> tuple[Path, dict[str, Any]]:
     """登记同一历史 Ticket PR、Locator 和 idle ownership，不推进被测动作。"""
-    fixture = managed_repo(repo) / "github.json"
+    git = workspace.open()
+    run_id = str(state["run_id"])
+    states = StateStore(workspace.state_root)
+    complete = states.load_current_run(run_id)
+    assert complete is not None
+    assert complete == state
+    assert complete["repository"].lower() == workspace.repository
+    assert complete["checkout_identity"] == git.checkout_identity()
+    # Controller.start in the historical scenario already initialized this
+    # profile. Registration must preserve that configuration and Run state.
+    assert AgentProfileStore(workspace.state_root).load(run_id) is not None
+    fixture = workspace.repository_root / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data.setdefault("delivery", {}).update(delivery or {})
     data["delivery"]["closed_issues"] = [ticket_number]
@@ -70,15 +84,20 @@ def _register_historical_run(
     })
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    registered = seed_run(repo, fixture)
-    assert registered.returncode == 0, registered.stderr
-    seed_idle_control(
-        TaskControlStore(managed_state(repo)),
-        TaskKey(managed_repo(repo), str(state["repository"]), 1),
-        str(state["run_id"]),
-        state_dir=managed_state(repo),
+    RunLocatorIndex.default().register(
+        run_id=run_id, repository_root=workspace.repository_root,
+        state_dir=workspace.state_root, repository=str(complete["repository"]),
+        parent_number=int(complete["parent"]["number"]),
     )
-    return fixture, state
+    seed_idle_control(
+        TaskControlStore(workspace.state_root),
+        TaskKey(
+            workspace.repository_root, str(complete["repository"]),
+            int(complete["parent"]["number"]),
+        ),
+        run_id, state_dir=workspace.state_root,
+    )
+    return fixture, complete
 
 
 def prepare_published_run(

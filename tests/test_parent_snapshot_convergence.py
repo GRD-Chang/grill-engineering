@@ -14,7 +14,9 @@ from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher
 from support.cli import load_only_run_state, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
-from support.parent_approval_update import append_remote, git_command, ready_parent, update_agents
+from support.parent_approval_update import (
+    append_remote, git_command, ready_parent, ready_parent_for_rules, update_agents,
+)
 from support.workspace import managed_repo
 
 
@@ -22,7 +24,7 @@ from support.workspace import managed_repo
 def test_approve_rereads_a_parent_snapshot_split_by_remote_append(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, moving_ref: str,
 ) -> None:
-    fixture, before = ready_parent(git_repo)
+    fixture, before = ready_parent_for_rules(git_repo)
     target = append_remote(git_repo, fixture, "main", "first.txt", "first advance\n")
     agents = update_agents(git_repo)
     observed: list[str] = []

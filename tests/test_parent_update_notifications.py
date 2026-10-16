@@ -16,7 +16,7 @@ from agent_run.notifications import read_notifications
 from agent_run.state import StateStore
 from support.cli import load_only_run_state, stdout_json
 from support.inprocess_cli import invoke_cli_inprocess
-from support.parent_approval_update import append_remote, ready_parent, update_agents
+from support.parent_approval_update import append_remote, ready_parent_for_rules, update_agents
 from support.workspace import managed_state
 from support.state import persist_run_fixture
 
@@ -26,7 +26,7 @@ from support.state import persist_run_fixture
 def test_update_notification_precedes_git_and_failed_delivery_does_not_block(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, mode: str, language: str,
 ) -> None:
-    fixture, before = ready_parent(git_repo)
+    fixture, before = ready_parent_for_rules(git_repo)
     root = managed_state(git_repo)
     states = StateStore(root)
     before["language"] = language
