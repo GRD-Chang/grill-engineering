@@ -17,7 +17,10 @@ from agent_run import sqlite_change_jobs as jobs
 from agent_run import sqlite_work_execution as execution
 from agent_run import sqlite_work_evidence as evidence
 from agent_run import sqlite_run_records as roots
+from agent_run.sqlite_change_job_queries import _ARCHIVES, _HISTORIES, _projection_owners
+from agent_run.sqlite_encoding import object_path
 from agent_run.sqlite_query_rows import bounded_query
+from agent_run.work_projection import JobHistoryAppend, JobProjection, RepairBudgetProjection
 
 
 INVOCATION_FIELDS = frozenset(
@@ -28,6 +31,10 @@ INVOCATION_FIELDS = frozenset(
     }
 )
 FIELDS = frozenset(jobs.FIELDS) | INVOCATION_FIELDS | roots.FIELDS
+CURRENT_FIELDS = FIELDS - frozenset(_ARCHIVES)
+KEYED_FIELDS = frozenset(
+    {"ticket_jobs", "ticket_agent_invocations", "retired_ticket_generations", "pending_ticket_retirements"}
+)
 TABLES = {**evidence.TABLES, **jobs.TABLES, **execution.TABLES, **roots.TABLES}
 INDEXES = {**evidence.INDEXES, **jobs.INDEXES, **execution.INDEXES, **roots.INDEXES}
 
@@ -37,6 +44,92 @@ class WorkBaseline:
     run_id: str
     baseline: dict[str, Any]
     total_changes: int
+    # Only object reads declare coverage. Other work/Timeline baselines keep
+    # their existing purpose and cannot stand in for an object save query.
+    fields: frozenset[str] = frozenset()
+    partial_fields: frozenset[str] = frozenset()
+    connection: sqlite3.Connection | None = None
+
+
+def read_baseline_for_save(
+    connection: sqlite3.Connection,
+    run_id: str,
+    state: Mapping[str, Any],
+    fields: set[str],
+    keyed_changes: Mapping[str, set[str]] | None,
+    archive_scope: Mapping[str, tuple[int, int]] | None,
+    view: WorkBaseline | None,
+) -> dict[str, Any] | None:
+    """Reuse facts only when this write snapshot covers the original query."""
+    needed = fields | (set(INVOCATION_FIELDS) if fields & INVOCATION_FIELDS else set())
+    if (not isinstance(view, WorkBaseline) or view.connection is not connection or view.run_id != run_id
+            or view.total_changes != connection.total_changes or not needed <= view.fields):
+        return None
+    numbers = {
+        number for field in ("ticket_jobs", "ticket_agent_invocations")
+        for number in (keyed_changes or {}).get(field, set())
+    }
+    result = {field: view.baseline[field] for field in needed if field in view.baseline}
+    for field in needed & KEYED_FIELDS:
+        selected = (
+            numbers or None if field in {"ticket_jobs", "ticket_agent_invocations"}
+            else (keyed_changes or {}).get(field)
+        )
+        values = result.get(field, {})
+        if not isinstance(values, Mapping):
+            return None
+        if field in view.partial_fields and (selected is None or not selected <= values.keys()):
+            return None
+        if selected is not None and field in result:
+            result[field] = {key: value for key, value in values.items() if key in selected}
+    if fields & INVOCATION_FIELDS:
+        if not _resume_ids(state) <= _resume_ids(view.baseline):
+            return None
+        from agent_run.sqlite_work_execution_invocations import invocation_identity
+
+        current = [result.get("active_agent_invocation"), *result.get("ticket_agent_invocations", {}).values()]
+        identities = {invocation_identity(item) for item in current if isinstance(item, Mapping)}
+        if "agent_invocation_history" in result:
+            resumes = _resume_ids(state)
+            result["agent_invocation_history"] = [
+                item for item in result["agent_invocation_history"]
+                if invocation_identity(item) in identities or item.get("resume_id") in resumes
+            ]
+    if fields & jobs.FIELDS:
+        if archive_scope is None:
+            return None
+        expected = jobs.projection_archives(result)
+        actual = {}
+        for key, value in archive_scope.items():
+            path = object_path(key)
+            if path[0] in fields and (path[0] != "ticket_jobs" or not numbers or path[1] in numbers):
+                actual[key] = value
+        if expected != actual:
+            return None
+        proposed = {field: state[field] for field in fields & jobs.FIELDS if field in state}
+        if numbers and "ticket_jobs" in proposed:
+            if not isinstance(proposed["ticket_jobs"], Mapping):
+                return None
+            proposed["ticket_jobs"] = {key: value for key, value in proposed["ticket_jobs"].items() if key in numbers}
+        if jobs.projection_repair_budget_scopes(result) != jobs.projection_repair_budget_scopes(proposed):
+            return None
+        previous = {path: job for path, job, _ in _projection_owners(result)}
+        for path, job, _ in _projection_owners(proposed):
+            before = previous.get(path)
+            if any(not isinstance(job[field], JobHistoryAppend)
+                   for field in (_HISTORIES & job.keys()) - (before or {}).keys()):
+                return None
+            budgets = (before or {}).get("repair_integration_budgets")
+            if (isinstance(budgets, RepairBudgetProjection)
+                    and not job.get("repair_integration_budgets", {}).keys() <= budgets.keys()):
+                return None
+            if isinstance(job, JobProjection) and job.publication_update is not None:
+                from agent_run.sqlite_mutations import _same
+
+                if (not isinstance(before, JobProjection) or before.publication_update is None
+                        or not _same(before.publication_update[0], job.publication_update[0])):
+                    return None
+    return result
 
 
 def without_work(state: Mapping[str, Any]) -> dict[str, Any]:

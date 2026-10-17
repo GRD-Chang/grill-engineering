@@ -18,6 +18,8 @@
 | repairing Run 起点 | `repairing_run` | 调用方显式提供 repair trigger；复制 policy/request，以显式 fixture 设置已有场景；Candidate 和 currentness 由被测 Engine 执行 |
 | CLI 所需 completed/accepted/published Run | `published_run` | 在场景上登记真实 Workspace/Locator/idle ownership；保留历史 Ticket PR 身份，避免 Final PR 复用编号；completed 起点不预先执行 Run Acceptance |
 | Ticket 首次 Required Checks | `ticket_scenarios` | 真实 Candidate/Publication、审核授权与 SQLite；尚未建 PR 或首次读 checks，后续由 Engine 推进，不伪造调用历史 |
+| CLI 已审核、尚未 Publication 的 Ticket | `accepted_ticket` | 仅单票 #2/#3；真实 Workspace/Profile/Locator/idle ownership 及开发入口的 base refs；Candidate 尚未发布，Publication、故障和恢复仍由真实 CLI 执行 |
+| Parent/Ticket/Final Run 的展示结果 | `cli_delivery_display` | 真实 Git、PR 与对象保存；展示入口持久化 intent 后调用外部展示，逐组合重开核对并验证不重复执行 |
 | Parent-only 审批规则 | `parent_scenarios` | 真实 Git、审核身份、PR 与 idle ownership；历史额度不冒充真实 Invocation，不用于依赖 Publication Attempt 的故障对账 |
 | Run 受阻审核通知 | `notification_scenarios` | 从已完成 Ticket 起点执行真实 Reviewer、Profile、通知查询及 observer；关闭本次 sender，后续恢复仍走 CLI |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
@@ -44,8 +46,11 @@ PR merge identity 与 Run ref 对齐；`_accepted_run` 在这个基础上运行�
 
 Ticket/Parent 的审批与 checks 场景只准备明确的历史事实，不补造 Invocation 或
 Semantic Attempt。`test_ticket_scenarios.py`、`test_parent_scenarios.py` 核对落盘状态、
-真实 parents/tree/ref、currentness 及首次 checks；关闭响应丢失等依赖已完成
-Publication Attempt 的场景保留完整前序。`test_published_run_scenarios.py` 另核对
+真实 parents/tree/ref、currentness 及首次 checks。`test_accepted_ticket_scenarios.py`
+另核对未发布 Candidate、准确需求、base refs 和 Thread/Profile 归属；该前置
+不生成 Invocation 或 Semantic Attempt。关闭响应丢失等依赖已完成 Publication
+Attempt 的场景仍执行真实 Publication 前序及恢复，不能以历史累计数替代。
+`test_published_run_scenarios.py` 另核对
 Locator、Profile 版本、idle ownership 和跨目录公开查询的准确身份及只读边界。
 `resume._prepare_terminal_resume_boundary` 通过真实 Engine 与 Control API 准备终止现场，
 仅供缺失/损坏 Control 的拒绝矩阵使用；各类公开运行/恢复边界继续保留真实进程代表。

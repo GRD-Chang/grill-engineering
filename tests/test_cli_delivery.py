@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.change_delivery_branches import ensure_linked_branch_display
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run.git import GitRepository
 from agent_run.semantic_attempt import canonical_fingerprint
@@ -32,6 +33,7 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.parent_scenarios import prepare_approval_ready_parent
+from support.cli_delivery_display import DisplayScope, prepare_display_boundary
 from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.published_run import (
     prepare_accepted_run, prepare_completed_run, prepare_published_run,
@@ -1865,13 +1867,100 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
     assert job["phase"] == "ready_for_approval"
 
 
+@pytest.mark.parametrize("scope", ["parent_only", "ticket", "final_run"])
 @pytest.mark.parametrize(
-    ("display_outcome", "expected_display_status"),
+    ("outcome", "expected_status"),
     [
         ("linked", "linked"),
         ("api_error", "unavailable"),
         ("empty", "unavailable"),
         ("missing_readback", "unavailable"),
+    ],
+)
+def test_linked_branch_display_results_persist_exactly_once(
+    git_repo: Path, scope: DisplayScope, outcome: str, expected_status: str,
+) -> None:
+    # 三种完整交付代表继续覆盖接线、Agent、merge、批准与清理；展示结果
+    # 的所有组合直接验证它们共用的生产入口，不重复无关的完整工作循环。
+    boundary = prepare_display_boundary(git_repo, scope=scope, outcome=outcome)
+    state = boundary.state
+    run_id = str(state["run_id"])
+    job = boundary.job(state)
+    before = StateStore(boundary.states.root).load_current_run(run_id)
+    assert before is not None
+    before_job = json.loads(json.dumps(boundary.job(before)))
+    assert "linked_branch_display" not in job
+    github = boundary.github
+    live = github.live_pull_request(job["pr_number"])
+    assert live["state"] == "OPEN"
+    assert live["head_branch"] == boundary.branch
+    assert live["head_sha"] == boundary.head_sha
+    assert live["head_repository"] == live["base_repository"] == state["repository"]
+    assert github.git.resolve(boundary.branch) == boundary.head_sha
+    before_delivery = json.loads(boundary.fixture.read_text(encoding="utf-8"))["delivery"]
+    before_config = subprocess.run(
+        ["git", "config", "--local", "--list"], cwd=github.git.root,
+        text=True, capture_output=True, check=True,
+    ).stdout
+
+    ensure_linked_branch_display(
+        github=github, state=state, job=job,
+        issue_number=boundary.issue_number, branch=boundary.branch,
+        head_sha=boundary.head_sha, save=boundary.save,
+    )
+
+    assert len(github.before_display) == 1
+    assert boundary.job(github.before_display[0])["linked_branch_display"] == {
+        "display_attempted": True, "status": "indeterminate",
+    }
+    assert {
+        key: value for key, value in boundary.job(github.before_display[0]).items()
+        if key != "linked_branch_display"
+    } == before_job
+    reopened = StateStore(boundary.states.root)
+    persisted = reopened.load_current_run(run_id)
+    assert persisted is not None
+    persisted_job = boundary.job(persisted)
+    assert persisted_job["linked_branch_display"] == {
+        "display_attempted": True, "status": expected_status,
+    }
+    assert {
+        key: value for key, value in persisted_job.items() if key != "linked_branch_display"
+    } == before_job
+    delivery = json.loads(boundary.fixture.read_text(encoding="utf-8"))["delivery"]
+    assert delivery["linked_branch_display_attempts"] == [{
+        "issue_number": boundary.issue_number,
+        "branch": boundary.branch,
+        "head_sha": boundary.head_sha,
+    }]
+    assert delivery["linked_branches"] == (
+        {str(boundary.issue_number): boundary.branch} if expected_status == "linked" else {}
+    )
+    for field in ("pull_requests", "published_branches", "mutations", "closed_issues"):
+        assert delivery[field] == before_delivery[field]
+    after_config = subprocess.run(
+        ["git", "config", "--local", "--list"], cwd=github.git.root,
+        text=True, capture_output=True, check=True,
+    ).stdout
+    assert after_config == before_config
+
+    # 重开 SQLite 与外部客户端后仍不得再次请求可选 mutation。
+    fixture_after_display = boundary.fixture.read_bytes()
+    ensure_linked_branch_display(
+        github=FixtureGitHubPublisher(boundary.fixture, github.git),
+        state=persisted, job=persisted_job,
+        issue_number=boundary.issue_number, branch=boundary.branch,
+        head_sha=boundary.head_sha, save=boundary.save,
+    )
+    assert boundary.fixture.read_bytes() == fixture_after_display
+    assert reopened.load_current_run(run_id) == persisted
+
+
+@pytest.mark.parametrize(
+    ("display_outcome", "expected_display_status"),
+    [
+        ("linked", "linked"),
+        ("api_error", "unavailable"),
     ],
 )
 def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
@@ -3191,26 +3280,9 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [{
-                    "expected_thread_id": None,
-                    "thread_id": "parent-developer",
-                    "summary": "Parent implementation.",
-                    "write_files": {"parent-feature.txt": "old\n"},
-                }],
-                "publications": [parent_publication()],
-                "reviews": [passing_acceptance("parent-reviewer", "Parent pass.")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    assert stdout_json(
-        run_internal_stage(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
-    )["status"] == "parent_approval_pending"
+    prepared = prepare_approval_ready_parent(git_repo, fixture)
+    run_id = str(prepared["run_id"])
+    assert prepared["status"] == "parent_approval_pending"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Changed parent requirement."
     fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -3340,40 +3412,14 @@ def test_child_addition_cannot_continue_parent_only_delivery(
 
 def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
+    prepared = prepare_approval_ready_parent(git_repo, fixture)
+    run_id = str(prepared["run_id"])
+    assert prepared["status"] == "parent_approval_pending"
     agents = git_repo / "parent-only-agents.json"
     agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-1",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance(
-                        "parent-reviewer-1",
-                        "parent-feature.txt is present in the candidate.",
-                    )
-                ],
-            }
-        ),
+        json.dumps({"developments": [], "publications": [], "reviews": []}),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(agents),
-    )
-    assert delivered.returncode == 0, delivered.stderr
-    assert stdout_json(delivered)["status"] == "parent_approval_pending"
     before_drift = json.loads(fixture.read_text(encoding="utf-8"))
     assert before_drift["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
@@ -3471,39 +3517,7 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-only-dirty-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "parent-developer-dirty",
-                        "summary": "Implemented the standalone parent request.",
-                        "write_files": {"parent-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [parent_publication()],
-                "reviews": [
-                    passing_acceptance(
-                        "parent-reviewer-dirty",
-                        "parent-feature.txt is present in the candidate.",
-                    )
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    delivered = run_internal_stage(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(agents),
-    )
-    assert delivered.returncode == 0, delivered.stderr
+    run_id = str(prepare_approval_ready_parent(git_repo, fixture)["run_id"])
     checkout = managed_state(git_repo) / "worktrees" / run_id / "parent"
     current = load_only_run_state(git_repo)
     GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(
@@ -3556,9 +3570,6 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
     ("display_outcome", "expected_status"),
     [
         ("linked", "linked"),
-        ("api_error", "unavailable"),
-        ("empty", "unavailable"),
-        ("missing_readback", "unavailable"),
     ],
 )
 def test_scripted_cli_delivers_active_ticket_end_to_end(
@@ -3779,9 +3790,6 @@ def test_forward_candidate_repair_removes_prior_out_of_scope_file(
     ("display_outcome", "expected_status"),
     [
         ("linked", "linked"),
-        ("api_error", "unavailable"),
-        ("empty", "unavailable"),
-        ("missing_readback", "unavailable"),
     ],
 )
 def test_run_cli_records_one_final_parent_linked_branch_display(

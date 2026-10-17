@@ -2474,87 +2474,103 @@ def _seed_read_only_executor_run(
     return query_fixture, run_id
 
 
-@pytest.mark.parametrize(
-    ("control_case", "reason"),
-    [
-        ("missing", "task_control_missing"),
-        ("corrupt", "task_control_invalid"),
-        ("inconsistent", "task_control_invalid"),
-        ("inconsistent_generation", "task_control_invalid"),
-    ],
-)
 def test_status_and_history_mark_unavailable_task_control_unknown_without_writes(
-    git_repo: Path, tmp_path: Path, control_case: str, reason: str
+    git_repo: Path, tmp_path: Path, subtests: pytest.Subtests,
 ) -> None:
     environment = _isolated_environment(tmp_path / "read-only-corrupt-control")
     fixture, run_id = _seed_read_only_executor_run(git_repo, environment)
     control, task = only_control(managed_state(git_repo, extra_env=environment))
-    if control_case == "missing":
-        delete_control_fixture(control, task)
-    elif control_case == "corrupt":
-        record = control.load(task)
-        assert record is not None
-        record["action"]["failure"] = "Bearer secret-token"
-        persist_control_fixture(control, task, record)
-        corrupt_control_fixture(control, task)
-    else:
-        record = control.load(task)
-        assert record is not None
-        if control_case == "inconsistent":
-            record["run_id"] = "run-other"
-            record["action"]["run_id"] = "run-other"
-            record["executor"]["run_id"] = "run-other"
-        else:
-            record["action"]["executor_generation"] += 1
-            record["executor"]["generation"] += 1
-            record["next_generation"] += 1
-        persist_control_fixture(control, task, record)
-    control_before = raw_control_snapshot(control, task)
+    control_baseline = snapshot_control(control, task)
     run_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
     run_before = snapshot_run(run_ref)
     persistent_roots = [git_repo, Path(environment["XDG_STATE_HOME"])]
-    before = {str(root): _file_snapshot(root) for root in persistent_roots}
 
-    for command in ("status", "history"):
-        machine = run_cli(
-            git_repo,
-            fixture,
-            command,
-            str(run_id),
-            "--json",
-            extra_env=environment,
-        )
-        assert machine.returncode == 0, f"{machine.stdout}\n{machine.stderr}"
-        machine_output = stdout_json(machine)
-        executor_control = machine_output["executor_control"]
-        assert executor_control == {
-            "activity": "unknown",
-            "reason": reason,
-        }
-        current_agent = machine_output.get("progress", {}).get("current_agent")
-        if current_agent is not None:
-            assert current_agent["is_active"] is False
-        serialized = json.dumps(machine_output, ensure_ascii=False)
-        assert "binding_token" not in serialized
-        assert "process_start_token" not in serialized
-        human = run_cli(
-            git_repo,
-            fixture,
-            command,
-            str(run_id),
-            extra_env=environment,
-        )
-        assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
-        assert "Agent 活跃状态: 无法确认" in human.stdout
-        assert "secret-token" not in human.stdout
-        assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
-        assert raw_control_snapshot(control, task) == control_before
-        assert snapshot_run(run_ref) == run_before
+    # 只有查询被测；每个分支从不可变基线恢复 Control，再注入自己的故障。
+    # 准备写入先于只读快照，上一分支即使失败也不能成为下一分支的前置。
+    for control_case, reason in (
+        ("missing", "task_control_missing"),
+        ("corrupt", "task_control_invalid"),
+        ("inconsistent", "task_control_invalid"),
+        ("inconsistent_generation", "task_control_invalid"),
+    ):
+        with subtests.test(control_case=control_case):
+            record = json.loads(control_baseline)
+            assert record is not None
+            if control_case == "corrupt":
+                record["action"]["failure"] = "Bearer secret-token"
+            elif control_case == "inconsistent":
+                record["run_id"] = "run-other"
+                record["action"]["run_id"] = "run-other"
+                record["executor"]["run_id"] = "run-other"
+            elif control_case == "inconsistent_generation":
+                record["action"]["executor_generation"] += 1
+                record["executor"]["generation"] += 1
+                record["next_generation"] += 1
+            persist_control_fixture(control, task, record)
+            if control_case == "missing":
+                delete_control_fixture(control, task)
+            elif control_case == "corrupt":
+                corrupt_control_fixture(control, task)
+            control_before = raw_control_snapshot(control, task)
+            before = {str(root): _file_snapshot(root) for root in persistent_roots}
+
+            for command in ("status", "history"):
+                machine = run_cli(
+                    git_repo,
+                    fixture,
+                    command,
+                    str(run_id),
+                    "--json",
+                    extra_env=environment,
+                )
+                assert machine.returncode == 0, f"{machine.stdout}\n{machine.stderr}"
+                machine_output = stdout_json(machine)
+                executor_control = machine_output["executor_control"]
+                assert executor_control == {
+                    "activity": "unknown",
+                    "reason": reason,
+                }
+                current_agent = machine_output.get("progress", {}).get("current_agent")
+                if current_agent is not None:
+                    assert current_agent["is_active"] is False
+                serialized = json.dumps(machine_output, ensure_ascii=False)
+                assert "binding_token" not in serialized
+                assert "process_start_token" not in serialized
+                human = run_cli(
+                    git_repo,
+                    fixture,
+                    command,
+                    str(run_id),
+                    extra_env=environment,
+                )
+                assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
+                assert "Agent 活跃状态: 无法确认" in human.stdout
+                assert "secret-token" not in human.stdout
+                assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
+                assert raw_control_snapshot(control, task) == control_before
+                assert snapshot_run(run_ref) == run_before
 
 
-@pytest.mark.parametrize(
-    ("host_status", "expected_activity"),
-    [
+def test_status_and_history_project_only_read_only_host_proof(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    subtests: pytest.Subtests,
+) -> None:
+    environment = _isolated_environment(tmp_path / "projection")
+    _, run_id = _seed_read_only_executor_run(git_repo, environment)
+    control, task = only_control(managed_state(git_repo, extra_env=environment))
+    control_baseline = snapshot_control(control, task)
+    run_ref = only_run_ref(managed_state(git_repo, extra_env=environment))
+    run_before = snapshot_run(run_ref)
+    monkeypatch.chdir(git_repo)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    persistent_roots = [git_repo, Path(environment["XDG_STATE_HOME"])]
+
+    # 共用静止的合法 Run，每种 Host 证据拥有独立的 Control 输入和调用计数。
+    for host_status, expected_activity in (
         ("running", "running"),
         ("absent", "not_running"),
         ("exited", "not_running"),
@@ -2565,72 +2581,60 @@ def test_status_and_history_mark_unavailable_task_control_unknown_without_writes
         ("control_starting_host_running", "unknown"),
         ("running_without_handshake", "unknown"),
         ("running_pid_conflict", "unknown"),
-    ],
-)
-def test_status_and_history_project_only_read_only_host_proof(
-    git_repo: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    host_status: str,
-    expected_activity: str,
-) -> None:
-    environment = _isolated_environment(tmp_path / f"projection-{host_status}")
-    _, run_id = _seed_read_only_executor_run(git_repo, environment)
-    control, task = only_control(managed_state(git_repo, extra_env=environment))
-    record = control.load(task)
-    assert record is not None
-    record["executor"]["status"] = (
-        "starting" if host_status == "control_starting_host_running" else "running"
-    )
-    record["executor"]["pid"] = 456 if host_status == "running_pid_conflict" else 123
-    if host_status == "running_without_handshake":
-        record["executor"]["handshake_at"] = None
-    persist_control_fixture(control, task, record)
+    ):
+        with subtests.test(host_status=host_status):
+            record = json.loads(control_baseline)
+            assert record is not None
+            record["executor"]["status"] = (
+                "starting" if host_status == "control_starting_host_running" else "running"
+            )
+            record["executor"]["pid"] = 456 if host_status == "running_pid_conflict" else 123
+            if host_status == "running_without_handshake":
+                record["executor"]["handshake_at"] = None
+            persist_control_fixture(control, task, record)
+            observe_calls = 0
 
-    observe_calls = 0
+            def observe(
+                spec: ExecutorSpec,
+                store: TaskControlStore,
+                **_kwargs: object,
+            ) -> HostObservation:
+                nonlocal observe_calls
+                del store
+                observe_calls += 1
+                if host_status == "unavailable":
+                    raise OSError("systemd unavailable")
+                observed_status = (
+                    "running"
+                    if host_status
+                    in {
+                        "control_starting_host_running",
+                        "running_without_handshake",
+                        "running_pid_conflict",
+                    }
+                    else host_status
+                )
+                return HostObservation(
+                    observed_status,  # type: ignore[arg-type]
+                    None if observed_status == "absent" else spec.generation,
+                    123 if observed_status == "running" else None,
+                    observed_status == "running",
+                )
 
-    def observe(
-        spec: ExecutorSpec,
-        store: TaskControlStore,
-        **_kwargs: object,
-    ) -> HostObservation:
-        nonlocal observe_calls
-        del store
-        observe_calls += 1
-        if host_status == "unavailable":
-            raise OSError("systemd unavailable")
-        observed_status = (
-            "running"
-            if host_status
-            in {
-                "control_starting_host_running",
-                "running_without_handshake",
-                "running_pid_conflict",
-            }
-            else host_status
-        )
-        return HostObservation(
-            observed_status,  # type: ignore[arg-type]
-            None if observed_status == "absent" else spec.generation,
-            123 if observed_status == "running" else None,
-            observed_status == "running",
-        )
+            monkeypatch.setattr(cli, "observe_systemd_executor", observe)
+            control_before = raw_control_snapshot(control, task)
+            before = {str(root): _file_snapshot(root) for root in persistent_roots}
+            capsys.readouterr()
 
-    monkeypatch.setattr(cli, "observe_systemd_executor", observe)
-    monkeypatch.chdir(git_repo)
-    for key, value in environment.items():
-        monkeypatch.setenv(key, value)
-    persistent_roots = [git_repo, Path(environment["XDG_STATE_HOME"])]
-    before = {str(root): _file_snapshot(root) for root in persistent_roots}
+            for command in ("status", "history"):
+                assert cli.main([command, str(run_id), "--json"]) == 0
+                output = json.loads(capsys.readouterr().out)
+                assert output["executor_control"]["activity"] == expected_activity
+                assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
+                assert raw_control_snapshot(control, task) == control_before
+                assert snapshot_run(run_ref) == run_before
 
-    for command in ("status", "history"):
-        assert cli.main([command, str(run_id), "--json"]) == 0
-        output = json.loads(capsys.readouterr().out)
-        assert output["executor_control"]["activity"] == expected_activity
-        assert {str(root): _file_snapshot(root) for root in persistent_roots} == before
-
-    assert observe_calls == 2
+            assert observe_calls == 2
 
 
 def test_status_and_history_bypass_an_active_action_without_persistent_writes(

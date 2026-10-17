@@ -1481,12 +1481,15 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
         ):
             raise TaskControlError("Task Control Record Action Run ID is invalid")
         try:
-            normalized_payload = _bounded_payload(action["payload"])
+            # Relational loading already decoded this payload into builtin
+            # JSON values. Keep the original admission size check without
+            # parsing and rebuilding the same tree a second time.
+            _encode_bounded_payload(action["payload"])
         except TaskControlError as error:
             raise TaskControlError(
                 "Task Control Record Action payload is invalid"
             ) from error
-        if _payload_digest(normalized_payload) != action["payload_digest"]:
+        if _payload_digest(action["payload"]) != action["payload_digest"]:
             raise TaskControlError(
                 "Task Control Record Action payload digest is invalid"
             )
@@ -1795,7 +1798,7 @@ def _require_executor(
     return executor
 
 
-def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _encode_bounded_payload(payload: Mapping[str, Any]) -> str:
     if not isinstance(payload, Mapping):
         raise TaskControlError("Lifecycle Action payload must be an object")
     try:
@@ -1804,6 +1807,11 @@ def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise TaskControlError("Lifecycle Action payload must be JSON") from error
     if len(encoded.encode("utf-8")) > 32 * 1024:
         raise TaskControlError("Lifecycle Action payload exceeds the size bound")
+    return encoded
+
+
+def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    encoded = _encode_bounded_payload(payload)
     loaded: object = json.loads(encoded)
     if not isinstance(
         loaded, dict

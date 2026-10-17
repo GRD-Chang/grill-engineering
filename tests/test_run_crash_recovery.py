@@ -16,6 +16,7 @@ from support.inprocess_cli import invoke_cli_inprocess
 from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import passing_acceptance
 from support.cli_crash import run_cli_at_resume_boundary
+from support.accepted_ticket import prepare_accepted_ticket
 from support.state import persist_run_fixture
 
 
@@ -437,9 +438,13 @@ def test_public_cli_recovers_after_external_response_loss(
     first_agents = _write_agents(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
-    run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", idle_control=True)
-    )["run_id"]
+    # 首次建分支仍覆盖初始开发入口；其余故障从合法审核结果开始，但
+    # Publication 和其真实 Semantic Attempt 均由下方被测交付流程产生。
+    run_id = (
+        stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
+        if action == "ensure_ticket_branch"
+        else str(prepare_accepted_ticket(git_repo, fixture, ticket_number=2)["run_id"])
+    )
 
     interrupted = run_internal_stage(
         git_repo,

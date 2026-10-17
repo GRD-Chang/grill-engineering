@@ -273,3 +273,22 @@ def test_control_view_rejects_combined_fields_over_its_limit(database: sqlite3.C
     with pytest.raises(ValueError, match="byte limit"):
         control.load(database, "task-1", IDENTITY)
     assert database.total_changes == writes
+
+
+def test_control_worker_relation_rejects_combined_bytes_before_decoding(
+    database: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with database:
+        database.execute("BEGIN")
+        control.save(database, "task-1", record())
+        token = "界" * 86
+        database.execute("UPDATE control_workers SET process_start_token=? WHERE task_id=?", (token, "task-1"))
+    monkeypatch.setattr(control, "MAX_CONTROL_BYTES", 512)
+
+    def decode(raw: bytes) -> str:
+        assert raw != token.encode(), "Worker relation text was fetched before its combined size proof"
+        return raw.decode("utf-8")
+
+    database.text_factory = decode
+    with pytest.raises(ValueError, match="byte limit"):
+        control.find_executor(database, "task-1", "action-1", 1)

@@ -91,3 +91,39 @@ def test_schema_check_reads_all_required_facts_without_unrelated_index_definitio
             writer.commit()
             with pytest.raises(IncompatibleRunStateError, match="indexes"):
                 repository._check_schema(reader)
+
+
+@pytest.mark.parametrize("damage", ["ddl", "protocol", "writable_schema"])
+def test_nested_query_rejects_schema_changes_in_its_own_transaction(tmp_path: Path, damage: str) -> None:
+    repository = SQLiteStateRepository(tmp_path)
+    repository.save("run-1", {"phase": "pending"})
+    with pytest.raises(IncompatibleRunStateError, match="schema|protocol|indexes"):
+        with repository.atomic():
+            assert repository.load_work("run-1", 2) == {"phase": "pending"}
+            connection = repository._local.connection
+            if damage == "ddl":
+                # DDL does not increment total_changes.
+                connection.execute("CREATE TABLE unexpected(value TEXT)")
+            elif damage == "protocol":
+                connection.execute("UPDATE schema_meta SET value='unsupported'")
+            else:
+                # writable_schema DML need not increment schema_version.
+                connection.execute("PRAGMA writable_schema=ON")
+                connection.execute("UPDATE sqlite_master SET sql=sql||' invalid' WHERE name='work_jobs'")
+            repository.load_work("run-1", 2)
+    assert repository.load_work("run-1", 2) == {"phase": "pending"}
+
+
+def test_nested_query_rechecks_schema_after_rollback_and_next_transaction(tmp_path: Path) -> None:
+    repository = SQLiteStateRepository(tmp_path)
+    repository.save("run-1", {"phase": "pending"})
+    with pytest.raises(RuntimeError, match="rollback"):
+        with repository.atomic():
+            assert repository.load_work("run-1", 2) == {"phase": "pending"}
+            raise RuntimeError("rollback")
+    with closing(sqlite3.connect(repository.path)) as writer:
+        writer.execute("UPDATE schema_meta SET value='unsupported'")
+        writer.commit()
+    with pytest.raises(IncompatibleRunStateError, match="protocol"):
+        with repository.atomic():
+            repository.load_work("run-1", 2)

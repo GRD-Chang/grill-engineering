@@ -194,6 +194,9 @@ class SQLiteStateConnection:
                     connection.execute("INSERT INTO schema_meta(key, value) VALUES ('protocol', ?)", (_PROTOCOL,))
             check_storage(self.path, connection)
             self._local.connection = connection
+            self._local.schema_proof = (
+                connection.total_changes, connection.execute("PRAGMA schema_version").fetchone()[0],
+            )
             self._local.failed = False
             self._local.rollback_callbacks = []
             self._local.work_view = None
@@ -225,6 +228,7 @@ class SQLiteStateConnection:
             raise
         finally:
             self._local.connection = None
+            self._local.schema_proof = None
             self._local.failed = False
             self._local.rollback_callbacks = []
             self._local.work_view = None
@@ -263,7 +267,14 @@ class SQLiteStateConnection:
             active = getattr(self._local, "connection", None)
             if active is not None:
                 if check_schema:
-                    self._check_schema(active)
+                    # BEGIN IMMEDIATE excludes other writers. Reuse only the
+                    # schema already checked in this exact transaction, while
+                    # detecting both DDL and direct writable_schema/protocol
+                    # changes made by the transaction's own connection.
+                    proof = (active.total_changes, active.execute("PRAGMA schema_version").fetchone()[0])
+                    if getattr(self._local, "schema_proof", None) != proof:
+                        self._check_schema(active)
+                        self._local.schema_proof = proof
                 yield active
                 return
             session = getattr(self._local, "work_connections", None)

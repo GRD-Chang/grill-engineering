@@ -2491,13 +2491,9 @@ class ValidatingCiStateStore(StateStore):
 def test_ticket_ci_repair_reviews_before_integration(
     git_repo: Path, tmp_path: Path, append_to: str, ci_round: int,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = ValidatingCiStateStore(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, _, checkout = published_ticket(git_repo, publisher=publisher, states=states)
     publisher.checks = ["fail", "pass"] if ci_round == 1 else ["fail", "fail", "pass"]
     run_branch = str(state["run_branch"])
 
@@ -2537,7 +2533,9 @@ def test_ticket_ci_repair_reviews_before_integration(
 
     assert result["status"] == "ticket_completed"
     job = result["active_ticket_job"]
-    assert agents.review_count == 1
+    assert agents.review_count == 0
+    assert job["validation_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
     assert job["ci_recovery"]["developments_used"] == ci_round
     assert job["ci_recovery"]["developments_used"] == ci_round
     assert job["integration_resync"]["used"] == (0 if append_to is None else 1)
@@ -2611,12 +2609,9 @@ def _replace_external_file(repo: Path, tmp_path: Path, head: str) -> str:
 def test_ticket_ci_conflict_human_resume_returns_to_integration(
     git_repo: Path, tmp_path: Path, ci_round: int, legacy_resume_phase: bool,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
-    state, _ = controller.start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
+    controller = Controller(FixtureGitHubReader(git_repo / "github.json"), GitRepository(git_repo), states)
     publisher.checks = ["fail", "pass"] if ci_round == 1 else ["fail", "fail", "pass"]
 
     class HumanConflictAgents(CheckRepairAgents):
@@ -2676,7 +2671,9 @@ def test_ticket_ci_conflict_human_resume_returns_to_integration(
     job = completed["active_ticket_job"]
     assert agents.ci_repairs == ci_round
     assert agents.conflict_calls == 2
-    assert agents.review_count == 1
+    assert agents.review_count == 0
+    assert job["validation_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
     assert job["ci_recovery"]["developments_used"] == ci_round
     assert job["ci_recovery"]["developments_used"] == ci_round
     assert job["ci_recovery"]["review_required"] is False
@@ -2761,14 +2758,17 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
                 self.crashed = True
                 raise SimulatedProcessCrash(f"after {checkpoint} save")
 
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = CrashAtIntegrationCheckpoint(git_repo / ".agent-run")
-    state, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states,
-        delivery_policy=DeliveryPolicy(ticket_ci_review=checkpoint in {"review_attempt", "review_result"}),
-    ).start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
+    if checkpoint in {"review_attempt", "review_result"}:
+        fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+        state, _ = Controller(
+            FixtureGitHubReader(fixture), GitRepository(git_repo), states,
+            delivery_policy=DeliveryPolicy(ticket_ci_review=True),
+        ).start(1)
+        checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    else:
+        state, _, checkout = published_ticket(git_repo, publisher=publisher, states=states)
     publisher.checks = ["fail", "pass"] if ci_round == 1 else ["fail", "fail", "pass"]
     run_branch = str(state["run_branch"])
 
@@ -2833,7 +2833,10 @@ def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     assert job["ci_recovery"]["review_required"] is (checkpoint in {"review_attempt", "review_result"})
     assert job["integration_resync"]["used"] == (0 if append_to is None else 1)
     assert agents.ci_repairs == ci_round
-    assert agents.review_count == (ci_round + 1 if checkpoint in {"review_attempt", "review_result"} else 1)
+    assert agents.review_count == (ci_round + 1 if checkpoint in {"review_attempt", "review_result"} else 0)
+    if checkpoint not in {"review_attempt", "review_result"}:
+        assert job["validation_attempts"] == 1
+        assert job["review_budget"]["reviewer_invocations"] == 1
     assert job["pr_number"] == publisher.pr_number
     if checkpoint == "review_attempt":
         attempts = job["semantic_attempt_history"]
@@ -4977,13 +4980,10 @@ def test_ticket_resync_limit_and_explicit_resume_keep_original_review(
 def test_ticket_ci_resync_renewal_returns_to_integration(
     git_repo: Path, ci_round: int,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
-    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
-    state, _ = controller.start(1)
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = CheckRepairAgents(checkout)
     publisher = ScriptedPublisher(git_repo)
+    state, states, checkout = published_ticket(git_repo, publisher=publisher)
+    controller = Controller(FixtureGitHubReader(git_repo / "github.json"), GitRepository(git_repo), states)
+    agents = CheckRepairAgents(checkout)
     publisher.checks = ["fail", "pending"] if ci_round == 1 else ["fail", "fail", "pending"]
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents,
@@ -5018,7 +5018,9 @@ def test_ticket_ci_resync_renewal_returns_to_integration(
     assert job["ci_recovery"]["review_required"] is False
     assert job["pr_number"] == original_pr
     published_tree = GitRepository(git_repo).resolve(f"{job['publication_sha']}^{{tree}}")
-    assert agents.review_count == 1
+    assert agents.review_count == 0
+    assert job["validation_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
     assert job["ci_repair_publication_receipt"]["candidate_tree"] == GitRepository(git_repo).resolve(f"{job['candidate_sha']}^{{tree}}")
     assert job["ticket_integration"]["head_tree"] == published_tree
 

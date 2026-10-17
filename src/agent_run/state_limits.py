@@ -225,6 +225,74 @@ def check_response(state: Mapping[str, Any], *, max_bytes: int | None = None) ->
     return meter.size
 
 
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+def require_response_limit(state: Mapping[str, Any], *, max_bytes: int | None = None) -> None:
+    """Prove a response fits, using exact bounded encoding when necessary.
+
+    Most current views are far below their response ceiling. A conservative
+    UTF-8 JSON bound can admit those views without producing encoded copies.
+    This is not a byte counter; callers needing exact bytes use check_response.
+    Unknown containers, invalid scalars and exhausted proof work use that same
+    encoder, preserving its ordered failures and bounded temporary memory.
+    """
+    from agent_run.work_projection import JobProjection, JobHistoryAppend, RepairBudgetProjection, ResumeHistory
+
+    limit = MAX_QUERY_BYTES if max_bytes is None else min(MAX_QUERY_BYTES, max_bytes)
+    budget = _query.get()
+    if budget is not None:
+        limit = min(limit, budget.max_bytes)
+    mappings = (dict, JobProjection, RepairBudgetProjection)
+    sequences = (list, tuple, JobHistoryAppend, ResumeHistory)
+    nodes = 4096
+
+    def bound(value: Any, available: int, depth: int = 64) -> int | None:
+        nonlocal nodes
+        nodes -= 1
+        if nodes < 0 or available < 0:
+            return None
+        kind = type(value)
+        if kind is str:
+            size = 6 * len(value) + 2
+            if size > available or not value.isascii() and _SURROGATE.search(value) is not None:
+                return None
+        elif value is None:
+            size = 4
+        elif kind is bool:
+            size = 5
+        elif kind is int and value.bit_length() <= 2048:
+            size = 3 + value.bit_length() // 3
+        elif kind is float and math.isfinite(value):
+            size = 32
+        elif depth > 0 and kind in mappings:
+            size = 2
+            for key, item in value.items():
+                if type(key) not in (str, int, float, bool, type(None)):
+                    return None
+                key_size = bound(key, available - size - 2, 0)
+                if key_size is None:
+                    return None
+                size += key_size + 2 + (0 if type(key) is str else 2)
+                item_size = bound(item, available - size, depth - 1)
+                if item_size is None:
+                    return None
+                size += item_size
+        elif depth > 0 and kind in sequences:
+            size = 2
+            for item in value:
+                item_size = bound(item, available - size - 1, depth - 1)
+                if item_size is None:
+                    return None
+                size += item_size + 1
+        else:
+            return None
+        return size if size <= available else None
+
+    if bound(state, limit) is None:
+        check_response(state, max_bytes=limit)
+
+
 def require_record_size(
     connection: sqlite3.Connection, table: str, columns: Iterable[str], where: str,
     parameters: tuple[Any, ...], *, limit: int | None = None,

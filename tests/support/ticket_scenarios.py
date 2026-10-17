@@ -47,15 +47,61 @@ def published_ticket(
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     if states is None:
         states = StateStore(git_repo / ".agent-run")
+    state, git = _reviewed_ticket(git_repo, fixture, states, ticket_number=3)
+    job = state["active_ticket_job"]
+    base = str(job["base_sha"])
+    publication = subprocess.run(
+        ["git", "commit-tree", git.resolve(f"{job['candidate_sha']}^{{tree}}"),
+         "-p", base, "-m", "feat(delivery): publish historical ticket candidate"],
+        cwd=git_repo, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    job.update({
+        "phase": "publishing",
+        "publication_attempts": 1,
+        "publication": {
+            "commit_message": "feat(delivery): publish historical ticket candidate",
+            "pr_title": "feat(delivery): publish historical ticket candidate",
+            "pr_body_markdown": "Historical Ticket publication prepared for Required Checks.",
+        },
+        "publication_sha": publication,
+        "publication_parent_sha": base,
+        "publication_prior_published_sha": base,
+        "published_sha": publication,
+    })
+    return _save_prepared_ticket(state, states, git, head=publication, publisher=publisher)
+
+
+def accepted_ticket(
+    git_repo: Path, *, fixture: Path, states: StateStore, ticket_number: int,
+) -> tuple[dict[str, Any], StateStore, Path]:
+    """在调用方需求上准备已审核 Candidate；Publication 仍由被测 Engine 执行。
+
+    仅供 CLI 的单 Ticket #2/#3 场景，不改写 fixture 的需求、故障或历史，
+    不构造 Invocation、Semantic Attempt、发布产物、远端 ref 或 PR。
+    """
+    assert ticket_number in {2, 3}
+    state, git = _reviewed_ticket(git_repo, fixture, states, ticket_number=ticket_number)
+    return _save_prepared_ticket(
+        state, states, git, head=str(state["active_ticket_job"]["candidate_sha"]),
+    )
+
+
+def _reviewed_ticket(
+    git_repo: Path, fixture: Path, states: StateStore, *, ticket_number: int,
+) -> tuple[dict[str, Any], GitRepository]:
+    """复用同一真实 Candidate/审核历史，不保存任何发布阶段事实。"""
     git = GitRepository(git_repo)
     state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
     job = state["active_ticket_job"]
+    key = str(ticket_number)
+    assert job["ticket_number"] == ticket_number
+    assert set(state["ticket_graph"]["tickets"]) == {key}
     base = git.resolve(str(state["run_branch"]))
-    branch = f"agent-run/{state['run_id']}/ticket-3"
-    candidate, publication = _published_commits(git_repo, states.root, base)
+    branch = f"agent-run/{state['run_id']}/ticket-{ticket_number}"
+    candidate = _candidate_commit(git_repo, states.root, base, ticket_number)
     tree = git.resolve(f"{candidate}^{{tree}}")
     revision = effective_revision(
-        ticket_revision=state["ticket_graph"]["tickets"]["3"]["content_revision"],
+        ticket_revision=state["ticket_graph"]["tickets"][key]["content_revision"],
         parent_revision=state["parent"]["revision"],
         graph_revision=state["ticket_graph"]["revision"],
     )
@@ -81,7 +127,7 @@ def published_ticket(
         "ticket_branch_initialized": True,
         "base_sha": base,
         "effective_revision": revision,
-        "phase": "publishing",
+        "phase": "accepted",
         "candidate_sha": candidate,
         "modification_attempts": 1,
         "code_modification_attempts": 1,
@@ -123,35 +169,36 @@ def published_ticket(
             "head_tree": tree,
             "conflict_paths": [],
         },
-        "publication_attempts": 1,
-        "publication": {
-            "commit_message": "feat(delivery): publish historical ticket candidate",
-            "pr_title": "feat(delivery): publish historical ticket candidate",
-            "pr_body_markdown": "Historical Ticket publication prepared for Required Checks.",
-        },
-        "publication_sha": publication,
-        "publication_parent_sha": base,
-        "publication_prior_published_sha": base,
-        "published_sha": publication,
     })
     observe_integration_snapshot(
         job, source_sha=base, target_sha=base,
         policy_snapshot=job["policy_snapshot"],
     )
     complete_integration_window(job)
-    state["ticket_jobs"]["3"] = job
-    state["ticket_integration_holder"] = 3
+    state["ticket_jobs"][key] = job
+    state["ticket_integration_holder"] = ticket_number
+    return state, git
+
+
+def _save_prepared_ticket(
+    state: dict[str, Any], states: StateStore, git: GitRepository, *, head: str,
+    publisher: ScriptedPublisher | None = None,
+) -> tuple[dict[str, Any], StateStore, Path]:
+    job = state["active_ticket_job"]
     subprocess.run(
-        ["git", "update-ref", f"refs/heads/{branch}", publication],
-        cwd=git_repo, check=True, capture_output=True,
+        ["git", "update-ref", f"refs/heads/{job['ticket_branch']}", head],
+        cwd=git.root, check=True, capture_output=True,
     )
-    publisher.live_head = publication
+    if publisher is not None:
+        publisher.live_head = head
     persist_run_fixture(states, str(state["run_id"]), state)
-    checkout = states.root / "worktrees" / str(state["run_id"]) / "ticket-3"
+    checkout = states.root / "worktrees" / str(state["run_id"]) / f"ticket-{job['ticket_number']}"
     return state, states, checkout
 
 
-def _published_commits(repository: Path, state_root: Path, base: str) -> tuple[str, str]:
+def _candidate_commit(
+    repository: Path, state_root: Path, base: str, ticket_number: int,
+) -> str:
     """用独立临时 index 写入真实 tree，不改工作区或用户 index。"""
     def run(*arguments: str, env: dict[str, str], input: str | None = None) -> str:
         return subprocess.run(
@@ -170,10 +217,6 @@ def _published_commits(repository: Path, state_root: Path, base: str) -> tuple[s
         tree = run("write-tree", env=environment)
         candidate = run(
             "commit-tree", tree, "-p", base, "-m",
-            "chore(ticket-3): candidate 1", env=environment,
+            f"chore(ticket-{ticket_number}): candidate 1", env=environment,
         )
-        publication = run(
-            "commit-tree", tree, "-p", base, "-m",
-            "feat(delivery): publish historical ticket candidate", env=environment,
-        )
-    return candidate, publication
+    return candidate

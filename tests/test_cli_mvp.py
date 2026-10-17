@@ -30,6 +30,7 @@ from support.cli import (
 )
 from support.cli_payloads import passing_acceptance, publication, repair_acceptance, ticket
 from support.cli_crash import run_cli_at_development_boundary
+from support.accepted_ticket import prepare_accepted_ticket
 from support.published_run import (
     prepare_accepted_run, prepare_completed_run, prepare_published_run,
 )
@@ -529,6 +530,7 @@ def test_run_supervises_pending_ticket_checks_in_one_call(git_repo: Path) -> Non
         delivery={"required_checks": ["pending", "pass", "none"]},
     )
     agents = _run_agents(git_repo / "agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -549,6 +551,7 @@ def test_explicit_resume_recovers_a_persisted_check_deadline_without_duplicate_d
         supervision_clock_multiplier=540,
     )
     agents = _run_agents(git_repo / "agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -594,6 +597,7 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
         supervision_clock_multiplier=540,
     )
     agents = _run_agents(git_repo / "agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -1096,6 +1100,7 @@ def test_run_reconciles_ticket_close_visibility_in_one_call(
         delivery={"ticket_close_event_lag_reads": 1},
     )
     agents = _run_agents(git_repo / "agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -1330,10 +1335,10 @@ def test_premature_approve_does_not_mark_run_as_execution_failed(
 
 
 def test_run_supervises_initial_graph_read_lag_in_one_call(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    # 已交付 Ticket 的完整前序与本例的 Graph 读取监督无关。
+    fixture, published = prepare_published_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
-    started = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    assert started.returncode == 0, started.stderr
+    assert published["status"] == "run_approval_pending"
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery_graph_read_failures"] = [
         {
@@ -1357,10 +1362,9 @@ def test_run_supervises_initial_graph_read_lag_in_one_call(git_repo: Path) -> No
 
 
 def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, completed = prepare_completed_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
-    started = seed_run(git_repo, fixture, "1", idle_control=True)
-    run_id = stdout_json(started)["run_id"]
+    run_id = str(completed["run_id"])
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -1414,10 +1418,9 @@ def test_publish_run_retries_final_pr_after_external_wait(git_repo: Path) -> Non
 def test_run_supervises_read_failures_after_supervision_timeout(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, completed = prepare_completed_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
-    started = seed_run(git_repo, fixture, "1", idle_control=True)
-    run_id = stdout_json(started)["run_id"]
+    run_id = str(completed["run_id"])
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -1568,6 +1571,7 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
         delivery={"crash_after_ensure_ticket_pr_once": True},
     )
     agents = _run_agents(git_repo / "agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     interrupted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -1719,6 +1723,7 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
         delivery={"crash_after_link_issue_branch_display_once": True},
     )
     agents = _run_agents(git_repo / "linked-branch-agents.json")
+    prepare_accepted_ticket(git_repo, fixture)
 
     interrupted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
     assert interrupted.returncode == 2

@@ -14,7 +14,7 @@ from agent_run.sqlite_encoding import copy_json_tree, encode_json, object_path
 from agent_run.sqlite_mutations import _same
 from agent_run.sqlite_query_rows import bounded_query
 from agent_run.sqlite_state_connection import SQLiteStateConnection, ReadConnection as ReadConnection
-from agent_run.state_limits import check_response
+from agent_run.state_limits import check_response, require_response_limit
 from agent_run.work_projection import JobProjection, JobHistoryAppend
 
 _FIELDS = work_records.FIELDS | audit.FIELDS
@@ -23,8 +23,8 @@ _FIELDS = work_records.FIELDS | audit.FIELDS
 class SQLiteStateRepository(SQLiteStateConnection):
     """Query and commit explicit Run domains using the shared SQLite lifecycle."""
 
-    def _check_size(self, state: Mapping[str, Any]) -> int:
-        return check_response(state, max_bytes=self.max_bytes)
+    def _check_size(self, state: Mapping[str, Any]) -> None:
+        require_response_limit(state, max_bytes=self.max_bytes)
 
     def _require_run_query(self, connection: sqlite3.Connection, run_id: str) -> bool:
         return bounded_query(connection, "SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is not None
@@ -319,8 +319,21 @@ class SQLiteStateRepository(SQLiteStateConnection):
             state = self._returned(run_id, state)
             self._local.work_timelines = timelines
             if thin_timeline:
+                scoped = related_tickets or ticket_numbers is not None or scheduler_tickets
+                queried = (work_records.CURRENT_FIELDS | audit.FIELDS) - excluded - sqlite_timeline.FIELDS
+                # These current audit views carry only related historical
+                # members; their writer still obtains its original baseline.
+                queried -= {"resume_audit", "human_response_audit"}
+                partial = {"retired_ticket_generations", "pending_ticket_retirements"} if scoped else set()
+                if scoped:
+                    queried |= {"ticket_jobs", "ticket_agent_invocations"}
+                    if not scheduler_tickets:
+                        partial |= {"ticket_jobs", "ticket_agent_invocations"}
                 self._local.work_view = (
-                    work_records.WorkBaseline(run_id, copy_json_tree(state), c.total_changes)
+                    work_records.WorkBaseline(
+                        run_id, copy_json_tree(state), c.total_changes,
+                        frozenset(queried), frozenset(partial), c,
+                    )
                     if self.in_transaction else None
                 )
             return state, positions
@@ -399,9 +412,14 @@ class SQLiteStateRepository(SQLiteStateConnection):
                 ) or fields & (timelines.keys() - timeline_updates.keys()):
                     raise ValueError("SQLite object patch cannot replace unread Timeline fields")
             owned = fields & work_records.FIELDS
-            before = work_records.baseline_for_save(c, run_id, state, owned, keyed_changes, archive_scope)
-            aux, _ = audit.load(c, run_id, fields=(fields & audit.FIELDS) - timelines.keys(), current_only=True)
-            before.update(aux)
+            before = work_records.read_baseline_for_save(
+                c, run_id, state, fields - timelines.keys(), keyed_changes, archive_scope,
+                getattr(self._local, "work_view", None),
+            )
+            if before is None:
+                before = work_records.baseline_for_save(c, run_id, state, owned, keyed_changes, archive_scope)
+                aux, _ = audit.load(c, run_id, fields=(fields & audit.FIELDS) - timelines.keys(), current_only=True)
+                before.update(aux)
             work_records.save(c, run_id, state, before, fields=owned, keyed_changes=keyed_changes)
             audit.save(
                 c, run_id, state, before,
