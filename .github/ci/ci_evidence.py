@@ -22,6 +22,7 @@ CONTRACT_TESTS = (
 IDENTITY_FIELDS = (
     "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF",
 )
+PASSED_SUBTESTS_PROPERTY = "agent-run-pytest-passed-subtests-v1"
 
 
 def digest(value: object) -> str:
@@ -77,7 +78,14 @@ def junit_cases(folder: Path) -> set[tuple[str, str]]:
     for suite in suites:
         if any(int(suite.get(name, "-1")) != 0 for name in ("failures", "errors", "skipped")):
             raise ValueError("JUnit contains failed, errored or skipped tests")
-        if int(suite.get("tests", "-1")) != len(list(suite.iter("testcase"))):
+        # support.sharding 从真实 SubtestReport 计数；未知差额仍按缺失报告拒绝。
+        subtest_counts = suite.findall(f"./properties/property[@name='{PASSED_SUBTESTS_PROPERTY}']")
+        if len(subtest_counts) > 1:
+            raise ValueError("Duplicate JUnit subtest count")
+        subtests = int(subtest_counts[0].get("value", "-1")) if subtest_counts else 0
+        if subtests < 0:
+            raise ValueError("Invalid JUnit subtest count")
+        if int(suite.get("tests", "-1")) != len(list(suite.iter("testcase"))) + subtests:
             raise ValueError("Incomplete JUnit test suite")
     result = set()
     for case in root.iter("testcase"):

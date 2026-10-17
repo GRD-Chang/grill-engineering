@@ -58,7 +58,17 @@ CI 每个分片的 `Run tests` 使用 `make test-report TEST_WORKERS=2 PYTEST_AR
 
 成功分片通过 `.github/ci/ci_evidence.py record` 生成 `evidence.json`：只重新收集 nodeid，不重新执行测试，逐项核对该分片的 JUnit 与完整集合应分配的范围。证据绑定仓库、准确提交、workflow run/attempt、workflow 身份、依赖文件以及原始 JUnit/环境报告。`quality` 只接受本次 workflow run 的两个完整分片，并核验相同收集范围和环境配置、互斥覆盖及全部成功结果；缺失、重复、过滤、不一致或跳过的结果明确失败。证据不跨 PR 或 workflow run 复用。同一 run 重跑失败作业时，可保留较早 attempt 的成功分片，仍核验相同候选和覆盖并保留原 attempt；不接受未来 attempt，附件上传覆盖同名旧结果。
 
-CI 规则的定向回归为 `PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .github/ci -p 'test_*.py' -q`。该回归包含四个微型真实 pytest 用例，保护分片与 JUnit 参数地址的实际兼容性。
+锁定的 pytest 9 将成功 subtest 计入 suite 的 `tests`，并复用父 `testcase`。
+`support.sharding` 在 JUnit controller 从真实报告统计成功 subtests，写入版本化属性
+`agent-run-pytest-passed-subtests-v1`；解析器要求 `tests = testcase + 显式成功 subtest 数`。
+没有属性的普通报告仍要求两者相等，未知差额不能当作成功。父 nodeid 继续决定分片覆盖，
+成功 subtest 不能补足缺失的父测试；失败、错误、跳过、缺失或重复结果仍拒绝。
+旧 subtest 报告需要重新运行生成属性，不手工补写计数。
+
+CI 规则的定向回归为 `PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .github/ci -p 'test_*.py' -q`。
+该回归使用六个微型真实 pytest 父测试，覆盖串行和 xdist 分片、参数地址、fixture/unittest
+subtests，另验证实际失败、跳过和 teardown error 报告，以及缺失、重复和错误分片拒绝。
+pytest 升级时须复验这些实际报告的兼容性。
 本地六 worker 的对应诊断入口是 `make test-report`。已安装 CLI 的 `agent-run --help` 和
 `make typecheck` 仍需单独检查。快速回归与全量的验证范围不同，不能用 `make test` 通过推断 CI 必须通过。
 

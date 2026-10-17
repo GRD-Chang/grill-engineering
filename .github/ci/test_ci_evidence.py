@@ -61,9 +61,12 @@ class EvidenceTests(unittest.TestCase):
     def folder(self, index):
         return self.results / f"test-diagnostics-shard-{index}"
 
-    def junit(self, folder, nodes, outcome=None):
+    def junit(self, folder, nodes, outcome=None, *, subtests=None):
         root = ET.Element("testsuites")
-        suite = ET.SubElement(root, "testsuite", tests=str(len(nodes)), errors="0", failures="0", skipped="0")
+        suite = ET.SubElement(root, "testsuite", tests=str(len(nodes) + (subtests or 0)), errors="0", failures="0", skipped="0")
+        if subtests is not None:
+            properties = ET.SubElement(suite, "properties")
+            ET.SubElement(properties, "property", name=evidence.PASSED_SUBTESTS_PROPERTY, value=str(subtests))
         for node in nodes:
             classname, name = evidence.junit_key(node)
             case = ET.SubElement(suite, "testcase", classname=classname, name=name)
@@ -158,6 +161,45 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(nodes=changed), self.assertRaises(ValueError):
                 evidence.record(self.folder(0), 0, contract=True)
 
+    def test_successful_subtests_preserve_parent_coverage_and_shard_counts(self):
+        for index in range(2):
+            nodes = sorted(self.nodes)[index::2]
+            self.junit(self.folder(index), nodes, subtests=2)
+            evidence.record(self.folder(index), index, contract=True)
+            receipt = json.loads((self.folder(index) / "evidence.json").read_text())
+            self.assertEqual(receipt["selected_count"], len(nodes))
+        self.assertEqual(self.verify(), len(self.nodes))
+        nodes = sorted(self.nodes)[0::2]
+        for changed in (nodes[:-1], nodes + ["tests/other.py::test_extra"], nodes + [nodes[0]], sorted(self.nodes)[1::2]):
+            self.junit(self.folder(0), changed, subtests=2)
+            with self.subTest(nodes=changed), self.assertRaises(ValueError):
+                evidence.record(self.folder(0), 0, contract=True)
+            self.change_receipt(0, junit_sha256=evidence.file_digest(self.folder(0) / "junit.xml"))
+            with self.assertRaises(ValueError):
+                self.verify()
+
+    def test_subtest_counts_require_explicit_exact_valid_metadata(self):
+        folder = self.folder(0)
+        for value in (None, "-1", "invalid", "", "1", "3", "duplicate", "unknown"):
+            self.junit(folder, sorted(self.nodes)[0::2], subtests=2)
+            tree = ET.parse(folder / "junit.xml")
+            properties = tree.getroot().find("testsuite/properties")
+            counter = properties.find("property")
+            if value is None:
+                properties.remove(counter)
+            elif value == "duplicate":
+                properties.append(deepcopy(counter))
+            elif value == "unknown":
+                counter.set("name", "agent-run-pytest-passed-subtests-unknown")
+            else:
+                counter.set("value", value)
+            tree.write(folder / "junit.xml", encoding="utf-8")
+            with self.subTest(count=value), self.assertRaises(ValueError):
+                evidence.record(folder, 0, contract=True)
+            self.change_receipt(0, junit_sha256=evidence.file_digest(folder / "junit.xml"))
+            with self.assertRaises(ValueError):
+                self.verify()
+
     def test_artifact_or_dependency_changes_invalidate_evidence(self):
         for name in ("junit.xml", "environment.json"):
             path = self.folder(1) / name
@@ -218,28 +260,69 @@ class EvidenceTests(unittest.TestCase):
     def test_junit_mapping_preserves_classes_and_parameter_separators(self):
         self.assertEqual(evidence.junit_key("tests/test_sample.py::TestGroup::test_value[a::b]"), ("tests.test_sample.TestGroup", "test_value[a::b]"))
 
+    def run_pytest(self, folder, *options):
+        source_tests = Path(__file__).resolve().parents[2] / "tests"
+        env = dict(os.environ, PYTHONPATH=str(source_tests), PYTEST_ADDOPTS="", PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "support.sharding",
+             f"--junitxml={folder / 'junit.xml'}", *options],
+            cwd=self.product, env=env, capture_output=True, text=True, timeout=30,
+        )
+
     def test_real_pytest_shards_and_junit_form_complete_evidence(self):
-        # 真实 pytest/JUnit 边界保护参数地址、分片及完整收集，只有四个微型用例。
+        # 同时保护 fixture/unittest subtests、参数地址和父测试分片。
         (self.product / "pyproject.toml").write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
         (self.product / "tests/test_sample.py").write_text(
-            'import pytest\n@pytest.mark.parametrize("value", ["a::b", "[c]"])\n'
+            'import pytest\nimport unittest\n@pytest.mark.parametrize("value", ["a::b", "[c]"])\n'
             'def test_values(value): assert value\n'
             'class TestGroup:\n    def test_value(self): assert True\n'
             'def test_plain(): assert True\n'
+            'def test_aaa_subtests(subtests):\n'
+            '    for value in (1, 2):\n'
+            '        with subtests.test(value=value): assert value > 0\n'
+            'class TestSubtests(unittest.TestCase):\n'
+            '    def test_values(self):\n'
+            '        for value in (1, 2):\n'
+            '            with self.subTest(value=value): self.assertGreater(value, 0)\n'
         )
-        source_tests = Path(__file__).resolve().parents[2] / "tests"
-        env = dict(os.environ, PYTHONPATH=str(source_tests), PYTEST_ADDOPTS="", PYTHONDONTWRITEBYTECODE="1")
         with patch.object(evidence, "collect_nodeids", self.real_collect):
             for index in range(2):
                 folder = self.folder(index)
-                result = subprocess.run(
-                    [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "support.sharding",
-                     "--test-shard-count=2", f"--test-shard-index={index}", f"--junitxml={folder / 'junit.xml'}"],
-                    cwd=self.product, env=env, capture_output=True, text=True, timeout=30,
-                )
+                workers = ("-n", "2", "--dist", "worksteal") if index else ()
+                result = self.run_pytest(folder, "--test-shard-count=2", f"--test-shard-index={index}", *workers)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                suite = ET.parse(folder / "junit.xml").getroot().find("testsuite")
+                self.assertEqual(int(suite.get("tests")), len(suite.findall("testcase")) + 2)
+                counter = suite.find(f"./properties/property[@name='{evidence.PASSED_SUBTESTS_PROPERTY}']")
+                self.assertEqual(counter.get("value"), "2")
                 evidence.record(folder, index, contract=False)
-        self.assertEqual(evidence.verify(self.results, selected="true", product="true", contract="false", result="success"), 4)
+        self.assertEqual(evidence.verify(self.results, selected="true", product="true", contract="false", result="success"), 6)
+
+    def test_real_pytest_subtest_failures_skips_and_errors_are_rejected(self):
+        (self.product / "pyproject.toml").write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        (self.product / "tests/test_sample.py").write_text(
+            'import pytest\n'
+            'def test_failure(subtests):\n'
+            '    with subtests.test(): assert False\n'
+            'def test_skipped(subtests):\n'
+            '    with subtests.test(): pytest.skip("subtest skipped")\n'
+            '@pytest.fixture\ndef broken_teardown():\n'
+            '    yield\n    raise RuntimeError("teardown failed")\n'
+            'def test_error(subtests, broken_teardown):\n'
+            '    with subtests.test(): assert True\n'
+        )
+        folder = self.folder(0)
+        for index in range(2):
+            self.change_receipt(index, dependencies_sha256=evidence.dependency_digest())
+        for outcome in ("failure", "skipped", "error"):
+            result = self.run_pytest(folder, "-k", f"test_{outcome}")
+            self.assertEqual(result.returncode, 0 if outcome == "skipped" else 1, result.stdout + result.stderr)
+            self.assertIsNotNone(ET.parse(folder / "junit.xml").getroot().find(f".//testcase/{outcome}"))
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(ValueError, "failed, errored or skipped"):
+                evidence.record(folder, 0, contract=True)
+            self.change_receipt(0, junit_sha256=evidence.file_digest(folder / "junit.xml"))
+            with self.assertRaisesRegex(ValueError, "failed, errored or skipped"):
+                self.verify()
 
 
 if __name__ == "__main__":
