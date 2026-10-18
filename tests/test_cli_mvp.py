@@ -18,7 +18,7 @@ from support.cli_fixtures import run_agents as _run_agents
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
-from support.state import write_run_fixture
+from support.state import read_run, write_run_fixture
 from support.cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
@@ -39,9 +39,14 @@ from support.published_run import (
 def _assert_credential_wait_is_not_public(
     repo: Path, fixture: Path, run_id: str
 ) -> None:
+    before = read_run_state_bytes(repo, run_id)
+    fixture_before = fixture.read_bytes()
     for command in ("status", "history"):
         output = stdout_json(invoke_cli_inprocess(repo, fixture, command, run_id, "--json"))
+        assert output["run_id"] == run_id
         assert output.get("supervision") is None
+    assert read_run_state_bytes(repo, run_id) == before
+    assert fixture.read_bytes() == fixture_before
 
 
 def test_run_reaches_explicit_approval_with_status_and_history(
@@ -757,6 +762,12 @@ def test_run_retries_initial_credential_before_starting_each_ticket_worker(
     ]
     assert len(attempts) == 1
     assert attempts[0]["status"] == "completed"
+    assert stdout_json(completed)["run_id"] == state["run_id"]
+    assert attempts[0]["work_subject"] == "ticket:3"
+    assert attempts[0]["semantic_attempt"]["work_subject"] == "ticket:3"
+    budget = state["ticket_jobs"]["3"]["review_budget"]
+    assert budget["window"] == 1
+    assert budget["development_attempts"] == budget["reviewer_invocations"] == 1
 
 
 def test_run_pauses_after_the_initial_worker_credential_window_expires(
@@ -798,8 +809,12 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
     assert state["active_agent_invocation"] is None
     assert state["agent_invocation_history"] == []
     run_id = str(state["run_id"])
+    assert stdout_json(paused)["run_id"] == run_id
+    before_queries = read_run_state_bytes(git_repo, run_id)
+    fixture_before_queries = fixture.read_bytes()
     for command in ("status", "history"):
         output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
+        assert output["run_id"] == run_id
         assert output["next_action"] == (
             "agent-run resume 1 --repo example/project --ticket 3"
         )
@@ -817,6 +832,8 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         assert "截止=" not in text.stdout
         assert "authorization" not in text.stdout.lower()
         assert "凭据 HTTP 状态：" not in text.stdout
+    assert read_run_state_bytes(git_repo, run_id) == before_queries
+    assert fixture.read_bytes() == fixture_before_queries
 
 
 @pytest.mark.parametrize(
@@ -833,9 +850,9 @@ def test_run_retries_initial_credential_for_final_workers_once(
     phase: str,
 ) -> None:
     if fixture_role == "run_publications":
-        fixture, _ = prepare_accepted_run(git_repo)
+        fixture, initial = prepare_accepted_run(git_repo)
     else:
-        fixture, _ = prepare_completed_run(git_repo)
+        fixture, initial = prepare_completed_run(git_repo)
     agents = _run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
     data["initial_credential_failures_by_role"] = {
@@ -847,7 +864,9 @@ def test_run_retries_initial_credential_for_final_workers_once(
 
     assert completed.returncode == 0, completed.stderr
     assert stdout_json(completed)["status"] == "run_approval_pending"
-    state = load_only_run_state(git_repo)
+    run_id = str(initial["run_id"])
+    assert stdout_json(completed)["run_id"] == run_id
+    state = read_run((managed_state(git_repo), run_id))
     assert "credential_availability" not in state
     attempts = [
         invocation
@@ -856,6 +875,15 @@ def test_run_retries_initial_credential_for_final_workers_once(
     ]
     assert len(attempts) == 1
     assert attempts[0]["status"] == "completed"
+
+    subject = "run-acceptance" if fixture_role == "run_reviews" else "run-publication"
+    expected_subject = f"{subject}:{run_id}"
+    assert attempts[0]["work_subject"] == expected_subject
+    assert attempts[0]["semantic_attempt"]["work_subject"] == expected_subject
+    assert state["ticket_jobs"] == initial["ticket_jobs"]
+    assert state["run_acceptance"]["review_budget"]["window"] == 1
+    assert state["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
+    _assert_credential_wait_is_not_public(git_repo, fixture, run_id)
 
 
 @pytest.mark.parametrize(
@@ -886,9 +914,9 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
     resume_status: str,
 ) -> None:
     if fixture_role == "run_publications":
-        fixture, _ = prepare_accepted_run(git_repo)
+        fixture, initial = prepare_accepted_run(git_repo)
     else:
-        fixture, _ = prepare_completed_run(git_repo)
+        fixture, initial = prepare_completed_run(git_repo)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock_multiplier"] = 120
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
@@ -903,7 +931,15 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
 
     assert paused.returncode == 2
     assert stdout_json(paused)["status"] == "supervision_timeout"
-    state = load_only_run_state(git_repo)
+    run_id = str(initial["run_id"])
+    assert stdout_json(paused)["run_id"] == run_id
+    reference = (managed_state(git_repo), run_id)
+    state = read_run(reference)
+    assert state["ticket_jobs"] == initial["ticket_jobs"]
+    paused_budget = state["run_acceptance"]["review_budget"]
+    assert paused_budget["window"] == 1
+    assert paused_budget["development_attempts"] == 0
+    assert paused_budget["reviewer_invocations"] == (0 if fixture_role == "run_reviews" else 1)
     availability = state["credential_availability"]
     assert {
         key: value for key, value in availability.items() if key != "retry_count"
@@ -925,26 +961,52 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
         if invocation.get("role") == invocation_role and invocation.get("phase") == phase
     ]
 
+    # 正确 Run 配上错误入口仓库时，必须在启动恢复 Worker 前拒绝。
+    before_rejected_resume = read_run_state_bytes(git_repo, run_id)
+    fixture_before = fixture.read_bytes()
+    agents_before = agents.read_bytes()
+    rejected = run_cli(
+        git_repo, fixture, "resume", run_id, "--repo", "example/other",
+        "--agent-fixture", str(agents),
+    )
+    assert rejected.returncode == 2, (rejected.stdout, rejected.stderr)
+    assert read_run_state_bytes(git_repo, run_id) == before_rejected_resume
+    assert fixture.read_bytes() == fixture_before
+    assert agents.read_bytes() == agents_before
+
     data["initial_credential_failures_by_role"] = {}
     agents.write_text(json.dumps(data), encoding="utf-8")
     recovered = run_cli(
         git_repo,
         fixture,
-        "run",
-        "1",
+        "resume",
+        run_id,
         "--agent-fixture",
         str(agents),
     )
 
     assert recovered.returncode == 0, recovered.stderr
     assert stdout_json(recovered)["status"] == "run_approval_pending"
-    resumed = load_only_run_state(git_repo)
+    assert stdout_json(recovered)["run_id"] == run_id
+    resumed = read_run(reference)
+    assert "credential_availability" not in resumed
+    assert resumed["active_agent_invocation"]["status"] == "completed"
+    assert resumed["ticket_jobs"] == state["ticket_jobs"]
+    resumed_budget = resumed["run_acceptance"]["review_budget"]
+    assert resumed_budget["window"] == paused_budget["window"]
+    assert resumed_budget["development_attempts"] == paused_budget["development_attempts"]
+    assert resumed_budget["reviewer_invocations"] == 1
+    assert resumed["run_publication"]["publication_attempts"] == 1
     attempts = [
         invocation
         for invocation in resumed["agent_invocation_history"]
         if invocation.get("role") == invocation_role and invocation.get("phase") == phase
     ]
     assert len(attempts) == 1
+    assert attempts[0]["status"] == "completed"
+    assert attempts[0]["work_subject"] == f"{work_subject}:{run_id}"
+    assert attempts[0]["semantic_attempt"]["work_subject"] == f"{work_subject}:{run_id}"
+    _assert_credential_wait_is_not_public(git_repo, fixture, run_id)
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert len(delivery["pull_requests"]) == 2
     assert delivery["closed_issues"] == [3]

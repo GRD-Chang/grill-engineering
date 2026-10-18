@@ -446,16 +446,25 @@ def test_installation_response_cannot_broaden_selected_scope(
         mint_installation_credential(profile, repository="other/repo")
 
 
-def test_renewal_recovers_and_exhaustion_is_sanitized():
+def test_renewal_recovers_and_exhaustion_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = [100.0]
     delivered = []
     updated = threading.Event()
     failure = threading.Event()
     errors = []
     calls = 0
+    failed_provider = {number: threading.Event() for number in (2, 4)}
+    release_provider = {number: threading.Event() for number in (2, 4)}
+    parked_call = 0
+
     def provider():
         nonlocal calls
         calls += 1
+        if calls in failed_provider:
+            failed_provider[calls].set()
+            assert release_provider[calls].wait(2), "failed provider was not released"
         if calls in (2, 4, 5):
             raise RuntimeError("secret-sensitive-token")
         return ReadCredential("A" if calls == 1 else "B", now[0] + 20)
@@ -465,34 +474,57 @@ def test_renewal_recovers_and_exhaustion_is_sanitized():
     lifecycle = RenewableCredential(provider, on_update=deliver,
         on_exhausted=lambda error: (errors.append(error), failure.set()),
         clock=lambda: now[0], renewal_margin=5, renewal_window=2)
+    original_wait = lifecycle._condition.wait
+
+    def parked_wait(timeout: float | None = None) -> bool:
+        nonlocal parked_call
+        if threading.current_thread() is lifecycle._renewal_thread:
+            # Provider entry and on_update both precede renewal bookkeeping.
+            # Only this wait proves retry_at/the next window is established.
+            parked_call = calls
+            lifecycle._condition.notify_all()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(lifecycle._condition, "wait", parked_wait)
+
+    def advance_after_park(expected_call: int, value: float) -> None:
+        with lifecycle._condition:
+            assert lifecycle._condition.wait_for(
+                lambda: parked_call == expected_call, timeout=2,
+            ), f"renewal did not finish bookkeeping after call {expected_call}"
+            now[0] = value
+            lifecycle._condition.notify_all()
+
     try:
         lifecycle.start()
         updated.clear()
-        now[0] = 115
-        lifecycle.wake()
-        deadline = time.monotonic() + 2
-        while calls < 2 and time.monotonic() < deadline:
-            time.sleep(.001)
+        advance_after_park(1, 115)
+        assert failed_provider[2].wait(2)
         assert calls == 2
         assert delivered == ["A"]
-        now[0] = 116
-        lifecycle.wake()
+        # Controlled regression: the old calls==2 barrier is satisfied while
+        # the failure has not even returned, so advancing time here races.
+        assert parked_call == 1
+        release_provider[2].set()
+        advance_after_park(2, 116)
         assert updated.wait(2)
         assert delivered == ["A", "B"]
-        now[0] = 131
-        lifecycle.wake()
-        deadline = time.monotonic() + 2
-        while calls < 4 and time.monotonic() < deadline:
-            time.sleep(.001)
+        advance_after_park(3, 131)
+        assert failed_provider[4].wait(2)
         assert calls == 4
-        now[0] = 137
-        lifecycle.wake()
+        assert parked_call == 3
+        release_provider[4].set()
+        advance_after_park(4, 137)
         assert failure.wait(2)
         assert "resume" in errors[0]
         assert "secret" not in errors[0]
-    finally:
         lifecycle.close()
-    assert not lifecycle._renewal_thread.is_alive()
+        assert not lifecycle._renewal_thread.is_alive()
+        assert not lifecycle._expiry_thread.is_alive()
+    finally:
+        for release in release_provider.values():
+            release.set()
+        lifecycle.close()
 
 
 def test_expired_old_token_stops_before_retry_window_ends():

@@ -18,6 +18,7 @@ from support.cli_payloads import passing_acceptance
 from support.cli_crash import run_cli_at_resume_boundary
 from support.accepted_ticket import prepare_accepted_ticket
 from support.state import persist_run_fixture
+from support.durable_save_boundaries import assert_durable_ticket_boundary
 
 
 def _ticket(
@@ -93,7 +94,7 @@ def _write_agents(
     return path
 
 
-def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
+def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> dict[str, Any]:
     state = load_only_run_state(repo)
     job = state["ticket_jobs"]["2"]
     assert state["status"] == "run_approval_pending"
@@ -112,11 +113,12 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     assert [
         mutation["action"] for mutation in delivery["mutations"]
     ] == ["completion_comment", "close_issue", "delete_managed_branch"]
+    return state
 
 
 @pytest.mark.parametrize("save_number", range(1, 16))
 def test_public_cli_recovers_after_every_durable_save_boundary(
-    git_repo: Path, save_number: int
+    git_repo: Path, save_number: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket()}
@@ -127,6 +129,19 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
+    saved: list[dict[str, Any]] = []
+    after_saved = FaultInjectingStateStore._after_run_saved
+
+    def capture_boundary(store: FaultInjectingStateStore) -> None:
+        try:
+            after_saved(store)
+        except SimulatedProcessCrash:
+            durable = StateStore(store.root).load_run(run_id)
+            assert durable is not None
+            saved.append(durable)
+            raise
+
+    monkeypatch.setattr(FaultInjectingStateStore, "_after_run_saved", capture_boundary)
 
     interrupted = run_internal_stage(
         git_repo,
@@ -140,6 +155,8 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
     )
 
     assert interrupted.returncode == 2
+    assert len(saved) == 1
+    assert_durable_ticket_boundary(saved[0], save_number, run_id)
     interrupted_state = load_only_run_state(git_repo)
     active = interrupted_state.get("active_ticket_job")
     invocation = interrupted_state.get("active_agent_invocation")
@@ -206,7 +223,24 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
     )
 
     assert recovered.returncode == 0, recovered.stdout
-    _assert_exactly_once_delivery(git_repo, fixture)
+    final = _assert_exactly_once_delivery(git_repo, fixture)
+    job = final["ticket_jobs"]["2"]
+    assert final["run_id"] == run_id
+    assert job["review_budget"]["window"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    if save_number >= 8:
+        previous_attempt = saved[0]["ticket_jobs"]["2"]["pending_semantic_attempt"]
+        attempts = [item for item in job["semantic_attempt_history"]
+                    if item["attempt_id"] == previous_attempt["attempt_id"]]
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "completed"
+    if save_number == 15:
+        # The returned result is already durable: recovery must not invoke
+        # Development again, even if a replacement fixture would be valid.
+        development = [item for item in final["agent_invocation_history"]
+                       if item["role"] == "development" and item["work_subject"] == "ticket:2"]
+        assert len(development) == 1
+        assert development[0]["reported_thread_id"] == "developer-2"
 
 
 def test_public_resume_recovers_completed_invocation_with_pending_attempt(

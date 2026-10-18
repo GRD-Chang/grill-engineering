@@ -105,7 +105,7 @@ def test_storage_preparation_and_ready_failures_reap_all_started_workers(
 def test_storage_preparation_does_not_consume_worker_ready_timeout(tmp_path: Path) -> None:
     command, environment = _executor_command(tmp_path, "delayed_preparation")
     stderr_path = tmp_path / "executor.stderr"
-    started, done = threading.Event(), threading.Event()
+    started, done, release_exit = threading.Event(), threading.Event(), threading.Event()
     results: list[dict[int, int]] = []
     errors: list[BaseException] = []
     with storage_executor(tmp_path, command, environment, stderr_path) as executor:
@@ -119,6 +119,8 @@ def test_storage_preparation_does_not_consume_worker_ready_timeout(tmp_path: Pat
                 errors.append(error)
             finally:
                 done.set()
+                if not release_exit.wait(5):
+                    errors.append(AssertionError("test did not release the readiness thread"))
 
         thread = threading.Thread(target=waiting)
         thread.start()
@@ -131,12 +133,21 @@ def test_storage_preparation_does_not_consume_worker_ready_timeout(tmp_path: Pat
             assert done.wait(5)
             assert errors == []
             assert len(results) == 1 and set(results[0]) == {3, 4}
+            # done proves the result, not thread exit. Hold the return path
+            # so this distinction is exercised on every run, without sleep.
+            assert thread.is_alive()
+            release_exit.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "ready thread did not exit normally"
+            assert errors == []
+            assert executor.poll() is None
         finally:
             (tmp_path / "continue-preparation").touch()
+            release_exit.set()
             # A failed assertion must not leave the readiness poller using
             # the fixture. Stopping its Executor makes alive() fail promptly.
             if thread.is_alive() and executor.poll() is None:
                 executor.kill()
-            thread.join()
+            thread.join(timeout=5)
             assert not thread.is_alive()
     assert all(not Path(f"/proc/{pid}").exists() for pid in results[0].values())

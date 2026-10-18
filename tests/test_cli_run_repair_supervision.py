@@ -753,3 +753,4 @@ def test_run_retries_initial_credential_before_starting_each_run_repair_worker(
     ]
     assert len(attempts) == 1
     assert attempts[0]["status"] == "completed"
+    assert attempts[0]["semantic_attempt"]["work_subject"] == f"run-repair:{state['run_id']}"

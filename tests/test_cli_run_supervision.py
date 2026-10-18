@@ -152,6 +152,8 @@ def test_run_retries_initial_credential_before_starting_each_parent_only_worker(
     ]
     assert len(attempts) == 1
     assert attempts[0]["status"] == "completed"
+    assert attempts[0]["work_subject"] == f"parent-only:{state['run_id']}"
+    assert attempts[0]["semantic_attempt"]["work_subject"] == attempts[0]["work_subject"]
 
 def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
