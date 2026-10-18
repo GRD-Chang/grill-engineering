@@ -20,7 +20,8 @@ from support.workspace import managed_repo, managed_state
 
 def git_command(root: Path, *arguments: str) -> str:
     return subprocess.run(
-        ["git", *arguments], cwd=root, check=True, capture_output=True, text=True,
+        ["git", *arguments], cwd=root, env=os.environ.copy(),
+        check=True, capture_output=True, text=True,
     ).stdout.strip()
 
 

@@ -14,8 +14,10 @@ from agent_run.state import ConcurrentRunStateError
 from agent_run.task_control import TaskControlBusyError
 from support.ticket_execution import TicketExecution
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize("readiness", ["ready", "dependency", "program_closeout"])
 def test_fifo_refills_while_sibling_runs_and_all_roles_share_slots(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, readiness: str,

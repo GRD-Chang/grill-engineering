@@ -44,10 +44,12 @@ def deliver_through_ticket_frontier(
 class TicketExecution:
     def __init__(
         self, target: Callable[[], None], *, release: Callable[[], None], name: str,
+        cleanup_timeout: float = 10,
     ) -> None:
         self.errors: list[BaseException] = []
         self._release = release
         self._finished = False
+        self._cleanup_timeout = cleanup_timeout
         # Separate Context copies share this execution's cancellation signal;
         # the cleanup copy can be entered while the dispatcher is running.
         with executor_cancellation_scope():
@@ -75,16 +77,30 @@ class TicketExecution:
         self._finished = True
 
     def __exit__(
-        self, exc_type: type[BaseException] | None, _error: BaseException | None,
+        self, exc_type: type[BaseException] | None, error: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
+        cleanup_errors: list[BaseException] = []
         if self.thread.is_alive():
-            self._cleanup_context.run(close_executor_admission)
-            self._release()
             # Cancellation closes admission before releasing controlled calls.
-            # The dispatcher's pool context joins every in-flight worker. Do
-            # not let fixture teardown race a still-running Git/SQLite writer.
-            self.thread.join()
-        assert not self.thread.is_alive()
+            # Attempt every cleanup step even if a release hook itself fails.
+            for cleanup in (
+                lambda: self._cleanup_context.run(close_executor_admission),
+                self._release,
+                lambda: self.thread.join(timeout=self._cleanup_timeout),
+            ):
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+        if self.thread.is_alive():
+            cleanup_errors.append(AssertionError(
+                f"Ticket dispatcher {self.thread.name!r} did not exit during bounded cleanup"
+            ))
+        if cleanup_errors:
+            if error is None:
+                raise cleanup_errors[0]
+            for cleanup_error in cleanup_errors:
+                error.add_note(f"Ticket cleanup failed: {cleanup_error!r}")
         if exc_type is None:
             assert self._finished, "Normal Ticket exit was not checked before cleanup"

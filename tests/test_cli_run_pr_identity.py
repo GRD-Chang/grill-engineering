@@ -182,4 +182,3 @@ def test_post_merge_readback_rejects_foreign_identity_before_parent_closeout(
         "head_branch": published["run_branch"], "head_sha": record["run_head_sha"],
         "base_branch": "main", "base_sha": record["default_head_sha"],
     }
-

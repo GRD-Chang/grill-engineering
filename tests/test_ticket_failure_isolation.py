@@ -1,4 +1,5 @@
 """Actual Invocation failure events must retain their Ticket owner."""
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlBusyError
 from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.ticket_process import isolated_ticket_test
 
 
 @pytest.mark.parametrize(("failed", "workers"), [(2, 1), (2, 2), (3, 2)])
@@ -198,6 +200,7 @@ def test_control_contention_pauses_only_its_ticket(git_repo: Path) -> None:
     require_current_run_state(states.load_current_run(state["run_id"]))
 
 
+@isolated_ticket_test
 def test_resume_after_local_contention_runs_before_sibling_finishes(git_repo: Path) -> None:
     from threading import Event
     from agent_run.resume_intent import bind_resume_intent

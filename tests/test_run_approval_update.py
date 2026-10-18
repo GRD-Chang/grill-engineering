@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from threading import Event, current_thread
 from typing import Any
 
 import pytest
@@ -12,7 +14,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher
 from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import passing_acceptance
 from support.inprocess_cli import invoke_cli_inprocess
-from support.parent_approval_update import append_remote, control_record
+from support.parent_approval_update import append_remote, control_record, git_command
 from support.published_run import prepare_published_run
 from support.run_approval_update import paused_update, ready_two_ticket_run, update_agents
 from support.workspace import managed_repo, managed_state
@@ -192,12 +194,16 @@ def test_run_update_reviews_latest_target_after_another_append(
     from agent_run.notifications import Notifications
     from agent_run.object_state import save_owned
     from agent_run.state import StateStore
+    from support.observer_errors import ObserverErrors
 
     fixture, before = prepare_published_run(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
+    run_id = str(before["run_id"])
     before["notifications"] = {
         "enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test",
     }
-    save_owned(StateStore(managed_state(git_repo)), before["run_id"], before, fields={"notifications"})
+    save_owned(states, run_id, before, fields={"notifications"})
     monkeypatch.setattr("agent_run.notifications.send", lambda *_args, **_kwargs: {"outcome": "success", "reason": None})
     append_remote(git_repo, fixture, "main", "first.txt", "first update\n")
     agents = update_agents(git_repo)
@@ -207,17 +213,52 @@ def test_run_update_reviews_latest_target_after_another_append(
     publishers: list[FixtureGitHubPublisher] = []
     notice_order = git_repo / "update-notice-order.jsonl"
     observe = Notifications._observe
+    close = Notifications.close
+    work = Notifications._work
+    invoker_pid = os.getpid()
     integrate = GitRepository.integrate_remote_heads
+    errors = ObserverErrors()
+    append_requested, observation_ready, append_finished = (Event() for _ in range(3))
 
     def observe_update(self: Any, state: dict[str, Any], **kwargs: Any) -> None:
-        for event in events(state):
-            if event["kind"] == "approval_update":
-                # StateStore notifies only after the update fact is durable.
-                persisted = load_only_run_state(git_repo)
-                assert persisted["run_publication"]["approval_update"] == state["run_publication"]["approval_update"]
+        with errors.capture():
+            for event in events(state):
+                if event["kind"] == "approval_update":
+                    # The exact StateStore/Run reference is prepared before the
+                    # sender starts; this read neither discovers nor patches env.
+                    persisted = states.load_run(run_id)
+                    assert persisted is not None and persisted["run_id"] == run_id
+                    assert persisted["run_publication"]["approval_update"] == state["run_publication"]["approval_update"]
+                    with notice_order.open("a") as stream:
+                        stream.write(json.dumps({"kind": "notice", "id": event["id"], "run_id": persisted["run_id"]}) + "\n")
+            if (os.getpid() != invoker_pid and append_requested.is_set() and not observation_ready.is_set()
+                    and current_thread() is self.thread):
+                observation_ready.set()
+                assert append_finished.wait(10), "Git append did not release the observer"
+                durable = states.load_run(run_id)
+                assert durable is not None and durable["run_id"] == run_id
                 with notice_order.open("a") as stream:
-                    stream.write(json.dumps({"kind": "notice", "id": event["id"]}) + "\n")
-        observe(self, state, **kwargs)
+                    stream.write(json.dumps({"kind": "concurrent_read", "run_id": durable["run_id"],
+                                             "target": git.resolve("main")}) + "\n")
+            observe(self, state, **kwargs)
+
+    def work_after_reviewer_ready(self: Notifications) -> None:
+        if os.getpid() != invoker_pid:
+            with errors.capture():
+                assert append_requested.wait(30), "Reviewer never reached the append boundary"
+        work(self)
+
+    def close_checked(self: Notifications) -> None:
+        # Failure before the Reviewer must still release this process's gate.
+        append_finished.set()
+        append_requested.set()
+        try:
+            close(self)
+            assert self.thread is None or not self.thread.is_alive()
+        finally:
+            # The fixture Executor forks. Re-raise in that process before its
+            # result is returned, as well as checking the caller's own channel.
+            errors.raise_if_any()
 
     def integrate_after_notice(self: Any, *args: Any, **kwargs: Any) -> Any:
         assert notice_order.exists(), "Run synchronized before submitting its update notice"
@@ -236,7 +277,12 @@ def test_run_update_reviews_latest_target_after_another_append(
         def review(self, request: dict[str, Any]) -> ReviewResult:
             result = super().review(request)
             if not self.changed:
-                append_remote(git_repo, fixture, "main", "later.txt", "later update\n")
+                append_requested.set()
+                try:
+                    assert observation_ready.wait(10), "Notification observer did not reach the append boundary"
+                    append_remote(git_repo, fixture, "main", "later.txt", "later update\n")
+                finally:
+                    append_finished.set()
                 for publisher in publishers:
                     publisher.data = json.loads(fixture.read_text())
                 self.changed = True
@@ -246,14 +292,20 @@ def test_run_update_reviews_latest_target_after_another_append(
     monkeypatch.setattr(cli, "FixtureGitHubPublisher", LivePublisher)
     monkeypatch.setattr(cli, "_agent_backend", lambda *_args, **_kwargs: backend)
     monkeypatch.setattr(Notifications, "_observe", observe_update)
+    monkeypatch.setattr(Notifications, "close", close_checked)
+    monkeypatch.setattr(Notifications, "_work", work_after_reviewer_ready)
     monkeypatch.setattr(GitRepository, "integrate_remote_heads", integrate_after_notice)
     result = invoke_cli_inprocess(git_repo, fixture, "approve", before["run_id"], "--json")
 
+    errors.raise_if_any()
     assert result.returncode == 0, result.stdout + result.stderr
     assert stdout_json(result)["action"]["status"] == "updating"
-    order = [json.loads(line)["kind"] for line in notice_order.read_text().splitlines()]
+    observations = [json.loads(line) for line in notice_order.read_text().splitlines()]
+    order = [record["kind"] for record in observations]
     assert order[0] == "notice"
     assert "synchronize" in order
+    assert order.count("concurrent_read") == 1
+    assert {item["run_id"] for item in observations if "run_id" in item} == {run_id}
     final = load_only_run_state(git_repo)
     run = final["run_acceptance"]
     target = json.loads(fixture.read_text())["default_head_sha"]
@@ -265,6 +317,11 @@ def test_run_update_reviews_latest_target_after_another_append(
     assert run["integration_resync"]["used"] == 2
     assert run["review_budget"]["development_attempts"] == 0
     assert run["review_budget"]["reviewer_invocations"] == 3
+    assert git.resolve("main") == target
+    assert next(item["target"] for item in observations if item["kind"] == "concurrent_read") == target
+    assert git_command(git.root, "show", f"{target}:later.txt") == "later update"
+    assert run["run_integration"]["target_sha"] == target
+    assert git.resolve(final["run_branch"]) == final["run_publication"]["published_head_sha"]
     assert GitRepository(managed_repo(git_repo)).is_ancestor(
         target, final["run_publication"]["published_head_sha"],
     )

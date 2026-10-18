@@ -1,6 +1,7 @@
 """Graph currentness is reconciled before the shared dispatch pool drains."""
 from __future__ import annotations
 
+
 import json
 from pathlib import Path
 from threading import Event
@@ -17,8 +18,10 @@ from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.task_control import ActionBusyError, TaskControlBusyError, TaskControlStore, TaskKey
 from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize("source", ["lane", "supervision"])
 @pytest.mark.parametrize("refresh_contention", [False, True])
 def test_graph_removal_closes_resume_and_notifies_before_sibling_finishes(
@@ -113,6 +116,7 @@ def test_graph_removal_closes_resume_and_notifies_before_sibling_finishes(
         assert refresh_calls >= 2
 
 
+@isolated_ticket_test
 def test_recovered_graph_observation_keeps_same_dispatcher_alive(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

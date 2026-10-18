@@ -6,16 +6,17 @@ import os
 import socket
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from support.workspace import managed_state
+from support.workspace import managed_state, managed_repo
+from agent_run.task_control import TaskKey
 from support.inprocess_cli import invoke_cli_inprocess
 from support.notification_scenarios import prepare_blocked_run_acceptance
+from support.notification_cli import NOTIFICATION_CLI_SCRIPT, run_notification_cli
 
 from agent_run.notification_cards import card
 from agent_run.notification_events import events, recovery_events
@@ -31,12 +32,13 @@ from support.state import snapshot_runs
 
 
 @pytest.mark.parametrize("language,drain,scope,mode", [
+    # English detailed-only fields move to test_notification_display; this
+    # representative retains actual lifecycle/Invocation and transport facts.
     ("zh", True, "ticket", "detailed"),
-    ("en", True, "ticket", "detailed"),
     ("zh", False, "ticket", "detailed"),
     ("zh", True, "ticket", "concise"),
     ("en", True, "parent", "concise"),
-], ids=["zh-delivery", "en-delivery", "bounded-cancel", "concise-repairs", "parent-concise"])
+], ids=["zh-delivery", "bounded-cancel", "concise-repairs", "parent-concise"])
 def test_cli_delivery_sends_cards_and_queries_never_send(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: bool, language: str,
     scope: str, mode: str,
@@ -104,69 +106,20 @@ else:
             })
     agents.write_text(json.dumps(data))
 
+    notification_root = managed_state(git_repo)
+    notification_task = TaskKey(managed_repo(git_repo), "example/project", 1)
+
     def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
-        # This explicit entrypoint is imported only by the CLI/Executor, never
-        # by every supervisor and fake CLI through sitecustomize.
-        script = """import os, socket, sys, threading
-import agent_run.notifications as notifications
-from agent_run.cli import main
-original_close = notifications.Notifications.close
-original_send = notifications.send
-original_observe = notifications.Notifications._observe
-real_delivery_titles = set()
-# Capture lifecycle assertions without waiting for transport under the
-# StateStore/Task Control transaction. Inspect the exact notification query
-# after it has loaded the facts; the commit observer is only a current view.
-def observe(self, *args, **kwargs):
-    state = args[0]
-    for event in notifications.events(state):
-        if event['kind'] in {'run_start', 'ticket_completed', 'boundary'}:
-            real_delivery_titles.add(event['title'])
-        if not kwargs.get('recovering') and event['kind'] in {'ticket_started', 'parent_started'} and event['id'] not in self.document.get('seen', []):
-            active = state.get('active_agent_invocation') or {}
-            assert active.get('reported_thread_id') and active.get('status') == 'running', active
-    original_observe(self, *args, **kwargs)
-notifications.Notifications._observe = observe
-# Detailed-stage combinations are asserted against persisted lifecycle facts.
-# Keep the start, completed-ticket effort and approval/completion cards on the
-# real executable transport; concise mode still delivers every card for its
-# sequence/deduplication assertions, and cancellation keeps its real sender.
-if os.environ.get('NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT'):
-    def representative_send(config, card, *args, **kwargs):
-        if card['header']['title']['content'] in real_delivery_titles:
-            return original_send(config, card, *args, **kwargs)
-        return {'outcome': 'success', 'reason': None}
-    notifications.send = representative_send
-release_sender = threading.Event()
-port = os.environ.get('NOTIFICATION_TEST_PORT')
-if port:
-    notifications.CLOSE_TIMEOUT_SECONDS = 0.05
-    def send(*args, **kwargs):
-        release_sender.wait()
-        return original_send(*args, **kwargs)
-    notifications.send = send
-    def close(self):
-        try:
-            if self.thread is not None:
-                release_sender.set()
-                with socket.create_connection(('127.0.0.1', int(port)), timeout=15) as ready:
-                    ready.sendall(b'C')
-                    assert ready.recv(1) == b'1', 'close readiness not acknowledged'
-        finally:
-            release_sender.set()
-            original_close(self)
-    notifications.Notifications.close = close
-raise SystemExit(main(sys.argv[1:]))
-"""
         source = str(Path(__file__).resolve().parents[1] / "src")
         environment = {**os.environ, "PYTHONPATH": source + os.pathsep + os.environ.get("PYTHONPATH", "")}
         processes = tmp_path / f"{arguments[0]}-processes.jsonl"
         environment["NOTIFICATION_TEST_PROCESSES"] = str(processes)
 
-        def execute() -> subprocess.CompletedProcess[str]:
-            result = subprocess.run(
-                [sys.executable, "-c", script, *arguments, "--json", "--github-fixture", str(fixture)],
-                cwd=git_repo, env=environment, capture_output=True, text=True, check=False,
+        def execute(server: socket.socket | None = None) -> subprocess.CompletedProcess[str]:
+            result = run_notification_cli(
+                [sys.executable, "-c", NOTIFICATION_CLI_SCRIPT, *arguments,
+                 "--json", "--github-fixture", str(fixture)],
+                git_repo, environment, ready=server, task=notification_task, state_root=notification_root,
             )
             assert processes.exists(), result.stdout + result.stderr
             for line in processes.read_text().splitlines():
@@ -188,23 +141,7 @@ raise SystemExit(main(sys.argv[1:]))
             server.listen()
             server.settimeout(30)
             environment["NOTIFICATION_TEST_PORT"] = str(server.getsockname()[1])
-            connections: dict[bytes, socket.socket] = {}
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(execute)
-                try:
-                    for _ in range(2):
-                        connection, _ = server.accept()
-                        connection.settimeout(15)
-                        kind = connection.recv(1)
-                        connections[kind] = connection
-                    assert set(connections) == {b'C', b'S'}
-                    connections[b'C'].sendall(b'1')
-                    return future.result(timeout=8)
-                finally:
-                    # Release test barriers before waiting for the CLI, even
-                    # if an assertion fails. Production reaps the sender tree.
-                    for connection in connections.values():
-                        connection.close()
+            return execute(server)
 
     result = invoke("run", "1", "--notification-mode", mode, "--agent-fixture", str(agents))
     assert result.returncode == 0, result.stderr

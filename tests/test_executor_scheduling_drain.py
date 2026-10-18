@@ -1,4 +1,5 @@
 """Dispatch failure must close Resume before waiting for existing workers."""
+
 from pathlib import Path
 from contextlib import nullcontext
 from threading import Event, Thread
@@ -21,6 +22,7 @@ from agent_run.task_control import ActionBusyError, TaskControlBusyError, TaskCo
 from support.ticket_execution import TicketExecution
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
 from support.state import persist_run_fixture
+from support.ticket_process import isolated_ticket_test
 
 
 @pytest.mark.parametrize("source", ["lane", "supervision", "global_state"])
@@ -266,6 +268,7 @@ def test_reconcilable_result_keeps_live_executor_resume_admission(tmp_path: Path
             assert control.load(task)["executor"].get("ticket_resume_closed") is not True
 
 
+@isolated_ticket_test
 def test_supervision_snapshot_race_keeps_dispatch_alive(git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_run.state import ConcurrentRunStateError
     import agent_run.delivery as delivery

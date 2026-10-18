@@ -19,8 +19,10 @@ from agent_run.ticket_resume import admit_ticket_resume
 from agent_run.object_state import save_owned
 from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize('publication_timing', ['ongoing', 'final', 'integration_only'])
 def test_resume_dispatches_after_development_drains_before_observer_returns(
     git_repo: Path, publication_timing: str,
@@ -127,6 +129,7 @@ def test_resume_dispatches_after_development_drains_before_observer_returns(
     require_current_run_state(final)
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize('outcome', ['complete', 'failure', 'stop'])
 def test_observer_only_interval_handles_completion_failure_and_stop(git_repo: Path, outcome: str) -> None:
     state, states, git, fixture = ticket_run(git_repo, (2,), workers=1)

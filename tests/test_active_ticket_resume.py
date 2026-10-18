@@ -24,8 +24,10 @@ from support.seeding import seed_run, write_fixture
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
 from support.state import persist_run_fixture
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize("pause_reason", ["ticket_execution_failed", "ticket_paused"])
 def test_active_resume_is_durable_fifo_and_automatically_restarts_review(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, pause_reason: str,

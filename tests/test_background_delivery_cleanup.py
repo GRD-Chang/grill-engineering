@@ -23,8 +23,10 @@ from support.seeding import seed_run, write_fixture
 from support.state import persist_run_fixture, snapshot_run
 from support.ticket_parallel import TicketAgents, ticket_engine
 from support.workspace import managed_repo, managed_state
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize("stage", ["development", "review", "publication"])
 def test_early_failure_reaps_delivery_before_closing_dependencies(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, stage: str,

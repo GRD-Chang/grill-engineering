@@ -36,6 +36,7 @@ def background_delivery(
     """失败时先关闭真实执行的准入并回收线程，最后关闭依赖资源。"""
     worker = None
     thread = None
+    cleanup_errors: list[BaseException] = []
     try:
         control, task, worker = _bind_running_executor(repo, run_id)
         ownership = control.load(task)
@@ -69,19 +70,40 @@ def background_delivery(
             finally:
                 try:
                     close_executor_admission(sys.exception())
+                except BaseException as error:
+                    cleanup_errors.append(error)
                 finally:
                     for gate in gates:
                         gate.set()
                     if thread.ident is not None:
-                        thread.join(15)
-                        assert not thread.is_alive(), f"交付取消后未退出：{errors!r}"
+                        try:
+                            thread.join(15)
+                        except BaseException as error:
+                            cleanup_errors.append(error)
+                        if thread.is_alive():
+                            cleanup_errors.append(AssertionError(f"交付取消后未退出：{errors!r}"))
     finally:
+        original_error = sys.exception()
         try:
             if worker is not None:
                 if worker.poll() is None:
-                    worker.terminate()
-                worker.wait(timeout=5)
+                    try:
+                        worker.terminate()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                try:
+                    worker.wait(timeout=5)
+                except BaseException as error:
+                    cleanup_errors.append(error)
         finally:
             # 线程仍存活时不能关闭它还在使用的通知依赖。
             if thread is None or not thread.is_alive():
-                sender.close()
+                try:
+                    sender.close()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            if original_error is None:
+                raise cleanup_errors[0]
+            for error in cleanup_errors:
+                original_error.add_note(f"Background delivery cleanup failed: {error!r}")

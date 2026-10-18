@@ -71,6 +71,51 @@ CLI 启动、环境继承、信号、崩溃恢复、Git、权限、安装和副�
 没有等效覆盖证据时保留现有层级，不能仅凭耗时删除断言。
 完整测量与资源口径见[测试入口](test-commands.md#ci-对齐与诊断)。
 
+## 通知观察与后台错误
+
+`workspace.managed_workspace/managed_state/managed_repo` 从显式环境映射计算路径，
+不临时覆盖进程环境。存在活动线程时，先准备准确的 StateStore、Run ID、Git 路径
+和子进程环境，再开始交错；需要不同环境的 Workspace 创建在独立进程完成。
+`inprocess_cli` 会改变 cwd、环境和输出流，只能在这些全局资源没有其他活动消费者时使用；
+Worker 内的辅助查询使用真实 `run_cli` 和显式环境。
+
+业务通知会捕获观察和传输异常以继续交付，测试不能只在回调内 assert。
+`observer_errors.ObserverErrors` 保存原始观察异常；调用方在 sender 关闭后独立检查。
+真实 CLI 仪器由 `notification_cli` 在 Executor 的 close 边界重新抛出观察错误，
+不能仅检查 fork 前主进程中的错误列表。正常路径先确认线程和进程退出，失败路径
+才使用有界取消；清理异常作为原始错误的 note，不让取消替代业务完成断言。
+
+回归入口：`test_workspace_concurrency.py`、`test_notification_observer_errors.py`、
+`test_notification_cli_support.py`、`test_ticket_execution_cleanup.py`、`test_ticket_process.py`。
+批准更新的真实 SQLite/Git 交错仍由
+`test_run_approval_update.py::test_run_update_reviews_latest_target_after_another_append`
+验证；语言与三轮投入字段组合由 `test_notification_display.py` 验证，真实通知传输、
+顺序、慢传输、取消和 run/approve 继续由 `test_cli_notifications.py` 保留。
+
+`TicketExecution` 与 `background_delivery` 的真实并发消费者使用
+`ticket_process.isolated_ticket_test` 在独立解释器保留完整测试断言；Python 无法安全强杀
+任意线程，线程取消超时或 release 抛错时，由该测试子进程退出/有界强制回收停止
+剩余线程和后代，父进程确认退出后才撤销 fixture。它只覆盖这些支撑的直接消费者，
+不为全库增加运行器或自动重试。负向回归同时保护在隔离前已存在的无关进程。
+通知 CLI 在启动前固定 Task/StateStore，仅补读该 Task 新增的 Action/Generation 及
+Executor PID/start token；失败回收只冻结并回收已确认拥有的进程和后代。
+不扫描其他任务的 Control，也不把 pytest 新出现的全部后代推断成本例进程。
+负向回归让其他 Task 在本次 CLI 启动后再创建子进程，确认两者均不受影响。
+
+隔离支撑只接受模块顶层函数及当前消费者的 Path、MonkeyPatch、JSON 参数。
+父 fixture 准备文件和环境；函数内 patch 在子进程执行，不复制父解释器的可变模块状态。
+子进程通过独立 socket 报告原始异常，输出单独捕获，后代继承输出 fd 不会阻塞失败回收。
+正常返回仍有活动线程/进程，或未捕获的线程异常，都使主测试失败。
+Python 3.12 的多线程 fork 警告在该子进程中按错误处理，保持并行验证可见。
+
+每次调用由轻量监督解释器先确认 Linux subreaper 能力，再启动实际测试解释器。
+测试解释器即使 `os._exit` 或被 SIGKILL，已切换 session 的后代仍收养到本次监督进程；
+后者报告结果后保持存活，直到调用方按其准确进程树有界回收。不依赖测试结束前的
+一次性 owned 快照，也不将 pytest 的其他新后代认成本例资源。监督层按测试解释器退出
+判断硬退出，不能只等可能被 raw fork 后代继承的 socket EOF。
+子测试原始 traceback 优先保留；接收、退出及清理错误附加到原错，即使仅有清理故障，
+也必须明确失败。输出回传和资源关闭仍继续尝试，fixture 撤销前完成回收。
+
 ## Final Run PR 身份覆盖
 
 `published_run.FinalRunContext` 只携带每例 Workspace、Git/StateStore 引用、准确 Run ID、

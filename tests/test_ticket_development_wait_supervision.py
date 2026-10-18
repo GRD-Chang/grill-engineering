@@ -14,8 +14,10 @@ from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state_contract import require_current_run_state
 from support.ticket_execution import TicketExecution, deliver_through_ticket_frontier
 from support.ticket_parallel import TicketAgents, ticket_engine, ticket_run
+from support.ticket_process import isolated_ticket_test
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize(("outcome", "slow_read"), [("retry", False), ("timeout", False), ("timeout", True)])
 def test_development_wait_is_supervised_before_other_agent_returns(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, slow_read: bool,
@@ -113,6 +115,7 @@ def test_development_wait_is_supervised_before_other_agent_returns(
         execution.finish(timeout=10)
 
 
+@isolated_ticket_test
 @pytest.mark.parametrize("wait_kind", ["branch", "credential"])
 def test_preparation_wait_leaves_fifo_and_expires_while_work_slot_is_full(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, wait_kind: str,

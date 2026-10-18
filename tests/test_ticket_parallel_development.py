@@ -9,7 +9,9 @@ from support.control_state import (
     snapshot_control,
 )
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Barrier, Event, Lock, Thread
@@ -21,13 +23,11 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_operator_stop
 from agent_run.controller import Controller
-from agent_run import cli
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
 from agent_run.delivery_history import history_progress_view
 from agent_run.git import GitRepository
 from agent_run.guidance_actions import next_action_fact
-from agent_run.executor_host import HostObservation
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
@@ -59,6 +59,7 @@ from support.ticket_parallel import (
 
 from support.state import snapshot_run
 from support.state import persist_run_fixture
+from support.ticket_process import isolated_ticket_test
 
 
 def test_fixture_revision_read_does_not_erase_parallel_ticket_branch(
@@ -285,6 +286,21 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
     run_ref = (states.root, str(run_id))
     evidence_path = git_repo / "branch-preparation-observed.json"
     observed: list[str] = []
+    # Prepare child-only Host responses before the dispatcher starts. Queries
+    # must not change the running test's environment, cwd or output streams.
+    query_bin = git_repo / "query-bin"
+    query_bin.mkdir()
+    systemctl = query_bin / "systemctl"
+    systemctl.write_text(
+        '#!/bin/sh\n[ "$1" = --user ] && [ "$2" = show ] || exit 2\n'
+        'printf "%s\\n" "$TICKET_TEST_SYSTEMD_OBSERVATION"\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o700)
+    # An inherited PYTHONPATH must not overwrite run_cli's source prefix when
+    # the callback passes only its explicitly prepared tool overrides.
+    monkeypatch.setenv("PYTHONPATH", str(query_bin))
+    query_environment = {"PATH": str(query_bin) + os.pathsep + os.environ["PATH"]}
 
     def inspect_preparation(_publisher: FixtureGitHubPublisher, **_kwargs: Any) -> None:
         preparing = states.load_current_run(run_id)
@@ -293,6 +309,16 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
         assert "2" not in preparing["ticket_agent_invocations"]
         original_control = snapshot_control(control_path_store, control_path_task)
         original_run = snapshot_run(run_ref)
+        record = json.loads(original_control)
+        executor = record["executor"]
+        runner_binding = executor.get("runner_binding") or "a" * 16
+        state_binding = hashlib.sha256(str(states.root.resolve()).encode()).hexdigest()[:16]
+        query_environment["TICKET_TEST_SYSTEMD_OBSERVATION"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\nExecMainPID=123\n"
+            f"Description=agent-run-executor:{control_path_task.fingerprint}:"
+            f"{record['action']['action_id']}:{run_id}:{executor['generation']}:"
+            f"runner-{runner_binding}:state-{state_binding}\nResult=success"
+        )
         try:
             for activity in ("not_running", "running", "unknown"):
                 if activity == "unknown":
@@ -305,42 +331,35 @@ def test_branch_preparation_status_queries_observe_real_control_without_invocati
                         handshake_at="2026-09-27T00:00:00+00:00",
                     )
                     persist_control_fixture(control_path_store, control_path_task, control)
-                with monkeypatch.context() as host_patch:
-                    if activity == "running":
-                        host_patch.setattr(
-                            cli, "observe_systemd_executor",
-                            lambda spec, *args, **kwargs: HostObservation(
-                                "running", spec.generation, 123, True
-                            ),
-                        )
-                    before_control = (
-                        snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None
+                before_control = (
+                    snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None
+                )
+                for command in ("status", "history"):
+                    result = run_cli(
+                        git_repo, fixture, command, run_id, "--json",
+                        extra_env=query_environment,
                     )
-                    for command in ("status", "history"):
-                        result = invoke_cli_inprocess(
-                            git_repo, fixture, command, run_id, "--json"
-                        )
-                        assert result.returncode == 0, result.stderr
-                        view = stdout_json(result)
-                        assert view["executor_control"]["activity"] == activity
-                        if command == "status":
-                            assert view["progress"]["multi_ticket"]["tickets"][0]["invocation"] is None
-                            assert view["progress"]["execution_activity"] == {
-                                "not_running": "interrupted",
-                                "running": "not_running",
-                                "unknown": "unknown",
-                            }[activity]
-                            if activity == "not_running":
-                                assert view["next_action"].startswith("agent-run resume ")
-                        else:
-                            assert view["execution_activity"] == {
-                                "not_running": "interrupted",
-                                "running": "not_running",
-                                "unknown": "unknown",
-                            }[activity]
-                    assert snapshot_run(run_ref) == original_run
-                    assert (snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None) == before_control
-                    observed.append(activity)
+                    assert result.returncode == 0, result.stderr
+                    view = stdout_json(result)
+                    assert view["executor_control"]["activity"] == activity
+                    if command == "status":
+                        assert view["progress"]["multi_ticket"]["tickets"][0]["invocation"] is None
+                        assert view["progress"]["execution_activity"] == {
+                            "not_running": "interrupted",
+                            "running": "not_running",
+                            "unknown": "unknown",
+                        }[activity]
+                        if activity == "not_running":
+                            assert view["next_action"].startswith("agent-run resume ")
+                    else:
+                        assert view["execution_activity"] == {
+                            "not_running": "interrupted",
+                            "running": "not_running",
+                            "unknown": "unknown",
+                        }[activity]
+                assert snapshot_run(run_ref) == original_run
+                assert (snapshot_control(control_path_store, control_path_task) if (control_path_store.load(control_path_task) is not None) else None) == before_control
+                observed.append(activity)
         finally:
             persist_control_fixture(control_path_store, control_path_task, json.loads(original_control))
         evidence_path.write_text(json.dumps(observed), encoding="utf-8")
@@ -1317,6 +1336,7 @@ def test_one_worker_refills_in_fifo_order(git_repo: Path) -> None:
     assert saved["ticket_work_queue"] == []
 
 
+@isolated_ticket_test
 def test_default_capacity_starts_three_without_starting_fourth(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

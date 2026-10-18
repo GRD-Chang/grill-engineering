@@ -38,11 +38,12 @@ def test_update_notification_precedes_git_and_failed_delivery_does_not_block(
     append_remote(git_repo, fixture, "main", "remote.txt", "remote contribution\n")
     agents = update_agents(git_repo)
     sent: list[str] = []
+    transport_timeouts: list[float] = []
 
     def unavailable(
         _config: Any, card: Any, _identity: Any, _cancel: Any, *, timeout_seconds: float,
     ) -> dict[str, Any]:
-        assert 0 <= timeout_seconds <= 60
+        transport_timeouts.append(timeout_seconds)
         sent.append(json.dumps(card, ensure_ascii=False))
         return {"outcome": "failed", "reason": "isolated transport unavailable"}
 
@@ -68,6 +69,7 @@ def test_update_notification_precedes_git_and_failed_delivery_does_not_block(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert submitted
+    assert transport_timeouts and all(0 <= seconds <= 60 for seconds in transport_timeouts)
     assert any(text("notification.event.approval_update", language=language) in value for value in sent)
     assert stdout_json(result)["action"]["status"] == "updating"
     final = load_only_run_state(git_repo)

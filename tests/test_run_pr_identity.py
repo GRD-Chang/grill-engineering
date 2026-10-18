@@ -243,4 +243,3 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
     )
     assert preserved["title"] == "preserve this title"
     assert preserved["body"] == "preserve this body"
-
