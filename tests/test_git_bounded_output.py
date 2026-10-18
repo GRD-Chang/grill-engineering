@@ -2,10 +2,45 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from agent_run.git import GitError, GitRepository
+
+
+def test_git_reads_ignore_inherited_shallow_file_but_keep_repository_boundary(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.git_output import run_git
+
+    def raw_git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments], cwd=git_repo, capture_output=True, text=True,
+        )
+
+    initial = raw_git("rev-parse", "HEAD").stdout.strip()
+    assert raw_git("commit", "--allow-empty", "-m", "second").returncode == 0
+    head = raw_git("rev-parse", "HEAD").stdout.strip()
+    inherited = tmp_path / "host-shallow"
+    inherited.write_text("host shallow file must not be read\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_SHALLOW_FILE", str(inherited))
+
+    # The inherited path really redirects Git's graph before Runner isolation.
+    assert raw_git("rev-list", "HEAD").returncode != 0
+    result = run_git(["git", "rev-list", "HEAD"], cwd=git_repo)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [head, initial]
+
+    # Removing an external override must not erase the repository's own limit.
+    (git_repo / ".git" / "shallow").write_text(head + "\n", encoding="utf-8")
+    result = run_git(["git", "rev-list", "HEAD"], cwd=git_repo)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [head]
+    shallow = run_git(["git", "rev-parse", "--is-shallow-repository"], cwd=git_repo)
+    assert shallow.returncode == 0
+    assert shallow.stdout.strip() == "true"
+    assert inherited.read_text(encoding="utf-8") == "host shallow file must not be read\n"
 
 
 def test_git_dispatch_honors_path_changes_after_cached_resolution(

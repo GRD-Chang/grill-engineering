@@ -106,3 +106,55 @@ def test_historical_registration_preserves_an_existing_profile_revision(git_repo
     _, registered = _register_historical_run(workspace, state, 7, None)
     assert registered == states.load_current_run(run_id) == state
     assert profiles.load(run_id) == configured
+
+
+def test_final_context_cli_preserves_source_and_exact_run_with_inherited_pythonpath(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from support.published_run import prepare_accepted_context
+    from support.state import snapshot_run
+
+    # 完整环境快照覆盖 run_cli 的临时 PYTHONPATH 时仍须加载当前源码。
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "unrelated-pythonpath"))
+    context = prepare_accepted_context(git_repo)
+    before = snapshot_run((context.states.root, context.run_id))
+    result = run_cli(
+        tmp_path, context.fixture, "status", context.run_id, "--json",
+        extra_env=context.environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stdout_json(result)["run_id"] == context.run_id
+    assert context.states.list_run_ids() == [context.run_id]
+    assert snapshot_run((context.states.root, context.run_id)) == before
+
+
+def test_final_context_does_not_authorize_replaced_workspace(
+    git_repo: Path, tmp_path: Path,
+) -> None:
+    import subprocess
+
+    from agent_run.managed_workspace import ManagedWorkspaceError
+    from support.control_state import snapshot_control
+    from support.published_run import prepare_accepted_context
+    from support.state import snapshot_run
+
+    context = prepare_accepted_context(git_repo)
+    control = TaskControlStore(context.states.root)
+    task = TaskKey(context.git.root, "example/project", 1)
+    before = snapshot_run((context.states.root, context.run_id))
+    before_control = snapshot_control(control, task)
+    # Context 已准备好之后替换 origin；生产重开不能继承先前的安全结论。
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "replacement")],
+        cwd=context.git.root, check=True,
+    )
+    with pytest.raises(ManagedWorkspaceError, match="Git"):
+        context.workspace.open()
+    failed = run_cli(
+        tmp_path, context.fixture, "run", "1", "--repo", "example/project",
+        extra_env=context.environment,
+    )
+    assert failed.returncode == 2, failed.stdout + failed.stderr
+    assert "Git" in stdout_json(failed)["diagnostics"][0]["message"]
+    assert snapshot_run((context.states.root, context.run_id)) == before
+    assert snapshot_control(control, task) == before_control

@@ -70,3 +70,36 @@ Locator、Profile 版本、idle ownership 和跨目录公开查询的准确身�
 CLI 启动、环境继承、信号、崩溃恢复、Git、权限、安装和副作用幂等继续保留真实边界。
 没有等效覆盖证据时保留现有层级，不能仅凭耗时删除断言。
 完整测量与资源口径见[测试入口](test-commands.md#ci-对齐与诊断)。
+
+## Final Run PR 身份覆盖
+
+`published_run.FinalRunContext` 只携带每例 Workspace、Git/StateStore 引用、准确 Run ID、
+fixture 路径和启动前捕获的子进程环境；`prepare_accepted_context` 与
+`prepare_published_context` 分别停在 Final Publication 前与显式批准前。
+后续准备不再次 attach Run 或发现状态根。业务动作后用原 StateStore 的准确 Run ID
+重新读取，拒绝后的断言使用独立落盘事实；生产重开和每次 Git 调度仍重新校验授权。
+旧的 tuple 返回接口继续供其他场景使用，不推广到其他领域。
+
+身份字段组合在 `test_run_pr_identity.py::test_identity_fields` 验证现有生产身份判定：
+head/base repository、head ref/SHA、base ref/SHA、repository 与 ref 同时错误及合法对照。
+三类应用入口仍真实运行 Engine，并另保留独立 CLI 进程；fake 仅控制外部响应。
+
+下表中的旧 nodeid 均以 `tests/test_cli_delivery.py::` 开头。
+
+| 旧 nodeid / 故障窗口 | 当前覆盖 |
+| --- | --- |
+| `test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr[head/base/head-repository/head-ref]` | `test_run_pr_identity.py` 中保留原函数名和四个参数地址，通过显式 accepted context 调用真实 Publication Engine，断言 `foreign_run_pr` 与原 PR title/body 不被改写；CLI 错误分类由下述恢复代表覆盖 |
+| `test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effects[head-repository/head-ref]` | `test_identity_application_rejects_before_unauthorized_effects[recovery-repository/recovery-ref]` 保留两组应用组合，完整逻辑快照与全部外部 delivery 不变；`test_cli_run_pr_identity.py` 中的同名无参数 CLI 代表保留退出码、持久阻断、Invocation、status/history 与准确 Action receipt |
+| `test_explicit_approval_rejects_foreign_final_run_pr_identity_without_external_writes[head-repository/head-ref]` | 应用组合 `[approve-repository/approve-ref]`，除准确 grant 及对应审核事件外比较完整落盘事实；`test_cli_run_pr_identity.py` 中的同名无参数 CLI 代表保留 receipt/grant、Invocation 和全部外部 delivery 不变 |
+| `test_post_merge_readback_rejects_foreign_identity_before_parent_closeout[head-repository/head-ref/base-repository]` | 应用组合 `[readback-head-repository/readback-ref/readback-base-repository]` 保留真实 merge parents、一次 merge intent 与外部调用记录；`test_cli_run_pr_identity.py` 中的同名无参数 CLI 代表仍证明 PR 已合并、Parent 未关闭和准确 receipt/grant |
+
+`test_run_publication_checks.py` 的 merge 前二次身份校验及 snapshot 漂移继续覆盖检查后变化；
+`test_run_publication_reconciliation.py` 保留 merge 响应丢失、重开及 base 推进后的对账。
+`test_git_dispatch_fence.py` 保留等待锁后的授权撤销与每次写入重查；
+`test_cli_workspace.py`、`test_managed_workspace.py` 保留受管祖先与生产重开校验；
+`test_published_run_scenarios.py::test_final_context_does_not_authorize_replaced_workspace`
+另在 Context 创建后替换 origin，验证公开 CLI 拒绝且完整 Run/Control 事实不变。
+`test_published_run_scenarios.py` 独立读取真实 Git、SQLite、Locator/Profile 与跨目录 CLI 查询。
+环境回归在 `test_test_environment.py` 顺序运行独立可变副本并核验模板静止、宿主文件保全；
+继承的 `GIT_SHALLOW_FILE`、`GIT_NAMESPACE` 不进入模板和每例准备，生产 Git 也清除外部 shallow
+文件覆盖，仓库自身的 `.git/shallow` 边界由 `test_git_bounded_output.py` 保留。

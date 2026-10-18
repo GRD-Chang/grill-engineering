@@ -17,6 +17,7 @@ from support.environment import _assert_python_and_git_environment
 _GIT_LOCATION_VARIABLES = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_TEMPLATE_DIR",
+    "GIT_SHALLOW_FILE", "GIT_NAMESPACE",
 )
 
 
@@ -115,12 +116,12 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
     git_overrides = {}
     for key in _GIT_LOCATION_VARIABLES:
         target = host / key.lower()
-        if key == "GIT_INDEX_FILE":
-            target.write_text("host index must not change", encoding="utf-8")
+        if key in {"GIT_INDEX_FILE", "GIT_SHALLOW_FILE"}:
+            target.write_text("host Git file must not change", encoding="utf-8")
         else:
             target.mkdir()
             (target / "keep").write_text("host Git directory must not change", encoding="utf-8")
-        git_overrides[key] = str(target)
+        git_overrides[key] = "host-namespace" if key == "GIT_NAMESPACE" else str(target)
     host_config = host / "host-gitconfig"
     host_config.write_text("[isolation]\n    inherited = host\n", encoding="utf-8")
     shutil.copyfile(host_config, Path(environment["HOME"]) / ".gitconfig")
