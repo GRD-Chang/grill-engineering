@@ -111,66 +111,6 @@ def record_execution_timing(
     return facts
 
 
-def unassociated_invocations(
-    raw: list[dict[str, Any]], known: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Match exact facts within an Invocation identity, including duplicates.
-
-    Identity narrows the comparison; it does not make two different bodies
-    equivalent. Malformed identities retain the ordinary equality fallback.
-    """
-    def key(invocation: dict[str, Any]) -> tuple[str, str] | None:
-        subject, started = invocation.get("work_subject"), invocation.get("started_at")
-        return (subject, started) if isinstance(subject, str) and isinstance(started, str) else None
-
-    indexed: dict[tuple[str, str] | None, list[dict[str, Any]]] = {}
-    for invocation in known:
-        indexed.setdefault(key(invocation), []).append(invocation)
-    return [invocation for invocation in raw if invocation not in indexed.get(key(invocation), [])]
-
-
-def execution_totals(
-    state: dict[str, Any], records: list[dict[str, Any]], at: object,
-    *, work_subject: str | None = None,
-) -> dict[str, Any]:
-    end, start = _time(at), _time(state.get("created_at"))
-    facts: dict[str, Any] = {"execution_timing_complete": False}
-    if end and start and end >= start:
-        facts["elapsed_seconds"] = int((end - start).total_seconds())
-    rounds = [record for record in records if not record.get("event_record")]
-    raw = state.get("agent_invocation_history") or []
-    if work_subject is not None:
-        rounds = [record for record in rounds if record.get("work_subject") == work_subject]
-        raw = [invocation for invocation in raw
-               if (invocation.get("work_subject") or (invocation.get("semantic_attempt") or {}).get("work_subject")) == work_subject]
-    known = [invocation for record in rounds for invocation in record.get("invocations", [])]
-    missing = unassociated_invocations(raw, known)
-    # Unassociated work prevents a complete total, but its closed segment is
-    # still valid partial evidence. Parallel subjects are summed independently.
-    included = [
-        invocation for invocation in [*known, *missing]
-        if end is None or (ended := _time(invocation.get("ended_at"))) is None or ended <= end
-    ]
-    recorded = aggregate_invocation_timing(included)["recorded_execution_seconds"]
-    if recorded is not None:
-        facts["recorded_execution_seconds"] = recorded
-    complete = bool(rounds) and not missing and all(
-        record_execution_timing(state, record)["execution_timing_complete"]
-        for record in rounds
-    )
-    if complete and end and any(
-        (ended := _time(invocation.get("ended_at"))) is not None and ended > end
-        for invocation in known
-    ):
-        complete = False
-    # Lifecycle snapshots may be bounded independently of durable Attempt and
-    # Invocation facts; timeline truncation alone does not lose execution time.
-    facts["execution_timing_complete"] = complete
-    if complete:
-        facts["total_seconds"] = recorded
-    return facts
-
-
 def invocation_execution_seconds(
     invocation: dict[str, Any], *, allow_open: bool = False
 ) -> int | None:

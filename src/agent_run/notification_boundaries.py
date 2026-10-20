@@ -5,7 +5,7 @@ from dataclasses import asdict
 from typing import Any
 
 from agent_run.delivery_facts import delivery_object_label, role_family
-from agent_run.execution_timing import execution_totals
+from agent_run.query_report import ExecutionReport
 from agent_run.final_approval_operation import final_approval_cleanup_pending
 from agent_run.guidance_actions import render_next_action
 from agent_run.messages import selected_language
@@ -75,7 +75,7 @@ def boundary_events(
             } else None,
             object=delivery_object_label(state, fact["location"], include_parent_for_run=True),
             next_step=render_next_action(fact["action"], state, language=language, human=True),
-            **execution_totals(state, records, None), **task,
+            **ExecutionReport(state, records).totals(), **task,
         ))
     terminal = _terminal_event(state, records)
     if terminal is not None:
@@ -109,5 +109,5 @@ def _terminal_event(state: dict[str, Any], records: list[dict[str, Any]]) -> dic
         "green" if status == "completed" and not cleanup else "yellow",
         current=True, status_code=status, summary=summary,
         next_step=str(next_action(state)) if cleanup else "",
-        **execution_totals(state, records, at), **task,
+        **ExecutionReport(state, records).totals(at), **task,
     )

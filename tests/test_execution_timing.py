@@ -12,12 +12,12 @@ import pytest
 from agent_run.agent_invocation import invocation_event_recorder, record_operator_stop
 from agent_run.execution_timing import (
     aggregate_invocation_timing,
-    execution_totals,
     invocation_started,
     invocation_execution_seconds,
     record_execution_timing,
 )
 from agent_run.history_facts import history_records
+from agent_run.query_report import ExecutionReport
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.notification_cards import card
 from agent_run.notification_events import events
@@ -98,7 +98,7 @@ def test_same_round_sums_execution_segments_excluding_resume_and_recovery_waits(
     assert records[0]["execution_seconds"] == 150
     assert records[0]["execution_timing_complete"] is True
     assert len(records[0]["configurations"]) == 2
-    assert execution_totals(state, records, "2026-09-21T04:00:00+00:00")["total_seconds"] == 150
+    assert ExecutionReport(state, records).totals("2026-09-21T04:00:00+00:00")["total_seconds"] == 150
     assert state == before
 
 
@@ -122,7 +122,7 @@ def test_missing_segments_keep_only_recorded_duration_and_configuration(missing:
         "recorded_execution_seconds": 60,
     }
     assert records[0]["configurations"][-1]["model"] == "model-b"
-    totals = execution_totals(state, records, "2026-09-21T04:00:00+00:00")
+    totals = ExecutionReport(state, records).totals("2026-09-21T04:00:00+00:00")
     assert totals["execution_timing_complete"] is False
     assert totals["recorded_execution_seconds"] == 60
     assert "total_seconds" not in totals
@@ -130,7 +130,7 @@ def test_missing_segments_keep_only_recorded_duration_and_configuration(missing:
 
 def test_unassociated_execution_cannot_be_a_complete_total() -> None:
     state, records = project([invocation(semantic_attempt={})])
-    facts = execution_totals(state, records, "2026-09-21T04:00:00+00:00")
+    facts = ExecutionReport(state, records).totals("2026-09-21T04:00:00+00:00")
     assert facts == {"execution_timing_complete": False, "recorded_execution_seconds": 60}
 
 
@@ -208,9 +208,9 @@ def test_parallel_subjects_are_summed_without_using_wall_clock_or_timeline_capac
     second = invocation("00:00:00", "00:02:00")
     second["semantic_attempt"].update(attempt_id="attempt-2", work_subject="ticket:4")
     state, records = project([invocation(), second], timeline_at_capacity=True)
-    total = execution_totals(state, records, "2026-09-21T04:00:00+00:00")
+    total = ExecutionReport(state, records).totals("2026-09-21T04:00:00+00:00")
     assert total["total_seconds"] == 180
-    selected = execution_totals(state, records, "2026-09-21T04:00:00+00:00", work_subject="ticket:3")
+    selected = ExecutionReport(state, records).subject("ticket:3").totals("2026-09-21T04:00:00+00:00")
     assert selected["total_seconds"] == 60
 
 

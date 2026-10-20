@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_run.execution_timing import execution_totals, parse_optional_timestamp
+from agent_run.execution_timing import parse_optional_timestamp
 from agent_run.history_facts import _ensure_history_record
 from agent_run.sqlite_query_rows import bounded_query, bounded_rows
 from agent_run.sqlite_work_execution_details import restore_details
@@ -15,7 +14,7 @@ from agent_run.state_limits import (
     MAX_BATCH_BYTES, MAX_CURRENT_BYTES, QUERY_BATCH_ROWS,
     consume_query_bytes, consume_query_rows,
 )
-from agent_run.ticket_effort import ticket_effort
+from agent_run.query_report import ExecutionReport
 
 _SCALARS = (
     "status", "reported_thread_id", "ended_at", "execution_not_started",
@@ -27,18 +26,6 @@ _COLUMNS = ("presence", *_SCALARS, "attempt_id", "attempt_version_id", *_DETAILS
 _ATTEMPT_COLUMNS = ("attempt_id", "work_subject", "generation", "role", "ordinal", "budget_window")
 _OWNER_CONTAINERS = ("ticket_jobs", "parent_job", "run_acceptance", "run_publication",
                      "retired_semantic_attempt_owners")
-
-
-@dataclass
-class TimingFacts:
-    state: dict[str, Any]
-    records: list[dict[str, Any]]
-
-    def totals(self, at: object = None, *, work_subject: str | None = None) -> dict[str, Any]:
-        return execution_totals(self.state, self.records, at, work_subject=work_subject)
-
-    def effort(self, work_subject: str) -> dict[str, dict[str, Any]]:
-        return ticket_effort(self.state, self.records, work_subject)
 
 
 def _visible_owners(c: sqlite3.Connection, run_id: str) -> set[str]:
@@ -125,7 +112,7 @@ def _invocations(c: sqlite3.Connection, run_id: str, work_subject: str | None) -
     return result
 
 
-def load(c: sqlite3.Connection, run_id: str, current: dict[str, Any], *, work_subject: str | None = None) -> TimingFacts:
+def load(c: sqlite3.Connection, run_id: str, current: dict[str, Any], *, work_subject: str | None = None) -> ExecutionReport:
     from agent_run.sqlite_run_audit import load_resume_events
     from agent_run.semantic_attempt import semantic_attempt_subjects
 
@@ -158,4 +145,4 @@ def load(c: sqlite3.Connection, run_id: str, current: dict[str, Any], *, work_su
         parse_optional_timestamp(item.get("started_at")) or parse_optional_timestamp(item.get("ended_at")) or datetime.max.replace(tzinfo=UTC),
         str(item.get("work_subject") or ""), str(item.get("role") or ""), item.get("ordinal") or 0,
     ))
-    return TimingFacts(state, ordered)
+    return ExecutionReport(state, ordered)

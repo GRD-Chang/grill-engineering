@@ -173,7 +173,7 @@ def _card_facts(c: sqlite3.Connection, run_id: str, state: dict[str, Any], docum
     result = {}
     for event in completions:
         work = f"ticket:{event['task_number']}"
-        result[event["id"]] = {**facts.totals(work_subject=work), "effort": facts.effort(work)}
+        result[event["id"]] = {**facts.subject(work).totals(), "effort": facts.subject(work).effort()}
     for event in boundaries:
         at = None
         if state.get("status") in {"completed", "abandoned"}:

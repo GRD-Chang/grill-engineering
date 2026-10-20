@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from agent_run.history_facts import history_records
-from agent_run.ticket_effort import ticket_effort
+from agent_run.query_report import ExecutionReport
 
 
 def invocation(identity: str, role: str = "development", *, start: int = 0,
@@ -27,7 +27,7 @@ def aggregate(values: list[dict[str, Any]], *, truncated: bool = False) -> dict[
     state = {"agent_invocation_history": values, "timeline_at_capacity": truncated}
     audit = {"agent_invocations": values}
     original = deepcopy(state)
-    result = ticket_effort(state, history_records(state, audit), "ticket:269")
+    result = ExecutionReport(state, history_records(state, audit)).subject("ticket:269").effort()
     assert state == original
     return result
 
@@ -104,7 +104,7 @@ def test_missing_association_does_not_report_partial_total(missing: str) -> None
         records[1]["attempt_id"] = None
     else:
         records.pop()
-    result = ticket_effort(state, records, "ticket:269")["development"]
+    result = ExecutionReport(state, records).subject("ticket:269").effort()["development"]
     assert result["execution_timing_complete"] is False
     assert "execution_seconds" not in result
     assert result["recorded_execution_seconds"] == 60
@@ -115,7 +115,7 @@ def test_missing_association_does_not_report_partial_total(missing: str) -> None
 def test_attempt_without_invocation_preserves_only_count() -> None:
     attempt = invocation("initial")["semantic_attempt"]
     records = history_records({}, {"semantic_agent_attempts": [attempt]})
-    assert ticket_effort({}, records, "ticket:269") == {
+    assert ExecutionReport({}, records).subject("ticket:269").effort() == {
         "development": {"rounds": 1, "rounds_complete": True, "shared_rounds": False,
                         "execution_timing_complete": False}}
 
@@ -140,7 +140,7 @@ def test_resume_reference_to_missing_segment_preserves_reliable_facts() -> None:
         "successor_invocation_started_at": values[0]["started_at"],
     }]}}
     records = history_records(state, {"agent_invocations": values})
-    result = ticket_effort(state, records, "ticket:269")["development"]
+    result = ExecutionReport(state, records).subject("ticket:269").effort()["development"]
     assert result["rounds"] == 1
     assert "execution_seconds" not in result
     assert result["execution_timing_complete"] is False

@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from agent_run.notification_event_facts import event_copy, event_envelope, event_subject
 
-from agent_run.execution_timing import execution_totals, invocation_started
-from agent_run.ticket_effort import ticket_effort
+from agent_run.execution_timing import invocation_started
+from agent_run.query_report import ExecutionReport
 from typing import Any
 
 from agent_run.attempt_projection import semantic_attempt_history
@@ -182,8 +182,8 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
             result.append(event_envelope(state, "ticket_completed", [number, job.get("generation")],
                                 event_copy(state, "ticket_completed", title=event_subject(state, f"ticket:{number}").get("task_title") or "#" + str(number)), "green",
                                 **event_subject(state, f"ticket:{number}"),
-                                **execution_totals(state, records, None, work_subject=f"ticket:{number}"),
-                                effort=ticket_effort(state, records, f"ticket:{number}"),
+                                **ExecutionReport(state, records).subject(f"ticket:{number}").totals(),
+                                effort=ExecutionReport(state, records).subject(f"ticket:{number}").effort(),
                                 next_step=event_copy(state, "ticket_next") if progress['completed'] < progress['total'] else event_copy(state, "ticket_final_next"),
                                 summary=event_copy(state, "progress", completed=progress["completed"], total=progress["total"])))
     publication = (state.get("parent_job") if state.get("delivery_type") == "parent_only"

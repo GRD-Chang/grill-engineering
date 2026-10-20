@@ -64,7 +64,7 @@ def delivery_result_lines(state: dict[str, Any]) -> list[str]:
 def status_timing(state: dict[str, Any], invocation: dict[str, Any] | None = None) -> dict[str, Any]:
     from agent_run.attempt_projection import semantic_attempt_history
     from agent_run.history_facts import history_records
-    from agent_run.execution_timing import execution_totals
+    from agent_run.query_report import ExecutionReport
 
     queried = state.get("_query_timing")
     if isinstance(queried, dict):
@@ -83,7 +83,7 @@ def status_timing(state: dict[str, Any], invocation: dict[str, Any] | None = Non
     audit = {"semantic_agent_attempts": semantic_attempt_history(state),
              "agent_invocations": state.get("agent_invocation_history", [])}
     records = history_records(state, audit)
-    totals = execution_totals(state, records, None)
+    totals = ExecutionReport(state, records).totals()
     identity = invocation.get("semantic_attempt") if invocation else None
     if isinstance(identity, dict):
         record = next((record for record in records if record.get("attempt_id") == identity.get("attempt_id")), None)

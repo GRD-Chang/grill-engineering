@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from agent_run.change_delivery_threads import require_development_thread
-from agent_run.execution_timing import execution_totals
+from agent_run.query_report import ExecutionReport
 from agent_run.executor import DeliveryExecutor
 from agent_run.object_state import object_store
 from agent_run.state import StateStore
@@ -27,7 +27,7 @@ def test_execution_totals_match_exact_bodies_with_duplicate_invocation_identity(
         observed["reported_thread_id"] = "different-thread"
     state = {"agent_invocation_history": [invocation, observed]}
     records = [{"attempt_id": "a-1", "invocations": [deepcopy(invocation)], "activity": "not_running"}]
-    totals = execution_totals(state, records, None)
+    totals = ExecutionReport(state, records).totals(None)
     assert totals["execution_timing_complete"] is not different
     assert totals["recorded_execution_seconds"] == (18 if different else 9)
     assert ("total_seconds" in totals) is not different
