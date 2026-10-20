@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run import change_delivery, run_acceptance
+from agent_run import change_delivery_review, run_acceptance
 from agent_run.agent_schemas import (
     acceptance_schema,
     development_or_human_blocker_schema,
@@ -267,7 +267,7 @@ def test_acceptance_artifact_has_three_evidence_backed_lanes() -> None:
 
 
 def test_ticket_and_run_acceptance_share_the_strict_artifact_parser() -> None:
-    assert change_delivery.AcceptanceArtifact is AcceptanceArtifact
+    assert change_delivery_review.AcceptanceArtifact is AcceptanceArtifact
     assert run_acceptance.AcceptanceArtifact is AcceptanceArtifact
 
 
