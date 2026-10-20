@@ -335,11 +335,11 @@ _Avoid_: 第二份 Delivery Run state、Action 队列、无界事件日志、用
 _Avoid_: workspace 全局长锁、等待锁、跨外部副作用持锁、仓库 Git 协调、Runner Management Lock
 
 **Task Control Reconciliation（任务控制对账）**:
-Task Control Record 缺失、损坏或与 Host/Run receipt 不一致时，下一次公开生命周期命令在接受新 Action 前执行的确定性恢复边界。它只比较准确 Delivery Run 的 Action Application Receipt、Executor Host ownership 与可验证的执行代次；证据足够时原子补回控制记录并继续本次命令，证据不足时 fail closed 并给出可定位诊断，不猜测旧 Executor 已退出、不启动第二个 Agent。`status` 与 `history` 不执行该对账、不修复或写入状态。
+下一次公开生命周期命令在接受新 Action 前，对唯一同库 Task Control 权威及其准确 Delivery Run 绑定执行的一致性核验边界。Action Application Receipt 只能核验已接受 Action 的业务应用事实，不能重建控制权威、Executor ownership 或退出证明。现有 Run 或 Receipt 要求控制权威而该权威缺失、损坏或绑定不一致时 fail closed，并给出可定位诊断；不从业务 Receipt 补造授权、不猜测旧 Executor 已退出、不启动后继。`status` 与 `history` 不执行修复或写入状态。
 _Avoid_: 只读查询隐式修复、删除 busy 标记冒充恢复、裸 PID 猜测、无法确认时启动新 Executor、重放业务 Action
 
 **Action Application Receipt（动作应用凭据）**:
-Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可歧义事实，证明该 Action identity 对应的命令特定业务意图已经幂等应用。它只用于在 Run state 已提交而 Task Control 尚未收口的崩溃窗口中补完原 Action，不能授权 Publisher、代替 Action Receipt View、参与 Action history 展示或复制完整 Action payload；Task Control Record 只引用它，不重新解释业务状态。对最终批准而言，它只证明批准意图已应用，不单独证明完整交付成功，也不能替代合并与收尾的结果确认。
+Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可歧义事实，证明该 Action identity 对应的命令特定业务意图已经幂等应用。它用于在已有同库控制权威下核验原 Action 的应用与收口，不能重建缺失控制记录或恢复授权，也不能授权 Publisher、代替 Action Receipt View、参与 Action history 展示或复制完整 Action payload；Task Control Record 只引用它，不重新解释业务状态。相关控制与业务变化按同库短事务合同提交，不依赖两份存储之间的补偿恢复。对最终批准而言，它只证明批准意图已应用，不单独证明完整交付成功，也不能替代合并与收尾的结果确认。
 _Avoid_: 用户回执、Action history、第二份业务状态、重放业务意图、Publisher authority
 
 **Action Receipt（动作回执）**:
