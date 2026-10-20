@@ -15,10 +15,10 @@ from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import (
     Controller,
-    _change_job_for_invocation,
     _resume_agent_human_blocker,
     _validated_human_response,
 )
+from agent_run.work_facts import locate_invocation_owner
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.human_responses import current_human_response_history
 from agent_run.cli_surface import _resume_is_ready
@@ -174,14 +174,14 @@ def test_parent_revision_reset_binds_invocations_to_the_new_generation() -> None
         2,
     )
     state["parent_job"] = job
-    assert _change_job_for_invocation(
+    assert locate_invocation_owner(
         state,
-        {"work_subject": "parent-only:run-1", "generation": 2},
-    ) is job
+        {"role": "development", "work_subject": "parent-only:run-1", "generation": 2},
+    ).owner is job
     with pytest.raises(ValueError, match="generation is stale"):
-        _change_job_for_invocation(
+        locate_invocation_owner(
             state,
-            {"work_subject": "parent-only:run-1", "generation": 1},
+            {"role": "development", "work_subject": "parent-only:run-1", "generation": 1},
         )
 
 

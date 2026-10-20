@@ -5,7 +5,98 @@ integration scene. They never become a second persisted lifecycle.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
+
+
+class InvocationOwner(NamedTuple):
+    owner: dict[str, Any]
+    publication_mirror: dict[str, Any] | None = None
+
+
+def locate_invocation_owner(
+    state: dict[str, Any], invocation: dict[str, Any],
+) -> InvocationOwner:
+    """Borrow the exact current owner of an Invocation's bound work.
+
+    This does not select work, check its phase or authorize continuation. The
+    Invocation's original Attempt version need not equal the current version.
+    Only Ticket Publication exposes a distinct selected mirror for its caller.
+    """
+    subject = invocation.get("work_subject")
+    generation = invocation.get("generation")
+    role = invocation.get("role")
+    run_id = state.get("run_id")
+    if role == "reviewer":
+        if subject != f"run-acceptance:{run_id}":
+            raise ValueError("Run Acceptance Invocation work_subject is invalid")
+        owner = state.get("run_acceptance")
+        if not isinstance(owner, dict):
+            raise ValueError("current Run Acceptance job is missing")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("current Agent Invocation generation is invalid")
+        current_generation = owner.get("acceptance_generation")
+    else:
+        publication = role in {"publication", "final_publication"}
+        if publication:
+            if not isinstance(subject, str) or not subject.strip():
+                raise ValueError("current Publication Invocation work_subject is missing")
+            if type(generation) is not int or generation < 1:
+                raise ValueError("current Publication Invocation generation is invalid")
+        elif not isinstance(subject, str) or type(generation) is not int or generation < 1:
+            raise ValueError("current Change Job Invocation identity is invalid")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("Delivery Run ID is missing")
+        family = "Publication" if publication else "Change Job"
+        label = "Publication job" if publication else "Change Job"
+        if role == "final_publication":
+            if subject != f"run-publication:{run_id}":
+                raise ValueError("Final Publication Invocation work_subject is invalid")
+            owner = state.get("run_publication")
+            if not isinstance(owner, dict):
+                raise ValueError("current Final Publication job is missing")
+            acceptance = state.get("run_acceptance")
+            current_generation = (
+                acceptance.get("acceptance_generation", 1) if isinstance(acceptance, dict) else None
+            )
+        elif subject.startswith("ticket:"):
+            ticket_text = subject.removeprefix("ticket:")
+            if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
+                prefix = "Ticket Publication" if publication else "current Ticket Change Job"
+                raise ValueError(f"{prefix} Invocation work_subject is invalid")
+            jobs = state.get("ticket_jobs")
+            owner = jobs.get(ticket_text) if isinstance(jobs, dict) else None
+            if not isinstance(owner, dict) or owner.get("ticket_number") != int(ticket_text):
+                raise ValueError(f"current Ticket {label} is missing")
+            current_generation = owner.get("ticket_branch_generation")
+        elif subject == f"parent-only:{run_id}":
+            owner = state.get("parent_job")
+            if not isinstance(owner, dict):
+                raise ValueError(f"current Parent-only {label} is missing")
+            current_generation = owner.get("parent_generation", 1)
+        elif subject == f"run-repair:{run_id}":
+            acceptance = state.get("run_acceptance")
+            owner = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+            if not isinstance(owner, dict):
+                raise ValueError(f"current Run Repair {label} is missing")
+            current_generation = owner.get("repair_generation")
+        elif subject == f"run-integration:{run_id}" and role == "development":
+            owner = state.get("run_acceptance")
+            if not isinstance(owner, dict):
+                raise ValueError("current Run Acceptance job is missing")
+            current_generation = owner.get("acceptance_generation")
+        else:
+            raise ValueError(f"{family} Invocation work_subject is invalid")
+    if type(current_generation) is not int or generation != current_generation:
+        raise ValueError("Publication Invocation generation is stale")
+    if role == "publication" and subject.startswith("ticket:"):
+        active = state.get("active_ticket_job")
+        if (
+            isinstance(active, dict)
+            and active.get("ticket_number") == owner["ticket_number"]
+            and active is not owner
+        ):
+            return InvocationOwner(owner, active)
+    return InvocationOwner(owner)
 
 
 class TicketDispatchJob(dict[str, Any]):

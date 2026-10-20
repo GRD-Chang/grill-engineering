@@ -9,7 +9,7 @@ from typing import Any, Callable, Literal, Protocol, cast
 
 from agent_run.resume_work import continuation_phase
 from agent_run.sqlite_change_job_gates import CURRENTNESS_REASONS, retains_run_control
-from agent_run.work_facts import work_phase
+from agent_run.work_facts import locate_invocation_owner, work_phase
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
@@ -1779,13 +1779,7 @@ def _bind_resume_message(
         generation = _subject_generation(subject)
     elif (isinstance(invocation, dict) and invocation.get("status") != "completed"
           and not is_ticket_execution_recovery(state, state.get("status"))):
-        role = invocation.get("role")
-        if role == "reviewer":
-            subject = _run_acceptance_for_invocation(state, invocation)
-        elif role in {"publication", "final_publication"}:
-            subject, _mirror = _publication_job_for_invocation(state, invocation)
-        else:
-            subject = _change_job_for_invocation(state, invocation)
+        subject = locate_invocation_owner(state, invocation).owner
         generation = int(invocation["generation"])
     else:
         from agent_run.resume_work import resume_message_owner
@@ -2459,7 +2453,7 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
                 return  # A saved response retains its original Thread for closeout.
     role = invocation.get("role")
     if role == "reviewer":
-        run = _run_acceptance_for_invocation(state, invocation)
+        run = locate_invocation_owner(state, invocation).owner
         # The returned result still owns this Attempt. Consume it before
         # choosing a Thread for any further Reviewer work.
         if isinstance(run.get("pending_review_result"), dict):
@@ -2476,7 +2470,7 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         )
         return
     if role in {"development", "fresh_acceptance"}:
-        job = _change_job_for_invocation(state, invocation)
+        job = locate_invocation_owner(state, invocation).owner
         if role == "development":
             from agent_run.work_facts import integration_scene
             scene = integration_scene(job)
@@ -2499,7 +2493,7 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         return
     if role not in {"publication", "final_publication"}:
         raise ValueError("--new-thread requires a current Agent Invocation")
-    job, mirror = _publication_job_for_invocation(state, invocation)
+    job, mirror = locate_invocation_owner(state, invocation)
     if invocation.get("role") == "final_publication":
         job.pop("thread_id", None)
         job.pop("publication_failure_resume", None)
@@ -2574,7 +2568,7 @@ def _restore_current_invocation_thread(
         return
     role = invocation.get("role")
     if role == "reviewer":
-        run = _run_acceptance_for_invocation(state, invocation)
+        run = locate_invocation_owner(state, invocation).owner
         thread_id = invocation.get("reported_thread_id") or invocation.get(
             "requested_thread_id"
         )
@@ -2591,7 +2585,7 @@ def _restore_current_invocation_thread(
         )
         return
     if role in {"development", "fresh_acceptance"}:
-        job = _change_job_for_invocation(state, invocation)
+        job = locate_invocation_owner(state, invocation).owner
         thread_id = invocation.get("reported_thread_id") or invocation.get(
             "requested_thread_id"
         )
@@ -2610,7 +2604,7 @@ def _restore_current_invocation_thread(
             job["review_new_thread"] = False
             job["review_failure_resume"] = True
         return
-    job, mirror = _publication_job_for_invocation(state, invocation)
+    job, mirror = locate_invocation_owner(state, invocation)
     thread_id = invocation.get("reported_thread_id") or invocation.get(
         "requested_thread_id"
     )
@@ -2686,22 +2680,6 @@ def _restore_parallel_ticket_invocations(state: dict[str, Any]) -> None:
     state["active_agent_invocation"] = selected
 
 
-def _run_acceptance_for_invocation(
-    state: dict[str, Any], invocation: dict[str, Any]
-) -> dict[str, Any]:
-    run_id = state.get("run_id")
-    if invocation.get("work_subject") != f"run-acceptance:{run_id}":
-        raise ValueError("Run Acceptance Invocation work_subject is invalid")
-    run = state.get("run_acceptance")
-    if not isinstance(run, dict):
-        raise ValueError("current Run Acceptance job is missing")
-    generation = invocation.get("generation")
-    if type(generation) is not int or generation < 1:
-        raise ValueError("current Agent Invocation generation is invalid")
-    _require_invocation_generation(generation, run.get("acceptance_generation"))
-    return run
-
-
 def _invalidate_stale_run_invocation(
     state: dict[str, Any], invocation: dict[str, Any]
 ) -> None:
@@ -2728,130 +2706,6 @@ def _invalidate_stale_run_invocation(
             "diagnostics": [],
         }
     )
-
-
-def _publication_job_for_invocation(
-    state: dict[str, Any], invocation: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Resolve a Publication job from its persisted, unambiguous subject."""
-
-    subject = invocation.get("work_subject")
-    generation = invocation.get("generation")
-    run_id = state.get("run_id")
-    if not isinstance(subject, str) or not subject.strip():
-        raise ValueError("current Publication Invocation work_subject is missing")
-    if type(generation) is not int or generation < 1:
-        raise ValueError("current Publication Invocation generation is invalid")
-    if not isinstance(run_id, str) or not run_id:
-        raise ValueError("Delivery Run ID is missing")
-
-    role = invocation.get("role")
-    if role == "final_publication":
-        if subject != f"run-publication:{run_id}":
-            raise ValueError("Final Publication Invocation work_subject is invalid")
-        publication = state.get("run_publication")
-        if not isinstance(publication, dict):
-            raise ValueError("current Final Publication job is missing")
-        acceptance = state.get("run_acceptance")
-        current_generation = (
-            acceptance.get("acceptance_generation", 1)
-            if isinstance(acceptance, dict)
-            else None
-        )
-        _require_invocation_generation(generation, current_generation)
-        return publication, None
-    if role != "publication":
-        raise ValueError("current Publication Invocation role is invalid")
-
-    if subject.startswith("ticket:"):
-        ticket_text = subject.removeprefix("ticket:")
-        if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
-            raise ValueError("Ticket Publication Invocation work_subject is invalid")
-        ticket_number = int(ticket_text)
-        jobs = state.get("ticket_jobs")
-        job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
-        if not isinstance(job, dict) or job.get("ticket_number") != ticket_number:
-            raise ValueError("current Ticket Publication job is missing")
-        _require_invocation_generation(generation, job.get("ticket_branch_generation"))
-        active = state.get("active_ticket_job")
-        mirror = (
-            active
-            if isinstance(active, dict)
-            and active.get("ticket_number") == ticket_number
-            and active is not job
-            else None
-        )
-        return job, mirror
-
-    if subject == f"parent-only:{run_id}":
-        parent = state.get("parent_job")
-        if not isinstance(parent, dict):
-            raise ValueError("current Parent-only Publication job is missing")
-        _require_invocation_generation(generation, parent.get("parent_generation", 1))
-        return parent, None
-
-    if subject == f"run-repair:{run_id}":
-        acceptance = state.get("run_acceptance")
-        repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-        if not isinstance(repair, dict):
-            raise ValueError("current Run Repair Publication job is missing")
-        _require_invocation_generation(generation, repair.get("repair_generation"))
-        return repair, None
-
-    raise ValueError("Publication Invocation work_subject is invalid")
-
-
-def _change_job_for_invocation(
-    state: dict[str, Any], invocation: dict[str, Any]
-) -> dict[str, Any]:
-    """Resolve a Change Job for Development or Fresh Acceptance resume."""
-
-    subject = invocation.get("work_subject")
-    generation = invocation.get("generation")
-    run_id = state.get("run_id")
-    if not isinstance(subject, str) or type(generation) is not int or generation < 1:
-        raise ValueError("current Change Job Invocation identity is invalid")
-    if not isinstance(run_id, str) or not run_id:
-        raise ValueError("Delivery Run ID is missing")
-    if subject.startswith("ticket:"):
-        ticket_text = subject.removeprefix("ticket:")
-        if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
-            raise ValueError(
-                "current Ticket Change Job Invocation work_subject is invalid"
-            )
-        jobs = state.get("ticket_jobs")
-        job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
-        if not isinstance(job, dict) or job.get("ticket_number") != int(ticket_text):
-            raise ValueError("current Ticket Change Job is missing")
-        _require_invocation_generation(generation, job.get("ticket_branch_generation"))
-        return job
-    if subject == f"parent-only:{run_id}":
-        job = state.get("parent_job")
-        if not isinstance(job, dict):
-            raise ValueError("current Parent-only Change Job is missing")
-        _require_invocation_generation(generation, job.get("parent_generation", 1))
-        return job
-    if subject == f"run-repair:{run_id}":
-        acceptance = state.get("run_acceptance")
-        job = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-        if not isinstance(job, dict):
-            raise ValueError("current Run Repair Change Job is missing")
-        _require_invocation_generation(generation, job.get("repair_generation"))
-        return job
-    if subject == f"run-integration:{run_id}" and invocation.get("role") == "development":
-        acceptance = state.get("run_acceptance")
-        if not isinstance(acceptance, dict):
-            raise ValueError("current Run Acceptance job is missing")
-        _require_invocation_generation(
-            generation, acceptance.get("acceptance_generation")
-        )
-        return acceptance
-    raise ValueError("Change Job Invocation work_subject is invalid")
-
-
-def _require_invocation_generation(invocation: int, current: object) -> None:
-    if type(current) is not int or invocation != current:
-        raise ValueError("Publication Invocation generation is stale")
 
 
 def _resume_change_job(
