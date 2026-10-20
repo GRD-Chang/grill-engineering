@@ -263,7 +263,7 @@ def _status(document: QueryDocument, rich: bool) -> Iterator[Node]:
         yield Label(copy('presentation.status.approve_merge'), text) if rich else Line(f"  {terminal_safe(text)}")
     timing = status_timing(state)
     if "total_seconds" in timing:
-        value = status._duration(timing['total_seconds'])
+        value: object = status._duration(timing['total_seconds'])
         yield _field(rich, copy('presentation.status.total_agent_execution_time'), value,
                      copy('presentation.status.total_agent_execution_time_v1', v1=value))
     elif timing.get("execution_timing_complete") is False:
@@ -285,7 +285,7 @@ def _status(document: QueryDocument, rich: bool) -> Iterator[Node]:
         yield Line(f"  {progress}")
         for line in status._multi_ticket_lines(view):
             yield Line(f"  {terminal_safe(line)}")
-    rounds = view.get("round_progress") if rich else view["round_progress"]
+    rounds: Any = view.get("round_progress") if rich else view["round_progress"]
     if (isinstance(rounds, dict) if rich else rounds is not None) and state.get("status") != "completed":
         if rich:
             yield Label(copy('presentation.status.execution_allowance'), "；".join(status._round_details(rounds)))
