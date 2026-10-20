@@ -5,10 +5,11 @@ from typing import Any
 
 import pytest
 
+from agent_run.query_document import QueryDocument, emit
+
 from agent_run.delivery_history import (
     history_progress_view,
     history_records,
-    print_history_progress,
 )
 
 
@@ -121,14 +122,7 @@ def test_repair_history_does_not_use_shared_budget_position_as_round(
     assert new["round"] == 2 and new["status"] == "completed"
     assert new["details"] == []
 
-    print_history_progress(
-        state,
-        audit,
-        progress,
-        display_term=lambda value: value,
-        print_operator_action=lambda _action: None,
-        details=True,
-    )
+    emit(QueryDocument("history", state, audit, progress), style="plain", details=True)
     output = capsys.readouterr().out
     assert "验收未通过" in output
     assert "验收通过" in output

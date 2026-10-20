@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from agent_run.delivery_budget import delivery_budget_owner
 
@@ -19,33 +19,9 @@ from agent_run.execution_timing import invocation_execution_seconds, invocation_
 
 from agent_run.messages import display_text, display_language
 
-if TYPE_CHECKING:
-    from rich.text import Text
-
-from agent_run.status_actions import approval_lines, controller_work, delivery_result_lines, status_heading, status_timing
-from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation, scheduler_notice
-from agent_run.final_approval_operation import (
-    approval_failure_text,
-    final_approval_cleanup_pending,
-)
-from agent_run.operator_action_presentation import (
-    human_action_type,
-    operator_action_items,
-    human_preserved_results,
-    human_trigger_invocation,
-)
-from agent_run.presentation_helpers import (
-    human_ci_fix_usage,
-    human_delivery_object,
-    human_agent_role,
-    human_next_action,
-    human_pause_reason,
-    human_status_term,
-    local_timestamp,
-    terminal_safe,
-    status_diagnostic_command,
-    unknown_execution_guidance,
-)
+from agent_run.status_actions import status_timing
+from agent_run.waiting_presentation import cleanup_instruction
+from agent_run.presentation_helpers import human_ci_fix_usage, human_agent_role, human_pause_reason, human_status_term, terminal_safe, unknown_execution_guidance
 
 
 def _ci_recovery_usage(recovery: dict[str, Any]) -> str:
@@ -192,456 +168,6 @@ def execution_guidance(
     return unknown_execution_guidance(state, include_command=include_resume_command)
 
 
-def print_status_progress(
-    state: dict[str, Any],
-    audit: dict[str, Any],
-    view: dict[str, Any],
-    *,
-    display_term: Callable[[object], object],
-    print_operator_action: Callable[[dict[str, Any]], None],
-) -> None:
-    parent = view["parent"]
-    print(display_text('presentation.status.repository_v1', v1=_terminal_safe(view['repository'] or display_text('presentation.status.unknown'))))
-    print(
-        display_text('presentation.status.parent_issue_v1_v3', v1=_terminal_safe(parent.get('number', '?')), v3=_terminal_safe(parent.get('title') or display_text('presentation.status.untitled_requirement')))
-    )
-    status_label = (
-        display_text('presentation.status.merged_cleanup_pending') if state.get("status") == "completed"
-        and final_approval_cleanup_pending(state) else display_term(view["status"])
-    )
-    status_label = status_heading(state, view, status_label)
-    print(display_text('presentation.status.status_v1', v1=_terminal_safe(status_label)))
-    if notice := scheduler_notice(view.get("scheduler")):
-        print(notice)
-    for result in delivery_result_lines(state):
-        print(display_text('presentation.status.delivery_result_v1', v1=result))
-    phase = _phase_term(view["phase"], view["current_object"], display_term)
-    print(
-        display_text('presentation.status.phase_v1', v1=_terminal_safe(phase if phase is not None else display_text('presentation.status.no_specific_phase_yet')))
-    )
-    print(display_text('presentation.status.conclusion_v1', v1=_terminal_safe(_human_conclusion(view['conclusion']))))
-    print(display_text('presentation.status.current_object_v1', v1=_terminal_safe(human_delivery_object(view['current_object']))))
-
-    for detail in approval_lines(state):
-        print(f"  {detail}")
-    control = audit.get("executor_control")
-    failure = control.get("approval_failure") if isinstance(control, dict) else None
-    if isinstance(failure, dict):
-        print(f"  {_terminal_safe(approval_failure_text(failure))}")
-    timing = status_timing(state)
-    if "total_seconds" in timing:
-        print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
-    elif timing.get("execution_timing_complete") is False:
-        print(display_text('presentation.status.timing_incomplete'))
-        if type(timing.get("recorded_execution_seconds")) is int:
-            print(display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds'])))
-    print(display_text('presentation.status.nprogress'))
-    print(f"  {_ticket_progress_text(state, view)}")
-    for line in _multi_ticket_lines(view):
-        print(f"  {_terminal_safe(line)}")
-    rounds = view["round_progress"]
-    if rounds is not None and state.get("status") != "completed":
-        print(display_text('presentation.status.nexecution_allowance'))
-        for line in _round_details(rounds):
-            print(f"  {_terminal_safe(line)}")
-    integration = view.get("integration_development")
-    if isinstance(integration, dict):
-        print(display_text("presentation.status.integration_development_usage",
-                           used=integration.get("used"), limit=integration.get("limit"),
-                           window=integration.get("window")))
-    resync = view.get("integration_resync")
-    if isinstance(resync, dict):
-        print(display_text('presentation.status.integration_resync_usage',
-                           used=resync.get('used'), limit=resync.get('limit'),
-                           window=resync.get('window')))
-    ci_recovery = view.get("ci_recovery")
-    if isinstance(ci_recovery, dict):
-        print(_ci_recovery_usage(ci_recovery))
-        for detail in _ci_recovery_details(ci_recovery):
-            print(detail)
-    if view["elapsed_seconds"] is not None:
-        print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
-
-    repair = view["run_repair"]
-    if repair is not None:
-        print(display_text('presentation.status.nrun_repair'))
-        print(
-            display_text('presentation.status.current_candidate_acceptance_v1', v1=_terminal_safe(display_term(repair['candidate_validation_status'])))
-        )
-        print(
-            display_text('presentation.status.code_modifications_v1_v3', v1=repair['code_modification_attempts'], v3=repair['code_modification_limit'])
-        )
-
-    automatic_work = controller_work(state, audit)
-    wait_view = waiting_presentation(state, audit)
-    if wait_view is not None:
-        print(display_text('presentation.status.ncurrent_work'))
-        print(f"  {_terminal_safe(wait_view.work)}")
-        print(f"  {_terminal_safe(wait_view.activity)}")
-        for label, text in wait_view.details:
-            print(f"  {_terminal_safe(label)}：{_terminal_safe(text)}")
-        _print_cleanup(audit.get("delivery_cleanup"))
-        _print_scope_change(audit.get("scope_change"))
-        print(display_text('presentation.status.nnext_step'))
-        print(f"  {_terminal_safe(wait_view.guidance)}")
-        actions = operator_action_items(audit)
-        if actions:
-            for action in actions:
-                print_operator_action(action)
-        elif wait_view.show_command:
-            print(f"  {_terminal_safe(view['next_action'])}")
-        _print_findings(view["findings"])
-        return
-
-    print(display_text('presentation.status.ncurrent_work'))
-    executor_control = audit.get("executor_control")
-    if (
-        isinstance(executor_control, dict)
-        and executor_control.get("activity") == "unknown"
-        and state.get("status") != "completed"
-    ):
-        print(display_text('presentation.status.agent_activity_unknown_execution_status_cannot_be_confirmed'))
-    activity = view["execution_activity"]
-    if activity == "interrupted":
-        print(display_text('presentation.status.execution_interrupted_waiting_to_resume_24'))
-    if automatic_work:
-        print(f"  {automatic_work}")
-    agent = view["current_agent"]
-    if state.get("status") == "completed":
-        agent = None
-    if agent is None:
-        print(display_text('presentation.status.no_agent_is_currently_running'))
-    else:
-        agent_label = display_text('presentation.status.current_agent') if agent["is_active"] else display_text('presentation.status.latest_agent')
-        print(
-            f"  {agent_label}: {_terminal_safe(human_agent_role(agent['role']))} · "
-            f"{_terminal_safe(human_delivery_object(agent['object']))}"
-        )
-        print(display_text('presentation.status.model_v1', v1=_terminal_safe(agent['model'])))
-        print(display_text('presentation.status.reasoning_effort_v1', v1=_terminal_safe(agent['reasoning_effort'])))
-        if agent.get("started_at"):
-            print(display_text('presentation.status.started_at_v1', v1=local_timestamp(agent['started_at'])))
-        if agent["duration_seconds"] is not None:
-            duration_label = display_text('presentation.status.round_execution_time')
-            print(f"  {duration_label:<20}{_duration(agent['duration_seconds'])}")
-        if agent["remaining_seconds"] is not None:
-            print(display_text('presentation.status.round_time_remaining_v1', v1=_duration(agent['remaining_seconds'])))
-        for detail in agent["recovery_details"]:
-            print(f"  {_terminal_safe(detail)}")
-
-    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
-        print(display_text('presentation.status.nnext_step'))
-        print(f"  {_terminal_safe(execution_guidance(state, activity))}")
-        _print_findings(view["findings"])
-        return
-
-    operator_action = audit.get("operator_action")
-    if not isinstance(operator_action, dict):
-        _print_cleanup(audit.get("delivery_cleanup"))
-        _print_scope_change(audit.get("scope_change"))
-        print(display_text('presentation.status.nnext_step'))
-        cleanup = audit.get("delivery_cleanup")
-        if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
-            print(display_text('presentation.status.inspect_cleanup_diagnostics_in_json_prepare_the_managed_checkout_'))
-            print(
-                display_text('presentation.status.recovery_command_v1', v1=_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id'))))
-            )
-        elif activity != "running" and not automatic_work:
-            print(
-                display_text('presentation.status.next_step_v1', v1=_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id'))))
-            )
-        current_invocation = audit.get("agent_invocation")
-        running_invocation = (
-            current_invocation if isinstance(current_invocation, dict) else None
-        )
-        print(
-            "  "
-            f"{automatic_work or _operator_instruction(state, running_invocation)}"
-        )
-        _print_findings(view["findings"])
-        return
-
-    _print_scope_change(audit.get("scope_change"))
-    print()
-    for action in operator_action_items(audit):
-        print_operator_action(action)
-    _print_findings(view["findings"])
-
-
-def print_rich_status_progress(
-    state: dict[str, Any],
-    audit: dict[str, Any],
-    view: dict[str, Any],
-) -> None:
-    """Render one static status card for an interactive terminal."""
-
-    from rich.console import Console, Group
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-
-    # Let Rich wrap Text within panels instead of treating long values as
-    # no-wrap content and clipping their business data at the panel edge.
-    console = Console(highlight=False, soft_wrap=False)
-    raw_status = str(view.get("status") or "")
-    status_style = _status_style(raw_status)
-    status_label = (
-        display_text('presentation.status.merged_cleanup_pending') if raw_status == "completed"
-        and final_approval_cleanup_pending(state) else _status_term(raw_status)
-    )
-
-    status_label = status_heading(state, view, status_label)
-    parent = view.get("parent")
-    parent_view = parent if isinstance(parent, dict) else {}
-    identity = Table.grid(expand=True, padding=(0, 1))
-    narrow = console.width < 72
-    if narrow:
-        identity.add_column(ratio=1, overflow="fold")
-    else:
-        identity.add_column(style="bold", no_wrap=True)
-        identity.add_column(ratio=1, overflow="fold")
-
-    def add_identity(label: str, value: object) -> None:
-        if narrow:
-            identity.add_row(_rich_labeled(label, value))
-        else:
-            identity.add_row(label, _rich_value(value))
-
-    add_identity(
-        display_text('presentation.status.task'),
-        f"{view.get('repository') or 'unknown'} · "
-        f"#{parent_view.get('number', '?')} "
-        f"{parent_view.get('title') or display_text('presentation.status.untitled_requirement')}",
-    )
-    add_identity(
-        display_text('presentation.status.status'),
-        f"{_status_symbol(raw_status)} {_human_conclusion(view.get('conclusion'))} · "
-        f"{status_label}",
-    )
-    add_identity(
-        display_text('presentation.status.phase'),
-        _phase_term(view.get("phase"), view.get("current_object"), _status_term)
-        or display_text('presentation.status.no_specific_phase_yet'),
-    )
-    add_identity(display_text('presentation.status.current_object'), human_delivery_object(view.get("current_object")))
-    if notice := scheduler_notice(view.get("scheduler")):
-        add_identity(display_text('presentation.status.status'), notice)
-
-    for result in delivery_result_lines(state):
-        add_identity(display_text('presentation.status.delivery_result'), result)
-    for detail in approval_lines(state):
-        add_identity(display_text('presentation.status.approve_merge'), detail)
-    control = audit.get("executor_control")
-    failure = control.get("approval_failure") if isinstance(control, dict) else None
-    if isinstance(failure, dict):
-        add_identity(
-            display_text('presentation.status.approve_merge'),
-            approval_failure_text(failure),
-        )
-    timing = status_timing(state)
-    if "total_seconds" in timing:
-        add_identity(display_text('presentation.status.total_agent_execution_time'), _duration(timing["total_seconds"]))
-    elif timing.get("execution_timing_complete") is False:
-        detail = display_text('presentation.status.timing_incomplete')
-        if type(timing.get("recorded_execution_seconds")) is int:
-            detail += " · " + display_text('presentation.status.recorded_execution_time', v1=_duration(timing['recorded_execution_seconds']))
-        add_identity(display_text('presentation.status.total_agent_execution_time'), detail)
-    progress_text = _ticket_progress_text(state, view)
-    rounds = view.get("round_progress")
-    if isinstance(rounds, dict) and state.get("status") != "completed":
-        add_identity(display_text('presentation.status.execution_allowance'), "；".join(_round_details(rounds)))
-    integration = view.get("integration_development")
-    if isinstance(integration, dict):
-        add_identity(display_text("presentation.status.integration_development_label"),
-                     display_text("presentation.status.integration_development_usage",
-                                  used=integration.get("used"), limit=integration.get("limit"),
-                                  window=integration.get("window")))
-    resync = view.get("integration_resync")
-    if isinstance(resync, dict):
-        add_identity(display_text('presentation.status.integration_resync_label'),
-                     display_text('presentation.status.integration_resync_values',
-                                  used=resync.get('used'), limit=resync.get('limit'),
-                                  window=resync.get('window')))
-    ci_recovery = view.get("ci_recovery")
-    if isinstance(ci_recovery, dict):
-        add_identity(display_text('presentation.status.ci_recovery_label'),
-                     _ci_recovery_usage(ci_recovery))
-        for detail in _ci_recovery_details(ci_recovery):
-            add_identity(display_text('presentation.status.ci_recovery_label'), detail)
-    repair = view.get("run_repair")
-    if isinstance(repair, dict):
-        progress_text += (
-            display_text('presentation.status.run_repair_candidate_acceptance_v1_code_modifications_v3_v5', v1=_status_term(repair.get('candidate_validation_status')), v3=repair.get('code_modification_attempts'), v5=repair.get('code_modification_limit'))
-        )
-    if view.get("elapsed_seconds") is not None:
-        progress_text += display_text('presentation.status.task_elapsed_time_v1_48', v1=_duration(view['elapsed_seconds']))
-    add_identity(display_text('presentation.status.overall_progress'), progress_text)
-    ticket_lines = _multi_ticket_lines(view)
-    if ticket_lines:
-        add_identity(display_text('presentation.status.ticket_details'), "\n".join(ticket_lines))
-
-    automatic_work = controller_work(state, audit)
-    wait_view = waiting_presentation(state, audit)
-    agent = view.get("current_agent") if state.get("status") != "completed" else None
-    if wait_view is not None:
-        agent_text = f"{wait_view.work}\n{wait_view.activity}"
-    elif isinstance(agent, dict):
-        label = display_text('presentation.status.current_agent') if agent.get("is_active") else display_text('presentation.status.latest_agent')
-        agent_text = (
-            display_text('presentation.status.v0_v2_v4_nmodel_v6_reasoning_effort_v8_n', v0=label, v2=human_agent_role(agent.get('role')), v4=human_delivery_object(agent.get('object')), v6=agent.get('model') or display_text('presentation.status.unbound'), v8=agent.get('reasoning_effort') or display_text('presentation.status.unbound'))
-
-        )
-        if agent.get("duration_seconds") is not None:
-            agent_text += display_text('presentation.status.round_execution_time_v1', v1=_duration(agent['duration_seconds']))
-        if agent.get("started_at"):
-            agent_text += display_text('presentation.status.started_at_v1_52', v1=local_timestamp(agent['started_at']))
-        if agent.get("remaining_seconds") is not None:
-            agent_text += display_text('presentation.status.round_time_remaining_v1_53', v1=_duration(agent['remaining_seconds']))
-        recovery_details = agent.get("recovery_details")
-        if isinstance(recovery_details, list):
-            agent_text += "\n" + "\n".join(str(item) for item in recovery_details)
-    else:
-        agent_text = display_text('presentation.status.no_confirmed_agent_work_record')
-    add_identity(display_text('presentation.status.current_work'), automatic_work or agent_text)
-
-    console.print(
-        Panel(
-            identity,
-            title=Text(display_text('presentation.status.agent_run_delivery_status'), style="bold"),
-            border_style=status_style,
-            expand=True,
-        )
-    )
-
-    action = audit.get("operator_action")
-    activity = view.get("execution_activity")
-    control = audit.get("executor_control")
-    unknown_wait = (
-        wait_view is not None and isinstance(control, dict)
-        and control.get("activity") == "unknown" and not isinstance(state.get("supervision_wait"), dict)
-    )
-    needs_diagnostic = activity == "unknown" or unknown_wait
-    agent_running = (automatic_work is not None or (wait_view is None and activity == "running")) and not isinstance(action, dict)
-    command = (
-        status_diagnostic_command(state) if needs_diagnostic else view.get("next_action")
-        or (action.get("next_action") if isinstance(action, dict) else None)
-    )
-    command_line = _rich_labeled(display_text('presentation.status.command'), command)
-    action_lines: list[Text] = []
-    if wait_view is not None and not isinstance(action, dict):
-        action_lines.append(_rich_value(
-            unknown_execution_guidance(state, include_command=False)
-            if unknown_wait else wait_view.guidance
-        ))
-    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"} and not operator_action_items(audit):
-        action_lines.append(
-            _rich_value(
-                execution_guidance(
-                    state, str(activity), include_resume_command=False
-                )
-            )
-        )
-    elif isinstance(action, dict):
-        for action in operator_action_items(audit):
-            action_lines.append(_rich_value(display_text("presentation.status.object_v1", v1=human_delivery_object(action.get("object")))))
-            action_lines.append(
-                _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
-            )
-            for reason in action.get("reasons", []):
-                message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
-                action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
-            action_lines.append(
-                _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
-            )
-            action_lines.append(
-                _rich_labeled(
-                    display_text('presentation.status.blocked_phase'),
-                    _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
-                )
-            )
-            triggering = action.get("trigger_invocation")
-            if isinstance(triggering, dict):
-                action_lines.append(
-                    _rich_labeled(
-                        display_text('presentation.status.agent_that_triggered_the_blocker'),
-                        human_trigger_invocation(triggering),
-                    )
-                )
-            if action.get("scope") == "global":
-                action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
-            else:
-                action_lines.append(Text(display_text('presentation.status.local_operator_gate')))
-            if action.get("type") == "Review Budget Checkpoint":
-                action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
-            action_lines.append(_rich_labeled(display_text('presentation.status.command'), action.get("next_action")))
-    else:
-        action_lines.append(
-            _rich_value(automatic_work or _operator_instruction(state, audit.get("agent_invocation")))
-        )
-    if wait_view is not None:
-        action_lines.extend(_rich_labeled(label, text) for label, text in wait_view.details)
-    cleanup = audit.get("delivery_cleanup")
-    if isinstance(cleanup, dict):
-        cleanup_status = {
-            "completed": display_text('presentation.status.completed'), "cleanup_pending": display_text('presentation.status.cleanup_pending'), "pending": display_text('presentation.status.pending'),
-        }.get(str(cleanup.get("status")), cleanup.get("status"))
-        action_lines.append(_rich_labeled(display_text('presentation.status.workspace_cleanup'), cleanup_status))
-        reason = _cleanup_reason(cleanup)
-        if reason:
-            action_lines.append(_rich_labeled(display_text('presentation.status.preservation_reason'), reason))
-        for path in _cleanup_paths(cleanup):
-            action_lines.append(_rich_labeled(display_text('presentation.status.workspace_requiring_attention'), path))
-    scope_change = audit.get("scope_change")
-    if isinstance(scope_change, dict):
-        summary = scope_change.get("graph_change_summary")
-        action_lines.append(
-            _rich_labeled(
-                display_text('presentation.status.task_and_dependency_changes'),
-                summary.get("summary") if isinstance(summary, dict) else display_text('presentation.status.see_json'),
-            )
-        )
-    # Put the executable next step before the detailed action panel so it is
-    # visible in the first screen. Keep it outside Rich panels so wrapping
-    # never inserts copy-breaking borders, padding, or hard newlines.
-    if not agent_running and command and command != "无" and (
-        needs_diagnostic or wait_view is None or wait_view.show_command or isinstance(action, dict)
-    ):
-        console.file.write(command_line.plain + "\n")
-    console.print(
-        Panel(
-            Group(*action_lines),
-            title=Text(display_text('presentation.status.next_step'), style="bold yellow"),
-            border_style="yellow" if action is not None else "cyan",
-            expand=True,
-        )
-    )
-
-    findings = view.get("findings")
-    finding_values = findings if isinstance(findings, list) else []
-    finding_renderables: list[Text] = []
-    if not finding_values:
-        finding_renderables.append(Text(display_text('presentation.status.no_findings_for_this_work_and_current_candidate')))
-    else:
-        for index, finding in enumerate(finding_values, start=1):
-            finding_renderables.append(Text(f"{index}.", style="bold red"))
-            match = _FINDING_PARTS.fullmatch(str(finding))
-            if match is None:
-                finding_renderables.append(_rich_value(finding))
-                continue
-            for label, value in zip(
-                (display_text('presentation.status.problem'), display_text('presentation.status.evidence'), display_text('presentation.status.required_fix'), display_text('presentation.status.revalidation')), match.groups()
-            ):
-                finding_renderables.append(_rich_labeled(label, value))
-    console.print(
-        Panel(
-            Group(*finding_renderables),
-            title=Text(display_text('presentation.status.current_findings_v1', v1=len(finding_values)), style="bold"),
-            border_style="red" if finding_values else "bright_black",
-            expand=True,
-        )
-    )
-
-
 def _status_style(value: object) -> str:
     return {
         "completed": "green",
@@ -674,29 +200,10 @@ def _status_style(value: object) -> str:
     }.get(str(value), "cyan")
 
 
-def _rich_value(value: object) -> Text:
-    from rich.text import Text
-
-    return Text(_terminal_safe(display_text('presentation.status.unknown') if value is None else value))
-
-
-def _rich_labeled(label: object, value: object) -> Text:
-    from rich.text import Text
-
-    text = Text()
-    text.append(f"{_terminal_safe(label)}：", style="bold")
-    text.append(_terminal_safe(display_text('presentation.status.unknown') if value is None else value))
-    return text
-
-
 def _terminal_safe(value: object) -> str:
     """Keep persisted/user text from injecting terminal control sequences."""
 
     return terminal_safe(value)
-
-
-def _rich_preserved_results(value: object) -> str:
-    return human_preserved_results(value)
 
 
 def _status_symbol(value: str) -> str:
@@ -707,10 +214,6 @@ def _status_symbol(value: str) -> str:
     if value in {"ready_for_human", "operator_stopped", "supervision_timeout"}:
         return "?"
     return "→"
-
-
-def _status_term(value: object) -> object:
-    return human_status_term(value)
 
 
 def _phase_term(
@@ -730,10 +233,6 @@ def _human_conclusion(value: object) -> object:
     if display_language() != "zh" and isinstance(value, str):
         return display_text("presentation.conclusion." + value)
     return display_text('presentation.status.current_candidate_passed_acceptance') if value == "当前有效通过" else value
-
-
-def _human_action_type(value: object) -> str:
-    return human_action_type(value)
 
 
 def _agent_view(
@@ -1091,29 +590,6 @@ _FINDING_PARTS = re.compile(
 )
 
 
-def _print_findings(findings: object) -> None:
-    values = findings if isinstance(findings, list) else []
-    print(display_text('presentation.status.ncurrent_findings_v1', v1=len(values)))
-    if not values:
-        print(display_text('presentation.status.none_123'))
-        return
-    for index, finding in enumerate(values, start=1):
-        text = _terminal_safe(finding)
-        match = _FINDING_PARTS.fullmatch(text)
-        if match is None:
-            print(f"  {index}. {text}")
-            continue
-        print(f"  {index}.")
-        for label, value in zip(
-            (display_text('presentation.status.problem'), display_text('presentation.status.evidence'), display_text('presentation.status.required_fix'), display_text('presentation.status.revalidation')), match.groups()
-        ):
-            print(f"     {_terminal_safe(label)}：{_terminal_safe(value)}")
-
-
-def _rich_role_label(value: object) -> str:
-    return human_agent_role(value)
-
-
 def _subject_label(state: dict[str, Any], subject: str) -> str:
     return delivery_object_label(state, subject)
 
@@ -1159,25 +635,6 @@ def _operator_instruction(
     return display_text('presentation.status.continue_with_the_command_above_do_not_start_this_task_again')
 
 
-def _print_cleanup(cleanup: object) -> None:
-    if not isinstance(cleanup, dict):
-        return
-    print(display_text('presentation.status.nworkspace_cleanup'))
-    print(display_text('presentation.status.status_v1_128', v1=_terminal_safe(human_status_term(cleanup.get('status')))))
-    if cleanup.get("status") == "completed":
-        return
-    reason = _cleanup_reason(cleanup)
-    if reason:
-        print(display_text('presentation.status.preservation_reason_v1', v1=_terminal_safe(reason)))
-    items = cleanup.get("items")
-    if isinstance(items, list):
-        pending = sum(1 for item in items if isinstance(item, dict))
-        if pending:
-            print(display_text('presentation.status.preserved_v1_development_workspaces', v1=pending))
-        for path in _cleanup_paths(cleanup):
-            print(display_text('presentation.status.workspace_requiring_attention_v1', v1=_terminal_safe(path)))
-
-
 def _cleanup_paths(cleanup: dict[str, Any]) -> list[str]:
     items = cleanup.get("items")
     if cleanup.get("status") == "completed" or not isinstance(items, list):
@@ -1197,12 +654,3 @@ def _cleanup_reason(cleanup: dict[str, Any]) -> str | None:
     if any(reason in error for reason in ("tracked modifications", "untracked", "dirty checkout")):
         return display_text('presentation.status.the_checkout_has_uncommitted_files_it_has_been_preserved')
     return error if len(error) <= 240 else error[:232] + display_text('presentation.status.truncated')
-
-
-def _print_scope_change(scope_change: object) -> None:
-    if not isinstance(scope_change, dict):
-        return
-    summary = scope_change.get("graph_change_summary")
-    print(display_text('presentation.status.ntask_and_dependency_changes'))
-    if isinstance(summary, dict):
-        print(f"  {_terminal_safe(summary.get('summary'))}")

@@ -4,6 +4,8 @@ from copy import deepcopy
 
 import pytest
 
+from agent_run.query_document import QueryDocument, emit
+
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.acceptance_facts import current_acceptance_artifact
 from agent_run.presentation_helpers import execution_duration
@@ -86,8 +88,7 @@ def test_execution_duration_preserves_seconds() -> None:
 
 @pytest.mark.parametrize("rich", [False, True])
 def test_status_renders_controller_work_without_resume_command(capsys, monkeypatch, rich: bool) -> None:
-    from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
-    from agent_run.presentation_helpers import human_status_term
+    from agent_run.delivery_status import status_progress_view
 
     state = {"language": "zh", "run_id": "r1", "repository": "example/project", "parent": {"number": 1},
              "status": "active", "parent_job": {"phase": "committing_candidate"}}
@@ -96,9 +97,9 @@ def test_status_renders_controller_work_without_resume_command(capsys, monkeypat
     view = status_progress_view(state, audit)
     monkeypatch.setenv("COLUMNS", "160")
     if rich:
-        print_rich_status_progress(state, audit, view)
+        emit(QueryDocument("status", state, audit, view), style="rich")
     else:
-        print_status_progress(state, audit, view, display_term=human_status_term, print_operator_action=lambda action: None)
+        emit(QueryDocument("status", state, audit, view), style="plain")
     output = capsys.readouterr().out
     assert "程序正在自动保存代码；无需操作。" in output
     assert "agent-run run 1" not in output
@@ -143,25 +144,23 @@ def test_history_omits_terminal_elapsed_without_end(capsys, monkeypatch, plain: 
 
 @pytest.mark.parametrize("rich", [False, True])
 def test_status_omits_terminal_elapsed_without_end(capsys, rich: bool) -> None:
-    from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
-    from agent_run.presentation_helpers import human_status_term
+    from agent_run.delivery_status import status_progress_view
 
     state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
              "created_at": "2026-09-15T01:00:00+00:00"}
     audit = {"status": "completed"}
     view = status_progress_view(state, audit)
     if rich:
-        print_rich_status_progress(state, audit, view)
+        emit(QueryDocument("status", state, audit, view), style="rich")
     else:
-        print_status_progress(state, audit, view, display_term=human_status_term, print_operator_action=lambda action: None)
+        emit(QueryDocument("status", state, audit, view), style="plain")
     assert "任务历时" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("plain", [False, True])
 def test_history_and_status_explain_partial_execution(capsys, monkeypatch, plain: bool) -> None:
     from agent_run.cli_presentation import _print_history
-    from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
-    from agent_run.presentation_helpers import human_status_term
+    from agent_run.delivery_status import status_progress_view
 
     attempt = {"attempt_id": "a", "role": "development", "work_subject": "parent:1", "ordinal": 1,
                "status": "completed", "outcome": "candidate"}
@@ -185,9 +184,9 @@ def test_history_and_status_explain_partial_execution(capsys, monkeypatch, plain
     audit = {"status": "completed"}
     view = status_progress_view(state, audit)
     if plain:
-        print_status_progress(state, audit, view, display_term=human_status_term, print_operator_action=lambda action: None)
+        emit(QueryDocument("status", state, audit, view), style="plain")
     else:
-        print_rich_status_progress(state, audit, view)
+        emit(QueryDocument("status", state, audit, view), style="rich")
     status = capsys.readouterr().out
     assert "耗时记录不完整" in status
     assert "已记录执行时长：7 分 55 秒" in status

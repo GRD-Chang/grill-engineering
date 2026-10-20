@@ -18,6 +18,8 @@ from typing import Any, Sequence
 
 import pytest
 
+from agent_run.query_document import QueryDocument, emit
+
 import agent_run.cli as cli
 import agent_run.doctor as doctor
 from agent_run.agent_invocation import invocation_event_recorder
@@ -844,9 +846,7 @@ def test_rich_status_wraps_long_findings_and_next_action(
         lambda _fd: os.terminal_size((width, 40)),
     )
 
-    cli.cli_presentation.print_rich_status_progress(
-        {},
-        {
+    emit(QueryDocument("status", {}, {
             "operator_action": {
                 "type": "Human Blocker",
                 "reasons": [],
@@ -860,8 +860,7 @@ def test_rich_status_wraps_long_findings_and_next_action(
                     "duration_seconds": 42,
                 },
             }
-        },
-        {
+        }, {
             "repository": "example/project",
             "parent": {"number": 1, "title": "Status card"},
             "status": "blocked",
@@ -876,8 +875,7 @@ def test_rich_status_wraps_long_findings_and_next_action(
             "execution_activity": "not_running",
             "next_action": command,
             "findings": [finding],
-        },
-    )
+        }), style="rich")
 
     rendered = output.getvalue()
     visible = Text.from_ansi(rendered).plain
@@ -6409,13 +6407,7 @@ def test_plain_status_and_history_strip_terminal_controls_but_keep_text(
         "next_action": None,
         "findings": [finding],
     }
-    cli.cli_presentation.print_status_progress(
-        {},
-        {},
-        view,
-        display_term=lambda value: value,
-        print_operator_action=lambda _action: None,
-    )
+    emit(QueryDocument("status", {}, {}, view), style="plain")
     status_output = capsys.readouterr().out
     assert "\x1b" not in status_output
     assert "[2J" in status_output

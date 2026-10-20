@@ -3,26 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
 from datetime import UTC, datetime, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agent_run.delivery_status import (
-    execution_guidance,
-    invocation_recovery_details,
-)
-from agent_run.final_approval_operation import approval_failure_text
+from agent_run.delivery_status import invocation_recovery_details
 from agent_run.messages import display_language, text
-from agent_run.operator_action_presentation import human_action_type, human_preserved_results, operator_action_items
-from agent_run.presentation_helpers import (
-    human_delivery_object,
-    human_pause_reason,
-    human_status_term,
-    human_next_action,
-    terminal_safe,
-)
-from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation, scheduler_notice
+from agent_run.presentation_helpers import human_delivery_object, human_status_term, human_next_action, terminal_safe
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 from agent_run.history_facts import (
     history_records as semantic_history_records,
     history_record_status_code,
@@ -75,241 +63,6 @@ def history_progress_view(
         },
         "time_zone": "UTC",
     }
-
-
-def print_history_progress(
-    state: dict[str, Any],
-    audit: dict[str, Any],
-    progress: dict[str, Any],
-    *,
-    display_term: Callable[[object], object],
-    print_operator_action: Callable[[dict[str, Any]], None],
-    details: bool = False,
-) -> None:
-    timezone, timezone_label = _local_timezone()
-    parent = state.get("parent")
-    parent_view = parent if isinstance(parent, dict) else {}
-    print(_copy('presentation.history.repository', v1=_safe_text(state.get('repository') or _copy('presentation.history.unknown'))))
-    print(
-        _copy('presentation.history.requirement', v1=_safe_text(parent_view.get('number', '?')), v3=_safe_text(parent_view.get('title') or _copy('presentation.history.untitled_requirement')))
-    )
-    print(_copy('presentation.history.timezone', v1=timezone_label))
-    if notice := scheduler_notice(progress.get("scheduler")):
-        print(notice)
-    if progress["summary"]["elapsed_seconds"] is not None:
-        print(_copy('presentation.history.elapsed', v1=_duration(progress['summary']['elapsed_seconds'])))
-    executor_control = audit.get("executor_control")
-    if (
-        isinstance(executor_control, dict)
-        and executor_control.get("activity") == "unknown"
-    ):
-        print(_copy('presentation.history.agent_activity_unknown_execution_status_cannot_be_confirmed'))
-    if progress["execution_activity"] == "interrupted":
-        print(_copy('presentation.history.execution_interrupted_waiting_to_resume'))
-    records = history_records(state, audit, progress["events"])
-    print(_copy('presentation.history.work_timeline'))
-    if records:
-        for record in records:
-            for line in _record_lines(record, timezone=timezone, details=details):
-                print(line)
-    else:
-        print(_copy('presentation.history.no_confirmed_agent_work_records_yet'))
-    for failure in _approval_failures(audit):
-        print(f"  {_safe_text(approval_failure_text(failure))}")
-    cleanup_lines = _cleanup_history_lines(state, details=details)
-    if cleanup_lines:
-        print(_copy('presentation.history.delivery_cleanup'))
-        for line in cleanup_lines:
-            print(line)
-
-    print(_copy('presentation.history.summary'))
-    rounds = progress["summary"]["rounds"]
-    if rounds:
-        for key, count in rounds.items():
-            print(_copy('presentation.history.rounds', v1=f'{_round_label(key):<22}', v2=count))
-    else:
-        print(_copy('presentation.history.no_agent_rounds_yet'))
-    if progress["summary"]["elapsed_seconds"] is not None:
-        print(f"  {_copy('presentation.history.elapsed_time'):<22}{_duration(progress['summary']['elapsed_seconds'])}")
-    waiting_lines = _current_wait_lines(state, audit)
-    if waiting_lines:
-        print("\n" + "\n".join(waiting_lines))
-        return
-    if progress["execution_activity"] in {
-        "interrupted",
-        "unknown",
-        "capacity_wait",
-        "recovery_wait",
-    } and not operator_action_items(audit):
-        print(_copy('presentation.history.next_step', v1=execution_guidance(state, progress['execution_activity'])))
-        return
-    actions = operator_action_items(audit)
-    if actions:
-        for operator_action in actions:
-            print()
-            bounded_action = dict(operator_action)
-            reasons = operator_action.get("reasons")
-            if isinstance(reasons, list):
-                bounded_action["reasons"] = [
-                    _truncate_history_detail(str(reason)) for reason in reasons
-                ]
-            print_operator_action(bounded_action)
-    else:
-        print(
-            _copy('presentation.history.next_step_17', v1=human_next_action(audit.get('next_action'), run_id=state.get('run_id')), v3=_operator_instruction(state, None))
-        )
-
-
-def print_rich_history_progress(
-    state: dict[str, Any],
-    audit: dict[str, Any],
-    progress: dict[str, Any],
-    *,
-    details: bool = False,
-) -> None:
-    """Render a bounded, static Rich timeline for an interactive terminal."""
-
-    from rich.console import Console
-    from rich.padding import Padding
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-
-    timezone, timezone_label = _local_timezone()
-    records = history_records(state, audit, progress["events"])
-    parent = state.get("parent")
-    parent_view = parent if isinstance(parent, dict) else {}
-    # A Panel renders child Text lines with crop semantics. Put each logical
-    # line in a foldable Table column so long URLs, commands, and CJK text wrap
-    # inside the panel and retain their complete content at narrow widths.
-    console = Console(highlight=False, soft_wrap=False)
-    header = [
-        _rich_line(
-            _copy('presentation.history.task'),
-            f"{state.get('repository') or 'unknown'} · #{parent_view.get('number', '?')} {parent_view.get('title') or _copy('presentation.history.untitled_requirement')}",
-        ),
-        _rich_line(_copy('presentation.history.timezone_19'), timezone_label),
-
-    ]
-    if notice := scheduler_notice(progress.get("scheduler")):
-        header.append(Text(notice))
-    if progress["summary"]["elapsed_seconds"] is not None:
-        header.append(_rich_line(_copy('presentation.history.elapsed_time'), _duration(progress["summary"]["elapsed_seconds"])))
-    if progress.get("execution_activity") in {
-        "interrupted",
-        "unknown",
-        "capacity_wait",
-        "recovery_wait",
-    }:
-        header.append(
-            _rich_line(
-                _copy('presentation.history.activity'),
-                _execution_activity_text(str(progress["execution_activity"])),
-            )
-        )
-
-    body: list[Text] = [*header, Text(""), Text(_copy('presentation.history.work_timeline_21'), style="bold")]
-    for record in records:
-        body.extend(
-            Text(line) for line in _record_lines(record, timezone=timezone, details=details)
-        )
-        body.append(Text(""))
-    if not records:
-        body.append(Text(_copy('presentation.history.no_confirmed_agent_work_records_yet')))
-    for failure in _approval_failures(audit):
-        body.append(Text(f"  {_safe_text(approval_failure_text(failure))}"))
-    cleanup_lines = _cleanup_history_lines(state, details=details)
-    if cleanup_lines:
-        body.extend([Text(""), Text(_copy('presentation.history.delivery_cleanup_22'), style="bold")])
-        body.extend(Text(line) for line in cleanup_lines)
-    for action in operator_action_items(audit):
-        body.extend([Text(""), Text(_copy('presentation.history.action_required'), style="bold yellow")])
-        body.append(Text(_copy('presentation.history.type', v1=_safe_text(human_action_type(action.get('type'))))))
-        body.append(Text(_copy("presentation.status.object_v1", v1=human_delivery_object(action.get("object")))))
-        body.append(Text(_copy("presentation.history.command", v1=action.get("next_action"))))
-        reasons = action.get("reasons")
-        if isinstance(reasons, list):
-            for reason in reasons:
-                value = _safe_text(
-                    reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
-                )
-                if not details:
-                    value = _truncate_history_detail(value)
-                body.append(Text(_copy('presentation.history.reason', v1=value)))
-        preserved = action.get("preserved")
-        if preserved is not None:
-            body.append(Text(_copy('presentation.history.preserved_results', v1=_safe_text(human_preserved_results(preserved)))))
-        phase = action.get("phase")
-        if phase is not None:
-            body.append(Text(_copy('presentation.history.phase', v1=_safe_text(human_status_term(phase)))))
-        if action.get("scope") == "global":
-            body.append(Text(_copy('presentation.history.the_entire_task_is_paused_other_subtasks_will_not_continue')))
-        else:
-            body.append(Text(_copy('presentation.status.local_operator_gate')))
-    body.extend(
-        [
-            Text(""),
-            Text(_copy('presentation.history.summary_29'), style="bold"),
-            Text(
-                _copy('presentation.history.agent_rounds', v1=_round_summary_text(progress['summary']['rounds']))
-            ),
-
-        ]
-    )
-    waiting_lines = _current_wait_lines(state, audit)
-    if waiting_lines:
-        body.extend([Text(""), *(Text(line) for line in waiting_lines)])
-    elif progress.get("execution_activity") in {
-        "interrupted",
-        "unknown",
-        "capacity_wait",
-        "recovery_wait",
-    }:
-        body.extend(
-            [
-                Text(""),
-                _rich_line(
-                    _copy('presentation.history.next_step_31'),
-                    execution_guidance(
-                        state,
-                        str(progress["execution_activity"]),
-                    ),
-                ),
-            ]
-        )
-    else:
-        next_action = audit.get("next_action")
-        body.extend(
-            [
-                Text(""),
-                _rich_line(
-                    _copy('presentation.history.next_step_31'),
-                    human_next_action(next_action, run_id=state.get("run_id")),
-                ),
-                Text(_operator_instruction(state, None)),
-            ]
-        )
-    border_style = {
-        "interrupted": "yellow",
-        "unknown": "yellow",
-        "capacity_wait": "yellow",
-        "recovery_wait": "red",
-    }.get(str(progress.get("execution_activity")), "cyan")
-    table = Table.grid(expand=True, padding=(0, 0))
-    table.add_column(no_wrap=False, overflow="fold")
-    for line in body:
-        indent = len(line.plain) - len(line.plain.lstrip(" "))
-        table.add_row(Padding(line[indent:], (0, 0, 0, indent)) if indent else line)
-    console.print(
-        Panel(
-            table,
-            title=Text(_copy('presentation.history.agent_run_work_timeline'), style="bold"),
-            border_style=border_style,
-            expand=True,
-        ),
-        overflow="fold",
-        crop=False,
-    )
 
 
 def history_records(
@@ -1139,15 +892,6 @@ def _round_summary_text(rounds: object) -> str:
     if not isinstance(rounds, dict) or not rounds:
         return _copy('presentation.history.no_agent_rounds_yet_193')
     return "；".join(_copy('presentation.history.rounds_194', v0=_round_label(str(key)), v2=value) for key, value in rounds.items())
-
-
-def _rich_line(label: object, value: object) -> Any:
-    from rich.text import Text
-
-    line = Text()
-    line.append(f"{_safe_text(label)}：", style="bold")
-    line.append(_safe_text(_copy('presentation.history.unknown') if value is None else value))
-    return line
 
 
 def _safe_text(value: object) -> str:

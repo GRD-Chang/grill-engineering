@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_run.delivery_progress import history_progress_view
+from agent_run.delivery_history import history_progress_view
 from agent_run.resume_audit import (
     append_explicit_resume_audit,
     bind_resume_to_successor,

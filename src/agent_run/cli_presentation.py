@@ -27,25 +27,16 @@ from agent_run.delivery_policy import (
     ticket_budget_policy_for_job,
 )
 from agent_run.guidance_actions import next_action_fact, render_next_action
-from agent_run.delivery_progress import (
-    history_progress_view,
-    print_history_progress,
-    print_rich_history_progress,
-    print_rich_status_progress,
-    print_status_progress,
-    run_elapsed_seconds,
-    status_progress_view,
-)
+from agent_run.delivery_status import status_progress_view
+from agent_run.delivery_history import history_progress_view
+from agent_run.execution_timing import run_elapsed_seconds
+from agent_run.query_document import QueryDocument, emit
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.operator_action_presentation import (
     operator_action_views,
     human_next_action_for_state,
-    print_operator_action as _print_operator_action,
 )
-from agent_run.presentation_helpers import (
-    human_next_action,
-    human_status_term,
-)
+from agent_run.presentation_helpers import human_status_term
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
 
@@ -211,20 +202,10 @@ def _print_status(
         output["progress"] = progress
         if as_json:
             output["lifecycle_action"] = state.get("action_application_receipt")
-            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-            return
-        if _use_rich_status(plain):
-            print_rich_status_progress(state, output, progress)
-        else:
-            print_status_progress(
-                state,
-                output,
-                progress,
-                display_term=_display_term,
-                print_operator_action=lambda action: _print_human_operator_action(
-                    state, action
-                ),
-            )
+        emit(
+            QueryDocument("status", state, output, progress, output),
+            style="json" if as_json else "rich" if _use_rich_status(plain) else "plain",
+        )
 
 
 def _print_history(
@@ -306,22 +287,11 @@ def _print_history(
             }
         progress = history_progress_view(state, progress_source)
         output.update(progress)
-        if as_json:
-            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-            return
-        if _use_rich_status(plain):
-            print_rich_history_progress(state, progress_source, progress, details=details)
-        else:
-            print_history_progress(
-                state,
-                progress_source,
-                progress,
-                display_term=_display_term,
-                print_operator_action=lambda action: _print_human_operator_action(
-                    state, action
-                ),
-                details=details,
-            )
+        emit(
+            QueryDocument("history", state, progress_source, progress, output),
+            style="json" if as_json else "rich" if _use_rich_status(plain) else "plain",
+            details=details,
+        )
 
 
 def _use_rich_status(plain: bool) -> bool:
@@ -508,20 +478,6 @@ def human_delivery_status(value: object, *, language: str = "zh") -> object:
     """Render the same delivery terminology used by status and history."""
 
     return human_status_term(value, language=language)
-
-
-def _print_human_operator_action(
-    state: Mapping[str, Any], action: dict[str, Any]
-) -> None:
-    human_action = dict(action)
-    from agent_run.guidance_actions import NextAction
-
-    decision = action.get("action")
-    if isinstance(decision, dict):
-        human_action["next_action"] = render_next_action(
-            NextAction(**decision), dict(state), language=selected_language(dict(state)), human=True,
-        )
-    _print_operator_action(human_action)
 
 
 def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
@@ -795,10 +751,6 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
     if job.get("phase") == "blocked":
         return "blocked"
     return "unreviewed"
-
-
-def _display_term(value: object) -> object:
-    return human_status_term(value, language=display_language())
 
 
 def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> None:
