@@ -2,13 +2,57 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
+from agent_run.change_delivery_contracts import (
+    ChangeDeliveryAdapter, ChangeDeliveryPublisher, ChangeJobContract,
+    ChangeJobStopped, StaleDisposition,
+)
+from agent_run.change_delivery_state import (
+    ChangeDeliveryStateStore, block_change_job, save_change_job,
+)
 from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.parent_integration import parent_integration_record_is_valid
+from agent_run.review_context import review_context_is_current
+from agent_run.semantic_attempt import (
+    close_semantic_attempt, detach_active_invocation, pending_semantic_attempt,
+)
+
+
+def change_agent_is_current(
+    git: GitRepository, contract: ChangeJobContract, adapter: ChangeDeliveryAdapter,
+    state: dict[str, Any], job: dict[str, Any],
+) -> bool:
+    """Agent work keeps the fixed Ticket/Parent-only development baseline."""
+    if contract.label.startswith("ticket-") or contract.label == "parent-only":
+        return not adapter.revision_changed(state, job)
+    current_base = git.resolve(contract.base_branch)
+    return adapter.base_is_current(current_base, job) and not adapter.revision_changed(state, job)
+
+
+def reject_stale_change(
+    git: GitRepository, contract: ChangeJobContract, adapter: ChangeDeliveryAdapter,
+    publisher: ChangeDeliveryPublisher, store: ChangeDeliveryStateStore,
+    state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    *, development_only: bool, message: str,
+) -> None:
+    """Settle the original Attempt and preserve the object's stale disposition."""
+    if not review_context_is_current(job) or not change_agent_is_current(git, contract, adapter, state, job):
+        pending = pending_semantic_attempt(job)
+        if pending is not None:
+            close_semantic_attempt(job, pending, outcome="currentness_invalidated")
+            detach_active_invocation(state, pending)
+        if adapter.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
+            publisher.invalidate_stale(state, job, checkout)
+            save_change_job(store, state, job, label=contract.label, development_only=development_only)
+        else:
+            block_change_job(store, state, job, label=contract.label,
+                development_only=development_only, code="effective_revision_mismatch", message=message)
+        raise ChangeJobStopped()
 
 
 class PullRequestReader(Protocol):

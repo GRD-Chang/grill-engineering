@@ -9,6 +9,7 @@ from agent_run.delivery_budget import delivery_budget_owner
 
 from agent_run.ci_recovery_budget import ci_review_required
 from agent_run.development_review import review_is_due
+from agent_run.change_delivery_review import ChangeReview
 from agent_run.change_delivery_integration import prepare_delivery_integration
 
 if TYPE_CHECKING:
@@ -66,14 +67,24 @@ class ChangeDevelopmentReview:
                 "Review budget is exhausted and the current Candidate still needs modification",
             )
             return True
-        self.engine._review(state, job, checkout)
+        self._review_work().review()
         return True
 
     def resume_review(self) -> bool:
         if isinstance(self.job.get("pending_review_result"), dict):
-            self.engine._complete_review(self.state, self.job, self.checkout)
+            self._review_work().complete()
         else:
             # Resume the existing semantic attempt, without charging a new one.
             self.job["phase"] = "candidate"
             self.engine.save(self.state)
         return True
+
+    def _review_work(self) -> ChangeReview:
+        engine = self.engine
+        return ChangeReview(
+            state=self.state, job=self.job, checkout=self.checkout,
+            git=engine.git, github=engine.github, agents=engine.agents,
+            contract=engine.contract, adapter=engine.adapter, publisher=engine.publisher,
+            state_store=engine.state_store, agent_work=engine.agent_work,
+            development_only=engine.development_only,
+        )

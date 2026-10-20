@@ -11,6 +11,10 @@ from typing import Any, Protocol
 from agent_run.review_budget import ReviewBudgetPolicy
 
 
+class ChangeJobStopped(Exception):
+    """The current Change has durably paused or invalidated its work."""
+
+
 class StaleDisposition(str, Enum):
     """The shared engine's deterministic recovery for a stale change job."""
 

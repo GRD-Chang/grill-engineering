@@ -15,9 +15,9 @@ import sys
 from typing import Any
 
 from agent_run.delivery_budget import delivery_budget_owner
-from agent_run.review_context import review_context_is_current
 from agent_run.agents import AgentBackend
-from agent_run.delivery_policy import parent_only_budget_policy_for_job
+from agent_run.delivery_policy import change_review_budget_policy
+from agent_run.change_currentness import change_agent_is_current, reject_stale_change
 from agent_run.development_review import advance_development_review
 from agent_run.integration_development_budget import (
     IntegrationDevelopmentExhausted, ensure_integration_development_available,
@@ -31,7 +31,7 @@ from agent_run.ci_recovery_budget import (
     mark_ci_repair,
     refund_ci_repair_without_candidate,
 )
-from agent_run.artifacts import AcceptanceArtifact
+from agent_run.artifacts import record_human_blocker
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
@@ -44,8 +44,6 @@ from agent_run.publication_operation_retry import record_publication_operation_f
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
-    close_semantic_attempt,
-    detach_active_invocation,
     pending_semantic_attempt,
     release_semantic_attempt,
 )
@@ -55,7 +53,6 @@ from agent_run.review_budget import (
     can_start_review,
     ensure_budget,
     mark_development,
-    policy_for_subject,
 )
 
 from agent_run.agent_work import AgentWorkScope
@@ -73,6 +70,7 @@ from agent_run.change_delivery_contracts import (
     ChangeDeliveryPublisher as ChangeDeliveryPublisher,
     ChangeJobContract as ChangeJobContract,
     StaleDisposition as StaleDisposition,
+    ChangeJobStopped,
 )
 from agent_run.change_delivery_development import (
     commit_candidate,
@@ -92,12 +90,10 @@ from agent_run.change_delivery_publication_agent import (
     publication,
 )
 from agent_run.change_delivery_published_head import publish_and_merge
-from agent_run.change_delivery_review import (
-    complete_review,
-    review,
-    wait_for_human,
-)
+from agent_run.change_delivery_review import record_change_status
 from agent_run.change_delivery_state import (
+    block_change_job,
+    save_change_job,
     ChangeDeliveryStateStore as ChangeDeliveryStateStore,
     require_mapping as _mapping,
 )
@@ -117,7 +113,6 @@ from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.ticket_queue import (
     acquire as acquire_ticket_slot,
     has_other_ticket_work,
-    reconcile as reconcile_ticket_slot,
 )
 from agent_run.parent_integration import (
     parent_integration_record_is_valid,
@@ -186,16 +181,8 @@ class ChangeDeliveryEngine:
         )
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
-        if self.contract.label.startswith("ticket-") and self._current_job is not None:
-            if self._current_job.get("phase") == "accepted":
-                if self.development_only:
-                    from agent_run.ticket_queue import enqueue
-
-                    enqueue(state, self._current_job)
-                else:
-                    acquire_ticket_slot(state, self._current_job)
-            reconcile_ticket_slot(state, self._current_job)
-        return self.state_store.save(state)
+        return save_change_job(self.state_store, state, self._current_job,
+            label=self.contract.label, development_only=self.development_only)
 
     def commit_required_checks_observation(
         self,
@@ -301,7 +288,7 @@ class ChangeDeliveryEngine:
             if self.agent_work.capacity_wait:
                 return DeliveryStep(DeliveryStepKind.WAITING, str(job["phase"]), "work_capacity")
             return DeliveryStep(DeliveryStepKind.NEEDS_AGENT, str(job["phase"]), work.role)
-        except _TerminalChangeJob:
+        except ChangeJobStopped:
             return self._step_result(state, job, waiting=True)
         except GitHubReadError as error:
             if not is_github_convergence_error(error.code):
@@ -479,17 +466,6 @@ class ChangeDeliveryEngine:
     ) -> tuple[str, int]:
         return invocation_identity(state, job)
 
-    def _review(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        self.require_agent_work("reviewer")
-        review(self, state, job, checkout)
-
-    def _complete_review(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        complete_review(self, state, job, checkout)
-
     def _wait_for_human(
         self,
         state: dict[str, Any],
@@ -499,9 +475,10 @@ class ChangeDeliveryEngine:
         blockers: tuple[str, ...],
         code: str = "agent_requires_human",
     ) -> None:
-        wait_for_human(
-            self, state, job, phase=phase, blockers=blockers, code=code
+        record_human_blocker(
+            state, job, resume_phase=phase, blocked_phase="blocked", blockers=blockers, code=code,
         )
+        self.save(state)
 
     def _publish_and_merge(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -572,10 +549,8 @@ class ChangeDeliveryEngine:
             job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
-        if self.contract.label == "parent-only" and self._current_job is not None:
-            return parent_only_budget_policy_for_job(self._current_job)
-        return self.contract.review_budget_policy or policy_for_subject(
-            self.contract.label
+        return change_review_budget_policy(
+            self.contract.label, self.contract.review_budget_policy, self._current_job,
         )
 
     def review_budget_exhausted_for_review(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
@@ -697,44 +672,8 @@ class ChangeDeliveryEngine:
         *,
         next_action: str | None = None,
     ) -> None:
-        if job.get("publication_authority") in {"fallback", "ci_repair"}:
-            validation_outcome = (
-                "ci_repair_unreviewed"
-                if job.get("publication_authority") == "ci_repair"
-                else "fallback"
-            )
-            lane_statuses = {
-                lane: "not_run" for lane in ("e2e", "standards", "spec")
-            }
-        else:
-            artifact = _mapping(job, "acceptance_artifact")
-            raw_checks = _mapping(artifact, "checks")
-            validation_outcome = AcceptanceArtifact.parse(artifact).outcome
-            lane_statuses = {
-                lane: str(_mapping(raw_checks, lane)["status"])
-                for lane in ("e2e", "standards", "spec")
-            }
-        if next_action is None:
-            if checks == "pending":
-                next_action = "wait for Required Checks"
-            elif checks == "fail":
-                next_action = "repair failed Required Checks"
-            elif checks == "not_checked":
-                next_action = "verify Published-Head Gate"
-            else:
-                next_action = "verify Published-Head Gate"
-        self.github.record_agent_run_status(
-            pr_number,
-            {
-                "scope": self.contract.label,
-                "base_sha": str(job["base_sha"]),
-                "candidate_sha": str(job["candidate_sha"]),
-                "validation_outcome": validation_outcome,
-                "lane_statuses": lane_statuses,
-                "required_checks": checks,
-                "next_action": next_action,
-            },
-        )
+        record_change_status(self.github, self.contract.label, pr_number, job,
+            checks, next_action=next_action)
 
     def _publication_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -790,15 +729,7 @@ class ChangeDeliveryEngine:
         )
 
     def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        # Ticket Development and its original Review intentionally use their
-        # fixed checkout. Remote source/target additions belong to the later
-        # integration boundary, never to an in-flight semantic attempt.
-        if self.contract.label.startswith("ticket-") or self.contract.label == "parent-only":
-            return not self.adapter.revision_changed(state, job)
-        current_base = self.git.resolve(self.contract.base_branch)
-        return self.adapter.base_is_current(
-            current_base, job
-        ) and not self.adapter.revision_changed(state, job)
+        return change_agent_is_current(self.git, self.contract, self.adapter, state, job)
 
     def _reject_stale(
         self,
@@ -807,19 +738,9 @@ class ChangeDeliveryEngine:
         checkout: Path,
         message: str,
     ) -> None:
-        if not review_context_is_current(job) or not self._agent_is_current(state, job):
-            pending_attempt = pending_semantic_attempt(job)
-            if pending_attempt is not None:
-                close_semantic_attempt(
-                    job, pending_attempt, outcome="currentness_invalidated"
-                )
-                detach_active_invocation(state, pending_attempt)
-            if self.adapter.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
-                self._invalidate_stale(state, job, checkout)
-                self.save(state)
-                raise _TerminalChangeJob()
-            self._block(state, job, "effective_revision_mismatch", message)
-            raise _TerminalChangeJob()
+        reject_stale_change(self.git, self.contract, self.adapter, self.publisher,
+            self.state_store, state, job, checkout,
+            development_only=self.development_only, message=message)
 
     def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -829,21 +750,10 @@ class ChangeDeliveryEngine:
     def _block(
         self, state: dict[str, Any], job: dict[str, Any], code: str, message: str
     ) -> bool:
-        if job.get("phase") != "blocked":
-            job["execution_resume_phase"] = job["phase"]
-        job.update({"phase": "blocked", "blocked_reason": code})
-        state["status"] = "blocked"
-        state["diagnostics"] = [
-            {"code": code, "message": message, "change_job": self.contract.label}
-        ]
-        self.save(state)
-        return False
+        return block_change_job(self.state_store, state, job,
+            label=self.contract.label, development_only=self.development_only, code=code, message=message)
 
     def _sync_attempts(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None:
         self.publisher.sync_attempts(state, job)
-
-
-class _TerminalChangeJob(Exception):
-    pass

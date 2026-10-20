@@ -16,6 +16,7 @@ from agent_run.review_budget import (
     RUN_POLICY,
     TICKET_POLICY,
     ReviewBudgetPolicy,
+    policy_for_subject,
 )
 
 
@@ -346,6 +347,15 @@ def invocation_deadline_for_state(
         else parse_policy_snapshot(state.get("policy_snapshot"))
     )
     return policy.invocation_deadlines[role_name]
+
+
+def change_review_budget_policy(
+    label: str, configured: ReviewBudgetPolicy | None, job: dict[str, Any] | None,
+) -> ReviewBudgetPolicy:
+    """Resolve the current Change's existing object-specific Review policy."""
+    if label == "parent-only" and job is not None:
+        return parent_only_budget_policy_for_job(job)
+    return configured or policy_for_subject(label)
 
 
 def ticket_review_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:

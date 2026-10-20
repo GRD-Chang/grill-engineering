@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine, ChangeJobContract
+from agent_run.change_delivery_review import ChangeReview
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
@@ -340,11 +341,12 @@ def test_parent_ci_candidate_reviews_before_rejoining_integration(
                               repair_pending=True, review_required=True)
     reviewed: list[tuple[str, str]] = []
 
-    def capture_review(_state: dict, current: dict, _checkout: Path) -> None:
+    def capture_review(work: ChangeReview) -> None:
+        current = work.job
         reviewed.append((current["base_sha"], current["candidate_sha"]))
         current["phase"] = "blocked"
 
-    monkeypatch.setattr(engine, "_review", capture_review)
+    monkeypatch.setattr(ChangeReview, "review", capture_review)
     engine.run(state, job, git_repo)
 
     assert reviewed == [(base, repaired_candidate)]
