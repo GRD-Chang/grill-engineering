@@ -170,7 +170,7 @@ def _findings(findings: object, rich: bool) -> Iterator[Node]:
         if match is None:
             if rich:
                 yield Line(f"{index}.", "bold red")
-                yield Line(terminal_safe(finding))
+                yield Line(terminal_safe(copy('presentation.status.unknown') if finding is None else finding))
             else:
                 yield Line(f"  {index}. {value}")
         else:
