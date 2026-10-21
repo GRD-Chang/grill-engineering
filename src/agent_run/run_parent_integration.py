@@ -28,6 +28,7 @@ from agent_run.resume_materials import require_change_checkout
 from agent_run.work_projection import materialize_history
 
 if TYPE_CHECKING:
+    from agent_run.development_review import DevelopmentReview
     from agent_run.run_acceptance import RunAcceptanceEngine
 
 
@@ -148,7 +149,9 @@ def prepare_run_parent_integration(
             owner._remove_empty_directories(checkout)
 
 
-def run_integration_record_is_valid(owner: RunAcceptanceEngine, state: dict[str, Any]) -> bool:
+def run_integration_record_is_valid(
+    owner: RunAcceptanceEngine | DevelopmentReview, state: dict[str, Any],
+) -> bool:
     run = state.get("run_acceptance")
     if not isinstance(run, dict):
         return False
@@ -169,7 +172,7 @@ def run_integration_record_is_valid(owner: RunAcceptanceEngine, state: dict[str,
 
 
 def run_integration_remote_is_current(
-    owner: RunAcceptanceEngine, state: dict[str, Any]
+    owner: RunAcceptanceEngine | DevelopmentReview, state: dict[str, Any],
 ) -> bool:
     if owner.github is None:
         return True
