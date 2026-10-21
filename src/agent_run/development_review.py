@@ -12,7 +12,7 @@ from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 import sys
-from typing import Any, Literal, cast
+from typing import Any, Literal, TYPE_CHECKING, cast
 from uuid import uuid4
 
 from agent_run.agent_execution import execute_agent_work, select_development_thread
@@ -81,7 +81,6 @@ from agent_run.integration_development_budget import (
     ensure_integration_development_available,
     acquire_integration_development,
 )
-from agent_run.integration_record_contract import require_completed_ticket_integration_records
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.review_attempt import (
     begin_review,
@@ -113,17 +112,14 @@ from agent_run.review_evidence import (
     run_review_identity,
     accepted_review_matches,
 )
-from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_currentness import (
     RunCurrentnessReader,
-    refresh_run_currentness,
     run_currentness_boundary,
     ticket_completion_records,
     ticket_fallback_records,
     ticket_ci_repair_records,
     ticket_integration_records,
 )
-from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
@@ -134,6 +130,11 @@ from agent_run.semantic_attempt import (
     require_controller_reprepare_intent,
 )
 from agent_run.state import StateStore
+
+if TYPE_CHECKING:
+    from agent_run.run_candidate_acceptance import CandidateRunAcceptance
+    from agent_run.run_repair_currentness import RunRepairCurrentness
+
 
 _RUN_ACCEPTANCE_CREDENTIAL_SUBJECT = "run-acceptance"
 ChangeScope = Literal["ticket", "parent-only", "repair"]
@@ -197,15 +198,15 @@ class DevelopmentReview:
         self, *, git: GitRepository, states: StateStore, agents: AgentBackend,
         github: GitHubPublisher | None = None,
         currentness_reader: RunCurrentnessReader | None = None,
-        default_head_sha: str | None = None,
+        candidate_acceptance: CandidateRunAcceptance | None = None,
+        repair_currentness: RunRepairCurrentness | None = None,
         development_only: bool = False,
     ) -> None:
         self.git, self.states, self.agents, self.github = git, states, agents, github
         self.currentness_reader = currentness_reader
-        self.default_head_sha = default_head_sha
         self.development_only = development_only
-        self.candidate_acceptance = CandidateRunAcceptance(git, default_head_sha=default_head_sha)
-        self.repair_currentness = RunRepairCurrentness(git, github, states) if github is not None else None
+        self._candidate_acceptance = candidate_acceptance
+        self._repair_currentness = repair_currentness
         from agent_run.ticket_state import TicketState
         from agent_run.ticket_work import TicketWorkAdmission
         admission = None
@@ -310,32 +311,19 @@ class DevelopmentReview:
     def _run_budget_policy(self, state: dict[str, Any], run: dict[str, Any]) -> ReviewBudgetPolicy:
         return run_repair_budget_policy_for_job(run, state_snapshot=state.get("policy_snapshot"))
 
-    def _default_head(self, state: dict[str, Any]) -> str:
-        return self.default_head_sha or str(state["base"]["sha"])
-
-    def _refresh_run_currentness(self, state: dict[str, Any]) -> bool:
-        require_completed_ticket_integration_records(state)
-        if self.currentness_reader is None:
-            return True
-        default_head = refresh_run_currentness(state, reader=self.currentness_reader, git=self.git)
-        if default_head is None:
-            return False
-        self.default_head_sha = default_head
-        self.candidate_acceptance.update_default_head(default_head)
-        return True
-
     def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         if self._scope != "repair":
             return not change_revision_changed(self.github, state, job)
         from agent_run.run_repair_integration import repair_run_branch_is_current
+        assert self._candidate_acceptance is not None
         if not repair_run_branch_is_current(self.git, job, self.git.resolve(str(state["run_branch"]))):
             return False
-        if not self._refresh_run_currentness(state):
+        if not self._candidate_acceptance.refresh_currentness(state, self.currentness_reader):
             return False
-        default = self._default_head(state)
-        assert self.repair_currentness is not None
+        default = self._candidate_acceptance.default_head(state)
+        assert self._repair_currentness is not None
         return (default == job.get("default_base_sha")
-                and not self.repair_currentness.non_default_revision_changed(
+                and not self._repair_currentness.non_default_revision_changed(
                     state,
                     job,
                     default_head_sha=default,
@@ -383,8 +371,6 @@ class DevelopmentReview:
             code=code,
         )
         self.save(state)
-
-
 
     def require_agent_work(self, role: str) -> None:
         self.agent_work.require(role)
@@ -557,7 +543,8 @@ class DevelopmentReview:
         acceptance: dict[str, Any],
     ) -> bool:
         if self._scope == "repair":
-            return self.candidate_acceptance.is_current(
+            assert self._candidate_acceptance is not None
+            return self._candidate_acceptance.is_current(
                 state,
                 job,
                 acceptance,
@@ -1103,7 +1090,6 @@ class DevelopmentReview:
         self.save(state)
         return True
 
-
     def advance_change(
         self,
         state: dict[str, Any],
@@ -1252,7 +1238,8 @@ class DevelopmentReview:
             self.save(state)
         try:
             if run_scope:
-                run_head, default_head = self.git.resolve(str(state["run_branch"])), self._default_head(state)
+                assert self._candidate_acceptance is not None
+                run_head, default_head = self.git.resolve(str(state["run_branch"])), self._candidate_acceptance.default_head(state)
                 try:
                     self.git.prepare_expected_merge_checkout(
                         default_head_sha=default_head,
@@ -1286,7 +1273,8 @@ class DevelopmentReview:
             else:
                 if self._scope == "repair":
                     from agent_run.run_repair_requests import RunRepairRequests
-                    self.candidate_acceptance.prepare_validation(job, validation)
+                    assert self._candidate_acceptance is not None
+                    self._candidate_acceptance.prepare_validation(job, validation)
                     assert self.github is not None
                     request = RunRepairRequests(self.git, self.github).review(state, job, validation)
                 else:
@@ -1433,13 +1421,14 @@ class DevelopmentReview:
         if self._scope != "run":
             return self._agent_is_current(state, job)
         from agent_run.run_parent_integration import run_integration_remote_is_current
-        return (self._refresh_run_currentness(state)
+        assert self._candidate_acceptance is not None
+        return (self._candidate_acceptance.refresh_currentness(state, self.currentness_reader)
                 and (not isinstance(
                     job.get("run_integration"),
                     dict,
                 ) or run_integration_remote_is_current(self, state))
                 and self.git.resolve(str(state["run_branch"])) == boundary["reviewed_head_sha"]
-                and self._default_head(state) == boundary["reviewed_default_base_sha"]
+                and self._candidate_acceptance.default_head(state) == boundary["reviewed_default_base_sha"]
                 and state["parent"]["revision"] == request["parent"]["revision"]
                 and state["ticket_graph"]["revision"] == request["ticket_graph"]["revision"]
                 and ticket_completion_records(state) == request["ticket_completion_records"])
@@ -1592,7 +1581,8 @@ class DevelopmentReview:
         ) and AcceptanceArtifact.parse(prior_acceptance.get("artifact")).is_accepted:
             job["previous_parent_acceptance_record"] = deepcopy(prior_acceptance)
         if self._scope == "repair":
-            job["acceptance_record"] = self.candidate_acceptance.record(
+            assert self._candidate_acceptance is not None
+            job["acceptance_record"] = self._candidate_acceptance.record(
                 job,
                 reviewer_thread_id,
                 artifact.raw,
@@ -1641,6 +1631,7 @@ class DevelopmentReview:
 
     def _complete_run_review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         from agent_run.run_parent_integration import run_integration_record_is_valid, run_integration_remote_is_current
+        assert self._candidate_acceptance is not None
         pending = _mapping(run, "pending_review_result")
         record = _mapping(pending, "record")
         artifact = AcceptanceArtifact.parse(record["artifact"])
@@ -1664,7 +1655,7 @@ class DevelopmentReview:
             "artifact": artifact.raw,
         }, limit=budget_policy.review_limit,
             human_blocker_resume=pending.get("human_blocker_resume") is True)
-        refreshed = self._refresh_run_currentness(state)
+        refreshed = self._candidate_acceptance.refresh_currentness(state, self.currentness_reader)
         integration = run.get("run_integration")
         integration_current = not isinstance(integration, dict) or (
             run_integration_record_is_valid(self, state)
@@ -1672,23 +1663,22 @@ class DevelopmentReview:
         )
         if (
             refreshed and integration_current and isinstance(integration, dict)
-            and self.default_head_sha is None
+            and self._candidate_acceptance.default_head_sha is None
         ):
             # A new Engine can resume a previously integrated default boundary
             # without rebuilding its checkout. Live refs above prove it still
             # applies; an explicitly refreshed head is never overwritten.
-            self.default_head_sha = str(integration["target_sha"])
-            self.candidate_acceptance.update_default_head(self.default_head_sha)
+            self._candidate_acceptance.update_default_head(str(integration["target_sha"]))
         if not (
             refreshed and integration_current
             # Different refs invalidate the old audit before Git previews a
             # potentially conflicting new merge. Matching refs still require
             # the complete evidence identity, including its expected tree.
             and self.git.resolve(str(state["run_branch"])) == run_head
-            and self._default_head(state) == default_head
+            and self._candidate_acceptance.default_head(state) == default_head
             and review_record_matches(
                 record, run_review_identity(
-                    state, self.git, self._default_head(state),
+                    state, self.git, self._candidate_acceptance.default_head(state),
                     self.git.resolve(str(state["run_branch"])),
                 ),
             )
@@ -1828,13 +1818,14 @@ class DevelopmentReview:
         pr_number = publication.get("pr_number")
         if not isinstance(pr_number, int):
             return
+        assert self._candidate_acceptance is not None
         checks = _mapping(artifact, "checks")
         outcome = AcceptanceArtifact.parse(artifact).outcome
         self.github.record_agent_run_status(
             pr_number,
             {
                 "scope": "final-run",
-                "base_sha": self._default_head(state),
+                "base_sha": self._candidate_acceptance.default_head(state),
                 "candidate_sha": run_head,
                 "validation_outcome": outcome,
                 "lane_statuses": {
