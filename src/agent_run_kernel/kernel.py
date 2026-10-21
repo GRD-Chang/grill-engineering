@@ -484,7 +484,7 @@ class Kernel:
             if job["current_attempt"]:
                 attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
                 if attempt["result_id"]:
-                    return self._consume(tx, run, job, attempt, world)
+                    return self._consume(tx, run, job, attempt, world, execution, allow_agent)
                 if not self._current(tx, job, run, world):
                     return Step("paused", subject, "currentness")
                 invocation = tx.one("SELECT * FROM invocations WHERE id=?", (attempt["current_invocation"],))
@@ -564,11 +564,7 @@ class Kernel:
         Both the attempt and the exact invocation/thread/lease must still match.
         """
         with self.storage.transaction() as tx:
-            invocation = tx.one("SELECT i.*,a.subject,a.generation FROM invocations i JOIN attempts a ON a.id=i.attempt WHERE i.id=?", (call.invocation_id,))
-            if (invocation["attempt"] != call.attempt_id or invocation["subject"] != call.subject
-                    or invocation["thread"] != call.thread_id or invocation["lease"] != call.lease_id
-                    or invocation["executor"] != call.execution.owner or invocation["epoch"] != call.execution.epoch):
-                raise KernelError("invocation_binding")
+            invocation = self._invocation(tx, call)
             material = tx.put(call.subject, "agent_raw", raw)
             if invocation["raw_id"] is not None:
                 if invocation["raw_id"] != material:
@@ -576,10 +572,13 @@ class Kernel:
                 return
             if invocation["status"] not in {"running", "interrupted"}:
                 raise KernelError("invocation_already_settled")
-            tx.execute("UPDATE invocations SET raw_id=?,status='returned',returned_at=? WHERE id=?", (material, self.clock(), call.invocation_id))
-            # A late, superseded invocation is history only, never current work.
-            tx.execute("UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=?",
-                       (material, call.attempt_id, call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET raw_id=?,returned_at=? WHERE invocation=? AND ordinal=?",
+                       (material, self.clock(), call.invocation_id, call.output_ordinal))
+            # A late output or superseded Invocation is history only.
+            if self._latest_output(tx, invocation):
+                tx.execute("UPDATE invocations SET status='returned' WHERE id=?", (call.invocation_id,))
+                tx.execute("UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=?",
+                           (material, call.attempt_id, call.invocation_id))
             current = self._job(tx, call.subject)
             if invocation["generation"] != current["generation"]:
                 attempt = tx.one("SELECT * FROM attempts WHERE id=?", (call.attempt_id,))
@@ -590,7 +589,8 @@ class Kernel:
                         pass
                     else:
                         self._charge_review(tx, attempt)
-            tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+            if invocation["dispatch_state"] not in {"sent", "started", "unknown"}:
+                tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
             self._event(tx, call.subject, "raw_returned", call.invocation_id, material, generation=invocation["generation"])
 
     def bind_thread(self, call: AgentCall, reported_thread: str) -> None:
@@ -598,16 +598,14 @@ class Kernel:
         if not reported_thread:
             raise KernelError("missing_thread")
         with self.storage.transaction() as tx:
-            invocation = tx.one("SELECT attempt,thread,lease FROM invocations WHERE id=?", (call.invocation_id,))
-            if tuple(invocation) != (call.attempt_id, call.thread_id, call.lease_id):
-                raise KernelError("invocation_binding")
+            self._invocation(tx, call)
             thread = tx.one("SELECT backend_id FROM threads WHERE id=?", (call.thread_id,))
             if thread[0] is not None and thread[0] != reported_thread:
                 raise KernelError("thread_identity_changed")
             tx.execute("UPDATE threads SET backend_id=? WHERE id=?", (reported_thread, call.thread_id))
 
     def _invocation(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
-        row = tx.one("SELECT i.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN attempts a ON a.id=i.attempt WHERE i.id=?", (call.invocation_id,))
+        row = tx.one("SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id JOIN attempts a ON a.id=i.attempt WHERE i.id=? AND o.ordinal=?", (call.invocation_id, call.output_ordinal))
         if (row["attempt"] != call.attempt_id or row["subject"] != call.subject or row["thread"] != call.thread_id
                 or row["lease"] != call.lease_id or row["executor"] != call.execution.owner or row["epoch"] != call.execution.epoch
                 or row["role"] != call.role or row["purpose"] != call.purpose
@@ -620,6 +618,9 @@ class Kernel:
             raise KernelError("invocation_binding")
         return row
 
+    def _latest_output(self, tx: Transaction, output: sqlite3.Row) -> bool:
+        return bool(output["ordinal"] == tx.one("SELECT max(ordinal) FROM invocation_outputs WHERE invocation=?", (output["id"],))[0])
+
     def _agent_authority(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
         run, job = self._owned(tx, call.subject, call.execution)
         invocation = self._invocation(tx, call)
@@ -629,6 +630,7 @@ class Kernel:
                 or invocation["generation"] != job["generation"] or job["current_attempt"] != call.attempt_id
                 or invocation["parent_revision"] != run["parent_revision"]
                 or invocation["graph_revision"] != run["graph_revision"] or invocation["revision"] != job["revision"]
+                or invocation["current_invocation"] != call.invocation_id or not self._latest_output(tx, invocation)
                 or invocation["raw_id"] is not None or invocation["dispatch_state"] not in {"allocated", "sent", "started"}
                 or self._eligibility(tx, job) is not None
                 or not tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))):
@@ -642,7 +644,8 @@ class Kernel:
             if invocation["dispatch_state"] != "allocated":
                 return False
             self._agent_authority(tx, call)
-            tx.execute("UPDATE invocations SET dispatch_state='sent',dispatched_at=? WHERE id=?", (self.clock(), call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET dispatch_state='sent',dispatched_at=? WHERE invocation=? AND ordinal=?",
+                       (self.clock(), call.invocation_id, call.output_ordinal))
             self._event(tx, call.subject, "agent_dispatched", call.invocation_id)
             return True
 
@@ -668,7 +671,8 @@ class Kernel:
                 return
             if invocation["dispatch_state"] not in {"sent", "unknown"}:
                 raise KernelError("agent_not_dispatched")
-            tx.execute("UPDATE invocations SET process_identity=?,dispatch_state='started',started_at=? WHERE id=?", (witness, self.clock(), call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET process_identity=?,dispatch_state='started',started_at=? WHERE invocation=? AND ordinal=?",
+                       (witness, self.clock(), call.invocation_id, call.output_ordinal))
             self._event(tx, call.subject, "worker_started", call.invocation_id, witness, generation=invocation["generation"])
 
     def agent_start_unknown(self, call: AgentCall, evidence: dict[str, Any]) -> None:
@@ -683,12 +687,14 @@ class Kernel:
                 self._process_exit(tx, call, invocation, observed_exit, "start_acknowledgement_unknown")
                 return
             material = tx.put(call.subject, "worker_start_unknown", wire_json(evidence))
-            tx.execute("UPDATE invocations SET dispatch_state='unknown',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET dispatch_state='unknown',start_evidence=? WHERE invocation=? AND ordinal=?",
+                       (material, call.invocation_id, call.output_ordinal))
             run = tx.one("SELECT * FROM runs")
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and job["generation"] == invocation["generation"] and job["current_attempt"] == call.attempt_id
-                    and invocation["current_invocation"] == call.invocation_id and not self._gates(tx, call.subject)):
+                    and invocation["current_invocation"] == call.invocation_id and self._latest_output(tx, invocation)
+                    and not self._gates(tx, call.subject)):
                 self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
 
     def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str) -> None:
@@ -698,13 +704,16 @@ class Kernel:
             if invocation["process_identity"] is not None or invocation["dispatch_state"] not in {"sent", "unavailable"}:
                 raise KernelError("worker_exit_unproven")
             material = tx.put(call.subject, "worker_unavailable", wire_json({"code": code, "evidence": evidence}))
-            tx.execute("UPDATE invocations SET dispatch_state='unavailable',status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
+                       (material, call.invocation_id, call.output_ordinal))
+            if self._latest_output(tx, invocation):
+                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (call.invocation_id,))
             tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
             run = tx.one("SELECT * FROM runs")
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
-                    and invocation["current_invocation"] == call.invocation_id
+                    and invocation["current_invocation"] == call.invocation_id and self._latest_output(tx, invocation)
                     and job["generation"] == invocation["generation"]):
                 self._gate(tx, call.subject, "worker_unavailable", evidence=material)
 
@@ -716,19 +725,26 @@ class Kernel:
             self._process_exit(tx, call, invocation, returncode, failure)
 
     def _process_exit(self, tx: Transaction, call: AgentCall, invocation: sqlite3.Row, returncode: int, failure: str | None) -> None:
-        if invocation["exit_code"] is not None and invocation["exit_code"] != returncode:
-            raise KernelError("conflicting_exit")
-        tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=?,exited_at=coalesce(exited_at,?) WHERE id=?", (returncode, self.clock(), call.invocation_id))
+        if invocation["exit_code"] is not None:
+            if invocation["exit_code"] != returncode:
+                raise KernelError("conflicting_exit")
+            return
+        tx.execute("UPDATE invocation_outputs SET dispatch_state='exited',exit_code=?,exited_at=? WHERE invocation=? AND ordinal=?",
+                   (returncode, self.clock(), call.invocation_id, call.output_ordinal))
         tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
         self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"], generation=invocation["generation"])
         if invocation["raw_id"] is None and (returncode != 0 or failure is not None):
             material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure}))
-            tx.execute("UPDATE invocations SET status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            tx.execute("UPDATE invocation_outputs SET start_evidence=? WHERE invocation=? AND ordinal=?",
+                       (material, call.invocation_id, call.output_ordinal))
+            if self._latest_output(tx, invocation):
+                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (call.invocation_id,))
             run = tx.one("SELECT * FROM runs")
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
-                    and invocation["current_invocation"] == call.invocation_id and job["generation"] == invocation["generation"]):
+                    and invocation["current_invocation"] == call.invocation_id and self._latest_output(tx, invocation)
+                    and job["generation"] == invocation["generation"]):
                 self._gate(tx, call.subject, "execution_failed", evidence=material)
 
     def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
@@ -836,10 +852,11 @@ class Kernel:
                         elif code == "worker_start_unknown":
                             if not job["current_attempt"]:
                                 raise KernelError("worker_exit_unproven")
-                            invocation = tx.one("SELECT i.* FROM invocations i JOIN attempts a ON a.current_invocation=i.id WHERE a.id=?", (job["current_attempt"],))
+                            invocation = tx.one("SELECT i.*,o.* FROM invocations i JOIN attempts a ON a.current_invocation=i.id JOIN invocation_outputs o ON o.invocation=i.id WHERE a.id=? ORDER BY o.ordinal DESC LIMIT 1", (job["current_attempt"],))
                             if invocation["dispatch_state"] != "exited" or invocation["process_identity"] is None:
                                 raise KernelError("worker_exit_unproven")
-                            tx.execute("UPDATE invocations SET status='interrupted' WHERE id=? AND raw_id IS NULL", (invocation["id"],))
+                            if invocation["raw_id"] is None:
+                                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (invocation["id"],))
                         elif code == "publication_retry_exhausted":
                             tx.execute("UPDATE effects SET attempts=0 WHERE subject=? AND status='sent'", (subject,))
                         elif code == "write_conflict":
@@ -1084,9 +1101,10 @@ class Kernel:
         deadline_seconds = {Role.DEVELOPMENT: policy.development_deadline_seconds, Role.REVIEW: policy.review_deadline_seconds,
                             Role.PUBLICATION: policy.publication_deadline_seconds}[role]
         deadline_at = allocated_at + deadline_seconds
-        tx.execute("INSERT INTO invocations(id,attempt,thread,context_id,executor,epoch,lease,status,allocated_at,mode,requested_thread,deadline_seconds,deadline_at) VALUES (?,?,?,?,?,?,?,'running',?,?,?,?,?)",
-                   (invocation_id, attempt_id, thread_id, context_id, execution.owner, execution.epoch, lease_id, allocated_at,
-                    mode, backend_thread, deadline_seconds, deadline_at))
+        tx.execute("INSERT INTO invocations(id,attempt,thread,executor,epoch,status,allocated_at,deadline_seconds,deadline_at) VALUES (?,?,?,?,?,'running',?,?,?)",
+                   (invocation_id, attempt_id, thread_id, execution.owner, execution.epoch, allocated_at, deadline_seconds, deadline_at))
+        tx.execute("INSERT INTO invocation_outputs(invocation,ordinal,context_id,lease,allocated_at,mode,requested_thread) VALUES (?,0,?,?,?,?,?)",
+                   (invocation_id, context_id, lease_id, allocated_at, mode, backend_thread))
         tx.execute("UPDATE attempts SET current_invocation=?,status='running',new_thread=0 WHERE id=?", (invocation_id, attempt_id))
         tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (lease_id, subject, invocation_id, execution.owner, execution.epoch))
         tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
@@ -1139,14 +1157,16 @@ class Kernel:
                                           "artifact": json.loads(tx.get(previous["result_id"], job["id"]))}
         return context
 
-    def _consume(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, attempt: sqlite3.Row, world: World) -> Step:
+    def _consume(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, attempt: sqlite3.Row,
+                 world: World, execution: Execution, allow_agent: bool) -> Step:
         subject = job["id"]
+        if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
+            return Step("waiting", subject, "previous_invocation_exit")
         role = Role(attempt["role"])
         try:
             result = artifact(role, tx.get(attempt["result_id"], subject))
-        except KernelError:
-            self._gate(tx, subject, "invalid_artifact", evidence=attempt["result_id"])
-            return Step("paused", subject, "invalid_artifact")
+        except KernelError as error:
+            return self._repair_output(tx, run, job, attempt, world, execution, allow_agent, str(error))
         if role == Role.REVIEW and not attempt["accounted"]:
             self._charge_review(tx, attempt)
         if (not self._current(tx, job, run, world)
@@ -1184,6 +1204,49 @@ class Kernel:
         tx.execute("UPDATE subjects SET current_attempt=NULL,phase=?,version=version+1 WHERE id=?", (phase, subject))
         self._event(tx, subject, "role_consumed", attempt["id"], attempt["result_id"])
         return Step("progress", subject)
+
+    def _repair_output(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, attempt: sqlite3.Row,
+                       world: World, execution: Execution, allow_agent: bool, error: str) -> Step:
+        subject = job["id"]
+        if (not self._current(tx, job, run, world) or attempt["generation"] != job["generation"]
+                or attempt["candidate_sha"] != job["candidate_sha"]):
+            self._gate(tx, subject, "stale_return", evidence=attempt["result_id"])
+            return Step("paused", subject, "stale_return")
+        previous = tx.one("SELECT i.*,o.* FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id WHERE i.id=? ORDER BY ordinal DESC LIMIT 1",
+                          (attempt["current_invocation"],))
+        if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
+            return Step("waiting", subject, "previous_invocation_exit")
+        backend = tx.one("SELECT * FROM threads WHERE id=?", (previous["thread"],))
+        ordinal = tx.one("SELECT max(o.ordinal) FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation WHERE i.attempt=?", (attempt["id"],))[0] + 1
+        if (previous["dispatch_state"] != "exited" or previous["exit_code"] != 0
+                or previous["process_identity"] is None or backend["backend_id"] is None or ordinal > 2):
+            self._gate(tx, subject, "invalid_artifact", evidence=attempt["result_id"])
+            return Step("paused", subject, "invalid_artifact")
+        if self.clock() >= previous["deadline_at"]:
+            self._gate(tx, subject, "execution_failed", evidence=attempt["result_id"])
+            return Step("paused", subject, "invocation_deadline_exceeded")
+        if not allow_agent:
+            return Step("needs_agent", subject)
+        self._ready(tx, subject, "work_queue")
+        if (tx.one("SELECT subject FROM work_queue ORDER BY ready LIMIT 1")[0] != subject
+                or tx.one("SELECT count(*) FROM leases")[0] >= run["concurrency"]):
+            return Step("waiting", subject, "agent_capacity")
+        context = json.loads(tx.get(previous["context_id"], subject))
+        context.update(readonly=True, contract_error=error[:2000],
+                       original_output=tx.get(previous["raw_id"], subject).decode("utf-8", errors="replace"))
+        context_id = tx.put(subject, "output_repair_context", wire_json(context))
+        lease_id = identity()
+        tx.execute("INSERT INTO invocation_outputs(invocation,ordinal,context_id,lease,allocated_at,mode,requested_thread) VALUES (?,?,?,?,?,'output-repair',?)",
+                   (previous["id"], ordinal, context_id, lease_id, self.clock(), backend["backend_id"]))
+        tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (lease_id, subject, previous["id"], execution.owner, execution.epoch))
+        tx.execute("UPDATE invocations SET status='running' WHERE id=?", (previous["id"],))
+        tx.execute("UPDATE attempts SET result_id=NULL,status='running' WHERE id=?", (attempt["id"],))
+        tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+        self._event(tx, subject, "output_repair_allocated", f"{previous['id']}:{ordinal}", context_id)
+        return Step("agent", subject, call=AgentCall(attempt["id"], previous["id"], subject, Role(attempt["role"]),
+                    Purpose(attempt["purpose"]), previous["thread"], lease_id, execution, context,
+                    Profile(backend["model"], backend["effort"]), previous["deadline_seconds"], previous["deadline_at"],
+                    "output-repair", backend["backend_id"], ordinal))
 
     def _pending_effect(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
         rows = tx.rows("SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link')", (subject,))

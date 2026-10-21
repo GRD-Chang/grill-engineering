@@ -244,6 +244,7 @@ class AgentCall:
     deadline_at: float
     mode: str = "fresh"
     reported_thread: str | None = None
+    output_ordinal: int = 0
 
 
 @dataclass(frozen=True)

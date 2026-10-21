@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v7-exploration"
+PROTOCOL = "independent-delivery-kernel-v8-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -145,13 +145,18 @@ CREATE TABLE attempts (
 );
 CREATE TABLE invocations (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
- context_id TEXT NOT NULL REFERENCES material(id),
- executor TEXT NOT NULL, epoch INTEGER NOT NULL, lease TEXT NOT NULL UNIQUE,
- status TEXT NOT NULL, raw_id TEXT REFERENCES material(id), output_repairs INTEGER NOT NULL DEFAULT 0,
+ executor TEXT NOT NULL, epoch INTEGER NOT NULL, status TEXT NOT NULL, allocated_at REAL NOT NULL,
+ deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL
+);
+CREATE TABLE invocation_outputs (
+ invocation TEXT NOT NULL REFERENCES invocations(id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 2),
+ context_id TEXT NOT NULL REFERENCES material(id), lease TEXT NOT NULL UNIQUE,
+ raw_id TEXT REFERENCES material(id),
  dispatch_state TEXT NOT NULL DEFAULT 'allocated', process_identity TEXT REFERENCES material(id),
  exit_code INTEGER, start_evidence TEXT REFERENCES material(id), allocated_at REAL NOT NULL,
  dispatched_at REAL, started_at REAL, returned_at REAL, exited_at REAL,
- mode TEXT NOT NULL, requested_thread TEXT, deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL
+ mode TEXT NOT NULL, requested_thread TEXT,
+ PRIMARY KEY(invocation,ordinal)
 );
 CREATE TABLE work_queue (
  subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE
