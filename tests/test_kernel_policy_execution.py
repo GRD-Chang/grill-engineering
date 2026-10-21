@@ -68,7 +68,7 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
 
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=0))
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN, policy=Policy(resync_limit=0))
     for _ in range(50):
         step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
         if step.effect is not None and step.effect.operation == "integrate":
@@ -92,4 +92,4 @@ def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_pa
     assert published is not None and scenario.port.git.is_ancestor(source.sha, published.sha)
     assert scenario.port.git.run("show", published.sha + ":foreign-source.txt").stdout == "Source work\n"
     assert scenario.port.git.run("show", published.sha + ":foreign-target.txt").stdout == "Target work\n"
-    assert scenario.development_count == 1
+    assert scenario.development_count == 0
