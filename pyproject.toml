@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-agent-run = "agent_run.cli:main"
+agent-run = "agent_run_kernel.query_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
