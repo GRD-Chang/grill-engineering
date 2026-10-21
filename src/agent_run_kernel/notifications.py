@@ -266,6 +266,8 @@ class NativeNotifications:
             facts = resumes.get(key)
             if facts:
                 event.update(facts)
+                event["title"] = event_copy(self.state, "resume_" + facts["resume_outcome"])
+                event["color"] = "red" if facts["resume_outcome"] == "failed" else "yellow"
                 event["summary"] = (event_copy(self.state, "resume_" + facts["resume_outcome"])
                                     + event_copy(self.state, "separator") + event["summary"])
             outbox.enqueue(document, event, time.time())

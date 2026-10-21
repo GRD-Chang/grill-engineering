@@ -343,7 +343,7 @@ def _resumed(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any],
         return ordinary
     summary = "resume_worker_started_summary" if row["kind"] == "worker_started" else "resume_controller_check_summary" if row["kind"] == "checks_observed" else "resume_controller_progress_summary"
     return [event_envelope(state, "resume", facts["resume_id"], event_copy(state, "resume_started"),
-                           "green", summary=event_copy(state, summary), **facts)]
+                           "blue", summary=event_copy(state, summary), **facts)]
 
 
 def events(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[dict[str, Any]]:

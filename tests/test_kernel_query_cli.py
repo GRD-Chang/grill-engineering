@@ -193,6 +193,42 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
     assert query.read(kernel.storage.path, "status").data["resume_waits"] == []
 
 
+def test_current_status_and_one_history_page_do_not_load_unrelated_archived_snapshots(
+    tmp_path: Path, capsys,
+) -> None:
+    kernel = _create(tmp_path)
+    assert kernel.control("stop", "original-stop", subject="ticket:2") == "applied"
+    assert kernel.control("resume", "original-resume", subject="ticket:2") == "applied"
+    with kernel.storage.transaction() as tx:
+        original = tx.one("SELECT * FROM history WHERE kind='control_applied' AND identity='original-resume'")
+        # Resource-reader fixture: copy a valid historical status snapshot,
+        # adding only legal JSON whitespace. These archived records create no
+        # new Action, Gate, Worker or business authorization. Their total is
+        # above a response's 32MiB budget but within the real database limit.
+        snapshot = " " * (7 * 1024 * 1024) + original["status"]
+        assert json.loads(snapshot) == json.loads(original["status"])
+        for ordinal in range(5):
+            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status) "
+                       "VALUES (?,'boundary_update',?,NULL,?,?,?,?,?)",
+                       (original["subject"], f"archived-boundary-{ordinal}", original["generation"],
+                        original["created_at"], original["phase"], original["purpose"], snapshot))
+        after = tx.one("SELECT max(position) FROM history")[0]
+    assert kernel.control("stop", "current-stop", subject="ticket:2") == "applied"
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--json")) == 0
+    current = json.loads(capsys.readouterr().out)
+    assert current["latest_resume"]["action_id"] == "original-resume"
+    assert current["latest_resume"]["progress"] is None
+    assert current["operator_actions"][0]["reason"] == "operator_stopped"
+    assert len(json.dumps(current).encode()) < 128 * 1024
+    assert main(_arguments(kernel, "history", "--json", "--after", str(after), "--limit", "1")) == 0
+    page = json.loads(capsys.readouterr().out)
+    assert len(page["timeline"]) == 1 and page["timeline"][0]["position"] == after + 1
+    assert page["history_page"]["has_more"] is True
+    assert page["latest_resume"]["action_id"] == "original-resume"
+    assert _snapshot(tmp_path) == before
+
+
 def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

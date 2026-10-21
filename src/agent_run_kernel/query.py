@@ -535,8 +535,10 @@ def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[s
             "integration_queue": scheduling["integration_fifo"], "tickets": views}
 
 
-def _control_history(tx: Transaction) -> list[dict[str, Any]]:
-    actions = _all(tx, "SELECT * FROM actions ORDER BY rowid")
+def _control_history(tx: Transaction, *, latest_resume_only: bool = False) -> list[dict[str, Any]]:
+    sql = ("SELECT * FROM actions WHERE kind='resume' ORDER BY rowid DESC LIMIT 1" if latest_resume_only
+           else "SELECT * FROM actions ORDER BY rowid")
+    actions = _all(tx, sql)
     first_owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
     for action in actions:
         owner = action["subject"] or first_owner
@@ -548,6 +550,7 @@ def _control_history(tx: Transaction) -> list[dict[str, Any]]:
 def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Display original acceptance and the shared exact-target outcome facts."""
     resumes: list[dict[str, Any]] = []
+    applications = []
     for action in control:
         if action["kind"] != "resume":
             continue
@@ -555,17 +558,29 @@ def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict
         started = tx.one("SELECT min(o.started_at) FROM invocation_outputs o JOIN invocations i "
                          "ON i.id=o.invocation WHERE i.action_id=?", (action["id"],))[0]
         receipt = action["receipt"]
+        application = tx.rows("SELECT position,generation FROM history WHERE kind='control_applied' "
+                              "AND identity=? AND material_id=? ORDER BY position LIMIT 1",
+                              (action["id"], action["receipt_id"]))
+        if application:
+            applications.append(application[0])
         resumes.append({"action_id": action["id"], "subject": action["subject"], "status": action["status"],
                         "payload": action["payload"], "receipt": receipt,
                         "applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
                         "successor_invocations": [row["id"] for row in successors],
                         "started_at": _timestamp(started), "progress": None})
-    if not resumes:
+    if not resumes or not applications:
         return resumes
     by_action = {row["action_id"]: row for row in resumes}
-    for row in tx.all("SELECT * FROM history WHERE position>(SELECT min(h.position) FROM history h "
-                      "JOIN actions a ON a.id=h.identity WHERE h.kind='control_applied' AND a.kind='resume') "
-                      "ORDER BY position"):
+    # This is a candidate read, not a second Resume interpretation. Only the
+    # shared reader decides whether a proof belongs to the original Action.
+    # Archived status bodies/phase copy are never needed by that reader.
+    sql = ("SELECT position,kind,identity,subject,generation,material_id FROM history WHERE position>? "
+           "AND kind IN ('worker_started','effect_consumed','checks_observed','role_consumed','paused')")
+    values: tuple[Any, ...] = (min(row["position"] for row in applications),)
+    if len(resumes) == 1 and resumes[0]["subject"] is not None:
+        sql += " AND subject=? AND generation=?"
+        values += (resumes[0]["subject"], applications[0]["generation"])
+    for row in tx.all(sql + " ORDER BY position", values):
         facts = resume_facts(tx, dict(row))
         if facts and facts["action_id"] in by_action:
             by_action[facts["action_id"]]["progress"] = facts
@@ -708,7 +723,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
-            control = _control_history(tx)
+            control = _control_history(tx, latest_resume_only=kind == "status")
             resumes = _resume_history(tx, control)
             data["latest_resume"] = resumes[-1] if resumes else None
             data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
