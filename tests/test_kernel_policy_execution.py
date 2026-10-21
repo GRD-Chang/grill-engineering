@@ -37,6 +37,27 @@ def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: 
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
 
 
+def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "parent", base, "refs/heads/source", "refs/heads/target")
+    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+                           language="en", repository_root=str(tmp_path)))
+    call = kernel.advance(delivery.key, kernel.claim_executor("executor"), World("parent", "graph", "parent", base)).call
+    assert call is not None
+    assert call.context.get("language") == "en"
+    assert call.context.get("repository_root") == str(tmp_path)
+
+
+@pytest.mark.parametrize(("kind", "review"), [(DeliveryKind.TICKET, False), (DeliveryKind.PARENT_ONLY, True)])
+def test_ci_review_requirement_is_not_inferred_from_an_unlimited_review_budget(tmp_path: Path, kind: DeliveryKind, review: bool) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("delivery", kind, 1, "parent", base, "refs/heads/source", "refs/heads/target")
+    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
+    ci = kernel.status(delivery.key)["budgets"]["ci"]
+    assert ci["review_limit"] is None
+    assert ci.get("review_required") is review
+
+
 @pytest.mark.parametrize("limit", [0, 1])
 def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
