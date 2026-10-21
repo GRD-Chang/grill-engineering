@@ -115,8 +115,16 @@ class _Executor:
         effect = step.effect
         if effect is None:
             raise KernelError("effect_request_required")
-        port = (self.remote if effect.operation in Kernel.REMOTE else
-                LocalEffects(self.remote.git, owned_root=Path(effect.payload["owned_root"])))
+        port: RemoteEffects | LocalEffects
+        if effect.operation in Kernel.REMOTE:
+            port = self.remote
+        else:
+            local_root: Path | None = None
+            if effect.operation == "abandon_worktree":
+                local_root = Path(effect.payload["resource"]["owned_root"])
+            elif effect.operation != "inspect_resources":
+                local_root = Path(effect.payload["owned_root"])
+            port = LocalEffects(self.remote.git, owned_root=local_root)
         if step.kind == "reconcile":
             # Original physical outcome is durable before any new source I/O.
             result = port.reconcile(effect)
@@ -131,16 +139,25 @@ class _Executor:
             effect = self.kernel.attach_publication_commit(
                 effect, port.prepare_publication(effect), self.execution, self.observe(effect.subject),
             )
+        if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
+            if not isinstance(port, RemoteEffects):
+                raise KernelError("remote_retirement_required")
+            effect = self.kernel.attach_retirement(
+                effect, port.prepare_retirement(effect), self.execution, self.observe(effect.subject),
+            )
         dispatched = False
 
         def authorize() -> None:
             nonlocal dispatched
             world = self.observe(effect.subject)
+            resources = self.kernel.effect_resources(effect)
+            inspections = (None if resources is None else
+                           LocalEffects(self.remote.git).inspect_resources(resources))
             if not dispatched:
-                if not self.kernel.dispatch(effect, self.execution, world):
+                if not self.kernel.dispatch(effect, self.execution, world, resource_inspections=inspections):
                     raise KernelError("operation_cancelled")
                 dispatched = True
-            self.kernel.guard_effect(effect, self.execution, world)
+            self.kernel.guard_effect(effect, self.execution, world, resource_inspections=inspections)
 
         # Authorization cancellation is not a failed external command. Only
         # the adapter's actual command result below can create that audit fact.
@@ -162,6 +179,7 @@ class _Executor:
         advance = self.kernel.advance_cleanup if cleanup else self.kernel.advance
         step = advance(subject, self.execution)
         if step.kind == "observe":
+            subject = step.subject
             step = advance(subject, self.execution, self.observe(subject))
         if step.kind in {"effect", "reconcile"}:
             return self.effect(step)
@@ -213,6 +231,8 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
         with ThreadPoolExecutor(max_workers=scheduling["concurrency"], thread_name_prefix="agent-run") as pool:
             try:
                 while True:
+                    if scheduling.get("cancel_workers") is True:
+                        driver.cancelled.set()
                     # Also picks up Worker-thread commits during long calls.
                     # Observation is lock-free; the I/O loop's bounded calls
                     # can delay this tick, so no one-second delivery is promised.

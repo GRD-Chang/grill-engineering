@@ -16,7 +16,7 @@ from typing import Any, TYPE_CHECKING
 from agent_run.messages import error_message, text
 
 from . import personal_settings
-from .model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, RunSpec, World
+from .model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
 
 if TYPE_CHECKING:
     from .kernel import Kernel
@@ -110,7 +110,9 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
            manager: SystemdHost, environment: Mapping[str, str], runner_lock: Path,
            subject: str | None = None, world: World | None = None,
            message: str | None = None, new_thread: bool = False,
-           policy_overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
+           policy_overrides: Mapping[str, Any] | None = None,
+           resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False,
+           continuation_of: str | None = None) -> dict[str, Any]:
     """Submit one explicit Action through the existing managed Host protocol.
 
     The caller supplies the exact command constructed by the selected native
@@ -125,7 +127,9 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
         carrier = directory / "environment.json"
         request = kernel.admit_host(action_id, kind=kind, command=command, environment_carrier=carrier,
                                     preflight=manager.preflight, subject=subject, world=world,
-                                    message=message, new_thread=new_thread, policy_overrides=policy_overrides)
+                                    message=message, new_thread=new_thread, policy_overrides=policy_overrides,
+                                    resource_inspections=resource_inspections, discard_worktree=discard_worktree,
+                                    continuation_of=continuation_of)
         handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
         observed = launch_handoff(kernel, action_id, manager, handoff)
         with kernel.storage.transaction(write=False) as tx:
@@ -240,7 +244,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     from .query_cli import _candidates, _select
     from .remote_effects import RemoteEffects
 
-    if parsed.command not in {"run", "resume", "approve"}:
+    if parsed.command not in {"run", "resume", "approve", "stop", "revise", "abandon"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
     _require_github_host()
     policy_overrides = personal_settings._policy_values(parsed)
@@ -277,6 +281,45 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
                 raise KernelError("task_run_unpublished", "This database is not the published Run for its Task")
             stored = tx.one("SELECT subject,material_id FROM run_inputs")
             inputs = json.loads(tx.get(stored["material_id"], stored["subject"]))
+            abandoned = tx.rows("SELECT id,status FROM actions WHERE kind='abandon'", limit=1) if parsed.command == "abandon" else []
+            abandonment = dict(abandoned[0]) if abandoned else None
+            unknown_host = bool(parsed.command == "abandon" and tx.rows(
+                "SELECT owner FROM hosts WHERE (status!='exited' OR usage_released=0) AND status!='running' LIMIT 1"))
+        if parsed.command == "stop":
+            subject = None
+            if parsed.ticket is not None:
+                with kernel.storage.transaction(write=False) as tx:
+                    targets = tx.all("SELECT id FROM subjects WHERE kind='ticket' AND issue=?", (parsed.ticket,))
+                    if len(targets) != 1:
+                        raise KernelError("control_subject_ambiguous", "Select an exact Ticket")
+                    subject = str(targets[0]["id"])
+            action_id = uuid4().hex
+            action_status = kernel.stop_task(action_id, subject=subject)
+            return {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
+                    "action_id": action_id, "action": "stop", "host": "unknown", "language": run["language"]}
+        inspections = None
+        if parsed.command == "abandon":
+            from .effects import LocalGit
+            from .local_effects import LocalEffects
+            inspections = LocalEffects(LocalGit(workspace.repository_root)).inspect_resources(kernel.generation_resources())
+
+            def abandon_receipt(host: str = "unknown") -> dict[str, Any]:
+                if abandonment is None:
+                    action_id = uuid4().hex
+                    assert inspections is not None
+                    status = kernel.abandon_task(action_id, resource_inspections=inspections,
+                                                 discard_worktree=parsed.discard_worktree)
+                else:
+                    action_id, status = abandonment["id"], abandonment["status"]
+                result: dict[str, Any] = {"result": "accepted" if abandonment is None else "attached", "status": "action_" + status,
+                          "run_id": run["id"], "action_id": action_id, "action": "abandon", "host": host,
+                          "language": run["language"]}
+                if abandonment is not None:
+                    result.update(requested_action="abandon", requested_action_applied=False)
+                return result
+
+            if (unknown_host and abandonment is None) or (abandonment is not None and abandonment["status"] == "complete"):
+                return abandon_receipt()
         if not _active_runner():
             raise HostUnavailable("Lifecycle commands require the installed Active Runner")
         manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
@@ -285,31 +328,46 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         workspace.open_path()
         original = attach(kernel, requested_action=parsed.command, manager=manager,
                           environment=environment, runner_lock=runner_lock)
+        if parsed.command == "abandon":
+            if original is not None and original["host"] != "running":
+                if original["host"] == "exited" and kernel.active_host_action() is None and abandonment is not None:
+                    original = None  # Exact exit and usage proof permit the original cleanup continuation.
+                else:
+                    return abandon_receipt()
+            if original is not None and abandonment is not None:
+                return abandon_receipt("running")
         if original is not None and original["host"] != "running":
             original["language"] = run["language"]
             return original
         with kernel.storage.transaction(write=False) as tx:
-            if parsed.command == "approve":
+            if parsed.command == "abandon":
+                targets = []
+            elif parsed.command == "approve":
                 targets = tx.all("SELECT id FROM subjects WHERE kind!='ticket' AND phase='approval'")
+            elif parsed.command == "revise":
+                targets = tx.all("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
             elif getattr(parsed, "ticket", None) is not None:
                 targets = tx.all("SELECT id FROM subjects WHERE kind='ticket' AND issue=?", (parsed.ticket,))
             elif run["stopped"]:
                 targets = []
             else:
                 targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id")
-            if len(targets) > 1 or (not targets and not (parsed.command == "resume" and run["stopped"])):
+            if len(targets) > 1 or (not targets and not (parsed.command == "abandon" or parsed.command == "resume" and run["stopped"])):
                 raise KernelError("control_subject_ambiguous", "Select an exact Ticket or current Parent boundary")
             subject = None if not targets else str(targets[0]["id"])
-        remote = inputs.get("repository_remote")
-        if not isinstance(remote, str) or not remote:
-            raise KernelError("creation_repository_remote_required")
-        port = RemoteEffects(workspace.repository_root, workspace.repository,
-                             runner_identity=inputs["runner_identity"], remote=remote)
         world = None
-        if parsed.command == "approve":
+        if parsed.command in {"approve", "revise"}:
             assert subject is not None
+            remote = inputs.get("repository_remote")
+            if not isinstance(remote, str) or not remote:
+                raise KernelError("creation_repository_remote_required")
+            port = RemoteEffects(workspace.repository_root, workspace.repository,
+                                 runner_identity=inputs["runner_identity"], remote=remote)
             world = port.observe(kernel, subject)
-        else:
+        elif parsed.command == "resume":
+            remote = inputs.get("repository_remote")
+            if not isinstance(remote, str) or not remote:
+                raise KernelError("creation_repository_remote_required")
             from agent_run.github import GhGitHubReader
             from .source_reading import read_requirements
             reader = GhGitHubReader(workspace.repository, working_directory=workspace.repository_root,
@@ -322,7 +380,8 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
             request = kernel.host_request(original["action_id"])
             kernel.control_host(request, parsed.command, action_id, subject=subject, world=world,
                 message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False),
-                policy_overrides=policy_overrides)
+                policy_overrides=policy_overrides, resource_inspections=inspections,
+                discard_worktree=getattr(parsed, "discard_worktree", False))
             with kernel.storage.transaction(write=False) as tx:
                 action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
             result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
@@ -332,7 +391,9 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
                             command=command(database, action_id, runner_lock, environment), manager=manager,
                             environment=environment, runner_lock=runner_lock, subject=subject, world=world,
                             message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False),
-                            policy_overrides=policy_overrides)
+                            policy_overrides=policy_overrides, resource_inspections=inspections,
+                            discard_worktree=getattr(parsed, "discard_worktree", False),
+                            continuation_of=abandonment["id"] if abandonment is not None else None)
         result["language"] = run["language"]
         return result
 

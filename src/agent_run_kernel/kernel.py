@@ -8,6 +8,7 @@ returned request. A raw return and its business consumption commit separately.
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -24,7 +25,7 @@ from agent_run.task_identity import TaskKey
 
 from .model import (
     AgentCall, Commit, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError,
-    Delivery, Policy, Profile, PullRequest, Purpose, Requirements, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
+    Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
 from .configuration import checkpoint_policy
@@ -37,7 +38,8 @@ def identity() -> str:
 
 class Kernel:
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
-    REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref")
+    ABANDON_EFFECTS = ("inspect_resources", "retire_pr", "reopen_ticket", "abandon_worktree")
+    REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref", "retire_pr", "reopen_ticket")
     def __init__(self, path: Path) -> None:
         self.storage = Storage(path)
         self.clock: Callable[[], float] = time.time
@@ -345,7 +347,9 @@ class Kernel:
             summary = {"added_tickets": sorted(new_members - old_members), "removed_tickets": sorted(old_members - new_members),
                        "added_dependencies": [{"ticket_number": number, "blocked_by": blocker} for number, blocker in sorted(new_edges - old_edges)],
                        "removed_dependencies": [{"ticket_number": number, "blocked_by": blocker} for number, blocker in sorted(old_edges - new_edges)]}
-        return {"frontier": frontier, "remaining": remaining, "blocked": run["blocked"], "stopped": bool(run["stopped"]),
+        abandoned = self._abandon_action(tx)
+        return {"frontier": frontier if abandoned is None else [], "remaining": remaining, "blocked": run["blocked"], "stopped": bool(run["stopped"]),
+                "abandonment": None if abandoned is None else {"action": abandoned["id"], "status": abandoned["status"]},
                 "parent_revision": run["parent_revision"], "observed_parent_revision": run["observed_parent_revision"],
                 "accepted_parent_revision": run["accepted_parent_revision"], "graph_change_summary": summary,
                 "graph_revision": run["graph_revision"], "observed_graph_revision": run["observed_graph_revision"],
@@ -361,6 +365,345 @@ class Kernel:
             dependencies = tuple(row[0] for row in tx.all("SELECT predecessor FROM dependencies WHERE subject=? ORDER BY predecessor", (subject,)))
             return Delivery(subject, DeliveryKind(job["kind"]), job["issue"], job["revision"], Commit(job["base_sha"], job["base_tree"]),
                             job["source_ref"], job["target_ref"], dependencies, job["completion_revision"], job["checkout"], job["owned_root"], job["common_git_dir"])
+
+    def generation_resources(self) -> tuple[ResourceWitness, ...]:
+        """Read original current and retired worktree identities for inspection."""
+        with self.storage.transaction(write=False) as tx:
+            return self._generation_resources(tx)
+
+    def _generation_resources(self, tx: Transaction) -> tuple[ResourceWitness, ...]:
+        resources: list[ResourceWitness] = []
+        for job in tx.all("SELECT * FROM subjects ORDER BY id"):
+            generations = [*tx.all("SELECT * FROM retired_generations WHERE subject=? ORDER BY generation", (job["id"],)), job]
+            for generation in generations:
+                subject = job["id"]
+                if generation["checkout"]:
+                    resources.append(ResourceWitness(subject, generation["generation"], "development", generation["checkout"],
+                                                     generation["owned_root"], generation["common_git_dir"], generation["source_ref"],
+                                                     generation["workspace_sha"]))
+                for checkout in sorted({generation["validation_checkout"], generation["validation_cleanup"]} - {None}):
+                    witnesses = [json.loads(tx.get(row[0], subject)) for row in tx.all(
+                        "SELECT payload_id FROM effects WHERE subject=? AND generation=? AND operation='validation_checkout' AND status IN ('confirmed','observed')",
+                        (subject, generation["generation"]))]
+                    matches = [value for value in witnesses if value["checkout"] == checkout]
+                    if len(matches) != 1:
+                        raise KernelError("validation_resource_unproven")
+                    saved = matches[0]
+                    resources.append(ResourceWitness(subject, generation["generation"], "validation", checkout,
+                                                     saved["owned_root"], saved["common_git_dir"], generation["source_ref"], saved["reviewed_commit"]))
+        for row in tx.all("SELECT * FROM effects WHERE operation='validation_checkout' AND status IN ('prepared','sent','observed') ORDER BY rowid"):
+            saved = json.loads(tx.get(row["payload_id"], row["subject"]))
+            if not any(item.checkout == saved["checkout"] for item in resources):
+                resources.append(ResourceWitness(row["subject"], row["generation"], "validation", saved["checkout"],
+                                                 saved["owned_root"], saved["common_git_dir"], row["source_ref"], saved["reviewed_commit"]))
+        return tuple(resources)
+
+    @staticmethod
+    def _check_resource_inspections(resources: tuple[ResourceWitness, ...], inspections: tuple[ResourceInspection, ...], discard: bool) -> None:
+        if tuple(item.resource for item in inspections) != resources:
+            raise KernelError("abandon_resource_boundary")
+        for item in inspections:
+            if (item.disposition not in {"clean", "dirty", "absent"}
+                    or (item.disposition != "absent" and item.head_sha != item.resource.head_sha)):
+                raise KernelError("abandon_resource_unproven", item.resource.checkout)
+            if item.disposition == "dirty" and not discard:
+                raise KernelError("dirty_worktree", item.resource.checkout)
+
+    def _abandon_action(self, tx: Transaction) -> sqlite3.Row | None:
+        rows = tx.rows("SELECT * FROM actions WHERE kind='abandon'", limit=1)
+        return None if not rows else rows[0]
+
+    def _abandon_scope(self, tx: Transaction, action: sqlite3.Row) -> dict[str, Any]:
+        owner = action["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        return dict(json.loads(tx.get(action["receipt_id"], owner))["abandonment"])
+
+    def _abandon_discard(self, tx: Transaction, action: sqlite3.Row) -> bool:
+        if self._abandon_scope(tx, action)["discard_worktree"]:
+            return True
+        for row in tx.all("SELECT subject,receipt_id FROM actions WHERE kind='abandon_continue' AND status='applied'"):
+            receipt = json.loads(tx.get(row["receipt_id"], row["subject"]))
+            if receipt.get("continuation_of") == action["id"] and receipt.get("discard_worktree") is True:
+                return True
+        return False
+
+    def _abandon_inspection(self, tx: Transaction, action: sqlite3.Row) -> sqlite3.Row | None:
+        rows = tx.rows("SELECT e.* FROM effects e JOIN history h ON h.identity=e.id AND h.kind='effect_prepared' "
+                       "WHERE e.control_action=? AND e.operation='inspect_resources' AND h.position>"
+                       "COALESCE((SELECT MAX(position) FROM history WHERE kind='abandon_continued' AND identity=?),0) "
+                       "ORDER BY h.position DESC LIMIT 1", (action["id"], action["id"]))
+        return rows[0] if rows else None
+
+    def _check_abandon_inspection(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> None:
+        result = json.loads(tx.get(row["receipt_id"], row["subject"]))
+        inspections = tuple(ResourceInspection(**{**value, "resource": ResourceWitness(**value["resource"])})
+                            for value in result["raw"].get("resources", []))
+        self._check_resource_inspections(self._abandon_resources(tx, action), inspections, self._abandon_discard(tx, action))
+
+    def _abandon_resources(self, tx: Transaction, action: sqlite3.Row) -> tuple[ResourceWitness, ...]:
+        scope = self._abandon_scope(tx, action)
+        resources = [ResourceWitness(**value) for value in scope["resources"]]
+        # A write already released before the fence may settle afterward. Its
+        # exact original receipt can advance that resource's known HEAD; it
+        # cannot add another checkout, owner or generation to this Action.
+        for effect_id in scope["unsettled"]:
+            row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+            if row["status"] != "confirmed" or row["receipt_id"] is None or row["operation"] not in {"candidate", "integrate", "publication_commit", "validation_checkout"}:
+                continue
+            result = json.loads(tx.get(row["receipt_id"], row["subject"]))
+            if result["disposition"] != "target" or result["commit"] is None:
+                continue
+            payload = json.loads(tx.get(row["payload_id"], row["subject"]))
+            resources = [replace(item, head_sha=result["commit"]["sha"])
+                         if (item.subject, item.generation, item.checkout) == (row["subject"], row["generation"], payload.get("checkout"))
+                         else item for item in resources]
+        return tuple(resources)
+
+    def _abandon_owned(self, tx: Transaction, action: sqlite3.Row, execution: Execution) -> None:
+        scope = self._abandon_scope(tx, action)
+        run = tx.one("SELECT * FROM runs")
+        hosts = tx.rows("SELECT * FROM hosts WHERE run_id=? AND owner=? AND epoch=?", (execution.run_id, execution.owner, execution.epoch))
+        original = bool(scope["execution"]["owner"] and scope["execution"] == asdict(execution)
+                        and run["executor"] == execution.owner and run["epoch"] == execution.epoch + 1)
+        admitted = False
+        if (hosts and action["run_id"] == execution.run_id and run["executor"] == execution.owner
+                and run["epoch"] == execution.epoch):
+            request = json.loads(tx.get(hosts[0]["request_id"], hosts[0]["subject"]))
+            admitted = (hosts[0]["action_id"] == action["id"] or request["intent"].get("continuation_of") == action["id"])
+        if (not (original or admitted) or (not hosts and tx.rows("SELECT owner FROM hosts LIMIT 1"))
+                or (hosts and (hosts[0]["status"] != "running" or not hosts[0]["usage_ready"]))):
+            raise KernelError("executor_fenced")
+
+    def _abandon_effects(self, tx: Transaction, action: sqlite3.Row) -> list[sqlite3.Row]:
+        return tx.all("SELECT * FROM effects WHERE control_action=? ORDER BY rowid", (action["id"],))
+
+    def _abandon_prs(self, tx: Transaction, action: sqlite3.Row) -> list[dict[str, Any]]:
+        scope = self._abandon_scope(tx, action)
+        generations = {tuple(value) for value in scope["generations"]}
+        generations.update((row["subject"], row["generation"]) for row in tx.all("SELECT subject,generation FROM retired_generations"))
+        latest: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in tx.all("SELECT * FROM effects WHERE operation='pr_write' AND status='confirmed' AND receipt_id IS NOT NULL ORDER BY rowid"):
+            key = (row["subject"], row["generation"])
+            if key not in generations:
+                continue
+            result = json.loads(tx.get(row["receipt_id"], row["subject"]))
+            if result["disposition"] == "target" and result["pr"] is not None:
+                latest[key] = {"subject": row["subject"], "generation": row["generation"], "prior_pr": result["pr"]}
+        settled = {(row["subject"], row["generation"], row["pr_number"]) for row in tx.all(
+            "SELECT subject,generation,pr_number FROM effects WHERE operation IN ('merge','retire_pr') AND status='confirmed'")}
+        return [value for key, value in latest.items() if (*key, value["prior_pr"]["number"]) not in settled]
+
+    def _abandon_control_scope(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> bool:
+        if action["status"] != "pending" or row["control_action"] != action["id"] or row["operation"] not in self.ABANDON_EFFECTS:
+            return False
+        payload = json.loads(tx.get(row["payload_id"], row["subject"]))
+        if payload.get("control_action") != action["id"]:
+            return False
+        discard = self._abandon_discard(tx, action)
+        if row["operation"] == "inspect_resources":
+            return bool(payload.get("resources") == [asdict(item) for item in self._abandon_resources(tx, action)]
+                        and type(payload.get("discard_worktree")) is bool and (not payload["discard_worktree"] or discard))
+        if row["operation"] == "abandon_worktree":
+            resource = payload.get("resource")
+            return bool(resource in [asdict(item) for item in self._abandon_resources(tx, action)]
+                        and type(payload.get("discard_worktree")) is bool and (not payload["discard_worktree"] or discard)
+                        and resource["subject"] == row["subject"] and resource["generation"] == row["generation"]
+                        and resource["source_ref"] == row["source_ref"] and resource["head_sha"] == row["before_sha"])
+        if row["operation"] == "retire_pr":
+            return bool(payload.get("control_kind") == "abandon" and any(
+                item["subject"] == row["subject"] and item["generation"] == row["generation"] and item["prior_pr"] == payload.get("prior_pr")
+                for item in self._abandon_prs(tx, action)))
+        completion = payload.get("completion")
+        return bool(row["operation"] == "reopen_ticket" and isinstance(completion, dict) and tx.rows(
+            "SELECT subject FROM completions WHERE subject=? AND generation=? AND close_effect=?",
+            (row["subject"], row["generation"], completion.get("close_effect"))))
+
+    def _abandon_control_authority(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> bool:
+        if not self._abandon_control_scope(tx, action, row):
+            return False
+        if row["operation"] != "inspect_resources":
+            inspection = self._abandon_inspection(tx, action)
+            if inspection is None or inspection["status"] != "confirmed":
+                return False
+            self._check_abandon_inspection(tx, action, inspection)
+        return True
+
+    def _abandon_reconciliation_blocked(self, tx: Transaction, action: sqlite3.Row) -> bool:
+        continued = tx.one("SELECT COALESCE(MAX(position),0) FROM history WHERE kind='abandon_continued' AND identity=?", (action["id"],))[0]
+        effects = {row["id"]: row for row in self._abandon_effects(tx, action)}
+        for effect_id in self._abandon_scope(tx, action)["unsettled"]:
+            effects[effect_id] = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+        for row in effects.values():
+            if row["status"] != "sent":
+                continue
+            pending = tx.one("SELECT COALESCE(MAX(position),0) FROM history WHERE kind='abandon_reconciliation_pending' AND identity=?", (row["id"],))[0]
+            dispatched = tx.one("SELECT COALESCE(MAX(position),0) FROM history WHERE kind='effect_dispatched' AND identity=?", (row["id"],))[0]
+            if pending > max(continued, dispatched):
+                return True
+        return False
+
+    def _effect_owned(self, tx: Transaction, effect: Effect, execution: Execution) -> tuple[sqlite3.Row, sqlite3.Row]:
+        action = self._abandon_action(tx)
+        if action is None:
+            return self._owned(tx, effect.subject, execution)
+        self._abandon_owned(tx, action, execution)
+        row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+        if not self._abandon_control_authority(tx, action, row):
+            raise KernelError("executor_fenced")
+        return tx.one("SELECT * FROM runs"), self._job(tx, effect.subject)
+
+    def _abandon_write_current(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row,
+                               inspections: tuple[ResourceInspection, ...] | None) -> None:
+        if row["operation"] not in self.REMOTE:
+            return
+        if inspections is None:
+            raise KernelError("abandon_resource_observation_required")
+        resources = self._abandon_resources(tx, action)
+        self._check_resource_inspections(resources, inspections, self._abandon_discard(tx, action))
+
+    def effect_resources(self, effect: Effect) -> tuple[ResourceWitness, ...] | None:
+        """Read the original Action's local witnesses for a fresh write guard."""
+        with self.storage.transaction(write=False) as tx:
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            if self._effect(tx, row, effect.execution) != effect:
+                raise KernelError("effect_binding")
+            action = self._abandon_action(tx)
+            if action is None or row["control_action"] != action["id"]:
+                return None
+            return self._abandon_resources(tx, action)
+
+    @staticmethod
+    def _event_actor(event: Mapping[str, Any]) -> str | None:
+        actor = event.get("actor")
+        return actor.get("login") if isinstance(actor, dict) else actor if isinstance(actor, str) else None
+
+    def _reopen_not_owned(self, payload: Mapping[str, Any], result: Mapping[str, Any]) -> bool:
+        original = payload["close_receipt"].get("raw", {}).get("event")
+        raw = result.get("raw", {})
+        latest = raw.get("latest_close")
+        return bool(isinstance(original, dict) and isinstance(latest, dict)
+                    and raw.get("issue") == payload["issue"] and raw.get("state") == "CLOSED"
+                    and type(latest.get("id")) is int and latest["id"] > original["id"]
+                    and latest.get("event") == "closed" and self._event_actor(latest))
+
+    def _prepare_abandon_effect(self, tx: Transaction, run: sqlite3.Row, action: sqlite3.Row, subject: str,
+                                generation: int, execution: Execution, world: World, operation: str, *, before: str,
+                                payload: dict[str, Any]) -> Step:
+        job = self._job(tx, subject)
+        step = self._prepare_effect(tx, run, job, execution, world, operation, before=before,
+                                    payload={**payload, "control_action": action["id"]})
+        assert step.effect is not None
+        if operation == "retire_pr":
+            prior = payload["prior_pr"]
+            tx.execute("UPDATE effects SET generation=?,source_ref=?,target_ref=?,pr_number=?,base_sha=?,base_tree=? WHERE id=?",
+                       (generation, prior["source_ref"], prior["target_ref"], prior["number"], prior["base"]["sha"], prior["base"]["tree"], step.effect.effect_id))
+        else:
+            resource = payload.get("resource")
+            tx.execute("UPDATE effects SET generation=?,source_ref=? WHERE id=?",
+                       (generation, job["source_ref"] if resource is None else resource["source_ref"], step.effect.effect_id))
+        return Step("effect", subject, effect=self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (step.effect.effect_id,)), execution))
+
+    def _advance_abandon(self, tx: Transaction, run: sqlite3.Row, action: sqlite3.Row, subject: str,
+                         execution: Execution, world: World | None) -> Step:
+        self._abandon_owned(tx, action, execution)
+        if action["status"] == "complete":
+            return Step("complete", subject, "abandoned")
+        if tx.rows("SELECT id FROM leases LIMIT 1"):
+            return Step("waiting", subject, "worker_exit_unproven")
+        scope = self._abandon_scope(tx, action)
+        for effect_id in scope["unsettled"]:
+            row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+            if row["status"] == "sent":
+                return Step("reconcile", row["subject"], effect=self._effect(tx, row, execution))
+            if row["status"] == "observed":
+                if world is None or subject != row["subject"]:
+                    return Step("observe", row["subject"])
+                job = self._job(tx, row["subject"])
+                if row["operation"] == "close":
+                    return self._apply_effect(tx, run, job, row, world)
+                return self._settle_stale_effect(tx, job, row)
+            if row["status"] == "prepared":
+                tx.execute("UPDATE effects SET status='cancelled' WHERE id=?", (row["id"],))
+                return Step("progress", row["subject"], "business_intent_cancelled")
+        effects = self._abandon_effects(tx, action)
+        for row in effects:
+            if row["status"] == "sent":
+                return Step("reconcile", row["subject"], effect=self._effect(tx, row, execution))
+            if row["status"] == "observed":
+                result = json.loads(tx.get(row["receipt_id"], row["subject"]))
+                self._validate_target(tx, run, self._job(tx, row["subject"]), row, result)
+                payload = json.loads(tx.get(row["payload_id"], row["subject"]))
+                inspection = self._abandon_inspection(tx, action)
+                if row["operation"] == "inspect_resources" and inspection is not None and inspection["id"] == row["id"]:
+                    try:
+                        self._check_abandon_inspection(tx, action, row)
+                    except KernelError as error:
+                        return Step("paused", row["subject"], error.code)
+                elif result["disposition"] != "target" and not (row["operation"] == "reopen_ticket"
+                        and result["disposition"] == "third" and self._reopen_not_owned(payload, result)):
+                    return Step("paused", row["subject"], "abandon_outcome_unproven")
+                tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
+                self._event(tx, row["subject"], "effect_consumed", row["id"], row["receipt_id"], generation=row["generation"])
+                return Step("progress", row["subject"])
+        def completed(operation: str, key: str, value: Any) -> bool:
+            return any(row["operation"] == operation and row["status"] == "confirmed"
+                       and json.loads(tx.get(row["payload_id"], row["subject"])).get(key) == value for row in effects)
+        owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        inspection = self._abandon_inspection(tx, action)
+        if inspection is None or inspection["status"] != "confirmed":
+            if inspection is not None and inspection["status"] == "prepared":
+                return Step("effect", inspection["subject"], effect=self._effect(tx, inspection, execution))
+            if world is None or subject != owner:
+                return Step("observe", owner)
+            return self._prepare_abandon_effect(tx, run, action, owner, self._job(tx, owner)["generation"], execution, world,
+                "inspect_resources", before=self._job(tx, owner)["workspace_sha"],
+                payload={"resources": [asdict(item) for item in self._abandon_resources(tx, action)], "discard_worktree": self._abandon_discard(tx, action)})
+        self._check_abandon_inspection(tx, action, inspection)
+        for row in effects:
+            if row["status"] == "retired" and self._abandon_control_scope(tx, action, row):
+                prior = tx.rows("SELECT material_id FROM history WHERE kind='abandon_prior_confirmed' AND identity=? ORDER BY position DESC LIMIT 1", (row["id"],))
+                if prior:
+                    proof = json.loads(tx.get(prior[0][0], row["subject"]))
+                    if proof["dispatch_serial"] == row["attempts"] and proof["result"]["disposition"] == "prior":
+                        tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (row["id"],))
+                        refreshed = tx.one("SELECT * FROM effects WHERE id=?", (row["id"],))
+                        return Step("effect", row["subject"], effect=self._effect(tx, refreshed, execution))
+            if row["status"] == "prepared":
+                return Step("effect", row["subject"], effect=self._effect(tx, row, execution))
+        prs = self._abandon_prs(tx, action)
+        for final in (False, True):
+            for item in prs:
+                if (self._job(tx, item["subject"])["kind"] == DeliveryKind.FINAL_RUN) != final:
+                    continue
+                if completed("retire_pr", "prior_pr", item["prior_pr"]):
+                    continue
+                if world is None or subject != item["subject"]:
+                    return Step("observe", item["subject"])
+                return self._prepare_abandon_effect(tx, run, action, item["subject"], item["generation"], execution, world,
+                    "retire_pr", before=item["prior_pr"]["head"]["sha"], payload={"prior_pr": item["prior_pr"], "control_kind": "abandon"})
+            if final:
+                continue
+            for completion in tx.all("SELECT * FROM completions ORDER BY subject,generation"):
+                value = dict(completion)
+                if completed("reopen_ticket", "completion", value):
+                    continue
+                if world is None or subject != completion["subject"]:
+                    return Step("observe", completion["subject"])
+                closed = tx.one("SELECT * FROM effects WHERE id=? AND operation='close' AND status='confirmed'", (completion["close_effect"],))
+                payload = json.loads(tx.get(closed["payload_id"], completion["subject"]))
+                return self._prepare_abandon_effect(tx, run, action, completion["subject"], completion["generation"], execution, world,
+                    "reopen_ticket", before=completion["merge_sha"], payload={"issue": self._job(tx, completion["subject"])["issue"],
+                     "completion": value, "close_receipt": json.loads(tx.get(closed["receipt_id"], completion["subject"])), "close_intent": payload["close_intent"]})
+        for witness in self._abandon_resources(tx, action):
+            resource = asdict(witness)
+            if completed("abandon_worktree", "resource", resource):
+                continue
+            if world is None or subject != resource["subject"]:
+                return Step("observe", resource["subject"])
+            return self._prepare_abandon_effect(tx, run, action, resource["subject"], resource["generation"], execution, world,
+                "abandon_worktree", before=resource["head_sha"], payload={"resource": resource, "discard_worktree": self._abandon_discard(tx, action)})
+        tx.execute("UPDATE actions SET status='complete' WHERE id=?", (action["id"],))
+        self._event(tx, owner, "abandoned", action["id"], action["receipt_id"])
+        return Step("complete", subject, "abandoned")
 
     def activate_final(self, execution: Execution, run_head: Commit, default_head: Commit, *, ancestry: tuple[tuple[str, str], ...]) -> str:
         """Create Final only from exact Completion and observed Git ancestry."""
@@ -407,52 +750,213 @@ class Kernel:
     def requeue(self, subject: str, action_id: str, replacement: Delivery, world: World) -> str:
         """Explicitly retire one stale generation, retaining its work and siblings."""
         with self.storage.transaction() as tx:
-            job = self._job(tx, subject)
-            run = tx.one("SELECT * FROM runs")
-            if job["kind"] == DeliveryKind.FINAL_RUN:
-                raise KernelError("final_reacceptance_required")
-            prior = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
-            if prior:
-                command = json.loads(tx.get(prior[0]["payload_id"], subject))
-                if (prior[0]["kind"] != "requeue" or prior[0]["subject"] != subject
-                        or wire_json(command["replacement"]) != wire_json(asdict(replacement))):
-                    raise KernelError("action_identity_changed")
-                return str(prior[0]["status"])
-            if run["stopped"] or run["blocked"] != "requeue_required" or run["final_action"]:
-                raise KernelError("requeue_not_authorized")
-            if not any(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)):
-                raise KernelError("requeue_not_authorized")
-            if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)) or self._pending_effect(tx, subject) is not None:
+            return self._control(tx, "requeue", action_id, subject=subject, world=world, replacement=replacement)
+
+    def _validate_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                          replacement: Delivery, world: World) -> str:
+        subject = job["id"]
+        if job["kind"] == DeliveryKind.FINAL_RUN:
+            raise KernelError("final_reacceptance_required")
+        if run["stopped"] or run["blocked"] != "requeue_required" or run["final_action"]:
+            raise KernelError("requeue_not_authorized")
+        if not any(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)):
+            raise KernelError("requeue_not_authorized")
+        if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)) or self._pending_effect(tx, subject) is not None:
+            raise KernelError("generation_unsettled")
+        if (replacement.key != subject or replacement.kind != job["kind"] or replacement.issue != job["issue"]
+                or replacement.source_ref == job["source_ref"] or replacement.checkout == job["checkout"]
+                or replacement.target_ref != job["target_ref"] or replacement.base != world.target):
+            raise KernelError("replacement_identity")
+        revision = (run["observed_parent_revision"] if job["kind"] != DeliveryKind.TICKET else
+                    tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0])
+        if world.revision != revision or world.parent_revision != run["observed_parent_revision"] or world.graph_revision != run["graph_revision"]:
+            raise KernelError("replacement_requirements")
+        return str(revision)
+
+    def _requeue_final(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> None:
+        """Fresh whole-Run Acceptance shares the existing invalidation transition."""
+        if (run["stopped"] or run["blocked"] != "final_refresh" or job["refresh_revision"] is None
+                or any(gate["code"] in {"operator_stopped", "execution_failed"} for gate in self._gates(tx, job["id"]))):
+            raise KernelError("requeue_not_authorized")
+        if (tx.rows("SELECT id FROM leases WHERE subject=?", (job["id"],))
+                or self._pending_effect(tx, job["id"]) is not None):
+            raise KernelError("generation_unsettled")
+        if job["merge_sha"] or self._final_merge_intent(tx, run, job) is not None:
+            raise KernelError("final_merge_unsettled")
+        if (world.source is None or world.target is None or world.revision != job["refresh_revision"]
+                or world.parent_revision != run["observed_parent_revision"] or world.graph_revision != run["graph_revision"]
+                or world.completion_revision != job["completion_revision"]):
+            raise KernelError("replacement_requirements")
+        refreshed = self._refresh_final(tx, run, job, world)
+        if refreshed.kind != "progress":
+            raise KernelError("requeue_not_authorized", refreshed.reason)
+
+    def _replace_generation(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, replacement: Delivery,
+                            revision: str, action_id: str, payload: str) -> None:
+        subject = job["id"]
+        self._retire_generation(tx, job, "requirements_changed")
+        tx.execute("UPDATE subjects SET generation=generation+1,revision=?,phase='workspace',purpose='requirements',source_ref=?,checkout=?,base_sha=?,base_tree=?,source_sha=?,workspace_sha=?,owned_root=?,common_git_dir=?,candidate_sha=NULL,candidate_tree=NULL,integrated_sha=NULL,integrated_tree=NULL,expected_tree=NULL,integration_target=NULL,current_attempt=NULL,review_attempt=NULL,publication_attempt=NULL,publication_sha=NULL,publication_tree=NULL,pr_number=NULL,checks_id=NULL,grant_id=NULL,merge_sha=NULL,gate_mode=NULL,development_thread=NULL,ci_failure=NULL,last_failure=NULL,resume_purpose=NULL,repair_source=NULL,validation_checkout=NULL,validation_cleanup=NULL,version=version+1 WHERE id=?",
+                   (revision, replacement.source_ref, replacement.checkout, replacement.base.sha, replacement.base.tree, replacement.base.sha, replacement.base.sha, replacement.owned_root, replacement.common_git_dir, subject))
+        tx.execute("DELETE FROM issue_links WHERE subject=?", (subject,))
+        tx.execute("UPDATE runs SET parent_revision=?", (run["observed_parent_revision"],))
+        for budget in tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,)):
+            limits = self._budget_limits(self._subject_policy(tx, job), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
+            tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1", (subject, budget["purpose"]))
+            tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required) VALUES (?,?,?,?,?,?)",
+                       (subject, budget["purpose"], budget["window"] + 1, *limits, budget["review_required"]))
+        self._renew_resync(tx, job, require_exhaustion=False)
+        tx.execute("DELETE FROM gates WHERE subject=?", (subject,))
+        self._release_integration(tx, subject)
+        tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+        if not tx.rows("SELECT subject FROM gates WHERE code='requeue_required' LIMIT 1"):
+            tx.execute("UPDATE runs SET blocked=NULL WHERE blocked='requeue_required'")
+        self._event(tx, subject, "generation_requeued", action_id, payload)
+
+    def _pending_requeue(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
+        rows = tx.rows("SELECT * FROM actions WHERE kind='requeue' AND subject=? AND status='pending'", (subject,), limit=1)
+        return None if not rows else rows[0]
+
+    def _requeue_scope(self, tx: Transaction, action: sqlite3.Row) -> dict[str, Any]:
+        return dict(json.loads(tx.get(action["receipt_id"], action["subject"]))["requeue"])
+
+    def _recorded_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> sqlite3.Row:
+        rows = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND pr_number=? AND operation='retire_pr' AND status='confirmed' ORDER BY rowid DESC LIMIT 1",
+                       (job["id"], job["generation"], job["pr_number"]))
+        if not rows or world.pr is None or world.pr.state != "CLOSED" or world.target is None:
+            raise KernelError("retirement_pr_changed")
+        row = rows[0]
+        result = json.loads(tx.get(row["receipt_id"], job["id"]))
+        self._validate_target(tx, run, job, row, result)
+        pr = result.get("pr")
+        if (result["disposition"] != "target" or not isinstance(pr, dict) or not self._pr_identity(run, job, world.pr)
+                or world.pr.number != pr["number"] or asdict(world.pr.head) != pr["head"] or world.pr.actor != pr["actor"]
+                or world.pr.base != world.target or (world.pr.base.sha != pr["base"]["sha"]
+                    and (pr["base"]["sha"], world.pr.base.sha) not in world.ancestry)):
+            raise KernelError("retirement_pr_changed")
+        return row
+
+    def _recheck_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
+                            row: sqlite3.Row, result: EffectResult) -> Step:
+        original = json.loads(tx.get(row["receipt_id"], job["id"]))
+        observed = asdict(result)
+        if result.disposition == "target":
+            self._validate_target(tx, run, job, row, observed)
+            if (result.raw.get("event") != original["raw"].get("event")
+                    or result.raw.get("close_intent") != original["raw"].get("close_intent")):
+                result = replace(result, disposition="third")
+                observed = asdict(result)
+        material = tx.put(job["id"], "retirement_readback", wire_json({"effect": row["id"], "receipt": row["receipt_id"], "result": observed}))
+        if result.disposition == "target":
+            previous = tx.rows("SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1", (action["id"],))
+            if not previous or previous[0][0] != material:
+                self._event(tx, job["id"], "retirement_rechecked", action["id"], material)
+            return Step("progress", job["id"])
+        if result.disposition == "unknown":
+            self._gate(tx, job["id"], "write_result_unknown", evidence=material)
+            self._event(tx, job["id"], "retirement_recheck_pending", action["id"], material)
+            return Step("paused", job["id"], "write_result_unknown")
+        tx.execute("UPDATE actions SET status='superseded' WHERE id=?", (action["id"],))
+        self._gate(tx, job["id"], "requeue_retirement_changed", evidence=material)
+        self._event(tx, job["id"], "requeue_superseded", action["id"], material)
+        return Step("paused", job["id"], "requeue_retirement_changed")
+
+    def _requeue_versions_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                                  action: sqlite3.Row, world: World | None) -> bool:
+        scope = self._requeue_scope(tx, action)
+        facts = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+        revision = run["observed_parent_revision"] if job["kind"] != DeliveryKind.TICKET else None if not facts else facts[0][0]
+        return bool(scope["generation"] == job["generation"] and scope["revision"] == revision
+                    and scope["parent_revision"] == run["observed_parent_revision"]
+                    and scope["graph_revision"] == run["graph_revision"] == run["observed_graph_revision"]
+                    and (world is None or (world.revision == scope["revision"] and world.parent_revision == scope["parent_revision"]
+                         and world.graph_revision == scope["graph_revision"])))
+
+    def _end_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
+                     pending: sqlite3.Row | None, reason: str) -> Step:
+        if pending is not None:
+            if pending["operation"] != "retire_pr":
                 raise KernelError("generation_unsettled")
-            if (replacement.key != subject or replacement.kind != job["kind"] or replacement.issue != job["issue"]
-                    or replacement.source_ref == job["source_ref"] or replacement.checkout == job["checkout"]
-                    or replacement.target_ref != job["target_ref"] or replacement.base != world.target):
-                raise KernelError("replacement_identity")
-            revision = (run["observed_parent_revision"] if job["kind"] != DeliveryKind.TICKET else
-                        tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0])
-            if world.revision != revision or world.parent_revision != run["observed_parent_revision"] or world.graph_revision != run["graph_revision"]:
-                raise KernelError("replacement_requirements")
-            payload = tx.put(subject, "control_intent", wire_json({"kind": "requeue", "generation": job["generation"], "replacement": asdict(replacement)}))
-            receipt = tx.put(subject, "control_receipt", wire_json({"action": action_id, "generation": job["generation"] + 1}))
-            tx.execute("INSERT INTO actions(id,run_id,kind,subject,payload_id,status,receipt_id) VALUES (?,?,?,?,?,'applied',?)", (action_id, run["id"], "requeue", subject, payload, receipt))
-            self._retire_generation(tx, job, "requirements_changed")
-            tx.execute("UPDATE subjects SET generation=generation+1,revision=?,phase='workspace',purpose='requirements',source_ref=?,checkout=?,base_sha=?,base_tree=?,source_sha=?,workspace_sha=?,owned_root=?,common_git_dir=?,candidate_sha=NULL,candidate_tree=NULL,integrated_sha=NULL,integrated_tree=NULL,expected_tree=NULL,integration_target=NULL,current_attempt=NULL,review_attempt=NULL,publication_attempt=NULL,publication_sha=NULL,publication_tree=NULL,pr_number=NULL,checks_id=NULL,grant_id=NULL,merge_sha=NULL,gate_mode=NULL,development_thread=NULL,ci_failure=NULL,last_failure=NULL,resume_purpose=NULL,repair_source=NULL,validation_checkout=NULL,validation_cleanup=NULL,version=version+1 WHERE id=?",
-                       (revision, replacement.source_ref, replacement.checkout, replacement.base.sha, replacement.base.tree, replacement.base.sha, replacement.base.sha, replacement.owned_root, replacement.common_git_dir, subject))
-            tx.execute("DELETE FROM issue_links WHERE subject=?", (subject,))
-            tx.execute("UPDATE runs SET parent_revision=?", (run["observed_parent_revision"],))
-            for budget in tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,)):
-                limits = self._budget_limits(self._subject_policy(tx, job), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
-                tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1", (subject, budget["purpose"]))
-                tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required) VALUES (?,?,?,?,?,?)",
-                           (subject, budget["purpose"], budget["window"] + 1, *limits, budget["review_required"]))
-            self._renew_resync(tx, job, require_exhaustion=False)
-            tx.execute("DELETE FROM gates WHERE subject=?", (subject,))
-            self._release_integration(tx, subject)
-            tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
-            if not tx.rows("SELECT subject FROM gates WHERE code='requeue_required' LIMIT 1"):
-                tx.execute("UPDATE runs SET blocked=NULL WHERE blocked='requeue_required'")
-            self._event(tx, subject, "generation_requeued", action_id, payload)
-            return "applied"
+            if pending["status"] == "observed":
+                result = json.loads(tx.get(pending["receipt_id"], job["id"]))
+                self._validate_target(tx, run, job, pending, result)
+                if result["disposition"] != "target":
+                    return Step("paused", job["id"], "retirement_unconfirmed")
+                tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (pending["id"],))
+                self._event(tx, job["id"], "effect_consumed", pending["id"], pending["receipt_id"])
+            elif pending["status"] == "prepared":
+                tx.execute("UPDATE effects SET status='cancelled' WHERE id=?", (pending["id"],))
+        tx.execute("UPDATE actions SET status='superseded' WHERE id=?", (action["id"],))
+        self._gate(tx, job["id"], reason)
+        self._event(tx, job["id"], "requeue_superseded", action["id"], None if pending is None else pending["receipt_id"])
+        return Step("paused", job["id"], reason)
+
+    def _requeue_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
+                         world: World, *, open_pr: bool = True) -> bool:
+        scope = self._requeue_scope(tx, action)
+        original, pr = scope["prior_pr"], world.pr
+        return bool(not run["stopped"] and run["blocked"] == "requeue_required" and not run["final_action"]
+                    and all(gate["code"] == "requeue_required" for gate in self._gates(tx, job["id"]))
+                    and self._requeue_versions_current(tx, run, job, action, world)
+                    and world.target is not None and (scope["target"] == asdict(world.target)
+                        or (scope["target"]["sha"] != world.target.sha
+                            and (scope["target"]["sha"], world.target.sha) in world.ancestry))
+                    and original is not None and pr is not None and self._pr_identity(run, job, pr)
+                    and pr.number == original["number"] and asdict(pr.head) == original["head"]
+                    and pr.base == world.target and pr.actor == original["actor"]
+                    and pr.state == ("OPEN" if open_pr else "CLOSED"))
+
+    def _advance_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
+                         execution: Execution, world: World | None) -> Step:
+        subject = job["id"]
+        scope = self._requeue_scope(tx, action)
+        pending = self._pending_effect(tx, subject)
+        if pending is not None and pending["status"] == "sent":
+            return Step("reconcile", subject, effect=self._effect(tx, pending, execution))
+        if not self._requeue_versions_current(tx, run, job, action, world):
+            return self._end_requeue(tx, run, job, action, pending, "requeue_scope_changed")
+        if run["stopped"] or any(gate["code"] != "requeue_required" for gate in self._gates(tx, subject)):
+            return Step("paused", subject, self._pause_reason(tx, subject, run))
+        readback = None
+        if scope.get("retired_effect") is not None:
+            original = tx.one("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND status='confirmed'",
+                              (scope["retired_effect"], subject, job["generation"]))
+            previous = tx.rows("SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1", (action["id"],))
+            if not previous:
+                return Step("reconcile", subject, effect=self._effect(tx, original, execution))
+            readback = previous[0][0]
+        if world is None:
+            return Step("observe", subject)
+        if not self._requeue_current(tx, run, job, action, world, open_pr=readback is None and (pending is None or pending["status"] != "observed")):
+            return self._end_requeue(tx, run, job, action, pending, "requeue_retirement_changed")
+        if pending is None and readback is None:
+            scope = self._requeue_scope(tx, action)
+            return self._prepare_effect(tx, run, job, execution, world, "retire_pr", before=scope["prior_pr"]["head"]["sha"],
+                                        payload={"control_action": action["id"], "control_kind": "requeue", "prior_pr": scope["prior_pr"]})
+        if readback is None:
+            assert pending is not None
+            if pending["operation"] != "retire_pr":
+                raise KernelError("generation_unsettled")
+            if pending["status"] == "prepared":
+                return Step("effect", subject, effect=self._effect(tx, pending, execution))
+            result = json.loads(tx.get(pending["receipt_id"], subject))
+            self._validate_target(tx, run, job, pending, result)
+            if result["disposition"] != "target":
+                return Step("paused", subject, "retirement_unconfirmed")
+            tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (pending["id"],))
+            self._event(tx, subject, "effect_consumed", pending["id"], pending["receipt_id"])
+            retirement_effect, retirement_receipt = pending["id"], pending["receipt_id"]
+        else:
+            retirement_effect, retirement_receipt = scope["retired_effect"], readback
+            self._event(tx, subject, "retirement_recheck_consumed", action["id"], readback)
+        command = json.loads(tx.get(action["payload_id"], subject))
+        replacement = command["replacement"]
+        delivery = Delivery(**{**replacement, "kind": DeliveryKind(replacement["kind"]),
+                               "base": self._require_target(world), "dependencies": tuple(replacement["dependencies"])})
+        material = tx.put(subject, "generation_replacement", wire_json({"action": action["id"], "replacement": asdict(delivery),
+            "retirement_effect": retirement_effect, "retirement_receipt": retirement_receipt, "observed_target": asdict(self._require_target(world))}))
+        self._replace_generation(tx, run, job, delivery, self._requeue_scope(tx, action)["revision"], action["id"], material)
+        tx.execute("UPDATE actions SET status='applied' WHERE id=?", (action["id"],))
+        return Step("progress", subject, "generation_requeued")
 
     def _charge_review(self, tx: Transaction, attempt: sqlite3.Row) -> None:
         if attempt["role"] == Role.REVIEW and not attempt["accounted"]:
@@ -461,9 +965,10 @@ class Kernel:
             tx.execute("UPDATE attempts SET accounted=1 WHERE id=?", (attempt["id"],))
 
     def _retire_generation(self, tx: Transaction, job: sqlite3.Row, reason: str) -> None:
-        tx.execute("INSERT INTO retired_generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        tx.execute("INSERT INTO retired_generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (job["id"], job["generation"], job["revision"], job["source_ref"], job["checkout"], job["source_sha"],
-                    job["candidate_sha"], job["publication_sha"], job["pr_number"], reason, job["validation_checkout"], job["validation_cleanup"]))
+                    job["candidate_sha"], job["publication_sha"], job["pr_number"], reason, job["validation_checkout"], job["validation_cleanup"],
+                    job["workspace_sha"], job["owned_root"], job["common_git_dir"]))
         if job["current_attempt"]:
             attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
             if attempt["role"] == Role.REVIEW and attempt["result_id"]:
@@ -486,14 +991,16 @@ class Kernel:
             run = tx.one("SELECT * FROM runs")
             if run["id"] != run_id or self._task(run) != task:
                 raise KernelError("task_location_identity")
+            abandoned = self._abandon_action(tx)
+            completed_abandonment = bool(abandoned is not None and abandoned["status"] == "complete")
             return bool(run["executor"] is None
-                and not tx.rows("SELECT id FROM subjects WHERE phase!='complete' LIMIT 1")
-                and not tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run' AND phase='complete') LIMIT 1")
+                and (completed_abandonment or not tx.rows("SELECT id FROM subjects WHERE phase!='complete' LIMIT 1"))
+                and (completed_abandonment or not tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run' AND phase='complete') LIMIT 1"))
                 and not tx.rows("SELECT id FROM leases LIMIT 1")
                 and not tx.rows("SELECT owner FROM retired_executors WHERE status!='exited' LIMIT 1")
                 and not tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0 LIMIT 1")
                 and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1")
-                and not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1"))
+                and (completed_abandonment or not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1")))
 
     @classmethod
     def open_task(cls, task: TaskKey) -> Kernel | None:
@@ -519,19 +1026,37 @@ class Kernel:
     def admit_host(self, action_id: str, *, kind: str, command: tuple[str, ...], environment_carrier: Path,
                    preflight: Callable[[], None], subject: str | None = None, world: World | None = None,
                    message: str | None = None, new_thread: bool = False,
-                   policy_overrides: Mapping[str, Any] | None = None) -> HostLaunch:
+                   policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
+                   resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False,
+                   continuation_of: str | None = None) -> HostLaunch:
         """Bind one Task and apply its explicit control with the same Host intent."""
-        if (kind not in {"run", "resume", "approve", "revise"} or not action_id or not command
+        if (kind not in {"run", "resume", "approve", "revise", "requeue", "abandon"} or not action_id or not command
                 or any(not part or "\0" in part for part in command) or not environment_carrier.is_absolute()):
             raise KernelError("host_request_invalid")
         preflight()  # External I/O precedes both Task binding and durable Action.
-        intent = {"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
+        intent: dict[str, Any] = {"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
                   "command": list(command), "environment_carrier": str(environment_carrier),
                   "policy_overrides": dict(policy_overrides or {})}
+        if replacement is not None:
+            intent["replacement"] = asdict(replacement)
+        if resource_inspections is not None:
+            intent["resource_inspections"] = [asdict(item) for item in resource_inspections]
+        if discard_worktree:
+            intent["discard_worktree"] = True
+        if continuation_of is not None:
+            intent["continuation_of"] = continuation_of
         if kind == "run" and policy_overrides:
             raise KernelError("policy_override_boundary")
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                if (kind != "abandon" or continuation_of != abandoned["id"] or abandoned["status"] != "pending"
+                        or subject is not None or message is not None or new_thread or policy_overrides or replacement is not None
+                        or type(discard_worktree) is not bool):
+                    raise KernelError("run_abandoned")
+            elif continuation_of is not None:
+                raise KernelError("abandon_continuation_boundary")
             run_id, task = run["id"], self._task(run)
         with locked_task(task) as location:
             prior = read_task(location)
@@ -556,7 +1081,32 @@ class Kernel:
                 if tx.rows("SELECT id FROM actions WHERE id=?", (action_id,)):
                     raise KernelError("action_already_applied_without_host")
                 material_owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-                if kind == "run":
+                if continuation_of is not None:
+                    abandoned = self._abandon_action(tx)
+                    if abandoned is None or abandoned["id"] != continuation_of or abandoned["status"] != "pending":
+                        raise KernelError("abandon_continuation_boundary")
+                    if discard_worktree and resource_inspections is None:
+                        raise KernelError("abandon_resource_observation_required")
+                    if resource_inspections is not None:
+                        self._check_resource_inspections(self._abandon_resources(tx, abandoned), resource_inspections,
+                                                         discard_worktree or self._abandon_discard(tx, abandoned))
+                    payload = tx.put(material_owner, "abandon_continuation_intent", wire_json(intent))
+                    receipt = tx.put(material_owner, "control_receipt", wire_json({"action": action_id, "continuation_of": continuation_of,
+                                                                                 "discard_worktree": discard_worktree}))
+                    tx.execute("INSERT INTO actions(id,run_id,kind,subject,payload_id,status,receipt_id) VALUES (?,?,'abandon_continue',?,?,'applied',?)",
+                               (action_id, run_id, material_owner, payload, receipt))
+                    # Pure observations remain facts even when they blocked the
+                    # prior cleanup. A new explicit continuation gets a fresh
+                    # inspection; its permission never rewrites the old Action.
+                    for effect in self._abandon_effects(tx, abandoned):
+                        if effect["status"] == "prepared":
+                            tx.execute("UPDATE effects SET status='cancelled' WHERE id=?", (effect["id"],))
+                            self._event(tx, effect["subject"], "abandon_preparation_cancelled", effect["id"], effect["payload_id"], generation=effect["generation"])
+                        elif effect["operation"] == "inspect_resources" and effect["status"] == "observed":
+                            tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (effect["id"],))
+                            self._event(tx, effect["subject"], "effect_consumed", effect["id"], effect["receipt_id"], generation=effect["generation"])
+                    self._event(tx, material_owner, "abandon_continued", continuation_of, receipt)
+                elif kind == "run":
                     if run["stopped"]:
                         raise KernelError("operator_stopped")
                     payload = tx.put(material_owner, "control_intent", wire_json(intent))
@@ -566,7 +1116,8 @@ class Kernel:
                     self._event(tx, material_owner, "control_applied", action_id, receipt)
                 else:
                     self._control(tx, kind, action_id, subject=subject, world=world, message=message,
-                                  new_thread=new_thread, policy_overrides=policy_overrides)
+                                  new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
+                                  resource_inspections=resource_inspections, discard_worktree=discard_worktree)
                 epoch = tx.one("SELECT epoch FROM runs")[0] + 1
                 owner, nonce = identity(), identity()
                 request = HostLaunch(run_id, epoch, owner, nonce, "agent-run-kernel-" + nonce + ".service", command, environment_carrier)
@@ -579,7 +1130,8 @@ class Kernel:
 
     def control_host(self, request: HostLaunch, kind: str, action_id: str, *, subject: str | None = None,
                      world: World | None = None, message: str | None = None, new_thread: bool = False,
-                     policy_overrides: Mapping[str, Any] | None = None) -> str:
+                     policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
+                     resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False) -> str:
         """Apply an explicit action through the exact current Task and Host."""
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
@@ -590,9 +1142,16 @@ class Kernel:
             with self.storage.transaction() as tx:
                 self._host(tx, request)
                 run = tx.one("SELECT * FROM runs")
-                self._executor_owned(tx, run, Execution(request.run_id, request.owner, request.epoch))
+                abandoned = self._abandon_action(tx)
+                if abandoned is not None:
+                    if kind != "abandon" or action_id != abandoned["id"]:
+                        raise KernelError("run_abandoned")
+                    self._abandon_owned(tx, abandoned, Execution(request.run_id, request.owner, request.epoch))
+                else:
+                    self._executor_owned(tx, run, Execution(request.run_id, request.owner, request.epoch))
                 return self._control(tx, kind, action_id, subject=subject, world=world,
-                                     message=message, new_thread=new_thread, policy_overrides=policy_overrides)
+                                     message=message, new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
+                                  resource_inspections=resource_inspections, discard_worktree=discard_worktree)
 
     def stop_task(self, action_id: str, *, subject: str | None = None) -> str:
         """Revoke business work under the exact Task lock without a Host launch.
@@ -608,6 +1167,19 @@ class Kernel:
                 raise KernelError("task_location_identity")
             with self.storage.transaction() as tx:
                 return self._control(tx, "stop", action_id, subject=subject)
+
+    def abandon_task(self, action_id: str, *, resource_inspections: tuple[ResourceInspection, ...],
+                     discard_worktree: bool = False) -> str:
+        """Record the permanent fence without reclaiming execution or launching cleanup."""
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            run_id, task = run["id"], self._task(run)
+        with locked_task(task) as location:
+            if read_task(location) != (run_id, self.storage.path.resolve()):
+                raise KernelError("task_location_identity")
+            with self.storage.transaction() as tx:
+                return self._control(tx, "abandon", action_id, resource_inspections=resource_inspections,
+                                     discard_worktree=discard_worktree)
 
     @staticmethod
     def _host_launch(tx: Transaction, row: sqlite3.Row) -> HostLaunch:
@@ -640,7 +1212,12 @@ class Kernel:
             if row["dispatched_at"] is not None or row["status"] != "allocated":
                 return False
             run = tx.one("SELECT * FROM runs")
-            if run["stopped"] or (run["executor"], run["epoch"]) != (request.owner, request.epoch):
+            abandoned = self._abandon_action(tx)
+            continuation = False
+            if abandoned is not None:
+                intent = json.loads(tx.get(row["request_id"], row["subject"]))["intent"]
+                continuation = (row["action_id"] == abandoned["id"] or intent.get("continuation_of") == abandoned["id"])
+            if (run["stopped"] and not continuation) or (run["executor"], run["epoch"]) != (request.owner, request.epoch):
                 return False
             tx.execute("UPDATE hosts SET status='dispatched',dispatched_at=? WHERE run_id=? AND epoch=?", (self.clock(), request.run_id, request.epoch))
             self._event(tx, row["subject"], "host_dispatched", request.nonce)
@@ -732,6 +1309,8 @@ class Kernel:
     def claim_executor(self, owner: str) -> Execution:
         with self.storage.transaction() as tx:
             run = tx.one("SELECT * FROM runs")
+            if self._abandon_action(tx) is not None:
+                raise KernelError("run_abandoned")
             if tx.rows("SELECT owner FROM hosts LIMIT 1"):
                 raise KernelError("managed_host_required")
             if run["stopped"]:
@@ -771,7 +1350,13 @@ class Kernel:
 
     def advance(self, subject: str, execution: Execution, world: World | None = None, *, allow_agent: bool = True) -> Step:
         with self.storage.transaction() as tx:
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                return self._advance_abandon(tx, tx.one("SELECT * FROM runs"), abandoned, subject, execution, world)
             run, job = self._owned(tx, subject, execution)
+            requeue = self._pending_requeue(tx, subject)
+            if requeue is not None:
+                return self._advance_requeue(tx, run, job, requeue, execution, world)
             pending = self._pending_effect(tx, subject)
             # An unknown write is read back before scope drift or any new work.
             if pending is not None:
@@ -869,6 +1454,10 @@ class Kernel:
     def advance_cleanup(self, subject: str, execution: Execution, world: World | None = None) -> Step:
         """Bounded program work; cleanup never owns an Agent or integration seat."""
         with self.storage.transaction() as tx:
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                self._abandon_owned(tx, abandoned, execution)
+                return Step("complete" if abandoned["status"] == "complete" else "waiting", subject, "abandoned")
             run, job = self._owned(tx, subject, execution)
             records = tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))
             if not records or records[0]["state"] == "complete":
@@ -1152,12 +1741,23 @@ class Kernel:
                     and invocation["raw_id"] is None):
                 self._gate(tx, call.subject, "execution_failed", evidence=material)
 
-    def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
+    def guard_effect(self, effect: Effect, execution: Execution, world: World, *,
+                     resource_inspections: tuple[ResourceInspection, ...] | None = None) -> None:
         """Read-only authority guard for each real successor mutation in an adapter."""
         with self.storage.transaction(write=False) as tx:
-            run, job = self._owned(tx, effect.subject, execution)
+            run, job = self._effect_owned(tx, effect, execution)
             row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
             self._guard_publisher(tx, run, row, world)
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                if row["status"] != "sent" or self._effect(tx, row, execution) != effect:
+                    raise KernelError("operation_cancelled")
+                self._abandon_write_current(tx, abandoned, row, resource_inspections)
+                return
+            if effect.operation == "retire_pr":
+                if row["status"] != "sent" or self._effect(tx, row, execution) != effect or not self._retirement_authority(tx, run, job, row, world):
+                    raise KernelError("operation_cancelled")
+                return
             if effect.operation in self.CLEANUP:
                 if (row["status"] != "sent" or run["stopped"] or run["blocked"] or self._gates(tx, effect.subject)
                         or not self._cleanup_current(tx, job, row) or self._effect(tx, row, execution) != effect):
@@ -1186,7 +1786,8 @@ class Kernel:
 
     def control(self, kind: str, action_id: str, *, subject: str | None = None,
                 world: World | None = None, message: str | None = None, new_thread: bool = False,
-                policy_overrides: Mapping[str, Any] | None = None) -> str:
+                policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
+                     resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False) -> str:
         """Apply one explicit operator intent atomically, with its application receipt.
 
         The offline prototype calls this trusted interface directly. Host launch,
@@ -1194,24 +1795,39 @@ class Kernel:
         """
         with self.storage.transaction() as tx:
             return self._control(tx, kind, action_id, subject=subject, world=world, message=message,
-                                 new_thread=new_thread, policy_overrides=policy_overrides)
+                                 new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
+                                  resource_inspections=resource_inspections, discard_worktree=discard_worktree)
 
     def _control(self, tx: Transaction, kind: str, action_id: str, *, subject: str | None = None,
                  world: World | None = None, message: str | None = None, new_thread: bool = False,
-                 policy_overrides: Mapping[str, Any] | None = None) -> str:
-        if kind not in {"stop", "resume", "approve", "revise"}:
+                 policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
+                     resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False) -> str:
+        if kind not in {"stop", "resume", "approve", "revise", "requeue", "abandon"}:
             raise KernelError("prototype_control_unimplemented", kind)
         run = tx.one("SELECT * FROM runs")
         material_owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-        payload = wire_json({"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
-                             "policy_overrides": dict(policy_overrides or {})})
+        command: dict[str, Any] = {"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
+                                   "policy_overrides": dict(policy_overrides or {})}
+        if replacement is not None:
+            command["replacement"] = asdict(replacement)
+        if resource_inspections is not None:
+            command["resource_inspections"] = [asdict(item) for item in resource_inspections]
+        if discard_worktree:
+            command["discard_worktree"] = True
+        payload = wire_json(command)
         prior = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
         if prior:
             if tx.get(prior[0]["payload_id"], material_owner) != payload:
                 raise KernelError("action_identity_changed")
             return str(prior[0]["status"])
+        if self._abandon_action(tx) is not None:
+            raise KernelError("run_abandoned")
         if run["final_action"]:
             raise KernelError("final_approval_noncancellable")
+        if replacement is not None and kind != "requeue":
+            raise KernelError("replacement_identity")
+        if kind != "abandon" and (resource_inspections is not None or discard_worktree):
+            raise KernelError("abandon_resource_boundary")
         job = None if subject is None else self._job(tx, subject)
         if message is not None and (not message.strip() or len(message.encode()) > 8192):
             raise KernelError("human_response_boundary")
@@ -1228,7 +1844,29 @@ class Kernel:
         tx.execute("INSERT INTO actions(id,run_id,kind,subject,payload_id,status) VALUES (?,?,?,?,?,'applied')",
                    (action_id, run["id"], kind, subject, payload_id))
         feedback_scope: dict[str, dict[str, Any]] = {}
-        if kind == "stop":
+        requeue_scope: dict[str, Any] | None = None
+        abandonment: dict[str, Any] | None = None
+        if kind == "abandon":
+            if subject is not None or type(discard_worktree) is not bool or resource_inspections is None:
+                raise KernelError("abandon_resource_boundary")
+            resources = self._generation_resources(tx)
+            self._check_resource_inspections(resources, resource_inspections, discard_worktree)
+            if tx.rows("SELECT id FROM subjects WHERE kind!='ticket' AND merge_sha IS NOT NULL LIMIT 1"):
+                raise KernelError("merged_run_noncancellable")
+            if tx.rows("SELECT e.id FROM effects e JOIN subjects s ON s.id=e.subject WHERE s.kind!='ticket' AND e.operation='merge' AND e.status IN ('sent','observed') LIMIT 1"):
+                raise KernelError("final_merge_unsettled")
+            abandonment = {"resources": [asdict(item) for item in resources], "discard_worktree": discard_worktree,
+                           "execution": {"run_id": run["id"], "owner": run["executor"], "epoch": run["epoch"]},
+                           "generations": [[row["id"], row["generation"]] for row in tx.all("SELECT id,generation FROM subjects ORDER BY id")],
+                           "unsettled": [row[0] for row in tx.all("SELECT id FROM effects WHERE status IN ('prepared','sent','observed')") ]}
+            tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
+            if run["executor"] is not None:
+                tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'pending')",
+                           (run["id"], run["executor"], run["epoch"]))
+            tx.execute("UPDATE runs SET epoch=epoch+1,integration_holder=NULL WHERE id=?", (run["id"],))
+            tx.execute("DELETE FROM work_queue")
+            tx.execute("DELETE FROM integration_queue")
+        elif kind == "stop":
             if job is None:
                 if not run["stopped"] and run["executor"] is not None:
                     tx.execute("INSERT INTO retired_executors VALUES (?,?,?,'pending')",
@@ -1312,6 +1950,49 @@ class Kernel:
                 if job["grant_id"] and job["phase"] in {"merge", "completion_comment", "close"}:
                     tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
                     tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
+        elif kind == "requeue" and job is not None and job["kind"] == DeliveryKind.FINAL_RUN:
+            if world is None or replacement is not None:
+                raise KernelError("requeue_not_authorized")
+            self._requeue_final(tx, run, job, world)
+        elif kind == "requeue":
+            if job is None or subject is None or world is None or replacement is None:
+                raise KernelError("requeue_not_authorized")
+            revision = self._validate_requeue(tx, run, job, replacement, world)
+            if self._pending_requeue(tx, subject) is not None:
+                raise KernelError("requeue_already_pending")
+            prior_pr = None
+            retired_effect = None
+            if job["pr_number"] is not None:
+                prior_pr = world.pr
+                written = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND operation='pr_write' AND status='confirmed' ORDER BY rowid DESC LIMIT 1",
+                                  (subject, job["generation"]))
+                original_pr = (None if not written or written[0]["receipt_id"] is None else
+                               json.loads(tx.get(written[0]["receipt_id"], subject)).get("pr"))
+                if (prior_pr is None or prior_pr.number != job["pr_number"] or prior_pr.state not in {"OPEN", "CLOSED"}
+                        or not self._pr_identity(run, job, prior_pr) or prior_pr.head.sha != job["publication_sha"]
+                        or prior_pr.base != world.target or not isinstance(original_pr, dict)
+                        or not self._pr_identity(run, job, original_pr) or prior_pr.actor != original_pr["actor"]
+                        or prior_pr.actor != written[0]["actor"]):
+                    raise KernelError("retirement_pr_changed")
+                if prior_pr.state == "CLOSED":
+                    retired = self._recorded_retirement(tx, run, job, world)
+                    retired_effect = retired["id"]
+                    # Reuse the original preparation, including its exact base;
+                    # only a new readback may establish that closure still owns
+                    # the current lifecycle. It grants no second close call.
+                    original_payload = json.loads(tx.get(retired["payload_id"], subject))
+                    prior_pr = PullRequest(**{**original_payload["prior_pr"],
+                        "head": Commit(**original_payload["prior_pr"]["head"]),
+                        "base": Commit(**original_payload["prior_pr"]["base"]), "merged": None})
+                    tx.execute("DELETE FROM gates WHERE subject=? AND code IN ('requeue_scope_changed','requeue_retirement_changed')", (subject,))
+            requeue_scope = {"generation": job["generation"], "revision": revision,
+                             "parent_revision": world.parent_revision, "graph_revision": world.graph_revision,
+                             "target": asdict(self._require_target(world)), "prior_pr": None if prior_pr is None else asdict(prior_pr),
+                             "retired_effect": retired_effect}
+            if prior_pr is None:
+                self._replace_generation(tx, run, job, replacement, revision, action_id, payload_id)
+            else:
+                tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
         elif kind == "revise":
             if (job is None or subject is None or world is None or message is None
                     or job["kind"] != DeliveryKind.FINAL_RUN or job["phase"] != "approval"):
@@ -1352,12 +2033,12 @@ class Kernel:
             tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
             tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
         receipt = tx.put(material_owner, "control_receipt", wire_json({"action": action_id, "kind": kind, "applied": True,
-                                                                     "feedback_scope": feedback_scope}))
+                                                                     "feedback_scope": feedback_scope, "requeue": requeue_scope, "abandonment": abandonment}))
         tx.execute("UPDATE actions SET receipt_id=? WHERE id=?", (receipt, action_id))
         self._event(tx, material_owner, "control_applied", action_id, receipt)
         if kind == "resume" and subject is None and (message is not None or new_thread):
             self._event(tx, material_owner, "run_feedback_pending", action_id, receipt)
-        return "pending" if kind == "approve" else "applied"
+        return str(tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0])
 
     def _renew(self, tx: Transaction, job: sqlite3.Row, purpose: str, *, new_cycle: bool = False) -> None:
         old = tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (job["id"], purpose))
@@ -1419,6 +2100,22 @@ class Kernel:
             run = tx.one("SELECT * FROM runs")
             jobs = tx.all("SELECT * FROM subjects ORDER BY id")
             active = tx.all("SELECT l.*,i.deadline_at,o.dispatch_state FROM leases l JOIN invocations i ON i.id=l.invocation JOIN invocation_outputs o ON o.invocation=i.id AND o.lease=l.id ORDER BY l.subject")
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                disposition = "complete" if abandoned["status"] == "complete" else "waiting" if active else "progress"
+                inspection = self._abandon_inspection(tx, abandoned)
+                if disposition == "progress" and inspection is not None and inspection["status"] in {"observed", "confirmed"}:
+                    try:
+                        self._check_abandon_inspection(tx, abandoned, inspection)
+                    except KernelError:
+                        disposition = "quiescent"
+                if disposition == "progress" and self._abandon_reconciliation_blocked(tx, abandoned):
+                    disposition = "quiescent"
+                return {"concurrency": run["concurrency"], "integration_holder": None,
+                        "active": [{key: row[key] for key in ("id", "subject", "invocation")} for row in active],
+                        "work_fifo": [], "integration_fifo": [], "cancel_workers": True,
+                        "disposition": disposition,
+                        "next_deadline_at": None}
             now = self.clock()
             deadlines = [float(row["deadline_at"]) for row in active]
             progress = any(row["dispatch_state"] == "allocated" and row["deadline_at"] <= now for row in active)
@@ -1427,6 +2124,9 @@ class Kernel:
                 subject = job["id"]
                 gates = {row["code"] for row in self._gates(tx, subject)}
                 pending = self._pending_effect(tx, subject)
+                if self._pending_requeue(tx, subject) is not None:
+                    progress |= not run["stopped"] and gates <= {"requeue_required"}
+                    continue
                 if pending is not None:
                     if pending["status"] == "sent":
                         progress |= not bool(gates & {"write_result_unknown", "write_conflict", "publication_retry_exhausted"})
@@ -1496,6 +2196,8 @@ class Kernel:
 
     @staticmethod
     def _executor_owned(tx: Transaction, run: sqlite3.Row, execution: Execution) -> None:
+        if tx.rows("SELECT id FROM actions WHERE kind='abandon' LIMIT 1"):
+            raise KernelError("executor_fenced")
         if (run["id"] != execution.run_id or run["executor"] != execution.owner or run["epoch"] != execution.epoch):
             raise KernelError("executor_fenced")
         hosts = tx.rows("SELECT status,usage_ready FROM hosts WHERE run_id=? AND owner=? AND epoch=?", (execution.run_id, execution.owner, execution.epoch))
@@ -2084,6 +2786,42 @@ class Kernel:
         operation = row["operation"]
         payload = json.loads(tx.get(row["payload_id"], job["id"]))
         commit, pr = result["commit"], result["pr"]
+        if operation == "abandon_worktree" and (result["raw"].get("resource") != payload["resource"]
+                or result["raw"].get("reason") != "worktree_absent"):
+            raise KernelError("foreign_resource_receipt")
+        if operation == "reopen_ticket":
+            raw = result["raw"]
+            event = raw.get("reopened_event")
+            original = payload["close_receipt"].get("raw", {}).get("event")
+            if (raw.get("issue") != payload["issue"] or raw.get("state") != "OPEN"
+                    or not isinstance(original, dict) or raw.get("prior_close") != original):
+                raise KernelError("foreign_ticket_recovery_receipt")
+            if raw.get("already_open") is not True:
+                if (not isinstance(event, dict) or type(event.get("id")) is not int or event["id"] <= original["id"]
+                        or event.get("event") != "reopened" or self._event_actor(event) != row["actor"]):
+                    raise KernelError("foreign_ticket_recovery_receipt")
+        if operation == "retire_pr":
+            intent = payload.get("retirement_intent")
+            receipt = result["raw"].get("close_intent")
+            event = result["raw"].get("event")
+            if (not isinstance(intent, dict) or not isinstance(receipt, dict) or not isinstance(event, dict)
+                    or any(receipt.get(key) != value for key, value in intent.items())
+                    or type(receipt.get("comment_id")) is not int or receipt["comment_id"] <= 0
+                    or type(event.get("id")) is not int or event["id"] <= intent["baseline_event_id"]
+                    or event.get("event") != "closed" or event.get("actor") != row["actor"]
+                    or not pr or not self._pr_identity(run, row, pr) or pr["number"] != row["pr_number"]
+                    or pr["state"] != "CLOSED" or pr["head"] != payload["prior_pr"]["head"]
+                    or (pr["base"] != payload["prior_pr"]["base"] and (pr["base"]["sha"] == payload["prior_pr"]["base"]["sha"]
+                        or result["raw"].get("base_ancestry") != [payload["prior_pr"]["base"]["sha"], pr["base"]["sha"]]))
+                    or pr["actor"] != payload["prior_pr"]["actor"]):
+                raise KernelError("foreign_retirement_receipt")
+            try:
+                commented = datetime.fromisoformat(receipt["comment_created_at"])
+                closed = datetime.fromisoformat(event["created_at"])
+                if commented.utcoffset() is None or closed.utcoffset() is None or closed < commented:
+                    raise ValueError("retirement_event_precedes_intent")
+            except (KeyError, TypeError, ValueError) as error:
+                raise KernelError("foreign_retirement_receipt") from error
         if operation == "merge" and not self._merge_receipt_matches(tx, run, job, row, result):
             raise KernelError("foreign_merge_receipt")
         if operation == "pr_write" and (not pr or not self._pr_identity(run, row, pr)
@@ -2406,6 +3144,9 @@ class Kernel:
                             (subject, job["generation"]))
             source_ref, target_ref = closed["source_ref"], closed["target_ref"]
             base = Commit(closed["base_sha"], closed["base_tree"])
+        elif operation in {"inspect_resources", "abandon_worktree"}:
+            source_ref, target_ref = job["source_ref"], job["target_ref"]
+            base = Commit(job["base_sha"], job["base_tree"])
         else:
             source_ref, target_ref, base = job["source_ref"], job["target_ref"], self._require_target(world)
         body = dict(payload or {})
@@ -2430,12 +3171,12 @@ class Kernel:
         payload_id = tx.put(subject, "effect_intent", wire_json(body))
         tx.execute("""INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,
             graph_revision,revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
-            candidate_tree,base_sha,base_tree,pr_number,actor,payload_id)
-            VALUES (?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            candidate_tree,base_sha,base_tree,pr_number,actor,payload_id,control_action)
+            VALUES (?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (effect_id, subject, operation, execution.owner, execution.epoch, run["parent_revision"],
                     run["graph_revision"], job["revision"], job["generation"], source_ref, target_ref,
                     before, after, candidate_sha, candidate_tree, base.sha, base.tree,
-                    job["pr_number"], actor, payload_id))
+                    job["pr_number"], actor, payload_id, body.get("control_action")))
         self._event(tx, subject, "effect_prepared", effect_id, payload_id)
         row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
         return Step("effect", subject, effect=self._effect(tx, row, execution))
@@ -2490,10 +3231,55 @@ class Kernel:
             self._event(tx, effect.subject, "publication_commit_prepared", effect.effect_id, material)
             return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
 
-    def dispatch(self, effect: Effect, execution: Execution, world: World) -> bool:
+    def _retirement_authority(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                              row: sqlite3.Row, world: World) -> bool:
+        abandoned = self._abandon_action(tx)
+        if abandoned is not None:
+            return self._abandon_control_authority(tx, abandoned, row)
+        payload = json.loads(tx.get(row["payload_id"], job["id"]))
+        action = self._pending_requeue(tx, job["id"])
+        return bool(action is not None and payload.get("control_action") == action["id"]
+                    and payload.get("control_kind") == "requeue" and row["generation"] == job["generation"]
+                    and self._requeue_current(tx, run, job, action, world))
+
+    def attach_retirement(self, effect: Effect, witness: Mapping[str, Any], execution: Execution, world: World) -> Effect:
+        """Bind a read-only PR/event watermark before any retirement write."""
+        with self.storage.transaction() as tx:
+            run, job = self._effect_owned(tx, effect, execution)
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            if (effect.operation != "retire_pr" or row["status"] != "prepared" or row["attempts"]
+                    or self._effect(tx, row, execution) != effect or not self._retirement_authority(tx, run, job, row, world)):
+                raise KernelError("retirement_intent_boundary")
+            payload = json.loads(tx.get(row["payload_id"], effect.subject))
+            prior = payload["prior_pr"]
+            expected = {"repository": effect.repository, "pr_number": prior["number"], "source_ref": effect.source_ref,
+                        "target_ref": effect.target_ref, "head_sha": prior["head"]["sha"], "base_sha": prior["base"]["sha"],
+                        "author": prior["actor"]}
+            if (set(witness) != {*expected, "baseline_event_id"} or any(witness[key] != value for key, value in expected.items())
+                    or type(witness["baseline_event_id"]) is not int or witness["baseline_event_id"] < 0):
+                raise KernelError("retirement_pr_changed")
+            intent = {**dict(witness), "effect_id": effect.effect_id, "control_action": payload["control_action"],
+                      "run_id": run["id"], "subject": effect.subject, "generation": row["generation"],
+                      "control_kind": payload["control_kind"], "actor": effect.actor,
+                      "comment_body": (("Abandoning the original delivery Run." if run["language"] == "en" else "放弃原交付 Run。")
+                                       if payload["control_kind"] == "abandon" else
+                                       ("Retiring the superseded generation." if run["language"] == "en" else "封存已被替代的工作代次。"))
+                                      + f"\n\n<!-- agent-run-retirement:{effect.effect_id} -->"}
+            if "retirement_intent" in payload:
+                if payload["retirement_intent"] != intent:
+                    raise KernelError("retirement_intent_changed")
+                return effect
+            payload["retirement_intent"] = intent
+            material = tx.put(effect.subject, "effect_intent", wire_json(payload))
+            tx.execute("UPDATE effects SET payload_id=? WHERE id=?", (material, effect.effect_id))
+            self._event(tx, effect.subject, "retirement_intent_prepared", effect.effect_id, material)
+            return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
+
+    def dispatch(self, effect: Effect, execution: Execution, world: World, *,
+                 resource_inspections: tuple[ResourceInspection, ...] | None = None) -> bool:
         """Recheck authority immediately before the single external operation."""
         with self.storage.transaction() as tx:
-            run, job = self._owned(tx, effect.subject, execution)
+            run, job = self._effect_owned(tx, effect, execution)
             row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
             if row["status"] != "prepared":
                 return False
@@ -2503,6 +3289,22 @@ class Kernel:
                     and not effect.payload.get("publication_commit_intent")):
                 raise KernelError("publication_commit_intent_required")
             self._guard_publisher(tx, run, row, world)
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
+                    raise KernelError("retirement_intent_required")
+                self._abandon_write_current(tx, abandoned, row, resource_inspections)
+                tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+                self._event(tx, effect.subject, "effect_dispatched", effect.effect_id, generation=row["generation"])
+                return True
+            if effect.operation == "retire_pr":
+                if not effect.payload.get("retirement_intent"):
+                    raise KernelError("retirement_intent_required")
+                if not self._retirement_authority(tx, run, job, row, world):
+                    return False
+                tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+                self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
+                return True
             if run["stopped"] or run["blocked"] or self._gates(tx, effect.subject):
                 return False
             if effect.operation in self.CLEANUP:
@@ -2550,6 +3352,13 @@ class Kernel:
         with self.storage.transaction() as tx:
             row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
             if row["status"] in {"confirmed", "observed"}:
+                requeue = self._pending_requeue(tx, effect.subject)
+                if (row["status"] == "confirmed" and requeue is not None
+                        and self._requeue_scope(tx, requeue).get("retired_effect") == row["id"]):
+                    run, job = self._owned(tx, effect.subject, execution)
+                    if self._effect(tx, row, execution) != effect:
+                        raise KernelError("effect_binding")
+                    return self._recheck_retirement(tx, run, job, requeue, row, result)
                 return Step("progress", effect.subject)
             original_target = row["status"] == "prepared" and row["attempts"] > 0 and result.disposition == "target"
             if row["status"] == "prepared" and not original_target:
@@ -2588,10 +3397,41 @@ class Kernel:
                 tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
                 self._event(tx, effect.subject, "effect_observed", effect.effect_id, receipt)
                 return Step("progress", effect.subject)
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                self._abandon_owned(tx, abandoned, execution)
+                if row["control_action"] == abandoned["id"]:
+                    payload = json.loads(tx.get(row["payload_id"], effect.subject))
+                    if result.disposition == "third" and row["operation"] == "reopen_ticket" and self._reopen_not_owned(payload, asdict(result)):
+                        receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
+                        tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+                        self._event(tx, effect.subject, "ticket_recovery_not_owned", effect.effect_id, receipt, generation=row["generation"])
+                        return Step("progress", effect.subject)
+                    if (result.disposition == "prior" and self._abandon_control_scope(tx, abandoned, row)
+                            and row["attempts"] - row["retry_baseline"] < 3):
+                        evidence = tx.put(effect.subject, "abandon_prior_observation", wire_json({"dispatch_serial": row["attempts"], "result": asdict(result)}))
+                        self._event(tx, effect.subject, "abandon_prior_confirmed", effect.effect_id, evidence, generation=row["generation"])
+                        tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                        return Step("progress", effect.subject)
+                elif effect.effect_id in self._abandon_scope(tx, abandoned)["unsettled"] and result.disposition == "prior":
+                    tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                    self._event(tx, effect.subject, "abandoned_business_intent_not_applied", effect.effect_id, generation=row["generation"])
+                    return Step("progress", effect.subject)
+                evidence = tx.put(effect.subject, "abandon_observation", wire_json(asdict(result)))
+                self._event(tx, effect.subject, "abandon_reconciliation_pending", effect.effect_id, evidence, generation=row["generation"])
+                return Step("paused", effect.subject, result.disposition)
             run, job = self._owned(tx, effect.subject, execution)
             if result.disposition == "prior":
                 if world is None:
                     return Step("observe", effect.subject)
+                if row["operation"] == "retire_pr":
+                    if not self._retirement_authority(tx, run, job, row, world):
+                        return Step("paused", effect.subject, "retirement_authority")
+                    if row["attempts"] - row["retry_baseline"] >= 3:
+                        self._gate(tx, effect.subject, "publication_retry_exhausted")
+                        return Step("paused", effect.subject, "publication_retry_exhausted")
+                    tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
+                    return Step("progress", effect.subject)
                 if self._effect_stale(tx, run, job, row):
                     tx.execute("UPDATE effects SET status='retired' WHERE id=?", (row["id"],))
                     if job["kind"] == DeliveryKind.FINAL_RUN and run["observed_graph_revision"] == run["graph_revision"]:

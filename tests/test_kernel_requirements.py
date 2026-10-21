@@ -8,7 +8,7 @@ import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Requirements, RunSpec, World
 from agent_run_kernel.offline import GraphScenario
-from agent_run_kernel.model import Effect, EffectResult
+from agent_run_kernel.model import Effect, EffectResult, Execution, HostObservation
 
 
 def native_input() -> dict:
@@ -136,6 +136,123 @@ def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(t
     assert kernel.status("ticket:4")["pending_attempt"] is None
     assert kernel.advance("ticket:3", token, demand_world(kernel, "ticket:3"), allow_agent=False).kind == "progress"
     assert kernel.status("ticket:3")["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.parametrize("retirement_race", ["none", "foreign_author", "target_append_after_receipt", "target_append_after_lost_ack", "requirements_after_receipt", "requirements_then_foreign_close"])
+def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generation(tmp_path: Path, retirement_race: str) -> None:
+    scenario = GraphScenario(tmp_path / "managed-requeue", independent_source(), policy=Policy(concurrency=2))
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    kernel.control("stop", "retire-fixture")
+    kernel.confirm_executor_exit(scenario.execution)
+    kernel.control("resume", "prepare-managed")
+    request = kernel.admit_host("start", kind="run", command=("native-host",),
+                                environment_carrier=tmp_path / "carrier", preflight=lambda: None)
+    assert kernel.dispatch_host(request)
+    assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
+                                                       42, "start", usage_ready=True)) == "running"
+    scenario.execution = Execution(request.run_id, request.owner, request.epoch)
+    for _ in range(100):
+        scenario.step()
+        if kernel.status(subject)["phase"] == "checks":
+            break
+    else:
+        raise AssertionError("Original Ticket never published its PR")
+    original_pr = scenario.port.pull_request(subject)
+    assert original_pr is not None and original_pr.state == "OPEN"
+    original = kernel.delivery(subject)
+    preserved = Path(original.checkout) / "operator-note.txt"
+    preserved.write_text("Uncommitted work from the retired generation\n")
+    scenario.select("ticket:4")
+    for _ in range(20):
+        step = kernel.advance("ticket:4", scenario.execution, scenario.world())
+        if step.call is not None:
+            sibling = step.call
+            break
+        scenario.handle(step)
+    else:
+        raise AssertionError("Independent sibling never acquired its Invocation")
+    assert kernel.dispatch_agent(sibling)
+    sibling_before = kernel.status("ticket:4")
+    scenario.select(subject)
+    scenario.requirements = replace(scenario.requirements, issues=tuple(
+        replace(issue, body=issue.body + "\nClarified requirement") if issue.number == original.issue else issue
+        for issue in scenario.requirements.issues))
+    world = scenario.world()
+    replacement = replace(original, source_ref=original.source_ref + "-g2", checkout=str(Path(original.checkout).with_name("ticket-3-g2")),
+                          base=world.target)
+    if retirement_race == "foreign_author":
+        scenario.port._write_pr(subject, replace(original_pr, actor="foreign-pr-author"))
+        with pytest.raises(KernelError, match="retirement_pr_changed"):
+            kernel.control_host(request, "requeue", "replace-generation", subject=subject, world=scenario.world(),
+                                replacement=replacement)
+        assert kernel.status(subject)["generation"] == 1
+        assert not [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+        return
+    assert kernel.control_host(request, "requeue", "replace-generation", subject=subject, world=world,
+                               replacement=replacement) == "pending"
+    assert kernel.control_host(request, "requeue", "replace-generation", subject=subject, world=world,
+                               replacement=replacement) == "pending"
+    assert kernel.status(subject)["generation"] == 1
+    retirement = kernel.advance(subject, scenario.execution, scenario.world())
+    assert retirement.effect is not None and retirement.effect.operation == "retire_pr"
+    assert retirement.effect.pr_number == original_pr.number and retirement.effect.before_sha == original_pr.head.sha
+    if retirement_race not in {"target_append_after_receipt", "requirements_after_receipt", "requirements_then_foreign_close"}:
+        scenario.port.lose_response.add("retire_pr")
+    scenario.handle(retirement)
+    assert kernel.status(subject)["generation"] == 1
+    assert not kernel.status(subject)["retired_generations"]
+    assert scenario.port.pull_request(subject).state == "CLOSED"
+    if retirement_race in {"requirements_after_receipt", "requirements_then_foreign_close"}:
+        scenario.requirements = replace(scenario.requirements, issues=tuple(
+            replace(issue, body=issue.body + "\nAnother requirement after the accepted Action") if issue.number == original.issue else issue
+            for issue in scenario.requirements.issues))
+        assert scenario.step().kind == "paused"
+        assert kernel.control_host(request, "requeue", "replace-generation", subject=subject, world=world,
+                                   replacement=replacement) == "superseded"
+        assert kernel.status(subject)["generation"] == 1
+        assert kernel.status(subject)["pending_write"] is None
+        assert not kernel.status(subject)["retired_generations"]
+        assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+        if retirement_race == "requirements_then_foreign_close":
+            scenario.port.external_pr_transition(original_pr.number, "OPEN", "another-maintainer")
+            scenario.port.external_pr_transition(original_pr.number, "CLOSED", "another-maintainer")
+        latest = scenario.world()
+        renewed = replace(replacement, base=latest.target)
+        assert kernel.control_host(request, "requeue", "accept-new-requirements", subject=subject, world=latest,
+                                   replacement=renewed) == "pending"
+        checked = kernel.advance(subject, scenario.execution, scenario.world())
+        assert checked.kind == "reconcile" and checked.effect is not None
+        assert checked.effect.effect_id == retirement.effect.effect_id and checked.effect.operation == "retire_pr"
+        scenario.handle(checked)
+        assert kernel.status(subject)["generation"] == 1
+        if retirement_race == "requirements_then_foreign_close":
+            assert kernel.control_host(request, "requeue", "accept-new-requirements", subject=subject, world=latest,
+                                       replacement=renewed) == "superseded"
+            assert kernel.status(subject)["pending_write"] is None
+            assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+            return
+        assert scenario.step().kind == "progress"
+        assert kernel.status(subject)["generation"] == 2
+        assert scenario.run().kind == "complete"
+        assert scenario.port.pr_by_number(original_pr.number).state == "CLOSED"
+        assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+        return
+    if retirement_race in {"target_append_after_receipt", "target_append_after_lost_ack"}:
+        scenario.port.external_remote_append(original.target_ref, {"independent-target.txt": "Independent target advancement\n"}, "after-retirement")
+    if retirement_race not in {"target_append_after_receipt", "requirements_after_receipt", "requirements_then_foreign_close"}:
+        assert scenario.step().kind == "reconcile"
+        assert kernel.status(subject)["generation"] == 1
+    assert scenario.step().kind == "progress"
+    assert kernel.status(subject)["generation"] == 2
+    assert kernel.status("ticket:4") == sibling_before
+    kernel.guard_agent(sibling)
+    assert preserved.read_text() == "Uncommitted work from the retired generation\n"
+    assert scenario.port.ref_commit(replacement.source_ref) is None
+    assert scenario.run().kind == "complete"
+    replacement_pr = scenario.port.pull_request(subject)
+    assert replacement_pr is not None and replacement_pr.number != original_pr.number
+    assert scenario.port.pr_by_number(original_pr.number).state == "CLOSED"
+    assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
 
 
 def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_authority(tmp_path: Path) -> None:

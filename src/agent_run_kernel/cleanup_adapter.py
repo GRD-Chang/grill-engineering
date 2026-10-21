@@ -6,13 +6,14 @@ import re
 import selectors
 import signal
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic
 
 from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError
+from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness
 
 
 def _result(disposition: str, reason: str, **facts: object) -> EffectResult:
@@ -131,23 +132,96 @@ def cleanup_remote_ref(git: LocalGit, effect: Effect) -> EffectResult:
     return inspect_remote_ref(git, effect)
 
 
-def _worktree(effect: Effect) -> tuple[Path, Path, Path, str, str] | None:
-    identity = _ref(effect, "validation_cleanup" if effect.operation == "validation_cleanup" else "cleanup_worktree")
-    values = [effect.payload.get(key) for key in ("checkout", "owned_root", "common_git_dir")]
-    if identity is None or any(not isinstance(value, str) or not value or "\0" in value for value in values):
+def _worktree_paths(values: tuple[object, object, object]) -> tuple[Path, Path, Path] | None:
+    if any(not isinstance(value, str) or not value or "\0" in value for value in values):
         return None
     checkout, owned, common = (Path(str(value)) for value in values)
     if (not all(path.is_absolute() for path in (checkout, owned, common))
             or not checkout.is_relative_to(owned) or checkout == owned
             or any(path.resolve() != path for path in (checkout, owned, common))):
         return None
-    return checkout, owned, common, *identity
+    return checkout, owned, common
+
+
+def _worktree(effect: Effect) -> tuple[Path, Path, Path, str, str] | None:
+    if effect.operation == "abandon_worktree":
+        resource = _abandon_resource(effect)
+        if resource is None:
+            return None
+        paths = _worktree_paths((resource.checkout, resource.owned_root, resource.common_git_dir))
+        return None if paths is None else (*paths, resource.source_ref, resource.head_sha)
+    identity = _ref(effect, "validation_cleanup" if effect.operation == "validation_cleanup" else "cleanup_worktree")
+    if identity is None:
+        return None
+    paths = _worktree_paths((effect.payload.get("checkout"), effect.payload.get("owned_root"),
+                             effect.payload.get("common_git_dir")))
+    return None if paths is None else (*paths, *identity)
+
+
+def _valid_resource(resource: ResourceWitness) -> bool:
+    return (isinstance(resource.subject, str) and bool(resource.subject)
+            and type(resource.generation) is int and resource.generation >= 1
+            and resource.kind in ("development", "validation")
+            and isinstance(resource.source_ref, str) and resource.source_ref.startswith("refs/heads/")
+            and "\0" not in resource.source_ref and isinstance(resource.head_sha, str)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", resource.head_sha) is not None)
+
+
+def _abandon_resource(effect: Effect) -> ResourceWitness | None:
+    raw = effect.payload.get("resource")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        resource = ResourceWitness(**raw)
+    except TypeError:
+        return None
+    if (not _valid_resource(resource) or resource.subject != effect.subject
+            or resource.source_ref != effect.source_ref or resource.head_sha != effect.before_sha
+            or resource.source_ref == effect.target_ref
+            or not isinstance(effect.payload.get("control_action"), str) or not effect.payload["control_action"]
+            or type(effect.payload.get("discard_worktree")) is not bool):
+        return None
+    return resource
 
 
 def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
     """Require exact registration, Git identity, HEAD and a clean owned checkout."""
     try:
-        identity = _worktree(effect)
+        discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
+        observed = _inspect_worktree(git, _worktree(effect),
+                                    check_dirty=effect.operation != "validation_cleanup" and not discard)
+        if effect.operation == "abandon_worktree" and _abandon_resource(effect) is not None:
+            return replace(observed, raw={**observed.raw, "resource": dict(effect.payload["resource"])})
+        return observed
+    except (KernelError, OSError, RuntimeError, subprocess.SubprocessError):
+        return _result("unknown", "worktree_read_failed")
+
+
+def inspect_resource(git: LocalGit, resource: ResourceWitness) -> ResourceInspection:
+    """Read one original resource witness, including validation checkout dirt."""
+    if not _valid_resource(resource):
+        return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
+    try:
+        paths = _worktree_paths((resource.checkout, resource.owned_root, resource.common_git_dir))
+        if paths is None:
+            return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
+    except (OSError, RuntimeError):
+        return ResourceInspection(resource, "unknown", reason="worktree_read_failed")
+    observed = _inspect_worktree(git, (*paths, resource.source_ref, resource.head_sha),
+                                 check_dirty=True)
+    reason = str(observed.raw["reason"])
+    if observed.disposition == "prior":
+        return ResourceInspection(resource, "clean", resource.head_sha, reason)
+    if reason == "worktree_dirty":
+        return ResourceInspection(resource, "dirty", resource.head_sha, reason)
+    if observed.disposition == "target":
+        return ResourceInspection(resource, "absent", reason=reason)
+    return ResourceInspection(resource, "unknown" if observed.disposition == "unknown" else "foreign", reason=reason)
+
+
+def _inspect_worktree(git: LocalGit, identity: tuple[Path, Path, Path, str, str] | None,
+                      *, check_dirty: bool) -> EffectResult:
+    try:
         if identity is None:
             return _result("third", "invalid_worktree_identity")
         checkout, _owned, common, ref, expected = identity
@@ -174,8 +248,7 @@ def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
                 or symbolic.returncode not in {0, 1}
                 or (symbolic.returncode == 0 and symbolic.stdout.strip() != ref)):
             return _result("third", "worktree_identity_changed")
-        if (effect.operation != "validation_cleanup"
-                and _read(git, "status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
+        if check_dirty and _read(git, "status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout:
             return _result("third", "worktree_dirty")
         return _result("prior", "worktree_owned", attached=symbolic.returncode == 0)
     except (KernelError, OSError, RuntimeError, subprocess.SubprocessError):
@@ -251,7 +324,8 @@ def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
             if verified.disposition != "prior":
                 return verified
             _authority(git)
-            options = ("--force",) if effect.operation == "validation_cleanup" else ()
+            discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
+            options = ("--force",) if effect.operation == "validation_cleanup" or discard else ()
             git.run("worktree", "remove", *options, str(checkout), check=False)
     except KernelError as error:
         if error.code not in {"cleanup_lock_timeout", "cleanup_lock_failed"}:

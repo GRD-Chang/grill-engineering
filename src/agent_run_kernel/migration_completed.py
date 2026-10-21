@@ -1,9 +1,7 @@
-"""Offline import of one completed v6 Ticket with witnessed external effects.
+"""Offline completed-Ticket import with lossless history and proved authority.
 
-The old synchronous backend has semantic Attempts, but no physical Invocation
-or bound Thread.  Completion is imported as a native relation, with old effect
-receipts and chronology retained as source material.  This does not authorize
-resuming the old runtime after the new one has acted.
+Historical records grant no execution. Only the current Completion's supporting
+semantic Attempts and current allowance become native operational relations.
 """
 from __future__ import annotations
 
@@ -23,26 +21,10 @@ from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
                         _require_no_v6_notification_journal, capture_v6)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
+from .migration_records import RECORD_TABLES, _preserve_copy
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
                     KernelError, ParentIssue, Policy, Profile, Requirements, Role,
                     RunSpec, artifact, wire_json)
-
-
-_COMPLETED_TABLES = frozenset({
-    "schema_meta", "runs", "run_root", "run_condition_base", "run_parent_versions",
-    "run_graph_versions", "run_graph_snapshots", "run_graph_scope_order",
-    "run_graph_ticket_slots", "run_graph_members", "run_frontier", "run_query_roots",
-    "run_resume_roots", "run_timeline_events", "run_timeline_slots",
-    "run_closeout_headers", "run_cleanup_items", "work_jobs", "work_job_slots",
-    "work_job_layout", "work_job_archives", "work_job_archive_roots",
-    "work_job_attempt_roots", "work_job_attempt_history", "work_job_acceptance_record",
-    "work_job_review_artifacts", "work_job_review_budget", "work_job_ci_recovery",
-    "work_job_integration_resync", "work_job_merge_intent", "work_job_record_strings",
-    "work_job_ticket_close_intent", "work_job_ticket_close_ownership",
-    "work_invocation_roots", "work_evidence", "work_evidence_materials",
-    "work_attempts", "work_attempt_versions", "work_attempt_current",
-    "work_attempt_returns", "work_attempt_result_members",
-})
 
 
 @dataclass(frozen=True)
@@ -71,10 +53,12 @@ class _Completed:
     old_job: dict[str, Any]
     old_cleanup: dict[str, Any]
     attempts: tuple[dict[str, Any], ...]
-    evidence: tuple[dict[str, Any], ...]
     timeline: tuple[dict[str, Any], ...]
     close_intent: dict[str, Any]
     close_ownership: dict[str, Any]
+    developments_used: int
+    reviews_used: int
+    physical_invocations: int
 
 
 def _completed_evidence(db: sqlite3.Connection, run_id: str, evidence_id: str,
@@ -104,31 +88,105 @@ def _completed_evidence(db: sqlite3.Connection, run_id: str, evidence_id: str,
     return selected
 
 
+def _settled_invocations(db: sqlite3.Connection, run_id: str, calls: list[dict[str, Any]],
+                         profile: Mapping[str, Any]) -> int:
+    """Verify old execution facts without constructing native execution rows."""
+    history = db.execute("SELECT * FROM work_invocation_history WHERE run_id=? ORDER BY position",
+                         (run_id,)).fetchall()
+    count = db.execute("SELECT count(*) FROM work_invocations WHERE run_id=?", (run_id,)).fetchone()[0]
+    if not count:
+        if history or profile["bindings"] or db.execute(
+                "SELECT 1 FROM work_invocation_current WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+            raise MigrationRefused("source_invocation_relations")
+        return 0
+    if count != len(history) or count != len(calls) or [row["position"] for row in history] != list(range(count)):
+        raise MigrationRefused("unsupported_source_invocation_history")
+    bindings = profile["bindings"]
+    by_thread = {row.get("thread_id"): row for row in bindings if isinstance(row, dict)}
+    if len(by_thread) != len(bindings):
+        raise MigrationRefused("source_profile_bindings")
+    previous_end = 0.0
+    for call, witness in zip(calls, history, strict=True):
+        invocation = _one(db, "SELECT * FROM work_invocations WHERE run_id=? AND work_subject=? AND started_at=?",
+                          (run_id, witness["work_subject"], witness["started_at"]))
+        bound = _one(db, "SELECT * FROM work_attempt_versions WHERE run_id=? AND attempt_id=? AND version_id=?",
+                     (run_id, call["attempt_id"], invocation["attempt_version_id"]))
+        if (invocation["attempt_id"] != call["attempt_id"]
+                or invocation["work_subject"] != call["work_subject"]
+                or invocation["generation"] != 1 or invocation["status"] != "completed"
+                or invocation["ended_at"] is None or invocation["resume_pending"] != 0
+                or invocation["error"] is not None or invocation["execution_interrupted"] != 0
+                or invocation["recovery_waiting"] != 0 or invocation["return_code"] is not None
+                or invocation["raw_result_evidence_id"] != call["raw_evidence_id"]
+                or not isinstance(invocation["reported_thread_id"], str)
+                or (call["thread_id"] is not None and invocation["reported_thread_id"] != call["thread_id"])
+                or bound["status"] != "pending" or bound["returned_result_evidence_id"] is not None
+                or (call["role"] == "review" and
+                    (bound["review_context_evidence_id"] is None or bound["review_context_evidence_id"]
+                     != call["current_version"]["review_context_evidence_id"]))):
+            raise MigrationRefused("unsupported_source_invocation")
+        started, ended = (_created_at_epoch(invocation[field]) for field in ("started_at", "ended_at"))
+        if not previous_end <= started <= ended:
+            raise MigrationRefused("source_invocation_chronology")
+        previous_end = ended
+        binding = by_thread.get(invocation["reported_thread_id"])
+        if (binding is None or any(binding.get(field) != invocation[field] for field in (
+                "binding_id", "model", "reasoning_effort", "profile_revision"))
+                or binding.get("role") != invocation["binding_role"]
+                or invocation["profile_role"] != binding.get("role")
+                or invocation["invocation_role"] != call["role"]
+                or invocation["profile_revision"] != profile["profile_revision"]):
+            raise MigrationRefused("source_profile_bindings")
+        owner = 'invocation:' + wire_json([invocation["work_subject"], invocation["started_at"]]).decode()
+        bound_thread = _completed_evidence(db, run_id, invocation["thread_execution_binding_evidence_id"],
+                                          owner=owner, kind="thread_execution_binding")
+        boundary = _completed_evidence(db, run_id, invocation["currentness_boundary_evidence_id"],
+                                      owner=owner, kind="currentness_boundary")
+        if bound_thread != binding or not isinstance(boundary, dict):
+            raise MigrationRefused("source_invocation_binding")
+        call["allocation_boundary"] = boundary
+        if call["thread_id"] is None:
+            # v6 publication_wire has no Thread field. Its distinct physical
+            # Invocation supplies the observed identity; raw stays unchanged.
+            call["thread_id"] = invocation["reported_thread_id"]
+            call["thread_identity_source"] = {key: invocation[key] for key in (
+                "work_subject", "started_at", "thread_execution_binding_evidence_id")}
+    if db.execute("SELECT 1 FROM work_invocation_current c LEFT JOIN work_invocations v "
+                  "USING(run_id,work_subject,started_at) WHERE c.run_id=? AND "
+                  "(v.started_at IS NULL OR v.status!='completed' OR v.ended_at IS NULL OR v.resume_pending!=0) LIMIT 1",
+                  (run_id,)).fetchone():
+        raise MigrationRefused("source_invocation_current")
+    return int(count)
+
+
 def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                     source_sha: str) -> _Completed:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA query_only=ON")
-        counts = {name: db.execute('SELECT count(*) FROM "' + name.replace('"', '""') + '"').fetchone()[0]
-                  for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-        if any(count and name not in _COMPLETED_TABLES for name, count in counts.items()):
+        run_id = profile.get("run_id")
+        if not isinstance(run_id, str):
+            raise MigrationRefused("source_profile")
+        counts: dict[str, int] = {}
+        for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            quoted = '"' + name.replace('"', '""') + '"'
+            scoped = any(row[1] == "run_id" for row in db.execute(f"PRAGMA table_info({quoted})"))
+            counts[name] = db.execute(f"SELECT count(*) FROM {quoted}" + (" WHERE run_id=?" if scoped else ""),
+                                      (run_id,) if scoped else ()).fetchone()[0]
+        if any(count and name not in RECORD_TABLES for name, count in counts.items()):
             raise MigrationRefused("unsupported_source_relations")
         exact = {"runs": 1, "run_root": 1, "run_condition_base": 1,
-                 "work_jobs": 2, "work_job_layout": 1, "work_attempts": 3,
-                 "work_attempt_current": 3, "work_attempt_returns": 3,
-                 "work_job_attempt_history": 3, "work_job_attempt_roots": 1,
-                 "work_invocations": 0, "work_invocation_history": 0,
-                 "work_invocation_current": 0, "run_timeline_events": 22,
-                 "run_timeline_slots": 22, "run_closeout_headers": 1,
+                 "work_jobs": 2, "work_job_layout": 1, "work_job_attempt_roots": 1,
+                 "run_closeout_headers": 1,
                  "run_cleanup_items": 1, "work_job_ticket_close_intent": 1,
-                 "work_job_ticket_close_ownership": 1, "work_job_review_artifacts": 1,
+                 "work_job_ticket_close_ownership": 1,
                  "work_job_acceptance_record": 1, "work_job_review_budget": 1,
                  "work_job_integration_resync": 1, "work_job_ci_recovery": 1,
                  "work_job_merge_intent": 1}
         if any(counts.get(name, 0) != value for name, value in exact.items()):
             raise MigrationRefused("unsupported_source_stage")
-        run = _one(db, "SELECT * FROM runs")
+        run = _one(db, "SELECT * FROM runs WHERE run_id=?", (run_id,))
         root = _one(db, "SELECT * FROM run_root WHERE run_id=?", (run["run_id"],))
         layout = _one(db, "SELECT * FROM work_job_layout WHERE run_id=?", (run["run_id"],))
         job = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id=?",
@@ -148,12 +206,19 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or job["value_ticket_branch_initialized"] != 1
                 or job["value_ticket_branch"] != f"agent-run/{run['run_id']}/ticket-{ticket}"
                 or job["value_publication_attempts"] != 1
-                or job["value_modification_attempts"] != 1
-                or job["value_validation_attempts"] != 1
+                or type(job["value_modification_attempts"]) is not int or job["value_modification_attempts"] < 1
+                or type(job["value_validation_attempts"]) is not int or job["value_validation_attempts"] < 1
                 or job["value_candidate_sha"] is None or job["value_integrated_sha"] is None
                 or job["value_publication_sha"] != job["value_integrated_sha"]
                 or job["value_integrated_tree"] is None or job["value_pr_number"] is None):
             raise MigrationRefused("unsupported_source_stage")
+        if any(job[field] is not None for field in (
+                "value_action_application_receipt", "value_ci_repair_publication_receipt",
+                "value_fallback_publication_receipt", "value_pending_publication_result",
+                "value_pending_review_result", "value_publication_authority")):
+            raise MigrationRefused("unsupported_source_write_authority")
+        if job["value_pending_attempt"] not in (None, 0) or job["value_pending_attempt_kind"] is not None:
+            raise MigrationRefused("source_attempt_history")
         closeout = _one(db, "SELECT * FROM run_closeout_headers WHERE run_id=? AND kind='cleanup'",
                         (run["run_id"],))
         cleanup = _one(db, "SELECT * FROM run_cleanup_items WHERE run_id=?", (run["run_id"],))
@@ -214,7 +279,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         if query["presence"] != b"\x1a" or counts.get("run_notification_config", 0):
             raise MigrationRefused("unsupported_source_notifications")
         if (profile.get("run_id") != run["run_id"] or profile.get("profile_revision") != 1
-                or profile.get("bindings") != []):
+                or not isinstance(profile.get("bindings"), list)):
             raise MigrationRefused("source_profile")
         profiles = {"preset": profile.get("preset"), "profiles": profile.get("profiles")}
         roles = profiles["profiles"]
@@ -236,27 +301,47 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                       (run["run_id"], job["job_id"]))
         resync = _one(db, "SELECT * FROM work_job_integration_resync WHERE run_id=? AND job_id=?",
                       (run["run_id"], job["job_id"]))
-        if (budget["value_window"] != 1 or budget["value_development_attempts"] != 1
-                or budget["value_reviewer_invocations"] != 1 or budget["value_final_ci_fix_used"] != 0
+        ci = _one(db, "SELECT * FROM work_job_ci_recovery WHERE run_id=? AND job_id=?",
+                  (run["run_id"], job["job_id"]))
+        if (budget["value_window"] != 1
+                or budget["value_development_attempts"] != job["value_modification_attempts"]
+                or budget["value_reviewer_invocations"] != job["value_validation_attempts"]
+                or not 1 <= budget["value_development_attempts"] <= policy.ticket_rounds
+                or not 1 <= budget["value_reviewer_invocations"] <= policy.ticket_rounds
+                or budget["value_final_ci_fix_used"] != 0
                 or resync["value_generation"] != 1 or resync["value_window"] != 1
                 or resync["value_used"] != 0 or resync["value_limit"] != policy.resync_limit
                 or resync["value_open"] != 0 or resync["value_source_sha"] != base["value_sha"]
                 or resync["value_target_sha"] != base["value_sha"]):
             raise MigrationRefused("unsupported_source_budget")
+        if (counts.get("work_job_budget_events", 0) or ci["value_window"] != 1
+                or any(ci[field] != 0 for field in ("value_developments_used", "value_repair_pending",
+                                                  "value_review_required", "value_reviewer_invocations"))
+                or ci["value_failure_head"] is not None or ci["value_previous_publication_authorization"] is not None):
+            raise MigrationRefused("unsupported_source_ci_history")
         roots = _one(db, "SELECT * FROM work_job_attempt_roots WHERE run_id=? AND job_id=?",
                      (run["run_id"], job["job_id"]))
         history = db.execute("SELECT * FROM work_job_attempt_history WHERE run_id=? AND job_id=? ORDER BY position",
                              (run["run_id"], job["job_id"])).fetchall()
-        if (roots["pending_present"] != 0 or roots["history_count"] != 3
-                or [row["position"] for row in history] != [0, 1, 2]):
+        if (roots["pending_present"] != 0 or not history or roots["history_count"] != len(history)
+                or [row["position"] for row in history] != list(range(len(history)))
+                or len({row["attempt_id"] for row in history}) != len(history)
+                or any(counts.get(name, 0) != len(history) for name in (
+                    "work_attempts", "work_attempt_current", "work_attempt_returns", "work_job_attempt_history"))):
             raise MigrationRefused("source_attempt_history")
         calls: list[dict[str, Any]] = []
         version_total = member_total = 0
-        for index, witness in enumerate(history):
-            role = (Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION)[index]
+        role_ordinals = {"development": 0, "reviewer": 0, "publication": 0}
+        for witness in history:
             attempt_id = witness["attempt_id"]
             attempt = _one(db, "SELECT * FROM work_attempts WHERE run_id=? AND attempt_id=?",
                            (run["run_id"], attempt_id))
+            old_role = attempt["role"]
+            if old_role not in role_ordinals:
+                raise MigrationRefused("unsupported_source_attempt_role")
+            role_ordinals[old_role] += 1
+            role = {"development": Role.DEVELOPMENT, "reviewer": Role.REVIEW,
+                    "publication": Role.PUBLICATION}[old_role]
             current = _one(db, "SELECT * FROM work_attempt_current WHERE run_id=? AND attempt_id=?",
                            (run["run_id"], attempt_id))
             version = _one(db, "SELECT * FROM work_attempt_versions WHERE run_id=? AND attempt_id=? AND version_id=?",
@@ -264,20 +349,24 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
             returned = _one(db, "SELECT * FROM work_attempt_returns WHERE run_id=? AND attempt_id=?",
                             (run["run_id"], attempt_id))
             if (attempt["job_id"] != job["job_id"] or attempt["work_subject"] != f"ticket:{ticket}"
-                    or attempt["generation"] != 1 or attempt["ordinal"] != 1
-                    or attempt["role"] != ("development", "reviewer", "publication")[index]
+                    or attempt["generation"] != 1 or attempt["ordinal"] != role_ordinals[old_role]
+                    or attempt["budget_window"] != (None if role == Role.PUBLICATION else budget["value_window"])
                     or version["status"] != "completed" or witness["version_id"] != current["version_id"]
-                    or version["outcome"] != ("candidate", "acceptance_artifact", "publication_artifact")[index]):
+                    or version["outcome"] != {Role.DEVELOPMENT: "candidate", Role.REVIEW: "acceptance_artifact",
+                                               Role.PUBLICATION: "publication_artifact"}[role]):
                 raise MigrationRefused("source_attempts")
             raw = _completed_evidence(db, run["run_id"], returned["evidence_id"],
                                       owner=f"attempt:{attempt_id}", kind="returned_result")
-            if (not isinstance(raw, dict) or raw.get("kind") != ("development", "review", "publication")[index]
-                    or not isinstance(raw.get("thread_id"), str)):
+            wire_publication = (role == Role.PUBLICATION and isinstance(raw, dict)
+                                and raw.get("kind") == "publication_wire")
+            if (not isinstance(raw, dict)
+                    or not wire_publication and (raw.get("kind") != role.value
+                                                  or not isinstance(raw.get("thread_id"), str))):
                 raise MigrationRefused("source_returned_result")
             value: Any = ({"result_kind": "development", "summary": raw.get("summary"),
-                           "human_blockers": None} if index == 0 else
+                           "human_blockers": None} if role == Role.DEVELOPMENT else
                           {"checks": raw.get("artifact", {}).get("checks")}
-                          if index == 1 and isinstance(raw.get("artifact"), dict) else
+                          if role == Role.REVIEW and isinstance(raw.get("artifact"), dict) else
                           raw.get("artifact"))
             try:
                 normalized = artifact(role, wire_json(value))
@@ -292,15 +381,22 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
             version_total += len(versions)
             member_total += len(members)
             calls.append({"attempt_id": attempt_id, "role": role.value,
+                          "work_subject": attempt["work_subject"],
+                          "thread_id": raw.get("thread_id"),
                           "old_role_ordinal": attempt["ordinal"], "returned": raw,
                           "current_version": _wire_row(dict(version)), "versions": versions,
                           "result_members": members, "artifact": normalized,
                           "raw_evidence_id": returned["evidence_id"]})
+        if (role_ordinals != {"development": budget["value_development_attempts"],
+                             "reviewer": budget["value_reviewer_invocations"], "publication": 1}
+                or calls[-1]["role"] != "publication"):
+            raise MigrationRefused("source_budget_accounting")
         if (version_total != counts["work_attempt_versions"]
                 or member_total != counts["work_attempt_result_members"]):
             raise MigrationRefused("source_attempt_relations")
-        review = _one(db, "SELECT * FROM work_job_review_artifacts WHERE run_id=? AND job_id=?",
-                      (run["run_id"], job["job_id"]))
+        physical_invocations = _settled_invocations(db, run["run_id"], calls, profile)
+        review = _one(db, "SELECT * FROM work_job_review_artifacts WHERE run_id=? AND job_id=? AND artifact_id=?",
+                      (run["run_id"], job["job_id"], job["value_acceptance_artifact"]))
         accepted = _one(db, "SELECT * FROM work_job_acceptance_record WHERE run_id=? AND job_id=?",
                         (run["run_id"], job["job_id"]))
         if (review["candidate_sha"] != job["value_candidate_sha"]
@@ -310,6 +406,49 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or accepted["value_reviewed_candidate_tree"] is None
                 or accepted["value_reviewed_base_sha"] != base["value_sha"]):
             raise MigrationRefused("source_acceptance")
+        # The accepted Review is identified by its original Thread, raw artifact
+        # and immutable Review context, not by position in a three-call fixture.
+        accepted_value = _completed_evidence(db, run["run_id"], accepted["value_artifact"],
+                                             owner=f"job:{job['job_id']}", kind="acceptance_record.artifact")
+        support = [(position, call) for position, call in enumerate(calls)
+                   if call["role"] == "review" and call["returned"]["thread_id"] == review["reviewer_thread_id"]
+                   and call["returned"].get("artifact") == accepted_value]
+        if (len(support) != 1 or review["reviewer_thread_id"] != accepted["value_reviewer_thread_id"]
+                or any(check.get("status") != "pass" for check in support[0][1]["artifact"]["checks"].values())):
+            raise MigrationRefused("source_acceptance_attempt")
+        review_position, accepted_call = support[0]
+        context = _completed_evidence(db, run["run_id"], accepted_call["current_version"]["review_context_evidence_id"],
+                                     owner=f"attempt:{accepted_call['attempt_id']}", kind="review_context")
+        expected_identity = {"reviewed_base_sha": base["value_sha"],
+                             "reviewed_candidate_sha": job["value_candidate_sha"],
+                             "reviewed_candidate_tree": accepted["value_reviewed_candidate_tree"]}
+        if (not isinstance(context, dict) or context.get("facts", {}).get("current_review_identity") != expected_identity
+                or context.get("binding", {}).get("effective_revision") != job["value_effective_revision"]
+                or context.get("binding", {}).get("base_sha") != base["value_sha"]
+                or context.get("binding", {}).get("candidate_sha") != job["value_candidate_sha"]
+                or accepted["value_effective_revision"] != job["value_effective_revision"]):
+            raise MigrationRefused("source_acceptance_identity")
+        accepted_call["allocation_boundary"] = {
+            "base_sha": base["value_sha"], "candidate_sha": job["value_candidate_sha"],
+            "candidate_tree": accepted["value_reviewed_candidate_tree"]}
+        development = [call for call in calls[:review_position] if call["role"] == "development"]
+        summary = _completed_evidence(db, run["run_id"], job["value_development_summary"],
+                                     owner=f"job:{job['job_id']}", kind="development_summary")
+        if (not development or development[-1]["returned"].get("summary") != summary
+                or development[-1]["returned"]["thread_id"] != job["value_development_thread_id"]
+                or calls[-1]["thread_id"] != job["value_development_thread_id"]
+                or any(call["role"] == "development" for call in calls[review_position + 1:])):
+            raise MigrationRefused("source_development_support")
+        supporting_calls = (development[-1], accepted_call, calls[-1])
+        for field, kind, expected in (
+                ("value_linked_branch_display", "linked_branch_display", {"status": "linked"}),
+                ("value_branch_publication_observation", "branch_publication_observation",
+                 {"disposition": "published", "branch": job["value_ticket_branch"],
+                  "head_sha": job["value_integrated_sha"]})):
+            observed_write = _completed_evidence(db, run["run_id"], job[field],
+                                                owner=f"job:{job['job_id']}", kind=kind)
+            if not isinstance(observed_write, dict) or any(observed_write.get(key) != value for key, value in expected.items()):
+                raise MigrationRefused("unsupported_source_effect_outcome")
         close_intent = _one(db, "SELECT * FROM work_job_ticket_close_intent WHERE run_id=? AND job_id=?",
                             (run["run_id"], job["job_id"]))
         close_owner = _one(db, "SELECT * FROM work_job_ticket_close_ownership WHERE run_id=? AND job_id=?",
@@ -321,15 +460,21 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or close_owner["value_event_id"] != f"{run['run_id']}:ticket-{ticket}:closed"
                 or close_intent["value_dispatch_attempted"] != 1):
             raise MigrationRefused("source_close_ownership")
-        evidence = tuple({"evidence_id": row["evidence_id"], "owner_id": row["owner_id"],
-                          "kind": row["kind"], "value": _completed_evidence(db, run["run_id"], row["evidence_id"],
-                                                     owner=row["owner_id"], kind=row["kind"])}
-                         for row in db.execute("SELECT * FROM work_evidence WHERE run_id=? ORDER BY evidence_id", (run["run_id"],)))
+        # Validate the complete evidence graph; the uniform record carrier
+        # preserves the original material once, including superseded versions.
+        for row in db.execute("SELECT * FROM work_evidence WHERE run_id=? ORDER BY evidence_id", (run["run_id"],)):
+            _completed_evidence(db, run["run_id"], row["evidence_id"], owner=row["owner_id"], kind=row["kind"])
         timeline = tuple(dict(row) for row in db.execute(
             "SELECT e.* FROM run_timeline_slots s JOIN run_timeline_events e "
             "ON e.run_id=s.run_id AND e.event_id=s.event_id "
             "WHERE s.run_id=? AND s.stream='timeline' ORDER BY s.position", (run["run_id"],)))
-        if (len(timeline) != 22 or timeline[-1]["value_phase"] != "completed"):
+        slots = db.execute("SELECT * FROM run_timeline_slots WHERE run_id=? ORDER BY stream,position",
+                           (run["run_id"],)).fetchall()
+        for stream in {slot["stream"] for slot in slots}:
+            if [slot["position"] for slot in slots if slot["stream"] == stream] != list(range(sum(slot["stream"] == stream for slot in slots))):
+                raise MigrationRefused("source_history")
+        if (not timeline or timeline[-1]["value_phase"] != "completed"
+                or len({slot["event_id"] for slot in slots}) != counts["run_timeline_events"]):
             raise MigrationRefused("source_history")
         return _Completed(run["run_id"], run["repository"], run["parent_number"],
                           parent_revision, graph_revision, _created_at_epoch(run["created_at"]),
@@ -338,9 +483,10 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                           ticket, job["value_ticket_branch"], job["value_candidate_sha"],
                           accepted["value_reviewed_candidate_tree"], job["value_integrated_sha"],
                           job["value_integrated_tree"], job["value_pr_number"], job["revision"],
-                          _wire_row(dict(job)), _wire_row(dict(cleanup)), tuple(calls),
-                          evidence, timeline, _wire_row(dict(close_intent)),
-                          _wire_row(dict(close_owner)))
+                          _wire_row(dict(job)), _wire_row(dict(cleanup)), supporting_calls,
+                          timeline, _wire_row(dict(close_intent)),
+                          _wire_row(dict(close_owner)), budget["value_development_attempts"],
+                          budget["value_reviewer_invocations"], physical_invocations)
     except sqlite3.Error as error:
         raise MigrationRefused("source_corrupt") from error
     finally:
@@ -416,9 +562,9 @@ def convert_completed_ticket_v6(
     repository_root: Path, final_checkout: Path, profile_snapshot: Path,
     github_snapshot: Path, observation_snapshot: Path, original_report: Path,
 ) -> Kernel:
-    """Import one sealed old Ticket completion, including its native Completion.
+    """Import a copied, offline single-Ticket completion and its source records.
 
-    The supplied old artifacts are from a finished synchronous fixture.  This
+    The supplied old artifacts are from a finished, observed runtime. This
     narrow API does not certify live Host quiescence or transfer ownership of
     a general old repository.  It creates its own Git repository and database.
     """
@@ -440,7 +586,7 @@ def convert_completed_ticket_v6(
     observed, observation_sha = _read_document(observation_snapshot)
     report, report_sha = _read_document(original_report)
     github, github_sha = _read_document(github_snapshot)
-    if (observed.get("backend") != "synchronous scripted roles, no native process evidence or ProfiledAgentBackend"
+    if (not isinstance(observed.get("backend"), str)
             or observed.get("copied_database_sha256") != snapshot.sha256
             or observed.get("source_database_sha256") != snapshot.sha256
             or observed.get("profile_present") is not True
@@ -448,8 +594,7 @@ def convert_completed_ticket_v6(
             or observed.get("github_sha256") != github_sha
             or observed.get("original_report_sha256") != report_sha
             or report.get("status") != "ticket_completed"
-            or observed.get("external_effects") != report.get("mutations")
-            or report.get("raw_backend_calls") != {"development": 1, "review": 1, "publication": 1}):
+            or observed.get("external_effects") != report.get("mutations")):
         raise MigrationRefused("source_observation")
     registrations = report.get("post_close_worktrees", {}).get("registrations")
     original_roots = ([Path(row["path"]) for row in registrations
@@ -467,6 +612,9 @@ def convert_completed_ticket_v6(
         facts = _read_completed(copied.path, profile, profile_sha, snapshot.sha256)
         _require_no_v6_notification_journal(snapshot, facts.run_id)
         if (observed.get("run_id") != facts.run_id
+                or report.get("raw_backend_calls") != {"development": facts.developments_used,
+                                                        "review": facts.reviews_used, "publication": 1}
+                or (facts.physical_invocations and observed.get("old_runtime_exit") != {"returncode": 0, "reaped": True})
                 or observed.get("candidate_sha") != facts.candidate_sha
                 or observed.get("integrated_sha") != facts.integrated_sha
                 or report.get("source_identity", {}).get("run_id") != facts.run_id
@@ -576,8 +724,9 @@ def convert_completed_ticket_v6(
                             facts.integrated_tree, facts.integrated_sha, facts.candidate_tree,
                             facts.base_sha, facts.pr_number, facts.integrated_sha,
                             facts.attempts[1]["attempt_id"], subject))
-                tx.execute("UPDATE budgets SET developments_used=1,reviews_used=1 "
-                           "WHERE subject=? AND purpose='requirements' AND window=1", (subject,))
+                tx.execute("UPDATE budgets SET developments_used=?,reviews_used=? "
+                           "WHERE subject=? AND purpose='requirements' AND window=1",
+                           (facts.developments_used, facts.reviews_used, subject))
                 tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
                            (subject, 1, 1, f"refs/heads/{facts.ticket_branch}",
                             f"refs/heads/{facts.run_branch}", facts.base_sha, facts.base_sha))
@@ -593,13 +742,15 @@ def convert_completed_ticket_v6(
                                "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}",
                                                        event["event_id"], material,
                                                        _created_at_epoch(event["value_at"])))
-                for entry in facts.evidence:
-                    tx.put(subject, "v6_evidence", wire_json(entry))
                 for index, call in enumerate(facts.attempts, start=1):
+                    allocation = call.get("allocation_boundary", {})
+                    allocated_candidate = allocation.get("candidate_sha")
+                    allocated_tree = allocation.get("candidate_tree")
                     context_value: dict[str, Any] = {"source": "v6-completed-semantic-attempt",
                                                      "old_role_ordinal": call["old_role_ordinal"],
                                                      "old_current_version": call["current_version"],
-                                                     "native_authority": {
+                                                     "original_allocation_boundary": allocation,
+                                                     "completion_identity": {
                                                          "parent_revision": facts.parent_revision,
                                                          "graph_revision": facts.graph_revision,
                                                          "revision": native["revision"],
@@ -617,7 +768,7 @@ def convert_completed_ticket_v6(
                         VALUES (?,?,1,?,?,'requirements',1,?,?,?,?,?,?,?,?,?,NULL,?,'consumed',?,?)""",
                                (call["attempt_id"], subject, index, call["role"], facts.parent_revision,
                                 facts.graph_revision, native["revision"], facts.base_sha,
-                                facts.candidate_sha, facts.candidate_tree, facts.candidate_tree,
+                                allocated_candidate, allocated_tree, allocated_tree,
                                 native["completion_revision"], context, result,
                                 1 if call["role"] == "review" else 0,
                                 "pass" if call["role"] == "review" else
@@ -654,8 +805,8 @@ def convert_completed_ticket_v6(
                     "github_sha256": github_sha, "observation_sha256": observation_sha,
                     "original_report_sha256": report_sha,
                     "old_backend": observed["backend"],
-                    "old_physical_invocations": 0,
-                    "old_profile_bindings": 0,
+                    "old_physical_invocations": facts.physical_invocations,
+                    "old_profile_bindings": len(profile["bindings"]),
                     "old_completed_job_revision": facts.old_job_revision,
                     "copied_repository_root": str(repository_root),
                     "candidate_sha": facts.candidate_sha,
@@ -666,6 +817,11 @@ def convert_completed_ticket_v6(
                 tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
                            "VALUES (?,?,?,?,1,?)", (subject, "v6_completed_import", facts.run_id,
                                                    identity, kernel.clock()))
+            profile_body = profile_snapshot.read_bytes()
+            if hashlib.sha256(profile_body).hexdigest() != profile_sha:
+                raise MigrationRefused("source_document_changed")
+            _preserve_copy(copied, kernel, run_id=facts.run_id, subject=subject,
+                           profile_document=profile_body)
             latest_requirements = Requirements(facts.requirements.parent,
                                                (replace(facts.requirements.issues[0], state="CLOSED"),))
             # This is the sealed copy's verified GitHub readback, not a new

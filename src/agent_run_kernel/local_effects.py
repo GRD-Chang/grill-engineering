@@ -1,8 +1,8 @@
 """Managed local Git effects; policy and durable intent attachment belong to Kernel."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import replace
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import subprocess
@@ -14,19 +14,34 @@ from agent_run.git_publication_commit import (
     install_publication_commit, observe_publication_commit, prepare_publication_commit,
 )
 
-from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_worktree
+from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_resource, inspect_worktree
 from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError
+from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness
 
 
 class LocalEffects:
     OPERATIONS = frozenset({"workspace", "validation_checkout", "validation_cleanup", "candidate",
-                            "integrate", "publication_commit", "cleanup_worktree", "cleanup_local_ref"})
+                            "integrate", "publication_commit", "cleanup_worktree", "cleanup_local_ref",
+                            "inspect_resources", "abandon_worktree"})
 
-    def __init__(self, git: LocalGit, *, owned_root: Path) -> None:
+    def __init__(self, git: LocalGit, *, owned_root: Path | None = None) -> None:
         self.git = LocalGit(git.root)
         self.git.env = git.env.copy()
         self.owned_root = owned_root
+
+    def inspect_resources(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
+        """Read each resource using its own original root and common Git witness."""
+        return tuple(inspect_resource(self.git, resource) for resource in resources)
+
+    def _resource_result(self, effect: Effect) -> EffectResult:
+        rows = effect.payload.get("resources")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return EffectResult("third", raw={"reason": "invalid_resource_witnesses"})
+        try:
+            resources = tuple(ResourceWitness(**row) for row in rows)
+        except TypeError:
+            return EffectResult("third", raw={"reason": "invalid_resource_witnesses"})
+        return EffectResult("target", raw={"resources": [asdict(item) for item in self.inspect_resources(resources)]})
 
     def _checkout(self, effect: Effect) -> tuple[Path, str | None]:
         values = [effect.payload.get(key) for key in ("checkout", "owned_root", "common_git_dir")]
@@ -74,7 +89,10 @@ class LocalEffects:
         )
 
     def _cleanup(self, effect: Effect) -> Effect:
-        if (effect.payload.get("owned_root") != str(self.owned_root)
+        resource = effect.payload.get("resource")
+        owned = (resource.get("owned_root") if effect.operation == "abandon_worktree" and isinstance(resource, Mapping)
+                 else effect.payload.get("owned_root"))
+        if (self.owned_root is None or owned != str(self.owned_root)
                 or not self.owned_root.is_absolute() or self.owned_root.resolve() != self.owned_root):
             raise KernelError("foreign_local_checkout")
         if effect.operation == "cleanup_local_ref":
@@ -195,9 +213,11 @@ class LocalEffects:
     def reconcile(self, effect: Effect) -> EffectResult:
         """Observe original physical facts without using response receipts as proof."""
         try:
+            if effect.operation == "inspect_resources":
+                return self._resource_result(effect)
             if effect.operation == "cleanup_local_ref":
                 return inspect_local_ref(self.git, self._cleanup(effect))
-            if effect.operation in {"validation_cleanup", "cleanup_worktree"}:
+            if effect.operation in {"validation_cleanup", "cleanup_worktree", "abandon_worktree"}:
                 return inspect_worktree(self.git, self._cleanup(effect))
             checkout, head = self._checkout(effect)
             if effect.operation in {"workspace", "validation_checkout"}:
@@ -226,6 +246,9 @@ class LocalEffects:
                                 else "unknown", raw={"reason": code})
 
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+        if effect.operation == "inspect_resources":
+            authorize()
+            return self.reconcile(effect)
         observed = self.reconcile(effect)
         no_write = (
             effect.operation == "integrate" and effect.candidate is not None and observed.commit == effect.candidate
@@ -233,7 +256,7 @@ class LocalEffects:
             and observed.commit is not None and observed.commit.sha == effect.before_sha
             or effect.operation == "publication_commit" and bool(effect.payload.get("reuse_sha"))
             and observed.commit is not None and observed.commit.sha == effect.payload["reuse_sha"]
-            or effect.operation in {"validation_cleanup", "cleanup_worktree"}
+            or effect.operation in {"validation_cleanup", "cleanup_worktree", "abandon_worktree"}
             and observed.raw.get("reason") == "worktree_absent"
             or effect.operation == "cleanup_local_ref" and observed.raw.get("reason") == "ref_absent"
         )
@@ -258,7 +281,7 @@ class LocalEffects:
         writer.env = self.git.env.copy()
         if effect.operation == "cleanup_local_ref":
             return cleanup_local_ref(writer, effect)
-        if effect.operation in {"validation_cleanup", "cleanup_worktree"}:
+        if effect.operation in {"validation_cleanup", "cleanup_worktree", "abandon_worktree"}:
             return cleanup_worktree(writer, self._cleanup(effect))
         checkout, head = self._checkout(effect)
         if effect.operation in {"workspace", "validation_checkout"}:

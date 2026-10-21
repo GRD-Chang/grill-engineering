@@ -42,7 +42,7 @@ Whole-Run Resume feedback binds to the next actual FIFO Agent allocation;
 another Ticket's local gate does not receive that feedback or resume authority.
 Accepted Actions retain their original generation scope and bind feedback in
 order, even when another Stop/Resume occurs before the next Agent allocation.
-This schema is the v14 exploration protocol and rejects earlier exploration
+This schema is the v16 exploration protocol and rejects earlier exploration
 databases rather than silently adding missing policy or control fields.
 
 Implemented representative paths include all three delivery kinds, initial
@@ -67,6 +67,21 @@ Shared Runner lease proofs remain distinct from a manager's running/exited
 observation. `host_request` and `host_usage` read original request and handoff
 evidence for mechanical reconciliation. The direct `claim_executor` and
 `confirm_executor_exit` interfaces remain trusted offline fixture seams.
+
+`stop_task` records Stop under the exact Task binding without launching or
+reclaiming a Host. Unknown process lifetimes remain unresolved. Explicit
+Requeue settles the original PR retirement before replacing a generation; a
+later requirements change supersedes that Action, and a new Action can read
+back the same immutable retirement without repeating its close write.
+
+Abandon permanently fences ordinary business authority. Its original Action
+authorizes only the frozen resources' finite cleanup and exact owned Ticket
+reopening. A managed continuation requires the preceding executor's proven
+exit, gets a new resource inspection, and cannot revive the old token. An
+explicit continuation may grant discard for those same resources after exact
+inspection; the original Action and earlier observations remain immutable.
+Formal acceptance history is emitted by the actual promotion transaction,
+using the original Review reference and current source and target evidence.
 
 Real process/Codex, public read/settings, source readers and copied-state
 migration are separately owned adapters with fixed-snapshot validation.

@@ -305,6 +305,26 @@ class AgentCall:
 
 
 @dataclass(frozen=True)
+class ResourceWitness:
+    subject: str
+    generation: int
+    kind: Literal["development", "validation"]
+    checkout: str
+    owned_root: str
+    common_git_dir: str
+    source_ref: str
+    head_sha: str
+
+
+@dataclass(frozen=True)
+class ResourceInspection:
+    resource: ResourceWitness
+    disposition: Literal["clean", "dirty", "absent", "unknown", "foreign"]
+    head_sha: str | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class Effect:
     effect_id: str
     subject: str

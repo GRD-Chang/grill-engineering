@@ -67,7 +67,23 @@ class RemoteEffects:
             return self._link_issue(effect, authorize)
         if effect.operation == "cleanup_remote_ref":
             return cleanup_remote_ref(self._cleanup_git(authorize), effect)
+        if effect.operation == "retire_pr":
+            return self._retire_pr(effect, authorize)
+        if effect.operation == "reopen_ticket":
+            return self._reopen_ticket(effect, authorize)
         observed = self.reconcile(effect)
+        prior = effect.payload.get("prior")
+        if (effect.operation == "pr_write" and effect.pr_number is not None and isinstance(prior, Mapping)
+                and prior.get("title") == effect.payload.get("title")
+                and prior.get("body") == effect.payload.get("body")):
+            observed = self._current_pr_edit(effect, observed)
+            if observed.disposition != "target":
+                return observed
+            if self.actor() != effect.actor:
+                raise KernelError("remote_actor_changed")
+            authorize()
+            fresh = self._current_pr_edit(effect, self.reconcile(effect))
+            return replace(fresh, disposition="third") if fresh.disposition == "target" and fresh != observed else fresh
         if observed.disposition != "prior":
             return observed
         if self.actor() != effect.actor:
@@ -122,6 +138,10 @@ class RemoteEffects:
                 return EffectResult("unknown", raw={"display": "acknowledgement_not_received"})
             if effect.operation == "cleanup_remote_ref":
                 return inspect_remote_ref(self._cleanup_git(), effect)
+            if effect.operation == "retire_pr":
+                return self._reconcile_retirement(effect)
+            if effect.operation == "reopen_ticket":
+                return self._reconcile_ticket_recovery(effect)
             if effect.operation in {"push", "run_branch"}:
                 head = self._remote_head(effect.source_ref)
                 if head is not None and head == effect.after_sha:
@@ -142,6 +162,216 @@ class RemoteEffects:
     def pull_request(self, number: int) -> PullRequest:
         """Original PR identity and actual commit trees, for reads and receipts."""
         return self._pr(self._api(f"repos/{self.repository}/pulls/{number}"))
+
+    def prepare_retirement(self, effect: Effect) -> dict[str, Any]:
+        """Read the original OPEN PR and its event watermark before Core attachment."""
+        self._binding(effect)
+        pr = self.pull_request(_number(effect.pr_number))
+        if pr.state != "OPEN" or self._retirement_match(effect, pr) is None:
+            raise KernelError("retirement_pr_changed")
+        events = self._events_at(self._retirement_path(effect))
+        baseline = max((event["id"] for event in events), default=0)
+        fresh = self.pull_request(pr.number)
+        if fresh != pr:
+            raise KernelError("retirement_pr_changed")
+        return self._retirement_witness(effect, baseline)
+
+    def _retirement_witness(self, effect: Effect, baseline: int) -> dict[str, Any]:
+        prior = effect.payload["prior_pr"]
+        if (effect.operation != "retire_pr" or prior["state"] != "OPEN"
+                or prior["number"] != effect.pr_number or prior["repository"].casefold() != self.repository.casefold()
+                or prior["source_ref"] != effect.source_ref or prior["target_ref"] != effect.target_ref
+                or prior["head"]["sha"] != effect.before_sha
+                or type(baseline) is not int or baseline < 0):
+            raise ValueError("invalid original retirement PR")
+        return {"repository": effect.repository, "pr_number": _number(effect.pr_number),
+                "source_ref": effect.source_ref, "target_ref": effect.target_ref,
+                "head_sha": _sha(prior["head"]["sha"]), "base_sha": _sha(prior["base"]["sha"]),
+                "author": _text(prior["actor"]), "baseline_event_id": baseline}
+
+    def _retirement_match(self, effect: Effect, pr: PullRequest) -> list[str] | None:
+        witness = self._retirement_witness(effect, 0)
+        if pr.actor is None or pr.head_repository is None:
+            raise ValueError("retirement PR identity is not observable")
+        prior = effect.payload["prior_pr"]
+        if (pr.repository.casefold() != self.repository.casefold()
+                or pr.head_repository.casefold() != self.repository.casefold()
+                or pr.number != witness["pr_number"] or pr.source_ref != effect.source_ref
+                or pr.target_ref != effect.target_ref or pr.actor != witness["author"]
+                or pr.head.sha != witness["head_sha"] or pr.head.tree != prior["head"]["tree"]):
+            return None
+        if pr.base.sha == witness["base_sha"]:
+            if pr.base.tree != prior["base"]["tree"]:
+                return None
+        elif not self._ancestor(witness["base_sha"], pr.base.sha):
+            return None
+        return [witness["base_sha"], pr.base.sha]
+
+    def _retirement_path(self, effect: Effect) -> str:
+        return f"repos/{self.repository}/issues/{_number(effect.pr_number)}"
+
+    def _retirement_intent(self, effect: Effect) -> dict[str, Any]:
+        intent = effect.payload.get("retirement_intent")
+        if not isinstance(intent, Mapping):
+            raise ValueError("missing persisted original retirement intent")
+        witness = self._retirement_witness(effect, intent["baseline_event_id"])
+        binding = {**witness, "effect_id": effect.effect_id, "control_action": effect.payload["control_action"],
+                   "control_kind": effect.payload["control_kind"], "run_id": effect.execution.run_id,
+                   "subject": effect.subject, "actor": effect.actor}
+        body = intent.get("comment_body")
+        marker = "<!-- agent-run-retirement:" + effect.effect_id + " -->"
+        if (any(intent.get(key) != value for key, value in binding.items())
+                or intent["control_kind"] not in {"requeue", "abandon"}
+                or type(intent.get("generation")) is not int or intent["generation"] < 1
+                or not isinstance(body, str) or body.count(marker) != 1):
+            raise ValueError("foreign retirement intent")
+        return dict(intent)
+
+    def _reconcile_retirement(self, effect: Effect) -> EffectResult:
+        intent = self._retirement_intent(effect)
+        pr = self.pull_request(_number(effect.pr_number))
+        ancestry = self._retirement_match(effect, pr)
+        if ancestry is None or pr.state not in {"OPEN", "CLOSED"}:
+            return EffectResult("third", pr=pr)
+        path = self._retirement_path(effect)
+        events = [event for event in self._events_at(path) if event["id"] > intent["baseline_event_id"]]
+        marker = "<!-- agent-run-retirement:" + effect.effect_id + " -->"
+        comments = [comment for comment in self._pages(path + "/comments?per_page=100")
+                    if marker in _string(comment["body"])]
+        if not comments:
+            return EffectResult("prior" if pr.state == "OPEN" and not events else "third", pr=pr,
+                                raw={"base_ancestry": ancestry})
+        if len(comments) != 1:
+            return EffectResult("unknown", pr=pr, raw={"diagnostic": "ambiguous retirement marker"})
+        comment = comments[0]
+        author = _login(comment.get("user"))
+        if author is None:
+            return EffectResult("unknown", pr=pr)
+        if author != effect.actor or comment["body"] != intent["comment_body"]:
+            return EffectResult("third", pr=pr)
+        _time(comment["created_at"])
+        receipt = {**intent, "comment_id": _number(comment["id"]), "comment_created_at": comment["created_at"]}
+        raw: dict[str, Any] = {"close_intent": receipt, "base_ancestry": ancestry}
+        if pr.state == "OPEN":
+            return EffectResult("third" if events else "prior", pr=pr, raw=raw)
+        if len(events) != 1 or events[0]["event"] != "closed":
+            return EffectResult("unknown", pr=pr, raw=raw)
+        event = events[0]
+        actor = _login(event.get("actor"))
+        if actor is None:
+            return EffectResult("unknown", pr=pr, raw=raw)
+        if actor != effect.actor or _time(event["created_at"]) < _time(comment["created_at"]):
+            return EffectResult("third", pr=pr, raw=raw)
+        raw["event"] = {"id": event["id"], "event": "closed", "actor": actor, "created_at": event["created_at"]}
+        return EffectResult("target", pr=pr, raw=raw)
+
+    def _retire_pr(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+        observed = self.reconcile(effect)
+        if observed.disposition != "prior":
+            return observed
+        if self.actor() != effect.actor:
+            raise KernelError("remote_actor_changed")
+        intent = self._retirement_intent(effect)
+
+        def guard() -> None:
+            authorize()
+            fresh = self.reconcile(effect)
+            # Reconciliation already proves the original identity and any
+            # append-only base movement. The original marker must stay exact.
+            if (fresh.disposition != "prior"
+                    or fresh.raw.get("close_intent") != observed.raw.get("close_intent")):
+                raise KernelError("retirement_boundary_changed")
+
+        if observed.raw.get("close_intent") is None:
+            self._write(self._retirement_path(effect) + "/comments", "POST", {"body": intent["comment_body"]}, guard)
+            observed = self.reconcile(effect)
+            if observed.disposition != "prior":
+                return observed
+            if observed.raw.get("close_intent") is None:
+                return EffectResult("unknown", pr=observed.pr, raw={"diagnostic": "retirement marker unconfirmed"})
+        response = self._write(f"repos/{self.repository}/pulls/{_number(effect.pr_number)}", "PATCH", {"state": "closed"}, guard)
+        result = self.reconcile(effect)
+        return replace(result, raw={**result.raw, "write_returncode": response.returncode,
+                                    "write_diagnostic": response.stderr[:4096]})
+
+    @staticmethod
+    def _event_actor(event: Mapping[str, Any]) -> str | None:
+        actor = event.get("actor")
+        return _login(actor) if isinstance(actor, Mapping) else actor if isinstance(actor, str) and actor else None
+
+    def _ticket_recovery_proof(self, effect: Effect) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        completion = effect.payload["completion"]
+        receipt = effect.payload["close_receipt"]
+        intent = effect.payload["close_intent"]
+        original = receipt["raw"]["event"]
+        if not all(isinstance(value, Mapping) for value in (completion, receipt, intent, original)):
+            raise ValueError("missing original Ticket close proof")
+        _text(completion["close_effect"])
+        binding = {"run_id": effect.execution.run_id, "subject": effect.subject,
+                   "issue": _number(effect.payload["issue"]), "merge_sha": effect.before_sha, "kind": "ticket"}
+        if (receipt["disposition"] != "target" or completion["subject"] != effect.subject
+                or completion["merge_sha"] != effect.before_sha
+                or any(intent.get(key) != value for key, value in binding.items())
+                or original["event"] != "closed" or self._event_actor(original) != _text(intent["actor"])
+                or type(intent["baseline_event_id"]) is not int or intent["baseline_event_id"] < 0
+                or _number(original["id"]) <= intent["baseline_event_id"]
+                or _time(original["created_at"]) < _time(intent["comment_created_at"])):
+            raise ValueError("foreign original Ticket close proof")
+        _number(intent["comment_id"])
+        _text(intent["comment_body"])
+        _sha(effect.before_sha)
+        return intent, original
+
+    def _reconcile_ticket_recovery(self, effect: Effect) -> EffectResult:
+        intent, original = self._ticket_recovery_proof(effect)
+        issue = self._issue(effect)
+        raw: dict[str, Any] = {"issue": effect.payload["issue"], "state": issue["state"].upper(),
+                               "prior_close": dict(original)}
+        comments = [comment for comment in self._pages(self._issue_path(effect) + "/comments?per_page=100")
+                    if comment["id"] == intent["comment_id"]]
+        if (len(comments) != 1 or comments[0]["body"] != intent["comment_body"]
+                or _login(comments[0].get("user")) != intent["actor"]
+                or _time(comments[0]["created_at"]) != _time(intent["comment_created_at"])):
+            return EffectResult("unknown", raw={**raw, "diagnostic": "original close comment unproven"})
+        events = self._events(effect)
+        matches = [event for event in events if event["id"] == original["id"]]
+        if (len(matches) != 1 or matches[0]["event"] != "closed"
+                or self._event_actor(matches[0]) != self._event_actor(original)
+                or _time(matches[0]["created_at"]) != _time(original["created_at"])):
+            return EffectResult("unknown", raw={**raw, "diagnostic": "original close event unproven"})
+        latest_close = next(event for event in reversed(events) if event["event"] == "closed")
+        if latest_close["id"] != original["id"]:
+            return EffectResult("third" if self._event_actor(latest_close) else "unknown",
+                                raw={**raw, "latest_close": latest_close})
+        later = [event for event in events if event["id"] > original["id"]]
+        if issue["state"] == "closed":
+            return EffectResult("unknown" if later else "prior", raw=raw)
+        if (later and later[-1]["event"] == "reopened" and self._event_actor(later[-1]) == effect.actor
+                and _time(later[-1]["created_at"]) >= _time(original["created_at"])):
+            return EffectResult("target", raw={**raw, "reopened_event": later[-1]})
+        return EffectResult("target", raw={**raw, "already_open": True})
+
+    def _reopen_ticket(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+        observed = self.reconcile(effect)
+        if observed.disposition not in {"prior", "target"}:
+            return observed
+
+        def guard() -> None:
+            authorize()
+            if self.reconcile(effect) != observed:
+                raise KernelError("ticket_recovery_boundary_changed")
+
+        if observed.disposition == "target":
+            # A verified already-OPEN cleanup outcome still needs first-dispatch
+            # authority. Reconciliation remains a pure physical observation.
+            guard()
+            return observed
+        if self.actor() != effect.actor:
+            raise KernelError("remote_actor_changed")
+        response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, guard)
+        result = self.reconcile(effect)
+        return replace(result, raw={**result.raw, "write_returncode": response.returncode,
+                                    "write_diagnostic": response.stderr[:4096]})
 
     def observe(self, kernel: Kernel, subject: str) -> World:
         """Read external facts using this input's exact refresh receipt.
@@ -392,6 +622,19 @@ class RemoteEffects:
         return EffectResult("prior" if pr.state == "OPEN" and pr.base.sha == effect.before_sha
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
 
+    def _current_pr_edit(self, effect: Effect, observed: EffectResult) -> EffectResult:
+        """An original unchanged edit requires live anchors before and after authorization."""
+        if observed.disposition != "target" or observed.pr is None:
+            return observed
+        try:
+            source, target = read_remote_heads(self.root, effect.source_ref, effect.target_ref,
+                                              runner_identity=self.identity, remote=self.remote)
+            if observed.pr.base != effect.base or source != effect.after_sha or target != effect.base.sha:
+                return replace(observed, disposition="third")
+        except (GitHubReadError, OSError, ValueError, KeyError, TypeError) as error:
+            return EffectResult("unknown", pr=observed.pr, raw={"diagnostic": str(error)[:4096]})
+        return observed
+
     def _issue_path(self, effect: Effect) -> str:
         return f"repos/{self.repository}/issues/{_number(effect.payload['issue'])}"
 
@@ -402,7 +645,10 @@ class RemoteEffects:
         return issue
 
     def _events(self, effect: Effect) -> list[dict[str, Any]]:
-        events = [event for event in self._pages(self._issue_path(effect) + "/events?per_page=100")
+        return self._events_at(self._issue_path(effect))
+
+    def _events_at(self, path: str) -> list[dict[str, Any]]:
+        events = [event for event in self._pages(path + "/events?per_page=100")
                   if event.get("event") in {"closed", "reopened"}]
         for event in events:
             _number(event["id"])

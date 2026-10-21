@@ -81,6 +81,11 @@ def review_findings(value: Any) -> list[str]:
     return result
 
 
+def _abandonment(tx: Transaction) -> dict[str, Any] | None:
+    rows = tx.rows("SELECT id,status FROM actions WHERE kind='abandon'", limit=1)
+    return {"action": rows[0]["id"], "status": rows[0]["status"]} if rows else None
+
+
 def _header(tx: Transaction, path: Path) -> dict[str, Any]:
     run = dict(tx.one("SELECT * FROM runs"))
     if not isinstance(run["id"], str) or not isinstance(run["repository"], str) or not isinstance(run["parent_issue"], int):
@@ -94,6 +99,9 @@ def _header(tx: Transaction, path: Path) -> dict[str, Any]:
     terminal = not any(row["phase"] not in {"complete", "abandoned"} for row in owners)
     if final_target and not any(row["kind"] == "final_run" and row["phase"] in {"complete", "abandoned"} for row in owners):
         terminal = False
+    abandonment = _abandonment(tx)
+    if abandonment is not None:
+        terminal = abandonment["status"] == "complete"
     return {"run_id": run["id"], "repository": run["repository"], "parent": run["parent_issue"],
             "repository_root": root, "language": run.get("language"), "created_at": _timestamp(run.get("created_at")),
             "phases": phases, "is_terminal": terminal, "stopped": bool(run["stopped"]), "blocked": run["blocked"],
@@ -294,8 +302,11 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
             "pending_writes": effects, "delivery_cleanup": dict(cleanup[0]) if cleanup else None}
 
 
-def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
+                      abandonment: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """Describe recorded gates; this does not decide whether a command will apply."""
+    if abandonment is not None:
+        return []  # The permanent fence supersedes ordinary business gates.
     result: list[dict[str, Any]] = []
     if run["stopped"] or run["blocked"]:
         result.append({"subject": None, "scope": "run", "reason": "operator_stopped" if run["stopped"] else run["blocked"],
@@ -356,8 +367,11 @@ def _public_phase(phase: str) -> str:
             "close": "closing", "complete": "completed"}.get(phase, phase)
 
 
-def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], terminal: bool) -> str:
+def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], terminal: bool, *,
+                   abandonment: Mapping[str, Any] | None = None) -> str:
     """User-facing classification of recorded phases, with no transition authority."""
+    if abandonment is not None:
+        return "abandoned" if abandonment["status"] == "complete" else "abandonment_pending"
     if run["stopped"]:
         return "operator_stopped"
     if run["blocked"]:
@@ -444,6 +458,10 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
 
 def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: str,
                  cleanup: Mapping[str, Any] | None) -> str:
+    if status == "abandonment_pending":
+        return f"agent-run abandon {run['parent_issue']} --repo {run['repository']}"
+    if status == "abandoned":
+        return "无"
     if actions:
         action = actions[0]
         return str(action["next_action"])
@@ -616,7 +634,7 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
     """
     run = dict(tx.one("SELECT * FROM runs"))
     subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
-    return {"actions": _operator_actions(run, subjects),
+    return {"actions": _operator_actions(run, subjects, abandonment=_abandonment(tx)),
             "generations": {job["subject"]: job["generation"] for job in subjects},
             "highwater": tx.one("SELECT coalesce(max(position),0) FROM history")[0]}
 
@@ -641,11 +659,12 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     raise QueryError("query_limit", "Public response exceeds its bounded limit")
                 return QueryDocument("settings", language, settings)
             subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
-            actions = _operator_actions(run, subjects)
+            abandonment = _abandonment(tx)
+            actions = _operator_actions(run, subjects, abandonment=abandonment)
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
             complete = location["is_terminal"]
-            status = _public_status(run, subjects, complete)
+            status = _public_status(run, subjects, complete, abandonment=abandonment)
             created = _timestamp(run.get("created_at"))
             closed = tx.rows("SELECT max(h.created_at) FROM history h JOIN effects e ON e.id=h.identity WHERE h.kind='effect_consumed' AND e.operation='close'")
             end = _timestamp(closed[0][0]) if complete and closed else None
@@ -654,7 +673,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             data: dict[str, Any] = {"run_id": run["id"], "repository": run["repository"],
                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None,
                            "body": title[0][1] if title else None, "revision": run["parent_revision"]},
-                "status": status, "phase": _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
+                "status": status, "phase": status if abandonment is not None else _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
                     "merged" if any(job["kind"] == "final_run" and job["phase"] == "complete" for job in subjects) else status,
                 "created_at": created, "elapsed_seconds": elapsed, "repository_root": location["repository_root"],
                 "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
@@ -667,6 +686,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
+            data["abandonment"] = abandonment
             data["multi_ticket"] = _multi_ticket(tx, run, subjects, data["scheduling"])
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
             data["progress"] = _progress(data)

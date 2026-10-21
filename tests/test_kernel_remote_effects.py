@@ -560,7 +560,12 @@ elif endpoint.startswith('repos/example/project/pulls'):
                 'base':{'sha':head('refs/heads/'+body['base']),'ref':body['base'],'repo':{'full_name':'example/project'}}}
             d['prs'].append(pr)
             result=pr
-        else: result=[d['prs']] if '--slurp' in args else d['prs']
+        else:
+            from urllib.parse import parse_qs,urlsplit
+            query=parse_qs(urlsplit(args[1]).query)
+            selected=[p for p in d['prs'] if ('head' not in query or p['head']['ref']==query['head'][0].split(':',1)[-1])
+                      and ('base' not in query or p['base']['ref']==query['base'][0])]
+            result=[selected] if '--slurp' in args else selected
     else:
         number=int(tail.split('/')[1]);pr=next((p for p in d['prs'] if p['number']==number),None)
         if pr is None: print('HTTP 404',file=sys.stderr);raise SystemExit(1)
@@ -574,7 +579,10 @@ elif endpoint.startswith('repos/example/project/pulls'):
             git('update-ref','refs/heads/'+pr['base']['ref'],sha,pr['base']['sha'])
             pr.update(state='closed',merged=True,merge_commit_sha=sha,merged_by={'login':'publisher'})
             result={'merged':True,'sha':sha}
-        elif method=='PATCH':pr.update(body);result=pr
+        elif method=='PATCH':
+            pr.update(body);result=pr
+            if body.get('state')=='closed':
+                d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})
         else:result=pr
 elif endpoint.startswith('repos/example/project/issues/'):
     if d.get('issue_read_error') and method=='GET':
@@ -586,7 +594,10 @@ elif endpoint.startswith('repos/example/project/issues/'):
         else:result=[d['comments']] if '--slurp' in args else d['comments']
     elif endpoint.endswith('/events'):result=[d['events']] if '--slurp' in args else d['events']
     elif method=='PATCH':
-        d['issue_state']=body['state'];d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'});result={'state':d['issue_state']}
+        d['issue_state']=body['state'];
+        event='closed' if body['state']=='closed' else 'reopened'
+        at='2026-10-21T10:01:00Z' if event=='closed' else '2026-10-21T10:02:00Z'
+        d['events'].append({'id':len(d['events'])+1,'event':event,'actor':{'login':'publisher'},'created_at':at});result={'state':d['issue_state']}
     else:result={'number':2,'node_id':'issue-node-2','state':d['issue_state']}
 else:raise SystemExit('unexpected endpoint '+endpoint)
 state.write_text(json.dumps(d))

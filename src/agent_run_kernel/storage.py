@@ -17,7 +17,7 @@ from agent_run.sqlite_runtime import require_wal_runtime
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v14-exploration"
+PROTOCOL = "independent-delivery-kernel-v16-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -93,7 +93,7 @@ CREATE TABLE retired_generations (
  subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL, revision TEXT NOT NULL,
  source_ref TEXT NOT NULL, checkout TEXT NOT NULL, source_sha TEXT NOT NULL,
  candidate_sha TEXT, publication_sha TEXT, pr_number INTEGER, reason TEXT NOT NULL,
- validation_checkout TEXT, validation_cleanup TEXT,
+ validation_checkout TEXT, validation_cleanup TEXT, workspace_sha TEXT NOT NULL, owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL,
  PRIMARY KEY(subject,generation)
 );
 CREATE TABLE resource_cleanup (
@@ -219,10 +219,11 @@ CREATE TABLE effects (
  before_sha TEXT NOT NULL, after_sha TEXT, candidate_sha TEXT, candidate_tree TEXT,
  base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT CHECK(actor IS NULL OR length(trim(actor))>0),
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
- attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0,
+ attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0, control_action TEXT REFERENCES actions(id),
  CHECK((executor IS NOT NULL AND epoch IS NOT NULL) OR (status='confirmed' AND executor IS NULL AND epoch IS NULL)),
- CHECK(actor IS NOT NULL OR status='confirmed' OR operation NOT IN ('push','run_branch','pr_write','merge','completion_comment','close','issue_link','cleanup_remote_ref'))
+ CHECK(actor IS NOT NULL OR status='confirmed' OR operation NOT IN ('push','run_branch','pr_write','merge','completion_comment','close','issue_link','cleanup_remote_ref','retire_pr','reopen_ticket'))
 );
+CREATE INDEX control_effects ON effects(control_action);
 CREATE TABLE effect_failures (
  effect TEXT NOT NULL REFERENCES effects(id), dispatch_serial INTEGER NOT NULL,
  evidence TEXT NOT NULL REFERENCES material(id), observed_at REAL NOT NULL,

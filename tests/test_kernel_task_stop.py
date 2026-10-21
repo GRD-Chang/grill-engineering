@@ -6,7 +6,7 @@ import pytest
 
 from agent_run.task_identity import TaskKey
 from agent_run_kernel import Kernel, KernelError
-from agent_run_kernel.model import HostObservation
+from agent_run_kernel.model import Execution, HostObservation
 from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.task_location import bind_task, locked_task
 from test_kernel_requirements import independent_source
@@ -18,10 +18,28 @@ def test_task_stop_uses_the_exact_pointer_without_launching_a_host(tmp_path: Pat
     kernel = Kernel.create_task(tmp_path / "published.sqlite3", scenario.spec, requirements=scenario.requirements)
     task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
     request = None
+    active_before = []
+    usage_before = None
     if host_state == "unknown":
         request = kernel.admit_host("original-launch", kind="run", command=("native-host",),
                                     environment_carrier=tmp_path / "carrier", preflight=lambda: None)
         assert kernel.dispatch_host(request)
+        assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
+                                                           42, "start", usage_ready=True)) == "running"
+        scenario.kernel = kernel
+        scenario.execution = Execution(request.run_id, request.owner, request.epoch)
+        for _ in range(20):
+            step = kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+            if step.call is not None:
+                assert kernel.dispatch_agent(step.call)
+                break
+            scenario.handle(step)
+        else:
+            raise AssertionError("The original Host never allocated its Worker lease")
+        active_before = kernel.scheduling()["active"]
+        assert len(active_before) == 1 and active_before[0]["invocation"] == step.call.invocation_id
+        usage_before = kernel.host_usage("original-launch")
+        assert usage_before is not None and usage_before.usage_ready and not usage_before.usage_released
         assert kernel.observe_host(request, HostObservation("unknown", request.unit_name)) == "unknown"
     if host_state == "rebound":
         other = Kernel.create(tmp_path / "other.sqlite3", replace(scenario.spec, run_id="other-run"), requirements=scenario.requirements)
@@ -41,7 +59,8 @@ def test_task_stop_uses_the_exact_pointer_without_launching_a_host(tmp_path: Pat
     assert scenario.port.writes() == before_writes
     assert kernel.active_host_action() == (None if request is None else "original-launch")
     if request is not None:
-        assert kernel.host_usage("original-launch") is None
+        assert kernel.host_usage("original-launch") == usage_before
+        assert kernel.scheduling()["active"] == active_before
         with pytest.raises(KernelError, match="executor_exit_unproven"):
             kernel.admit_host("cannot-replace-unknown", kind="resume", command=("another-host",),
                               environment_carrier=tmp_path / "another-carrier", preflight=lambda: None)

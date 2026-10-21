@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from agent_run.managed_workspace import ManagedWorkspace, read_git_identity
 
 
@@ -289,7 +291,7 @@ def test_lifecycle_rejects_unsupported_github_host_before_managed_or_remote_acce
 
 
 @contextmanager
-def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch):
+def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit: bool = True):
     """Real Git/source/manager reads around a controlled ready Host.
 
     This producer supplies usage readiness; the unchanged managed-entry E2E
@@ -338,6 +340,12 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch):
     manager_root.mkdir()
     manager, fixture, response, calls = controlled_manager(manager_root)
     monkeypatch.setattr(host_adapter, "SystemdHost", lambda **_kwargs: manager)
+    receipt = kernel.source_status()
+    world = World(receipt["observed_parent_revision"], receipt["observed_graph_revision"],
+                  kernel.delivery("parent:1").revision, base)
+    if not admit:
+        yield kernel, None, None, world, calls
+        return
     request = kernel.admit_host("original", kind="run", command=fixture.command,
         environment_carrier=tmp_path / "original-environment", preflight=manager.preflight)
     assert kernel.dispatch_host(request)
@@ -352,9 +360,6 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch):
         observation = manager.observe(request)
         assert observation.disposition == "running"
         assert kernel.observe_host(request, replace(observation, usage_ready=True)) == "running"
-        receipt = kernel.source_status()
-        world = World(receipt["observed_parent_revision"], receipt["observed_graph_revision"],
-                      kernel.delivery("parent:1").revision, base)
         yield kernel, request, Execution(request.run_id, request.owner, request.epoch), world, calls
     finally:
         process.terminate()
@@ -424,3 +429,138 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
         assert continued is not None and continued.attempt_id == original.attempt_id
         assert continued.deadline_seconds == 7.0 and kernel.host_request("original") == request
         assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
+
+
+def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    import pytest
+    from agent_run_kernel import host_adapter, lifecycle_cli, remote_effects
+    from agent_run_kernel.model import HostObservation, KernelError
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, _calls):
+        assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
+            evidence="The manager cannot currently prove this original Host's lifetime.")) == "unknown"
+        with kernel.storage.transaction(write=False) as tx:
+            original_host = dict(tx.one("SELECT * FROM hosts"))
+            original_leases = [dict(row) for row in tx.all("SELECT * FROM leases")]
+            original_epoch = tx.one("SELECT epoch FROM runs")[0]
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail("Unknown-Host Abandon must not launch, attach, read remote state, or claim cleanup")
+
+        monkeypatch.setattr(host_adapter, "SystemdHost", forbidden)
+        monkeypatch.setattr(lifecycle_cli, "attach", forbidden)
+        monkeypatch.setattr(lifecycle_cli, "submit", forbidden)
+        monkeypatch.setattr(remote_effects, "RemoteEffects", forbidden)
+        assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["result"] == "accepted" and result["status"] == "action_pending"
+        assert result["action"] == "abandon" and result["host"] == "unknown"
+        assert kernel.source_status()["abandonment"] == {"action": result["action_id"], "status": "pending"}
+        assert kernel.host_request("original") == request
+        with kernel.storage.transaction(write=False) as tx:
+            assert dict(tx.one("SELECT * FROM hosts")) == original_host
+            assert [dict(row) for row in tx.all("SELECT * FROM leases")] == original_leases
+            assert tx.one("SELECT epoch FROM runs")[0] == original_epoch + 1
+            assert tx.one("SELECT count(*) FROM actions WHERE kind='abandon'")[0] == 1
+            assert tx.one("SELECT count(*) FROM effects WHERE control_action IS NOT NULL")[0] == 0
+        with pytest.raises(KernelError, match="executor_fenced"):
+            kernel.advance("parent:1", execution, world)
+
+
+def test_public_queries_show_the_recorded_pending_abandonment_instead_of_new_business_actions(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run_kernel.effects import LocalGit
+    from agent_run_kernel.local_effects import LocalEffects
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, _calls):
+        with kernel.storage.transaction(write=False) as tx:
+            root = Path(tx.one("SELECT repository_root FROM runs")[0])
+        resources = kernel.generation_resources()
+        inspections = LocalEffects(LocalGit(root)).inspect_resources(resources)
+        kernel.stop_task("original-local-stop", subject="parent:1")
+        assert kernel.control_host(request, "abandon", "original-abandon", resource_inspections=inspections) == "pending"
+        before = kernel.source_status()
+        for command in ("status", "history"):
+            assert main([command, "--parent", "1", "--repo", "example/project", "--json"]) == 0
+            document = json.loads(capsys.readouterr().out)
+            assert document["status"] == "abandonment_pending"
+            assert document["progress"]["status"] == "abandonment_pending"
+            assert document["abandonment"]["action"] == "original-abandon"
+            assert document["abandonment"]["status"] == "pending"
+            assert all(action["operation"] == "abandon" for action in document["operator_actions"])
+            assert main([command, "--parent", "1", "--repo", "example/project", "--plain"]) == 0
+            assert "Abandonment pending" in capsys.readouterr().out
+        assert kernel.source_status() == before
+
+
+def test_public_abandon_uses_the_original_ready_host_without_a_second_launch(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run_kernel import lifecycle_cli
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, calls):
+        monkeypatch.setattr(lifecycle_cli, "submit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
+        assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["result"] == "accepted" and result["status"] == "action_pending"
+        assert result["action"] == "abandon" and result["host"] == "running"
+        assert kernel.host_request("original") == request
+        assert kernel.source_status()["abandonment"] == {"action": result["action_id"], "status": "pending"}
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+        assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_public_idle_abandon_records_the_exact_initial_or_continuation_host_intent(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys, continuation: bool,
+) -> None:
+    import json
+    from agent_run_kernel import lifecycle_cli
+    from agent_run_kernel.effects import LocalGit
+    from agent_run_kernel.local_effects import LocalEffects
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, _world, _calls):
+        if continuation:
+            with kernel.storage.transaction(write=False) as tx:
+                root = Path(tx.one("SELECT repository_root FROM runs")[0])
+            inspections = LocalEffects(LocalGit(root)).inspect_resources(kernel.generation_resources())
+            assert kernel.abandon_task("original-abandon", resource_inspections=inspections) == "pending"
+        submitted = []
+
+        def record_host_intent(selected, kind, *, action_id, command, manager, environment, runner_lock, **intent):
+            # This verifies real Core admission, not physical Host handoff.
+            request = selected.admit_host(action_id, kind=kind, command=command,
+                environment_carrier=tmp_path / "new-environment.json", preflight=manager.preflight, **intent)
+            submitted.append(request)
+            with selected.storage.transaction(write=False) as tx:
+                status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
+            return {"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
+                    "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}
+
+        monkeypatch.setattr(lifecycle_cli, "submit", record_host_intent)
+        assert main(["abandon", "1", "--repo", "example/project", "--discard-worktree", "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["result"] == "accepted" and result["host"] == "unknown"
+        assert len(submitted) == 1
+        request = submitted[0]
+        with kernel.storage.transaction(write=False) as tx:
+            host = tx.one("SELECT subject,request_id FROM hosts")
+            intent = json.loads(tx.get(host["request_id"], host["subject"]))["intent"]
+            assert intent["kind"] == "abandon" and intent["discard_worktree"] is True
+            assert intent.get("continuation_of") == ("original-abandon" if continuation else None)
+            assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+            assert tx.one("SELECT count(*) FROM actions WHERE kind='abandon'")[0] == 1
+            assert tx.one("SELECT count(*) FROM invocations")[0] == 0
+        assert kernel.source_status()["abandonment"]["status"] == "pending"
+        assert kernel.host_request(result["action_id"]) == request
