@@ -14,7 +14,9 @@ from agent_run.integration_record_contract import require_completed_ticket_integ
 from agent_run.object_state import object_store
 from agent_run.review_budget import ensure_budget, new_budget
 from agent_run.review_evidence import review_record_matches, run_review_identity
+from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_currentness import RunCurrentnessReader, invalidate_run_acceptance
+from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_parent_integration import prepare_run_parent_integration
 from agent_run.run_pr_reconciliation import reconcile_run_pr_write
 from agent_run.run_repair_lifecycle import RunRepairLifecycle
@@ -39,9 +41,16 @@ class RunAcceptanceEngine:
         self.states = object_store(states, parent_scope=True)
         self.agents = agents
         self.github = github
+        self.currentness_reader = currentness_reader
+        self.candidate_acceptance = CandidateRunAcceptance(git, default_head_sha)
+        self.repair_currentness = (
+            RunRepairCurrentness(git, github, self.states) if github is not None else None
+        )
         self.work = DevelopmentReview(
             git=git, states=self.states, agents=agents, github=github,
-            currentness_reader=currentness_reader, default_head_sha=default_head_sha,
+            currentness_reader=currentness_reader,
+            candidate_acceptance=self.candidate_acceptance,
+            repair_currentness=self.repair_currentness,
         )
         self._repair_promotion = RunRepairPromotion(self)
         self._repair_lifecycle = RunRepairLifecycle(self, self._repair_promotion)
@@ -68,7 +77,7 @@ class RunAcceptanceEngine:
             current_head_sha=self.git.resolve(str(state["run_branch"])),
         ):
             return state
-        if not self.work._refresh_run_currentness(state):
+        if not self.candidate_acceptance.refresh_currentness(state, self.currentness_reader):
             return self._save(state)
         if not self._all_tickets_completed(state):
             raise ValueError("Run Acceptance requires every Ticket to be completed")
@@ -158,7 +167,7 @@ class RunAcceptanceEngine:
             return
         current_head = self.git.resolve(str(state["run_branch"]))
         if review_record_matches(
-            record, run_review_identity(state, self.git, self.work._default_head(state), current_head),
+            record, run_review_identity(state, self.git, self.candidate_acceptance.default_head(state), current_head),
         ):
             return
         invalidate_run_acceptance(state)

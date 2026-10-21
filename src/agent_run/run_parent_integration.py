@@ -121,8 +121,7 @@ def prepare_run_parent_integration(
             return False
         if not isinstance(record, dict):
             raise ValueError("Run integration did not produce a record")
-        owner.work.default_head_sha = str(record["target_sha"])
-        owner.work.candidate_acceptance.update_default_head(owner.work.default_head_sha)
+        owner.candidate_acceptance.update_default_head(str(record["target_sha"]))
         accepted = run.get("acceptance_record")
         if isinstance(accepted, dict) and (
             accepted.get("reviewed_head_sha") != record["head_sha"]
@@ -311,8 +310,7 @@ def observe_run_repair_snapshot(
             policy_snapshot=run.get("policy_snapshot") or state["policy_snapshot"],
             own_source_write=own_source,
         )
-        owner.work.default_head_sha = target
-        owner.work.candidate_acceptance.update_default_head(target)
+        owner.candidate_acceptance.update_default_head(target)
         owner._save(state)
         return True
     except (ParentHistoryRewritten, ResyncBudgetExhausted, GitError) as error:

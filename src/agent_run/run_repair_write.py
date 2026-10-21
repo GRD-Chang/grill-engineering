@@ -23,18 +23,18 @@ def update_run_branch(
     intent = job.get("run_branch_write_intent")
     if not isinstance(intent, dict):
         acceptance = job.get("acceptance_record")
-        if not isinstance(acceptance, dict) or not owner.work.candidate_acceptance.is_current(
+        if not isinstance(acceptance, dict) or not owner.candidate_acceptance.is_current(
             state, job, acceptance,
         ):
             promotion.invalidate_stale(state, job, owner._repair_checkout(state))
             owner._save(state)
             return False
-        if not owner.work._refresh_run_currentness(state) or not promotion._repair_trigger_is_current(
+        if not owner.candidate_acceptance.refresh_currentness(state, owner.currentness_reader) or not promotion._repair_trigger_is_current(
             state, job,
         ):
             owner._save(state)
             return False
-        if owner.work._default_head(state) != job["default_base_sha"]:
+        if owner.candidate_acceptance.default_head(state) != job["default_base_sha"]:
             promotion.invalidate_stale(state, job, owner._repair_checkout(state))
             owner._save(state)
             return False
@@ -69,9 +69,9 @@ def update_run_branch(
             # saved evidence still authorizes a write that has not happened.
             acceptance = job.get("acceptance_record")
             if (
-                not owner.work._refresh_run_currentness(state)
+                not owner.candidate_acceptance.refresh_currentness(state, owner.currentness_reader)
                 or not isinstance(acceptance, dict)
-                or not owner.work.candidate_acceptance.is_current(state, job, acceptance)
+                or not owner.candidate_acceptance.is_current(state, job, acceptance)
                 or not promotion._repair_trigger_is_current(state, job)
             ):
                 job.pop("run_branch_write_intent", None)

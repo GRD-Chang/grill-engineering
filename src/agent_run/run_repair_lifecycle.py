@@ -392,7 +392,7 @@ class RunRepairLifecycle:
                 else f"agent-run-repair/{state['run_id']}/{generation}-generation-{generation}"
             ),
             "base_sha": base_sha,
-            "default_base_sha": self.owner.work._default_head(state),
+            "default_base_sha": self.owner.candidate_acceptance.default_head(state),
             "repair_base_run_head_sha": base_sha,
             "parent_revision": self.owner._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self.owner._mapping(state, "ticket_graph")["revision"],
@@ -495,7 +495,7 @@ class RunRepairLifecycle:
         repair_source: str,
         repair_request: dict[str, Any],
     ) -> dict[str, Any] | None:
-        currentness = self.owner.work.repair_currentness
+        currentness = self.owner.repair_currentness
         if currentness is None:
             raise ValueError("Run Repair requires the Publisher")
         return currentness.create_trigger(state, repair_source, repair_request)

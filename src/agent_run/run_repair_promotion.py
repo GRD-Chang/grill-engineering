@@ -41,10 +41,10 @@ class RunRepairPromotion:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         current_default = (
-            self.owner.work.candidate_acceptance.default_head_sha
+            self.owner.candidate_acceptance.default_head_sha
             or str(self.owner._mapping(state, "base")["sha"])
         )
-        currentness = self.owner.work.repair_currentness
+        currentness = self.owner.repair_currentness
         if (
             currentness is not None
             and current_default != job.get("default_base_sha")
@@ -135,8 +135,7 @@ class RunRepairPromotion:
                     "candidate_sha": integrated,
                 }
             )
-        self.owner.work.default_head_sha = default_head
-        self.owner.work.candidate_acceptance.update_default_head(default_head)
+        self.owner.candidate_acceptance.update_default_head(default_head)
         stale_keys = [
             "acceptance_record",
             "acceptance_artifact",
@@ -318,11 +317,11 @@ class RunRepairPromotion:
     def _repair_trigger_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
-        currentness = self.owner.work.repair_currentness
+        currentness = self.owner.repair_currentness
         if currentness is None:
             raise ValueError("Run Repair requires the Publisher")
         return currentness.trigger_is_current(
-            state, job, default_head_sha=self.owner.work._default_head(state)
+            state, job, default_head_sha=self.owner.candidate_acceptance.default_head(state)
         )
 
     def after_update(
@@ -342,12 +341,12 @@ class RunRepairPromotion:
         ):
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
-        if not self.owner.work._refresh_run_currentness(state):
+        if not self.owner.candidate_acceptance.refresh_currentness(state, self.owner.currentness_reader):
             return False
         if not self._repair_trigger_is_current(state, job):
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
-        promoted = self.owner.work.candidate_acceptance.promotion_record(state, job, integrated)
+        promoted = self.owner.candidate_acceptance.promotion_record(state, job, integrated)
         if promoted is None:
             # A written Candidate is not automatically an accepted Run.  Any
             # mismatch at this seam discards the Candidate and starts a fresh

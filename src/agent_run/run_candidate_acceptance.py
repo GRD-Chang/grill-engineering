@@ -11,7 +11,12 @@ from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.review_evidence import candidate_run_review_identity, review_record_matches
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitError, GitRepository
-from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_currentness import (
+    RunCurrentnessReader,
+    refresh_run_currentness,
+    ticket_completion_records,
+)
+from agent_run.integration_record_contract import require_completed_ticket_integration_records
 from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state_contract import require_candidate_acceptance_history
@@ -27,6 +32,19 @@ class CandidateRunAcceptance:
 
     def update_default_head(self, default_head_sha: str) -> None:
         self.default_head_sha = default_head_sha
+
+    def refresh_currentness(
+        self, state: dict[str, Any], reader: RunCurrentnessReader | None,
+    ) -> bool:
+        """Refresh the live Run boundary and retain its one default head fact."""
+        require_completed_ticket_integration_records(state)
+        if reader is None:
+            return True
+        default_head = refresh_run_currentness(state, reader=reader, git=self.git)
+        if default_head is None:
+            return False
+        self.update_default_head(default_head)
+        return True
 
     def prepare_validation(
         self, job: dict[str, Any], validation: Path
@@ -118,7 +136,7 @@ class CandidateRunAcceptance:
             return False
         return (
             review_record_matches(acceptance, identity)
-            and self._default_head(state) == default_base
+            and self.default_head(state) == default_base
             and repair_run_branch_is_current(
                 self.git, job, self.git.resolve(str(state["run_branch"]))
             )
@@ -155,7 +173,7 @@ class CandidateRunAcceptance:
             or not artifact.is_accepted
             or not review_record_matches(record, identity)
             or expected_merge_tree != candidate_expected_merge_tree
-            or self._default_head(state) != default_base
+            or self.default_head(state) != default_base
             or self.git.resolve(str(state["run_branch"])) != integrated
             or integrated_tree != candidate_tree
             or run_tree != candidate_tree
@@ -188,7 +206,7 @@ class CandidateRunAcceptance:
         ):
             raise GitError("Merge-resolution Candidate lacks a required boundary ancestor")
 
-    def _default_head(self, state: dict[str, Any]) -> str:
+    def default_head(self, state: dict[str, Any]) -> str:
         return self.default_head_sha or str(_mapping(state, "base")["sha"])
 
 

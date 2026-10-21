@@ -83,7 +83,7 @@ def resolve_run_integration_work(
         github = owner.github
         assert github is not None
         def scene_is_current() -> bool:
-            if not owner.work._refresh_run_currentness(state):
+            if not owner.candidate_acceptance.refresh_currentness(state, owner.currentness_reader):
                 return False
             source_branch = str(state["run_branch"])
             target_branch = str(state["base"]["branch"])
