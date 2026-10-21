@@ -11,7 +11,7 @@ import sys
 from typing import Any, Literal, NoReturn, Sequence
 
 from .query import QueryDocument, QueryError, discover, read
-from .query_render import render
+from .query_render import render, safe_text
 
 
 def _personal_language() -> str:
@@ -152,9 +152,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
             print(json.dumps(error_output, ensure_ascii=False, sort_keys=True))
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
-            print(f"{prefix}: {error.code}\n{str(error)}")
+            print(safe_text(f"{prefix}: {error.code}\n{str(error)}"))
             for error_candidate in error.candidates:
-                print(f"{error_candidate['repository']} Parent #{error_candidate['parent']} {error_candidate['run_id']} {error_candidate['repository_root']}")
+                root = error_candidate["repository_root"] or ("未记录" if language == "zh" else "Not recorded")
+                print(safe_text(f"{error_candidate['repository']} Parent #{error_candidate['parent']} {error_candidate['run_id']} {root} [{error_candidate['state_dir']}]"))
         return 2
     except KeyboardInterrupt:
         return 130

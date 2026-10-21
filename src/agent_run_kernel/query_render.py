@@ -81,7 +81,7 @@ _TERMS = {
 }
 
 
-def _safe(value: object) -> str:
+def safe_text(value: object) -> str:
     content = str(value)
     content = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", content)
     content = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", content)
@@ -206,10 +206,10 @@ def render(document: QueryDocument, *, style: Literal["json", "plain", "rich"], 
         return
     if style == "plain":
         for line in _lines(document, details):
-            print(_safe(line), file=stream)
+            print(safe_text(line), file=stream)
         return
     from rich.console import Console
     from rich.text import Text
     console = Console(file=stream, markup=False, highlight=False)
     for line in _lines(document, details):
-        console.print(Text(_safe(line)))
+        console.print(Text(safe_text(line)))

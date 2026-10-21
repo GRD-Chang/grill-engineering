@@ -107,7 +107,7 @@ def header(path: Path) -> dict[str, Any]:
             return _header(tx, path)
     except KernelError as error:
         raise QueryError(error.code if error.code in {"query_limit", "storage_limit"} else "incompatible_run_state", str(error)) from error
-    except (sqlite3.Error, OSError) as error:
+    except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
         raise QueryError("incompatible_run_state", str(error)) from error
 
 
