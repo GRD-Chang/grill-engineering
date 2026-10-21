@@ -84,7 +84,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     history = read_only(kernel, tmp_path, "history").data
     assert history["supervision"] == window
     assert any(event["kind"] == "paused" and event["evidence"].get("scope_id") == window["scope_id"]
-               for event in history["events"] if isinstance(event["evidence"], dict))
+               for event in history["events"] if isinstance(event.get("evidence"), dict))
     assert kernel.control("stop", "retire-original-executor") == "applied"
     kernel.confirm_executor_exit(execution)
     assert kernel.control("resume", "explicit-original-resume") == "applied"

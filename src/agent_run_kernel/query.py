@@ -353,6 +353,12 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
             waits = [window for window in supervision_windows if window["subject"] == item["subject"] and window["timed_out"]]
             if waits:
                 artifact = {**(artifact if isinstance(artifact, Mapping) else {}), "supervision_windows": waits}
+        reasons = artifact.get("human_blockers", [reason]) if reason == "human_blocker" and isinstance(artifact, Mapping) else [reason]
+        if reason == "supervision_timeout" and isinstance(artifact, Mapping):
+            for window in artifact.get("supervision_windows", []):
+                observation = window["latest_observation"]
+                if isinstance(observation, Mapping) and isinstance(observation.get("code"), str) and isinstance(observation.get("message"), str):
+                    reasons.append(f"{observation['code']}: {observation['message']}")
         pending = owner["pending_attempt"] if owner else None
         invocation = pending["invocations"][-1] if pending and pending["invocations"] else None
         kind = ("final_approval" if operation == "approve" else "review_budget_checkpoint" if "budget_exhausted" in reason
@@ -375,7 +381,7 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
             "trigger_invocation": invocation if reason == "human_blocker" else None,
             "preserved": "；".join(part for part in (f"Candidate {owner['candidate_sha']}" if owner and owner["candidate_sha"] else "",
                          f"PR #{owner['pr_number']}" if owner and owner["pr_number"] else "") if part) or None,
-            "reasons": artifact.get("human_blockers", [reason]) if reason == "human_blocker" and isinstance(artifact, Mapping) else [reason],
+            "reasons": reasons,
             "evidence": {"operator_gate": {"code": reason, "detail": artifact},
                          "human_blockers": artifact.get("human_blockers") if isinstance(artifact, Mapping) else None,
                          "diagnostics": None, "failure_evidence": artifact if reason != "human_blocker" else None,
