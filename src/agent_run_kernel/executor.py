@@ -88,6 +88,14 @@ class _Executor:
             return self.remote.observe(self.kernel, subject)
 
     def agent(self, call: AgentCall) -> None:
+        try:
+            prompt = render_role_prompt(call)
+        except Exception as error:
+            # Match the process adapter's dispatch-before-preparation contract:
+            # this exact allocated call is known not to have launched anything.
+            if self.kernel.dispatch_agent(call):
+                self.kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+            return
         from .codex_execution import execute_selected_codex
 
         def authorize_source() -> None:
@@ -95,7 +103,7 @@ class _Executor:
 
         execute_selected_codex(
             self.kernel, call, identity=self.worker_identity, environment=self.environment,
-            prompt=render_role_prompt(call), hidden_paths=self.hidden_paths,
+            prompt=prompt, hidden_paths=self.hidden_paths,
             hidden_environment=self.hidden_environment,
             authorize_source=authorize_source,
         )
@@ -164,7 +172,7 @@ class _Executor:
 
     def subjects(self, scheduling: Mapping[str, Any]) -> list[str]:
         with self.kernel.storage.transaction(write=False) as tx:
-            ids = [row[0] for row in tx.rows("SELECT id FROM subjects ORDER BY rowid")]
+            ids = [row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid")]
         return list(dict.fromkeys([*scheduling["work_fifo"], *scheduling["integration_fifo"], *ids]))
 
     def activate_final(self) -> bool:
