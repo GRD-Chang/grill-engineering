@@ -227,12 +227,12 @@ def test_cached_integration_summary_rejects_changed_requirements_before_git(
         return DevelopmentResult("conflict-thread", "Resolved the recorded integration scene")
 
     work.agents = SimpleNamespace(develop=develop)
-    finish_name = "finish_ticket_snapshot" if kind == "ticket" else "finish_parent_snapshot"
+    git_operation = "commit_integration_work" if kind == "ticket" else "integrate_remote_heads"
 
-    def interrupted_finish(**_kwargs: Any) -> Any:
+    def interrupted_git(*_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("interrupt after saved summary before Git")
 
-    monkeypatch.setattr(conflicts, finish_name, interrupted_finish)
+    monkeypatch.setattr(work.git, git_operation, interrupted_git)
     with pytest.raises(RuntimeError, match="after saved summary"):
         conflicts.run_conflict(work, state, job, git_repo)
     saved = StateStore(store.root).load_current_run(state["run_id"])
@@ -257,10 +257,10 @@ def test_cached_integration_summary_rejects_changed_requirements_before_git(
     if kind == "ticket":
         resumed["active_ticket_job"] = resumed_job
 
-    def forbidden_finish(**_kwargs: Any) -> Any:
+    def forbidden_git(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("stale cached summary reached Git closeout")
 
-    monkeypatch.setattr(conflicts, finish_name, forbidden_finish)
+    monkeypatch.setattr(work.git, git_operation, forbidden_git)
     with pytest.raises(ChangeJobStopped):
         conflicts.run_conflict(work, resumed, resumed_job, git_repo)
     rejected = StateStore(store.root).load_current_run(str(saved["run_id"]))

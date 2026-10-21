@@ -284,3 +284,108 @@ def test_merge_resolution_repair_preserves_default_ancestor_and_remote_run_appen
     assert final.publish(str(scene.state["run_id"]))["status"] == "run_approval_pending"
     assert final.approve(str(scene.state["run_id"]))["status"] == "completed"
     assert _git(git_repo, "show", "main:human.txt") == "human repair"
+
+
+def test_accepted_repair_second_integration_unit_fails_in_public_executor(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run import cli
+    from agent_run.executor_host import FakeExecutorHost
+    from agent_run.task_control import TaskControlStore, TaskKey
+    from support.inprocess_cli import invoke_cli_inprocess
+    from support.seeding import seed_idle_control
+    from support.workspace import prepare_workspace
+
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    run_id = str(state["run_id"])
+    fixture = repo / "github.json"
+    branch = str(state["run_branch"])
+
+    class Agents(ScriptedRunAgents):
+        integration_calls = 0
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            if request.get("repair_source") != "integration":
+                return super().develop(request)
+            self.integration_calls += 1
+            self.development_requests.append(request)
+            event = request["_invocation_event"]
+            event("started", requested_thread_id="run-repair-developer", attempt_count=1)
+            event("thread_started", reported_thread_id="run-repair-developer")
+            checkout = Path(request["checkout"])
+            (checkout / "run-repair.txt").write_text("repaired with human contribution\n")
+            (checkout / "market.csv").write_bytes(b"code,value\r\nA,1\r\n")
+            event("completed", reported_thread_id="run-repair-developer")
+            return DevelopmentResult("run-repair-developer", "Resolved both contributions")
+
+    agents = Agents()
+
+    def stop_after_review(_identifier: str, saved: dict[str, Any]) -> None:
+        if saved.get("run_acceptance", {}).get("repair_job", {}).get("phase") == "accepted":
+            raise OSError("interrupt at accepted repair before Run Branch update")
+
+    with monkeypatch.context() as pause:
+        observe_run_commits(pause, states, after=stop_after_review)
+        with pytest.raises(OSError, match="at accepted repair"):
+            RunAcceptanceEngine(
+                git=git, states=states, agents=agents,
+                github=FixtureGitHubPublisher(fixture, git),
+            ).accept(run_id)
+    saved = StateStore(states.root).load_current_run(run_id)
+    assert saved is not None
+    job = saved["run_acceptance"]["repair_job"]
+    assert job["phase"] == "accepted"
+    candidate = job["candidate_sha"]
+    base = job["base_sha"]
+    generation = job["repair_generation"]
+    ci_budget = deepcopy(saved["run_acceptance"]["ci_recovery"])
+    assert saved["run_acceptance"]["review_budget"]["development_attempts"] == 1
+    assert len(agents.development_requests) == 1
+    assert len(agents.review_requests) == 2
+
+    external = tmp_path / "accepted-repair-target"
+    git.prepare_validation_checkout(head_sha=base, checkout=external)
+    try:
+        (external / "run-repair.txt").write_text("human contribution\n")
+        target = git.commit_candidate(external, ticket_number=3, attempt=1, expected_head=base)
+    finally:
+        git.remove_worktree(external)
+    facts = json.loads(fixture.read_text())
+    facts["delivery"]["published_branches"][branch] = target
+    fixture.write_text(json.dumps(facts))
+    seed_idle_control(TaskControlStore(states.root), TaskKey(repo, state["repository"], 1), run_id)
+    monkeypatch.setattr(cli, "FakeExecutorHost", lambda **_kwargs: FakeExecutorHost())
+    monkeypatch.setattr(cli, "_agent_backend", lambda *_args, **_kwargs: agents)
+
+    # Keep the actual CLI admission, Driver and Executor broad failure handler.
+    # There is deliberately no helper catching AgentWorkRequired and retrying.
+    result = invoke_cli_inprocess(repo, fixture, "run", "1", "--json")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    failed = StateStore(states.root).load_current_run(run_id)
+    assert failed is not None
+    assert failed["status"] == "execution_failed"
+    assert failed["diagnostics"][0]["code"] == "command_failed"
+    run = failed["run_acceptance"]
+    failed_job = run["repair_job"]
+    assert failed_job["phase"] == "accepted"
+    assert failed_job["repair_generation"] == generation
+    assert failed_job["candidate_sha"] == candidate
+    assert agents.integration_calls == 1
+    assert len(agents.development_requests) == 2
+    assert len(agents.review_requests) == 2
+    assert run["review_budget"]["development_attempts"] == 2
+    assert run["review_budget"]["reviewer_invocations"] == 2
+    assert run["ci_recovery"] == ci_budget
+    assert "pending_semantic_attempt" not in failed_job
+    scene = failed_job["run_repair_integration_conflict"]
+    assert scene["failure"]["command"] == ["git", "diff", "--cached", "--check"]
+    assert scene["failure"]["returncode"] != 0
+    assert "market.csv" in json.loads(scene["failure"]["stdout_json"])
+    assert (Path(failed_job["repair_checkout"]) / "market.csv").read_bytes().endswith(b"\r\n")
+    assert git.resolve(branch) == base
+    assert json.loads(fixture.read_text())["delivery"]["published_branches"][branch] == target
+    assert not run.get("completed_repair_jobs")
+    assert not json.loads(fixture.read_text())["delivery"].get("pull_requests")
