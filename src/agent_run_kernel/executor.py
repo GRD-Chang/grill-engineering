@@ -67,7 +67,7 @@ class _Executor:
         self.worker_identity = inputs["worker_identity"]
         self.source_lock = threading.Lock()
         self.cancelled = threading.Event()
-        self.hidden_paths = (kernel.storage.path.parent,)
+        self.hidden_paths: tuple[Path, ...] = (kernel.storage.path.parent,)
         self.hidden_environment: tuple[str, ...] = ()
         protected = list(self.hidden_paths)
         variables: list[str] = []
