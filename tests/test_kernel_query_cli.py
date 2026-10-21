@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
+import subprocess
+import sys
 
+import pytest
+
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Profile, RunSpec, World
+from agent_run_kernel import query
 from agent_run_kernel.query_cli import main
 
 
@@ -16,3 +23,189 @@ def test_missing_exact_query_is_actionable_and_does_not_create_storage(
     assert result["result"] == "error"
     assert result["diagnostics"][0]["code"] == "run_locator_missing"
     assert not missing.exists()
+
+
+def _create(root: Path, run_id: str = "run-query", *, language: str | None = "en",
+            repository: str = "example/project", parent: int = 1,
+            repository_root: Path | None = None) -> Kernel:
+    base = Commit("base", "base-tree")
+    spec = RunSpec(run_id, repository, parent, "parent-v1", "graph-v1",
+                   (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
+                             "refs/heads/ticket", "refs/heads/run"),),
+                   Policy(development_profile=Profile("recorded-development-model", "high")),
+                   language=language, repository_root=str(repository_root or root / "checkout"))
+    return Kernel.create(root / run_id / "kernel.sqlite3", spec)
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    # SQLite SHM is coordination, not durable business state. Retain all WAL
+    # bytes if present; a read is not allowed to append durable frames.
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.name.endswith("-shm") and
+            not (path.name.endswith("-wal") and path.stat().st_size == 0)}
+
+
+def _arguments(kernel: Kernel, command: str = "status", *extra: str) -> list[str]:
+    return [command, kernel.storage.path.parent.name, "--state-dir", str(kernel.storage.path), *extra]
+
+
+def _human(kernel: Kernel, message: str = "Need the original decision / 保留原文") -> None:
+    execution = kernel.claim_executor("query-executor")
+    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
+    call = kernel.advance("ticket:2", execution, world).call
+    assert call is not None
+    kernel.receive(call, json.dumps({"result_kind": "human_blocker", "summary": None,
+                                    "human_blockers": [message]}).encode())
+    assert kernel.advance("ticket:2", execution, world).kind == "paused"
+
+
+def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _create(tmp_path)
+    _human(kernel)
+    before = _snapshot(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("A query attempted to advance business work")
+
+    monkeypatch.setattr(Kernel, "advance", forbidden)
+    assert main(_arguments(kernel, "status", "--json")) == 0
+    output = json.loads(capsys.readouterr().out)
+    job = output["subjects"][0]
+    assert output["run_id"] == "run-query"
+    assert output["repository"] == "example/project"
+    assert output["operator_actions"][0]["scope"] == "ticket"
+    assert output["operator_actions"][0]["action"] == "resume"
+    pending = job["pending_attempt"]
+    assert pending["result"]["human_blockers"] == ["Need the original decision / 保留原文"]
+    invocation = pending["invocations"][0]
+    assert invocation["model"] == "recorded-development-model" and invocation["effort"] == "high"
+    assert invocation["started_at"] is None and invocation["elapsed_seconds"] is None
+    assert invocation["live_status"] == "unknown"
+    used = {row["purpose"]: row["developments_used"] for row in job["budgets"] if row["current"]}
+    assert used["requirements"] == 1
+    assert _snapshot(tmp_path) == before
+
+
+def test_parent_selector_rejects_multiple_runs_and_exact_id_remains_available(
+    tmp_path: Path, capsys,
+) -> None:
+    one, two = _create(tmp_path, "run-one"), _create(tmp_path, "run-two")
+    before = _snapshot(tmp_path)
+    selected = ["--repo", "EXAMPLE/project", "--parent", "1", "--data-root", str(tmp_path), "--json"]
+    assert main(["status", *selected]) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["diagnostics"][0]["code"] == "run_locator_conflict"
+    assert {item["run_id"] for item in error["candidates"]} == {"run-one", "run-two"}
+    assert main(_arguments(one, "status", "--data-root", str(tmp_path), "--json")) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == "run-one"
+    assert main(_arguments(two, "status", "--data-root", str(tmp_path), "--json")) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == "run-two"
+    assert _snapshot(tmp_path) == before
+
+
+def test_runs_filters_repository_and_parent_without_creating_an_index(tmp_path: Path, capsys) -> None:
+    _create(tmp_path, "selected", parent=10)
+    _create(tmp_path, "another-parent", parent=20)
+    _create(tmp_path, "other-repository", repository="other/project", parent=10)
+    before = _snapshot(tmp_path)
+    assert main(["runs", "--repo", "example/project", "--parent", "10", "--data-root", str(tmp_path), "--json"]) == 0
+    assert [item["run_id"] for item in json.loads(capsys.readouterr().out)["runs"]] == ["selected"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_missing_run_language_is_rejected_without_using_personal_defaults(tmp_path: Path, capsys) -> None:
+    kernel = _create(tmp_path, language=None)
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--json")) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["diagnostics"][0]["code"] == "recovery_materials_missing"
+    assert "language" in error["diagnostics"][0]["message"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_machine_data_is_independent_of_run_language_and_history_details(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(query.time, "time", lambda: 2_000_000_000.0)
+    english = _create(tmp_path / "english", repository_root=tmp_path / "repository")
+    chinese = _create(tmp_path / "chinese", language="zh", repository_root=tmp_path / "repository")
+    documents = [query.read(item.storage.path, "status") for item in (english, chinese)]
+    assert documents[0].language == "en" and documents[1].language == "zh"
+    assert documents[0].data == documents[1].data
+    assert main(_arguments(english, "history", "--json")) == 0
+    ordinary = json.loads(capsys.readouterr().out)
+    assert main(_arguments(english, "history", "--json", "--details")) == 0
+    assert json.loads(capsys.readouterr().out) == ordinary
+
+
+def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Path, capsys) -> None:
+    kernel = _create(tmp_path)
+    _human(kernel)
+    kernel.control("resume", "original-response", subject="ticket:2", message="保持原文\r\nDo exactly this.\n")
+    before = _snapshot(tmp_path)
+    document = query.read(kernel.storage.path, "history")
+    response = next(event for event in document.data["timeline"] if event["kind"] == "human_response")
+    assert response["evidence"] == "保持原文\r\nDo exactly this.\n"
+    observed: list[int] = []
+    after = 0
+    for _ in range(20):
+        page = query.read(kernel.storage.path, "history", after=after, limit=2).data
+        observed.extend(event["position"] for event in page["timeline"])
+        after = page["history_page"]["next_after"]
+        if not page["history_page"]["has_more"]:
+            break
+    else:
+        raise AssertionError("bounded history never reached its recorded end")
+    assert observed == [event["position"] for event in document.data["timeline"]]
+    assert len(observed) == len(set(observed))
+    assert main(_arguments(kernel, "history", "--plain", "--details")) == 0
+    assert "Do exactly this." in capsys.readouterr().out
+    assert _snapshot(tmp_path) == before
+
+
+def test_corrupt_history_material_fails_only_its_read_scope_without_rewriting(tmp_path: Path, capsys) -> None:
+    kernel = _create(tmp_path)
+    _human(kernel)
+    kernel.control("resume", "record-response", subject="ticket:2", message="Original response")
+    with kernel.storage.transaction() as tx:
+        evidence = tx.one("SELECT material_id FROM history WHERE kind='human_response'")[0]
+        tx.execute("UPDATE material SET digest=? WHERE id=?", ("0" * 64, evidence))
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--json")) == 0
+    capsys.readouterr()
+    assert main(_arguments(kernel, "history", "--json")) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_plain_and_tty_preserve_text_without_executing_terminal_controls(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch, terminal: bool,
+) -> None:
+    kernel = _create(tmp_path)
+    _human(kernel, "Need the original decision / 保留原文 \x1b[31mkeep-text\x1b[0m\u202e")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: terminal)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert main(_arguments(kernel, "status")) == 0
+    output = capsys.readouterr().out
+    assert "Need the original decision" in output and "保留原文" in output
+    assert "--ticket 2" in output
+    assert "recorded-development-model" in output and "high" in output
+    assert "keep-text" in output and "\u202e" not in output
+    assert "\x1b[31m" not in output
+
+
+def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_path: Path) -> None:
+    kernel = _create(tmp_path)
+    before = _snapshot(tmp_path)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    completed = subprocess.run([sys.executable, "-m", "agent_run_kernel.query_cli", *_arguments(kernel, "status", "--json")],
+                               text=True, capture_output=True, env=env, timeout=15, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["run_id"] == "run-query"
+    assert completed.stderr == ""
+    assert _snapshot(tmp_path) == before
