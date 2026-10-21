@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +24,31 @@ from agent_run.state_contract import IncompatibleRunStateError, require_current_
 from support.seeding import seed_run, write_fixture
 from support.cli import issue, load_only_run_state, run_cli, stdout_json
 
-from support.state import only_run_ref, read_run, snapshot_run, write_run_fixture
+from support.state import only_run_ref, write_run_fixture
+
+
+def _corrupt_retry_record(root: Path, run_id: str, job_id: str, retry: dict[str, int]) -> None:
+    """Write the exact negative input below business submission validation."""
+    from agent_run.sqlite_change_job_codec import presence, present, save_record
+    from agent_run.sqlite_change_job_schema import JOB_FIELDS
+
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection, connection:
+        stored, owner = connection.execute(
+            "SELECT presence,evidence_owner_id FROM work_jobs WHERE run_id=? AND job_id=?",
+            (run_id, job_id),
+        ).fetchone()
+        connection.execute(
+            "UPDATE work_jobs SET presence=? WHERE run_id=? AND job_id=?",
+            (presence(present(stored, JOB_FIELDS) | {"publication_operation_retry"}, JOB_FIELDS), run_id, job_id),
+        )
+        save_record(connection, run_id, job_id, "publication_operation_retry", retry, owner_id=owner)
+
+
+def _database_snapshot(root: Path) -> tuple[str, ...]:
+    # Damaged records deliberately cannot be decoded through the production
+    # reader. Audit all physical relations without bypassing its rejection.
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        return tuple(connection.iterdump())
 
 
 @pytest.mark.parametrize(
@@ -119,8 +145,12 @@ def test_unstarted_publication_credential_wait_releases_its_retry_owner() -> Non
     assert "last_publication_error" not in owner
 
 
-def test_fresh_publication_attempt_does_not_inherit_prior_operation_retry() -> None:
-    owner: dict[str, object] = {"publication_attempts": 1}
+def test_fresh_publication_attempt_does_not_inherit_prior_operation_retry(tmp_path: Path) -> None:
+    from agent_run.sqlite_change_jobs import projection_archives
+    from agent_run.sqlite_state import SQLiteStateRepository
+
+    repository = SQLiteStateRepository(tmp_path)
+    owner: dict[str, object] = {"ticket_number": 2, "phase": "accepted", "publication_attempts": 1}
     first = allocate_semantic_attempt(
         owner,
         role="publication",
@@ -129,10 +159,24 @@ def test_fresh_publication_attempt_does_not_inherit_prior_operation_retry() -> N
         currentness_boundary={"candidate_sha": "candidate-1"},
         ordinal=1,
     )
+    repository.save("retry-renewal", {"ticket_jobs": {"2": owner}})
+    current = repository.load_objects("retry-renewal")[0]
+    owner = current["ticket_jobs"]["2"]
+    first = owner["pending_semantic_attempt"]
+
+    def save_checkpoint() -> None:
+        repository.save_objects(
+            "retry-renewal", current, fields={"ticket_jobs"},
+            keyed_changes={"ticket_jobs": {"2"}}, archive_scope=projection_archives(current),
+        )
+
     record_publication_operation_failure(owner, OSError("context offline"))
+    save_checkpoint()
     close_semantic_attempt(owner, first, outcome="publication_artifact")
+    save_checkpoint()
     for _ in range(3):
         record_publication_operation_failure(owner, OSError("publish offline"))
+        save_checkpoint()
 
     begin_publication_operation_attempt(owner)
     owner["publication_attempts"] = 2
@@ -145,6 +189,10 @@ def test_fresh_publication_attempt_does_not_inherit_prior_operation_retry() -> N
         ordinal=2,
     )
     record_publication_operation_failure(owner, OSError("fresh offline"))
+    save_checkpoint()
+    # Only durable A/B facts are observed; no mutable history carrier or
+    # side-channel retry patch is part of this test's contract.
+    owner = repository.load("retry-renewal")["ticket_jobs"]["2"]
 
     assert first["attempt_id"] != second["attempt_id"]
     assert owner["publication_operation_retry"] == {"attempts": 1, "limit": 5}
@@ -184,11 +232,22 @@ def test_state_contract_rejects_conflicting_live_and_archived_retry_authority(
     )
     owner["publication_operation_retry"] = {"attempts": 1, "limit": 5}
     close_semantic_attempt(owner, attempt, outcome="publication_artifact")
-    owner["publication_operation_retry"] = {"attempts": 2, "limit": 5}
     state["run_publication"] = owner
+    reference = only_run_ref(managed_state(git_repo))
+    write_run_fixture(reference, state)
+    root, run_id = reference
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        job_id = connection.execute(
+            "SELECT job_id FROM work_jobs WHERE run_id=? AND owner_kind='run_publication'",
+            (run_id,),
+        ).fetchone()[0]
+    _corrupt_retry_record(root, run_id, job_id, {"attempts": 2, "limit": 5})
+    before = _database_snapshot(root)
+    from agent_run.state import StateStore
 
-    with pytest.raises(IncompatibleRunStateError, match="conflicting"):
-        require_current_run_state(state)
+    with pytest.raises(IncompatibleRunStateError, match="conflict"):
+        StateStore(root).load_current_run(run_id)
+    assert _database_snapshot(root) == before
 
 
 @pytest.mark.parametrize(
@@ -247,13 +306,13 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
     state_ref = only_run_ref(managed_state(git_repo))
-    state = read_run(state_ref)
-    state["active_ticket_job"]["publication_operation_retry"] = {
-        "attempts": 1,
-        "limit": 999,
-    }
-    write_run_fixture(state_ref, state)
-    state_before = snapshot_run(state_ref)
+    root, _ = state_ref
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        job_id = connection.execute(
+            "SELECT active_job_id FROM work_job_layout WHERE run_id=?", (run_id,),
+        ).fetchone()[0]
+    _corrupt_retry_record(root, run_id, job_id, {"attempts": 1, "limit": 999})
+    state_before = _database_snapshot(root)
     fixture_before = fixture.read_bytes()
     head_before = (git_repo / ".git" / "HEAD").read_bytes()
 
@@ -261,6 +320,6 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
 
     assert rejected.returncode == 2
     assert stdout_json(rejected)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == state_before
+    assert _database_snapshot(root) == state_before
     assert fixture.read_bytes() == fixture_before
     assert (git_repo / ".git" / "HEAD").read_bytes() == head_before

@@ -114,9 +114,17 @@ def _merge_change(old: Any, new: Any, latest: Any, owner: str) -> Any:
                 _owner_facts(new), _owner_facts(latest)
             ):
                 raise ConcurrentRunStateError(f"Owner changed before commit: {owner}")
+        publication_changed = any(not _same(old.get(field), new.get(field))
+                                  for field in ("publication_attempts", "publication_operation_retry"))
+        source = new if isinstance(new, JobProjection) else old
+        expected_publication = source.expected_publication_attempt if isinstance(source, JobProjection) else None
+        if (publication_changed and expected_publication is not None
+                and (not isinstance(latest, JobProjection)
+                     or expected_publication != latest.expected_publication_attempt)):
+            raise ConcurrentRunStateError("Completed Publication Attempt changed before retry update")
         result = deepcopy(latest)
-        if isinstance(result, JobProjection) and isinstance(new, JobProjection):
-            result.publication_update = deepcopy(new.publication_update)
+        if publication_changed and isinstance(result, JobProjection):
+            result.expected_publication_attempt = expected_publication
         for key in old.keys() | new.keys():
             if _same(old.get(key, _MISSING), new.get(key, _MISSING)):
                 continue

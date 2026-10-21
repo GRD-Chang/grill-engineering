@@ -107,6 +107,11 @@ def test_own_final_ref_readback_does_not_open_new_run_integration(
     owner = RunAcceptanceEngine(
         git=git, states=states, agents=ScriptedRunAgents(), github=publisher,
     )
+    # Arrangement replaces the stored Run and its physical versions. Follow
+    # the real acceptance entry's read through this owner's parent scope.
+    failed = owner.states.load_current_run(str(state["run_id"]))
+    assert failed is not None
+    run = failed["run_acceptance"]
 
     assert prepare_run_parent_integration(owner, failed, run)
     assert run["run_integration"] == record

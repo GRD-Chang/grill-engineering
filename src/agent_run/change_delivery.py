@@ -29,8 +29,6 @@ from agent_run.external_supervision import (
     is_github_convergence_error,
     wait_for_github_convergence,
 )
-from agent_run.publication_operation_retry import record_publication_operation_failure
-from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.review_budget import ReviewBudgetPolicy, ensure_budget
 
@@ -402,36 +400,6 @@ class ChangeDeliveryEngine:
 
 
 
-
-    def _record_publication_operation_failure(
-        self, state: dict[str, Any], job: dict[str, Any], error: Exception
-    ) -> bool:
-        exhausted = self._record_publication_operation_failure_in_memory(
-            state, job, error
-        )
-        self.save(state)
-        return exhausted
-
-    def _record_publication_operation_failure_in_memory(
-        self, state: dict[str, Any], job: dict[str, Any], error: Exception
-    ) -> bool:
-        exhausted = record_publication_operation_failure(job, error)
-        if exhausted:
-            if job.get("phase") in {"publishing", "merging", "merged"}:
-                job["execution_resume_phase"] = job["phase"]
-            job["phase"] = "publication_pending"
-            state.update(
-                {
-                    "status": "publication_pending",
-                    "terminal_kind": "publication_pending",
-                    "diagnostics": [
-                        publication_pending_diagnostic(
-                            subject_key="change_job", subject=self.contract.label
-                        )
-                    ],
-                }
-            )
-        return exhausted
 
     def _wait_for_merge_reconciliation(
         self, state: dict[str, Any], job: dict[str, Any], message: str | None = None

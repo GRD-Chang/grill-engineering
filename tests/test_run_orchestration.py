@@ -2210,10 +2210,13 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
         agents=FixtureAgentBackend(agent_fixture),
     )._engine(waiting, paused)
     stage._current_job = paused
+    from agent_run.publication_lifecycle import mark_publication_failure
     for _ in range(5):
-        exhausted = stage._record_publication_operation_failure(
-            waiting, paused, OSError("publisher unavailable")
+        exhausted = mark_publication_failure(
+            waiting, paused, OSError("publisher unavailable"),
+            subject_key="change_job", subject=stage.contract.label,
         )
+        stage.save(waiting)
     assert exhausted is True
     require_current_run_state(waiting)
     assert paused["publication_operation_retry"] == {"attempts": 5, "limit": 5}

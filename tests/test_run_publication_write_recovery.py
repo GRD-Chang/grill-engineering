@@ -314,14 +314,13 @@ def test_parent_only_published_retry_resume_continues_without_new_agents(git_rep
     # Start from the actual published delivery rather than rerunning costly
     # setup for each failed read. The canonical failure transition owns the
     # exhausted retry checkpoint used by the public resume application.
-    from agent_run.change_delivery import ChangeDeliveryEngine
-    from types import SimpleNamespace
-    stage = SimpleNamespace(contract=SimpleNamespace(label="parent-only"))
+    from agent_run.publication_lifecycle import mark_publication_failure
     paused = states.load_current_run(run_id)
     paused["parent_job"]["phase"] = "publishing"
     for _ in range(5):
-        ChangeDeliveryEngine._record_publication_operation_failure_in_memory(
-            stage, paused, paused["parent_job"], OSError("publication read unavailable"),
+        mark_publication_failure(
+            paused, paused["parent_job"], OSError("publication read unavailable"),
+            subject_key="change_job", subject="parent-only",
         )
     persist_run_fixture(states, run_id, paused)
     assert paused["status"] == "publication_pending"

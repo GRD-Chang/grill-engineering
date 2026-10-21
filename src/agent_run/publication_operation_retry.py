@@ -2,26 +2,11 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from contextlib import contextmanager
-from contextvars import ContextVar
-from collections.abc import Iterator, Mapping
 from typing import Any
-from agent_run.work_projection import JobProjection, publication_attempt_for_current_ordinal
+from agent_run.work_projection import publication_attempt_for_current_ordinal
 
 
 MAX_PUBLICATION_OPERATION_ATTEMPTS = 5
-_RELATED_ATTEMPTS: ContextVar[Mapping[int, dict[str, Any]]] = ContextVar("related_publication_attempts", default={})
-
-
-@contextmanager
-def scoped_publication_attempts(owners: Mapping[int, dict[str, Any]]) -> Iterator[None]:
-    """Expose proved related records only during one work contract check."""
-    token = _RELATED_ATTEMPTS.set(owners)
-    try:
-        yield
-    finally:
-        _RELATED_ATTEMPTS.reset(token)
 
 
 def require_publication_operation_retry(
@@ -60,7 +45,6 @@ def record_publication_operation_failure(owner: dict[str, Any], error: Exception
         "attempts": attempts,
         "limit": MAX_PUBLICATION_OPERATION_ATTEMPTS,
     }
-    _sync_completed_publication_attempt(owner)
     owner["last_publication_error"] = str(error)
     return attempts >= MAX_PUBLICATION_OPERATION_ATTEMPTS
 
@@ -70,56 +54,25 @@ def begin_publication_operation_attempt(owner: dict[str, Any]) -> None:
 
     if owner.get("publication_operation_retry") is None:
         return
-    _sync_completed_publication_attempt(owner, required=True)
+    retry = require_publication_operation_retry(owner["publication_operation_retry"])
+    attempt = publication_operation_attempt(owner)
+    if (
+        attempt is None or attempt.get("status") != "completed"
+        or attempt.get("publication_operation_retry") != retry
+    ):
+        raise ValueError("Publication Operation Retry must be saved before a fresh Attempt")
     owner.pop("publication_operation_retry", None)
     owner.pop("last_publication_error", None)
 
 
 def publication_operation_attempt(
     owner: dict[str, Any],
+    related_attempt: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Return the exact Attempt that owns the live retry aggregate."""
+    """Read the exact retry owner, without constructing a pending update."""
 
     pending = owner.get("pending_semantic_attempt")
     if isinstance(pending, dict) and pending.get("role") == "publication":
         return pending
-    current_ordinal = owner.get("publication_attempts")
-    if isinstance(owner, JobProjection):
-        attempt = publication_attempt_for_current_ordinal(owner)
-        if attempt is not None and attempt.get("status") == "completed":
-            return attempt
-    related = _RELATED_ATTEMPTS.get().get(id(owner))
-    if related is not None and "semantic_attempt_history" not in owner:
-        if (
-            related.get("role") == "publication"
-            and related.get("status") == "completed"
-            and related.get("ordinal") == current_ordinal
-        ):
-            return related
-        return None
-    history = owner.get("semantic_attempt_history")
-    if isinstance(history, list):
-        for attempt in reversed(history):
-            if (
-                isinstance(attempt, dict)
-                and attempt.get("role") == "publication"
-                and attempt.get("status") == "completed"
-                and attempt.get("ordinal") == current_ordinal
-            ):
-                return attempt
-    return None
-
-
-def _sync_completed_publication_attempt(owner: dict[str, Any], *, required: bool = False) -> None:
-    value = owner.get("publication_operation_retry")
-    if value is None:
-        return
-    retry = require_publication_operation_retry(value)
-    attempt = publication_operation_attempt(owner)
-    if attempt is not None and attempt.get("status") == "completed":
-        attempt["publication_operation_retry"] = deepcopy(retry)
-        return
-    if attempt is not None:
-        return
-    if required:
-        raise ValueError("Publication Operation Retry has no completed Attempt owner")
+    attempt = publication_attempt_for_current_ordinal(owner, related_attempt)
+    return attempt if attempt is not None and attempt.get("status") == "completed" else None

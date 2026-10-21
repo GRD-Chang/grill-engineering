@@ -123,11 +123,9 @@ def read_baseline_for_save(
             if (isinstance(budgets, RepairBudgetProjection)
                     and not job.get("repair_integration_budgets", {}).keys() <= budgets.keys()):
                 return None
-            if isinstance(job, JobProjection) and job.publication_update is not None:
-                from agent_run.sqlite_mutations import _same
-
-                if (not isinstance(before, JobProjection) or before.publication_update is None
-                        or not _same(before.publication_update[0], job.publication_update[0])):
+            if isinstance(job, JobProjection) and job.expected_publication_attempt is not None:
+                if (not isinstance(before, JobProjection)
+                        or before.expected_publication_attempt != job.expected_publication_attempt):
                     return None
     return result
 

@@ -153,12 +153,15 @@ def test_later_history_and_publication_reads_keep_the_original_baseline_query(
     repository = SQLiteStateRepository(tmp_path)
     job = ({"ticket_number": 2, "phase": "developing", "reviewer_thread_ids": ["original-reviewer"]}
            if history == "reviewer_thread_ids" else {
-               "ticket_number": 2, "phase": "publishing", "publication_attempts": 0,
+               "ticket_number": 2, "phase": "publishing", "publication_attempts": 1,
                "semantic_attempt_history": [attempt(role="publication")],
            })
     repository.save("run-1", {"ticket_jobs": {"2": deepcopy(job)}})
     with repository.atomic():
-        current, _ = repository.load_objects("run-1", thin_timeline=True)
+        current, _ = repository.load_objects(
+            "run-1", thin_timeline=True,
+            excluded_fields={"ticket_jobs"} if history == "publication" else set(),
+        )
         # An exact path read must neither widen nor replace the original
         # transaction snapshot's object/Timeline coverage.
         owner = repository.load_paths("run-1", {("ticket_jobs", "2")})["ticket_jobs"]["2"]
@@ -167,9 +170,9 @@ def test_later_history_and_publication_reads_keep_the_original_baseline_query(
             assert owner.materialize(history) == ["original-reviewer"]
             owner["phase"] = job["phase"] = "reviewing"
         else:
-            owner["publication_attempts"] = job["publication_attempts"] = 1
             assert publication_attempt_for_current_ordinal(owner) is not None
-        current["ticket_jobs"]["2"] = owner
+            owner["phase"] = job["phase"] = "accepted"
+        current.setdefault("ticket_jobs", {})["2"] = owner
         repository.save_objects("run-1", current, fields={"ticket_jobs"}, keyed_changes={"ticket_jobs": {"2"}},
                                 archive_scope=jobs.projection_archives(current))
     assert baseline_reads == ["run-1"]

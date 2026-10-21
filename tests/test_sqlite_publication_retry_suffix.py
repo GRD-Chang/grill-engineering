@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -73,11 +74,17 @@ def test_saved_suffix_accepts_continuous_retry_and_keeps_original_return_and_inv
                                     "JOIN work_evidence e ON e.run_id=v.run_id AND e.evidence_id=v.publication_evidence_id").fetchone()
     for count in (1, 2):
         job = current["ticket_jobs"]["3"]
-        record_publication_operation_failure(job, TimeoutError("original transport timeout"))
-        assert job.publication_update is not None
-        before, updated = job.publication_update
-        assert updated["publication_operation_retry"] == {"attempts": count, "limit": 5}
+        expected = job.expected_publication_attempt
+        assert expected is not None
+        before = publication_attempt_for_current_ordinal(job)
+        assert before is not None
+        assert before["attempt_id"] == expected.attempt_id
         assert before.get("publication_operation_retry") == (None if count == 1 else {"attempts": 1, "limit": 5})
+        record_publication_operation_failure(job, TimeoutError("original transport timeout"))
+        assert job["publication_operation_retry"] == {"attempts": count, "limit": 5}
+        assert job.expected_publication_attempt == expected
+        # A relationship read is independent of a writable retry proposal.
+        assert publication_attempt_for_current_ordinal(job) == before
         if copy_kind == "deepcopy":
             current = deepcopy(current)
         elif copy_kind == "json-tree":
@@ -150,29 +157,30 @@ def test_retry_suffix_keeps_exact_member_owner_and_position_guards(tmp_path: Pat
         return
     record_publication_operation_failure(job, OSError("original failure"))
     if damage == "other-member":
-        assert job.publication_update is not None
-        job.publication_update[1]["publication"]["pr_title"] = "changed narrative"
+        job["semantic_attempt_history"][-1]["publication"]["pr_title"] = "changed narrative"
     elif damage in {"foreign-owner", "foreign-run"}:
-        assert job.publication_update is not None
+        assert job.expected_publication_attempt is not None
         target_run = "foreign-run" if damage == "foreign-run" else _RUN
         number = 3 if damage == "foreign-run" else 4
         if damage == "foreign-run":
             repository.save(target_run, {"ticket_jobs": {"3": {"ticket_number": 3}}})
+        foreign_original = deepcopy(repository.load(target_run))
         foreign = repository.load_objects(target_run)[0]
         foreign_job = JobProjection({"ticket_number": number, "phase": "publishing", "publication_attempts": 1,
                                     "publication_operation_retry": {"attempts": 1, "limit": 5}},
                                     job_id=f"ticket:{number}:generation:1", revision=0,
                                     archives={"semantic_attempt_history": (2, 0)})
-        foreign_job.publication_update = deepcopy(job.publication_update)
+        foreign_job.expected_publication_attempt = job.expected_publication_attempt
         foreign["ticket_jobs"][str(number)] = foreign_job
-        with pytest.raises(ValueError, match="Completed Publication Attempt changed"):
+        with pytest.raises(ValueError, match="Completed Publication Attempt (changed|belongs to another owner)"):
             repository.save_objects(target_run, foreign, fields={"ticket_jobs"}, archive_scope=projection_archives(foreign),
                                     keyed_changes={"ticket_jobs": {str(number)}})
         assert repository.load(_RUN) == original
+        assert repository.load(target_run) == foreign_original
         return
     else:
         job["semantic_attempt_history"].base_count += 1
-    with pytest.raises(ValueError, match="Only the exact completed Publication retry|different history position"):
+    with pytest.raises(ValueError, match="Only the exact completed Publication retry|Cannot overwrite an unread Semantic Attempt"):
         _save(repository, current)
     assert repository.load(_RUN) == original
 
@@ -187,7 +195,13 @@ def test_reopened_current_owner_can_retry_without_loading_its_archive(tmp_path: 
     current = reopened.load_objects(_RUN)[0]
     owner = current["ticket_jobs"]["3"]
     assert "semantic_attempt_history" not in owner
-    assert owner.publication_update is not None
+    expected = owner.expected_publication_attempt
+    assert expected is not None
+    assert (expected.run_id, expected.job_id, expected.ordinal) == (_RUN, _JOB, 1)
+    original_version = expected.version_id
+    with pytest.raises(FrozenInstanceError):
+        expected.version_id = "forged-version"
+    assert expected.version_id == original_version
 
     def reject_archive(*_args):
         pytest.fail("An exact Publication retry loaded the complete archive")
@@ -200,15 +214,26 @@ def test_reopened_current_owner_can_retry_without_loading_its_archive(tmp_path: 
     }
 
 
-def test_retry_suffix_rejects_a_stale_exact_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize("same_error", [False, True], ids=["different-error", "same-error"])
+def test_retry_suffix_rejects_a_stale_exact_version(tmp_path: Path, same_error: bool) -> None:
     repository, stale = _pending(tmp_path)
     _close(stale)
     _save(repository, stale)
     record_publication_operation_failure(stale["ticket_jobs"]["3"], OSError("stale retry"))
+    readonly = SQLiteStateRepository(tmp_path).load_objects(_RUN)[0]
+    assert "semantic_attempt_history" not in readonly["ticket_jobs"]["3"]
     concurrent = SQLiteStateRepository(tmp_path).load_objects(_RUN)[0]
-    record_publication_operation_failure(concurrent["ticket_jobs"]["3"], OSError("newer retry"))
+    record_publication_operation_failure(
+        concurrent["ticket_jobs"]["3"], OSError("stale retry" if same_error else "newer retry"),
+    )
     _save(repository, concurrent)
     original = repository.load(_RUN)
+    observed = publication_attempt_for_current_ordinal(readonly["ticket_jobs"]["3"])
+    assert observed is not None
+    assert observed["attempt_id"] == stale["ticket_jobs"]["3"]["semantic_attempt_history"][-1]["attempt_id"]
+    assert observed["role"] == "publication" and observed["status"] == "completed"
+    assert observed.get("publication_operation_retry") is None
+    assert repository.load(_RUN) == original
     with pytest.raises(ValueError, match="Completed Publication Attempt changed before retry update"):
         _save(repository, stale)
     assert repository.load(_RUN) == original

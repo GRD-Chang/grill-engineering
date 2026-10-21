@@ -99,20 +99,15 @@ class SQLiteStateRepository(SQLiteStateConnection):
             return value
 
     def _read_publication_attempt(self, run_id: str, job: JobProjection) -> dict[str, Any] | None:
-        from agent_run.sqlite_work_execution import load_completed_publication_attempt
+        from agent_run.sqlite_work_execution_attempts import load_publication_attempt_version
 
-        ordinal = job.get("publication_attempts")
-        if type(ordinal) is not int or ordinal < 1:
+        expected = job.expected_publication_attempt
+        if expected is None or expected.ordinal != job.get("publication_attempts"):
             return None
         with self._reading() as connection:
             if connection is None:
                 raise ValueError("Run disappeared before an exact Publication query")
-            row = bounded_query(connection,
-                "SELECT revision FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job.job_id)
-            ).fetchone()
-            if row != (job.revision,):
-                raise ValueError("Job changed before its exact Publication query")
-            value = load_completed_publication_attempt(connection, run_id, job.job_id, ordinal)
+            value = load_publication_attempt_version(connection, run_id, job.job_id, expected)
             check_response({"attempt": value}, max_bytes=self.max_bytes)
             return value
 

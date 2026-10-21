@@ -44,7 +44,7 @@ from agent_run.sqlite_change_job_schema import (
 )
 from agent_run.sqlite_change_job_schema import INDEXES as INDEXES, TABLES as TABLES
 from agent_run.sqlite_change_job_gates import gate_projection, load_gate as _load_gate, save_gate as _save_gate
-from agent_run.sqlite_encoding import copy_json_tree, encode_json
+from agent_run.sqlite_encoding import encode_json
 from agent_run.sqlite_mutations import _same
 from agent_run.work_projection import JobProjection, JobHistoryAppend, RepairBudgetProjection
 
@@ -182,36 +182,9 @@ def _save_owner(
                 old[field] = read_owner_history(c, run_id, job_id, field)
                 continue
             raise ValueError(f"cannot replace unloaded Job history: {field}")
-    if isinstance(job, JobProjection) and job.publication_update is not None:
-        from agent_run.sqlite_work_execution_attempts import save_publication_retry
-
-        before_attempt, updated_attempt = job.publication_update
-        if "semantic_attempt_history" not in job.loaded_histories and not _same(before_attempt, updated_attempt):
-            history = job.get("semantic_attempt_history")
-            committed = True
-            if isinstance(history, JobHistoryAppend):
-                ordinal = next((index for index, attempt in enumerate(history)
-                                if isinstance(attempt, dict)
-                                and attempt.get("attempt_id") == updated_attempt.get("attempt_id")), None)
-                if ordinal is not None:
-                    position = bounded_query(c,
-                        "SELECT position FROM work_job_attempt_history WHERE run_id=? AND job_id=? AND attempt_id=?",
-                        (run_id, job_id, updated_attempt.get("attempt_id")),
-                    ).fetchone()
-                    if position is None:
-                        # A newly closed suffix has no archived version yet.
-                        # Its initial retry facts join the ordinary append.
-                        committed = False
-                    elif position[0] != history.base_count + ordinal:
-                        raise ValueError("Completed Publication retry has a different history position")
-            if committed:
-                save_publication_retry(c, run_id, job_id, before_attempt, updated_attempt)
-    # The retry patch must precede any current-version advance: a retained
-    # known suffix then observes the same exact version at its old position.
-    save_attempts(c, run_id, job_id, dict(job), dict(old))
-    if isinstance(job, JobProjection) and job.publication_update is not None:
-        _, updated_attempt = job.publication_update
-        job.publication_update = (copy_json_tree(updated_attempt), updated_attempt)
+    # Attempt persistence owns the aggregate/retry relation and its exact
+    # immutable source-version check for both full and bounded histories.
+    save_attempts(c, run_id, job_id, job, old)
     changed = {key for key in job.keys() | old.keys() if not _same(job.get(key, _MISSING), old.get(key, _MISSING))}
     current, meta = load_core(c, run_id, job_id, fields=changed)
     _load_gate(c, run_id, job_id, current, meta["stage"])
@@ -363,8 +336,12 @@ def _save_owner(
     )
     revision = bounded_query(c, "SELECT revision FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, job_id)).fetchone()[0]
     from agent_run.sqlite_repair_budgets import narrow_saved_scope
+    from agent_run.sqlite_work_execution_attempts import publication_attempt_expectation
 
     narrow_saved_scope(job, run_id, job_id)
+    publication_ordinal = job.get("publication_attempts")
+    expected = (publication_attempt_expectation(c, run_id, job_id, publication_ordinal)
+                if type(publication_ordinal) is int and publication_ordinal > 0 else None)
     if not isinstance(job, JobProjection):
         from agent_run.sqlite_work_execution import attempt_history_metadata
 
@@ -376,12 +353,11 @@ def _save_owner(
             )
             for field in (keys & _HISTORIES) - job.keys()
         }
-        if not archives:
-            # A complete caller still owns this exact mutable object. Only
-            # unread archives need a JobProjection and its query metadata.
+        if not archives and expected is None:
             return job if isinstance(job, dict) else dict(job)
         job = JobProjection(job, job_id=job_id, revision=revision, archives=archives)
     job.revision = revision
+    job.expected_publication_attempt = expected
     job.loaded_histories.update(
         field for field in job.keys() & _HISTORIES if not isinstance(job[field], JobHistoryAppend)
     )
@@ -462,6 +438,22 @@ def append_archive(c: sqlite3.Connection, run_id: str, field: str, items: list[A
     )
 
 
+def _same_job(c: sqlite3.Connection, run_id: str, proposed: Any, baseline: Any) -> bool:
+    if not _same(proposed, baseline):
+        return False
+    expected = proposed.expected_publication_attempt if isinstance(proposed, JobProjection) else None
+    retry = proposed.get("publication_operation_retry") if isinstance(proposed, Mapping) else None
+    if (expected is None or retry is None
+            or isinstance(baseline, JobProjection) and expected == baseline.expected_publication_attempt):
+        return True
+    from agent_run.sqlite_work_execution_attempts import load_version
+
+    # Two failures may propose exactly the same fields. Only an actual retry
+    # proposal needs the source-version CAS; a readonly stale token is inert.
+    source = load_version(c, run_id, expected.attempt_id, expected.version_id)
+    return _same(source.get("publication_operation_retry"), retry)
+
+
 def save_jobs(
     c: sqlite3.Connection,
     run_id: str,
@@ -472,6 +464,17 @@ def save_jobs(
     keyed_changes: Mapping[str, Any] | None = None,
 ) -> None:
     selected = FIELDS if fields is None else FIELDS & fields
+    active = state.get("active_ticket_job")
+    tickets = state.get("ticket_jobs")
+    stored = tickets.get(str(active.get("ticket_number"))) if isinstance(active, Mapping) and isinstance(tickets, Mapping) else None
+    if (isinstance(state, dict) and isinstance(active, JobProjection) and isinstance(stored, JobProjection)
+            and active.expected_publication_attempt == stored.expected_publication_attempt
+            and active.loaded_histories == stored.loaded_histories
+            and projection_archives({"active_ticket_job": active}) == projection_archives({"active_ticket_job": stored})
+            and _same(active, stored)):
+        # Selection and Ticket are two references to this same proposed owner.
+        # Canonical Attempt encoding must update both aliases once.
+        state["active_ticket_job"] = stored
     row = bounded_query(c, "SELECT presence,active_job_id FROM work_job_layout WHERE run_id=?", (run_id,)).fetchone()
     keys, active_id = (present(row[0], ROOT_FIELDS), row[1]) if row else (set(), None)
     for field in ("ticket_jobs", "parent_job", "run_acceptance", "run_publication", *_ARCHIVES):
@@ -505,7 +508,7 @@ def save_jobs(
             )
             for key in changed:
                 job, old = jobs.get(key), old_jobs.get(key)
-                if _same(job, old):
+                if _same_job(c, run_id, job, old):
                     continue
                 if isinstance(job, Mapping):
                     identity = job_identity("ticket", job, ticket_number=int(key))
@@ -546,7 +549,7 @@ def save_jobs(
             jobs = state.get("ticket_jobs")
             stored = jobs.get(str(number)) if isinstance(jobs, Mapping) else None
             old_active = baseline.get("active_ticket_job")
-            if stored is None or not _same(active, old_active) and not _same(active, stored):
+            if stored is None or not _same_job(c, run_id, active, old_active) and not _same_job(c, run_id, active, stored):
                 saved = _save_owner(
                     c,
                     run_id,

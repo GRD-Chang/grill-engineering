@@ -31,10 +31,6 @@ from agent_run.run_currentness import (
 )
 from agent_run.state import StateStore
 from agent_run.object_state import object_store
-from agent_run.publication_operation_retry import (
-    record_publication_operation_failure,
-)
-from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.required_checks import (
     supervise_check_evidence_mismatch,
 )
@@ -419,29 +415,6 @@ class RunPublicationShared:
             publication.pop("publication_operation_retry", None)
             publication.pop("last_publication_error", None)
         return observation
-
-    def _record_operation_failure(
-        self,
-        state: dict[str, Any],
-        publication: dict[str, Any],
-        error: Exception,
-    ) -> bool:
-        if not record_publication_operation_failure(publication, error):
-            return False
-        publication["phase"] = "publication_pending"
-        state.update(
-            {
-                "status": "publication_pending",
-                "terminal_kind": "publication_pending",
-                "diagnostics": [
-                    publication_pending_diagnostic(
-                        subject_key="delivery_run", subject=str(state["run_id"])
-                    )
-                ],
-            }
-        )
-        self._save(state)
-        return True
 
     def _publication_request(
         self, state: dict[str, Any], checkout: Path

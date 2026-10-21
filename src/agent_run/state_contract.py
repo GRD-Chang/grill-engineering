@@ -47,7 +47,6 @@ from agent_run.ticket_publication_contract import (
 from agent_run.publication_operation_retry import (
     publication_operation_attempt,
     require_publication_operation_retry,
-    scoped_publication_attempts,
 )
 from agent_run.resume_audit_contract import (
     RESUME_AUDIT_EVENT_KEYS,
@@ -116,8 +115,10 @@ def require_current_work_state(
                 or attempt.get("ordinal") != related_owner.get("publication_attempts")):
             raise IncompatibleRunStateError("invalid scoped Publication Attempt association")
         attempt_owners[id(related_owner)] = attempt
-    with scoped_budget_validation(budget_owners), scoped_publication_attempts(attempt_owners):
-        _validate_current_run_state(state, timelines, parent_scope=parent_scope)
+    with scoped_budget_validation(budget_owners):
+        _validate_current_run_state(
+            state, timelines, parent_scope=parent_scope, related_attempts=attempt_owners,
+        )
 
 
 _DEFAULT_WORK_VALIDATION = require_current_work_state
@@ -149,7 +150,12 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
     }
 )
 def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = False) -> None:
-    """Reject non-canonical persisted Runs before they are read or mutated."""
+    """Validate current business facts, including uncommitted proposals.
+
+    SQL loaders check stored Publication retry/Attempt consistency before
+    creating these views. A proposal may change the retry aggregate without
+    mutating its observed historical Attempt.
+    """
 
     from agent_run.object_projection import ObjectProjection
 
@@ -171,9 +177,12 @@ def require_current_run_state(state: dict[str, Any], *, parent_scope: bool = Fal
 
 def _validate_current_run_state(
     state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+    related_attempts: Mapping[int, dict[str, Any]] | None = None,
 ) -> None:
     try:
-        _require_current_run_state(state, timelines, parent_scope=parent_scope)
+        _require_current_run_state(
+            state, timelines, parent_scope=parent_scope, related_attempts=related_attempts,
+        )
     except (ValueError, KeyError, TypeError) as error:
         raise_materials_error(state, error)
 
@@ -262,6 +271,7 @@ def require_query_state_current(state: dict[str,Any]) -> None:
 
 def _require_current_run_state(
     state: dict[str, Any], timelines: Mapping[str, TimelineScope], *, parent_scope: bool = False,
+    related_attempts: Mapping[int, dict[str, Any]] | None = None,
 ) -> None:
 
     require_query_state_current(state)
@@ -339,7 +349,7 @@ def _require_current_run_state(
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
-    _require_semantic_attempt_owners(state)
+    _require_semantic_attempt_owners(state, related_attempts)
     from agent_run.review_attempt import require_pending_run_review
 
     run_review = state.get("run_acceptance")
@@ -1775,7 +1785,9 @@ def _require_active_invocation_identity(
     _require_pending_invocation_attempt(owner, invocation, state=state)
 
 
-def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
+def _require_semantic_attempt_owners(
+    state: dict[str, Any], related_attempts: Mapping[int, dict[str, Any]] | None = None,
+) -> None:
     """Reject owner-local Attempt contradictions even without an active pointer."""
 
     run_id = str(state["run_id"])
@@ -1891,6 +1903,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             owner,
             location=location,
             publication_capable="publication" in roles,
+            related_attempt=(related_attempts or {}).get(id(owner)),
         )
         pending = owner.get("pending_semantic_attempt")
         if pending is not None:
@@ -1934,7 +1947,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             )
             _require_unique_attempt_record(records_by_id, attempt, item_location)
         if "semantic_attempt_history" not in owner:
-            related = publication_operation_attempt(owner)
+            related = publication_operation_attempt(owner, (related_attempts or {}).get(id(owner)))
             if isinstance(related, dict) and related.get("status") == "completed":
                 _require_owner_attempt(
                     related, state=state, location=f"{location}.related_publication_attempt",
@@ -1945,7 +1958,8 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
 
 
 def _require_owner_publication_operation_retry(
-    owner: dict[str, Any], *, location: str, publication_capable: bool
+    owner: dict[str, Any], *, location: str, publication_capable: bool,
+    related_attempt: dict[str, Any] | None = None,
 ) -> None:
     history = owner.get("publication_operation_retry_history", [])
     if not isinstance(history, list):
@@ -1991,17 +2005,14 @@ def _require_owner_publication_operation_retry(
         raise IncompatibleRunStateError(
             f"run state has exhausted {location}.publication_operation_retry outside a terminal boundary"
         )
-    attempt = publication_operation_attempt(owner)
+    attempt = publication_operation_attempt(owner, related_attempt)
     if attempt is None:
         raise IncompatibleRunStateError(
             f"run state has orphaned {location}.publication_operation_retry"
         )
-    if attempt.get("status") == "completed" and attempt.get(
-        "publication_operation_retry"
-    ) != retry:
-        raise IncompatibleRunStateError(
-            f"run state has conflicting {location}.publication_operation_retry authority"
-        )
+    # A proposal's new aggregate does not mutate its observed historical
+    # Attempt. Storage validates the original persisted relationship on read
+    # and applies this exact retry under its immutable expected version.
 
 
 def _require_owner_attempt(

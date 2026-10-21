@@ -10,18 +10,20 @@ from agent_run.agent_execution import execute_agent_work
 from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
-from agent_run.publication_operation_retry import begin_publication_operation_attempt
+from agent_run.publication_lifecycle import (
+    begin_publication,
+    complete_change_commit,
+    retain_change_return,
+)
 from agent_run.publication_evidence import publication_is_current
 from agent_run.git_publication_commit import observe_publication_commit
 from agent_run.git import GitError
 from agent_run.semantic_attempt import (
-    allocate_semantic_attempt,
     canonical_fingerprint,
     close_semantic_attempt,
     detach_active_invocation,
     pending_semantic_attempt,
 )
-from agent_run.required_checks_observation import bind_new_publication_head
 
 
 def _invalidate_stale_publication(
@@ -101,17 +103,12 @@ def publication(
         stage.require_agent_work("publication")
         semantic_attempt = pending_semantic_attempt(job, role="publication")
         if semantic_attempt is None:
-            begin_publication_operation_attempt(job)
-            ordinal = int(job.get("publication_attempts", 0)) + 1
-            job["publication_attempts"] = ordinal
             work_subject, generation = stage.adapter.invocation_identity(state, job)
-            semantic_attempt = allocate_semantic_attempt(
+            semantic_attempt = begin_publication(
                 job,
-                role="publication",
                 work_subject=work_subject,
                 generation=generation,
-                currentness_boundary=stage._invocation_boundary(job),
-                ordinal=ordinal,
+                boundary=stage._invocation_boundary(job),
             )
         stage.save(state)
         request = stage.adapter.publication_request(state, job, checkout)
@@ -128,50 +125,17 @@ def publication(
         finally:
             stage.release_agent_work()
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
-        job.pop("publication_failure_resume", None)
-        if isinstance(raw, HumanBlockerResult):
-            job["publication_thread_id"] = raw.thread_id
-            job.pop("publication_new_thread", None)
-            stage._wait_for_human(
-                state,
-                job,
-                phase="accepted",
-                blockers=raw.human_blockers,
-            )
+        returned_publication = retain_change_return(
+            state, job, raw,
+            primary_ticket=(int(job["ticket_number"]) if isinstance(job.get("ticket_number"), int) else None),
+            delivery_run=(None if isinstance(job.get("ticket_number"), int) else str(job["run_id"])),
+        )
+        if returned_publication is None:
+            stage.save(state)
             return
-        if isinstance(raw, PublicationResult):
-            job.pop("publication_new_thread", None)
-            if raw.replaced_thread_id is not None:
-                raise ValueError(
-                    "Publication Invocation cannot replace its Thread automatically"
-                )
-            elif raw.thread_id != job.get("development_thread_id"):
-                job["publication_thread_id"] = raw.thread_id
-            artifact_data = raw.artifact
-            parse_publication = PublicationArtifact.parse
-        else:
-            artifact_data = raw
-            parse_publication = (
-                PublicationArtifact.parse
-                if isinstance(raw, dict) and "result_kind" in raw
-                else PublicationArtifact.from_stored
-            )
-        job.pop("publication_new_thread", None)
-        if isinstance(job.get("ticket_number"), int):
-            publication = parse_publication(
-                artifact_data, primary_ticket=int(job["ticket_number"])
-            )
-        else:
-            publication = parse_publication(
-                artifact_data, delivery_run=str(job["run_id"])
-            )
+        publication = returned_publication
         # The Worker has finished. Persist its normalized result before the
         # next remote fence so a read outage cannot rerun the completed Agent.
-        job["pending_publication_result"] = {
-            "commit_message": publication.commit_message,
-            "pr_title": publication.pr_title,
-            "pr_body_markdown": publication.pr_body_markdown,
-        }
         stage.save(state)
         break
     clear_current_human_blocker(job)
@@ -188,11 +152,6 @@ def publication(
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is None:
         raise ValueError("Publication closeout is missing its Semantic Attempt")
-    publication_result = {
-        "commit_message": publication.commit_message,
-        "pr_title": publication.pr_title,
-        "pr_body_markdown": publication.pr_body_markdown,
-    }
     publication_parent = str(job.get("published_sha", job["base_sha"]))
     if "publication_commit_intent" in job and not isinstance(
         job["publication_commit_intent"], dict
@@ -206,25 +165,11 @@ def publication(
         save_intent=save_commit_intent,
     )
     actual_parent = stage.git.commit_parents(sha)[0]
-    close_semantic_attempt(
-        job,
-        semantic_attempt,
-        outcome="publication_artifact",
-        result={"publication": publication_result},
+    complete_change_commit(
+        job, semantic_attempt,
+        sha=sha, actual_parent=actual_parent,
+        prior_published=publication_parent, publication=publication,
     )
-    bind_new_publication_head(job, sha)
-    job.update(
-        {
-            "publication": publication_result,
-            "publication_sha": sha,
-            "publication_parent_sha": actual_parent,
-            "publication_prior_published_sha": publication_parent,
-            "phase": "publishing",
-        }
-    )
-    job.pop("pending_publication_result", None)
-    job.pop("publication_commit_intent", None)
-    job.pop("last_publication_error", None)
     stage.save(state)
     stage._reject_stale(
         state, job, checkout, "Publication was discarded after requirements changed"

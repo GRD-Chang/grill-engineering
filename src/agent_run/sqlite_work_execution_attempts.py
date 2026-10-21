@@ -11,7 +11,7 @@ from agent_run.sqlite_query_rows import bounded_query, current_collection_size
 from agent_run.semantic_attempt import require_semantic_attempt_record
 from agent_run.sqlite_encoding import encode_json
 from agent_run.sqlite_mutations import _same
-from agent_run.work_projection import JobHistoryAppend
+from agent_run.work_projection import ExpectedPublicationAttempt, JobHistoryAppend, JobProjection
 from agent_run.sqlite_work_evidence import (
     evidence_size,
     get_evidence,
@@ -389,6 +389,67 @@ def _history_size(c: sqlite3.Connection, run_id: str, attempt_id: str, version_i
     return int(row[0])
 
 
+def _encode_publication_retry(
+    c: sqlite3.Connection, run_id: str, job_id: str, subject: Mapping[str, Any],
+    baseline: Mapping[str, Any], records: dict[str, Mapping[str, Any]], before: dict[str, Mapping[str, Any]],
+) -> None:
+    expected = subject.expected_publication_attempt if isinstance(subject, JobProjection) else None
+    ordinal = subject.get("publication_attempts")
+    if expected is not None and ordinal != expected.ordinal:
+        # A new Attempt consumes this exact prior completion's retry facts.
+        load_expected_publication_attempt(c, run_id, job_id, expected)
+    retry = subject.get("publication_operation_retry")
+    pending = subject.get("pending_semantic_attempt")
+    if retry is None or isinstance(pending, Mapping) and pending.get("role") == "publication":
+        return
+    visible = next((record for record in records.values()
+                    if record.get("role") == "publication" and record.get("status") == "completed"
+                    and record.get("ordinal") == ordinal), None)
+    if expected is not None and expected.ordinal == ordinal:
+        if expected.run_id != run_id or expected.job_id != job_id:
+            raise ValueError("Completed Publication Attempt belongs to another owner")
+        prior = load_version(c, run_id, expected.attempt_id, expected.version_id)
+        if visible is not None and (
+            {key: value for key, value in visible.items() if key != "publication_operation_retry"}
+            != {key: value for key, value in prior.items() if key != "publication_operation_retry"}
+        ):
+            raise ValueError("Only the exact completed Publication retry may be updated")
+        if (_same(prior.get("publication_operation_retry"), retry)
+                and _same(baseline.get("publication_operation_retry"), retry)):
+            if visible is not None and not _same(visible.get("publication_operation_retry"), retry):
+                raise ValueError("Completed Publication retry conflicts with its aggregate")
+            return
+        canonical = save_publication_retry(c, run_id, job_id, expected, retry)
+        if visible is None:
+            return
+        # The exact history/current version already advanced together. Feed
+        # that same canonical value to ordinary full/suffix encoding, so it
+        # cannot restore the old version or count the size delta twice.
+        before[expected.attempt_id] = canonical
+    elif visible is not None:
+        existing = bounded_query(c,
+            "SELECT 1 FROM work_job_attempt_history WHERE run_id=? AND job_id=? AND attempt_id=?",
+            (run_id, job_id, visible["attempt_id"]),
+        ).fetchone()
+        if existing is not None:
+            if not _same(visible.get("publication_operation_retry"), retry):
+                raise ValueError("Completed Publication retry requires its exact version witness")
+            return
+        # A newly closed Attempt has no history version to patch. Its first
+        # completion and retry are one ordinary append in this transaction.
+        canonical = {**visible, "publication_operation_retry": dict(retry)}
+    else:
+        raise ValueError("Publication Operation Retry has no completed Attempt owner")
+    identity = str(canonical["attempt_id"])
+    records[identity] = canonical
+    history = subject.get("semantic_attempt_history")
+    if isinstance(history, list):
+        for index, record in enumerate(history):
+            if isinstance(record, Mapping) and record.get("attempt_id") == identity:
+                history[index] = canonical
+                break
+
+
 def save_attempts(
     c: sqlite3.Connection,
     run_id: str,
@@ -398,6 +459,7 @@ def save_attempts(
 ) -> None:
     records, order = _records(subject)
     before, old_order = _records(baseline_subject)
+    _encode_publication_retry(c, run_id, job_id, subject, baseline_subject, records, before)
     versions: dict[str, str] = {}
     for attempt_id, record in records.items():
         current = bounded_query(c, "SELECT version_id FROM work_attempt_current WHERE run_id=? AND attempt_id=?", (run_id, attempt_id)
@@ -550,50 +612,80 @@ def attempt_history_metadata(c: sqlite3.Connection, run_id: str, job_id: str) ->
     return (2, 0) if root is None else (int(root[4]), int(root[3]))
 
 
-def save_publication_retry(
-    c: sqlite3.Connection, run_id: str, job_id: str, before: dict[str, Any], attempt: dict[str, Any]
-) -> None:
-    """Patch one precisely read completed Attempt without materializing its archive."""
-    if _same(before, attempt):
-        return
-    identity = before.get("attempt_id")
-    if (
-        not isinstance(identity, str)
-        or before.get("role") != "publication"
-        or before.get("status") != "completed"
-        or {key: value for key, value in before.items() if key != "publication_operation_retry"}
-        != {key: value for key, value in attempt.items() if key != "publication_operation_retry"}
-    ):
-        raise ValueError("Only the exact completed Publication retry may be updated")
-    row = bounded_query(c, "SELECT position,version_id FROM work_job_attempt_history WHERE run_id=? AND job_id=? AND attempt_id=?",
-        (run_id, job_id, identity),
+def load_publication_attempt_version(
+    c: sqlite3.Connection, run_id: str, job_id: str, expected: ExpectedPublicationAttempt,
+) -> dict[str, Any]:
+    """Read the immutable source fact, independently of later current-owner writes."""
+    if expected.run_id != run_id or expected.job_id != job_id:
+        raise ValueError("Completed Publication Attempt belongs to another owner")
+    origin = bounded_query(c,
+        "SELECT job_id FROM work_attempts WHERE run_id=? AND attempt_id=?",
+        (run_id, expected.attempt_id),
+    ).fetchone()
+    if origin != (job_id,):
+        raise ValueError("Completed Publication Attempt belongs to another owner")
+    record = load_version(c, run_id, expected.attempt_id, expected.version_id)
+    if (record.get("role") != "publication" or record.get("status") != "completed"
+            or record.get("ordinal") != expected.ordinal):
+        raise ValueError("Invalid expected completed Publication Attempt")
+    return record
+
+
+def load_expected_publication_attempt(
+    c: sqlite3.Connection, run_id: str, job_id: str, expected: ExpectedPublicationAttempt,
+) -> dict[str, Any]:
+    if expected.run_id != run_id or expected.job_id != job_id:
+        raise ValueError("Completed Publication Attempt belongs to another owner")
+    row = bounded_query(c,
+        "SELECT position,version_id FROM work_job_attempt_history WHERE run_id=? AND job_id=? AND attempt_id=?",
+        (run_id, job_id, expected.attempt_id),
     ).fetchone()
     root = _roots(c, run_id, job_id)
-    if row is None or root is None or not 0 <= row[0] < root[3] or load_version(c, run_id, identity, row[1]) != before:
+    if (row is None or root is None or not 0 <= row[0] < root[3]
+            or row[1] != expected.version_id):
         raise ValueError("Completed Publication Attempt changed before retry update")
-    current = bounded_query(c, "SELECT version_id FROM work_attempt_current WHERE run_id=? AND attempt_id=?", (run_id, identity)
+    record = load_publication_attempt_version(c, run_id, job_id, expected)
+    current = bounded_query(c,
+        "SELECT version_id FROM work_attempt_current WHERE run_id=? AND attempt_id=?",
+        (run_id, expected.attempt_id),
     ).fetchone()
-    if current != (row[1],):
+    if current != (expected.version_id,):
         raise ValueError("Completed Publication current version changed before retry update")
-    old_size = _history_size(c, run_id, identity, row[1])
-    version = save_version(c, run_id, attempt, job_id=job_id, before=before, previous_version=row[1])
-    new_size = _history_size(c, run_id, identity, version)
+    return record
+
+
+def save_publication_retry(
+    c: sqlite3.Connection, run_id: str, job_id: str,
+    expected: ExpectedPublicationAttempt, retry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Encode an aggregate's retry on its exact source version, without a writable shadow."""
+    before = load_expected_publication_attempt(c, run_id, job_id, expected)
+    attempt = {**before, "publication_operation_retry": dict(retry)}
+    if _same(before, attempt):
+        return before
+    root = _roots(c, run_id, job_id)
+    assert root is not None
+    old_size = _history_size(c, run_id, expected.attempt_id, expected.version_id)
+    version = save_version(c, run_id, attempt, job_id=job_id, before=before, previous_version=expected.version_id)
+    new_size = _history_size(c, run_id, expected.attempt_id, version)
     c.execute(
         "UPDATE work_job_attempt_history SET version_id=? WHERE run_id=? AND job_id=? AND attempt_id=?",
-        (version, run_id, job_id, identity),
+        (version, run_id, job_id, expected.attempt_id),
     )
     c.execute(
-        "UPDATE work_attempt_current SET version_id=? WHERE run_id=? AND attempt_id=?", (version, run_id, identity)
+        "UPDATE work_attempt_current SET version_id=? WHERE run_id=? AND attempt_id=?",
+        (version, run_id, expected.attempt_id),
     )
     c.execute(
         "UPDATE work_job_attempt_roots SET history_bytes=? WHERE run_id=? AND job_id=?",
         (root[4] + new_size - old_size, run_id, job_id),
     )
+    return attempt
 
 
-def load_completed_publication_attempt(
-    c: sqlite3.Connection, run_id: str, job_id: str, ordinal: int
-) -> dict[str, Any] | None:
+def publication_attempt_expectation(
+    c: sqlite3.Connection, run_id: str, job_id: str, ordinal: int,
+) -> ExpectedPublicationAttempt | None:
     root = _roots(c, run_id, job_id)
     row = bounded_query(c, "SELECT h.attempt_id,h.version_id,h.position FROM work_attempts a INDEXED BY work_attempt_owner_role "
         "CROSS JOIN work_job_attempt_history h CROSS JOIN work_attempt_versions v "
@@ -605,7 +697,14 @@ def load_completed_publication_attempt(
     ).fetchone()
     if row is not None and (root is None or type(row[2]) is not int or not 0 <= row[2] < root[3]):
         raise ValueError("Invalid related Semantic Attempt history position")
-    return None if row is None else load_version(c, run_id, row[0], row[1])
+    return None if row is None else ExpectedPublicationAttempt(run_id, job_id, row[0], row[1], ordinal)
+
+
+def load_completed_publication_attempt(
+    c: sqlite3.Connection, run_id: str, job_id: str, ordinal: int,
+) -> dict[str, Any] | None:
+    expected = publication_attempt_expectation(c, run_id, job_id, ordinal)
+    return None if expected is None else load_version(c, run_id, expected.attempt_id, expected.version_id)
 
 
 def find_result_reference(

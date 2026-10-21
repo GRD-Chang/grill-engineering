@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator, Mapping
-from copy import deepcopy
 from typing import Any
 
 from agent_run.sqlite_change_job_archives import read_metadata, require_metadata
@@ -94,7 +93,10 @@ def _load_owner(
     repair_budget_scope: RepairBudgetScope | None = None,
     current_budgets_only: bool = False,
 ) -> dict[str, Any]:
-    from agent_run.sqlite_work_execution import load_attempts, load_completed_publication_attempt
+    from agent_run.sqlite_work_execution import load_attempts
+    from agent_run.sqlite_work_execution_attempts import (
+        load_expected_publication_attempt, publication_attempt_expectation,
+    )
 
     job, meta = load_core(c, run_id, job_id)
     keys, owner = meta["keys"], meta["owner_id"]
@@ -165,8 +167,30 @@ def _load_owner(
         elif meta["cycle_evidence_id"] is not None:
             cycle.update(material(c, run_id, owner, "repair_cycle.completed", meta["cycle_evidence_id"]))
     _load_gate(c, run_id, job_id, job, meta["stage"])
+    ordinal = job.get("publication_attempts")
+    pending = job.get("pending_semantic_attempt")
+    expected = None
+    if (type(ordinal) is int and ordinal > 0
+            and not (isinstance(pending, dict) and pending.get("role") == "publication")):
+        expected = publication_attempt_expectation(c, run_id, job_id, ordinal)
+        retry = job.get("publication_operation_retry")
+        if retry is not None:
+            related: dict[str, Any] | None
+            if expected is not None:
+                related = load_expected_publication_attempt(c, run_id, job_id, expected)
+            else:
+                related = None
+                for attempt in reversed(job.get("semantic_attempt_history", [])):
+                    if (isinstance(attempt, dict) and attempt.get("role") == "publication"
+                            and attempt.get("status") == "completed" and attempt.get("ordinal") == ordinal):
+                        related = attempt
+                        break
+            if related is None:
+                raise ValueError("Publication Operation Retry has no completed Attempt owner")
+            if related.get("publication_operation_retry") != retry:
+                raise ValueError("Stored Publication Operation Retry conflicts with its completed Attempt")
     missing = (keys & _HISTORIES) - job.keys()
-    if missing:
+    if missing or expected is not None:
         from agent_run.sqlite_work_execution import attempt_history_metadata
 
         archives = {
@@ -178,17 +202,8 @@ def _load_owner(
             for field in missing
         }
         job = JobProjection(job, job_id=job_id, revision=meta["revision"], archives=archives)
-        ordinal = job.get("publication_attempts")
-        pending = job.get("pending_semantic_attempt")
-        if (
-            "semantic_attempt_history" in archives
-            and type(ordinal) is int
-            and ordinal > 0
-            and not (isinstance(pending, dict) and pending.get("role") == "publication")
-        ):
-            related = load_completed_publication_attempt(c, run_id, job_id, ordinal)
-            if related is not None:
-                job.publication_update = (deepcopy(related), related)
+        job.loaded_histories.update(job.keys() & _HISTORIES)
+        job.expected_publication_attempt = expected
     return job
 
 

@@ -48,6 +48,7 @@ from agent_run.parent_integration import (
 )
 from agent_run.parent_only_integration import reconcile_parent_integration
 from agent_run.run_repair_integration import reconcile_repair_integration
+from agent_run.publication_lifecycle import mark_publication_failure
 
 
 class PublishedHeadStage(ChangeDeliveryStage, Protocol):
@@ -103,7 +104,12 @@ def _publication_operation(
     try:
         return False, operation()
     except (OSError, TimeoutError) as error:
-        if stage._record_publication_operation_failure(state, job, error):
+        exhausted = mark_publication_failure(
+            state, job, error,
+            subject_key="change_job", subject=stage.contract.label,
+        )
+        stage.save(state)
+        if exhausted:
             return True, None
         raise
 

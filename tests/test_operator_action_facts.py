@@ -304,10 +304,11 @@ def test_publication_failure_transition_keeps_its_owned_diagnostic(failure: str,
 
     from agent_run.git import GitError
     from agent_run.cli_presentation import _print_history, _print_status
-    from agent_run.github import GitHubReadError
     from agent_run.notification_cards import card
     from agent_run.notification_events import events
-    from agent_run.run_publication_flow import RunPublicationFlow
+    from agent_run.publication_lifecycle import (
+        hold_unknown_publication_write, record_final_ref_failure,
+    )
 
     state = parallel_state()
     state["ticket_jobs"]["3"].update(blocked_reason="ticket_execution_failed", execution_failure="Ticket-only error")
@@ -317,11 +318,12 @@ def test_publication_failure_transition_keeps_its_owned_diagnostic(failure: str,
     flow = SimpleNamespace(_save=deepcopy)
     message = "write response lost" if failure == "github_write_outcome_unknown" else "Run ref has a foreign identity"
     if failure == "github_write_outcome_unknown":
-        saved = RunPublicationFlow._hold_unknown_write_outcome(
-            flow, state, subject, GitHubReadError(failure, message),
+        hold_unknown_publication_write(
+            state, subject, message,
         )
     else:
-        saved = RunPublicationFlow._handle_final_run_ref_error(flow, state, subject, GitError(message))
+        record_final_ref_failure(state, subject, GitError(message))
+    saved = flow._save(state)
     before = deepcopy(saved)
     fact = next(item for item in operator_action_facts(saved) if item["location"] == "run_publication")
     assert fact["reason"] == failure

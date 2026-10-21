@@ -319,6 +319,10 @@ class TicketState:
 
             if isinstance(current, JobProjection) and not isinstance(saved_job, JobProjection):
                 known = current.copy()
+                if (isinstance(self._last_job, JobProjection)
+                        and any(self._last_job.get(field) != job.get(field)
+                                for field in ("publication_attempts", "publication_operation_retry"))):
+                    known.expected_publication_attempt = self._last_job.expected_publication_attempt
                 known.clear()
                 known.update(saved_job)
                 # 完整调用方修改已读档案时，按准确旧版本补读 lane 基线。

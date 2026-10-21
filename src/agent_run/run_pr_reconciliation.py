@@ -7,8 +7,8 @@ from typing import Any, Callable
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.github import GitHubReadError
 from agent_run.git import GitError
-from agent_run.error_safety import bounded_error
 from agent_run.pr_write import observe_pr_write
+from agent_run.publication_lifecycle import hold_unknown_publication_write
 
 
 def reconcile_run_pr_write(
@@ -58,13 +58,6 @@ def reconcile_run_pr_write(
         # Normal publication consumes an unchanged-boundary intent itself.
         return True
     except (GitHubReadError, GitError, OSError, TimeoutError) as error:
-        publication.update(
-            phase="ready_for_human", pause_resume_phase="waiting_external",
-            blocked_reason="github_write_outcome_unknown",
-        )
-        state.update(
-            status="ready_for_human", terminal_kind="waiting_human",
-            diagnostics=[{"code": "github_write_outcome_unknown", "message": bounded_error(str(error))}],
-        )
+        hold_unknown_publication_write(state, publication, str(error))
         save(state)
         return False

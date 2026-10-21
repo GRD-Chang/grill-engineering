@@ -18,6 +18,17 @@ class JobHistoryAppend(list[Any]):
 
 
 @dataclass(frozen=True)
+class ExpectedPublicationAttempt:
+    """准确读取的不可变版本身份；不承载可写 Attempt 副本。"""
+
+    run_id: str
+    job_id: str
+    attempt_id: str
+    version_id: str
+    ordinal: int
+
+
+@dataclass(frozen=True)
 class RepairBudgetScope:
     run_id: str
     job_id: str
@@ -62,7 +73,7 @@ class JobProjection(dict[str, Any]):
         self.previous_review_reader: Callable[[JobProjection], dict[str, Any] | None] | None = None
         self.latest_thread_reader: Callable[[JobProjection, str], str | None] | None = None
         self.publication_reader: Callable[[JobProjection], dict[str, Any] | None] | None = None
-        self.publication_update: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self.expected_publication_attempt: ExpectedPublicationAttempt | None = None
 
     def materialize(self, field: str) -> Any:
         self.materialize_histories({field})
@@ -86,17 +97,6 @@ class JobProjection(dict[str, Any]):
             if overlap < 0 or overlap > len(pending) or value[pending.base_count :] != pending[:overlap]:
                 raise ValueError("Job history changed before materializing its known append")
             value.extend(pending[overlap:])
-        if field == "semantic_attempt_history" and self.publication_update is not None:
-            before, updated = self.publication_update
-            if before != updated:
-                for index, attempt in enumerate(value):
-                    if attempt.get("attempt_id") == updated.get("attempt_id"):
-                        if attempt != before and attempt != updated:
-                            raise ValueError("Publication Attempt changed before materializing its retry update")
-                        value[index] = updated
-                        break
-                else:
-                    raise ValueError("Publication Attempt disappeared before materializing its retry update")
         self[field] = value
         self.loaded_histories.add(field)
 
@@ -115,7 +115,7 @@ class JobProjection(dict[str, Any]):
         result.previous_review_reader = self.previous_review_reader
         result.latest_thread_reader = self.latest_thread_reader
         result.publication_reader = self.publication_reader
-        result.publication_update = deepcopy(self.publication_update)
+        result.expected_publication_attempt = self.expected_publication_attempt
         return result
 
     def __deepcopy__(self, memo: dict[int, Any]) -> JobProjection:
@@ -187,10 +187,12 @@ def previous_review_artifact(owner: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def publication_attempt_for_current_ordinal(owner: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve the precise completed Publication Attempt owned by this counter."""
-    history = owner.get("semantic_attempt_history")
+def publication_attempt_for_current_ordinal(
+    owner: dict[str, Any], related_attempt: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read the precise Publication Attempt without creating a writable shadow."""
     ordinal = owner.get("publication_attempts")
+    history = owner.get("semantic_attempt_history")
     if isinstance(history, list):
         for attempt in reversed(history):
             if (
@@ -198,26 +200,21 @@ def publication_attempt_for_current_ordinal(owner: dict[str, Any]) -> dict[str, 
                 and attempt.get("role") == "publication"
                 and (type(ordinal) is not int or attempt.get("ordinal") == ordinal)
             ):
-                if (isinstance(owner, JobProjection) and isinstance(history, JobHistoryAppend)
-                        and attempt.get("status") == "completed"):
-                    previous = owner.publication_update
-                    before = (previous[0] if previous is not None
-                              and previous[0].get("attempt_id") == attempt.get("attempt_id") else deepcopy(attempt))
-                    owner.publication_update = before, attempt
-                return attempt
+                return deepcopy(attempt)
+    if related_attempt is not None:
+        if (related_attempt.get("role") == "publication"
+                and related_attempt.get("status") == "completed"
+                and related_attempt.get("ordinal") == ordinal):
+            return deepcopy(related_attempt)
+        return None
     if (
         isinstance(owner, JobProjection)
         and "semantic_attempt_history" in owner.archives
         and "semantic_attempt_history" not in owner.loaded_histories
     ):
-        if owner.publication_update is not None and owner.publication_update[1].get("ordinal") == ordinal:
-            return owner.publication_update[1]
         if owner.publication_reader is None:
             raise ValueError("Publication Attempt requires its exact query reader")
-        attempt = owner.publication_reader(owner)
-        if attempt is not None:
-            owner.publication_update = (deepcopy(attempt), attempt)
-        return attempt
+        return owner.publication_reader(owner)
     return None
 
 
@@ -239,7 +236,7 @@ def restore_work_scopes(
                 after.previous_review_reader = before.previous_review_reader
                 after.latest_thread_reader = before.latest_thread_reader
                 after.publication_reader = before.publication_reader
-                after.publication_update = deepcopy(before.publication_update)
+                after.expected_publication_attempt = before.expected_publication_attempt
             elif not (
                 preserve_owner_references
                 and all(

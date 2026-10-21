@@ -92,13 +92,4 @@ class ChangeDeliveryStage(Protocol):
         next_action: str | None = None,
     ) -> None: ...
 
-    def _record_publication_operation_failure(
-        self, state: dict[str, Any], job: dict[str, Any], error: Exception
-    ) -> bool: ...
-
-    def _record_publication_operation_failure_in_memory(
-        self, state: dict[str, Any], job: dict[str, Any], error: Exception
-    ) -> bool: ...
-
-
     def review_budget_policy(self) -> ReviewBudgetPolicy: ...
