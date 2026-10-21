@@ -687,6 +687,12 @@ class Scenario:
                 mutations.append({"action": "delete_managed_branch", "branch": source_label})
         current = self.kernel.status(self.delivery.key)
         projected = self.observable(script["id"], Step("complete", self.delivery.key))
+        with self.kernel.storage.transaction(write=False) as tx:
+            publication = tx.one("SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='publication' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                 (self.delivery.key, current["generation"]))
+            publication_wire = json.loads(tx.get(publication[0], self.delivery.key))
+        approval = any(checkpoint["phase"] == "approval" for checkpoint in self.checkpoints)
+        historical = script.get("completed_ticket_precondition")
         display_attempts = [{"issue_number": issue, "branch": labels.get(ref, ref),
                              "head_sha": head_identity(head)} for issue, ref, head, _ in linked]
         context_paths = {"review": current["reviewed_checkout"], "publication": self.delivery.checkout}
@@ -712,7 +718,7 @@ class Scenario:
                 "roles": projected["role_calls"], "raw_backend_calls": {"development": self.development_count,
                     "review": self.review_count, "publication": self.publication_count},
                 "status": ("ticket_completed" if self.delivery.kind == DeliveryKind.TICKET else "completed") if current["phase"] == "complete" else current["phase"],
-                "approval_required": False, "budget": {"initial_development": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["developments_used"],
+                "approval_required": current["phase"] == "approval", "budget": {"initial_development": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["developments_used"],
                     "initial_review": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["reviews_used"]},
                 "commits": {name: actual_commit(head) for name, head in heads.items()}, "local_refs": refs,
                 "published_refs": {labels.get(ref, ref): head_identity(head)
@@ -726,7 +732,14 @@ class Scenario:
                                                               "status": None if current["issue_link"] is None else current["issue_link"]["state"]}},
                 "post_close_worktrees": {"observed": True, "registrations": registered,
                                          "role_checkouts": {role: {"observed": True, "path": path, "exists": Path(path).exists(), "registered": f"worktree {path}" in registry} for role, path in context_paths.items()}},
-                "publication_wire": script["agents"]["publication"][0], "cross_architecture_compared": False,
+                "publication_wire": publication_wire, "cross_architecture_compared": False,
+                "delivery_kind": "full_parent" if self.delivery.kind == DeliveryKind.FINAL_RUN else self.delivery.kind.value,
+                "approval_boundary": ("run_approval_pending" if self.delivery.kind == DeliveryKind.FINAL_RUN else "parent_approval_pending") if approval else None,
+                "historical_input": None if historical is None else {
+                    "kind": "completed Ticket fixture, no backend called for this prefix",
+                    "budget": {key: historical["historical_budget"][key] for key in ("development_attempts", "reviewer_invocations")},
+                    "head": heads["candidate"]},
+                "source_ref_identity": self.delivery.source_ref.removeprefix("refs/heads/"),
                 "known_gaps": ["GitHub Issue branch linking uses a persistent synthetic remote, not the native online API"],
                 "raw_effects": self.port.writes()}
 
@@ -820,7 +833,7 @@ def main() -> None:
     parser.add_argument("--scenario", required=True, choices=("ticket-normal", "ticket-review-repair", "ticket-fallback",
                         "parent-only-normal", "full-parent-normal", "full-parent-review-repair"))
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--input", type=Path, help="Exact neutral Ticket script, shared with the unchanged baseline adapter")
+    parser.add_argument("--input", type=Path, help="Exact neutral delivery script, shared with the unchanged baseline adapter")
     args = parser.parse_args()
     configurations = {
         "ticket-normal": (DeliveryKind.TICKET, ("pass",), "complete"),
