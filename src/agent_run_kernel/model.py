@@ -11,7 +11,7 @@ from enum import StrEnum
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 class KernelError(RuntimeError):
@@ -226,6 +226,37 @@ class Execution:
     run_id: str
     owner: str
     epoch: int
+
+
+@dataclass(frozen=True)
+class HostLaunch:
+    run_id: str
+    epoch: int
+    owner: str
+    nonce: str
+    unit_name: str
+    command: tuple[str, ...]
+    environment_carrier: Path
+
+    @property
+    def description(self) -> str:
+        return "agent-run-kernel:" + json.dumps(
+            [self.run_id, self.epoch, self.owner, self.nonce], separators=(",", ":"), ensure_ascii=True,
+        )
+
+
+@dataclass(frozen=True)
+class HostObservation:
+    disposition: Literal["running", "exited", "unknown"]
+    unit_name: str
+    invocation_id: str | None = None
+    cgroup: str | None = None
+    boot_id: str | None = None
+    main_pid: int | None = None
+    start_token: str | None = None
+    exit_status: int | None = None
+    ended_at: float | None = None
+    evidence: str = ""
 
 
 @dataclass(frozen=True)
