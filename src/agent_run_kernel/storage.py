@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v8-exploration"
+PROTOCOL = "independent-delivery-kernel-v9-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -31,7 +31,8 @@ CREATE TABLE runs (
  executor TEXT, epoch INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0,
  final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT,
  source_sequence INTEGER, observed_parent_revision TEXT, observed_graph_revision TEXT,
- language TEXT CHECK(language IN ('zh','en')), repository_root TEXT, created_at REAL NOT NULL
+ language TEXT CHECK(language IN ('zh','en')), repository_root TEXT, created_at REAL NOT NULL,
+ profile_revision INTEGER NOT NULL DEFAULT 1 REFERENCES profile_revisions(id) DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE subjects (
  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
@@ -109,7 +110,7 @@ CREATE TABLE budgets (
  subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
  window INTEGER NOT NULL, developments_used INTEGER NOT NULL DEFAULT 0,
  reviews_used INTEGER NOT NULL DEFAULT 0, development_limit INTEGER NOT NULL,
- review_limit INTEGER, current INTEGER NOT NULL DEFAULT 1,
+ review_limit INTEGER, review_required INTEGER NOT NULL, current INTEGER NOT NULL DEFAULT 1,
  PRIMARY KEY(subject,purpose,window)
 );
 CREATE UNIQUE INDEX current_budget ON budgets(subject,purpose) WHERE current=1;
@@ -132,7 +133,15 @@ CREATE TABLE material (
 );
 CREATE TABLE threads (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), role TEXT NOT NULL,
- model TEXT NOT NULL, effort TEXT NOT NULL, backend_id TEXT UNIQUE
+ profile_revision INTEGER NOT NULL REFERENCES profile_revisions(id), backend_id TEXT UNIQUE
+);
+CREATE TABLE profile_revisions (
+ id INTEGER PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id),
+ material_id TEXT NOT NULL REFERENCES material(id), created_at REAL NOT NULL
+);
+CREATE TABLE run_inputs (
+ run_id TEXT PRIMARY KEY REFERENCES runs(id), subject TEXT NOT NULL REFERENCES subjects(id),
+ material_id TEXT NOT NULL REFERENCES material(id)
 );
 CREATE TABLE attempts (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
@@ -161,6 +170,11 @@ CREATE TABLE invocation_outputs (
  mode TEXT NOT NULL, requested_thread TEXT,
  failure_kind TEXT CHECK(failure_kind IN ('ordinary','capacity','fatal')), recovery_ready_at REAL,
  PRIMARY KEY(invocation,ordinal)
+);
+CREATE TABLE worker_activity (
+ invocation TEXT NOT NULL, ordinal INTEGER NOT NULL, identity TEXT NOT NULL,
+ active INTEGER NOT NULL, observed_at REAL NOT NULL, evidence TEXT NOT NULL REFERENCES material(id),
+ PRIMARY KEY(invocation,ordinal,identity), FOREIGN KEY(invocation,ordinal) REFERENCES invocation_outputs(invocation,ordinal)
 );
 CREATE TABLE work_queue (
  subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE
@@ -192,7 +206,12 @@ CREATE TABLE effects (
  before_sha TEXT NOT NULL, after_sha TEXT, candidate_sha TEXT, candidate_tree TEXT,
  base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT NOT NULL,
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
- attempts INTEGER NOT NULL DEFAULT 0
+ attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE effect_failures (
+ effect TEXT NOT NULL REFERENCES effects(id), dispatch_serial INTEGER NOT NULL,
+ evidence TEXT NOT NULL REFERENCES material(id), observed_at REAL NOT NULL,
+ PRIMARY KEY(effect,dispatch_serial)
 );
 CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link');
 CREATE TABLE checks (
@@ -213,7 +232,7 @@ CREATE TABLE actions (
 CREATE TABLE history (
  position INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL REFERENCES subjects(id),
  kind TEXT NOT NULL, identity TEXT NOT NULL, material_id TEXT REFERENCES material(id),
- generation INTEGER NOT NULL, created_at REAL NOT NULL
+ generation INTEGER NOT NULL, created_at REAL NOT NULL, phase TEXT, purpose TEXT, status TEXT
 );
 """
 

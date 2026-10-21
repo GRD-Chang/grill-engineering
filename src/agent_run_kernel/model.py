@@ -104,6 +104,17 @@ class Delivery:
 
 
 @dataclass(frozen=True)
+class CreationInputs:
+    """Resolved non-secret inputs; personal files are never read on continuation."""
+    profiles: Mapping[str, Any]
+    prompt_resources: Mapping[str, str]
+    worker_identity: Mapping[str, Any]
+    runner_identity: Mapping[str, Any]
+    notifications: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class RunSpec:
     run_id: str
     repository: str
@@ -114,6 +125,7 @@ class RunSpec:
     policy: Policy = field(default_factory=Policy)
     language: str | None = None
     repository_root: str | None = None
+    inputs: CreationInputs | None = None
 
     def __post_init__(self) -> None:
         if self.language not in {None, "zh", "en"}:
@@ -276,6 +288,8 @@ class AgentCall:
     mode: str = "fresh"
     reported_thread: str | None = None
     output_ordinal: int = 0
+    profile_revision: int = 1
+    profile_reference: str | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +308,7 @@ class Effect:
     actor: str
     payload: Mapping[str, Any]
     execution: Execution
+    dispatch_serial: int = 1
 
 
 @dataclass(frozen=True)

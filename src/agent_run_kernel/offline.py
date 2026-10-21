@@ -110,7 +110,8 @@ class OfflinePort:
         delivery = Delivery(key, kind, ticket_number if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
                             source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout),
                             owned_root=str(checkout.parent.resolve()), common_git_dir=str((self.git.root / ".git").resolve()))
-        spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy())
+        spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy(),
+                       language="zh", repository_root=str(self.git.root.resolve()))
         return spec, delivery
 
     def pull_request(self, subject: str) -> PullRequest | None:
@@ -572,8 +573,11 @@ class Scenario:
             if self.kernel.dispatch(effect, self.execution, self.world()):
                 try:
                     acknowledgement = self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
-                except LostResponse:
-                    pass
+                except LostResponse as error:
+                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                except Exception as error:
+                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                    raise
                 else:
                     if effect.operation == "issue_link":
                         if acknowledgement is not None:

@@ -10,11 +10,16 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable, Mapping
 from uuid import uuid4
+
+from agent_run.agent_profiles import ProfileOverrides, resolve_profiles
+from agent_run.github_identity import validate_identity_snapshot
+from agent_run.prompt_resources import validate_resources
 
 from .model import (
     AgentCall, Commit, DeliveryKind, Effect, EffectResult, Execution, KernelError,
@@ -38,6 +43,20 @@ class Kernel:
                fixture_evidence: Mapping[str, Any] | None = None) -> Kernel:
         if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
             raise ValueError("one or more uniquely identified deliveries are required")
+        profiles = ({"preset": None, "profiles": {
+            role.value: {"model": getattr(spec.policy, role.value + "_profile").model,
+                         "reasoning_effort": getattr(spec.policy, role.value + "_profile").effort,
+                         "reference": None, "provenance": {"source": "explicit_policy"}} for role in Role}}
+                    if spec.inputs is None else resolve_profiles(current=spec.inputs.profiles))
+        if spec.inputs is not None:
+            if spec.language is None:
+                raise KernelError("creation_language_required")
+            validate_resources(dict(spec.inputs.prompt_resources))
+            validate_identity_snapshot(spec.inputs.worker_identity)
+            validate_identity_snapshot(spec.inputs.runner_identity)
+        policy = asdict(spec.policy)
+        for role in Role:
+            del policy[role.value + "_profile"]
         Storage.create(path)
         kernel = cls(path)
         with kernel.storage.transaction() as tx:
@@ -55,7 +74,7 @@ class Kernel:
                     raise KernelError("final_target_required")
             tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy,language,repository_root,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
-                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(asdict(spec.policy)),
+                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(policy),
                         spec.language, None if spec.repository_root is None else str(Path(spec.repository_root).resolve()), kernel.clock()))
             for delivery in spec.deliveries:
                 if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
@@ -67,6 +86,13 @@ class Kernel:
                         "unread" if issue is None else kernel._fingerprint({"title": issue.title, "body": issue.body}))
                     delivery = replace(delivery, revision=revision, dependencies=())
                 kernel._add_delivery(tx, spec.run_id, spec.policy, delivery)
+            owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+            kernel._store_profiles(tx, owner, profiles, {"operation": "create"})
+            if spec.inputs is not None:
+                values = {name: dict(getattr(spec.inputs, name)) for name in (
+                    "prompt_resources", "worker_identity", "runner_identity", "notifications", "provenance")}
+                material = tx.put(owner, "creation_inputs", wire_json(values))
+                tx.execute("INSERT INTO run_inputs VALUES (?,?,?)", (spec.run_id, owner, material))
             if requirements is None:
                 for delivery in spec.deliveries:
                     for predecessor in delivery.dependencies:
@@ -91,8 +117,9 @@ class Kernel:
                     delivery.completion_revision, delivery.checkout, delivery.base.sha, delivery.owned_root, delivery.common_git_dir))
         limits = self._budget_limits(policy, delivery.kind)
         for purpose, (development_limit, review_limit) in limits.items():
-            tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,1,?,?)",
-                       (delivery.key, purpose.value, development_limit, review_limit))
+            review_required = delivery.kind != DeliveryKind.TICKET or purpose == Purpose.REQUIREMENTS or (purpose == Purpose.CI and policy.ticket_ci_review)
+            tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required) VALUES (?,?,1,?,?,?)",
+                       (delivery.key, purpose.value, development_limit, review_limit, review_required))
         tx.execute("INSERT INTO resync_allowances(subject,generation,allowance) VALUES (?,1,?)", (delivery.key, policy.resync_limit))
 
     def _budget_limits(self, policy: Policy, kind: DeliveryKind) -> dict[Purpose, tuple[int, int | None]]:
@@ -370,8 +397,8 @@ class Kernel:
             for budget in tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,)):
                 limits = self._budget_limits(self._policy(run), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
                 tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1", (subject, budget["purpose"]))
-                tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,?,?,?)",
-                           (subject, budget["purpose"], budget["window"] + 1, *limits))
+                tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required) VALUES (?,?,?,?,?,?)",
+                           (subject, budget["purpose"], budget["window"] + 1, *limits, budget["review_required"]))
             self._renew_resync(tx, job, require_exhaustion=False)
             tx.execute("DELETE FROM gates WHERE subject=?", (subject,))
             self._release_integration(tx, subject)
@@ -628,8 +655,9 @@ class Kernel:
                 or row["deadline_seconds"] != call.deadline_seconds or row["deadline_at"] != call.deadline_at
                 or json.loads(tx.get(row["context_id"], call.subject)) != call.context):
             raise KernelError("invocation_binding")
-        profile = tx.one("SELECT model,effort FROM threads WHERE id=?", (call.thread_id,))
-        if call.profile != Profile(profile["model"], profile["effort"]):
+        binding = tx.one("SELECT * FROM threads WHERE id=?", (call.thread_id,))
+        profile, reference = self._thread_profile(tx, binding)
+        if call.profile != profile or call.profile_revision != binding["profile_revision"] or call.profile_reference != reference:
             raise KernelError("invocation_binding")
         return row
 
@@ -733,17 +761,36 @@ class Kernel:
                 self._gate(tx, call.subject, "worker_unavailable", evidence=material)
 
     def agent_exited(self, call: AgentCall, process_identity: dict[str, Any], returncode: int, *, failure: str | None = None,
-                     failure_kind: str = "ordinary") -> None:
+                     failure_kind: str = "ordinary", diagnostic: Mapping[str, Any] | None = None) -> None:
         if failure_kind not in {"ordinary", "capacity", "fatal"}:
             raise KernelError("invalid_failure_kind")
         with self.storage.transaction() as tx:
             invocation = self._invocation(tx, call)
             if invocation["process_identity"] is None or json.loads(tx.get(invocation["process_identity"], call.subject)) != process_identity:
                 raise KernelError("process_identity_changed")
-            self._process_exit(tx, call, invocation, returncode, failure, failure_kind)
+            self._process_exit(tx, call, invocation, returncode, failure, failure_kind, diagnostic)
+
+    def observe_worker_activity(self, call: AgentCall, observation_id: str, *, active: bool, observed_at: float,
+                                evidence: Mapping[str, Any]) -> None:
+        """Record exact Worker events; process lifetime does not imply active work."""
+        if not observation_id or type(active) is not bool or not math.isfinite(observed_at) or observed_at < 0 or not evidence:
+            raise KernelError("invalid_activity_observation")
+        with self.storage.transaction() as tx:
+            output = self._invocation(tx, call)
+            if output["process_identity"] is None:
+                raise KernelError("worker_start_unproven")
+            material = tx.put(call.subject, "worker_activity", wire_json(dict(evidence)))
+            old = tx.rows("SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? AND identity=?",
+                          (call.invocation_id, call.output_ordinal, observation_id))
+            if old:
+                if (old[0]["active"], old[0]["observed_at"], old[0]["evidence"]) != (active, observed_at, material):
+                    raise KernelError("conflicting_activity_observation")
+                return
+            tx.execute("INSERT INTO worker_activity VALUES (?,?,?,?,?,?)",
+                       (call.invocation_id, call.output_ordinal, observation_id, active, observed_at, material))
 
     def _process_exit(self, tx: Transaction, call: AgentCall, invocation: sqlite3.Row, returncode: int, failure: str | None,
-                      failure_kind: str) -> None:
+                      failure_kind: str, diagnostic: Mapping[str, Any] | None = None) -> None:
         if invocation["exit_code"] is not None:
             if invocation["exit_code"] != returncode:
                 raise KernelError("conflicting_exit")
@@ -756,7 +803,8 @@ class Kernel:
         tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
         self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"], generation=invocation["generation"])
         if failed:
-            material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure, "kind": failure_kind}))
+            material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure, "kind": failure_kind,
+                                                                       "diagnostic": diagnostic}))
             tx.execute("UPDATE invocation_outputs SET start_evidence=? WHERE invocation=? AND ordinal=?",
                        (material, call.invocation_id, call.output_ordinal))
             if invocation["raw_id"] is None and self._latest_output(tx, invocation):
@@ -883,7 +931,7 @@ class Kernel:
                             if invocation["raw_id"] is None:
                                 tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (invocation["id"],))
                         elif code == "publication_retry_exhausted":
-                            tx.execute("UPDATE effects SET attempts=0 WHERE subject=? AND status='sent'", (subject,))
+                            tx.execute("UPDATE effects SET retry_baseline=attempts WHERE subject=? AND status='sent'", (subject,))
                         elif code == "write_conflict":
                             pending_write = self._pending_effect(tx, subject)
                             if pending_write is None or pending_write["status"] != "observed":
@@ -943,8 +991,8 @@ class Kernel:
             developments, reviews = old["developments_used"], old["reviews_used"]
             policy = self._policy(run)
             limit += policy.run_repairs if job["kind"] == DeliveryKind.PARENT_ONLY else policy.integration_developments
-        tx.execute("INSERT INTO budgets VALUES (?,?,?,?,?,?,?,1)",
-                   (job["id"], purpose, old["window"] + 1, developments, reviews, limit, old["review_limit"]))
+        tx.execute("INSERT INTO budgets VALUES (?,?,?,?,?,?,?,?,1)",
+                   (job["id"], purpose, old["window"] + 1, developments, reviews, limit, old["review_limit"], old["review_required"]))
         self._event(tx, job["id"], "budget_renewed", f"{purpose}:{old['window'] + 1}")
 
     def status(self, subject: str) -> dict[str, Any]:
@@ -974,7 +1022,8 @@ class Kernel:
                 "holds_integration": run["integration_holder"] == subject,
                 "pending_write": None if (effect := self._pending_effect(tx, subject)) is None
                 else {"operation": effect["operation"], "status": effect["status"], "id": effect["id"]},
-                "budgets": {row["purpose"]: {key: row[key] for key in ("window", "developments_used", "reviews_used", "development_limit", "review_limit")} for row in budgets},
+                "budgets": {row["purpose"]: {**{key: row[key] for key in ("window", "developments_used", "reviews_used", "development_limit", "review_limit")},
+                                           "review_required": bool(row["review_required"])} for row in budgets},
                 "resource_cleanup": next((dict(row) for row in tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))), None),
                 "issue_link": next((dict(row) for row in tx.rows("SELECT * FROM issue_links WHERE subject=?", (subject,))), None),
                 "retired_generations": [dict(row) for row in tx.rows("SELECT * FROM retired_generations WHERE subject=? ORDER BY generation", (subject,))],
@@ -1034,10 +1083,46 @@ class Kernel:
         return True
 
     def _policy(self, run: sqlite3.Row) -> Policy:
-        data = json.loads(run["policy"])
-        for field in ("development_profile", "review_profile", "publication_profile"):
-            data[field] = Profile(**data[field])
-        return Policy(**data)
+        return Policy(**json.loads(run["policy"]))
+
+    def _store_profiles(self, tx: Transaction, subject: str, profiles: Mapping[str, Any], source: Mapping[str, Any]) -> int:
+        revision = tx.one("SELECT coalesce(max(id),0)+1 FROM profile_revisions")[0]
+        material = tx.put(subject, "profile_revision", wire_json({**profiles, "source": dict(source)}))
+        tx.execute("INSERT INTO profile_revisions VALUES (?,?,?,?)", (revision, subject, material, self.clock()))
+        return int(revision)
+
+    def _profile_document(self, tx: Transaction, revision: int) -> dict[str, Any]:
+        row = tx.one("SELECT * FROM profile_revisions WHERE id=?", (revision,))
+        return dict(json.loads(tx.get(row["material_id"], row["subject"])))
+
+    def _thread_profile(self, tx: Transaction, thread: sqlite3.Row) -> tuple[Profile, str | None]:
+        value = self._profile_document(tx, thread["profile_revision"])["profiles"][thread["role"]]
+        return Profile(value["model"], value["reasoning_effort"]), value["reference"]
+
+    def configure_profiles(self, action_id: str, *, preset: str | None = None, overrides: ProfileOverrides | None = None) -> int:
+        """An explicit immutable revision applies only when a new Thread is allocated."""
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            owner = tx.one("SELECT subject FROM profile_revisions WHERE id=?", (run["profile_revision"],))[0]
+            payload = wire_json({"kind": "configure_profiles", "preset": preset, "overrides": dict(overrides or {})})
+            existing = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
+            if existing:
+                if tx.get(existing[0]["payload_id"], owner) != payload:
+                    raise KernelError("action_identity_changed")
+                return int(json.loads(tx.get(existing[0]["receipt_id"], owner))["profile_revision"])
+            profiles = resolve_profiles(preset=preset, current=self._profile_document(tx, run["profile_revision"]), overrides=overrides)
+            revision = self._store_profiles(tx, owner, profiles, {"operation": "configure", "action": action_id})
+            material = tx.put(owner, "control_intent", payload)
+            receipt = tx.put(owner, "control_receipt", wire_json({"profile_revision": revision}))
+            tx.execute("INSERT INTO actions(id,run_id,kind,payload_id,status,receipt_id) VALUES (?,?,'configure_profiles',?,'applied',?)",
+                       (action_id, run["id"], material, receipt))
+            tx.execute("UPDATE runs SET profile_revision=?", (revision,))
+            self._event(tx, owner, "profiles_configured", action_id, receipt)
+            return revision
+
+    def _inputs(self, tx: Transaction, run: sqlite3.Row) -> dict[str, Any]:
+        rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
+        return {} if not rows else dict(json.loads(tx.get(rows[0]["material_id"], rows[0]["subject"])))
 
     def _budget(self, tx: Transaction, job: sqlite3.Row) -> sqlite3.Row:
         return tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (job["id"], job["purpose"]))
@@ -1081,8 +1166,6 @@ class Kernel:
                                         payload={"reviewed_commit": job["integrated_sha"] or job["candidate_sha"]})
         tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
         policy = self._policy(run)
-        profile = {Role.DEVELOPMENT: policy.development_profile, Role.REVIEW: policy.review_profile,
-                   Role.PUBLICATION: policy.publication_profile}[role]
         attempt_id = pending["id"] if pending is not None else identity()
         previous_output = None if pending is None else tx.one(
             "SELECT i.*,o.* FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id WHERE i.id=? ORDER BY ordinal DESC LIMIT 1",
@@ -1095,12 +1178,11 @@ class Kernel:
             thread_id = job["development_thread"]
         if thread_id is None:
             thread_id = identity()
-            tx.execute("INSERT INTO threads(id,subject,role,model,effort) VALUES (?,?,?,?,?)", (thread_id, subject, role.value, profile.model, profile.effort))
-        else:
-            binding = tx.one("SELECT * FROM threads WHERE id=?", (thread_id,))
-            if binding["subject"] != subject or binding["role"] != role.value:
-                raise KernelError("thread_role_binding")
-            profile = Profile(binding["model"], binding["effort"])
+            tx.execute("INSERT INTO threads(id,subject,role,profile_revision) VALUES (?,?,?,?)", (thread_id, subject, role.value, run["profile_revision"]))
+        binding = tx.one("SELECT * FROM threads WHERE id=?", (thread_id,))
+        if binding["subject"] != subject or binding["role"] != role.value:
+            raise KernelError("thread_role_binding")
+        profile, reference = self._thread_profile(tx, binding)
         if role == Role.DEVELOPMENT:
             tx.execute("UPDATE subjects SET development_thread=? WHERE id=?", (thread_id, subject))
         context = self._context(tx, run, job, world, role)
@@ -1148,7 +1230,8 @@ class Kernel:
         tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
         self._event(tx, subject, "agent_allocated", invocation_id)
         call = AgentCall(attempt_id, invocation_id, subject, role, Purpose(job["purpose"]), thread_id,
-                         lease_id, execution, context, profile, deadline_seconds, deadline_at, mode, backend_thread, ordinal)
+                         lease_id, execution, context, profile, deadline_seconds, deadline_at, mode, backend_thread, ordinal,
+                         binding["profile_revision"], reference)
         return Step("agent", subject, call=call)
 
     def _recover_agent(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, attempt: sqlite3.Row,
@@ -1174,6 +1257,7 @@ class Kernel:
     def _context(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World, role: Role) -> dict[str, Any]:
         context: dict[str, Any] = {
             "repository": run["repository"], "parent_issue": run["parent_issue"], "issue": job["issue"],
+            "language": run["language"], "repository_root": run["repository_root"],
             "scope": job["kind"], "generation": job["generation"], "role": role.value,
             "purpose": job["purpose"], "revision": job["revision"], "parent_revision": run["parent_revision"],
             "repair_source": job["repair_source"],
@@ -1185,6 +1269,9 @@ class Kernel:
             "reviewed_commit": job["integrated_sha"] or job["candidate_sha"],
             "expected_tree": job["expected_tree"], "full_scope": job["kind"],
         }
+        inputs = self._inputs(tx, run)
+        if inputs:
+            context.update(_prompt_resources=inputs["prompt_resources"], github_identity=inputs["worker_identity"])
         for key in ("last_failure", "ci_failure"):
             if job[key]:
                 context[key] = json.loads(tx.get(job[key], job["id"]))
@@ -1306,10 +1393,11 @@ class Kernel:
         tx.execute("UPDATE attempts SET result_id=NULL,status='running' WHERE id=?", (attempt["id"],))
         tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
         self._event(tx, subject, "output_repair_allocated", f"{previous['id']}:{ordinal}", context_id)
+        profile, reference = self._thread_profile(tx, backend)
         return Step("agent", subject, call=AgentCall(attempt["id"], previous["id"], subject, Role(attempt["role"]),
                     Purpose(attempt["purpose"]), previous["thread"], lease_id, execution, context,
-                    Profile(backend["model"], backend["effort"]), previous["deadline_seconds"], previous["deadline_at"],
-                    "output-repair", backend["backend_id"], ordinal))
+                    profile, previous["deadline_seconds"], previous["deadline_at"],
+                    "output-repair", backend["backend_id"], ordinal, backend["profile_revision"], reference))
 
     def _pending_effect(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
         rows = tx.rows("SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link')", (subject,))
@@ -1448,7 +1536,8 @@ class Kernel:
                       row["before_sha"], row["after_sha"],
                       None if row["candidate_sha"] is None else Commit(row["candidate_sha"], row["candidate_tree"]),
                       Commit(row["base_sha"], row["base_tree"]), row["pr_number"], row["actor"],
-                      json.loads(tx.get(row["payload_id"], row["subject"])), execution)
+                      json.loads(tx.get(row["payload_id"], row["subject"])), execution,
+                      row["attempts"] + (1 if row["status"] == "prepared" else 0))
 
     def _mechanical(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, execution: Execution, world: World) -> Step:
         subject, phase = job["id"], job["phase"]
@@ -1631,6 +1720,9 @@ class Kernel:
         body["integrated_sha"] = job["integrated_sha"]
         body["integrated_tree"] = job["integrated_tree"]
         body["kind"] = job["kind"]
+        inputs = self._inputs(tx, run)
+        if inputs:
+            body["github_identity"] = inputs["runner_identity"]
         if operation == "validation_checkout":
             body["checkout"] = str(Path(job["checkout"]).parent / ("review-" + effect_id))
         payload_id = tx.put(subject, "effect_intent", wire_json(body))
@@ -1734,7 +1826,7 @@ class Kernel:
                     tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
                     self._update_boundary(tx, run, job)
                     return Step("progress", effect.subject, "updating")
-                if row["attempts"] >= 3:
+                if row["attempts"] - row["retry_baseline"] >= 3:
                     self._gate(tx, effect.subject, "publication_retry_exhausted")
                     return Step("paused", effect.subject, "publication_retry_exhausted")
                 tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
@@ -1743,6 +1835,24 @@ class Kernel:
             self._gate(tx, effect.subject, "write_conflict" if result.disposition == "third" else "write_result_unknown", evidence=evidence)
             self._finish_final_failure(tx, run)
             return Step("paused", effect.subject, result.disposition)
+
+    def observe_effect_failure(self, effect: Effect, diagnostic: Mapping[str, Any]) -> None:
+        """A call failure is an audit fact, not proof of a remote write's outcome."""
+        with self.storage.transaction() as tx:
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            actual = self._effect(tx, row, effect.execution)
+            if (replace(effect, dispatch_serial=actual.dispatch_serial) != actual
+                    or not 1 <= effect.dispatch_serial <= row["attempts"]):
+                raise KernelError("effect_binding")
+            material = tx.put(effect.subject, "effect_failure", wire_json(dict(diagnostic)))
+            old = tx.rows("SELECT evidence FROM effect_failures WHERE effect=? AND dispatch_serial=?",
+                          (effect.effect_id, effect.dispatch_serial))
+            if old:
+                if old[0][0] != material:
+                    raise KernelError("conflicting_effect_failure")
+                return
+            tx.execute("INSERT INTO effect_failures VALUES (?,?,?,?)", (effect.effect_id, effect.dispatch_serial, material, self.clock()))
+            self._event(tx, effect.subject, "effect_failed", effect.effect_id, material, generation=row["generation"])
 
     def _apply_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, world: World) -> Step:
         subject, operation = job["id"], row["operation"]
@@ -1787,10 +1897,9 @@ class Kernel:
             tx.execute("UPDATE subjects SET candidate_sha=?,candidate_tree=?,workspace_sha=?,expected_tree=?,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL WHERE id=?",
                        (commit["sha"], commit["tree"], commit["sha"], commit["tree"], subject))
             budget = self._budget(tx, job)
-            policy = self._policy(run)
             if job["purpose"] == Purpose.INTEGRATION:
                 phase = "integration"
-            elif job["purpose"] == Purpose.CI and job["kind"] == DeliveryKind.TICKET and not policy.ticket_ci_review:
+            elif job["purpose"] == Purpose.CI and not budget["review_required"]:
                 phase = "integration"
                 tx.execute("UPDATE subjects SET gate_mode='ci_waiver' WHERE id=?", (subject,))
             elif (job["kind"] == DeliveryKind.TICKET and job["purpose"] == Purpose.REQUIREMENTS
@@ -1986,7 +2095,16 @@ class Kernel:
                 and grant["completion_revision"] == job["completion_revision"])
 
     def _event(self, tx: Transaction, subject: str, kind: str, event_id: str, material: str | None = None, *, generation: int | None = None) -> None:
+        job = tx.one("SELECT generation,phase,purpose,current_attempt FROM subjects WHERE id=?", (subject,))
         if generation is None:
-            generation = tx.one("SELECT generation FROM subjects WHERE id=?", (subject,))[0]
-        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)",
-                   (subject, kind, event_id, material, generation, self.clock()))
+            generation = job["generation"]
+        status = None
+        if generation == job["generation"]:
+            run = tx.one("SELECT stopped,blocked FROM runs")
+            status = wire_json({"stopped": bool(run["stopped"]), "blocked": run["blocked"],
+                                "gates": [row["code"] for row in self._gates(tx, subject)],
+                                "attempt_status": None if job["current_attempt"] is None else
+                                tx.one("SELECT status FROM attempts WHERE id=?", (job["current_attempt"],))[0]}).decode()
+        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status) VALUES (?,?,?,?,?,?,?,?,?)",
+                   (subject, kind, event_id, material, generation, self.clock(),
+                    job["phase"] if status is not None else None, job["purpose"] if status is not None else None, status))
