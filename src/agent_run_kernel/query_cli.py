@@ -10,20 +10,12 @@ import subprocess
 import sys
 from typing import Any, Literal, NoReturn, Sequence
 
+from agent_run.cli_messages import personal_language as _personal_language
+from agent_run.messages import error_detail
+
+from . import personal_settings
 from .query import QueryDocument, QueryError, discover, read
-from .query_render import render, safe_text
-
-
-def _personal_language() -> str:
-    root = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-    path = root / "agent-run" / "user-defaults.json"
-    try:
-        if path.stat().st_size > 65536:
-            return "zh"
-        value = json.loads(path.read_text())
-        return "en" if value.get("language") == "en" else "zh"
-    except (OSError, ValueError, AttributeError):
-        return "zh"  # The documented personal builtin; never a Run language fallback.
+from .query_render import render, render_settings, safe_text
 
 
 class _Parser(argparse.ArgumentParser):
@@ -60,6 +52,7 @@ def _parser(language: str) -> argparse.ArgumentParser:
             child.add_argument("--details", action="store_true")
             child.add_argument("--after", type=int, default=0)
             child.add_argument("--limit", type=int)
+    personal_settings.add_parsers(commands, language)
     return parser
 
 
@@ -127,6 +120,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
+        if parsed.command in {"settings", "policy"}:
+            settings = personal_settings.execute(parsed)
+            render_settings(settings, as_json=parsed.command == "policy" or parsed.as_json, stream=sys.stdout)
+            return 0
         selected = _select(parsed, _candidates(parsed))
         if parsed.command == "runs":
             document = QueryDocument("runs", language, {"result": "runs", "runs": selected})
@@ -143,17 +140,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 and sys.stdout.isatty()) else "plain"
         render(document, style=style, details=getattr(parsed, "details", False), stream=sys.stdout)
         return 0
-    except QueryError as error:
+    except (ValueError, OSError) as error:
+        diagnostic_code = error.code if isinstance(error, QueryError) else "command_failed"
+        error_candidates = error.candidates if isinstance(error, QueryError) else []
         error_output: dict[str, Any] = {"result": "error", "status": "command_failed",
-                  "diagnostics": [{"code": error.code, "message": str(error)}]}
-        if error.candidates:
-            error_output["candidates"] = error.candidates
+                  "diagnostics": [{"code": diagnostic_code, "message": str(error)}]}
+        if error_candidates:
+            error_output["candidates"] = error_candidates
         if parsed.as_json:
             print(json.dumps(error_output, ensure_ascii=False, sort_keys=True))
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
-            print(safe_text(f"{prefix}: {error.code}\n{str(error)}"))
-            for error_candidate in error.candidates:
+            print(safe_text(f"{prefix}: {diagnostic_code}\n{error_detail(error, language)}"))
+            for error_candidate in error_candidates:
                 root = error_candidate["repository_root"] or ("未记录" if language == "zh" else "Not recorded")
                 print(safe_text(f"{error_candidate['repository']} Parent #{error_candidate['parent']} {error_candidate['run_id']} {root} [{error_candidate['state_dir']}]"))
         return 2

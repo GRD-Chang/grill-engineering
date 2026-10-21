@@ -254,6 +254,40 @@ def test_missing_run_language_is_rejected_without_using_personal_defaults(tmp_pa
     assert _snapshot(tmp_path) == before
 
 
+def test_numeric_read_selector_is_exact_run_while_parent_is_explicit(tmp_path: Path, capsys) -> None:
+    # Old _load_read_only_run calls load_exact_run for every positional string;
+    # only lifecycle mutation selection treats a decimal selector as Parent.
+    _create(tmp_path, "1", parent=7)
+    _create(tmp_path, "parent-one", parent=1)
+    before = _snapshot(tmp_path)
+    assert main(["status", "1", "--data-root", str(tmp_path), "--json"]) == 0
+    exact = json.loads(capsys.readouterr().out)
+    assert exact["run_id"] == "1" and exact["parent"]["number"] == 7
+    assert main(["status", "--repo", "example/project", "--parent", "1", "--data-root", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == "parent-one"
+    assert _snapshot(tmp_path) == before
+
+
+def test_invalid_personal_defaults_do_not_override_or_block_existing_run(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _create(tmp_path / "run")
+    _human(kernel)
+    config = tmp_path / "config"
+    defaults = config / "agent-run" / "user-defaults.json"
+    defaults.parent.mkdir(parents=True)
+    defaults.write_text('{"profile":{"unknown":"invalid personal data"}}')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--json")) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["worker"] is None
+    invocation = document["subjects"][0]["pending_attempt"]["invocations"][0]
+    assert invocation["model"] == "recorded-development-model"
+    assert query.read(kernel.storage.path, "status").language == "en"
+    assert _snapshot(tmp_path) == before
+
+
 def test_machine_data_is_independent_of_run_language_and_history_details(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

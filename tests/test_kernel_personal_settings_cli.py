@@ -6,6 +6,7 @@ UserDefaultsStore and its filesystem transaction; no alternate config writer.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -72,7 +73,7 @@ def test_public_settings_options_preserve_old_receipt_and_persisted_values(
     assert new == old
     assert personal.read_bytes() == saved
     assert personal.stat().st_mode & 0o777 == 0o600
-    assert "DELIVERY_TEST_PAT" not in __import__("os").environ
+    assert "DELIVERY_TEST_PAT" not in os.environ
     assert _call(main, ["settings", "show", "--json"], capsys)[1]["defaults"] == json.loads(saved)
 
 

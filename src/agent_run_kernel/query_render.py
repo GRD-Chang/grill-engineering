@@ -1,12 +1,14 @@
 """One factual document rendered as machine JSON, plain text or safe Rich text."""
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 import json
 import re
 from typing import Any, Literal, TextIO
 import unicodedata
+
+from agent_run.messages import text
 
 from .query import QueryDocument, QueryError, review_findings
 from .storage import QUERY_LIMIT
@@ -213,3 +215,36 @@ def render(document: QueryDocument, *, style: Literal["json", "plain", "rich"], 
     console = Console(file=stream, markup=False, highlight=False)
     for line in _lines(document, details):
         console.print(Text(safe_text(line)))
+
+
+def _setting_lines(values: Mapping[str, Any], language: str, indent: int = 0) -> Iterator[str]:
+    for key, value in values.items():
+        try:
+            label = text("cli.settings.field." + key, language=language)
+        except KeyError:
+            label = key
+        prefix = " " * indent + label + ":"
+        if isinstance(value, dict) and value:
+            yield prefix
+            yield from _setting_lines(value, language, indent + 2)
+        elif isinstance(value, list) and value:
+            yield prefix
+            for item in value:
+                if isinstance(item, dict):
+                    yield from _setting_lines(item, language, indent + 2)
+                else:
+                    yield " " * (indent + 2) + str(item)
+        else:
+            rendered = (text("cli.settings.unset", language=language) if value is None or value == [] or value == {} else
+                        text("cli.settings.yes" if value else "cli.settings.no", language=language) if isinstance(value, bool) else str(value))
+            yield f"{prefix} {rendered}"
+
+
+def render_settings(values: Mapping[str, Any], *, as_json: bool, stream: TextIO) -> None:
+    if as_json:
+        print(json.dumps(values, ensure_ascii=False, sort_keys=True), file=stream)
+        return
+    language = str(values["language"])
+    print(text("settings.personal_title", language=language), file=stream)
+    for line in _setting_lines(values, language):
+        print(safe_text(line), file=stream)
