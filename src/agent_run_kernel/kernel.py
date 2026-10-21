@@ -187,8 +187,7 @@ class Kernel:
                 has_work = bool(tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (job["id"], job["generation"])))
                 if has_work and (revision != job["revision"] or changed_parent):
                     if job["kind"] == DeliveryKind.FINAL_RUN:
-                        pending = self._pending_effect(tx, job["id"])
-                        if run["final_action"] and (job["merge_sha"] or pending is not None and pending["operation"] == "merge" and pending["status"] in {"sent", "observed"}):
+                        if self._final_merge_intent(tx, run, job) is not None:
                             # The original approval owns exact unknown-merge
                             # readback and successful Parent closeout first.
                             parent_in_use = True
@@ -1190,14 +1189,33 @@ class Kernel:
                     and pr["base"]["sha"] == row["before_sha"] and pr["merged"] == commit and commit["tree"] == job["publication_tree"]
                     and result["raw"].get("parents") == payload["parents"])
 
+    def _final_merge_intent(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> sqlite3.Row | None:
+        """The frozen grant survives the bounded lifetime of an Action observer."""
+        if (job["kind"] != DeliveryKind.FINAL_RUN or not job["grant_id"]
+                or run["observed_graph_revision"] not in {None, run["graph_revision"]}):
+            return None
+        grant = tx.one("SELECT * FROM grants WHERE id=? AND subject=?", (job["grant_id"], job["id"]))
+        intents = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND operation='merge' AND status IN ('sent','observed','confirmed') ORDER BY rowid DESC LIMIT 1",
+                          (job["id"], job["generation"]))
+        if not intents:
+            return None
+        intent = intents[0]
+        if not (grant["pr_number"] == intent["pr_number"] == job["pr_number"]
+                and grant["head_sha"] == intent["after_sha"] == job["publication_sha"]
+                and grant["base_sha"] == intent["before_sha"]
+                and grant["review_attempt"] == job["review_attempt"] and grant["checks_id"] == job["checks_id"]
+                and grant["revision"] == intent["revision"] == job["revision"]
+                and grant["parent_revision"] == intent["parent_revision"] == run["parent_revision"]
+                and grant["graph_revision"] == intent["graph_revision"] == run["graph_revision"]
+                and grant["completion_revision"] == job["completion_revision"]
+                and intent["source_ref"] == job["source_ref"] and intent["target_ref"] == job["target_ref"]):
+            return None
+        return intent
+
     def _final_closing(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> bool:
-        if job["kind"] != DeliveryKind.FINAL_RUN or not run["final_action"] or run["observed_graph_revision"] not in {None, run["graph_revision"]}:
-            return False
-        if job["merge_sha"]:
-            return True
-        pending = self._pending_effect(tx, job["id"])
-        return bool(pending is not None and pending["operation"] == "merge" and pending["status"] == "observed"
-                    and self._merge_receipt_matches(tx, run, job, pending, json.loads(tx.get(pending["receipt_id"], job["id"]))))
+        intent = self._final_merge_intent(tx, run, job)
+        return bool(intent is not None and intent["status"] in {"observed", "confirmed"} and intent["receipt_id"]
+                    and self._merge_receipt_matches(tx, run, job, intent, json.loads(tx.get(intent["receipt_id"], job["id"]))))
 
     def _validate_target(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, result: dict[str, Any]) -> None:
         if result["disposition"] != "target":

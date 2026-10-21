@@ -397,8 +397,11 @@ class OfflinePort:
                 parents = list(self.git.parents(pr.merged.sha))
                 if parents != list(effect.payload["parents"]) or pr.merged.tree != pr.head.tree:
                     return EffectResult("third", pr=pr)
-                if self.remote_refs().get(effect.target_ref) != pr.merged.sha or self.git.commit(effect.target_ref) != pr.merged:
+                target = self.remote_commit(effect.target_ref)
+                if target is None:
                     return EffectResult("unknown", pr=pr)
+                if not self.git.is_ancestor(pr.merged.sha, target.sha):
+                    return EffectResult("third", pr=pr)
                 return EffectResult("target", commit=pr.merged, pr=pr, raw={"parents": parents})
             prior = (pr.state == "OPEN" and pr.head.sha == effect.after_sha and pr.base.sha == effect.before_sha
                      and self.remote_refs().get(effect.target_ref) == effect.before_sha
