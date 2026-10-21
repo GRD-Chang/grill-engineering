@@ -6,6 +6,7 @@ UserDefaultsStore remains the sole personal-file validator and atomic writer.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Any
 
 from agent_run.cli_messages import personal_language
@@ -75,7 +76,7 @@ def add_parsers(commands: Any, language: str) -> None:
     show.add_argument("--run", dest="run_id", help=text("settings.run_help", language=language))
     show.add_argument("--parent", type=_positive, help=text("settings.parent_help", language=language))
     show.add_argument("--repo", help=text("cli.repo_help", language=language))
-    show.add_argument("--state-dir", help=text("cli.state_dir_help", language=language))
+    show.add_argument("--state-dir", type=Path, help=text("cli.state_dir_help", language=language))
     show.add_argument("--json", action="store_true", dest="as_json")
     configure = actions.add_parser("configure", language=language, help=text("settings.configure_help", language=language))
     configure.add_argument("--language", metavar="{zh,en}", help=text("settings.language_help", language=language))
@@ -128,7 +129,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         return result
     if parsed.settings_command == "show":
         if parsed.run_id is not None or parsed.parent is not None:
-            raise QueryError("recovery_materials_missing", "Native frozen Run configuration is not connected yet; personal defaults cannot replace it")
+            raise QueryError("run_locator_invalid", "Select a canonical Run before reading its frozen configuration")
         if parsed.repo or parsed.state_dir:
             raise ValueError(text("settings.run_required", language=store.language()))
         return store.describe()

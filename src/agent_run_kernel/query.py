@@ -18,7 +18,7 @@ from .storage import QUERY_LIMIT, Storage, Transaction
 
 @dataclass(frozen=True)
 class QueryDocument:
-    kind: Literal["status", "history", "runs"]
+    kind: Literal["status", "history", "runs", "settings"]
     language: str
     data: Mapping[str, Any]
 
@@ -137,8 +137,37 @@ def discover(root: Path) -> list[dict[str, Any]]:
     return candidates
 
 
+def _activity(tx: Transaction, invocation: str, ordinal: int, subject: str) -> tuple[list[dict[str, Any]], float | None]:
+    events = _all(tx, "SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? ORDER BY observed_at,identity", (invocation, ordinal))
+    start = None
+    elapsed = 0.0
+    valid = bool(events)
+    for event in events:
+        event["observed_at"] = _timestamp(event["observed_at"])
+        event["active"] = bool(event["active"])
+        event["evidence"] = _material(tx, event["evidence"], subject)
+        if event["active"]:
+            if start is not None:
+                valid = False
+            start = event["observed_at"]
+        elif start is None:
+            valid = False
+        else:
+            elapsed += event["observed_at"] - start
+            start = None
+    return events, elapsed if valid and start is None else None
+
+
+def _profile(tx: Transaction, revision: int) -> dict[str, Any]:
+    row = tx.one("SELECT subject,material_id FROM profile_revisions WHERE id=?", (revision,))
+    value = _material(tx, row["material_id"], row["subject"])
+    if not isinstance(value, dict) or not isinstance(value.get("profiles"), dict):
+        raise QueryError("incompatible_run_state", "Invalid recorded Profile Revision")
+    return value
+
+
 def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> list[dict[str, Any]]:
-    sql = """SELECT i.*,t.role,t.model,t.effort,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
+    sql = """SELECT i.*,t.role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
              JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread WHERE a.subject=?"""
     values: tuple[Any, ...] = (subject,)
     if attempt is not None:
@@ -148,18 +177,52 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
     for row in result:
         if row.pop("thread_subject") != subject:
             raise QueryError("incompatible_run_state", "Invocation has a missing or foreign Thread binding")
-        for field in ("allocated_at", "dispatched_at", "started_at", "returned_at", "exited_at"):
-            row[field] = _timestamp(row.get(field))
-        row["process_span_seconds"] = (row["exited_at"] - row["started_at"]
-                                  if row["started_at"] is not None and row["exited_at"] is not None
-                                  and row["exited_at"] >= row["started_at"] else None)
-        row["elapsed_seconds"] = None  # A process interval is not an Agent execution segment.
+        profile = _profile(tx, row["profile_revision"])["profiles"][row["role"]]
+        row.update({"model": profile["model"], "effort": profile["reasoning_effort"], "profile_reference": profile["reference"]})
+        row["allocated_at"] = _timestamp(row["allocated_at"])
+        outputs = _all(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (row["id"],))
+        if not outputs:
+            raise QueryError("incompatible_run_state", "Invocation has no physical output allocation")
+        for output in outputs:
+            for field in ("allocated_at", "dispatched_at", "started_at", "returned_at", "exited_at", "recovery_ready_at"):
+                output[field] = _timestamp(output[field])
+            output["raw_return"] = _material(tx, output["raw_id"], subject)
+            output["failure_evidence"] = _material(tx, output["start_evidence"], subject)
+            output["activity"], output["elapsed_seconds"] = _activity(tx, row["id"], output["ordinal"], subject)
+            output["process_span_seconds"] = (output["exited_at"] - output["started_at"]
+                if output["started_at"] is not None and output["exited_at"] is not None
+                and output["exited_at"] >= output["started_at"] else None)
+            output.pop("context_id")
+            output.pop("process_identity")
+            output.pop("start_evidence")
+        row["outputs"] = outputs
+        row["output_repairs"] = len(outputs) - 1
+        row["output_ordinal"] = outputs[-1]["ordinal"]
+        for field in ("raw_id", "raw_return", "dispatch_state", "started_at", "returned_at", "exited_at", "exit_code", "process_span_seconds"):
+            row[field] = outputs[-1][field]
+        row["elapsed_seconds"] = (sum(output["elapsed_seconds"] for output in outputs)
+                                  if all(output["elapsed_seconds"] is not None for output in outputs) else None)
         row["live_status"] = "unknown"
-        row["raw_return"] = _material(tx, row["raw_id"], subject)
-        # Host observation and transcript are not copied into the public view.
-        row.pop("process_identity", None)
-        row.pop("start_evidence", None)
     return result
+
+
+def _effect_failures(tx: Transaction, subject: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT f.*,e.subject,e.operation,e.status FROM effect_failures f JOIN effects e ON e.id=f.effect"
+    values = () if subject is None else (subject,)
+    rows = _all(tx, sql + (" WHERE e.subject=?" if subject is not None else "") + " ORDER BY f.observed_at,f.effect,f.dispatch_serial", values)
+    for row in rows:
+        row["observed_at"] = _timestamp(row["observed_at"])
+        row["evidence"] = _material(tx, row["evidence"], row["subject"])
+    return rows
+
+
+def _resync(tx: Transaction, subject: str) -> dict[str, Any]:
+    allowance = tx.one("SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,))
+    snapshots = tx.rows("SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
+    snapshot = dict(snapshots[0]) if snapshots else None
+    return {"generation": allowance["generation"], "used": allowance["used"], "limit": allowance["allowance"],
+            "window": snapshot["window"] if snapshot else None, "open": bool(snapshot and snapshot["open"]),
+            "source_sha": snapshot["source_sha"] if snapshot else None, "target_sha": snapshot["target_sha"] if snapshot else None}
 
 
 def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
@@ -194,6 +257,7 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
             "integrated_sha": job["integrated_sha"], "pr_number": job["pr_number"],
             "ci_evidence": _material(tx, job["ci_failure"], subject),
             "gates": gates, "budgets": budgets, "pending_attempt": pending, "review": review, "required_checks": checks,
+            "integration_resync": _resync(tx, subject), "effect_failures": _effect_failures(tx, subject),
             "pending_writes": effects, "delivery_cleanup": dict(cleanup[0]) if cleanup else None}
 
 
@@ -208,7 +272,7 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]]) ->
             action = ("requeue" if gate["code"] == "requeue_required" else "resume"
                       if gate["code"] in {"human_blocker", "operator_stopped", "execution_failed", "worker_unavailable",
                                           "review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted",
-                                          "supervision_timeout", "ci_investigation_paused"} else "inspect")
+                                          "supervision_timeout", "ci_investigation_paused", "integration_resync_exhausted"} else "inspect")
             result.append({"subject": job["subject"], "issue": job["issue"], "generation": job["generation"],
                            "scope": "ticket" if job["kind"] == "ticket" else "run", "reason": gate["code"],
                            "action": action, "evidence": gate["detail"]})
@@ -330,15 +394,15 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
     return {"active_ticket": selected["issue"] if selected and selected["kind"] == "ticket" else None,
             "worker": worker, "run_repair": None, "candidate_sha": selected["candidate_sha"] if selected else None,
             "pr_number": selected["pr_number"] if selected else None, "review_budget": review_budget,
-            "integration_resync": None,
+            "integration_resync": selected["integration_resync"] if selected else None,
             "integration_development": None if integration is None else {"window": integration["window"], "used": integration["developments_used"], "limit": integration["development_limit"], "renewals": None},
             "ci_recovery": None if ci is None else {"window": ci["window"], "developments_used": ci["developments_used"],
                 "development_limit": ci["development_limit"], "reviewer_invocations": ci["reviews_used"],
-                "review_required": None, "failure_evidence": selected["ci_evidence"] if selected else None},
+                "review_required": bool(ci["review_required"]), "failure_evidence": selected["ci_evidence"] if selected else None},
             "agent_invocation": invocation, "semantic_agent_attempt": attempt,
-            "output_attempt": None if invocation is None else {"invocation_started_at": invocation["started_at"], "attempt_count": None, "repairs_used": invocation["output_repairs"]},
+            "output_attempt": None if invocation is None else {"invocation_started_at": invocation["started_at"], "attempt_count": len(invocation["outputs"]), "repairs_used": invocation["output_repairs"]},
             "budget_window": attempt["window"] if attempt else ordinary["window"] if ordinary else None,
-            "publication_operation_retry": None, "latest_resume": None, "lifecycle_action": None,
+            "publication_operation_retry": selected["effect_failures"] if selected else [], "latest_resume": None, "lifecycle_action": None,
             "scope_change": run["blocked"] if run["blocked"] == "unsupported_scope_change" else None,
             "abandonment": None, "supervision": None,
             "delivery_cleanup": None if not cleanups else {"status": "cleanup_pending" if cleanup_items else "completed",
@@ -391,10 +455,17 @@ def _history_views(data: Mapping[str, Any], subjects: list[dict[str, Any]], even
     for event in events:
         job = owners[event["subject"]]
         moment = event["created_at"]
+        snapshot = event["status"]
+        event_status = None
+        if snapshot is not None and event["phase"] is not None:
+            observed = {"kind": job["kind"], "phase": event["phase"],
+                        "gates": [{"code": code} for code in snapshot["gates"]]}
+            event_status = _public_status(snapshot, [observed], event["phase"] in {"complete", "abandoned"})
         projected.append({"at": datetime.fromtimestamp(moment, UTC).isoformat() if moment is not None else None,
             "kind": event["kind"], "object": f"Ticket #{job['issue']}" if job["kind"] == "ticket" else f"Parent Issue #{job['issue']}" if job["kind"] == "parent_only" else "Final Run",
             "subject": job["subject"], "generation": event["generation"], "identity": event["identity"],
-            "phase": None, "status": None, "role": None, "round": None,
+            "phase": _public_phase(event["phase"]) if event["phase"] is not None else None,
+            "purpose": event["purpose"], "status": event_status, "status_snapshot": snapshot, "role": None, "round": None,
             "details": [] if event["evidence"] is None else [event["evidence"]]})
     return {"events": projected, "execution_activity": "unknown",
             "scheduler": {"activity": "unknown", "failure": None}, "multi_ticket": data["multi_ticket"],
@@ -430,7 +501,7 @@ def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[s
                 "reviewer_invocations": required.get("reviews_used"), "review_limit": required.get("review_limit"),
                 "ci_developments_used": ci.get("developments_used"), "ci_development_limit": ci.get("development_limit"),
                 "integration_development_used": integration.get("developments_used"), "integration_development_limit": integration.get("development_limit"),
-                "integration_resync_used": None, "integration_resync_limit": None},
+                "integration_resync_used": job["integration_resync"]["used"], "integration_resync_limit": job["integration_resync"]["limit"]},
             "pause_requested": None, "resume_accepted": None, "stop_wait_reason": None, "supervision": None, "recovery_action": None})
     return {"executor_activity": "unknown", "work_concurrency_limit": run["concurrency"],
             "work_slots_active": len(active), "integration_holder": run["integration_holder"],
@@ -447,7 +518,35 @@ def _control_history(tx: Transaction) -> list[dict[str, Any]]:
     return actions
 
 
-def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limit: int | None = None,
+
+def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
+    from agent_run.github_identity import describe_identity
+    from agent_run.messages import text
+
+    profiles = _profile(tx, run["profile_revision"])
+    rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
+    inputs = _material(tx, rows[0]["material_id"], rows[0]["subject"]) if rows else {}
+    if not isinstance(inputs, dict):
+        raise QueryError("incompatible_run_state", "Invalid frozen creation inputs")
+    bindings = []
+    for thread in _all(tx, "SELECT * FROM threads ORDER BY rowid"):
+        profile = _profile(tx, thread["profile_revision"])["profiles"][thread["role"]]
+        bindings.append({"thread_identity": thread["id"], "thread_id": thread["backend_id"],
+                         "role": thread["role"], "profile_revision": thread["profile_revision"],
+                         "model": profile["model"], "reasoning_effort": profile["reasoning_effort"],
+                         "reference": profile["reference"]})
+    return {"result": "settings", "scope": "run", "run_id": run["id"], "language": run["language"],
+            "repository_root": run["repository_root"], "policy": json.loads(run["policy"]),
+            "github": describe_identity(inputs["worker_identity"], run["language"], inputs.get("runner_identity"))
+                      if inputs.get("worker_identity") is not None else None,
+            "notifications": inputs.get("notifications"), "prompt_resources": inputs.get("prompt_resources"),
+            "provenance": inputs.get("provenance"),
+            "profile": {"preset": profiles.get("preset"), "profiles": profiles["profiles"], "profile_revision": run["profile_revision"]},
+            "source": "run_snapshot", "bindings": bindings, "message": text("settings.run_notice", language=run["language"]),
+            "unavailable_facts": [key for key in ("worker_identity", "runner_identity", "notifications", "prompt_resources", "provenance")
+                                  if inputs.get(key) is None]}
+
+def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
          expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
     if after < 0 or (limit is not None and not 1 <= limit <= 128):
         raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
@@ -461,6 +560,11 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
             language = run.get("language")
             if language not in {"zh", "en"}:
                 raise QueryError("recovery_materials_missing", "Run language is missing or invalid; personal defaults cannot replace it")
+            if kind == "settings":
+                settings = _frozen_settings(tx, run)
+                if len(json.dumps(settings, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
+                    raise QueryError("query_limit", "Public response exceeds its bounded limit")
+                return QueryDocument("settings", language, settings)
             subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
             actions = _operator_actions(run, subjects)
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
@@ -492,8 +596,7 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
             data["progress"] = _progress(data)
             data["gate"] = "required_checks" if status == "waiting_checks" else None
-            data["unavailable_facts"] = ["host_liveness", "notifications", "agent_execution_segments",
-                                         "publication_failure_count", "output_attempt_history"]
+            data["unavailable_facts"] = ["host_liveness", "notifications", "host_activity_segments"]
             if kind == "history":
                 events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
                           [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
@@ -503,6 +606,7 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                             or not isinstance(event["kind"], str) or not isinstance(event["identity"], str)):
                         raise QueryError("incompatible_run_state", "Invalid history event identity")
                     event["created_at"] = _timestamp(event.get("created_at"))
+                    event["status"] = json.loads(event["status"]) if event["status"] is not None else None
                     event["evidence"] = _material(tx, event["material_id"], event["subject"])
                 next_after = events[-1]["position"] if events else after
                 has_more = bool(tx.rows("SELECT position FROM history WHERE position>? LIMIT 1", (next_after,)))
@@ -515,13 +619,14 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                 resumes = [{"action_id": action["id"], "subject": action["subject"], "status": action["status"],
                             "payload": action["payload"], "receipt": action["receipt"], "started_at": None}
                            for action in control if action["kind"] == "resume"]
+                all_invocations = [invocation for job in subjects for invocation in _invocations(tx, job["subject"])]
                 data.update({"timeline": events, "timeline_continuation": [],
                              "semantic_agent_attempts": attempts,
-                             "agent_invocations": [invocation for job in subjects for invocation in _invocations(tx, job["subject"])],
-                             "publication_operation_retries": None,
+                             "agent_invocations": all_invocations,
+                             "publication_operation_retries": _effect_failures(tx),
                              "effect_operations": _all(tx, "SELECT id,subject,operation,attempts,status FROM effects ORDER BY rowid"),
                              "budget_windows": [budget for job in subjects for budget in job["budgets"]],
-                             "output_attempts": None, "agent_resumes": resumes, "resume_audit": resumes,
+                             "output_attempts": [dict(output, subject=invocation["subject"]) for invocation in all_invocations for output in invocation["outputs"]], "agent_resumes": resumes, "resume_audit": resumes,
                              "actions": control,
                              "history_page": {"after": after, "next_after": next_after, "has_more": has_more}})
                 data.update(_history_views(data, subjects, events, attempts))

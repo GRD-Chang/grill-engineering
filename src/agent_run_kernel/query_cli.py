@@ -79,7 +79,7 @@ def _cwd_repository() -> str | None:
 
 def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
     default_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "agent-run"
-    roots = [parsed.state_dir] if parsed.state_dir is not None else [parsed.data_root or default_root]
+    roots = [parsed.state_dir] if parsed.state_dir is not None else [getattr(parsed, "data_root", None) or default_root]
     result: dict[str, dict[str, Any]] = {}
     for root in roots:
         for candidate in discover(root):
@@ -121,7 +121,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
         if parsed.command in {"settings", "policy"}:
-            settings = personal_settings.execute(parsed)
+            if parsed.command == "settings" and parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
+                candidate = _select(parsed, _candidates(parsed))[0]
+                document = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
+                                expected_repository=candidate["repository"].lower())
+                settings = dict(document.data)
+                language = document.language
+            else:
+                settings = personal_settings.execute(parsed)
             render_settings(settings, as_json=parsed.command == "policy" or parsed.as_json, stream=sys.stdout)
             return 0
         selected = _select(parsed, _candidates(parsed))

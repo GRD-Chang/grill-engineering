@@ -245,6 +245,6 @@ def render_settings(values: Mapping[str, Any], *, as_json: bool, stream: TextIO)
         print(json.dumps(values, ensure_ascii=False, sort_keys=True), file=stream)
         return
     language = str(values["language"])
-    print(text("settings.personal_title", language=language), file=stream)
+    print(text("settings.run_title" if values.get("scope") == "run" else "settings.personal_title", language=language), file=stream)
     for line in _setting_lines(values, language):
         print(safe_text(line), file=stream)

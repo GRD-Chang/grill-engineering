@@ -218,6 +218,6 @@ def test_run_settings_are_not_answered_with_current_personal_defaults(personal: 
     before = personal.read_bytes()
     code, result = _call(main, ["settings", "show", "--run", "not-imported", "--json"], capsys)
     assert code == 2 and result["result"] == "error"
-    assert result["diagnostics"][0]["code"] == "recovery_materials_missing"
+    assert result["diagnostics"][0]["code"] == "run_locator_missing"
     assert "future-only" not in json.dumps(result)
     assert personal.read_bytes() == before
