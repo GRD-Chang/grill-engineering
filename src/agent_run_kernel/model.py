@@ -84,6 +84,7 @@ class Delivery:
     target_ref: str
     dependencies: tuple[str, ...] = ()
     completion_revision: str = "no-tickets"
+    checkout: str = ""
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,8 @@ class AgentCall:
     execution: Execution
     context: Mapping[str, Any]
     profile: Profile
+    mode: str = "fresh"
+    reported_thread: str | None = None
 
 
 @dataclass(frozen=True)

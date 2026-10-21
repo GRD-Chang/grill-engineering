@@ -29,7 +29,7 @@ CREATE TABLE runs (
  parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
  concurrency INTEGER NOT NULL CHECK(concurrency>0), policy BLOB NOT NULL,
  executor TEXT, epoch INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0,
- final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0
+ final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT
 );
 CREATE TABLE subjects (
  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
@@ -43,6 +43,7 @@ CREATE TABLE subjects (
  publication_sha TEXT, publication_tree TEXT, pr_number INTEGER,
  checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
+ ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
@@ -63,7 +64,7 @@ CREATE TABLE material (
 );
 CREATE TABLE threads (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), role TEXT NOT NULL,
- model TEXT NOT NULL, effort TEXT NOT NULL
+ model TEXT NOT NULL, effort TEXT NOT NULL, backend_id TEXT UNIQUE
 );
 CREATE TABLE attempts (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
@@ -72,7 +73,7 @@ CREATE TABLE attempts (
  base_sha TEXT NOT NULL, candidate_sha TEXT, candidate_tree TEXT, expected_tree TEXT,
  completion_revision TEXT NOT NULL, context_id TEXT NOT NULL REFERENCES material(id),
  current_invocation TEXT, result_id TEXT REFERENCES material(id), status TEXT NOT NULL,
- accounted INTEGER NOT NULL DEFAULT 0, outcome TEXT, UNIQUE(subject,ordinal)
+ accounted INTEGER NOT NULL DEFAULT 0, outcome TEXT, new_thread INTEGER NOT NULL DEFAULT 0, UNIQUE(subject,ordinal)
 );
 CREATE TABLE invocations (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
@@ -104,7 +105,7 @@ CREATE TABLE effects (
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
  attempts INTEGER NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent');
+CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent','observed');
 CREATE TABLE checks (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), pr_number INTEGER NOT NULL,
  head_sha TEXT NOT NULL, result TEXT NOT NULL, material_id TEXT NOT NULL REFERENCES material(id)
