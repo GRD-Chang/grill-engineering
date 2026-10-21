@@ -200,6 +200,9 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
 
 
 def render(document: QueryDocument, *, style: Literal["json", "plain", "rich"], details: bool, stream: TextIO) -> None:
+    if document.kind == "settings":
+        render_settings(document.data, as_json=style == "json", stream=stream)
+        return
     if style == "json":
         encoded = json.dumps(document.data, ensure_ascii=False, sort_keys=True, allow_nan=False)
         if len(encoded.encode()) > QUERY_LIMIT:

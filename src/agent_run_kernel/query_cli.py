@@ -123,6 +123,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if parsed.command in {"settings", "policy"}:
             if parsed.command == "settings" and parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
                 candidate = _select(parsed, _candidates(parsed))[0]
+                if candidate.get("language") in {"zh", "en"}:
+                    language = candidate["language"]
                 document = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
                                 expected_repository=candidate["repository"].lower())
                 settings = dict(document.data)
