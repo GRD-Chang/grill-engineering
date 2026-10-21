@@ -17,7 +17,7 @@ import time
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
-from agent_run.agent_profiles import ProfileOverrides, resolve_profiles
+from agent_run.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
 from agent_run.github_identity import validate_identity_snapshot
 from agent_run.prompt_resources import validate_resources
 
@@ -47,8 +47,14 @@ class Kernel:
             role.value: {"model": getattr(spec.policy, role.value + "_profile").model,
                          "reasoning_effort": getattr(spec.policy, role.value + "_profile").effort,
                          "reference": None, "provenance": {"source": "explicit_policy"}} for role in Role}}
-                    if spec.inputs is None else resolve_profiles(current=spec.inputs.profiles))
+                    if spec.inputs is None else dict(spec.inputs.profiles))
         if spec.inputs is not None:
+            validate_profile_options(preset=profiles.get("preset"))
+            checked = resolve_profiles(current=profiles)
+            if any(field not in profiles["profiles"][role.value]
+                   or profiles["profiles"][role.value][field] != checked["profiles"][role.value][field]
+                   for role in Role for field in ("model", "reasoning_effort", "reference")):
+                raise KernelError("creation_profile_binding_changed")
             if spec.language is None:
                 raise KernelError("creation_language_required")
             validate_resources(dict(spec.inputs.prompt_resources))
