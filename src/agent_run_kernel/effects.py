@@ -10,14 +10,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .model import Commit, KernelError
 
 
 class LocalGit:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, authorize: Callable[[], None] | None = None) -> None:
         self.root = root
+        self.authorize = authorize
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                          "GIT_AUTHOR_NAME": "Offline Publisher", "GIT_AUTHOR_EMAIL": "offline@example.invalid",
@@ -27,6 +28,9 @@ class LocalGit:
     def run(self, *arguments: str, cwd: Path | None = None, input_text: str | None = None,
             check: bool = True) -> subprocess.CompletedProcess[str]:
         command = ("git", "-C", str(cwd or self.root), *arguments)
+        if arguments and arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge"}:
+            if self.authorize is not None:
+                self.authorize()
         result = subprocess.run(command, input=input_text, text=True, capture_output=True,
                                 timeout=30, env=self.env, check=False)
         if len(result.stdout.encode()) + len(result.stderr.encode()) > 4 * 1024 * 1024:
@@ -35,6 +39,13 @@ class LocalGit:
             raise KernelError("git_operation_failed", repr({"command": command, "returncode": result.returncode,
                               "stdout": result.stdout, "stderr": result.stderr}))
         return result
+
+    def conflict_checkout(self, checkout: Path, target: str) -> dict[str, object]:
+        result = self.run("merge", "--no-commit", "--no-ff", target, cwd=checkout, check=False)
+        return {"command": ["git", "merge", "--no-commit", "--no-ff", target], "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr,
+                "head": self.run("rev-parse", "HEAD", cwd=checkout).stdout.strip(),
+                "merge_head": self.run("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=checkout, check=False).stdout.strip()}
 
     def commit(self, sha: str) -> Commit:
         resolved = self.run("rev-parse", "--verify", f"{sha}^{{commit}}").stdout.strip()

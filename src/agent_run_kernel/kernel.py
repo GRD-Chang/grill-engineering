@@ -11,7 +11,8 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+import time
+from typing import Any, Callable
 from uuid import uuid4
 
 from .model import (
@@ -28,6 +29,7 @@ def identity() -> str:
 class Kernel:
     def __init__(self, path: Path) -> None:
         self.storage = Storage(path)
+        self.clock: Callable[[], float] = time.time
 
     @classmethod
     def create(cls, path: Path, spec: RunSpec) -> Kernel:
@@ -55,7 +57,7 @@ class Kernel:
                     Purpose.REQUIREMENTS: (spec.policy.ticket_rounds + 1, spec.policy.ticket_rounds)
                     if delivery.kind == DeliveryKind.TICKET else (spec.policy.parent_rounds, spec.policy.parent_rounds),
                     Purpose.INTEGRATION: (spec.policy.run_repairs, spec.policy.run_repairs + 1)
-                    if final else (spec.policy.integration_developments,
+                    if final else (spec.policy.run_repairs if delivery.kind == DeliveryKind.PARENT_ONLY else spec.policy.integration_developments,
                                    0 if delivery.kind == DeliveryKind.TICKET else None),
                     Purpose.CI: (spec.policy.ci_developments, None),
                 }
@@ -70,11 +72,38 @@ class Kernel:
     def claim_executor(self, owner: str) -> Execution:
         with self.storage.transaction() as tx:
             run = tx.one("SELECT * FROM runs")
+            if run["stopped"]:
+                raise KernelError("operator_stopped")
+            if tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND status='pending'", (run["id"],)):
+                raise KernelError("executor_exit_unproven")
             if run["executor"] is not None and run["executor"] != owner:
                 raise KernelError("executor_exit_unproven")
             epoch = run["epoch"] if run["executor"] == owner else run["epoch"] + 1
             tx.execute("UPDATE runs SET executor=?,epoch=?", (owner, epoch))
             return Execution(run["id"], owner, epoch)
+
+    def confirm_executor_exit(self, execution: Execution, exited_invocations: tuple[str, ...] = ()) -> None:
+        """Consume exact Host exit evidence; no PID guessing or replacement claim.
+
+        The caller must have observed the old Executor and all listed Workers
+        exit. The isolated driver supplies synthetic Host evidence; a real Host
+        adapter is deliberately outside this exploration's implemented surface.
+        """
+        with self.storage.transaction() as tx:
+            retired = tx.one("SELECT * FROM retired_executors WHERE run_id=? AND owner=? AND epoch=?",
+                             (execution.run_id, execution.owner, execution.epoch))
+            if retired["status"] == "exited":
+                return
+            leases = tx.rows("SELECT * FROM leases WHERE executor=? AND epoch=?", (execution.owner, execution.epoch))
+            if {row["invocation"] for row in leases} != set(exited_invocations):
+                raise KernelError("worker_exit_unproven")
+            for lease in leases:
+                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=? AND status='running'", (lease["invocation"],))
+                tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (lease["id"], lease["invocation"]))
+            tx.execute("UPDATE retired_executors SET status='exited' WHERE run_id=? AND owner=? AND epoch=?",
+                       (execution.run_id, execution.owner, execution.epoch))
+            tx.execute("UPDATE runs SET executor=NULL WHERE id=? AND executor=? AND epoch>?",
+                       (execution.run_id, execution.owner, execution.epoch))
 
     def advance(self, subject: str, execution: Execution, world: World, *, allow_agent: bool = True) -> Step:
         with self.storage.transaction() as tx:
@@ -153,6 +182,22 @@ class Kernel:
                 raise KernelError("thread_identity_changed")
             tx.execute("UPDATE threads SET backend_id=? WHERE id=?", (reported_thread, call.thread_id))
 
+    def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
+        """Read-only authority guard for each real successor mutation in an adapter."""
+        with self.storage.transaction(write=False) as tx:
+            run, job = self._owned(tx, effect.subject, execution)
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            if (row["status"] != "sent" or run["stopped"] or run["blocked"] or self._gates(tx, effect.subject)
+                    or row["generation"] != job["generation"] or row["revision"] != world.revision
+                    or row["parent_revision"] != world.parent_revision or row["graph_revision"] != world.graph_revision
+                    or job["completion_revision"] != world.completion_revision
+                    or self._effect(tx, row, execution) != effect):
+                raise KernelError("operation_cancelled")
+            if effect.operation in {"integrate", "run_branch", "publication_commit", "push", "pr_write", "merge"} and effect.base.sha != world.target.sha:
+                raise KernelError("operation_boundary_changed")
+            if effect.operation == "merge" and not self._merge_authority(tx, run, job, world):
+                raise KernelError("merge_authority_changed")
+
     def control(self, kind: str, action_id: str, *, subject: str | None = None,
                 world: World | None = None, message: str | None = None, new_thread: bool = False) -> str:
         """Apply one explicit operator intent atomically, with its application receipt.
@@ -179,7 +224,12 @@ class Kernel:
                        (action_id, run["id"], kind, subject, payload_id))
             if kind == "stop":
                 if job is None:
-                    tx.execute("UPDATE runs SET stopped=1 WHERE id=?", (run["id"],))
+                    if not run["stopped"] and run["executor"] is not None:
+                        tx.execute("INSERT INTO retired_executors VALUES (?,?,?,'pending')",
+                                   (run["id"], run["executor"], run["epoch"]))
+                        tx.execute("UPDATE runs SET stopped=1,epoch=epoch+1 WHERE id=?", (run["id"],))
+                    else:
+                        tx.execute("UPDATE runs SET stopped=1 WHERE id=?", (run["id"],))
                     targets = tx.rows("SELECT id FROM subjects WHERE run_id=?", (run["id"],))
                 else:
                     self._gate(tx, subject, "operator_stopped")
@@ -191,6 +241,8 @@ class Kernel:
                     self._release_integration(tx, target_id)
             elif kind == "resume":
                 if job is None:
+                    if run["executor"] is not None:
+                        raise KernelError("executor_exit_unproven")
                     if tx.one("SELECT count(*) FROM leases")[0]:
                         raise KernelError("worker_exit_unproven")
                     if not run["stopped"]:
@@ -217,13 +269,21 @@ class Kernel:
                                 tx.execute("UPDATE attempts SET result_id=NULL,status='continuing' WHERE id=?", (job["current_attempt"],))
                         elif code == "publication_retry_exhausted":
                             tx.execute("UPDATE effects SET attempts=0 WHERE subject=? AND status='sent'", (subject,))
-                        elif code not in {"operator_stopped", "execution_failed", "write_result_unknown", "ci_investigation_paused"}:
+                        elif code == "write_conflict":
+                            pending_write = self._pending_effect(tx, subject)
+                            if pending_write is None or pending_write["status"] != "observed":
+                                raise KernelError("unresolved_write_conflict")
+                        elif code not in {"operator_stopped", "execution_failed", "write_result_unknown", "ci_investigation_paused", "supervision_timeout"}:
                             continue
                         tx.execute("DELETE FROM gates WHERE subject=? AND code=?", (subject, code))
                     if new_thread and job["current_attempt"]:
                         tx.execute("UPDATE attempts SET new_thread=1 WHERE id=?", (job["current_attempt"],))
                     if job["phase"] in {"development", "review", "publish"}:
                         self._ready(tx, subject, "work_queue")
+                    tx.execute("DELETE FROM waits WHERE subject=?", (subject,))
+                    if job["grant_id"] and job["phase"] in {"merge", "completion_comment", "close"}:
+                        tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
+                        tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
             else:
                 if job is None or world is None or job["phase"] != "approval" or job["kind"] == DeliveryKind.TICKET:
                     raise KernelError("no_approval_boundary")
@@ -255,13 +315,16 @@ class Kernel:
         old = tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (job["id"], purpose))
         tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND window=?", (job["id"], purpose, old["window"]))
         developments, reviews, limit = 0, 0, old["development_limit"]
+        if purpose == Purpose.CI:
+            reviews = old["reviews_used"]  # CI Reviewer count is cumulative, not a renewable quota.
         if purpose == Purpose.INTEGRATION and job["kind"] == DeliveryKind.FINAL_RUN:
             developments = 0 if old["developments_used"] >= old["development_limit"] else old["developments_used"]
             reviews = 0 if old["review_limit"] is not None and old["reviews_used"] >= old["review_limit"] else old["reviews_used"]
         if purpose == Purpose.INTEGRATION and job["kind"] != DeliveryKind.FINAL_RUN:
             # This policy extends an accumulated allowance instead of erasing use.
             developments, reviews = old["developments_used"], old["reviews_used"]
-            limit += self._policy(run).integration_developments
+            policy = self._policy(run)
+            limit += policy.run_repairs if job["kind"] == DeliveryKind.PARENT_ONLY else policy.integration_developments
         tx.execute("INSERT INTO budgets VALUES (?,?,?,?,?,?,?,1)",
                    (job["id"], purpose, old["window"] + 1, developments, reviews, limit, old["review_limit"]))
         self._event(tx, job["id"], "budget_renewed", f"{purpose}:{old['window'] + 1}")
@@ -283,6 +346,14 @@ class Kernel:
                 else {"operation": effect["operation"], "status": effect["status"], "id": effect["id"]},
                 "budgets": {row["purpose"]: {key: row[key] for key in ("window", "developments_used", "reviews_used", "development_limit", "review_limit")} for row in budgets},
             }
+
+    def scheduling(self) -> dict[str, Any]:
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT concurrency,integration_holder FROM runs")
+            return {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
+                    "active": [dict(row) for row in tx.rows("SELECT id,subject,invocation FROM leases ORDER BY subject")],
+                    "work_fifo": [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")],
+                    "integration_fifo": [row[0] for row in tx.rows("SELECT subject FROM integration_queue ORDER BY ready")]}
 
     def history(self, subject: str, *, after: int = 0, limit: int = 128) -> list[dict[str, Any]]:
         if not 1 <= limit <= 128:
@@ -426,6 +497,7 @@ class Kernel:
             "repository": run["repository"], "parent_issue": run["parent_issue"], "issue": job["issue"],
             "scope": job["kind"], "generation": job["generation"], "role": role.value,
             "purpose": job["purpose"], "revision": job["revision"], "parent_revision": run["parent_revision"],
+            "repair_source": job["repair_source"],
             "graph_revision": run["graph_revision"], "completion_revision": job["completion_revision"],
             "base_sha": job["base_sha"] if job["purpose"] == Purpose.REQUIREMENTS else world.target.sha,
             "candidate_sha": job["candidate_sha"], "candidate_tree": job["candidate_tree"], "checkout": job["checkout"],
@@ -470,6 +542,7 @@ class Kernel:
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (attempt["id"], subject))
             if outcome == "fail":
                 tx.execute("UPDATE subjects SET last_failure=? WHERE id=?", (attempt["result_id"], subject))
+                tx.execute("UPDATE subjects SET repair_source=? WHERE id=?", ("required_checks" if job["purpose"] == Purpose.CI else "acceptance", subject))
                 phase = "development"
                 self._release_integration(tx, subject)
             else:
@@ -519,9 +592,14 @@ class Kernel:
         if phase == "publication_commit":
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
             narrative = json.loads(tx.get(attempt["result_id"], subject))
+            parents = [job["source_sha"]]
+            if (job["kind"] == DeliveryKind.PARENT_ONLY and world.target.sha != job["source_sha"]
+                    and (world.target.sha, job["source_sha"]) not in world.ancestry):
+                parents.append(world.target.sha)
             return self._prepare_effect(tx, run, job, execution, world, "publication_commit", before=job["source_sha"],
                                         payload={"commit_message": narrative["commit_message"], "title": narrative["pr_title"],
-                                                 "body": narrative["pr_body_markdown"]})
+                                                 "body": narrative["pr_body_markdown"], "parents": parents,
+                                                 "reuse_sha": job["integrated_sha"] if job["kind"] == DeliveryKind.FINAL_RUN else None})
         if phase == "push":
             if job["source_sha"] == job["publication_sha"]:
                 tx.execute("UPDATE subjects SET phase='pr',version=version+1 WHERE id=?", (subject,))
@@ -539,16 +617,17 @@ class Kernel:
                 return Step("paused", subject, "published_head")
             checks = world.checks
             if checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]:
-                return Step("waiting", subject, "checks_unknown")
+                return self._wait(tx, run, job, "required_checks", 2700)
             material = tx.put(subject, "required_checks", wire_json(asdict(checks)))
             check_id = material
             tx.execute("INSERT OR IGNORE INTO checks VALUES (?,?,?,?,?,?)", (check_id, subject, checks.pr_number,
                        checks.head_sha, checks.result, material))
             tx.execute("UPDATE subjects SET checks_id=? WHERE id=?", (check_id, subject))
             if checks.result in {"pending", "unknown"}:
-                return Step("waiting", subject, "required_checks")
+                return self._wait(tx, run, job, "required_checks", 2700)
+            tx.execute("DELETE FROM waits WHERE subject=? AND kind='required_checks'", (subject,))
             if checks.result == "fail":
-                tx.execute("UPDATE subjects SET phase='development',purpose='ci',ci_failure=?,last_failure=?,grant_id=NULL,integrated_sha=NULL,integrated_tree=NULL,version=version+1 WHERE id=?",
+                tx.execute("UPDATE subjects SET phase='development',purpose='ci',repair_source='required_checks',ci_failure=?,last_failure=?,grant_id=NULL,integrated_sha=NULL,integrated_tree=NULL,version=version+1 WHERE id=?",
                            (material, material, subject))
                 self._release_integration(tx, subject)
                 self._event(tx, subject, "ci_failed", check_id, material)
@@ -562,13 +641,25 @@ class Kernel:
                 return Step("paused", subject, "published_head")
             return Step("approval", subject, "explicit_approval_required")
         if phase == "merge":
-            if not self._published(tx, run, job, world) or not self._merge_authority(tx, run, job, world):
+            if not self._published(tx, run, job, world):
+                self._finish_final_failure(tx, run)
+                return Step("paused", subject, "merge_authority")
+            if world.checks is None or world.checks.result in {"pending", "unknown"}:
+                return self._wait(tx, run, job, "required_checks", 2700)
+            if world.checks.result == "fail":
+                self._finish_final_failure(tx, run, "updating")
+                tx.execute("UPDATE subjects SET phase='checks',grant_id=NULL WHERE id=?", (subject,))
+                return Step("progress", subject)
+            if not self._merge_authority(tx, run, job, world):
+                self._finish_final_failure(tx, run)
+                self._gate(tx, subject, "approval_revalidation_failed")
                 return Step("paused", subject, "merge_authority")
             publication = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
             narrative = json.loads(tx.get(publication[0], subject))
             return self._prepare_effect(tx, run, job, execution, world, "merge", before=world.target.sha,
                                         after=job["publication_sha"], payload={"method": "squash" if job["kind"] == DeliveryKind.TICKET else "merge",
-                                        "commit_message": narrative["commit_message"]})
+                                        "commit_message": narrative["commit_message"],
+                                        "parents": [world.target.sha] + ([] if job["kind"] == DeliveryKind.TICKET else [job["publication_sha"]])})
         if phase == "completion_comment":
             return self._prepare_effect(tx, run, job, execution, world, "completion_comment", before=job["merge_sha"],
                                         payload={"issue": job["issue"], "merge_sha": job["merge_sha"], "gate_mode": job["gate_mode"]})
@@ -579,6 +670,21 @@ class Kernel:
 
     def _last_attempt(self, tx: Transaction, subject: str, role: Role) -> str:
         return str(tx.one("SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1", (subject, role.value))[0])
+
+    def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, kind: str, seconds: int) -> Step:
+        deadline = tx.rows("SELECT deadline FROM waits WHERE subject=? AND kind=?", (job["id"], kind))
+        if not deadline:
+            tx.execute("INSERT INTO waits VALUES (?,?,?)", (job["id"], kind, self.clock() + seconds))
+        elif self.clock() >= deadline[0][0]:
+            self._gate(tx, job["id"], "supervision_timeout")
+            self._finish_final_failure(tx, run)
+            return Step("paused", job["id"], "supervision_timeout")
+        return Step("waiting", job["id"], kind)
+
+    def _finish_final_failure(self, tx: Transaction, run: sqlite3.Row, result: str = "failed") -> None:
+        if run["final_action"]:
+            tx.execute("UPDATE actions SET status=? WHERE id=?", (result, run["final_action"]))
+            tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
 
     def _integration_seat(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> bool:
         if job["kind"] != DeliveryKind.TICKET:
@@ -636,14 +742,18 @@ class Kernel:
                 return False
             if not self._current(tx, job, run, world):
                 return False
-            if (effect.operation in {"run_branch", "publication_commit", "push", "pr_write", "merge"}
+            if (effect.operation in {"integrate", "run_branch", "publication_commit", "push", "pr_write", "merge"}
                     and row["base_sha"] != world.target.sha):
+                tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                if effect.operation != "integrate":
+                    self._update_boundary(tx, run, job)
                 return False
             if (row["generation"] != job["generation"] or row["parent_revision"] != run["parent_revision"]
                     or row["graph_revision"] != run["graph_revision"] or row["revision"] != job["revision"]):
                 return False
             if effect.operation == "merge" and (not self._published(tx, run, job, world)
                                                    or not self._merge_authority(tx, run, job, world)):
+                tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
                 return False
             tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
             self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
@@ -684,6 +794,7 @@ class Kernel:
                 return Step("progress", effect.subject)
             evidence = tx.put(effect.subject, "effect_observation", wire_json(asdict(result)))
             self._gate(tx, effect.subject, "write_conflict" if result.disposition == "third" else "write_result_unknown", evidence=evidence)
+            self._finish_final_failure(tx, run)
             return Step("paused", effect.subject, result.disposition)
 
     def _apply_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, world: World) -> Step:
@@ -692,8 +803,10 @@ class Kernel:
         commit = result["commit"]
         if result["disposition"] == "failure":
             tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
-            tx.execute("UPDATE subjects SET phase='development',purpose='integration',resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,version=version+1 WHERE id=?",
-                       (job["purpose"], row["receipt_id"], subject))
+            purpose = Purpose.INTEGRATION.value if operation == "integrate" else job["purpose"]
+            tx.execute("UPDATE subjects SET phase='development',purpose=?,repair_source=?,resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,workspace_sha=?,version=version+1 WHERE id=?",
+                       (purpose, "integration" if operation == "integrate" else "git_integrity", job["purpose"], row["receipt_id"],
+                        job["workspace_sha"] if commit is None else commit["sha"], subject))
             self._release_integration(tx, subject)
             return Step("progress", subject)
         if operation in {"candidate", "integrate", "publication_commit", "merge"} and not commit:
@@ -731,6 +844,10 @@ class Kernel:
                 raise KernelError("integration_receipt_incomplete")
             tx.execute("UPDATE subjects SET integrated_sha=?,integrated_tree=?,workspace_sha=?,expected_tree=?,integration_target=? WHERE id=?",
                        (commit["sha"], commit["tree"], commit["sha"], result["expected_tree"], row["base_sha"], subject))
+            if row["base_sha"] != world.target.sha:
+                tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
+                tx.execute("UPDATE subjects SET phase='integration',version=version+1 WHERE id=?", (subject,))
+                return Step("progress", subject, "integration_snapshot_changed")
             latest = self._job(tx, subject)
             if job["kind"] == DeliveryKind.TICKET:
                 phase = "ready_publication"
@@ -798,20 +915,22 @@ class Kernel:
                 and review["base_sha"] == world.target.sha and review["expected_tree"] == job["expected_tree"]
                 and review["completion_revision"] == job["completion_revision"])
 
-    def _published(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
+    def _published_matches(self, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         pr = world.pr
-        if (pr is None or pr.number != job["pr_number"] or pr.repository != run["repository"]
-                or pr.source_ref != job["source_ref"] or pr.target_ref != job["target_ref"]
-                or pr.head.sha != job["publication_sha"] or pr.head.tree != job["publication_tree"]
-                or pr.base.sha != job["integration_target"] or world.target.sha != pr.base.sha
-                or pr.state not in {"OPEN", "MERGED"}):
+        return (pr is not None and pr.number == job["pr_number"] and pr.repository == run["repository"]
+                and pr.source_ref == job["source_ref"] and pr.target_ref == job["target_ref"]
+                and pr.head.sha == job["publication_sha"] and pr.head.tree == job["publication_tree"]
+                and pr.base.sha == job["integration_target"] and world.target.sha == pr.base.sha and pr.state == "OPEN")
+
+    def _published(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
+        if not self._published_matches(run, job, world):
             self._gate(tx, job["id"], "published_head_changed")
             return False
         return True
 
     def _merge_authority(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         checks = world.checks
-        if (checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]
+        if (not self._published_matches(run, job, world) or checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]
                 or checks.result not in {"pass", "none"} or not job["checks_id"]):
             return False
         recorded = tx.one("SELECT material_id FROM checks WHERE id=?", (job["checks_id"],))

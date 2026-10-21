@@ -43,7 +43,7 @@ CREATE TABLE subjects (
  publication_sha TEXT, publication_tree TEXT, pr_number INTEGER,
  checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
- ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT
+ ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
@@ -90,6 +90,14 @@ CREATE TABLE integration_queue (
 CREATE TABLE leases (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL UNIQUE REFERENCES subjects(id),
  invocation TEXT NOT NULL UNIQUE REFERENCES invocations(id), executor TEXT NOT NULL, epoch INTEGER NOT NULL
+);
+CREATE TABLE retired_executors (
+ run_id TEXT NOT NULL REFERENCES runs(id), owner TEXT NOT NULL, epoch INTEGER NOT NULL,
+ status TEXT NOT NULL, PRIMARY KEY(run_id,owner,epoch)
+);
+CREATE TABLE waits (
+ subject TEXT NOT NULL REFERENCES subjects(id), kind TEXT NOT NULL, deadline REAL NOT NULL,
+ PRIMARY KEY(subject,kind)
 );
 CREATE TABLE gates (
  subject TEXT NOT NULL REFERENCES subjects(id), code TEXT NOT NULL,

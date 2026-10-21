@@ -10,7 +10,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .effects import LocalGit
 from .kernel import Kernel
@@ -109,7 +109,9 @@ class OfflinePort:
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
                      self.git.commit(delivery.target_ref), self.git.commit(delivery.source_ref), pr, checks,
-                     delivery.completion_revision)
+                     delivery.completion_revision,
+                     ((self.git.commit(delivery.target_ref).sha, self.git.commit(delivery.source_ref).sha),)
+                     if self.git.is_ancestor(self.git.commit(delivery.target_ref).sha, self.git.commit(delivery.source_ref).sha) else ())
 
     def _write_pr(self, subject: str, pr: PullRequest) -> None:
         with sqlite3.connect(self.database) as db:
@@ -120,39 +122,46 @@ class OfflinePort:
         with sqlite3.connect(self.database) as db:
             db.execute("INSERT OR REPLACE INTO receipts VALUES (?,?)", (effect.effect_id, wire_json(asdict(result))))
 
-    def execute(self, effect: Effect) -> None:
+    def execute(self, effect: Effect, authorize: Callable[[], None] | None = None) -> None:
         operation = effect.operation
         payload = effect.payload
+        git = LocalGit(self.git.root, authorize)
         commit, pr, expected, raw = None, None, None, {}
         try:
             if operation == "candidate":
-                commit, no_change = self.git.candidate(Path(payload["checkout"]), effect.before_sha, effect.effect_id)
-                raw = {"parents": self.git.parents(commit.sha), "no_change": no_change}
+                commit, no_change = git.candidate(Path(payload["checkout"]), effect.before_sha, effect.effect_id)
+                raw = {"parents": git.parents(commit.sha), "no_change": no_change}
             elif operation == "integrate":
                 if effect.candidate is None:
                     raise KernelError("missing_candidate")
                 commit = effect.candidate
-                if payload["source_sha"]:
-                    commit = self.git.combine(commit.sha, payload["source_sha"], effect.effect_id + "-source")
-                commit = self.git.combine(commit.sha, effect.base.sha, effect.effect_id + "-target")
+                for suffix, target in (("source", payload["source_sha"]), ("target", effect.base.sha)):
+                    if target:
+                        try:
+                            commit = git.combine(commit.sha, target, effect.effect_id + "-" + suffix)
+                        except KernelError as error:
+                            if error.code != "integration_failed":
+                                raise
+                            raw = git.conflict_checkout(Path(payload["checkout"]), target)
+                            self._receipt(effect, EffectResult("failure", commit=self.git.commit(raw["head"]), raw=raw))
+                            return
+                        git.install_checkout(Path(payload["checkout"]), commit.sha)
                 expected = commit.tree
-                self.git.install_checkout(Path(payload["checkout"]), commit.sha)
-                raw = {"parents": self.git.parents(commit.sha)}
+                raw = {"parents": git.parents(commit.sha)}
             elif operation == "publication_commit":
-                if payload["kind"] == DeliveryKind.FINAL_RUN:
-                    commit = self.git.commit(payload["integrated_sha"])
+                if payload["reuse_sha"]:
+                    commit = git.commit(payload["reuse_sha"])
                 else:
-                    parents = [effect.before_sha]
-                    if payload["kind"] == DeliveryKind.PARENT_ONLY and not self.git.is_ancestor(effect.base.sha, effect.before_sha):
-                        parents.append(effect.base.sha)
-                    commit = self.git.make_commit(payload["integrated_tree"], parents, payload["commit_message"])
-                raw = {"parents": self.git.parents(commit.sha)}
+                    commit = git.make_commit(payload["integrated_tree"], payload["parents"], payload["commit_message"])
+                raw = {"parents": git.parents(commit.sha)}
             elif operation in {"push", "run_branch"}:
                 if effect.after_sha is None:
                     raise KernelError("missing_write_target")
-                self.git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
-                commit = self.git.commit(effect.after_sha)
+                git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                commit = git.commit(effect.after_sha)
             elif operation == "pr_write":
+                if authorize is not None:
+                    authorize()
                 prior = self.pull_request(effect.subject)
                 if prior is not None and prior.state != "OPEN":
                     raise KernelError("closed_pull_request")
@@ -166,25 +175,28 @@ class OfflinePort:
                 pr = self.pull_request(effect.subject)
                 if pr is None or pr.head.sha != effect.after_sha or pr.base.sha != effect.before_sha or pr.state != "OPEN":
                     raise KernelError("merge_compare_and_swap")
-                parents = [effect.before_sha]
-                if payload["method"] == "merge":
-                    parents.append(pr.head.sha)
-                commit = self.git.make_commit(pr.head.tree, parents, payload["commit_message"])
-                self.git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
+                commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
+                git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
                 pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
                                  pr.title, pr.body, "MERGED", effect.actor, commit)
                 self._write_pr(effect.subject, pr)
             elif operation == "completion_comment":
+                if authorize is not None:
+                    authorize()
                 with sqlite3.connect(self.database) as db:
                     db.execute("INSERT OR IGNORE INTO comments VALUES (?,?,?,?)",
                                (effect.effect_id, payload["issue"], effect.actor, wire_json(dict(payload))))
             elif operation == "close":
+                if authorize is not None:
+                    authorize()
                 with sqlite3.connect(self.database) as db:
                     db.execute("INSERT OR IGNORE INTO closed VALUES (?,?,?,?)",
                                (payload["issue"], effect.effect_id, effect.actor, payload["merge_sha"]))
             else:
                 raise KernelError("unsupported_offline_verb", operation)
         except KernelError as error:
+            if error.code in {"operation_cancelled", "operation_boundary_changed", "executor_fenced"}:
+                raise
             if operation not in {"candidate", "integrate"}:
                 raise
             self._receipt(effect, EffectResult("failure", raw={"code": error.code, "evidence": str(error)}))
@@ -252,10 +264,27 @@ class OfflinePort:
         return [{"operation": operation, "subject": subject, "intent": intent, "facts": json.loads(facts)}
                 for operation, subject, intent, facts in rows]
 
+    def external_append(self, ref: str, files: Mapping[str, str], token: str) -> Commit:
+        """A separate fixture actor advances an exact ref; never used by the driver."""
+        before = self.git.commit(ref)
+        checkout = self.root / ("external-" + token)
+        self.git.run("worktree", "add", "--detach", str(checkout), before.sha)
+        for name, body in files.items():
+            path = checkout / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+        candidate, _ = self.git.candidate(checkout, before.sha, token)
+        if candidate.sha == before.sha:
+            candidate = self.git.make_commit(before.tree, (before.sha,), "external append " + token)
+        self.git.compare_and_swap(ref, before.sha, candidate.sha)
+        self.git.run("worktree", "remove", str(checkout))
+        return candidate
+
 
 class Scenario:
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
-                 checks: Sequence[str] = ("none",), policy: Policy | None = None) -> None:
+                 checks: Sequence[str] = ("none",), policy: Policy | None = None,
+                 edits: Sequence[Mapping[str, str]] | None = None) -> None:
         self.port = OfflinePort.create(root)
         self.spec, self.delivery = self.port.prepare(kind, policy=policy)
         self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec)
@@ -268,6 +297,7 @@ class Scenario:
         self.heads: list[str] = []
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
+        self.edits = edits
 
     def world(self) -> World:
         pr = self.port.pull_request(self.delivery.key)
@@ -276,21 +306,28 @@ class Scenario:
         index = max(0, len(self.heads) - 1)
         return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)])
 
-    def _agent(self, call: AgentCall) -> bytes:
+    def agent(self, call: AgentCall) -> bytes:
         self.role_calls.append({"role": call.role.value, "purpose": call.purpose.value,
-                                "owner_kind": self.delivery.kind.value, "attempt": call.attempt_id})
+                                "owner_kind": self.delivery.kind.value, "attempt": call.attempt_id,
+                                "repair_source": call.context.get("repair_source")})
         self.kernel.bind_thread(call, call.reported_thread or "offline-" + call.thread_id)
         if call.role == Role.DEVELOPMENT:
             self.development_count += 1
-            (Path(call.context["checkout"]) / f"development-{self.development_count}.txt").write_text(f"Change {self.development_count}\n")
+            edits = ({f"development-{self.development_count}.txt": f"Change {self.development_count}\n"} if self.edits is None
+                     else self.edits[min(self.development_count - 1, len(self.edits) - 1)])
+            for name, body in edits.items():
+                path = Path(call.context["checkout"]) / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
             return wire_json({"result_kind": "development", "summary": f"Changed synthetic behavior {self.development_count}", "human_blockers": None})
         if call.role == Role.REVIEW:
             outcome = self.reviews[min(self.review_count, len(self.reviews) - 1)]
             self.review_count += 1
             return wire_json(review_result(outcome))
         self.publication_count += 1
-        return wire_json({"result_kind": "publication", "commit_message": "feat: synthetic behavior\n\nValidated change.",
-                          "pr_title": "feat: synthetic behavior", "pr_body_markdown": "Synthetic scenario with recorded evidence.", "human_blockers": None})
+        return wire_json({"result_kind": "publication", "commit_message": f"feat: synthetic behavior {self.publication_count}\n\nValidated change.",
+                          "pr_title": f"feat: synthetic behavior {self.publication_count}",
+                          "pr_body_markdown": f"Synthetic scenario with recorded evidence {self.publication_count}.", "human_blockers": None})
 
     def step(self) -> Step:
         world = self.world()
@@ -299,11 +336,11 @@ class Scenario:
 
     def handle(self, step: Step) -> Step:
         if step.kind == "agent" and step.call is not None:
-            self.kernel.receive(step.call, self._agent(step.call))
+            self.kernel.receive(step.call, self.agent(step.call))
         elif step.kind == "effect" and step.effect is not None:
             if self.kernel.dispatch(step.effect, self.execution, self.world()):
                 try:
-                    self.port.execute(step.effect)
+                    self.port.execute(step.effect, lambda: self.kernel.guard_effect(step.effect, self.execution, self.world()))
                 except LostResponse:
                     pass
                 else:
@@ -313,8 +350,10 @@ class Scenario:
         self.checkpoints.append(self.kernel.status(self.delivery.key))
         return step
 
-    def run(self, *, approve: bool = False, max_steps: int = 200) -> Step:
+    def run(self, *, approve: bool = False, max_steps: int = 200, cut: str = "complete") -> Step:
         for _ in range(max_steps):
+            if cut == "publication_pending" and self.kernel.status(self.delivery.key)["phase"] == "publish":
+                return Step("publication_pending", self.delivery.key)
             step = self.step()
             if step.kind == "approval" and approve:
                 self.kernel.control("approve", f"approval-{self.publication_count}", subject=self.delivery.key, world=self.world())
@@ -327,3 +366,65 @@ class Scenario:
                 "raw_backend_calls": {"development": self.development_count, "review": self.review_count,
                                       "publication": self.publication_count},
                 "external_writes": self.port.writes(), "final": self.kernel.status(self.delivery.key)}
+
+    def observable(self, scenario_id: str, boundary: Step) -> dict[str, Any]:
+        """A declared read-side projection, not an expected-value generator."""
+        calls: list[dict[str, str]] = []
+        # Exact frozen call contexts are read through the same public history,
+        # captured by the Agent adapter at actual invocation time below.
+        for call in self.role_calls:
+            role, purpose = call["role"], call["purpose"]
+            if role == "publication":
+                purpose = "publication"
+            elif purpose == "ci":
+                purpose = "ci_repair"
+            elif self.delivery.kind == DeliveryKind.FINAL_RUN:
+                purpose = "acceptance_repair" if call.get("repair_source") == "acceptance" else "full_review" if role == "review" else "integration"
+            elif purpose == "requirements":
+                purpose = "acceptance_repair" if role == "development" and call.get("repair_source") == "acceptance" else "initial"
+            calls.append({"role": "reviewer" if role == "review" else role, "purpose": purpose,
+                          "owner_kind": "full_parent" if self.delivery.kind == DeliveryKind.FINAL_RUN else self.delivery.kind.value})
+        world = self.world()
+        refs = {}
+        import hashlib
+        for name, ref in (("source", self.delivery.source_ref), ("target", self.delivery.target_ref)):
+            commit = self.port.git.commit(ref)
+            paths = self.port.git.run("ls-tree", "-r", "--name-only", commit.sha).stdout.splitlines()
+            refs[name] = {"sha": commit.sha, "tree": commit.tree, "parents": list(self.port.git.parents(commit.sha)),
+                          "files": {path: hashlib.sha256(self.port.git.run("show", f"{commit.sha}:{path}").stdout.encode()).hexdigest() for path in paths}}
+        return {"scenario_id": scenario_id, "parameters": {"kind": self.delivery.kind.value, "cut": boundary.kind,
+                "policy": asdict(self.spec.policy)}, "role_calls": calls,
+                "raw_backend_calls": {"development": self.development_count, "reviewer": self.review_count,
+                                      "publication": self.publication_count},
+                "checkpoints": self.checkpoints, "external_writes": self.port.writes(),
+                "final": self.kernel.status(self.delivery.key), "terminal": boundary.kind,
+                "world": asdict(world), "git_evidence": refs}
+
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Run one isolated replacement-kernel scenario on newly created data")
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--scenario", required=True, choices=("ticket-normal", "ticket-review-repair", "ticket-fallback",
+                        "parent-only-normal", "full-parent-normal", "full-parent-review-repair"))
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    configurations = {
+        "ticket-normal": (DeliveryKind.TICKET, ("pass",), "complete"),
+        "ticket-review-repair": (DeliveryKind.TICKET, ("fail", "pass"), "complete"),
+        "ticket-fallback": (DeliveryKind.TICKET, ("fail",), "complete"),
+        "parent-only-normal": (DeliveryKind.PARENT_ONLY, ("pass",), "complete"),
+        "full-parent-normal": (DeliveryKind.FINAL_RUN, ("pass",), "complete"),
+        "full-parent-review-repair": (DeliveryKind.FINAL_RUN, ("fail", "pass"), "publication_pending"),
+    }
+    kind, reviews, cut = configurations[args.scenario]
+    scenario = Scenario(args.root, kind, reviews=reviews)
+    boundary = scenario.run(approve=kind != DeliveryKind.TICKET, cut=cut)
+    result = {"schema": "kernel-observable-trace/1", "implementation": "independent-kernel-exploration",
+              "cross_architecture_compared": False, "scenarios": [scenario.observable(args.scenario, boundary)]}
+    args.output.write_bytes(wire_json(result) + b"\n")
+    print(json.dumps({"scenario": args.scenario, "terminal": boundary.kind, "output": str(args.output)}))
+
+
+if __name__ == "__main__":
+    main()

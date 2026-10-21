@@ -144,6 +144,7 @@ class World:
     pr: PullRequest | None = None
     checks: Checks | None = None
     completion_revision: str = "no-tickets"
+    ancestry: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
