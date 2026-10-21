@@ -69,9 +69,6 @@ class ChangeDeliveryStage(Protocol):
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool: ...
 
-    def _sync_attempts(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> None: ...
 
     def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -110,20 +107,5 @@ class ChangeDeliveryStage(Protocol):
         self, state: dict[str, Any], job: dict[str, Any], error: Exception
     ) -> bool: ...
 
-    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
 
     def review_budget_policy(self) -> ReviewBudgetPolicy: ...
-
-    def review_budget_exhausted_for_review(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
-
-    def _checkpoint_budget(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        code: str,
-        message: str,
-    ) -> None: ...
-
-    def mark_development_attempt(
-        self, state: dict[str, Any], job: dict[str, Any], *, attempt_kind: str
-    ) -> int: ...

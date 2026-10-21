@@ -3,9 +3,10 @@ from __future__ import annotations
 """Ticket delivery integration after fixed-base Development and Review."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from agent_run.change_delivery_stage import ChangeDeliveryStage
+if TYPE_CHECKING:
+    from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.git import GitError
 from agent_run.integration_resync_budget import (
     ResyncBudgetExhausted,
@@ -20,7 +21,7 @@ from agent_run.semantic_attempt import (
 from agent_run.required_checks_observation import clear_required_checks_observation
 
 
-def _pause(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:
+def _pause(stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:
     stage._block(state, job, code, message)
     state["terminal_kind"] = "waiting_human"
     stage.save(state)
@@ -95,7 +96,7 @@ def _own_source_write(job: dict[str, Any], source: str) -> bool:
     )
 
 
-def reconcile_ticket_integration(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]) -> bool:
+def reconcile_ticket_integration(stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any]) -> bool:
     """Invalidate a published candidate when a new external snapshot is observed."""
 
     record = job.get("ticket_integration")
@@ -123,7 +124,7 @@ def reconcile_ticket_integration(stage: ChangeDeliveryStage, state: dict[str, An
 
 
 def _invalidate_ticket_publication(
-    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
+    stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any]
 ) -> None:
     pending = pending_semantic_attempt(job, role="publication")
     if pending is not None:
@@ -145,7 +146,7 @@ def _invalidate_ticket_publication(
     stage.save(state)
 
 
-def _observe(stage: ChangeDeliveryStage, job: dict[str, Any]) -> tuple[str, str]:
+def _observe(stage: ChangeDeliveryEngine, job: dict[str, Any]) -> tuple[str, str]:
     source, target = stage.github.live_branch_heads(
         stage.contract.branch, stage.contract.base_branch
     )
@@ -184,7 +185,7 @@ class HistoryRewritten(GitError):
 
 
 def prepare_ticket_integration(
-    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], checkout: Path
 ) -> bool:
     """Return True only when one exact live snapshot has been integrated."""
 
@@ -195,7 +196,7 @@ def prepare_ticket_integration(
 
 
 def _prepare_ticket_integration_once(
-    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], checkout: Path,
 ) -> bool | None:
     try:
         source, target = _observe(stage, job)
@@ -328,6 +329,5 @@ def _prepare_ticket_integration_once(
     return reconcile_ticket_integration(stage, state, job)
 
 
-def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-    from agent_run.integration_development import resolve_integration_work
-    return resolve_integration_work(stage, state, job, checkout)
+def _resolve_conflict(stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
+    return stage.work.resolve_ticket_integration(state, job, checkout)

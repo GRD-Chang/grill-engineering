@@ -18,13 +18,12 @@ from agent_run.delivery_budget import delivery_budget_owner
 from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import change_review_budget_policy
 from agent_run.change_currentness import change_agent_is_current, reject_stale_change
-from agent_run.development_review import advance_development_review
+from agent_run.development_review import DevelopmentReview
 from agent_run.integration_development_budget import (
     IntegrationDevelopmentExhausted, ensure_integration_development_available,
 )
 from agent_run.delivery_step import AgentWorkRequired, DeliveryStep, DeliveryStepKind
 from agent_run.change_delivery_integration import prepare_delivery_integration
-from agent_run.change_development_review import ChangeDevelopmentReview
 from agent_run.ci_recovery_budget import (
     can_start_ci_repair,
     ci_limit_for_job,
@@ -71,12 +70,6 @@ from agent_run.change_delivery_contracts import (
     ChangeJobContract as ChangeJobContract,
     StaleDisposition as StaleDisposition,
     ChangeJobStopped,
-)
-from agent_run.change_delivery_development import (
-    commit_candidate,
-    develop,
-    resume_after_initial_credential,
-    wait_for_initial_credential as wait_for_initial_credential_stage,
 )
 from agent_run.change_delivery_fallback import (
     fallback_candidate_is_eligible,
@@ -138,6 +131,7 @@ class ChangeDeliveryEngine:
         publisher: ChangeDeliveryPublisher,
         state_store: ChangeDeliveryStateStore,
         development_only: bool = False,
+        work: DevelopmentReview,
     ) -> None:
         self.git = git
         self.github = github
@@ -148,17 +142,8 @@ class ChangeDeliveryEngine:
         self.state_store = state_store
         self.development_only = development_only
         self._current_job: dict[str, Any] | None = None
-        admission = None
-        if contract.label.startswith("ticket-"):
-            from agent_run.ticket_state import TicketState
-            from agent_run.ticket_work import TicketWorkAdmission
-
-            store = state_store.states
-            admission = TicketWorkAdmission(
-                store.states if isinstance(store, TicketState) else store,
-                state_store.run_id,
-            )
-        self.agent_work = AgentWorkScope(admission)
+        self.work = work
+        self.agent_work = work.agent_work
 
     def _pause_ticket_if_requested(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -255,10 +240,12 @@ class ChangeDeliveryEngine:
                 self.save(state)
                 return self._step_result(state, job)
             if phase in {"developing", "repairing", "committing_candidate", "candidate", "reviewing"}:
-                progressing = advance_development_review(
-                    ChangeDevelopmentReview(self, state, job, checkout), single_step=True
-                )
-                return self._step_result(state, job, waiting=not progressing)
+                if (phase == "candidate" and self.contract.label == "parent-only"
+                    and not isinstance(job.get("pending_review_result"), dict)
+                    and not (isinstance(job.get("pending_semantic_attempt"), dict) and "returned_result" in job["pending_semantic_attempt"])):
+                    if not prepare_delivery_integration(self, state, job, checkout, before_review=True):
+                        return self._step_result(state, job, waiting=job.get("phase") == "ready_for_integration")
+                return self.work.advance_change(state, job, checkout, scope="ticket" if self.contract.label.startswith("ticket-") else "parent-only", allow_agent=True)
             if phase == "accepted":
                 if self.development_only:
                     return DeliveryStep(DeliveryStepKind.WAITING, phase, "development_complete")
@@ -301,8 +288,8 @@ class ChangeDeliveryEngine:
             self.agent_work.defer()
             return self._step_result(state, job, waiting=True)
         except InitialCredentialUnavailable as error:
-            self._refund_unstarted_credential_invocation(state, job)
-            self._wait_for_initial_credential(state, job, http_status=error.http_status)
+            self.work._refund_unstarted_credential_invocation(state, job)
+            self.work._wait_for_initial_credential(state, job, http_status=error.http_status)
             self.agent_work.defer()
             return self._step_result(state, job, waiting=True)
 
@@ -361,67 +348,9 @@ class ChangeDeliveryEngine:
         except (GitError, ValueError):
             return False
 
-    def _develop(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
-        if attempt_kind not in {"ordinary", "ci_repair", "integration"}:
-            raise ValueError(f"unknown Development attempt kind: {attempt_kind}")
-        if pending_semantic_attempt(job, role="development") is None:
-            if attempt_kind == "integration":
-                try:
-                    ensure_integration_development_available(job, policy_snapshot=job["policy_snapshot"])
-                except IntegrationDevelopmentExhausted:
-                    self._block(state, job, "integration_development_exhausted",
-                        "Parent integration Development allowance is exhausted; resume explicitly")
-                    state["terminal_kind"] = "waiting_human"
-                    self.save(state)
-                    return
-            elif attempt_kind == "ci_repair":
-                limit = ci_limit_for_job(job)
-                if not can_start_ci_repair(
-                    delivery_budget_owner(state, job),
-                    limit=limit,
-                    is_ticket=self.contract.label.startswith("ticket-"),
-                ):
-                    self._checkpoint_ci_budget(
-                        state, job,
-                        "ci_development_budget_exhausted",
-                    )
-                    return
-            elif not can_start_development(
-                delivery_budget_owner(state, job), self.review_budget_policy(), attempt_kind=attempt_kind
-            ):
-                self._checkpoint_budget(
-                    state,
-                    job,
-                    "modification_budget_exhausted",
-                    "Development budget is exhausted for the current Review Budget Window",
-                )
-                return
-        self.require_agent_work("development")
-        develop(self, state, job, checkout)
 
-    def _wait_for_initial_credential(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        *,
-        http_status: int | None,
-    ) -> None:
-        wait_for_initial_credential_stage(
-            self, state, job, http_status=http_status
-        )
 
-    def _resume_after_initial_credential(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> None:
-        resume_after_initial_credential(self, state, job)
 
-    def _commit_candidate(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> bool:
-        return commit_candidate(self, state, job, checkout)
 
     def _publication(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -485,134 +414,20 @@ class ChangeDeliveryEngine:
     ) -> bool:
         return publish_and_merge(self, state, job, checkout)
 
-    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return not can_start_development(delivery_budget_owner(state, job), self.review_budget_policy())
 
-    def _refund_unstarted_credential_invocation(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> None:
-        budget = ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
-        semantic_attempt = pending_semantic_attempt(job)
-        if semantic_attempt is None:
-            return
-        active = state.get("active_agent_invocation")
-        bound_attempt = (
-            active.get("semantic_attempt") if isinstance(active, dict) else None
-        )
-        if (
-            isinstance(active, dict)
-            and active.get("status") == "resuming"
-            and isinstance(bound_attempt, dict)
-            and bound_attempt.get("attempt_id") == semantic_attempt.get("attempt_id")
-        ):
-            return
-        semantic_role = semantic_attempt.get("role")
-        integration_budget = job.get("integration_development_budget")
-        if (semantic_role == "development" and isinstance(integration_budget, dict)
-            and semantic_attempt["attempt_id"] in integration_budget["attempt_ids"]):
-            integration_budget["attempt_ids"].remove(semantic_attempt["attempt_id"])
-            integration_budget["used"] -= 1
-            job.pop("pending_attempt", None)
-            job.pop("pending_attempt_kind", None)
-            release_semantic_attempt(job)
-            return
-        if (
-            semantic_role == "development"
-            and job.get("phase") in {"developing", "repairing"}
-            and isinstance(job.get("pending_attempt"), int)
-            and job["pending_attempt"] > int(job.get("modification_attempts", 0))
-        ):
-            if job.get("pending_attempt_kind") == "ci_repair":
-                limit = ci_limit_for_job(job)
-                refund_ci_repair_without_candidate(
-                    delivery_budget_owner(state, job),
-                    limit=limit,
-                    is_ticket=self.contract.label.startswith("ticket-"),
-                )
-            elif budget["development_attempts"] > 0:
-                budget["development_attempts"] -= 1
-            job.pop("pending_attempt", None)
-            job.pop("pending_attempt_kind", None)
-            release_semantic_attempt(job)
-        elif semantic_role == "reviewer" and job.get("phase") == "reviewing":
-            job["validation_attempts"] = max(
-                0, int(job.get("validation_attempts", 0)) - 1
-            )
-            job["phase"] = "candidate"
-            release_semantic_attempt(job)
-        elif semantic_role == "publication" and job.get("phase") == "accepted":
-            job["publication_attempts"] = max(
-                0, int(job.get("publication_attempts", 0)) - 1
-            )
-            release_semantic_attempt(job)
-            job.pop("publication_operation_retry", None)
-            job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
         return change_review_budget_policy(
             self.contract.label, self.contract.review_budget_policy, self._current_job,
         )
 
-    def review_budget_exhausted_for_review(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        if job.get("attempt_kind") == "ci_repair":
-            return False
-        return not can_start_review(delivery_budget_owner(state, job), self.review_budget_policy())
 
-    def mark_development_attempt(
-        self, state: dict[str, Any], job: dict[str, Any], *, attempt_kind: str
-    ) -> int:
-        if attempt_kind == "ci_repair":
-            limit = ci_limit_for_job(job)
-            return mark_ci_repair(
-                delivery_budget_owner(state, job),
-                limit=limit,
-                is_ticket=self.contract.label.startswith("ticket-"),
-            )
-        return mark_development(
-            delivery_budget_owner(state, job), self.review_budget_policy(), attempt_kind=attempt_kind
-        )
 
-    def _checkpoint_ci_budget(
-        self, state: dict[str, Any], job: dict[str, Any], code: str
-    ) -> None:
-        job.update({"phase": "escalating", "escalation_code": code})
-        delivery_budget_owner(state, job)["ci_recovery"]["checkpoint_reason"] = code
-        self.save(state)
 
-    def _prepare_ticket_ci_publication_authorization(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> bool:
-        from agent_run.change_delivery_fallback import (
-            prepare_ticket_ci_publication_authorization,
-        )
 
-        return prepare_ticket_ci_publication_authorization(self, state, job)
 
-    def _checkpoint_budget(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        code: str,
-        message: str,
-    ) -> None:
-        job.update({"phase": "escalating", "escalation_code": code})
-        budget = ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
-        budget["checkpoint_reason"] = code
-        self.save(state)
 
-    @staticmethod
-    def _previous_publication_authorization(
-        job: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        return previous_publication_authorization(job)
 
-    def _prepare_ticket_fallback(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> bool:
-        return prepare_ticket_fallback(self, state, job)
-
-    def _fallback_candidate_is_eligible(self, job: dict[str, Any]) -> bool:
-        return fallback_candidate_is_eligible(job, self.review_budget_policy())
 
     def _record_publication_operation_failure(
         self, state: dict[str, Any], job: dict[str, Any], error: Exception
@@ -752,8 +567,3 @@ class ChangeDeliveryEngine:
     ) -> bool:
         return block_change_job(self.state_store, state, job,
             label=self.contract.label, development_only=self.development_only, code=code, message=message)
-
-    def _sync_attempts(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> None:
-        self.publisher.sync_attempts(state, job)

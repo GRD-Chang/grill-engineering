@@ -38,30 +38,13 @@ class ChangeDeliveryAdapter(Protocol):
     stale_disposition: StaleDisposition
     classify_required_check_failures: bool
 
-    def development_thread_is_allowed(
-        self, state: dict[str, Any], thread_id: str
-    ) -> bool: ...
 
-    def development_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]: ...
 
     def publication_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]: ...
 
-    def review_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]: ...
 
-    def acceptance_record(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-        *, review_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]: ...
 
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
@@ -93,18 +76,12 @@ class ChangeDeliveryAdapter(Protocol):
 class ChangeDeliveryPublisher(Protocol):
     """Consumer-specific mutations executed through the Publisher seam."""
 
-    def commit_candidate(
-        self, checkout: Path, job: dict[str, Any], attempt: int
-    ) -> str | None: ...
 
     def create_publication_commit(
         self, checkout: Path, job: dict[str, Any], message: str,
         *, save_intent: Callable[[], None],
     ) -> str: ...
 
-    def prepare_validation(
-        self, checkout: Path, job: dict[str, Any], validation: Path
-    ) -> None: ...
 
     def ensure_pr(
         self,
@@ -135,5 +112,3 @@ class ChangeDeliveryPublisher(Protocol):
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str
     ) -> None: ...
-
-    def sync_attempts(self, state: dict[str, Any], job: dict[str, Any]) -> None: ...

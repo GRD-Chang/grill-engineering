@@ -11,7 +11,10 @@ from typing import Any, cast
 from agent_run.agents import DevelopmentResult, HumanBlockerResult
 from agent_run.agent_execution import execute_agent_work, select_development_thread
 from agent_run.artifacts import clear_current_human_blocker
-from agent_run.change_delivery_stage import ChangeDeliveryStage
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_run.development_review import DevelopmentReview
 from agent_run.change_delivery_threads import (
     record_development_thread, require_development_thread,
 )
@@ -27,7 +30,7 @@ from agent_run.semantic_attempt import (
 
 
 def failure_scene(
-    stage: ChangeDeliveryStage, job: dict[str, Any], checkout: Path, error: GitError,
+    stage: DevelopmentReview, job: dict[str, Any], checkout: Path, error: GitError,
     *, source: str, target: str, paths: list[str],
 ) -> dict[str, Any]:
     evidence = dict(error.evidence or {})
@@ -43,7 +46,7 @@ def failure_scene(
 
 
 def resolve_integration_work(
-    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    stage: DevelopmentReview, state: dict[str, Any], job: dict[str, Any], checkout: Path,
     *, scene_key: str = "integration_conflict",
     finish: Callable[[], bool] | None = None,
 ) -> bool:
@@ -60,7 +63,7 @@ def resolve_integration_work(
 
 
 def _resolve_integration_work_once(
-    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    stage: DevelopmentReview, state: dict[str, Any], job: dict[str, Any], checkout: Path,
     *, scene_key: str, finish: Callable[[], bool] | None,
 ) -> bool | None:
     scene = job[scene_key]
@@ -86,7 +89,7 @@ def _resolve_integration_work_once(
             int(job.get("modification_attempts", 0)),
             int(job.get("integration_conflict_agent_ordinal", 0)),
         ) + 1
-    work_subject, generation = stage.adapter.invocation_identity(state, job)
+    work_subject, generation = stage._identity(state, job)
     attempt = allocate_semantic_attempt(
         job, role="development", work_subject=work_subject, generation=generation,
         currentness_boundary=stage._invocation_boundary(job),
@@ -103,7 +106,7 @@ def _resolve_integration_work_once(
     # Human Response inputs retain the exact Job history reader and revision.
     request_job = job.copy()
     request_job.update(repair_input)
-    request = stage.adapter.development_request(state, request_job, checkout)
+    request = stage._development_request(state, request_job, checkout)
     request.update(repair_input)
     stage.save(state)
     if "development_summary" not in scene:
@@ -117,7 +120,7 @@ def _resolve_integration_work_once(
             stage.release_agent_work()
         require_development_thread(job, result.thread_id, requested_thread=request.get("thread_id"))
         clear_initial_credential_wait(state, work_subject=stage.contract.label)
-        if not stage.adapter.development_thread_is_allowed(state, result.thread_id):
+        if not stage._thread_allowed(state, result.thread_id):
             raise ValueError("Change Job Development Thread is not independent")
         record_development_thread(job, result.thread_id, result.replaced_thread_id)
         job.pop("development_new_thread", None)

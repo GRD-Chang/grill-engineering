@@ -211,7 +211,7 @@ def prepare_parent_integration(
             job["previous_parent_acceptance_record"] = acceptance
         job["base_sha"] = record["target_sha"]
         job["candidate_sha"] = record["head_sha"]
-        current = isinstance(acceptance, dict) and stage.adapter.acceptance_is_current(state, job, acceptance)
+        current = isinstance(acceptance, dict) and stage._acceptance_is_current(state, job, acceptance)
         if changed or not current:
             awaiting_review = job.get("phase") == "candidate"
             job["parent_integration_stage"] = True
@@ -306,9 +306,9 @@ def resolve_parent_conflict(
     # Select this invocation's evidence before the adapter reads historical repair input.
     request_job = job.copy()
     request_job.update(conflict_input)
-    request = stage.adapter.development_request(state, request_job, checkout)
+    request = stage._development_request(state, request_job, checkout)
     request.update(conflict_input)
-    work_subject, generation = stage.adapter.invocation_identity(state, job)
+    work_subject, generation = stage._identity(state, job)
     if attempt is None:
         ordinal_key = f"{record_key}_conflict_ordinal"
         job[ordinal_key] = max(

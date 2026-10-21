@@ -35,6 +35,9 @@ class AgentWorkScope:
 
     @contextmanager
     def step(self, job: dict[str, Any], *, allow_agent: bool) -> Iterator[None]:
+        if self._job is job:
+            yield
+            return
         self._job = job
         self._allowed = allow_agent
         self.capacity_wait = False

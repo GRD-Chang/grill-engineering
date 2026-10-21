@@ -9,6 +9,7 @@ from typing import Any
 from agent_run.review_context import candidate_review_identity
 from agent_run.review_evidence import accepted_review_matches
 from agent_run.commit_messages import commit_messages_match
+from agent_run.development_review import DevelopmentReview, change_revision_changed, parent_review_identity
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
@@ -67,55 +68,10 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         self.git = git
         self.github = github
 
-    def development_thread_is_allowed(
-        self, _state: dict[str, Any], _thread_id: str
-    ) -> bool:
-        return True
 
     def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool:
         return current_base == job.get("base_sha")
 
-    def development_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "ticket",
-            "parent_issue_url": _parent(state)["url"],
-            "task_issue_url": _ticket(state, job)["url"],
-            "run_id": state["run_id"],
-            "repository": str(state["repository"]),
-            "parent": _parent(state),
-            "ticket": _ticket(state, job),
-            "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "head_sha": self.git.checkout_head(checkout),
-            "checkout": str(checkout),
-            "thread_id": (
-                None
-                if job.get("development_new_thread")
-                else job.get("development_thread_id")
-            ),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("ticket_branch_generation", 1))
-        ):
-            request["human_response_history"] = history
-        if job.get("development_summary"):
-            request["development_summary"] = str(job["development_summary"])
-        if job.get("repair_source") == "git_integrity":
-            request["repair_source"] = "git_integrity"
-            request["git_integrity_evidence"] = _mapping(
-                job, "git_integrity_evidence"
-            )
-        elif job.get("repair_source") == "acceptance":
-            request["repair_source"] = "acceptance"
-            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
-        elif job.get("repair_source") == "required_checks":
-            request["repair_source"] = "required_checks"
-            request["ci_evidence"] = _mapping(job, "ci_evidence")
-        return request
 
     def publication_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -172,64 +128,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             request["ci_evidence"] = _mapping(job, "ci_evidence")
         return request
 
-    def review_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        review_base = str(job["base_sha"])
-        request = {
-            "acceptance_scope": "ticket",
-            "parent_issue_url": _parent(state)["url"],
-            "task_issue_url": _ticket(state, job)["url"],
-            "run_id": state["run_id"],
-            "repository": str(state["repository"]),
-            "parent": _parent(state),
-            "ticket": _ticket(state, job),
-            "base_sha": review_base,
-            "candidate_sha": job["candidate_sha"],
-            "current_review_identity": candidate_review_identity(job, self.git),
-            "effective_revision": job["effective_revision"],
-            "checkout": str(checkout),
-            "thread_id": (
-                latest_reviewer_thread(job)
-                if (
-                    (
-                        job.get("review_human_blocker_resume")
-                        or job.get("review_resume_thread_id")
-                    )
-                    and not job.get("review_new_thread")
-                )
-                else None
-            ),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("ticket_branch_generation", 1))
-        ):
-            request["human_response_history"] = history
-        previous = previous_review_context(job)
-        if previous is not None:
-            request["previous_acceptance_artifact"] = previous["artifact"]
-            request["previous_review_identity"] = previous["identity"]
-        return request
 
-    def acceptance_record(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-        *, review_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "change_job",
-            **(review_context["facts"]["current_review_identity"] if review_context is not None
-               else candidate_review_identity(job, self.git)),
-            "effective_revision": str(review_context["binding"]["effective_revision"]
-                                      if review_context is not None else job["effective_revision"]),
-            "reviewer_thread_id": reviewer_thread_id,
-            "artifact": artifact,
-        }
 
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
@@ -243,12 +142,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         )
 
     def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        current = self.github.current_effective_revision(
-            parent_number=int(_mapping(state, "parent")["number"]),
-            ticket_number=int(job["ticket_number"]),
-            expected_revision=str(job["effective_revision"]),
-        )
-        return current != str(job["effective_revision"])
+        return change_revision_changed(self.github, state, job)
 
     def requires_explicit_approval(
         self, _state: dict[str, Any], _job: dict[str, Any]
@@ -284,24 +178,6 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
     def __init__(self, owner: TicketDeliveryLoop) -> None:
         self.owner = owner
 
-    def commit_candidate(
-        self, checkout: Path, job: dict[str, Any], attempt: int
-    ) -> str | None:
-        return self.owner.git.commit_candidate(
-            checkout,
-            ticket_number=int(job["ticket_number"]),
-            attempt=attempt,
-            expected_head=str(
-                job.get("managed_checkout_head")
-                or job.get("candidate_sha")
-                or job["base_sha"]
-            ),
-            candidate_intent=(
-                job.get("candidate_commit_intent")
-                if isinstance(job.get("candidate_commit_intent"), dict)
-                else None
-            ),
-        )
 
     def create_publication_commit(
         self, checkout: Path, job: dict[str, Any], message: str,
@@ -321,12 +197,6 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
             save_intent=save_intent,
         )
 
-    def prepare_validation(
-        self, _checkout: Path, job: dict[str, Any], validation: Path
-    ) -> None:
-        self.owner.git.prepare_validation_checkout(
-            head_sha=str(job["candidate_sha"]), checkout=validation
-        )
 
     def ensure_pr(
         self,
@@ -380,8 +250,6 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
     ) -> None:
         self.owner._escalate(state, job, code)
 
-    def sync_attempts(self, _state: dict[str, Any], _job: dict[str, Any]) -> None:
-        return None
 
 
 class TicketDeliveryLoop:
@@ -418,7 +286,9 @@ class TicketDeliveryLoop:
             scoped = TicketState(self.states, str(state["run_id"]), int(job["ticket_number"]))
             scoped.load_current_run(str(state["run_id"]))
             self.states = scoped  # type: ignore[assignment]
+        work = DevelopmentReview(git=self.git, states=self.states, agents=self.agents, github=self.github, development_only=self.development_only)
         return ChangeDeliveryEngine(
+            work=work,
             git=self.git,
             github=self.github,
             agents=self.agents,

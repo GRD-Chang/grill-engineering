@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from agent_run.development_review import DevelopmentReview, change_revision_changed, parent_review_identity
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.agent_invocation import select_publication_thread
@@ -46,10 +47,6 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         self.git = git
         self.github = github
 
-    def development_thread_is_allowed(
-        self, _state: dict[str, Any], _thread_id: str
-    ) -> bool:
-        return True
 
     def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool:
         if "parent_integration" in job:
@@ -66,56 +63,6 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             return parent_integration_record_is_valid(self.git, job)
         return current_base == job.get("base_sha")
 
-    def development_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "parent_only",
-            "parent_issue_url": _parent(state)["url"],
-            "run_id": state["run_id"],
-            "repository": str(state["repository"]),
-            "parent": _parent(state),
-            "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "head_sha": self.git.checkout_head(checkout),
-            "checkout": str(checkout),
-            "thread_id": (
-                None
-                if job.get("development_new_thread")
-                else job.get("development_thread_id")
-            ),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("parent_generation", 1))
-        ):
-            request["human_response_history"] = history
-        if (
-            job.get("pending_attempt_kind", job.get("next_attempt_kind")) == "integration"
-            and job.get("repair_source") == "acceptance"
-        ):
-            request["repair_source"] = "integration"
-            request["work_source"] = "integration"
-            request["integration_evidence"] = json.dumps(
-                {
-                    "acceptance_artifact": _mapping(job, "acceptance_artifact"),
-                    "parent_integration": _mapping(job, "parent_integration"),
-                },
-                ensure_ascii=False, sort_keys=True, indent=2,
-            )
-        elif job.get("repair_source") == "git_integrity":
-            request["repair_source"] = "git_integrity"
-            request["git_integrity_evidence"] = _mapping(
-                job, "git_integrity_evidence"
-            )
-        elif job.get("repair_source") == "acceptance":
-            request["repair_source"] = "acceptance"
-            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
-        elif job.get("repair_source") == "required_checks":
-            request["repair_source"] = "required_checks"
-            request["ci_evidence"] = _mapping(job, "ci_evidence")
-        return request
 
     def publication_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -150,117 +97,9 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             request["integration_record"] = job["parent_integration"]
         return request
 
-    def review_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "parent_only",
-            "parent_issue_url": _parent(state)["url"],
-            "run_id": state["run_id"],
-            "repository": str(state["repository"]),
-            "parent": _parent(state),
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "current_review_identity": self.review_identity(state, job),
-            "effective_revision": job["effective_revision"],
-            "checkout": str(checkout),
-            "thread_id": (
-                latest_reviewer_thread(job)
-                if (
-                    (
-                        job.get("review_human_blocker_resume")
-                        or job.get("review_resume_thread_id")
-                    )
-                    and not job.get("review_new_thread")
-                )
-                else None
-            ),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("parent_generation", 1))
-        ):
-            request["human_response_history"] = history
-        previous = self.compatible_review_baseline(state, job)
-        baseline = self.compatible_review_baseline(state, job, accepted_only=True)
-        if baseline is not None:
-            request["parent_acceptance_baseline"] = baseline
-        if previous is not None:
-            request["previous_acceptance_artifact"] = previous["artifact"]
-            request["previous_review_identity"] = {
-                key: previous[key] for key in request["current_review_identity"]
-            }
-        if isinstance(job.get("parent_integration"), dict):
-            request["work_source"] = "integration"
-            request["integration_record"] = job["parent_integration"]
-        return request
 
-    def review_identity(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "parent_only",
-            "parent_number": _mapping(state, "parent")["number"],
-            "effective_revision": job["effective_revision"],
-            "reviewed_base_sha": job["base_sha"],
-            "reviewed_candidate_sha": job["candidate_sha"],
-            "reviewed_candidate_tree": self.git.resolve(
-                f"{job['candidate_sha']}^{{tree}}"
-            ),
-            "expected_merge_tree": self.git.expected_merge_tree(
-                default_head_sha=str(job["base_sha"]),
-                run_head_sha=str(job["candidate_sha"]),
-            ),
-        }
 
-    def compatible_review_baseline(
-        self, state: dict[str, Any], job: dict[str, Any], *, accepted_only: bool = False
-    ) -> dict[str, Any] | None:
-        for key in ("acceptance_record", "previous_parent_acceptance_record"):
-            record = job.get(key)
-            if not isinstance(record, dict) or (
-                record.get("acceptance_scope") != "parent_only"
-                or record.get("parent_number") != _mapping(state, "parent")["number"]
-                or record.get("effective_revision") != job.get("effective_revision")
-                or self.revision_changed(state, job)
-            ):
-                continue
-            identity_fields = (
-                "reviewed_base_sha", "reviewed_candidate_sha",
-                "reviewed_candidate_tree", "expected_merge_tree", "reviewer_thread_id",
-            )
-            if not all(
-                isinstance(record.get(field), str) and record[field]
-                for field in identity_fields
-            ):
-                continue
-            try:
-                artifact = AcceptanceArtifact.parse(record.get("artifact"))
-            except ValueError:
-                continue
-            if accepted_only and not artifact.is_accepted:
-                continue
-            if not any(
-                check["status"] == "blocked" for check in artifact.checks.values()
-            ):
-                return record
-        return None
 
-    def acceptance_record(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-        *, review_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            **(review_context["facts"]["current_review_identity"] if review_context is not None
-               else self.review_identity(state, job)),
-            "reviewer_thread_id": reviewer_thread_id,
-            "artifact": artifact,
-        }
 
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
@@ -269,15 +108,13 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             return False
         try:
             return accepted_review_matches(
-                acceptance, self.review_identity(state, job), job.get("acceptance_artifact"),
+                acceptance, parent_review_identity(self.git, state, job), job.get("acceptance_artifact"),
             )
         except (GitError, ValueError, KeyError):
             return False
 
     def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return _mapping(state, "parent").get("revision") != job.get(
-            "effective_revision"
-        )
+        return change_revision_changed(self.github, state, job)
 
     def requires_explicit_approval(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -316,24 +153,6 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
     def __init__(self, owner: ParentDeliveryLoop) -> None:
         self.owner = owner
 
-    def commit_candidate(
-        self, checkout: Path, job: dict[str, Any], attempt: int
-    ) -> str | None:
-        return self.owner.git.commit_candidate(
-            checkout,
-            ticket_number=0,
-            attempt=attempt,
-            expected_head=str(
-                job.get("managed_checkout_head")
-                or job.get("candidate_sha")
-                or job["base_sha"]
-            ),
-            candidate_intent=(
-                job.get("candidate_commit_intent")
-                if isinstance(job.get("candidate_commit_intent"), dict)
-                else None
-            ),
-        )
 
     def create_publication_commit(
         self, checkout: Path, job: dict[str, Any], message: str,
@@ -356,12 +175,6 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
             save_intent=save_intent,
         )
 
-    def prepare_validation(
-        self, _checkout: Path, job: dict[str, Any], validation: Path
-    ) -> None:
-        self.owner.git.prepare_validation_checkout(
-            head_sha=str(job["candidate_sha"]), checkout=validation
-        )
 
     def ensure_pr(
         self,
@@ -422,8 +235,6 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
     ) -> None:
         self.owner._escalate(state, job, code)
 
-    def sync_attempts(self, _state: dict[str, Any], _job: dict[str, Any]) -> None:
-        return None
 
 
 class ParentDeliveryLoop:
@@ -453,7 +264,9 @@ class ParentDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> ChangeDeliveryEngine:
         self.states.load_current_run(str(state["run_id"]))
+        work = DevelopmentReview(git=self.git, states=self.states, agents=self.agents, github=self.github)
         return ChangeDeliveryEngine(
+            work=work,
             git=self.git,
             github=self.github,
             agents=self.agents,

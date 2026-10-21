@@ -91,7 +91,6 @@ class PublishedHeadStage(ChangeDeliveryStage, Protocol):
         message: str | None = None,
     ) -> bool: ...
 
-    def modification_budget_exhausted(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
 
 
 def _publication_operation(
