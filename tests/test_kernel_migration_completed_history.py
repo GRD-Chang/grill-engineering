@@ -42,7 +42,7 @@ frozen, root, output = map(Path, (request['frozen'], request['repository'], requ
 assert Path(agent_run.controller.__file__).resolve().is_relative_to(frozen / 'project/src')
 rounds = request['rounds']
 git = GitRepository(root)
-states = StateStore(root / '.agent-run')
+states = StateStore(Path(request['state_root']) if request.get('state_root') else root / '.agent-run')
 fixture = output / 'github.json'
 fixture.write_text(json.dumps({
     'repository': 'example/project', 'default_branch': 'main', 'default_head_sha': git.resolve('main'),
@@ -78,8 +78,41 @@ class Agents(FixtureAgentBackend):
     def publication(self, request):
         calls.append('publication'); return super().publication(request)
 backend = ProfiledAgentBackend(Agents(agents_file), profiles, run_id=run_id)
-TicketDeliveryEngine(git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
-                     agents=backend).deliver(run_id)
+def deliver():
+    TicketDeliveryEngine(git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+                         agents=backend).deliver(run_id)
+    if request.get('controlled'):
+        control.record_application(task, action_id=claim.action_id, run_id=run_id,
+                                   payload_digest=claim.action['payload_digest'],
+                                   generation=spec.generation, state_dir=states.root)
+        (output / 'host-calls.json').write_text(json.dumps(calls))
+    return states.load_current_run(run_id)
+if request.get('controlled'):
+    from agent_run.executor_host import ExecutorSpec, FakeExecutorHost
+    from agent_run.task_control import TaskControlStore
+    from agent_run.task_identity import TaskKey
+    task = TaskKey(root, 'example/project', 1)
+    control = TaskControlStore(states.root)
+    claim = control.claim_action(task, kind='run', payload={'parent': 1})
+    assert claim.action_id and claim.action
+    control.bind_run(task, claim.action_id, run_id, state_dir=states.root)
+    spec = ExecutorSpec(task, claim.action_id, run_id, claim.action['executor_generation'],
+                        cwd=root, state_root=states.root)
+    observed = FakeExecutorHost(separate_process=True).ensure(spec, control, execute=deliver)
+    assert observed.status == 'exited' and observed.pid
+    import os
+    try:
+        os.kill(observed.pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError('original Executor was not reaped')
+    calls = json.loads((output / 'host-calls.json').read_text())
+    owned = control.load(task)
+    assert owned['executor']['status'] == 'exited' and owned['executor']['exited_at']
+    assert owned['action']['status'] == 'completed' and owned['action']['application_observed']
+else:
+    deliver()
 after = states.load_current_run(run_id)
 job = after['ticket_jobs']['2']
 assert after['status'] == 'ticket_completed' and job['phase'] == 'completed'
@@ -103,7 +136,8 @@ print(json.dumps({'run_id': run_id, 'status': after['status']}))
 '''
 
 
-def _completed_source(tmp_path: Path, git_repo: Path, rounds: int) -> dict[str, Path]:
+def _completed_source(tmp_path: Path, git_repo: Path, rounds: int, *,
+                      state_root: Path | None = None, controlled: bool = False) -> dict[str, Path]:
     frozen, source = tmp_path / 'unchanged-02', tmp_path / 'source'
     old_v6_runtime(frozen)  # Only materializes verified, unchanged source files.
     source.mkdir()
@@ -111,15 +145,18 @@ def _completed_source(tmp_path: Path, git_repo: Path, rounds: int) -> dict[str, 
                    'PYTHONPATH': os.pathsep.join(str(frozen / name) for name in ('project/src', 'project/tests'))}
     result = subprocess.run([sys.executable, '-c', _COMPLETE], env=environment,
                             input=json.dumps({'frozen': str(frozen), 'repository': str(git_repo),
-                                              'output': str(source), 'rounds': rounds}),
+                                              'output': str(source), 'rounds': rounds,
+                                              'state_root': str(state_root) if state_root else None,
+                                              'controlled': controlled}),
                             text=True, capture_output=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
     identity = json.loads(result.stdout)
     assert identity['status'] == 'ticket_completed'
     run_id = identity['run_id']
-    paths = {'database': git_repo / '.agent-run/state.sqlite3',
+    source_state = state_root if state_root is not None else git_repo / '.agent-run'
+    paths = {'database': source_state / 'state.sqlite3',
              'github': source / 'github.json', 'report': source / 'report.json',
-             'profile': git_repo / '.agent-run/profiles' / (run_id + '.json'),
+             'profile': source_state / 'profiles' / (run_id + '.json'),
              'git': source / 'copied.git', 'observation': source / 'observation.json'}
     assert paths['profile'].is_file()
     shutil.copytree(git_repo / '.git', paths['git'], symlinks=True)
@@ -172,6 +209,11 @@ def _assert_original_records(snapshot: SourceSnapshot, reader: V6RecordReader) -
             elif table == 'work_evidence_materials':
                 where, parameters = (' WHERE material_id IN (SELECT material_id FROM work_evidence '
                                      'WHERE run_id=? AND material_id IS NOT NULL)', (run_id,))
+            elif 'run_id' not in {column['name'] for column in schema} and 'task_id' in {column['name'] for column in schema}:
+                selected_tasks = tuple(row[0] for row in db.execute(
+                    'SELECT task_id FROM control_tasks WHERE run_id=?', (run_id,)))
+                where = ' WHERE task_id IN (' + ','.join('?' for _ in selected_tasks) + ')'
+                parameters = selected_tasks
             else:
                 where, parameters = ' WHERE run_id=?', (run_id,)
             order = ','.join('"' + name + '"' for name in metadata['primary_key'])
@@ -378,6 +420,10 @@ def test_completed_ticket_import_preserves_real_multiround_history(
     tmp_path: Path, git_repo: Path, rounds: int,
 ) -> None:
     paths = _completed_source(tmp_path, git_repo, rounds)
+    _import_history_and_continue(tmp_path, paths, rounds)
+
+
+def _import_history_and_continue(tmp_path: Path, paths: dict[str, Path], rounds: int) -> None:
     snapshot = capture_v6(paths['database'], tmp_path / 'copied.sqlite3')
     with closing(sqlite3.connect(snapshot.path)) as db:
         assert db.execute('SELECT count(*) FROM work_attempts').fetchone()[0] == 2 * rounds + 1
@@ -402,6 +448,13 @@ def test_completed_ticket_import_preserves_real_multiround_history(
         assert tuple(used) == (rounds, rounds)
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert tx.one('SELECT count(*) FROM attempts')[0] == 3  # Only Completion support; not all history.
+        prior_pr = json.loads(paths['report'].read_text())['source_identity']['pull_request']
+        completed = tx.one('SELECT source_sha,merge_sha,tree FROM completions')
+        assert completed['source_sha'] == prior_pr['head_sha']
+        assert completed['merge_sha'] == prior_pr['integrated_sha']
+        current = tx.one("SELECT source_sha,publication_sha,merge_sha FROM subjects WHERE id='ticket:2'")
+        assert current['source_sha'] == current['publication_sha'] == prior_pr['head_sha']
+        assert current['merge_sha'] == prior_pr['integrated_sha']
     reader = V6RecordReader(kernel)
     _assert_original_records(snapshot, reader)
     assert reader.document('profile')['body'] == paths['profile'].read_bytes()
@@ -411,6 +464,25 @@ def test_completed_ticket_import_preserves_real_multiround_history(
     _continue_final(kernel, port, paths)
     _assert_original_records(snapshot, V6RecordReader(kernel))
     assert {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items() if path.is_file()} == before
+
+
+def test_retained_cross_second_publication_keeps_distinct_original_commit_identities(tmp_path: Path) -> None:
+    oracle = Path(__file__).resolve().parents[3] / 'results/kernel-completed-cross-second-observation'
+    manifest = oracle / 'manifest.json'
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == '1a97ecae1e87dbba3129e0ed55d681dd3c94c5697553959455c7157f402ffc41'
+    sealed = json.loads(manifest.read_text())
+    assert {str(path.relative_to(oracle)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in oracle.rglob('*') if path.is_file() and path != manifest} == sealed['files']
+    paths = {name: oracle / (name + ('.sqlite3' if name == 'database' else '.json'))
+             for name in ('database', 'profile', 'github', 'observation', 'report')}
+    paths['git'] = oracle / 'copied.git'
+    with closing(sqlite3.connect(paths['database'])) as db:
+        publication, integrated = db.execute("SELECT value_publication_sha,value_integrated_sha FROM work_jobs WHERE stage='completed'").fetchone()
+    assert publication == sealed['publication_sha'] and integrated == sealed['integrated_sha']
+    assert publication != integrated
+    prior = json.loads(paths['report'].read_text())['source_identity']['pull_request']
+    assert prior['head_sha'] == publication and prior['integrated_sha'] == integrated
+    _import_history_and_continue(tmp_path, paths, 3)
 
 
 @pytest.mark.parametrize('boundary', ['unknown-write', 'resume-pending', 'bound-context-drift'])

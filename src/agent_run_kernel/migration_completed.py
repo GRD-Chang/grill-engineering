@@ -5,6 +5,7 @@ semantic Attempts and current allowance become native operational relations.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -16,12 +17,16 @@ import sqlite3
 import tempfile
 from typing import Any, Mapping
 
+from agent_run.managed_workspace import ManagedWorkspace
+
+from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
                         _require_no_v6_notification_journal, capture_v6)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
 from .migration_records import RECORD_TABLES, _preserve_copy
+from .migration_quiescence import read_v6_host_exit
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
                     KernelError, ParentIssue, Policy, Profile, Requirements, Role,
                     RunSpec, artifact, wire_json)
@@ -46,6 +51,7 @@ class _Completed:
     ticket_branch: str
     candidate_sha: str
     candidate_tree: str
+    publication_sha: str
     integrated_sha: str
     integrated_tree: str
     pr_number: int
@@ -187,6 +193,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         if any(counts.get(name, 0) != value for name, value in exact.items()):
             raise MigrationRefused("unsupported_source_stage")
         run = _one(db, "SELECT * FROM runs WHERE run_id=?", (run_id,))
+        read_v6_host_exit(db, run_id)
         root = _one(db, "SELECT * FROM run_root WHERE run_id=?", (run["run_id"],))
         layout = _one(db, "SELECT * FROM work_job_layout WHERE run_id=?", (run["run_id"],))
         job = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id=?",
@@ -209,7 +216,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or type(job["value_modification_attempts"]) is not int or job["value_modification_attempts"] < 1
                 or type(job["value_validation_attempts"]) is not int or job["value_validation_attempts"] < 1
                 or job["value_candidate_sha"] is None or job["value_integrated_sha"] is None
-                or job["value_publication_sha"] != job["value_integrated_sha"]
+                or job["value_publication_sha"] is None
                 or job["value_integrated_tree"] is None or job["value_pr_number"] is None):
             raise MigrationRefused("unsupported_source_stage")
         if any(job[field] is not None for field in (
@@ -224,7 +231,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         cleanup = _one(db, "SELECT * FROM run_cleanup_items WHERE run_id=?", (run["run_id"],))
         if (closeout["value_status"] != "completed" or cleanup["branch"] != job["value_ticket_branch"]
                 or cleanup["value_status"] != "completed"
-                or cleanup["value_expected_head_sha"] != job["value_integrated_sha"]):
+                or cleanup["value_expected_head_sha"] != job["value_publication_sha"]):
             raise MigrationRefused("source_cleanup")
         parent = _one(db, "SELECT * FROM run_parent_versions WHERE run_id=? AND version_id=?",
                       (run["run_id"], root["value_parent_version_id"]))
@@ -263,7 +270,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         base = _one(db, "SELECT * FROM run_condition_base WHERE run_id=?", (run["run_id"],))
         if (job["value_base_sha"] != base["value_sha"] or base["value_branch"] != "main"
                 or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None
-                       for value in (base["value_sha"], job["value_candidate_sha"],
+                       for value in (base["value_sha"], job["value_candidate_sha"], job["value_publication_sha"],
                                      job["value_integrated_sha"]))
                 or root["value_run_branch"] != f"agent-run/{run['run_id']}/run"):
             raise MigrationRefused("source_base")
@@ -440,11 +447,41 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or any(call["role"] == "development" for call in calls[review_position + 1:])):
             raise MigrationRefused("source_development_support")
         supporting_calls = (development[-1], accepted_call, calls[-1])
+        integrated = _completed_evidence(
+            db, run_id, job['value_deterministic_integration_record'],
+            owner=f"job:{job['job_id']}", kind='deterministic_integration_record')
+        merge = _one(db, 'SELECT * FROM work_job_merge_intent WHERE run_id=? AND job_id=?',
+                     (run_id, job['job_id']))
+        integration_identity = {
+            'base_sha': base['value_sha'], 'candidate_sha': job['value_candidate_sha'],
+            'candidate_tree': accepted['value_reviewed_candidate_tree'],
+            'publication_sha': job['value_publication_sha'],
+            'integrated_publication_sha': job['value_publication_sha'],
+            'integrated_sha': job['value_integrated_sha'], 'integrated_tree': job['value_integrated_tree'],
+            'integrated_parents': [base['value_sha']], 'pr_number': job['value_pr_number'],
+        }
+        if (not isinstance(integrated, dict)
+                or any(integrated.get(key) != value for key, value in integration_identity.items())
+                or job['value_integrated_publication_sha'] != job['value_publication_sha']
+                or job['value_publication_parent_sha'] != base['value_sha']
+                or job['value_integrated_tree'] != accepted['value_reviewed_candidate_tree']
+                or merge['value_head_sha'] != job['value_publication_sha']
+                or merge['value_base_sha'] != base['value_sha']
+                or merge['value_base_branch'] != root['value_run_branch']
+                or merge['value_effective_revision'] != job['value_effective_revision']):
+            raise MigrationRefused('source_integration_identity')
+        integrated_pr = integrated.get('pr')
+        if (not isinstance(integrated_pr, dict)
+                or integrated_pr.get('head_sha') != job['value_publication_sha']
+                or integrated_pr.get('merge_commit_sha') != job['value_integrated_sha']
+                or integrated_pr.get('number') != job['value_pr_number']
+                or integrated_pr.get('base_sha') != base['value_sha']):
+            raise MigrationRefused('source_integration_identity')
         for field, kind, expected in (
                 ("value_linked_branch_display", "linked_branch_display", {"status": "linked"}),
                 ("value_branch_publication_observation", "branch_publication_observation",
                  {"disposition": "published", "branch": job["value_ticket_branch"],
-                  "head_sha": job["value_integrated_sha"]})):
+                  "head_sha": job["value_publication_sha"]})):
             observed_write = _completed_evidence(db, run["run_id"], job[field],
                                                 owner=f"job:{job['job_id']}", kind=kind)
             if not isinstance(observed_write, dict) or any(observed_write.get(key) != value for key, value in expected.items()):
@@ -481,7 +518,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                           root["value_language"], requirements, policy, inputs,
                           root["value_run_branch"], base["value_branch"], base["value_sha"],
                           ticket, job["value_ticket_branch"], job["value_candidate_sha"],
-                          accepted["value_reviewed_candidate_tree"], job["value_integrated_sha"],
+                          accepted["value_reviewed_candidate_tree"], job["value_publication_sha"], job["value_integrated_sha"],
                           job["value_integrated_tree"], job["value_pr_number"], job["revision"],
                           _wire_row(dict(job)), _wire_row(dict(cleanup)), supporting_calls,
                           timeline, _wire_row(dict(close_intent)),
@@ -510,7 +547,7 @@ def _read_document(path: Path, *, limit: int = 4 * 1024 * 1024) -> tuple[dict[st
 
 
 def _copy_loose_git(source: Path, target: Path, *, run_ref: str, base: str,
-                    candidate: str, integrated: str, candidate_tree: str,
+                    candidate: str, publication: str, integrated: str, candidate_tree: str,
                     integrated_tree: str) -> None:
     """Build a new owned repository using only sealed loose objects, never source config."""
     if (source.is_symlink() or not source.is_dir() or target.is_symlink()
@@ -541,11 +578,12 @@ def _copy_loose_git(source: Path, target: Path, *, run_ref: str, base: str,
         destination = target / ".git" / "objects" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(entry, destination)
-    for sha, tree in ((candidate, candidate_tree), (integrated, integrated_tree)):
+    for sha, tree in ((candidate, candidate_tree), (publication, integrated_tree), (integrated, integrated_tree)):
         if _git(target, "cat-file", "-t", sha) != "commit" or _git(target, "rev-parse", f"{sha}^{{tree}}") != tree:
             raise MigrationRefused("source_git_object")
     if (_git(target, "cat-file", "-t", base) != "commit"
-            or _git(target, "show", "-s", "--format=%P", integrated) != base):
+            or any(_git(target, "show", "-s", "--format=%P", sha) != base
+                   for sha in (publication, integrated))):
         raise MigrationRefused("source_git_ancestry")
     _git(target, "update-ref", "refs/heads/main", base)
     _git(target, "update-ref", run_ref, integrated)
@@ -557,20 +595,75 @@ def _copy_loose_git(source: Path, target: Path, *, run_ref: str, base: str,
         raise MigrationRefused("copied_git_dirty")
 
 
+def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Completed,
+                            destination: Path, root: Path, final: Path, git_store: Path) -> None:
+    """Verify original resources without changing a ref, worktree or clone."""
+    managed = ManagedWorkspace.for_repository(facts.repository)
+    expected_final = managed.root / 'worktrees' / facts.run_id / 'run-publication'
+    if (root != managed.repository_root or managed.open_path() != root
+            or snapshot.source.resolve() != managed.state_root / 'state.sqlite3'
+            or destination != managed.state_root / facts.run_id / 'kernel.sqlite3'
+            or destination.parent.resolve() != destination.parent
+            or final != expected_final or final.exists() or final.is_symlink()
+            or git_store != root / '.git' or git_store.resolve() != git_store):
+        raise MigrationRefused('source_existing_resources')
+    with closing(sqlite3.connect(copied.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        if db.execute('SELECT count(*) FROM runs').fetchone()[0] != 1:
+            raise MigrationRefused('source_task_scope')
+        task = read_v6_host_exit(db, facts.run_id, required=True)
+        control = _one(db, 'SELECT run_state_dir FROM control_tasks')
+        uuid = _one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?',
+                    (facts.run_id,))[0]
+        if (task is None or task.workspace != root
+                or control['run_state_dir'] != str(managed.state_root)
+                or not isinstance(uuid, str) or re.fullmatch(r'[0-9a-f]{32}', uuid) is None):
+            raise MigrationRefused('source_existing_identity')
+    marker = git_store / 'agent-run-checkout-id'
+    if (marker.is_symlink() or not marker.is_file() or marker.stat().st_nlink != 1
+            or marker.stat().st_size != 33 or marker.read_bytes() != uuid.encode('ascii') + b'\n'):
+        raise MigrationRefused('source_existing_identity')
+    reader = LocalGit(root)
+    for ref, sha in ((f'refs/heads/{facts.run_branch}', facts.integrated_sha),
+                     (f'refs/heads/{facts.base_branch}', facts.base_sha)):
+        if (reader.run('symbolic-ref', '-q', ref, check=False).returncode != 1
+                or _git(root, 'rev-parse', '--verify', ref) != sha):
+            raise MigrationRefused('source_existing_ref')
+    if (_git(root, 'rev-parse', 'HEAD') != facts.base_sha
+            or _git(root, 'status', '--porcelain')
+            or _git(root, 'for-each-ref', '--format=%(refname)', f'refs/heads/{facts.ticket_branch}')):
+        raise MigrationRefused('source_existing_checkout')
+    worktrees = _git(root, 'worktree', 'list', '--porcelain').strip().split('\n\n')
+    if len(worktrees) != 1 or worktrees[0].splitlines()[0] != f'worktree {root}':
+        raise MigrationRefused('source_existing_worktrees')
+    for sha, tree in ((facts.candidate_sha, facts.candidate_tree),
+                      (facts.publication_sha, facts.integrated_tree),
+                      (facts.integrated_sha, facts.integrated_tree)):
+        if (_git(root, 'cat-file', '-t', sha) != 'commit'
+                or _git(root, 'rev-parse', f'{sha}^{{tree}}') != tree):
+            raise MigrationRefused('source_git_object')
+    if (_git(root, 'cat-file', '-t', facts.base_sha) != 'commit'
+            or any(_git(root, 'show', '-s', '--format=%P', sha) != facts.base_sha
+                   for sha in (facts.publication_sha, facts.integrated_sha))):
+        raise MigrationRefused('source_git_ancestry')
+
+
 def convert_completed_ticket_v6(
     snapshot: SourceSnapshot, destination: Path, *, git_store: Path,
     repository_root: Path, final_checkout: Path, profile_snapshot: Path,
     github_snapshot: Path, observation_snapshot: Path, original_report: Path,
+    existing_verified: bool = False,
 ) -> Kernel:
     """Import a copied, offline single-Ticket completion and its source records.
 
     The supplied old artifacts are from a finished, observed runtime. This
-    narrow API does not certify live Host quiescence or transfer ownership of
-    a general old repository.  It creates its own Git repository and database.
+    ``existing_verified`` instead verifies the exact original managed clone
+    read-only and creates only an unpublished database. Neither mode retires
+    source authority, publishes a Task, activates Final or launches a Host.
     """
     destination = destination.absolute()
     repository_root, final_checkout = repository_root.absolute(), final_checkout.absolute()
-    if (destination.exists() or destination.is_symlink() or repository_root.exists()
+    if not existing_verified and (destination.exists() or destination.is_symlink() or repository_root.exists()
             or repository_root.is_symlink()
             or not repository_root.parent.resolve().is_relative_to(destination.parent.resolve())
             or not repository_root.is_relative_to(destination.parent)
@@ -582,6 +675,9 @@ def convert_completed_ticket_v6(
             or not final_checkout.is_relative_to(destination.parent)
             or not final_checkout.parent.resolve().is_relative_to(destination.parent.resolve())):
         raise MigrationRefused("private_destination_required")
+    if existing_verified and (destination.exists() or destination.is_symlink()
+                              or not destination.parent.is_dir() or repository_root.is_symlink()):
+        raise MigrationRefused('source_existing_resources')
     profile, profile_sha = _read_profile(profile_snapshot)
     observed, observation_sha = _read_document(observation_snapshot)
     report, report_sha = _read_document(original_report)
@@ -602,7 +698,8 @@ def convert_completed_ticket_v6(
                        and isinstance(row.get("path"), str)]
                       if isinstance(registrations, list) else [])
     if (len(original_roots) != 1 or not original_roots[0].is_absolute()
-            or destination.parent.resolve().is_relative_to(original_roots[0].resolve())):
+            or (not existing_verified and destination.parent.resolve().is_relative_to(original_roots[0].resolve()))
+            or (existing_verified and original_roots[0] != repository_root)):
         raise MigrationRefused("old_repository_alias")
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".v6-completed-") as directory:
         copied = capture_v6(snapshot.path, Path(directory) / "source.sqlite3")
@@ -644,7 +741,7 @@ def convert_completed_ticket_v6(
         if (not isinstance(pr, dict)
                 or pr.get("number") != facts.pr_number or pr.get("state") != "MERGED"
                 or pr.get("branch") != facts.ticket_branch or pr.get("base_branch") != facts.run_branch
-                or pr.get("head_sha") != facts.integrated_sha
+                or pr.get("head_sha") != facts.publication_sha
                 or pr.get("integrated_sha") != facts.integrated_sha
                 or pr.get("base_sha") != facts.base_sha):
             raise MigrationRefused("source_external_pr")
@@ -678,21 +775,26 @@ def convert_completed_ticket_v6(
                                  and not (git_store / "packed-refs").exists())
         except (OSError, UnicodeError):
             source_refs_valid = False
-        if not source_refs_valid:
+        if not source_refs_valid and not existing_verified:
             raise MigrationRefused("source_git_refs")
         subject = f"ticket:{facts.ticket}"
         owned_repository = False
         try:
-            try:
-                repository_root.mkdir()
-            except FileExistsError as error:
-                raise MigrationRefused("private_destination_exists") from error
-            owned_repository = True
-            _copy_loose_git(git_store, repository_root,
-                            run_ref=f"refs/heads/{facts.run_branch}", base=facts.base_sha,
-                            candidate=facts.candidate_sha, integrated=facts.integrated_sha,
-                            candidate_tree=facts.candidate_tree,
-                            integrated_tree=facts.integrated_tree)
+            if existing_verified:
+                _existing_completed_git(snapshot, copied.path, facts, destination,
+                                        repository_root, final_checkout, git_store)
+            else:
+                try:
+                    repository_root.mkdir()
+                except FileExistsError as error:
+                    raise MigrationRefused("private_destination_exists") from error
+                owned_repository = True
+                _copy_loose_git(git_store, repository_root,
+                                run_ref=f"refs/heads/{facts.run_branch}", base=facts.base_sha,
+                                candidate=facts.candidate_sha, publication=facts.publication_sha,
+                                integrated=facts.integrated_sha,
+                                candidate_tree=facts.candidate_tree,
+                                integrated_tree=facts.integrated_tree)
             base_tree = _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")
             common = repository_root / ".git"
             spec = RunSpec(facts.run_id, facts.repository, facts.parent_number,
@@ -719,9 +821,9 @@ def convert_completed_ticket_v6(
                     publication_sha=?,publication_tree=?,workspace_sha=?,expected_tree=?,
                     integration_target=?,pr_number=?,gate_mode='review',merge_sha=?,
                     review_attempt=?,current_attempt=NULL WHERE id=?""",
-                           (facts.integrated_sha, facts.candidate_sha, facts.candidate_tree,
-                            facts.integrated_sha, facts.integrated_tree, facts.integrated_sha,
-                            facts.integrated_tree, facts.integrated_sha, facts.candidate_tree,
+                           (facts.publication_sha, facts.candidate_sha, facts.candidate_tree,
+                            facts.integrated_sha, facts.integrated_tree, facts.publication_sha,
+                            facts.integrated_tree, facts.publication_sha, facts.candidate_tree,
                             facts.base_sha, facts.pr_number, facts.integrated_sha,
                             facts.attempts[1]["attempt_id"], subject))
                 tx.execute("UPDATE budgets SET developments_used=?,reviews_used=? "
@@ -796,7 +898,7 @@ def convert_completed_ticket_v6(
                     receipt_ids.append(effect_id)
                 tx.execute("INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (subject, 1, native["revision"], facts.parent_revision,
-                            facts.graph_revision, facts.integrated_sha, facts.integrated_sha,
+                            facts.graph_revision, facts.publication_sha, facts.integrated_sha,
                             facts.integrated_tree, facts.pr_number, "review",
                             facts.attempts[1]["attempt_id"], facts.attempts[0]["attempt_id"],
                             *receipt_ids))
@@ -809,7 +911,9 @@ def convert_completed_ticket_v6(
                     "old_profile_bindings": len(profile["bindings"]),
                     "old_completed_job_revision": facts.old_job_revision,
                     "copied_repository_root": str(repository_root),
+                    "resource_mode": "existing-verified" if existing_verified else "copy",
                     "candidate_sha": facts.candidate_sha,
+                    "publication_sha": facts.publication_sha,
                     "integrated_sha": facts.integrated_sha,
                     "old_job": facts.old_job,
                     "old_cleanup": facts.old_cleanup,

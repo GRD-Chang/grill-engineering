@@ -18,10 +18,11 @@ from typing import Any, Sequence
 
 from .kernel import Kernel
 from .migration import MigrationRefused, SourceSnapshot, capture_v6
+from .migration_quiescence import CONTROL_TABLES
 from .model import wire_json
 
 
-RECORD_TABLES = frozenset({
+RECORD_TABLES = CONTROL_TABLES | frozenset({
     'schema_meta', 'runs', 'run_root', 'run_condition_base', 'run_parent_versions',
     'run_graph_versions', 'run_graph_snapshots', 'run_graph_scope_order',
     'run_graph_ticket_slots', 'run_graph_members', 'run_frontier', 'run_query_roots',
@@ -55,6 +56,8 @@ def _scope(table: str, columns: Sequence[str], run_id: str) -> tuple[str, tuple[
     if table == 'work_evidence_materials':
         return (' WHERE material_id IN (SELECT material_id FROM work_evidence '
                 'WHERE run_id=? AND material_id IS NOT NULL)', (run_id,))
+    if table in CONTROL_TABLES:
+        return (' WHERE task_id IN (SELECT task_id FROM control_tasks WHERE run_id=?)', (run_id,))
     if 'run_id' in columns:
         return ' WHERE run_id=?', (run_id,)
     raise MigrationRefused('source_record_scope')

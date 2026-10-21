@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 from .storage import MATERIAL_LIMIT, Transaction
 
 
+class ObservationSuperseded(KernelError):
+    """This read lost to an independently committed local authority change."""
+
+
 class RemoteEffects:
     """A concrete execute/reconcile port; authorize is required for every write.
 
@@ -393,9 +397,13 @@ class RemoteEffects:
                 if "review_context" in context:
                     anchors.add(context["review_context"]["full_range"]["candidate_sha"])
         reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-        receipt = kernel.refresh(lambda: read_requirements(reader, parent))
+        receipt = self._refresh_requirements(kernel, reader, parent)
         completions = [row for row in receipt["completion_revisions"] if row["subject"] == subject]
         if len(completions) != 1 or completions[0]["generation"] != job["generation"]:
+            with kernel.storage.transaction(write=False) as tx:
+                current = tx.one("SELECT generation FROM subjects WHERE id=?", (subject,))[0]
+            if current != job["generation"]:
+                raise ObservationSuperseded("source_subject_changed")
             raise KernelError("source_subject_changed")
         revision = receipt["observed_parent_revision"]
         if job["kind"] == "ticket":
@@ -435,7 +443,7 @@ class RemoteEffects:
             target = tx.one("SELECT source_ref,target_ref FROM final_target")
             source_ref, target_ref = target["source_ref"], target["target_ref"]
         reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-        receipt = kernel.refresh(lambda: read_requirements(reader, parent))
+        receipt = self._refresh_requirements(kernel, reader, parent)
         run_sha, default_sha = read_remote_heads(self.root, source_ref, target_ref,
                                                  runner_identity=self.identity, remote=self.remote)
         if run_sha is None:
@@ -448,6 +456,20 @@ class RemoteEffects:
                    if generations.get(row["subject"]) == row["generation"]}
         proof = tuple((before, run_sha) for before in sorted(anchors) if self._ancestor(_sha(before), run_sha))
         return run_head, default_head, proof
+
+    def _refresh_requirements(self, kernel: Kernel, reader: GhGitHubReader, parent: int) -> dict[str, Any]:
+        with kernel.storage.transaction(write=False) as tx:
+            sequence = tx.one("SELECT source_sequence FROM runs")[0]
+        try:
+            return kernel.refresh(lambda: read_requirements(reader, parent))
+        except KernelError as error:
+            if error.code != "source_observation_changed":
+                raise
+            with kernel.storage.transaction(write=False) as tx:
+                current = tx.one("SELECT source_sequence FROM runs")[0]
+            if current == sequence:
+                raise
+            raise ObservationSuperseded(error.code) from error
 
     def _source_parent(self, tx: Transaction) -> int:
         run = tx.one("SELECT * FROM runs")

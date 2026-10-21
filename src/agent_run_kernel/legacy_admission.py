@@ -9,20 +9,27 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+import base64
 import fcntl
 import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+from typing import Iterator, Mapping
 
 from agent_run.managed_workspace import ManagedWorkspace, ManagedWorkspaceError, normalize_repository
 from agent_run.paths import app_data_root
 from agent_run.task_identity import TaskKey
 
 from .migration import SOURCE_PROTOCOL, SOURCE_TABLES, source_identity
-from .model import KernelError
+from .model import KernelError, wire_json
 from .task_location import locked_task
+
+
+_SOURCE_FENCE_PREFIX = "original-source-to-native/1:"
+_SOURCE_FENCE_KEYS = frozenset({"nonce", "source_db", "source_sha256", "run_id", "task_fingerprint",
+                                "source_uuid", "target_db"})
+_SOURCE_FENCE_LIMIT = 16 * 1024
 
 
 @dataclass(frozen=True, order=True)
@@ -35,6 +42,50 @@ class _Source:
 def _refuse() -> KernelError:
     return KernelError("legacy_requires_offline_migration",
                        "The original Task authority must be retired by an explicit offline migration")
+
+
+def _fence_material(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != _SOURCE_FENCE_KEYS:
+        raise _refuse()
+    receipt: dict[str, str] = {}
+    for key in sorted(_SOURCE_FENCE_KEYS):
+        item = value[key]
+        if not isinstance(item, str) or not item or any(ord(character) < 32 for character in item):
+            raise _refuse()
+        receipt[key] = item
+    for key, length in (("nonce", 32), ("source_uuid", 32), ("source_sha256", 64), ("task_fingerprint", 64)):
+        if len(receipt[key]) != length or any(character not in "0123456789abcdef" for character in receipt[key]):
+            raise _refuse()
+    for key in ("source_db", "target_db"):
+        path = Path(receipt[key])
+        if (not path.is_absolute() or str(path) != receipt[key] or ".." in path.parts
+                or receipt[key].startswith("//") or len(receipt[key]) > 4096):
+            raise _refuse()
+    if receipt["source_db"] == receipt["target_db"] or len(receipt["run_id"]) > 256:
+        raise _refuse()
+    return receipt
+
+
+def source_fence(receipt: Mapping[str, str]) -> str:
+    """Encode the shared original-source receipt; encoding grants no admission."""
+    protocol = _SOURCE_FENCE_PREFIX + base64.urlsafe_b64encode(wire_json(_fence_material(dict(receipt)))).decode("ascii")
+    if len(protocol) > _SOURCE_FENCE_LIMIT:
+        raise _refuse()
+    return protocol
+
+
+def read_source_fence(protocol: str) -> dict[str, str]:
+    """Read only this exact canonical protocol, never a private-copy marker."""
+    if not protocol.startswith(_SOURCE_FENCE_PREFIX) or len(protocol) > _SOURCE_FENCE_LIMIT:
+        raise _refuse()
+    try:
+        encoded = protocol[len(_SOURCE_FENCE_PREFIX):].encode("ascii")
+        receipt = _fence_material(json.loads(base64.b64decode(encoded, altchars=b"-_", validate=True)))
+    except (ValueError, UnicodeError) as error:
+        raise _refuse() from error
+    if source_fence(receipt) != protocol:
+        raise _refuse()
+    return receipt
 
 
 def _sources(task: TaskKey) -> tuple[_Source, ...]:

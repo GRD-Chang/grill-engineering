@@ -599,8 +599,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
 
 
 @contextmanager
-def _approval_read_barrier():
-    """Delay one real remote read after the durable Final approval boundary."""
+def _approval_read_barrier(*, boundary=None, released=None):
+    """Delay one real remote read at a recorded control boundary."""
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind("")
     listener.listen(8)
@@ -621,11 +621,16 @@ def _approval_read_barrier():
                     channel.settimeout(10)
                     assert channel.recv(2) == b"1"
                     if databases and not reached.is_set():
-                        with databases[0].storage.transaction(write=False) as tx:
-                            approval = tx.rows("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
+                        if boundary is None:
+                            with databases[0].storage.transaction(write=False) as tx:
+                                approval = tx.rows("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
+                        else:
+                            approval = boundary(databases[0])
                         if approval:
                             reached.set()
-                            assert release.wait(25), "Final approval read was never released"
+                            assert release.wait(25), "Control boundary read was never released"
+                            if released is not None:
+                                released.set()
                     channel.sendall(b"1")
         except BaseException as error:
             if not stopped.is_set():
@@ -739,3 +744,197 @@ if role == 'development':
                     "total_seconds": time.monotonic() - preparation_started}))
             finally:
                 release.set()
+
+
+def test_public_requeue_delivers_fresh_ticket_and_final_generations_in_the_original_managed_host(
+    git_repo: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    fresh_body = "Keep the original deliverable and record this clarified requirement in requeue-evidence.txt."
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+"""
+    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    codex = codex.replace("with open(os.environ['ENTRY_ROLE_TRACE'], 'a') as log:", """requirement = None
+if role == 'development' and Path.cwd().name.startswith('ticket-'):
+    requirement = json.loads(subprocess.check_output(['gh', 'issue', 'view', '2', '--repo', 'example/project',
+        '--json', 'number,title,body'], text=True))
+    if Path.cwd().name.endswith('-g2'):
+        assert requirement['body'] == os.environ['ENTRY_REQUEUE_BODY']
+        Path('requeue-evidence.txt').write_text(requirement['body'] + chr(10))
+with open(os.environ['ENTRY_ROLE_TRACE'], 'a') as log:""")
+    codex = codex.replace("'head': head}", "'head': head, 'prompt': prompt, 'requirement': requirement}")
+    hold = r'''
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+    control.settimeout(30)
+    control.connect('\0' + os.environ['ENTRY_WORKER_CONTROL'][1:])
+    control.sendall(json.dumps({'role':role, 'thread':thread, 'checkout':str(Path.cwd()), 'prompt':prompt,
+                               'requirement':requirement}).encode())
+    control.shutdown(socket.SHUT_WR)
+    assert control.recv(1) == b'1'
+'''
+    codex = codex.replace("content = 'Implementation", hold + "\ncontent = 'Implementation")
+
+    boundary_stage = {"final_generation": None}
+    released = threading.Event()
+
+    def current_boundary(kernel):
+        with kernel.storage.transaction(write=False) as tx:
+            if boundary_stage["final_generation"] is not None:
+                return bool(tx.rows("SELECT id FROM subjects WHERE kind='final_run' AND generation=? AND phase='approval'",
+                                    (boundary_stage["final_generation"],)))
+            return bool(tx.rows("SELECT id FROM subjects WHERE id='ticket:2' AND generation=1 AND phase='candidate'")) and not tx.rows(
+                "SELECT id FROM leases WHERE subject='ticket:2'")
+
+    with _worker_controls(tmp_path) as (worker_address, arrivals), _approval_read_barrier(boundary=current_boundary, released=released) as (address, databases, reached, release):
+        monkeypatch.setenv("ENTRY_WORKER_CONTROL", worker_address)
+        monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
+        monkeypatch.setenv("ENTRY_REQUEUE_BODY", fresh_body)
+        environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
+        with _local_manager(tmp_path / "manager", environment, host_timeout=180) as (manager, serving, errors, children, trace, commands, output):
+            started = time.monotonic()
+            deadline = started + 180
+            timing = {"overall_budget_seconds": 180}
+            kernel = None
+            environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
+
+            def remaining():
+                return max(0.01, deadline - time.monotonic())
+
+            def public(*arguments):
+                result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments,
+                    "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
+                    text=True, capture_output=True, timeout=min(20, remaining()))
+                return result.returncode, json.loads(result.stdout)
+
+            try:
+                code, accepted = public("run", "1", "--no-notifications")
+                assert code == 0, accepted
+                command = commands[0]
+                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                databases.append(kernel)
+                environment.pop("ENTRY_APPROVAL_CONTROL")
+                original_event, channel = arrivals.get(timeout=min(20, remaining()))
+                assert original_event["requirement"]["body"] == "Original requirement for Ticket 2."
+                channel.sendall(b"1")
+                while not reached.wait(0.1):
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                preparation_seconds = time.monotonic() - started
+                timing["preparation_seconds"] = preparation_seconds
+                request = kernel.host_request(accepted["action_id"])
+                before = kernel.status("ticket:2")
+                assert before["generation"] == 1 and before["phase"] == "candidate"
+                with kernel.storage.transaction(write=False) as tx:
+                    original_threads = [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")]
+                    original_attempt = tx.one("SELECT id FROM attempts WHERE subject='ticket:2' AND generation=1 AND role='development'")[0]
+                changed = json.loads(state.read_text())
+                changed["source_graph"]["issues"]["2"]["body"] = fresh_body
+                state.write_text(json.dumps(changed))
+                controlled_at = time.monotonic()
+                timing["ticket_control_since_run_seconds"] = controlled_at - started
+                code, requeued = public("requeue", accepted["run_id"])
+                assert code == 0, requeued
+                assert requeued["host"] == "running" and requeued["status"] == "action_applied"
+                assert kernel.host_request(accepted["action_id"]) == request
+                assert kernel.status("ticket:2")["generation"] == 2
+                assert kernel.status("ticket:2")["phase"] == "workspace"
+                boundary_stage["final_generation"] = 1
+                release.set()
+                assert released.wait(min(5, remaining()))
+                release.clear()
+                reached.clear()
+                while not reached.wait(0.1):
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                ticket_to_approval_seconds = time.monotonic() - controlled_at
+                timing["ticket_requeue_to_final_approval_seconds"] = ticket_to_approval_seconds
+                final = kernel.source_status()["final_subject"]
+                assert final is not None and kernel.status(final)["phase"] == "approval"
+                final_before = kernel.status(final)
+                final_delivery = kernel.delivery(final)
+                completions = kernel.source_status()["completions"]
+                original_run_head = _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref)
+                changed = json.loads(state.read_text())
+                changed["source_graph"]["parent"]["body"] += "\nRecheck the entire delivered Run against this clarified Parent outcome."
+                state.write_text(json.dumps(changed))
+                final_controlled_at = time.monotonic()
+                timing["final_control_since_run_seconds"] = final_controlled_at - started
+                code, final_requeued = public("requeue", accepted["run_id"])
+                assert code == 0, final_requeued
+                assert final_requeued["host"] == "running" and final_requeued["status"] == "action_applied"
+                assert kernel.host_request(accepted["action_id"]) == request
+                renewed = kernel.status(final)
+                assert renewed["generation"] == final_before["generation"] + 1 and renewed["phase"] == "workspace"
+                assert renewed["budgets"] == final_before["budgets"]
+                assert renewed["pr_number"] == final_before["pr_number"]
+                assert kernel.delivery(final).source_ref == final_delivery.source_ref
+                assert kernel.delivery(final).target_ref == final_delivery.target_ref
+                assert kernel.delivery(final).checkout != final_delivery.checkout
+                assert kernel.source_status()["completions"] == completions
+                with kernel.storage.transaction(write=False) as tx:
+                    assert tx.one("SELECT count(*) FROM grants WHERE subject=?", (final,))[0] == 0
+                boundary_stage["final_generation"] = renewed["generation"]
+                released.clear()
+                release.set()
+                assert released.wait(min(5, remaining()))
+                release.clear()
+                reached.clear()
+                while not reached.wait(0.1):
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                assert kernel.status(final)["phase"] == "approval"
+                timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
+                approve_started = time.monotonic()
+                code, approved = public("approve", accepted["run_id"])
+                assert code == 0 and approved["status"] == "action_pending" and approved["host"] == "running", approved
+                assert kernel.host_request(accepted["action_id"]) == request
+                with kernel.storage.transaction(write=False) as tx:
+                    grant = tx.one("SELECT action,pr_number,head_sha FROM grants WHERE subject=?", (final,))
+                    assert grant["action"] == approved["action_id"] and grant["pr_number"] == final_before["pr_number"]
+                release.set()
+                serving.join(timeout=remaining())
+                assert not serving.is_alive() and not errors, errors
+                assert children[0].returncode == 0 and len(commands) == 1, output
+                status = kernel.status("ticket:2")
+                assert status["phase"] == "complete" and status["generation"] == 2
+                assert status["retired_generations"][0]["generation"] == 1
+                assert len(kernel.source_status()["completions"]) == 1
+                assert kernel.source_status()["completions"][0]["generation"] == 2
+                assert kernel.status(final)["phase"] == "complete"
+                assert kernel.status(final)["generation"] == renewed["generation"]
+                assert kernel.status(final)["pr_number"] == final_before["pr_number"]
+                assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
+                events = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
+                fresh = [event for event in events if Path(event["checkout"]).name == "ticket-2-g2"]
+                assert [event["role"] for event in fresh] == ["development", "review", "publication"]
+                assert fresh[0]["requirement"]["body"] == fresh_body
+                assert f"https://github.com/example/project/issues/2" in fresh[0]["prompt"]
+                assert fresh[0]["thread"] != original_event["thread"]
+                fresh_final = [event for event in events if Path(event["checkout"]).name == "final-1-g2"]
+                assert [event["role"] for event in fresh_final] == ["review", "publication"]
+                with kernel.storage.transaction(write=False) as tx:
+                    assert all(dict(tx.one("SELECT * FROM threads WHERE id=?", (thread["id"],))) == thread for thread in original_threads)
+                    assert tx.one("SELECT count(*) FROM history WHERE kind='role_consumed' AND identity=?", (original_attempt,))[0] == 1
+                    assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+                    workers = tx.all("SELECT a.generation,o.process_identity FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation "
+                                     "JOIN attempts a ON a.id=i.attempt WHERE a.subject='ticket:2'")
+                    assert {row["generation"] for row in workers} == {1, 2}
+                    assert all(json.loads(tx.get(row["process_identity"], "ticket:2"))["host_pid"] == children[0].pid for row in workers)
+                branch = kernel.delivery("ticket:2").target_ref
+                assert _git(tmp_path / "origin.git", "show", branch + ":requeue-evidence.txt") == fresh_body
+                assert json.loads(state.read_text())["source_graph"]["issues"]["2"]["state"] == "CLOSED"
+                assert len(json.loads(state.read_text())["prs"]) == 2
+                assert next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == final_before["pr_number"])["merged"]
+                code, completed = public("status", accepted["run_id"])
+                assert code == 0 and completed["status"] == "completed", completed
+                assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
+                timing["approve_to_complete_seconds"] = time.monotonic() - approve_started
+            finally:
+                release.set()
+                timing.update(total_seconds=time.monotonic() - started,
+                              host_poll=children[0].poll() if children else None,
+                              manager_trace=trace, manager_errors=[repr(error) for error in errors])
+                if kernel is not None:
+                    with kernel.storage.transaction(write=False) as tx:
+                        timing["history_tail"] = [dict(row) for row in tx.all(
+                            "SELECT position,subject,kind,phase,created_at FROM history ORDER BY position DESC LIMIT 20")]
+                (tmp_path / "control-timing.json").write_text(json.dumps(timing))

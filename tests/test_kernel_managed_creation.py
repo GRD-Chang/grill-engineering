@@ -155,7 +155,7 @@ def test_native_public_parser_preserves_creation_and_resume_arguments() -> None:
     assert resume.message == "原样反馈\r\nDo not rewrite" and resume.as_json
 
 
-def test_unconnected_public_action_reports_failure_without_mutating_settings(tmp_path: Path, capsys) -> None:
+def test_requeue_of_a_missing_run_reports_failure_without_mutating_settings(tmp_path: Path, capsys) -> None:
     import json
     from agent_run.user_defaults import UserDefaultsStore
     from agent_run_kernel.query_cli import main
@@ -164,7 +164,7 @@ def test_unconnected_public_action_reports_failure_without_mutating_settings(tmp
     before = defaults.path.read_bytes()
     assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 2
     output = json.loads(capsys.readouterr().out)
-    assert output["result"] == "error" and output["diagnostics"][0]["code"] == "lifecycle_not_connected"
+    assert output["result"] == "error" and output["diagnostics"][0]["code"] == "run_locator_missing"
     assert defaults.path.read_bytes() == before
 
 
@@ -291,7 +291,8 @@ def test_lifecycle_rejects_unsupported_github_host_before_managed_or_remote_acce
 
 
 @contextmanager
-def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit: bool = True):
+def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit: bool = True,
+                           tickets: tuple[int, ...] = ()):
     """Real Git/source/manager reads around a controlled ready Host.
 
     This producer supplies usage readiness; the unchanged managed-entry E2E
@@ -299,13 +300,9 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     """
     import json
     import os
-    from agent_run.paths import app_data_root
     from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec, World
+    from agent_run_kernel import Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, RunSpec, World
     from agent_run_kernel.configuration import freeze_creation
-    from agent_run_kernel.model import Execution
-    from agent_run_kernel import host_adapter, lifecycle_cli
-    from tests.test_kernel_host_adapter import controlled_manager
     from tests.test_kernel_remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
     binary.mkdir()
@@ -314,7 +311,9 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     executable.chmod(0o700)
     remote_state = tmp_path / "github.json"
     remote_state.write_text(json.dumps({"prs": [], "source_graph": {"parent": {
-        "number": 1, "title": "Parent", "body": "Frozen requirement", "sub_issues": []}, "issues": {}}}))
+        "number": 1, "title": "Parent", "body": "Frozen requirement", "sub_issues": list(tickets)}, "issues": {
+            str(number): {"number": number, "title": f"Ticket {number}", "body": "Frozen Ticket requirement",
+                          "state": "OPEN", "labels": ["ready-for-agent"]} for number in tickets}}}))
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("REMOTE_TEST_STATE", str(remote_state))
     monkeypatch.setenv("REMOTE_TEST_CALLS", str(tmp_path / "gh-calls.jsonl"))
@@ -324,15 +323,37 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     base = Commit(git(root, "rev-parse", "HEAD"), git(root, "rev-parse", "HEAD^{tree}"))
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "unobserved", base,
                         "refs/heads/parent", "refs/heads/main")
+    deliveries = (delivery,) if not tickets else (*tuple(
+        Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "unobserved", base,
+                 f"refs/heads/ticket-{number}", "refs/heads/run") for number in tickets),
+        Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unobserved", base, "refs/heads/run", "refs/heads/main"))
     defaults = UserDefaultsStore()
     defaults.configure(language="en")
-    spec = freeze_creation(RunSpec("public-controls", workspace.repository, 1, "parent", "graph", (delivery,),
+    spec = freeze_creation(RunSpec("public-controls", workspace.repository, 1, "parent", "graph", deliveries,
                                    repository_root=str(root)), defaults,
                            policy_overrides={"parent_only_paired_rounds": 1, "development_deadline": "7s"})
     assert spec.inputs is not None
     spec = replace(spec, inputs=replace(spec.inputs, repository_remote="origin"))
     kernel = Kernel.create_task(workspace.state_root / spec.run_id / "kernel.sqlite3", spec,
-        requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement"), ()))
+        requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement", tickets), tuple(
+            Issue(number, f"Ticket {number}", "Frozen Ticket requirement", "OPEN", labels=frozenset({"ready-for-agent"}))
+            for number in tickets)))
+    receipt = kernel.source_status()
+    world = World(receipt["observed_parent_revision"], receipt["observed_graph_revision"],
+                  kernel.delivery(deliveries[0].key).revision, base)
+    with _ready_public_host(kernel, tmp_path, monkeypatch, admit=admit) as (request, execution, calls):
+        yield kernel, request, execution, world, calls
+
+
+@contextmanager
+def _ready_public_host(kernel, tmp_path: Path, monkeypatch, *, admit: bool = True):
+    """Use the original executable manager and real PID; readiness is explicit."""
+    import json
+    from agent_run.paths import app_data_root
+    from agent_run_kernel import host_adapter, lifecycle_cli
+    from agent_run_kernel.model import Execution
+    from tests.test_kernel_host_adapter import controlled_manager
+
     active = app_data_root() / "active" / "current"
     active.parent.mkdir(parents=True)
     active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[2], target_is_directory=True)
@@ -340,11 +361,8 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     manager_root.mkdir()
     manager, fixture, response, calls = controlled_manager(manager_root)
     monkeypatch.setattr(host_adapter, "SystemdHost", lambda **_kwargs: manager)
-    receipt = kernel.source_status()
-    world = World(receipt["observed_parent_revision"], receipt["observed_graph_revision"],
-                  kernel.delivery("parent:1").revision, base)
     if not admit:
-        yield kernel, None, None, world, calls
+        yield None, None, calls
         return
     request = kernel.admit_host("original", kind="run", command=fixture.command,
         environment_carrier=tmp_path / "original-environment", preflight=manager.preflight)
@@ -360,7 +378,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
         observation = manager.observe(request)
         assert observation.disposition == "running"
         assert kernel.observe_host(request, replace(observation, usage_ready=True)) == "running"
-        yield kernel, request, Execution(request.run_id, request.owner, request.epoch), world, calls
+        yield request, Execution(request.run_id, request.owner, request.epoch), calls
     finally:
         process.terminate()
         process.wait(timeout=3)
@@ -429,6 +447,150 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
         assert continued is not None and continued.attempt_id == original.attempt_id
         assert continued.deadline_seconds == 7.0 and kernel.host_request("original") == request
         assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
+
+
+def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_original_host(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run.github import GhGitHubReader
+    from agent_run_kernel import lifecycle_cli
+    from agent_run_kernel.query_cli import main
+    from agent_run_kernel.source_reading import read_requirements
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, calls):
+        original = kernel.advance("parent:1", execution, world).call
+        assert original is not None
+        kernel.bind_thread(original, "original-parent-thread")
+        kernel.receive(original, b'{"result_kind":"development","summary":"Original investigation","human_blockers":null}')
+        assert kernel.advance("parent:1", execution, world).kind == "progress"
+        previous = kernel.delivery("parent:1")
+        state = tmp_path / "github.json"
+        changed = json.loads(state.read_text())
+        changed["source_graph"]["parent"]["body"] = "Fresh Parent requirement\r\n保留正文。"
+        state.write_text(json.dumps(changed))
+        with kernel.storage.transaction(write=False) as tx:
+            root = Path(tx.one("SELECT repository_root FROM runs")[0])
+            original_calls = [dict(row) for row in tx.all("SELECT * FROM invocations")]
+            stored = tx.one("SELECT subject,material_id FROM run_inputs")
+            identity = json.loads(tx.get(stored["material_id"], stored["subject"]))["runner_identity"]
+        reader = GhGitHubReader("example/project", working_directory=root, runner_identity=identity)
+        kernel.refresh(lambda: read_requirements(reader, 1))
+        assert kernel.source_status()["blocked"] == "requeue_required"
+        monkeypatch.setattr(lifecycle_cli, "submit", lambda *_a, **_kw: pytest.fail("Requeue must use the exact ready original Host"))
+        assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["action"] == "requeue" and result["host"] == "running" and result["status"] == "action_applied"
+        current = kernel.delivery("parent:1")
+        assert current.key == previous.key and current.kind == previous.kind and current.issue == previous.issue
+        assert current.source_ref != previous.source_ref and current.checkout != previous.checkout
+        assert current.target_ref == previous.target_ref and current.base == world.target
+        assert current.owned_root == str(root.parent / "worktrees" / request.run_id)
+        assert current.common_git_dir == str(root / ".git")
+        assert not Path(current.checkout).exists()
+        assert git(root, "for-each-ref", "--format=%(refname)", current.source_ref) == ""
+        assert kernel.status("parent:1")["generation"] == 2
+        assert kernel.status("parent:1")["phase"] == "workspace"
+        assert kernel.status("parent:1")["revision"] == kernel.source_status()["observed_parent_revision"]
+        assert kernel.status("parent:1")["retired_generations"][0]["generation"] == 1
+        assert kernel.source_status()["blocked"] is None
+        assert kernel.host_request("original") == request
+        with kernel.storage.transaction(write=False) as tx:
+            assert [dict(row) for row in tx.all("SELECT * FROM invocations")] == original_calls
+            assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+            assert tx.one("SELECT count(*) FROM actions WHERE kind='requeue'")[0] == 1
+        assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
+
+
+def test_public_requeue_without_a_current_change_job_does_not_consume_an_action(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, _calls):
+        before = kernel.source_status()
+        assert main(["requeue", request.run_id, "--repo", "example/project", "--json"]) == 2
+        result = json.loads(capsys.readouterr().out)
+        assert result["diagnostics"][0]["code"] == "control_subject_ambiguous"
+        assert kernel.source_status() == before
+        assert kernel.host_request("original") == request
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM actions WHERE kind='requeue'")[0] == 0
+
+
+def test_public_requeue_with_multiple_stale_tickets_requires_an_exact_current_change_job(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch, tickets=(2, 3)) as (kernel, request, execution, world, _calls):
+        for number in (2, 3):
+            subject = f"ticket:{number}"
+            call = kernel.advance(subject, execution, replace(world, revision=kernel.delivery(subject).revision)).call
+            assert call is not None
+            kernel.bind_thread(call, f"original-ticket-{number}")
+            kernel.receive(call, b'{"result_kind":"development","summary":"Original Ticket investigation","human_blockers":null}')
+            assert kernel.advance(subject, execution, replace(world, revision=kernel.delivery(subject).revision)).kind == "progress"
+        state = tmp_path / "github.json"
+        changed = json.loads(state.read_text())
+        for issue in changed["source_graph"]["issues"].values():
+            issue["body"] += "\nClarified independently."
+        state.write_text(json.dumps(changed))
+        assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 2
+        result = json.loads(capsys.readouterr().out)
+        assert result["diagnostics"][0]["code"] == "control_subject_ambiguous"
+        assert kernel.source_status()["blocked"] == "requeue_required"
+        assert all(kernel.status(f"ticket:{number}")["generation"] == 1 for number in (2, 3))
+        assert kernel.host_request("original") == request
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM actions WHERE kind='requeue'")[0] == 0
+
+
+def test_public_idle_requeue_binds_the_exact_replacement_to_the_original_host_intent(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    import json
+    from agent_run_kernel import lifecycle_cli
+    from agent_run_kernel.query_cli import main
+
+    with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, world, _calls):
+        execution = kernel.claim_executor("isolated-preparation")
+        call = kernel.advance("parent:1", execution, world).call
+        assert call is not None
+        kernel.bind_thread(call, "original-parent-thread")
+        kernel.receive(call, b'{"result_kind":"development","summary":"Original investigation","human_blockers":null}')
+        assert kernel.advance("parent:1", execution, world).kind == "progress"
+        kernel.stop_task("retire-isolated-preparation")
+        kernel.confirm_executor_exit(execution)
+        kernel.control("resume", "prepare-managed-requeue")
+        state = tmp_path / "github.json"
+        changed = json.loads(state.read_text())
+        changed["source_graph"]["parent"]["body"] += "\nFresh observed Parent requirement."
+        state.write_text(json.dumps(changed))
+        admitted = []
+
+        def record_host_intent(selected, kind, *, action_id, command, manager, environment, runner_lock, **intent):
+            # A real durable admission; the long consumer proves physical handoff separately.
+            request = selected.admit_host(action_id, kind=kind, command=command,
+                environment_carrier=tmp_path / "requeue-environment.json", preflight=manager.preflight, **intent)
+            admitted.append(request)
+            return {"result": "accepted", "status": "action_applied", "run_id": request.run_id,
+                    "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}
+
+        monkeypatch.setattr(lifecycle_cli, "submit", record_host_intent)
+        assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert len(admitted) == 1 and result["host"] == "unknown"
+        with kernel.storage.transaction(write=False) as tx:
+            host = tx.one("SELECT subject,request_id FROM hosts")
+            intent = json.loads(tx.get(host["request_id"], host["subject"]))["intent"]
+            assert intent["kind"] == "requeue" and intent["subject"] == "parent:1"
+            assert intent["replacement"]["key"] == "parent:1"
+            assert intent["replacement"]["source_ref"] == kernel.delivery("parent:1").source_ref
+            assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+        assert kernel.status("parent:1")["generation"] == 2
 
 
 def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(

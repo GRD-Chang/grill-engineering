@@ -23,7 +23,7 @@ from .execution import ProcessExitUnknown
 from .kernel import Kernel
 from .model import AgentCall, Execution, KernelError, Step, World
 from .native_host import managed_host_environment
-from .remote_effects import RemoteEffects
+from .remote_effects import ObservationSuperseded, RemoteEffects
 from .role_prompt import render_role_prompt
 
 
@@ -177,13 +177,18 @@ class _Executor:
 
     def advance(self, subject: str, *, cleanup: bool = False) -> Step:
         advance = self.kernel.advance_cleanup if cleanup else self.kernel.advance
-        step = advance(subject, self.execution)
-        if step.kind == "observe":
-            subject = step.subject
-            step = advance(subject, self.execution, self.observe(subject))
-        if step.kind in {"effect", "reconcile"}:
-            return self.effect(step)
-        return step
+        try:
+            step = advance(subject, self.execution)
+            if step.kind == "observe":
+                subject = step.subject
+                step = advance(subject, self.execution, self.observe(subject))
+            if step.kind in {"effect", "reconcile"}:
+                return self.effect(step)
+            return step
+        except ObservationSuperseded:
+            # Yield this obsolete read; sent effects retain their durable receipt
+            # and the next ordinary advance chooses reconciliation, never replay.
+            return Step("progress", subject, "observation_superseded")
 
     def subjects(self, scheduling: Mapping[str, Any]) -> list[str]:
         with self.kernel.storage.transaction(write=False) as tx:
@@ -207,8 +212,11 @@ class _Executor:
         with self.kernel.storage.transaction(write=False) as tx:
             if not tx.rows("SELECT id FROM final_target") or tx.rows("SELECT id FROM subjects WHERE kind='final_run'"):
                 return False
-        with self.source_lock:
-            head, default, proof = self.remote.final_observation(self.kernel)
+        try:
+            with self.source_lock:
+                head, default, proof = self.remote.final_observation(self.kernel)
+        except ObservationSuperseded:
+            return False
         try:
             self.kernel.activate_final(self.execution, head, default, ancestry=proof)
         except KernelError as error:
