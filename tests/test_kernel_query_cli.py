@@ -144,6 +144,38 @@ def test_unrepresentable_recorded_time_returns_diagnostic_without_modifying_stor
     assert _snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("language,label", [("zh", "错误"), ("en", "Error")])
+def test_parser_errors_use_personal_language_stderr_and_exit_two(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch, language: str, label: str,
+) -> None:
+    config = tmp_path / "config"
+    defaults = config / "agent-run" / "user-defaults.json"
+    defaults.parent.mkdir(parents=True)
+    defaults.write_text(json.dumps({"language": language}))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    before = _snapshot(tmp_path)
+    assert main(["status", "--nonexistent-option"]) == 2
+    output = capsys.readouterr()
+    assert output.out == "" and label in output.err and "--nonexistent-option" in output.err
+    assert _snapshot(tmp_path) == before
+
+
+def test_interrupted_read_returns_130_without_advancing_or_writing(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run_kernel import query_cli
+    kernel = _create(tmp_path)
+    before = _snapshot(tmp_path)
+
+    def interrupted(_root):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(query_cli, "discover", interrupted)
+    assert main(_arguments(kernel, "status", "--json")) == 130
+    assert capsys.readouterr().out == ""
+    assert _snapshot(tmp_path) == before
+
+
 def test_missing_run_language_is_rejected_without_using_personal_defaults(tmp_path: Path, capsys) -> None:
     kernel = _create(tmp_path, language=None)
     before = _snapshot(tmp_path)

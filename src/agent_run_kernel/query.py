@@ -78,7 +78,7 @@ def _header(tx: Transaction, path: Path) -> dict[str, Any]:
     if final_target and not any(row["kind"] == "final_run" and row["phase"] in {"complete", "abandoned"} for row in owners):
         terminal = False
     return {"run_id": run["id"], "repository": run["repository"], "parent": run["parent_issue"],
-            "repository_root": root, "created_at": _timestamp(run.get("created_at")),
+            "repository_root": root, "language": run.get("language"), "created_at": _timestamp(run.get("created_at")),
             "phases": phases, "is_terminal": terminal, "stopped": bool(run["stopped"]), "blocked": run["blocked"],
             "state_dir": str(path.parent), "database": str(path)}
 

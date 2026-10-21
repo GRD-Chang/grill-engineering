@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, NoReturn, Sequence
 
 from .query import QueryDocument, QueryError, discover, read
 from .query_render import render
@@ -26,11 +26,28 @@ def _personal_language() -> str:
         return "zh"  # The documented personal builtin; never a Run language fallback.
 
 
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, language: str, **kwargs: Any) -> None:
+        self.language = language
+        super().__init__(*args, **kwargs)
+        if language == "zh":
+            self._positionals.title = "位置参数"
+            self._optionals.title = "选项"
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        label = "错误" if self.language == "zh" else "Error"
+        self.exit(2, f"{label}: {message}\n")
+
+
 def _parser(language: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-run", description="只读交付查询" if language == "zh" else "Read-only delivery queries")
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser = _Parser(language=language, prog="agent-run", description="只读交付查询" if language == "zh" else "Read-only delivery queries")
+    commands = parser.add_subparsers(dest="command", required=True,
+        parser_class=lambda **kwargs: _Parser(language=language, **kwargs))
     for command in ("status", "history", "runs"):
-        child = commands.add_parser(command)
+        help_text = {"status": "当前交付状态", "history": "语义轮次与原始审计", "runs": "发现本地交付运行"}[command] if language == "zh" else {
+            "status": "Current delivery status", "history": "Semantic rounds and original audit", "runs": "Discover local delivery Runs"}[command]
+        child = commands.add_parser(command, help=help_text, description=help_text)
         if command != "runs":
             child.add_argument("run_id", nargs="?")
         child.add_argument("--repo")
@@ -116,6 +133,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             document = QueryDocument("runs", language, {"result": "runs", "runs": selected})
         else:
             candidate = selected[0]
+            if candidate.get("language") in {"zh", "en"}:
+                language = candidate["language"]
             kind: Literal["history", "status"] = "history" if parsed.command == "history" else "status"
             document = read(Path(candidate["database"]), kind,
                             after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", 128),
@@ -135,8 +154,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
             print(f"{prefix}: {error.code}\n{str(error)}")
-            for candidate in error.candidates:
-                print(f"{candidate['repository']} Parent #{candidate['parent']} {candidate['run_id']} {candidate['repository_root']}")
+            for error_candidate in error.candidates:
+                print(f"{error_candidate['repository']} Parent #{error_candidate['parent']} {error_candidate['run_id']} {error_candidate['repository_root']}")
         return 2
     except KeyboardInterrupt:
         return 130
