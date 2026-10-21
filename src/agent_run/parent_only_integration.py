@@ -181,7 +181,7 @@ def prepare_parent_integration(
                 scene["failure"] = dict(evidence) | {"error": str(error)}
             else:
                 scene = failure_scene(
-                    stage, job, checkout, error, source=evidence["source_sha"],
+                    stage.git, job, checkout, error, source=evidence["source_sha"],
                     target=evidence["target_sha"], paths=[],
                 )
                 if evidence.get("operation") == "fetch_remote_commit":

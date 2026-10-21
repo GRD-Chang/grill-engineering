@@ -219,7 +219,7 @@ def _prepare_ticket_integration_once(
         existing = job.get("integration_conflict")
         if not isinstance(existing, dict) or "resolution_sha" in existing:
             job["integration_conflict"] = failure_scene(
-                stage, job, checkout, error, source=source, target=target, paths=[],
+                stage.git, job, checkout, error, source=source, target=target, paths=[],
             )
             stage.save(state)
         if not _resolve_conflict(stage, state, job, checkout):
@@ -293,7 +293,7 @@ def _prepare_ticket_integration_once(
         except GitError as error:
             from agent_run.integration_development import failure_scene
             job["integration_conflict"] = failure_scene(
-                stage, job, checkout, error, source=source, target=target,
+                stage.git, job, checkout, error, source=source, target=target,
                 paths=conflict_paths,
             )
             stage.save(state)

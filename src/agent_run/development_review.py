@@ -1644,6 +1644,7 @@ class DevelopmentReview:
         # it cannot keep advertising an obsolete passing Candidate.
         existing_pr = job.get("pr_number")
         if not artifact.requires_human and isinstance(existing_pr, int):
+            assert self.github is not None
             record_change_status(
                 self.github, self.contract.label, existing_pr,
                 job,

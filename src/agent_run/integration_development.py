@@ -20,6 +20,7 @@ from agent_run.change_delivery_threads import (
 )
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.git_errors import GitError
+from agent_run.git import GitRepository
 from agent_run.integration_development_budget import (
     IntegrationDevelopmentExhausted, acquire_integration_development,
     ensure_integration_development_available,
@@ -30,11 +31,11 @@ from agent_run.semantic_attempt import (
 
 
 def failure_scene(
-    stage: DevelopmentReview, job: dict[str, Any], checkout: Path, error: GitError,
+    git: GitRepository, job: dict[str, Any], checkout: Path, error: GitError,
     *, source: str, target: str, paths: list[str],
 ) -> dict[str, Any]:
     evidence = dict(error.evidence or {})
-    head = evidence.get("head_sha") or stage.git.checkout_head(checkout)
+    head = evidence.get("head_sha") or git.checkout_head(checkout)
     merge_head = evidence.get("merge_head_sha")
     return {
         "source_sha": source, "target_sha": target,
@@ -168,7 +169,7 @@ def _resolve_integration_work_once(
             return False
         if finish is None:
             job[scene_key] = failure_scene(
-                stage, job, checkout, error, source=scene["source_sha"],
+                stage.git, job, checkout, error, source=scene["source_sha"],
                 target=scene["target_sha"], paths=scene["paths"],
             )
         else:
