@@ -1,5 +1,6 @@
 """Creation defaults become native facts; existing Threads never read new defaults."""
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -8,6 +9,29 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec, World
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.offline import Scenario
+
+
+def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_path: Path) -> None:
+    defaults = UserDefaultsStore(tmp_path / "user-defaults.json")
+    defaults.configure(language="en")
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket", DeliveryKind.TICKET, 2, "ticket-v1", base, "refs/heads/source", "refs/heads/target")
+    spec = freeze_creation(RunSpec("run", "example/project", 1, "parent-v1", "graph-v1", (delivery,)), defaults)
+    assert spec.inputs is not None
+    profiles = {"preset": None, "profiles": {
+        role: {"model": role + "-explicit-model", "reasoning_effort": "high", "reference": None,
+               "provenance": {"source": "explicit-migration-input", "preset": None, "role": role}}
+        for role in ("development", "review", "publication")
+    }}
+    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(spec, inputs=replace(spec.inputs, profiles=profiles)))
+    execution = kernel.claim_executor("owner")
+    call = kernel.advance(delivery.key, execution, World("parent-v1", "graph-v1", "ticket-v1", base)).call
+    assert call is not None and call.profile.model == "development-explicit-model"
+    with kernel.storage.transaction(write=False) as tx:
+        revision = tx.one("SELECT p.* FROM threads t JOIN profile_revisions p ON p.id=t.profile_revision WHERE t.id=?", (call.thread_id,))
+        frozen = json.loads(tx.get(revision["material_id"], revision["subject"]))
+    assert frozen["preset"] is None
+    assert frozen["profiles"] == profiles["profiles"]
 
 
 def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_configure(tmp_path: Path) -> None:
