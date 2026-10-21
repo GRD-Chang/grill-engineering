@@ -122,6 +122,39 @@ def test_original_completed_cutover_fences_old_writers_and_continues_same_manage
         paths['report'].read_text())['integrated_sha']
 
 
+def test_original_cutover_records_original_local_run_ref_responsibility_without_workspace_effect(
+    tmp_path: Path, git_repo: Path,
+) -> None:
+    managed, paths = _managed_source(tmp_path, git_repo)
+    snapshot = capture_v6(paths['database'], tmp_path / 'sealed.sqlite3')
+    with closing(sqlite3.connect(snapshot.path)) as source:
+        run_id, branch = source.execute('SELECT run_id,value_run_branch FROM run_root').fetchone()
+        (integrated,) = source.execute("SELECT value_integrated_sha FROM work_jobs WHERE stage='completed'").fetchone()
+    source_ref = 'refs/heads/' + branch
+    assert LocalGit(managed.repository_root).commit(source_ref).sha == integrated
+    before = _git_bytes(managed.repository_root)
+    nonce = '8a' * 16
+    kernel = migration_cutover.migrate_completed_original_v6(
+        snapshot, repository='example/project', parent_number=1, nonce=nonce,
+        profile_snapshot=paths['profile'], github_snapshot=paths['github'],
+        observation_snapshot=paths['observation'], original_report=paths['report'])
+    with kernel.storage.transaction(write=False) as tx:
+        facts = tx.rows("SELECT subject,identity,material_id FROM history WHERE kind='v6_local_ref_ownership'")
+        assert len(facts) == 1, 'original RunRoot local-ref responsibility was not transferred'
+        fact = facts[0]
+        assert fact['subject'] == 'ticket:2' and fact['identity'] == source_ref
+        assert tx.one('SELECT purpose FROM material WHERE id=?', (fact['material_id'],))[0] == 'v6_local_ref_ownership'
+        assert json.loads(tx.get(fact['material_id'], fact['subject'])) == {
+            'origin_nonce': nonce, 'source_ref': source_ref, 'expected_oid': integrated,
+            'source_record': {'table': 'run_root', 'key': [run_id]},
+        }
+        assert tx.one("SELECT count(*) FROM effects WHERE operation='workspace'")[0] == 0
+        assert tx.one('SELECT count(*) FROM actions')[0] == 0
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+    assert _git_bytes(managed.repository_root) == before
+    assert LocalGit(managed.repository_root).commit(source_ref).sha == integrated
+
+
 def test_original_cutover_refuses_another_real_runner_usage_without_stopping_it(
     tmp_path: Path, git_repo: Path,
 ) -> None:

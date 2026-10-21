@@ -19,7 +19,8 @@ from agent_run_kernel.migration_records import V6RecordReader
 from test_kernel_migration_completed_history import _assert_original_records, _completed_source
 
 
-def _managed_source(tmp_path: Path, git_repo: Path) -> tuple[ManagedWorkspace, dict[str, Path]]:
+def _managed_source(tmp_path: Path, git_repo: Path, *, actual_github_close: bool = False,
+                    ) -> tuple[ManagedWorkspace, dict[str, Path]]:
     managed = ManagedWorkspace.for_repository('example/project')
     managed.root.mkdir(parents=True)
     git_repo.rename(managed.repository_root)
@@ -31,7 +32,8 @@ def _managed_source(tmp_path: Path, git_repo: Path) -> tuple[ManagedWorkspace, d
         'repository': managed.repository, 'remote_url': remote}) + '\n')
     assert managed.open_path() == managed.repository_root
     paths = _completed_source(tmp_path, managed.repository_root, 2,
-                              state_root=managed.state_root, controlled=True)
+                              state_root=managed.state_root, controlled=True,
+                              actual_github_close=actual_github_close)
     return managed, paths
 
 

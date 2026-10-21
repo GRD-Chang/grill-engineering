@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -42,10 +43,14 @@ class _Parser(argparse.ArgumentParser):
         label = "错误" if self.language == "zh" else "Error"
         self.exit(2, f"{label}: {message}\n")
 
+    def add_subparsers(self, **kwargs: Any) -> Any:
+        kwargs.setdefault("parser_class", partial(type(self), language=self.language))
+        return super().add_subparsers(**kwargs)
+
 
 def _parser(language: str) -> argparse.ArgumentParser:
     parser = _Parser(language=language, prog="agent-run", description="只读交付查询" if language == "zh" else "Read-only delivery queries")
-    commands = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    commands = parser.add_subparsers(dest="command", required=True)
     for command in ("status", "history", "runs"):
         help_text = {"status": "当前交付状态", "history": "语义轮次与原始审计", "runs": "发现本地交付运行"}[command] if language == "zh" else {
             "status": "Current delivery status", "history": "Semantic rounds and original audit", "runs": "Discover local delivery Runs"}[command]
@@ -67,6 +72,10 @@ def _parser(language: str) -> argparse.ArgumentParser:
         help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
     doctor.add_argument("--json", action="store_true", dest="as_json")
     personal_settings.add_parsers(commands, language)
+    from . import run_profile_cli
+    run_profile_cli.add_parser(commands, language)
+    from agent_run import prompt_cli
+    prompt_cli.add_parser(commands)
     from .lifecycle_cli import add_parsers
     add_parsers(commands, language)
     return parser
@@ -250,6 +259,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
+        if parsed.command in {"configure", "config", "profile"}:
+            from . import run_profile_cli
+            return run_profile_cli.execute(parsed)
+        if parsed.command == "prompts":
+            from agent_run import prompt_cli
+            return prompt_cli.execute(parsed)
         if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
             from .lifecycle_cli import execute
             output = execute(parsed)

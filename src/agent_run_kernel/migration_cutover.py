@@ -35,7 +35,7 @@ from .migration import (MigrationRefused, SourceSnapshot, _offline_source, _sour
 from .legacy_admission import legacy_task_lock, read_source_fence, source_fence
 from .migration_active import _read_profile
 from .migration_completed import (_Completed, convert_completed_ticket_v6, _existing_completed_git,
-                                  _read_completed)
+                                  _read_completed, _read_document)
 from .migration_quiescence import read_v6_host_exit
 from .migration_records import V6RecordReader
 from .migration_conversion import _git
@@ -491,10 +491,18 @@ def _original_prepared(native: Kernel, receipt: dict[str, str], task: TaskKey,
                     imported['subject'], 1, facts.publication_sha, facts.integrated_sha,
                     facts.integrated_tree, facts.pr_number)]
                 or any(tx.one(f'SELECT count(*) FROM {name}')[0] for name in (
-                    'final_barriers', 'retired_generations', 'resource_cleanup'))):
+                    'final_barriers', 'retired_generations'))):
+            raise MigrationRefused('native_original_cutover_advanced')
+        checkout = Path(receipt['source_db']).parent / 'worktrees' / receipt['run_id'] / f'ticket-{ticket}'
+        cleanup = [tuple(row) for row in tx.rows('SELECT subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir,stage,state,effect_id,outcome FROM resource_cleanup')]
+        expected_cleanup = [(imported['subject'], 1, 'refs/heads/' + facts.ticket_branch, facts.publication_sha,
+                             str(checkout), facts.publication_sha, str(checkout.parent),
+                             str(task.workspace / '.git'), 0, 'pending', None, None)] if facts.pending_resources else []
+        if cleanup != expected_cleanup:
             raise MigrationRefused('native_original_cutover_advanced')
         ownership = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
-                           "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_local_ref_ownership'")
+                           "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_local_ref_ownership' AND h.identity=?",
+                           ('refs/heads/' + facts.run_branch,))
         if (ownership['subject'] != imported['subject']
                 or ownership['purpose'] != 'v6_local_ref_ownership'
                 or ownership['identity'] != 'refs/heads/' + facts.run_branch
@@ -504,6 +512,22 @@ def _original_prepared(native: Kernel, receipt: dict[str, str], task: TaskKey,
                     'source_record': {'table': 'run_root', 'key': [receipt['run_id']]},
                 }):
             raise MigrationRefused('native_original_cutover_provenance')
+        local = tx.rows("SELECT h.subject,h.kind,h.identity,h.material_id,m.purpose FROM history h JOIN material m ON m.id=h.material_id "
+                        "WHERE h.kind IN ('v6_local_ref_ownership','v6_local_worktree_ownership') AND h.identity!=?",
+                        (ownership['identity'],))
+        expected_local = {('v6_local_ref_ownership', 'refs/heads/' + facts.ticket_branch),
+                          ('v6_local_worktree_ownership', str(checkout))} if facts.pending_resources else set()
+        if len(local) != len(expected_local) or {(row['kind'], row['identity']) for row in local} != expected_local:
+            raise MigrationRefused('native_original_cutover_provenance')
+        for fact in local:
+            field = 'source_ref' if fact['kind'] == 'v6_local_ref_ownership' else 'checkout'
+            resource = 'refs/heads/' + facts.ticket_branch if field == 'source_ref' else str(checkout)
+            if (fact['subject'] != imported['subject'] or fact['identity'] != resource
+                    or fact['purpose'] != fact['kind']
+                    or json.loads(tx.get(fact['material_id'], fact['subject'])) != {
+                        'origin_nonce': receipt['nonce'], field: resource, 'expected_oid': facts.publication_sha,
+                        'source_record': {'table': 'work_jobs', 'key': [facts.run_id, facts.old_job['job_id']]}}):
+                raise MigrationRefused('native_original_cutover_provenance')
     reader = V6RecordReader(native)
     if (reader.source['sha256'] != receipt['source_sha256']
             or reader.source['run_id'] != receipt['run_id']
@@ -533,13 +557,14 @@ def _same_original_rows(db: sqlite3.Connection, sealed: Path, protocol: str) -> 
                     break
 
 
-def _retire_original(source: Path, sealed: Path, receipt: dict[str, str], *, retired: bool) -> None:
+def _retire_original(source: Path, sealed: Path, receipt: dict[str, str], *, retired: bool,
+                     release: bool = False) -> None:
     """Only protocol changes, under the source inode lock and one SQLite transaction."""
     protocol = source_fence(receipt)
     with _offline_source(source) as descriptor:
         # Keep this descriptor through the SQLite transaction. Never open and
         # close another same-inode hash/bridge connection inside this boundary.
-        if not retired:
+        if not retired and not release:
             digest = hashlib.sha256()
             for block in _source_blocks(descriptor):
                 digest.update(block)
@@ -556,9 +581,10 @@ def _retire_original(source: Path, sealed: Path, receipt: dict[str, str], *, ret
                     raise MigrationRefused('source_original_fence_changed')
                 read_v6_host_exit(db, receipt['run_id'], required=True)
                 _same_original_rows(db, sealed, protocol if retired else _OLD_PROTOCOL)
-                if not retired:
+                target = _OLD_PROTOCOL if release else protocol
+                if current[0] != target:
                     changed = db.execute("UPDATE schema_meta SET value=? WHERE key='protocol' AND value=?",
-                                         (protocol, _OLD_PROTOCOL))
+                                         (target, current[0]))
                     if changed.rowcount != 1:
                         raise MigrationRefused('source_original_fence_changed')
                 db.commit()
@@ -574,8 +600,9 @@ def _retire_original(source: Path, sealed: Path, receipt: dict[str, str], *, ret
 
 def migrate_completed_original_v6(
     snapshot: SourceSnapshot, *, repository: str, parent_number: int, nonce: str,
-    profile_snapshot: Path, github_snapshot: Path, observation_snapshot: Path,
-    original_report: Path,
+    profile_snapshot: Path, github_snapshot: Path | None = None,
+    observation_snapshot: Path | None = None, original_report: Path | None = None,
+    external_snapshot: Path | None = None,
 ) -> Kernel:
     """Transfer one settled original Task to the same managed clone's native DB.
 
@@ -606,7 +633,8 @@ def migrate_completed_original_v6(
                     raise MigrationRefused('source_task_scope')
                 run_id, uuid = db.execute('SELECT run_id,value_checkout_identity FROM run_root').fetchone()
             profile, profile_sha = _read_profile(profile_snapshot)
-            facts = _read_completed(checked.path, profile, profile_sha, snapshot.sha256)
+            readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
+            facts = _read_completed(checked.path, profile, profile_sha, snapshot.sha256, readproof)
             if (facts.run_id != run_id or facts.repository != task.repository
                     or facts.parent_number != task.parent_number):
                 raise MigrationRefused('source_original_identity')
@@ -636,13 +664,13 @@ def migrate_completed_original_v6(
                     repository_root=managed.repository_root, final_checkout=final,
                     profile_snapshot=profile_snapshot, github_snapshot=github_snapshot,
                     observation_snapshot=observation_snapshot, original_report=original_report,
-                    existing_verified=True, source_origin=receipt)
+                    existing_verified=True, source_origin=receipt, external_snapshot=external_snapshot)
             _original_prepared(native, receipt, task, facts)
             reader = LocalGit(managed.repository_root)
             with ExitStack() as refs:
                 for ref, sha in sorted({f'refs/heads/{facts.run_branch}': facts.integrated_sha,
                                         f'refs/heads/{facts.base_branch}': facts.base_sha,
-                                        f'refs/heads/{facts.ticket_branch}': '0' * len(facts.base_sha)}.items()):
+                                        f'refs/heads/{facts.ticket_branch}': facts.publication_sha if facts.pending_resources else '0' * len(facts.base_sha)}.items()):
                     refs.enter_context(_hold_ref(reader, managed.repository_root, ref, sha))
                 _existing_completed_git(accepted, checked.path, facts, destination,
                                         managed.repository_root, final, managed.repository_root / '.git')
@@ -651,6 +679,110 @@ def migrate_completed_original_v6(
                     raise MigrationRefused('native_task_binding_changed')
                 bind_task(location, run_id, destination)
     return Kernel(destination)
+
+
+def _withdraw_original_pointer(location: Path, run_id: str, destination: Path) -> None:
+    current = read_task(location)
+    if current is not None:
+        if current != (run_id, destination):
+            raise MigrationRefused('native_task_binding_changed')
+        location.unlink()
+        descriptor = os.open(location.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
+                         parent_number: int, nonce: str,
+                         external_snapshot: Path | None = None) -> dict[str, str]:
+    """Return exactly an untouched original transfer; retain every native byte.
+
+    No new native execution or external write is inverted. The original rows
+    are compared with the preserved source, then only protocol is restored.
+    Missing/advanced/foreign evidence refuses with both databases retained.
+    """
+    managed = ManagedWorkspace.for_repository(repository)
+    source = managed.state_root / 'state.sqlite3'
+    task = TaskKey(managed.repository_root, managed.repository, parent_number)
+    if snapshot.source != source or snapshot.path.is_symlink() or snapshot.path.samefile(source):
+        raise MigrationRefused('source_original_identity')
+    with runner_management_lease(default_runner_lock_path()), legacy_task_lock(task, managed.state_root), locked_task(task) as location:
+        managed.open_path()
+        sentinel = managed.state_root / 'task-control' / (task.fingerprint + '.json')
+        if sentinel.exists() or sentinel.is_symlink():
+            raise MigrationRefused('source_legacy_control_json')
+        with tempfile.TemporaryDirectory(dir=managed.state_root, prefix='.original-rollback-') as directory:
+            checked = capture_v6(snapshot.path, Path(directory) / 'sealed.sqlite3')
+            if ((checked.sha256, checked.schema_sha256, checked.table_rows)
+                    != (snapshot.sha256, snapshot.schema_sha256, snapshot.table_rows)):
+                raise MigrationRefused('snapshot_changed')
+            with closing(sqlite3.connect(checked.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+                run_id, uuid = db.execute('SELECT run_id,value_checkout_identity FROM run_root').fetchone()
+            profile, profile_sha = _read_profile(managed.state_root / 'profiles' / (run_id + '.json'))
+            readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
+            facts = _read_completed(checked.path, profile, profile_sha, snapshot.sha256, readproof)
+            if facts.repository != task.repository or facts.parent_number != task.parent_number:
+                raise MigrationRefused('source_original_identity')
+            destination = managed.state_root / run_id / 'kernel.sqlite3'
+            if destination.is_symlink() or not destination.is_file():
+                raise MigrationRefused('native_original_cutover_missing')
+            native = Kernel(destination)
+            receipt = read_source_fence(source_fence({
+                'nonce': nonce, 'source_db': str(source), 'source_sha256': snapshot.sha256,
+                'run_id': run_id, 'task_fingerprint': task.fingerprint,
+                'source_uuid': uuid, 'target_db': str(destination)}))
+            _original_prepared(native, receipt, task, facts)
+            with native.storage.transaction(write=False) as tx:
+                imported = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_completed_import'")
+                body = json.loads(tx.get(imported['material_id'], imported['subject']))
+                if body['profile_sha256'] != profile_sha:
+                    raise MigrationRefused('source_profile_changed')
+                started = tx.rows("SELECT subject,material_id FROM history WHERE kind='v6_original_rollback_started'")
+                if started and (len(started) != 1 or started[0]['subject'] != imported['subject']
+                                or tx.get(started[0]['material_id'], started[0]['subject']) != wire_json(receipt)):
+                    raise MigrationRefused('native_original_cutover_provenance')
+            prior = read_task(location)
+            protocol = _original_protocol(source)
+            if (protocol != source_fence(receipt) and not (started and protocol == _OLD_PROTOCOL)
+                    or prior not in ((run_id, destination), None)
+                    or prior is None and not started):
+                raise MigrationRefused('source_original_fence_changed')
+            reader = LocalGit(managed.repository_root)
+            with ExitStack() as refs:
+                for ref, sha in sorted({f'refs/heads/{facts.run_branch}': facts.integrated_sha,
+                                        f'refs/heads/{facts.base_branch}': facts.base_sha,
+                                        f'refs/heads/{facts.ticket_branch}': facts.publication_sha if facts.pending_resources else '0' * len(facts.base_sha)}.items()):
+                    refs.enter_context(_hold_ref(reader, managed.repository_root, ref, sha))
+                accepted = SourceSnapshot(source, checked.path, checked.sha256, checked.source_protocol,
+                                          checked.schema_sha256, checked.table_rows)
+                _existing_completed_git(accepted, checked.path, facts, destination,
+                                        managed.repository_root,
+                                        managed.root / 'worktrees' / run_id / 'run-publication',
+                                        managed.repository_root / '.git')
+                # Prove source quiescence/rows before withdrawing its successor.
+                # The same locks remain held through both durable boundaries.
+                _retire_original(source, checked.path, receipt, retired=protocol != _OLD_PROTOCOL,
+                                 release=protocol == _OLD_PROTOCOL)
+                if not started:
+                    with native.storage.transaction() as tx:
+                        material = tx.put(imported['subject'], 'v6_original_rollback', wire_json(receipt))
+                        tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                                   'VALUES (?,?,?,?,1,?)', (imported['subject'], 'v6_original_rollback_started',
+                                                           nonce, material, native.clock()))
+                _withdraw_original_pointer(location, run_id, destination)
+                _retire_original(source, checked.path, receipt, retired=protocol != _OLD_PROTOCOL,
+                                 release=True)
+                with native.storage.transaction() as tx:
+                    completed = tx.rows("SELECT material_id FROM history WHERE kind='v6_original_rollback_complete'")
+                    if not completed:
+                        material = tx.put(imported['subject'], 'v6_original_rollback', wire_json(receipt))
+                        tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                                   'VALUES (?,?,?,?,1,?)', (imported['subject'], 'v6_original_rollback_complete',
+                                                           nonce, material, native.clock()))
+    return {'status': 'rolled_back', 'nonce': nonce, 'source_database': str(source),
+            'retained_native_database': str(destination)}
 
 
 if __name__ == '__main__':

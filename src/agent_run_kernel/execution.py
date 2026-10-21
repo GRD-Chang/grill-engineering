@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from agent_run.error_safety import bounded_error
 from agent_run.process_binding import _process_start_token as _start_token
 
-from .model import AgentCall
+from .model import AgentCall, ReadWait
 from .remote_effects import ObservationSuperseded
 from .storage import MATERIAL_LIMIT
 
@@ -239,13 +239,33 @@ def _execute(
 
 def _authorize_source(
     kernel: Kernel, call: AgentCall, authorize_source: Callable[[], None] | None, deadline: float,
+    capture: _CodexCapture | None = None,
 ) -> None:
     if authorize_source is None:
         return
     while True:
+        kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired during source authorization")
         try:
             authorize_source()
             return
+        except ReadWait as waiting:
+            if waiting.step.kind != "waiting":
+                raise
+            # Keep this call and any bound bootstrap. A short mechanical wait
+            # keeps Stop, credential cancellation and the original deadline live.
+            retry_at = waiting.retry_at
+            while retry_at is not None and kernel.clock() < retry_at:
+                kernel.guard_agent(call)
+                if capture is not None:
+                    capture.guard()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Worker deadline expired during source authorization")
+                time.sleep(min(0.1, remaining, max(0.0, retry_at - kernel.clock())))
         except ObservationSuperseded:
             # Only a proved obsolete read can be replaced. Keep this original
             # call, lease and any bound bootstrap; never retry a Worker launch.
@@ -272,14 +292,15 @@ def _run_dispatched(
             raise ValueError("Worker arguments are required")
         if not hasattr(os, "pidfd_open"):
             raise OSError("The local process adapter requires Linux pidfd")
-        _authorize_source(kernel, call, authorize_source, deadline)
+        _authorize_source(kernel, call, authorize_source, deadline, capture)
         kernel.guard_agent(call)
         if capture is not None:
             capture.guard()
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired during preparation")
     except BaseException as error:
-        kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+        kernel.agent_unavailable(call, "github_read_wait" if isinstance(error, ReadWait) else "worker_preparation_failed",
+                                 {"error_type": type(error).__name__})
         raise
     gate_read, gate_write = os.pipe()
     try:
@@ -308,12 +329,13 @@ def _run_dispatched(
         identity = _identity(process.pid)
         kernel.agent_started(call, identity)
         bound = True
-        _authorize_source(kernel, call, authorize_source, deadline)
+        _authorize_source(kernel, call, authorize_source, deadline, capture)
         kernel.guard_agent(call)
         if capture is not None:
             capture.guard()
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired before process release")
+        kernel.agent_source_ready(call)
         os.write(gate_write, b"1")
         os.close(gate_write)
         gate_write = -1

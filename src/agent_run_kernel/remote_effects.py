@@ -37,6 +37,15 @@ class ObservationSuperseded(KernelError):
     """This read lost to an independently committed local authority change."""
 
 
+class EffectReadError(GitHubReadError):
+    """A typed read failure after an actual command's response was observed."""
+
+    def __init__(self, error: GitHubReadError, response: subprocess.CompletedProcess[str]) -> None:
+        super().__init__(error.code, error.message)
+        self.write_returncode = response.returncode
+        self.write_diagnostic = response.stderr[:4096]
+
+
 class RemoteEffects:
     """A concrete execute/reconcile port; authorize is required for every write.
 
@@ -130,7 +139,13 @@ class RemoteEffects:
             response = self._write(self._issue_path(effect), "PATCH", {"state": "closed"}, authorize)
         else:
             raise KernelError("unsupported_remote_effect", operation)
-        result = self.reconcile(effect)
+        return self._readback(effect, response)
+
+    def _readback(self, effect: Effect, response: subprocess.CompletedProcess[str]) -> EffectResult:
+        try:
+            result = self.reconcile(effect)
+        except GitHubReadError as error:
+            raise EffectReadError(error, response) from error
         return replace(result, raw={**result.raw, "write_returncode": response.returncode,
                                     "write_diagnostic": response.stderr[:4096]})
 
@@ -160,7 +175,11 @@ class RemoteEffects:
             if effect.operation == "close":
                 return self._reconcile_close(effect)
             raise KernelError("unsupported_remote_effect", effect.operation)
-        except (GitHubReadError, KernelError, OSError, ValueError, KeyError, TypeError) as error:
+        except GitHubReadError:
+            # The Host must supervise the original read, retaining any sent
+            # intent. An unavailable read is not a physical write outcome.
+            raise
+        except (KernelError, OSError, ValueError, KeyError, TypeError) as error:
             return EffectResult("unknown", raw={"diagnostic": str(error)[:4096]})
 
     def pull_request(self, number: int) -> PullRequest:
@@ -294,9 +313,7 @@ class RemoteEffects:
             if observed.raw.get("close_intent") is None:
                 return EffectResult("unknown", pr=observed.pr, raw={"diagnostic": "retirement marker unconfirmed"})
         response = self._write(f"repos/{self.repository}/pulls/{_number(effect.pr_number)}", "PATCH", {"state": "closed"}, guard)
-        result = self.reconcile(effect)
-        return replace(result, raw={**result.raw, "write_returncode": response.returncode,
-                                    "write_diagnostic": response.stderr[:4096]})
+        return self._readback(effect, response)
 
     @staticmethod
     def _event_actor(event: Mapping[str, Any]) -> str | None:
@@ -373,9 +390,7 @@ class RemoteEffects:
         if self.actor() != effect.actor:
             raise KernelError("remote_actor_changed")
         response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, guard)
-        result = self.reconcile(effect)
-        return replace(result, raw={**result.raw, "write_returncode": response.returncode,
-                                    "write_diagnostic": response.stderr[:4096]})
+        return self._readback(effect, response)
 
     def observe(self, kernel: Kernel, subject: str) -> World:
         """Read external facts using this input's exact refresh receipt.
@@ -653,7 +668,9 @@ class RemoteEffects:
                                               runner_identity=self.identity, remote=self.remote)
             if observed.pr.base != effect.base or source != effect.after_sha or target != effect.base.sha:
                 return replace(observed, disposition="third")
-        except (GitHubReadError, OSError, ValueError, KeyError, TypeError) as error:
+        except GitHubReadError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError) as error:
             return EffectResult("unknown", pr=observed.pr, raw={"diagnostic": str(error)[:4096]})
         return observed
 

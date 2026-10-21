@@ -65,6 +65,95 @@ class _Completed:
     developments_used: int
     reviews_used: int
     physical_invocations: int
+    close_readproof: dict[str, Any] | None = None
+    pending_resources: bool = False
+
+
+def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, repository: str,
+                          ticket: int, pr_number: int, publication_sha: str,
+                          integrated_sha: str, base_sha: str, run_branch: str,
+                          ticket_branch: str, base_branch: str, source_sha: str,
+                          intent: Mapping[str, Any], requirements: Requirements,
+                          runner_identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind original intent/merge authority to observed external facts once.
+
+    This is evidence validation for the shared importer, not a close retry or
+    delivery phase interpreter. No original row is normalized into completion.
+    """
+    try:
+        close = readproof['close']
+        issue, actor = close['issue'], close['actor']
+        binding = f'pr-{pr_number}:sha-{integrated_sha}'
+        baseline = intent['value_baseline_event_id']
+        login, intended = intent['value_actor'], intent['value_intent_created_at']
+        if (readproof['source_sha256'] != source_sha or readproof['runner_identity'] != runner_identity
+                or close['repository'] != repository or close['issue_number'] != ticket
+                or issue['number'] != ticket or issue['state'] != 'closed'
+                or actor['login'] != login or intent['value_dispatch_attempted'] != 1
+                or intent['value_intent_binding'] != binding
+                or type(baseline) is not int or baseline < 0
+                or not isinstance(login, str) or not login):
+            raise MigrationRefused('source_external_close')
+        values = (close['actor'], close['issue'], close['comment_pages'], close['event_pages'])
+        if (len(close['responses']) != 4
+                or any(json.loads(response['stdout']) != value
+                       for response, value in zip(close['responses'], values, strict=True))):
+            raise MigrationRefused('source_external_close')
+        comments = [comment for page in close['comment_pages'] for comment in page]
+        events = [event for page in close['event_pages'] for event in page]
+        transitions = [event for event in events if event.get('event') in {'closed', 'reopened'}]
+        if any(type(event.get('id')) is not int or event['id'] < 1
+               or not isinstance(event.get('created_at'), str) for event in transitions):
+            raise MigrationRefused('source_external_close')
+        transitions.sort(key=lambda event: (_created_at_epoch(event['created_at']), event['id']))
+        after = [event for event in transitions if event['id'] > baseline]
+        if (len(after) != 1 or not transitions or after[0] != transitions[-1]
+                or after[0]['event'] != 'closed' or after[0].get('actor', {}).get('login') != login
+                or _created_at_epoch(after[0]['created_at']) < _created_at_epoch(intended)):
+            raise MigrationRefused('source_external_close')
+        markers = (f'<!-- agent-run:{run_id}:ticket-{ticket}:completed -->',
+                   f'<!-- agent-run:{run_id}:ticket-{ticket}:publisher-close-intent:{binding} -->',
+                   f'<!-- agent-run:{run_id}:ticket-{ticket}:publisher-close-baseline:{binding}:{baseline} -->')
+        matching = [comment for comment in comments
+                    if comment.get('user', {}).get('login') == login
+                    and comment.get('created_at') == intended
+                    and isinstance(comment.get('body'), str)
+                    and all(marker in comment['body'] for marker in markers)]
+        if len(matching) != 1 or type(matching[0].get('id')) is not int or matching[0]['id'] < 1:
+            raise MigrationRefused('source_external_close')
+        for pr in (readproof['pr_before'], readproof['pr_after']):
+            if (pr['number'] != pr_number or pr['state'] != 'closed' or pr['merged'] is not True
+                    or pr['merge_commit_sha'] != integrated_sha or pr['user']['login'] != login
+                    or pr['head']['sha'] != publication_sha or pr['head']['ref'] != ticket_branch
+                    or pr['head']['repo']['full_name'] != repository
+                    or pr['base']['sha'] not in {base_sha, integrated_sha} or pr['base']['ref'] != run_branch
+                    or pr['base']['repo']['full_name'] != repository):
+                raise MigrationRefused('source_external_pr')
+        expected_requirements = {
+            'parent': {'number': requirements.parent.number, 'title': requirements.parent.title,
+                       'body': requirements.parent.body,
+                       'sub_issue_numbers': list(requirements.parent.sub_issue_numbers),
+                       'sub_issue_order_reliable': requirements.parent.sub_issue_order_reliable},
+            'issues': [{'number': item.number, 'title': item.title, 'body': item.body,
+                        'state': 'CLOSED', 'labels': sorted(item.labels),
+                        'blocked_by': [{'number': edge.number, 'state': edge.state} for edge in item.blocked_by]}
+                       for item in requirements.issues],
+        }
+        if readproof['requirements'] != expected_requirements:
+            raise MigrationRefused('source_external_requirements')
+        heads = readproof['remote_heads']
+        if (set(heads) != {'refs/heads/' + branch for branch in (run_branch, ticket_branch, base_branch)}
+                or heads['refs/heads/' + run_branch] != integrated_sha
+                or heads['refs/heads/' + base_branch] != base_sha
+                or heads['refs/heads/' + ticket_branch] not in {publication_sha, None}):
+            raise MigrationRefused('source_external_refs')
+        return {'event': after[0], 'comment': matching[0],
+                'close_intent': {'actor': login, 'intent_created_at': intended,
+                                 'baseline_event_id': baseline, 'intent_binding': binding}}
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        if isinstance(error, MigrationRefused):
+            raise
+        raise MigrationRefused('source_external_close') from error
 
 
 def _completed_evidence(db: sqlite3.Connection, run_id: str, evidence_id: str,
@@ -166,7 +255,7 @@ def _settled_invocations(db: sqlite3.Connection, run_id: str, calls: list[dict[s
 
 
 def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
-                    source_sha: str) -> _Completed:
+                    source_sha: str, readproof: Mapping[str, Any] | None = None) -> _Completed:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     db.row_factory = sqlite3.Row
     try:
@@ -182,11 +271,17 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                                       (run_id,) if scoped else ()).fetchone()[0]
         if any(count and name not in RECORD_TABLES for name, count in counts.items()):
             raise MigrationRefused("unsupported_source_relations")
+        run = _one(db, "SELECT * FROM runs WHERE run_id=?", (run_id,))
+        layout = _one(db, "SELECT * FROM work_job_layout WHERE run_id=?", (run_id,))
+        job = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id=?", (run_id, layout['active_job_id']))
+        pending_resources = run['status'] == 'waiting_external' and job['stage'] == 'merged'
+        if pending_resources and readproof is None:
+            raise MigrationRefused('source_external_readback_required')
         exact = {"runs": 1, "run_root": 1, "run_condition_base": 1,
                  "work_jobs": 2, "work_job_layout": 1, "work_job_attempt_roots": 1,
-                 "run_closeout_headers": 1,
-                 "run_cleanup_items": 1, "work_job_ticket_close_intent": 1,
-                 "work_job_ticket_close_ownership": 1,
+                 "run_closeout_headers": 0 if pending_resources else 1,
+                 "run_cleanup_items": 0 if pending_resources else 1, "work_job_ticket_close_intent": 1,
+                 "work_job_ticket_close_ownership": 0 if pending_resources else 1,
                  "work_job_acceptance_record": 1, "work_job_review_budget": 1,
                  "work_job_integration_resync": 1, "work_job_ci_recovery": 1,
                  "work_job_merge_intent": 1}
@@ -205,11 +300,13 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
             raise MigrationRefused("source_identity")
         selected = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id!=?",
                         (run["run_id"], job["job_id"]))
-        if (run["status"] != "ticket_completed" or root["value_language"] not in {"zh", "en"}
-                or job["job_id"] != f"ticket:{ticket}:generation:1" or job["stage"] != "completed"
+        if ((not pending_resources and (run["status"] != "ticket_completed" or job["stage"] != "completed"))
+                or root["value_language"] not in {"zh", "en"}
+                or job["job_id"] != f"ticket:{ticket}:generation:1"
                 or job["owner_kind"] != "ticket" or job["owner_key"] != str(ticket)
                 or selected["job_id"] != f"ticket:{ticket}:selection" or selected["stage"] is not None
-                or job["value_ticket_closed_by_run"] != 1
+                or (job["value_ticket_closed_by_run"] not in (None, 0) if pending_resources
+                    else job["value_ticket_closed_by_run"] != 1)
                 or job["value_ticket_branch_initialized"] != 1
                 or job["value_ticket_branch"] != f"agent-run/{run['run_id']}/ticket-{ticket}"
                 or job["value_publication_attempts"] != 1
@@ -226,13 +323,14 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
             raise MigrationRefused("unsupported_source_write_authority")
         if job["value_pending_attempt"] not in (None, 0) or job["value_pending_attempt_kind"] is not None:
             raise MigrationRefused("source_attempt_history")
-        closeout = _one(db, "SELECT * FROM run_closeout_headers WHERE run_id=? AND kind='cleanup'",
-                        (run["run_id"],))
-        cleanup = _one(db, "SELECT * FROM run_cleanup_items WHERE run_id=?", (run["run_id"],))
-        if (closeout["value_status"] != "completed" or cleanup["branch"] != job["value_ticket_branch"]
-                or cleanup["value_status"] != "completed"
-                or cleanup["value_expected_head_sha"] != job["value_publication_sha"]):
-            raise MigrationRefused("source_cleanup")
+        cleanup: dict[str, Any] = {}
+        if not pending_resources:
+            closeout = _one(db, "SELECT * FROM run_closeout_headers WHERE run_id=? AND kind='cleanup'", (run_id,))
+            cleanup = dict(_one(db, "SELECT * FROM run_cleanup_items WHERE run_id=?", (run_id,)))
+            if (closeout["value_status"] != "completed" or cleanup["branch"] != job["value_ticket_branch"]
+                    or cleanup["value_status"] != "completed"
+                    or cleanup["value_expected_head_sha"] != job["value_publication_sha"]):
+                raise MigrationRefused("source_cleanup")
         parent = _one(db, "SELECT * FROM run_parent_versions WHERE run_id=? AND version_id=?",
                       (run["run_id"], root["value_parent_version_id"]))
         title = _completed_evidence(db, run["run_id"], parent["title_id"], owner=f"run:{run['run_id']}", kind="parent.title")
@@ -488,13 +586,26 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 raise MigrationRefused("unsupported_source_effect_outcome")
         close_intent = _one(db, "SELECT * FROM work_job_ticket_close_intent WHERE run_id=? AND job_id=?",
                             (run["run_id"], job["job_id"]))
-        close_owner = _one(db, "SELECT * FROM work_job_ticket_close_ownership WHERE run_id=? AND job_id=?",
-                           (run["run_id"], job["job_id"]))
+        close_owner: dict[str, Any] = ({} if pending_resources else dict(_one(
+            db, "SELECT * FROM work_job_ticket_close_ownership WHERE run_id=? AND job_id=?", (run_id, job['job_id']))))
         binding = f"pr-{job['value_pr_number']}:sha-{job['value_integrated_sha']}"
-        if (close_intent["value_intent_binding"] != binding
+        close_readproof = None
+        if readproof is not None:
+            close_readproof = _external_close_proof(
+                readproof, run_id=run_id, repository=run['repository'], ticket=ticket,
+                pr_number=job['value_pr_number'], publication_sha=job['value_publication_sha'],
+                integrated_sha=job['value_integrated_sha'], base_sha=base['value_sha'],
+                run_branch=root['value_run_branch'], ticket_branch=job['value_ticket_branch'],
+                base_branch=base['value_branch'], source_sha=source_sha, intent=dict(close_intent),
+                requirements=requirements, runner_identity=frozen['runner_github_identity'])
+        if (close_intent["value_intent_binding"] != binding or close_intent['value_dispatch_attempted'] != 1):
+            raise MigrationRefused('source_close_ownership')
+        if not pending_resources and (
+                close_intent["value_intent_binding"] != binding
                 or close_owner["value_intent_binding"] != binding
                 or close_owner["value_actor"] != close_intent["value_actor"]
-                or close_owner["value_event_id"] != f"{run['run_id']}:ticket-{ticket}:closed"
+                or close_owner["value_event_id"] != (close_readproof['event']['id'] if close_readproof is not None
+                                                      else f"{run['run_id']}:ticket-{ticket}:closed")
                 or close_intent["value_dispatch_attempted"] != 1):
             raise MigrationRefused("source_close_ownership")
         # Validate the complete evidence graph; the uniform record carrier
@@ -510,7 +621,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         for stream in {slot["stream"] for slot in slots}:
             if [slot["position"] for slot in slots if slot["stream"] == stream] != list(range(sum(slot["stream"] == stream for slot in slots))):
                 raise MigrationRefused("source_history")
-        if (not timeline or timeline[-1]["value_phase"] != "completed"
+        if (not timeline or timeline[-1]["value_phase"] != ('merged' if pending_resources else 'completed')
                 or len({slot["event_id"] for slot in slots}) != counts["run_timeline_events"]):
             raise MigrationRefused("source_history")
         return _Completed(run["run_id"], run["repository"], run["parent_number"],
@@ -523,7 +634,8 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                           _wire_row(dict(job)), _wire_row(dict(cleanup)), supporting_calls,
                           timeline, _wire_row(dict(close_intent)),
                           _wire_row(dict(close_owner)), budget["value_development_attempts"],
-                          budget["value_reviewer_invocations"], physical_invocations)
+                          budget["value_reviewer_invocations"], physical_invocations,
+                          close_readproof, pending_resources)
     except sqlite3.Error as error:
         raise MigrationRefused("source_corrupt") from error
     finally:
@@ -629,12 +741,26 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
         if (reader.run('symbolic-ref', '-q', ref, check=False).returncode != 1
                 or _git(root, 'rev-parse', '--verify', ref) != sha):
             raise MigrationRefused('source_existing_ref')
-    if (_git(root, 'rev-parse', 'HEAD') != facts.base_sha
-            or _git(root, 'status', '--porcelain')
-            or _git(root, 'for-each-ref', '--format=%(refname)', f'refs/heads/{facts.ticket_branch}')):
+    ticket_ref = f'refs/heads/{facts.ticket_branch}'
+    ticket_checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
+    if (_git(root, 'rev-parse', 'HEAD') != facts.base_sha or _git(root, 'status', '--porcelain')
+            or (not facts.pending_resources and _git(root, 'for-each-ref', '--format=%(refname)', ticket_ref))):
         raise MigrationRefused('source_existing_checkout')
     worktrees = _git(root, 'worktree', 'list', '--porcelain').strip().split('\n\n')
-    if len(worktrees) != 1 or worktrees[0].splitlines()[0] != f'worktree {root}':
+    expected_paths = {str(root)}
+    if facts.pending_resources:
+        expected_paths.add(str(ticket_checkout))
+        if (ticket_checkout.is_symlink() or not ticket_checkout.is_dir()
+                or ticket_checkout.resolve() != ticket_checkout
+                or reader.run('symbolic-ref', '-q', ticket_ref, check=False).returncode != 1
+                or _git(root, 'rev-parse', '--verify', ticket_ref) != facts.publication_sha
+                or _git(ticket_checkout, 'symbolic-ref', '-q', 'HEAD') != ticket_ref
+                or _git(ticket_checkout, 'rev-parse', 'HEAD') != facts.publication_sha
+                or _git(ticket_checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir') != str(git_store)
+                or _git(ticket_checkout, 'status', '--porcelain')):
+            raise MigrationRefused('source_existing_ticket_resources')
+    if (len(worktrees) != len(expected_paths)
+            or {entry.splitlines()[0].removeprefix('worktree ') for entry in worktrees} != expected_paths):
         raise MigrationRefused('source_existing_worktrees')
     for sha, tree in ((facts.candidate_sha, facts.candidate_tree),
                       (facts.publication_sha, facts.integrated_tree),
@@ -651,7 +777,8 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
 def convert_completed_ticket_v6(
     snapshot: SourceSnapshot, destination: Path, *, git_store: Path,
     repository_root: Path, final_checkout: Path, profile_snapshot: Path,
-    github_snapshot: Path, observation_snapshot: Path, original_report: Path,
+    github_snapshot: Path | None = None, observation_snapshot: Path | None = None,
+    original_report: Path | None = None, external_snapshot: Path | None = None,
     existing_verified: bool = False,
     source_origin: Mapping[str, str] | None = None,
 ) -> Kernel:
@@ -683,104 +810,120 @@ def convert_completed_ticket_v6(
                               or not destination.parent.is_dir() or repository_root.is_symlink()):
         raise MigrationRefused('source_existing_resources')
     profile, profile_sha = _read_profile(profile_snapshot)
-    observed, observation_sha = _read_document(observation_snapshot)
-    report, report_sha = _read_document(original_report)
-    github, github_sha = _read_document(github_snapshot)
-    if (not isinstance(observed.get("backend"), str)
-            or observed.get("copied_database_sha256") != snapshot.sha256
-            or observed.get("source_database_sha256") != snapshot.sha256
-            or observed.get("profile_present") is not True
-            or observed.get("profile_sha256") != profile_sha
-            or observed.get("github_sha256") != github_sha
-            or observed.get("original_report_sha256") != report_sha
-            or report.get("status") != "ticket_completed"
-            or observed.get("external_effects") != report.get("mutations")):
-        raise MigrationRefused("source_observation")
-    registrations = report.get("post_close_worktrees", {}).get("registrations")
-    original_roots = ([Path(row["path"]) for row in registrations
-                       if isinstance(row, dict) and row.get("repository") is True
-                       and isinstance(row.get("path"), str)]
-                      if isinstance(registrations, list) else [])
-    if (len(original_roots) != 1 or not original_roots[0].is_absolute()
-            or (not existing_verified and destination.parent.resolve().is_relative_to(original_roots[0].resolve()))
-            or (existing_verified and original_roots[0] != repository_root)):
-        raise MigrationRefused("old_repository_alias")
+    readproof, readproof_sha = (None, None) if external_snapshot is None else _read_document(external_snapshot)
+    if readproof is not None and (not existing_verified or origin is None
+                                  or any(path is not None for path in (github_snapshot, observation_snapshot, original_report))):
+        raise MigrationRefused('source_readproof_resources')
+    observed: dict[str, Any] = {}
+    report: dict[str, Any] = {}
+    github: dict[str, Any] = {}
+    observation_sha: str | None = None
+    report_sha: str | None = None
+    github_sha: str | None = None
+    if readproof is None:
+        if github_snapshot is None or observation_snapshot is None or original_report is None:
+            raise MigrationRefused('source_documents_required')
+        observed, observation_sha = _read_document(observation_snapshot)
+        report, report_sha = _read_document(original_report)
+        github, github_sha = _read_document(github_snapshot)
+        if (not isinstance(observed.get("backend"), str)
+                or observed.get("copied_database_sha256") != snapshot.sha256
+                or observed.get("source_database_sha256") != snapshot.sha256
+                or observed.get("profile_present") is not True
+                or observed.get("profile_sha256") != profile_sha
+                or observed.get("github_sha256") != github_sha
+                or observed.get("original_report_sha256") != report_sha
+                or report.get("status") != "ticket_completed"
+                or observed.get("external_effects") != report.get("mutations")):
+            raise MigrationRefused("source_observation")
+        registrations = report.get("post_close_worktrees", {}).get("registrations")
+        original_roots = ([Path(row["path"]) for row in registrations
+                           if isinstance(row, dict) and row.get("repository") is True
+                           and isinstance(row.get("path"), str)]
+                          if isinstance(registrations, list) else [])
+        if (len(original_roots) != 1 or not original_roots[0].is_absolute()
+                or (not existing_verified and destination.parent.resolve().is_relative_to(original_roots[0].resolve()))
+                or (existing_verified and original_roots[0] != repository_root)):
+            raise MigrationRefused("old_repository_alias")
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".v6-completed-") as directory:
         copied = capture_v6(snapshot.path, Path(directory) / "source.sqlite3")
         if ((copied.sha256, copied.source_protocol, copied.schema_sha256, copied.table_rows)
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
-        facts = _read_completed(copied.path, profile, profile_sha, snapshot.sha256)
+        facts = _read_completed(copied.path, profile, profile_sha, snapshot.sha256, readproof)
         _require_no_v6_notification_journal(snapshot, facts.run_id)
-        if (observed.get("run_id") != facts.run_id
-                or report.get("raw_backend_calls") != {"development": facts.developments_used,
-                                                        "review": facts.reviews_used, "publication": 1}
-                or (facts.physical_invocations and observed.get("old_runtime_exit") != {"returncode": 0, "reaped": True})
-                or observed.get("candidate_sha") != facts.candidate_sha
-                or observed.get("integrated_sha") != facts.integrated_sha
-                or report.get("source_identity", {}).get("run_id") != facts.run_id
-                or report.get("source_identity", {}).get("pull_request") != observed.get("pull_request")):
-            raise MigrationRefused("source_observation")
-        delivery = github.get("delivery")
-        issues = github.get("issues")
-        if (github.get("repository") != facts.repository or not isinstance(delivery, dict)
-                or not isinstance(issues, dict) or not isinstance(issues.get(str(facts.ticket)), dict)
-                or github.get("parent") != {"number": facts.parent_number,
-                                            "title": facts.requirements.parent.title,
-                                            "body": facts.requirements.parent.body,
-                                            "sub_issues": [facts.ticket],
-                                            "sub_issue_order_reliable": True}
-                or delivery.get("closed_issues") != [facts.ticket]
-                or issues[str(facts.ticket)].get("state") != "CLOSED"
-                or delivery.get("pull_requests") != [observed["pull_request"]]
-                or delivery.get("published_branches", {}).get(facts.run_branch) != facts.integrated_sha):
-            raise MigrationRefused("source_external")
-        original = facts.requirements.issues[0]
-        latest = issues[str(facts.ticket)]
-        if (latest.get("number") != facts.ticket or latest.get("title") != original.title
-                or latest.get("body") != original.body or set(latest.get("labels", [])) != original.labels
-                or latest.get("blocked_by") != [] or original.state != "OPEN"):
-            raise MigrationRefused("source_external_issue")
-        pr = observed.get("pull_request")
-        if (not isinstance(pr, dict)
-                or pr.get("number") != facts.pr_number or pr.get("state") != "MERGED"
-                or pr.get("branch") != facts.ticket_branch or pr.get("base_branch") != facts.run_branch
-                or pr.get("head_sha") != facts.publication_sha
-                or pr.get("integrated_sha") != facts.integrated_sha
-                or pr.get("base_sha") != facts.base_sha):
-            raise MigrationRefused("source_external_pr")
-        mutations = delivery.get("mutations")
-        expected = {"run_id": facts.run_id, "ticket_number": facts.ticket,
-                    "pr_number": facts.pr_number, "integrated_sha": facts.integrated_sha}
-        if (not isinstance(mutations, list) or len(mutations) != 3
-                or mutations[:2] != [{"action": action, **expected}
-                                     for action in ("completion_comment", "close_issue")]
-                or mutations[2] != {"action": "delete_managed_branch", "branch": facts.ticket_branch}
-                or delivery.get("ticket_close_ownership", {}).get(str(facts.ticket), {}).get("event_id")
-                   != facts.close_ownership["value_event_id"]
-                or delivery["ticket_close_ownership"][str(facts.ticket)].get("intent_binding")
-                   != facts.close_ownership["value_intent_binding"]
-                or delivery["ticket_close_ownership"][str(facts.ticket)].get("actor")
-                   != facts.close_ownership["value_actor"]):
-            raise MigrationRefused("source_external_effects")
-        observed_refs = observed.get("git_refs")
-        if observed_refs != sorted([f"refs/heads/{facts.run_branch}\t{facts.integrated_sha}",
-                                    f"refs/heads/{facts.base_branch}\t{facts.base_sha}"]):
-            raise MigrationRefused("source_git_refs")
-        source_run_ref = git_store / "refs" / "heads" / facts.run_branch
-        source_base_ref = git_store / "refs" / "heads" / facts.base_branch
-        try:
-            source_refs_valid = (not any(path.is_symlink() or not path.is_file()
-                                         or not path.resolve().is_relative_to(git_store.resolve())
-                                         for path in (source_run_ref, source_base_ref))
-                                 and source_run_ref.read_text(encoding="ascii").strip() == facts.integrated_sha
-                                 and source_base_ref.read_text(encoding="ascii").strip() == facts.base_sha
-                                 and not (git_store / "refs" / "heads" / facts.ticket_branch).exists()
-                                 and not (git_store / "packed-refs").exists())
-        except (OSError, UnicodeError):
-            source_refs_valid = False
-        if not source_refs_valid and not existing_verified:
-            raise MigrationRefused("source_git_refs")
+        mutations: list[Any] = []
+        if readproof is None:
+            if (observed.get("run_id") != facts.run_id
+                    or report.get("raw_backend_calls") != {"development": facts.developments_used,
+                                                            "review": facts.reviews_used, "publication": 1}
+                    or (facts.physical_invocations and observed.get("old_runtime_exit") != {"returncode": 0, "reaped": True})
+                    or observed.get("candidate_sha") != facts.candidate_sha
+                    or observed.get("integrated_sha") != facts.integrated_sha
+                    or report.get("source_identity", {}).get("run_id") != facts.run_id
+                    or report.get("source_identity", {}).get("pull_request") != observed.get("pull_request")):
+                raise MigrationRefused("source_observation")
+            delivery = github.get("delivery")
+            issues = github.get("issues")
+            if (github.get("repository") != facts.repository or not isinstance(delivery, dict)
+                    or not isinstance(issues, dict) or not isinstance(issues.get(str(facts.ticket)), dict)
+                    or github.get("parent") != {"number": facts.parent_number,
+                                                "title": facts.requirements.parent.title,
+                                                "body": facts.requirements.parent.body,
+                                                "sub_issues": [facts.ticket],
+                                                "sub_issue_order_reliable": True}
+                    or delivery.get("closed_issues") != [facts.ticket]
+                    or issues[str(facts.ticket)].get("state") != "CLOSED"
+                    or delivery.get("pull_requests") != [observed["pull_request"]]
+                    or delivery.get("published_branches", {}).get(facts.run_branch) != facts.integrated_sha):
+                raise MigrationRefused("source_external")
+            original = facts.requirements.issues[0]
+            latest = issues[str(facts.ticket)]
+            if (latest.get("number") != facts.ticket or latest.get("title") != original.title
+                    or latest.get("body") != original.body or set(latest.get("labels", [])) != original.labels
+                    or latest.get("blocked_by") != [] or original.state != "OPEN"):
+                raise MigrationRefused("source_external_issue")
+            pr = observed.get("pull_request")
+            if (not isinstance(pr, dict)
+                    or pr.get("number") != facts.pr_number or pr.get("state") != "MERGED"
+                    or pr.get("branch") != facts.ticket_branch or pr.get("base_branch") != facts.run_branch
+                    or pr.get("head_sha") != facts.publication_sha
+                    or pr.get("integrated_sha") != facts.integrated_sha
+                    or pr.get("base_sha") != facts.base_sha):
+                raise MigrationRefused("source_external_pr")
+            source_mutations = delivery.get("mutations")
+            expected = {"run_id": facts.run_id, "ticket_number": facts.ticket,
+                        "pr_number": facts.pr_number, "integrated_sha": facts.integrated_sha}
+            if (not isinstance(source_mutations, list) or len(source_mutations) != 3
+                    or source_mutations[:2] != [{"action": action, **expected}
+                                         for action in ("completion_comment", "close_issue")]
+                    or source_mutations[2] != {"action": "delete_managed_branch", "branch": facts.ticket_branch}
+                    or delivery.get("ticket_close_ownership", {}).get(str(facts.ticket), {}).get("event_id")
+                       != facts.close_ownership["value_event_id"]
+                    or delivery["ticket_close_ownership"][str(facts.ticket)].get("intent_binding")
+                       != facts.close_ownership["value_intent_binding"]
+                    or delivery["ticket_close_ownership"][str(facts.ticket)].get("actor")
+                       != facts.close_ownership["value_actor"]):
+                raise MigrationRefused("source_external_effects")
+            mutations = source_mutations
+            observed_refs = observed.get("git_refs")
+            if observed_refs != sorted([f"refs/heads/{facts.run_branch}\t{facts.integrated_sha}",
+                                        f"refs/heads/{facts.base_branch}\t{facts.base_sha}"]):
+                raise MigrationRefused("source_git_refs")
+            source_run_ref = git_store / "refs" / "heads" / facts.run_branch
+            source_base_ref = git_store / "refs" / "heads" / facts.base_branch
+            try:
+                source_refs_valid = (not any(path.is_symlink() or not path.is_file()
+                                             or not path.resolve().is_relative_to(git_store.resolve())
+                                             for path in (source_run_ref, source_base_ref))
+                                     and source_run_ref.read_text(encoding="ascii").strip() == facts.integrated_sha
+                                     and source_base_ref.read_text(encoding="ascii").strip() == facts.base_sha
+                                     and not (git_store / "refs" / "heads" / facts.ticket_branch).exists()
+                                     and not (git_store / "packed-refs").exists())
+            except (OSError, UnicodeError):
+                source_refs_valid = False
+            if not source_refs_valid and not existing_verified:
+                raise MigrationRefused("source_git_refs")
         subject = f"ticket:{facts.ticket}"
         owned_repository = False
         try:
@@ -801,12 +944,16 @@ def convert_completed_ticket_v6(
                                 integrated_tree=facts.integrated_tree)
             base_tree = _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")
             common = repository_root / ".git"
+            ticket_checkout = ManagedWorkspace.for_repository(facts.repository).state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
             spec = RunSpec(facts.run_id, facts.repository, facts.parent_number,
                            facts.parent_revision, facts.graph_revision,
                            (Delivery(subject, DeliveryKind.TICKET, facts.ticket, "source-verified",
                                      Commit(facts.base_sha, base_tree),
                                      f"refs/heads/{facts.ticket_branch}",
-                                     f"refs/heads/{facts.run_branch}"),
+                                     f"refs/heads/{facts.run_branch}",
+                                     checkout=str(ticket_checkout) if facts.pending_resources else '',
+                                     owned_root=str(ticket_checkout.parent) if facts.pending_resources else '',
+                                     common_git_dir=str(common) if facts.pending_resources else ''),
                             Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN,
                                      facts.parent_number, facts.parent_revision,
                                      Commit(facts.base_sha, base_tree),
@@ -885,13 +1032,32 @@ def convert_completed_ticket_v6(
                                 "development" if call["role"] == "development" else "publication"))
                     tx.put(subject, "v6_semantic_attempt", wire_json(call))
                 receipt_ids = []
-                for operation, mutation in zip(("completion_comment", "close"), mutations[:2], strict=True):
-                    receipt = tx.put(subject, "v6_confirmed_effect_receipt", wire_json({
-                        "mutation": mutation, "close_intent": facts.close_intent,
-                        "close_ownership": facts.close_ownership if operation == "close" else None,
-                        "source": "old-github-fixture-and-v6-close-ledger"}))
+                for index, operation in enumerate(('completion_comment', 'close')):
                     effect_id = f"v6-import:{facts.run_id}:{facts.ticket}:{operation}"
-                    payload_id = tx.put(subject, "v6_confirmed_effect_payload", wire_json(mutation))
+                    if facts.close_readproof is None:
+                        payload = mutations[index]
+                        receipt_body = {
+                            'mutation': payload, 'close_intent': facts.close_intent,
+                            'close_ownership': facts.close_ownership if operation == 'close' else None,
+                            'source': 'old-github-fixture-and-v6-close-ledger'}
+                    else:
+                        close_proof = facts.close_readproof
+                        close_intent = {
+                            **close_proof['close_intent'], 'run_id': facts.run_id, 'subject': subject,
+                            'issue': facts.ticket, 'merge_sha': facts.integrated_sha,
+                            'effect_id': f'v6-import:{facts.run_id}:{facts.ticket}:completion_comment',
+                            'pr_number': facts.pr_number, 'kind': 'ticket',
+                            'comment_id': close_proof['comment']['id'],
+                            'comment_created_at': close_proof['comment']['created_at'],
+                            'comment_body': close_proof['comment']['body'],
+                        }
+                        payload = {'issue': facts.ticket, 'merge_sha': facts.integrated_sha,
+                                   'kind': 'ticket', 'close_intent': close_intent}
+                        receipt_body = {'disposition': 'target', 'commit': None, 'pr': None,
+                                        'raw': {**close_proof, 'close_intent': close_intent,
+                                                'source': 'v6-intent-and-external-readproof'}}
+                    receipt = tx.put(subject, 'v6_confirmed_effect_receipt', wire_json(receipt_body))
+                    payload_id = tx.put(subject, 'v6_confirmed_effect_payload', wire_json(payload))
                     tx.execute("""INSERT INTO effects(
                         id,subject,operation,status,executor,epoch,parent_revision,graph_revision,
                         revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
@@ -902,7 +1068,7 @@ def convert_completed_ticket_v6(
                                 f"refs/heads/{facts.run_branch}", facts.integrated_sha,
                                 facts.integrated_sha, facts.candidate_sha, facts.candidate_tree,
                                 facts.base_sha, base_tree, facts.pr_number,
-                                facts.close_ownership["value_actor"], payload_id, receipt))
+                                facts.close_intent['value_actor'], payload_id, receipt))
                     receipt_ids.append(effect_id)
                 tx.execute("INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (subject, 1, native["revision"], facts.parent_revision,
@@ -914,7 +1080,7 @@ def convert_completed_ticket_v6(
                     "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
                     "github_sha256": github_sha, "observation_sha256": observation_sha,
                     "original_report_sha256": report_sha,
-                    "old_backend": observed["backend"],
+                    "old_backend": observed.get('backend'),
                     "old_physical_invocations": facts.physical_invocations,
                     "old_profile_bindings": len(profile["bindings"]),
                     "old_completed_job_revision": facts.old_job_revision,
@@ -925,10 +1091,22 @@ def convert_completed_ticket_v6(
                     "integrated_sha": facts.integrated_sha,
                     "old_job": facts.old_job,
                     "old_cleanup": facts.old_cleanup,
+                    "external_readproof_sha256": readproof_sha,
                 }))
                 tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
                            "VALUES (?,?,?,?,1,?)", (subject, "v6_completed_import", facts.run_id,
                                                    identity, kernel.clock()))
+                if readproof is not None:
+                    material = tx.put(subject, 'v6_external_readproof', wire_json(readproof))
+                    tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                               'VALUES (?,?,?,?,1,?)', (subject, 'v6_external_readproof', readproof_sha,
+                                                       material, kernel.clock()))
+                if facts.pending_resources:
+                    tx.execute('INSERT INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir) '
+                               'VALUES (?,1,?,?,?,?,?,?)',
+                               (subject, f'refs/heads/{facts.ticket_branch}', facts.publication_sha,
+                                str(ticket_checkout), facts.publication_sha,
+                                str(ticket_checkout.parent), str(common)))
             profile_body = profile_snapshot.read_bytes()
             if hashlib.sha256(profile_body).hexdigest() != profile_sha:
                 raise MigrationRefused("source_document_changed")
@@ -962,6 +1140,16 @@ def convert_completed_ticket_v6(
                     tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
                                'VALUES (?,?,?,?,1,?)',
                                (subject, 'v6_local_ref_ownership', source_ref, ownership, kernel.clock()))
+                    if facts.pending_resources:
+                        record = {'table': 'work_jobs', 'key': [facts.run_id, facts.old_job['job_id']]}
+                        for kind, field, resource in (
+                                ('v6_local_ref_ownership', 'source_ref', 'refs/heads/' + facts.ticket_branch),
+                                ('v6_local_worktree_ownership', 'checkout', str(ticket_checkout))):
+                            body = {'origin_nonce': origin['nonce'], field: resource,
+                                    'expected_oid': facts.publication_sha, 'source_record': record}
+                            material = tx.put(subject, kind, wire_json(body))
+                            tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                                       'VALUES (?,?,?,?,1,?)', (subject, kind, resource, material, kernel.clock()))
             latest_requirements = Requirements(facts.requirements.parent,
                                                (replace(facts.requirements.issues[0], state="CLOSED"),))
             # This is the sealed copy's verified GitHub readback, not a new
@@ -974,7 +1162,12 @@ def convert_completed_ticket_v6(
                     or subject in summary["frontier"]):
                 raise MigrationRefused("converted_state")
             for path, expected_sha in ((profile_snapshot, profile_sha), (github_snapshot, github_sha),
-                                       (observation_snapshot, observation_sha), (original_report, report_sha)):
+                                       (observation_snapshot, observation_sha), (original_report, report_sha),
+                                       (external_snapshot, readproof_sha)):
+                if path is None:
+                    if expected_sha is not None:
+                        raise MigrationRefused('source_document_changed')
+                    continue
                 if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
                     raise MigrationRefused("source_document_changed")
             if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size

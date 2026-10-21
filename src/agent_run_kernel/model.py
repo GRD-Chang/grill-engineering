@@ -359,6 +359,16 @@ class Step:
     reason: str = ""
     call: AgentCall | None = None
     effect: Effect | None = None
+    retry_at: float | None = None
+
+
+class ReadWait(KernelError):
+    """A Core-selected read retry, consumed mechanically by the process adapter."""
+
+    def __init__(self, step: Step) -> None:
+        self.step = step
+        self.retry_at = step.retry_at
+        super().__init__(step.reason)
 
 
 def wire_json(value: Any) -> bytes:

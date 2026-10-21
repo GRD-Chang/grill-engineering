@@ -8,9 +8,10 @@ import sys
 
 import pytest
 
+from agent_run.github import GitHubReadError
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Effect, Execution, KernelError
-from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run_kernel.remote_effects import EffectReadError, RemoteEffects
 
 
 def _fixture(tmp_path, monkeypatch):
@@ -149,6 +150,23 @@ def test_written_pr_target_settles_after_base_append_without_another_write(tmp_p
     assert sum("--method" in c for c in actual) == 1
 
 
+def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch):
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, lambda: None).disposition == "target"
+    pr = _pr_effect(push)
+    _change(state, lose_operation="pr", read_error_after_write=True)
+    with pytest.raises(EffectReadError) as failed:
+        port.execute(pr, lambda: None)
+    assert failed.value.code == "remote_read_failed"
+    assert failed.value.write_returncode == 1
+    assert "response lost after actual mutation" in failed.value.write_diagnostic
+    _change(state, read_error=False)
+    assert port.reconcile(pr).disposition == "target"
+    assert port.execute(pr, lambda: pytest.fail("original PR write must not repeat")).disposition == "target"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("--method" in call for call in actual) == 1
+
+
 @pytest.mark.parametrize("field", ["actor", "head_repository", "title", "closed"])
 def test_pr_foreign_original_facts_cannot_be_overwritten_or_replaced(tmp_path, monkeypatch, field):
     port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
@@ -247,7 +265,11 @@ def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monke
     close = replace(effect, operation="close", payload={"issue": 2, "merge_sha": effect.after_sha})
     assert port.execute(close, lambda: pytest.fail("no persisted close intent")).disposition == "unknown"
     _change(state, read_error=True)
-    assert port.execute(_pr_effect(effect), lambda: pytest.fail("unknown cannot write")).disposition == "unknown"
+    for read in (lambda: port.reconcile(_pr_effect(effect)),
+                 lambda: port.execute(_pr_effect(effect), lambda: pytest.fail("unknown cannot write"))):
+        with pytest.raises(GitHubReadError) as failure:
+            read()
+        assert failure.value.code == "remote_read_failed"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert not any("--method" in c for c in actual)
 
@@ -600,6 +622,7 @@ elif endpoint.startswith('repos/example/project/issues/'):
         d['events'].append({'id':len(d['events'])+1,'event':event,'actor':{'login':'publisher'},'created_at':at});result={'state':d['issue_state']}
     else:result={'number':2,'node_id':'issue-node-2','state':d['issue_state']}
 else:raise SystemExit('unexpected endpoint '+endpoint)
+if method!='GET' and d.get('read_error_after_write'):d['read_error']=True
 state.write_text(json.dumps(d))
 print(json.dumps(result))
 if method!='GET' and d.get('lose_operation')==('issue_link' if endpoint=='graphql' else 'merge' if endpoint.endswith('/merge') else 'comment' if endpoint.endswith('/comments') else 'close' if '/issues/' in endpoint else 'pr'):

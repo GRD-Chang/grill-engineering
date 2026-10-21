@@ -17,7 +17,7 @@ from agent_run.sqlite_runtime import require_wal_runtime
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v16-exploration"
+PROTOCOL = "independent-delivery-kernel-v17-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -204,8 +204,12 @@ CREATE TABLE hosts (
  PRIMARY KEY(run_id,epoch), UNIQUE(run_id,owner)
 );
 CREATE TABLE waits (
- subject TEXT NOT NULL REFERENCES subjects(id), kind TEXT NOT NULL, deadline REAL NOT NULL,
- PRIMARY KEY(subject,kind)
+ subject TEXT REFERENCES subjects(id), kind TEXT NOT NULL,
+ scope_id TEXT NOT NULL REFERENCES material(id),
+ started_at REAL NOT NULL, deadline REAL NOT NULL,
+ retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL,
+ evidence TEXT REFERENCES material(id),
+ PRIMARY KEY(scope_id,kind)
 );
 CREATE TABLE gates (
  subject TEXT NOT NULL REFERENCES subjects(id), code TEXT NOT NULL,

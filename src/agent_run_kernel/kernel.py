@@ -1501,7 +1501,216 @@ class Kernel:
                 return self._allocate(tx, run, job, execution, world, allow_agent)
             return self._mechanical(tx, run, job, execution, world)
 
-    def _imported_local_ref(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+    def begin_automatic_step(self, execution: Execution, subject: str | None = None, *, cleanup: bool = False) -> str:
+        """Capture only this operation's business identity, never a Run snapshot.
+
+        The Executor brackets one complete observe/advance/effect operation.
+        Individual idempotent reads and receipt writes are deliberately outside
+        the no-progress decision. The token is opaque to the I/O adapters.
+        """
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            self._automatic_owned(tx, run, execution)
+            return wire_json({"scope": self._automatic_scope(tx, run, subject, cleanup),
+                              "progress": self._automatic_progress(tx, run, subject, cleanup)}).decode()
+
+    def _automatic_owned(self, tx: Transaction, run: sqlite3.Row, execution: Execution) -> None:
+        abandoned = self._abandon_action(tx)
+        if abandoned is None:
+            self._executor_owned(tx, run, execution)
+        else:
+            self._abandon_owned(tx, abandoned, execution)
+
+    def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> dict[str, Any]:
+        scope: dict[str, Any] = {"run": run["id"], "parent_revision": run["parent_revision"],
+                                 "graph_revision": run["graph_revision"], "subject": subject, "cleanup": cleanup}
+        abandoned = self._abandon_action(tx)
+        if abandoned is not None:
+            scope["abandon_action"] = abandoned["id"]
+        if subject is None:
+            scope["final_target"] = [dict(row) for row in tx.rows("SELECT * FROM final_target")]
+        else:
+            job = self._job(tx, subject)
+            scope["delivery"] = {key: job[key] for key in (
+                "generation", "revision", "phase", "purpose", "source_ref", "target_ref", "base_sha",
+                "source_sha", "candidate_sha", "integrated_sha", "publication_sha", "pr_number",
+                "current_attempt", "completion_revision")}
+        return scope
+
+    def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> str:
+        # No sequence counters, diagnostics, history, clocks, polling attempts
+        # or sibling records can make a stalled operation appear to progress.
+        abandoned = self._abandon_action(tx)
+        if abandoned is not None:
+            unsettled = self._abandon_scope(tx, abandoned)["unsettled"]
+            facts: Any = {"action": abandoned["id"], "status": abandoned["status"],
+                          "effects": [dict(row) for row in tx.all(
+                              "SELECT id,status,receipt_id FROM effects WHERE control_action=? ORDER BY id", (abandoned["id"],))],
+                          "originals": [dict(tx.one("SELECT id,status,receipt_id FROM effects WHERE id=?", (effect_id,)))
+                                        for effect_id in unsettled]}
+        elif subject is None:
+            facts = [dict(row) for row in tx.rows("SELECT id,generation,phase FROM subjects WHERE kind='final_run'")]
+        else:
+            job = self._job(tx, subject)
+            facts = {"delivery": {key: job[key] for key in job.keys() if key not in {"version", "last_failure", "checks_id"}},
+                     "attempt": [dict(row) for row in tx.rows(
+                         "SELECT id,status,result_id,accounted,outcome,current_invocation,resume_action,new_thread "
+                         "FROM attempts WHERE id=?", (job["current_attempt"],))],
+                     "effects": [dict(row) for row in tx.all(
+                         "SELECT id,operation,status,receipt_id FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY id", (subject,))],
+                     "gates": [dict(row) for row in tx.rows("SELECT code,purpose FROM gates WHERE subject=? ORDER BY code", (subject,))],
+                     "work_queue": bool(tx.rows("SELECT subject FROM work_queue WHERE subject=?", (subject,))),
+                     "integration_queue": bool(tx.rows("SELECT subject FROM integration_queue WHERE subject=?", (subject,))),
+                     "integration_seat": run["integration_holder"] == subject,
+                     "cleanup": [dict(row) for row in tx.rows("SELECT generation,stage,state,effect_id,outcome FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))],
+                     "link": [dict(row) for row in tx.rows("SELECT generation,state,effect_id FROM issue_links WHERE subject=?", (subject,))]}
+        return self._fingerprint(facts)
+
+    @staticmethod
+    def _automatic_token(token: str) -> dict[str, Any]:
+        try:
+            if len(token.encode()) > CURRENT_LIMIT:
+                raise ValueError("oversize token")
+            value = json.loads(token)
+            if not isinstance(value, dict) or set(value) != {"scope", "progress"} or not isinstance(value["scope"], dict):
+                raise ValueError("invalid token")
+            return value
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise KernelError("automatic_step_identity") from error
+
+    def guard_automatic_step(self, token: str, execution: Execution, *, after_read: bool = False,
+                             readback: Effect | None = None) -> Step | None:
+        """Recheck exact work and Stop after I/O, without clearing a read wait."""
+        value = self._automatic_token(token)
+        scope = value["scope"]
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            self._automatic_owned(tx, run, execution)
+            if scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"]):
+                raise KernelError("automatic_step_superseded")
+            if run["blocked"] == "supervision_timeout" or (scope["subject"] is not None and any(
+                    gate["code"] == "supervision_timeout" for gate in self._gates(tx, scope["subject"]))):
+                return Step("paused", scope["subject"] or "", "supervision_timeout")
+            if readback is not None:
+                row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (readback.effect_id, scope["subject"]))
+                if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
+                    raise KernelError("effect_binding")
+            if (readback is None and self._abandon_action(tx) is None and
+                    (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
+                raise KernelError("automatic_step_paused")
+            if not after_read:
+                owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+                rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
+                               "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
+                               (owner, wire_json(scope)))
+                if rows:
+                    row = rows[0]
+                    if self.clock() >= row["deadline"]:
+                        seconds = 2700 if row["kind"] == "required_checks" else 600
+                        return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
+                    if row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
+                        return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
+            return None
+
+    def finish_automatic_step(self, token: str, execution: Execution, step: Step) -> Step:
+        """Validate a whole operation's Progress and retire a completed read wait."""
+        value = self._automatic_token(token)
+        scope, subject = value["scope"], value["scope"]["subject"]
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            self._automatic_owned(tx, run, execution)
+            if subject is not None and step.subject != subject and self._abandon_action(tx) is None:
+                raise KernelError("automatic_step_identity")
+            if step.kind == "progress" and value["progress"] == self._automatic_progress(tx, run, subject, scope["cleanup"]):
+                owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+                evidence = tx.put(owner, "execution_failure", wire_json({"code": "controller_no_progress",
+                    "message": "Controller returned Progress without changing its durable business identity", "scope": scope}))
+                if subject is None:
+                    tx.execute("UPDATE runs SET blocked='execution_failed'")
+                    self._event(tx, owner, "paused", "controller_no_progress", evidence)
+                else:
+                    self._gate(tx, subject, "execution_failed", evidence=evidence)
+                self._finish_final_failure(tx, run)
+                return Step("paused", subject or "", "controller_no_progress")
+            if step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"} and step.reason != "supervision_timeout":
+                tx.execute("DELETE FROM waits WHERE subject IS ? AND kind='github_convergence'", (subject,))
+            return step
+
+    def wait_for_read(self, token: str, execution: Execution, code: str, message: str) -> Step:
+        """Persist one original read outage; successful reads alone never renew it."""
+        from agent_run.error_safety import bounded_error
+
+        value = self._automatic_token(token)
+        scope, subject = value["scope"], value["scope"]["subject"]
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            self._automatic_owned(tx, run, execution)
+            if scope != self._automatic_scope(tx, run, subject, scope["cleanup"]):
+                return Step("waiting", subject or "", "observation_superseded")
+            if run["stopped"] or run["blocked"] or (subject is not None and self._gates(tx, subject)):
+                return Step("paused", subject or "", run["blocked"] or "operator_gate")
+            owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+            evidence = tx.put(owner, "github_read_observation", wire_json({"code": code, "message": bounded_error(message)}))
+            if code in {"ambiguous_run_pr", "invalid_fixture", "invalid_parent", "missing_parent", "stale_run_pr",
+                        "foreign_run_pr", "github_invalid_response", "change_pr_identity_mismatch", "change_pr_head_drift", "parent_close_external_conflict"}:
+                if subject is None:
+                    tx.execute("UPDATE runs SET blocked='deterministic_contradiction'")
+                    self._event(tx, owner, "paused", code, evidence)
+                else:
+                    self._gate(tx, subject, "deterministic_contradiction", evidence=evidence)
+                return Step("paused", subject or "", code)
+            kind = "required_checks" if subject is not None and self._job(tx, subject)["phase"] == "checks" else "github_convergence"
+            seconds = 2700 if kind == "required_checks" else 600
+            return self._supervised_wait(tx, run, subject, scope, kind, seconds, evidence)
+
+    def _supervised_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, scope: Mapping[str, Any],
+                         kind: str, seconds: int, evidence: str | None = None) -> Step:
+        owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
+        now = self.clock()
+        rows = tx.rows("SELECT * FROM waits WHERE scope_id=? AND kind=?", (scope_id, kind))
+        if not rows:
+            # One current identity per subject and wait kind. Retain immutable
+            # evidence, but never let an obsolete object govern a new candidate.
+            tx.execute("DELETE FROM waits WHERE subject IS ? AND kind=?", (subject, kind))
+            tx.execute("INSERT INTO waits(subject,kind,scope_id,started_at,deadline,evidence) VALUES (?,?,?,?,?,?)",
+                       (subject, kind, scope_id, now, now + seconds, evidence))
+        row = tx.one("SELECT * FROM waits WHERE scope_id=? AND kind=?", (scope_id, kind))
+        if now >= row["deadline"]:
+            detail = tx.put(owner, "supervision_timeout", wire_json({"kind": kind, "scope_id": scope_id,
+                "started_at": row["started_at"], "deadline": row["deadline"], "budget_seconds": seconds,
+                "retry_count": row["retry_count"], "latest_observation": evidence or row["evidence"]}))
+            if evidence is not None:
+                tx.execute("UPDATE waits SET evidence=? WHERE scope_id=? AND kind=?", (evidence, scope_id, kind))
+            if subject is None:
+                tx.execute("UPDATE runs SET blocked='supervision_timeout'")
+                self._event(tx, owner, "paused", "supervision_timeout", detail)
+            else:
+                self._gate(tx, subject, "supervision_timeout", evidence=detail)
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                for pending in tx.rows("SELECT id FROM effects WHERE subject IS ? AND status='sent'", (subject,)):
+                    self._event(tx, owner, "abandon_reconciliation_pending", pending["id"], detail)
+            self._finish_final_failure(tx, run)
+            return Step("paused", subject or "", "supervision_timeout")
+        retries = row["retry_count"]
+        retry_at = row["next_retry_at"]
+        if retry_at is None or now >= retry_at:
+            retries += 1
+            retry_at = min(now + min(60, 5 * 2 ** min(retries - 1, 4)), row["deadline"])
+        tx.execute("UPDATE waits SET retry_count=?,next_retry_at=?,evidence=COALESCE(?,evidence) WHERE scope_id=? AND kind=?",
+                   (retries, retry_at, evidence, scope_id, kind))
+        return Step("waiting", subject or "", kind, retry_at=retry_at)
+
+    def agent_source_ready(self, call: AgentCall) -> None:
+        """The original Worker is authorized to release, beyond a successful read."""
+        with self.storage.transaction() as tx:
+            invocation = self._agent_authority(tx, call)
+            if invocation["dispatch_state"] != "started":
+                raise KernelError("agent_not_started")
+            tx.execute("DELETE FROM waits WHERE subject=? AND kind='github_convergence'", (call.subject,))
+
+    def _imported_local_resources(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                             cleanup: sqlite3.Row) -> tuple[str, str] | None:
         origins = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
                           "WHERE h.kind='v6_original_cutover' LIMIT 2")
@@ -1511,7 +1720,7 @@ class Kernel:
                             "WHERE h.kind='v6_local_ref_ownership' AND h.identity=? LIMIT 2", (cleanup["source_ref"],))
         imports = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
                          "WHERE h.kind='v6_completed_import' AND h.identity=? LIMIT 2", (run["id"],))
-        if len(origins) != 1 or len(ownership) != 1 or len(imports) != 1 or job["kind"] != DeliveryKind.FINAL_RUN:
+        if len(origins) != 1 or len(ownership) != 1 or len(imports) != 1:
             raise KernelError("cleanup_marker_unproven")
         anchor, fact, imported = origins[0], ownership[0], imports[0]
         original = json.loads(tx.get(anchor["material_id"], anchor["subject"]))
@@ -1534,8 +1743,38 @@ class Kernel:
                 or proof.get("copied_repository_root") != run["repository_root"]
                 or not isinstance(value, dict) or set(value) != {"origin_nonce", "source_ref", "expected_oid", "source_record"}
                 or value["origin_nonce"] != origin["nonce"] or value["source_ref"] != cleanup["source_ref"]
-                or value["source_record"] != {"table": "run_root", "key": [run["id"]]}
-                or not isinstance(value["expected_oid"], str) or value["expected_oid"] != proof.get("integrated_sha")):
+                or not isinstance(value["expected_oid"], str)):
+            raise KernelError("cleanup_marker_unproven")
+        if job["kind"] == DeliveryKind.FINAL_RUN:
+            if (value["source_record"] != {"table": "run_root", "key": [run["id"]]}
+                    or value["expected_oid"] != proof.get("integrated_sha")):
+                raise KernelError("cleanup_marker_unproven")
+        elif job["kind"] == DeliveryKind.TICKET:
+            old = proof.get("old_job")
+            trees = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                            "WHERE h.kind='v6_local_worktree_ownership' AND h.identity=? LIMIT 2", (cleanup["checkout"],))
+            if (job["generation"] != 1 or job["id"] != imported["subject"] or not isinstance(old, dict)
+                    or old.get("run_id") != run["id"] or old.get("owner_kind") != "ticket"
+                    or old.get("value_ticket_number") != job["issue"]
+                    or old.get("job_id") != f"ticket:{job['issue']}:generation:1" or len(trees) != 1):
+                raise KernelError("cleanup_marker_unproven")
+            tree = trees[0]
+            tree_value = json.loads(tx.get(tree["material_id"], tree["subject"]))
+            record = {"table": "work_jobs", "key": [run["id"], old["job_id"]]}
+            checkout = Path(origin["target_db"]).parent.parent / "worktrees" / run["id"] / f"ticket-{job['issue']}"
+            if (fact["generation"] != 1 or tree["generation"] != 1 or tree["subject"] != imported["subject"]
+                    or tree["material_purpose"] != "v6_local_worktree_ownership"
+                    or value["source_record"] != record or value["expected_oid"] != proof.get("publication_sha")
+                    or value["expected_oid"] != old.get("value_publication_sha")
+                    or cleanup["source_ref"] != "refs/heads/" + str(old.get("value_ticket_branch"))
+                    or any(cleanup[key] != job[key] for key in ("checkout", "owned_root", "common_git_dir"))
+                    or cleanup["checkout"] != str(checkout) or cleanup["owned_root"] != str(checkout.parent)
+                    or cleanup["common_git_dir"] != str(Path(run["repository_root"]) / ".git")
+                    or cleanup["workspace_sha"] != value["expected_oid"] or cleanup["source_sha"] != value["expected_oid"]
+                    or tree_value != {"origin_nonce": origin["nonce"], "checkout": cleanup["checkout"],
+                                      "expected_oid": value["expected_oid"], "source_record": record}):
+                raise KernelError("cleanup_marker_unproven")
+        else:
             raise KernelError("cleanup_marker_unproven")
         return value["expected_oid"], origin["source_uuid"]
 
@@ -1580,37 +1819,60 @@ class Kernel:
             operation = self.CLEANUP[cleanup["stage"]]
             head = cleanup["workspace_sha"] if operation == "cleanup_worktree" else cleanup["source_sha"]
             source_uuid = None
+            if operation == "cleanup_worktree" and job["kind"] == DeliveryKind.TICKET:
+                workspaces = tx.rows("SELECT id FROM effects WHERE subject=? AND generation=? AND operation='workspace' AND status='confirmed'",
+                                     (subject, cleanup["generation"]))
+                if not workspaces:
+                    try:
+                        original = self._imported_local_resources(tx, run, job, cleanup)
+                    except KernelError as error:
+                        if error.code != "cleanup_marker_unproven":
+                            raise
+                        return Step("paused", subject, error.code)
+                    if original is not None:
+                        head, source_uuid = original
             if operation == "cleanup_local_ref":
                 workspaces = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND source_ref=? AND operation='workspace' AND status='confirmed'",
                                      (subject, cleanup["generation"], cleanup["source_ref"]))
-                if len(workspaces) != 1:
-                    return Step("paused", subject, "cleanup_marker_unproven")
-                workspace = workspaces[0]
-                intent = json.loads(tx.get(workspace["payload_id"], subject))
-                receipt = json.loads(tx.get(workspace["receipt_id"], subject))
-                if (any(intent.get(key) != cleanup[key] for key in ("checkout", "owned_root", "common_git_dir"))
-                        or receipt.get("disposition") != "target" or not isinstance(receipt.get("commit"), dict)
-                        or receipt["commit"].get("sha") != workspace["before_sha"]):
-                    return Step("paused", subject, "cleanup_marker_unproven")
-                if intent.get("create_ref") is False:
+                if not workspaces and job["kind"] == DeliveryKind.TICKET:
                     try:
-                        original = self._imported_local_ref(tx, run, job, cleanup)
+                        original = self._imported_local_resources(tx, run, job, cleanup)
                     except KernelError as error:
                         if error.code != "cleanup_marker_unproven":
                             raise
                         return Step("paused", subject, error.code)
                     if original is None:
-                        # An ordinary detached Final workspace creates no
-                        # local branch. Remote publication grants no ownership.
-                        tx.execute("UPDATE resource_cleanup SET stage=stage+1 WHERE subject=? AND generation=?",
-                                   (subject, cleanup["generation"]))
-                        self._event(tx, subject, "resource_not_owned", operation, workspace["payload_id"])
-                        return Step("progress", subject)
+                        return Step("paused", subject, "cleanup_marker_unproven")
                     head, source_uuid = original
-                elif intent.get("create_ref") is True:
-                    head = workspace["before_sha"]
-                else:
+                elif len(workspaces) != 1:
                     return Step("paused", subject, "cleanup_marker_unproven")
+                if workspaces:
+                    workspace = workspaces[0]
+                    intent = json.loads(tx.get(workspace["payload_id"], subject))
+                    receipt = json.loads(tx.get(workspace["receipt_id"], subject))
+                    if (any(intent.get(key) != cleanup[key] for key in ("checkout", "owned_root", "common_git_dir"))
+                            or receipt.get("disposition") != "target" or not isinstance(receipt.get("commit"), dict)
+                            or receipt["commit"].get("sha") != workspace["before_sha"]):
+                        return Step("paused", subject, "cleanup_marker_unproven")
+                    if intent.get("create_ref") is False:
+                        try:
+                            original = self._imported_local_resources(tx, run, job, cleanup)
+                        except KernelError as error:
+                            if error.code != "cleanup_marker_unproven":
+                                raise
+                            return Step("paused", subject, error.code)
+                        if original is None:
+                            # An ordinary detached Final workspace creates no
+                            # local branch. Remote publication grants no ownership.
+                            tx.execute("UPDATE resource_cleanup SET stage=stage+1 WHERE subject=? AND generation=?",
+                                       (subject, cleanup["generation"]))
+                            self._event(tx, subject, "resource_not_owned", operation, workspace["payload_id"])
+                            return Step("progress", subject)
+                        head, source_uuid = original
+                    elif intent.get("create_ref") is True:
+                        head = workspace["before_sha"]
+                    else:
+                        return Step("paused", subject, "cleanup_marker_unproven")
             payload = {"checkout": cleanup["checkout"], "owned_root": cleanup["owned_root"],
                        "common_git_dir": cleanup["common_git_dir"], "branch_ref": cleanup["source_ref"], "expected_head": head,
                        "remote": self._inputs(tx, run)["repository_remote"]}
@@ -2012,9 +2274,12 @@ class Kernel:
                     raise KernelError("executor_exit_unproven")
                 if tx.one("SELECT count(*) FROM leases")[0]:
                     raise KernelError("worker_exit_unproven")
-                if not run["stopped"]:
+                if not run["stopped"] and run["blocked"] != "supervision_timeout":
                     raise KernelError("no_resumable_boundary")
                 tx.execute("UPDATE runs SET stopped=0 WHERE id=?", (run["id"],))
+                if run["blocked"] == "supervision_timeout":
+                    tx.execute("UPDATE runs SET blocked=NULL WHERE id=?", (run["id"],))
+                    tx.execute("DELETE FROM waits WHERE subject IS NULL")
                 tx.execute("UPDATE attempts SET resume_action=? WHERE id IN (SELECT s.current_attempt FROM subjects s WHERE s.run_id=? AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id))",
                            (action_id, run["id"]))
                 if message is not None or new_thread:
@@ -2251,7 +2516,7 @@ class Kernel:
                     continue
                 if pending is not None:
                     if pending["status"] == "sent":
-                        progress |= not bool(gates & {"write_result_unknown", "write_conflict", "publication_retry_exhausted"})
+                        progress |= not bool(gates & {"write_result_unknown", "write_conflict", "publication_retry_exhausted", "supervision_timeout"})
                     elif self._effect_stale(tx, run, job, pending):
                         progress = True
                 refreshing = (job["refresh_revision"] is not None and run["blocked"] == "final_refresh"
@@ -2273,11 +2538,10 @@ class Kernel:
                     continue
                 if tx.rows("SELECT s.id FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' LIMIT 1", (subject,)):
                     continue
-                waits = (tx.rows("SELECT deadline FROM waits WHERE subject=?", (subject,))
-                         if job["phase"] in {"checks", "merge"} else [])
+                waits = tx.rows("SELECT deadline,next_retry_at FROM waits WHERE subject=?", (subject,))
                 if waits:
-                    deadlines.extend(float(row[0]) for row in waits)
-                    progress |= any(row[0] <= now for row in waits)
+                    deadlines.extend(float(row["next_retry_at"] or row["deadline"]) for row in waits)
+                    progress |= any((row["next_retry_at"] or row["deadline"]) <= now for row in waits)
                     continue
                 if job["current_attempt"]:
                     recovery = tx.rows("SELECT o.failure_kind,o.recovery_ready_at FROM attempts a JOIN invocation_outputs o ON o.invocation=a.current_invocation WHERE a.id=? ORDER BY o.ordinal DESC LIMIT 1",
@@ -2291,7 +2555,11 @@ class Kernel:
             final_pending = bool(tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run')"))
             if final_pending and not run["stopped"] and not run["blocked"]:
                 tickets = [job for job in jobs if job["kind"] == DeliveryKind.TICKET]
-                progress |= bool(tickets) and all(self._completion(tx, job) is not None for job in tickets)
+                final_wait = tx.rows("SELECT deadline,next_retry_at FROM waits WHERE subject IS NULL")
+                if final_wait:
+                    deadlines.extend(float(row["next_retry_at"] or row["deadline"]) for row in final_wait)
+                progress |= (bool(tickets) and all(self._completion(tx, job) is not None for job in tickets)
+                             and (not final_wait or any((row["next_retry_at"] or row["deadline"]) <= now for row in final_wait)))
             complete = (all(job["phase"] == "complete" for job in jobs) and not final_pending
                         and not active and not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1")
                         and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1"))
@@ -2425,6 +2693,17 @@ class Kernel:
     def _thread_profile(self, tx: Transaction, thread: sqlite3.Row) -> tuple[Profile, str | None]:
         value = self._profile_document(tx, thread["profile_revision"])["profiles"][thread["role"]]
         return Profile(value["model"], value["reasoning_effort"]), value["reference"]
+
+    def configure_task_profiles(self, action_id: str, *, preset: str | None = None,
+                                overrides: ProfileOverrides | None = None) -> int:
+        """Configure future Threads only under this exact published Task's lock."""
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            run_id, task = run["id"], self._task(run)
+        with locked_admission(task) as location:
+            if read_task(location) != (run_id, self.storage.path.resolve()):
+                raise KernelError("task_location_identity")
+            return self.configure_profiles(action_id, preset=preset, overrides=overrides)
 
     def configure_profiles(self, action_id: str, *, preset: str | None = None, overrides: ProfileOverrides | None = None) -> int:
         """An explicit immutable revision applies only when a new Thread is allocated."""
@@ -3204,14 +3483,7 @@ class Kernel:
         return str(tx.one("SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1", (subject, role.value))[0])
 
     def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, kind: str, seconds: int) -> Step:
-        deadline = tx.rows("SELECT deadline FROM waits WHERE subject=? AND kind=?", (job["id"], kind))
-        if not deadline:
-            tx.execute("INSERT INTO waits VALUES (?,?,?)", (job["id"], kind, self.clock() + seconds))
-        elif self.clock() >= deadline[0][0]:
-            self._gate(tx, job["id"], "supervision_timeout")
-            self._finish_final_failure(tx, run)
-            return Step("paused", job["id"], "supervision_timeout")
-        return Step("waiting", job["id"], kind)
+        return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False), kind, seconds)
 
     def _finish_final_failure(self, tx: Transaction, run: sqlite3.Row, result: str = "failed") -> None:
         if run["final_action"]:

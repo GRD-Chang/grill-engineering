@@ -97,7 +97,8 @@ class LocalEffects:
         if (self.owned_root is None or owned != str(self.owned_root)
                 or not self.owned_root.is_absolute() or self.owned_root.resolve() != self.owned_root):
             raise KernelError("foreign_local_checkout")
-        if effect.operation == "cleanup_local_ref":
+        if (effect.operation == "cleanup_local_ref"
+                or effect.operation == "cleanup_worktree" and "source_uuid" in effect.payload):
             common = effect.payload.get("common_git_dir")
             if (not isinstance(common, str) or not common or "\0" in common
                     or not Path(common).is_absolute() or Path(common).resolve() != Path(common)):

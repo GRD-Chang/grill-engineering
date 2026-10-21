@@ -46,7 +46,8 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
         thread.join(10)
     assert not thread.is_alive()
     assert failures == []
-    assert len(outcomes) == 1 and outcomes[0].kind == "progress"
+    assert len(outcomes) == 1 and outcomes[0].kind == "waiting"
+    assert outcomes[0].reason == "observation_superseded"
     assert outcomes[0].call is None and outcomes[0].effect is None
     assert current["observed_parent_revision"] != before["observed_parent_revision"]
     assert kernel.source_status() == current
@@ -70,6 +71,12 @@ def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypat
         raise error
 
     monkeypatch.setattr(external, "read_requirements", failed)
+    if isinstance(error, GitHubReadError):
+        step = driver.advance("parent:1")
+        assert step.kind == "waiting" and step.reason == "github_convergence"
+        assert step.call is None and step.effect is None
+        assert kernel.status("parent:1")["gates"] == []
+        return
     with pytest.raises(type(error)) as raised:
         driver.advance("parent:1")
     assert raised.value is error

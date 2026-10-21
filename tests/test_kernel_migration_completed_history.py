@@ -78,8 +78,28 @@ class Agents(FixtureAgentBackend):
     def publication(self, request):
         calls.append('publication'); return super().publication(request)
 backend = ProfiledAgentBackend(Agents(agents_file), profiles, run_id=run_id)
+publisher = FixtureGitHubPublisher(fixture, git)
+if request.get('actual_github_close'):
+    from agent_run.github_publish import GhGitHubPublisher
+    class ActualClosePublisher(FixtureGitHubPublisher):
+        def prepare_primary_ticket_close(self, **arguments):
+            return GhGitHubPublisher('example/project',git).prepare_primary_ticket_close(**arguments)
+        def close_primary_ticket(self, **arguments):
+            ownership=GhGitHubPublisher('example/project',git).close_primary_ticket(**arguments)
+            assert ownership is not None and type(ownership['event_id']) is int
+            ticket=arguments['ticket_number']
+            delivery=self._delivery()
+            delivery.setdefault('closed_issues',[]).append(ticket)
+            delivery.setdefault('ticket_close_ownership',{})[str(ticket)]=ownership
+            marker={key:arguments[key] for key in ('ticket_number','run_id','pr_number','integrated_sha')}
+            delivery.setdefault('mutations',[]).extend({'action':action,**marker}
+                for action in ('completion_comment','close_issue'))
+            self.data['issues'][str(ticket)]['state']='CLOSED'
+            self._save()
+            return ownership
+    publisher=ActualClosePublisher(fixture,git)
 def deliver():
-    TicketDeliveryEngine(git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+    TicketDeliveryEngine(git=git, states=states, github=publisher,
                          agents=backend).deliver(run_id)
     if request.get('controlled'):
         control.record_application(task, action_id=claim.action_id, run_id=run_id,
@@ -115,7 +135,14 @@ else:
     deliver()
 after = states.load_current_run(run_id)
 job = after['ticket_jobs']['2']
-assert after['status'] == 'ticket_completed' and job['phase'] == 'completed'
+if request.get('actual_github_close'):
+    # The real old adapter completed its external close, then the unchanged
+    # old codec rejected ownership.created_at. Keep that actual checkpoint.
+    assert after['status'] == 'waiting_external' and job['phase'] == 'merged'
+    assert job['ticket_close_intent']['dispatch_attempted'] is True
+    assert not job.get('ticket_close_ownership') and not job.get('ticket_closed_by_run')
+else:
+    assert after['status'] == 'ticket_completed' and job['phase'] == 'completed'
 assert job['review_budget']['development_attempts'] == rounds
 assert job['review_budget']['reviewer_invocations'] == rounds
 assert calls == ['development', 'review'] * rounds + ['publication']
@@ -137,21 +164,26 @@ print(json.dumps({'run_id': run_id, 'status': after['status']}))
 
 
 def _completed_source(tmp_path: Path, git_repo: Path, rounds: int, *,
-                      state_root: Path | None = None, controlled: bool = False) -> dict[str, Path]:
+                      state_root: Path | None = None, controlled: bool = False,
+                      actual_github_close: bool = False) -> dict[str, Path]:
     frozen, source = tmp_path / 'unchanged-02', tmp_path / 'source'
     old_v6_runtime(frozen)  # Only materializes verified, unchanged source files.
     source.mkdir()
     environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
                    'PYTHONPATH': os.pathsep.join(str(frozen / name) for name in ('project/src', 'project/tests'))}
+    if actual_github_close:
+        from support.v6_close_service import close_service_environment
+        environment = close_service_environment(tmp_path, environment)
     result = subprocess.run([sys.executable, '-c', _COMPLETE], env=environment,
                             input=json.dumps({'frozen': str(frozen), 'repository': str(git_repo),
                                               'output': str(source), 'rounds': rounds,
                                               'state_root': str(state_root) if state_root else None,
-                                              'controlled': controlled}),
+                                              'controlled': controlled,
+                                              'actual_github_close': actual_github_close}),
                             text=True, capture_output=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
     identity = json.loads(result.stdout)
-    assert identity['status'] == 'ticket_completed'
+    assert identity['status'] == ('waiting_external' if actual_github_close else 'ticket_completed')
     run_id = identity['run_id']
     source_state = state_root if state_root is not None else git_repo / '.agent-run'
     paths = {'database': source_state / 'state.sqlite3',
@@ -253,8 +285,7 @@ class _HistoricalPublisherScenario(Scenario):
         return replace(super().world(), publisher_actor=self.original_actor)
 
 
-def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path], *,
-                    reviews: tuple[str, ...] = ('pass',)) -> None:
+def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -> None:
     """Reuse the existing native driver, with copied old Git/external facts."""
     report = json.loads(paths['report'].read_text())
     run_id = report['source_identity']['run_id']
@@ -296,15 +327,13 @@ def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path], *
                                 profiles, inputs['prompt_resources'], inputs['worker_identity'],
                                 inputs['runner_identity'], inputs['notifications'], inputs['provenance']))
     scenario.initial = default
-    assert reviews in {('pass',), ('fail', 'pass')}
-    scenario.reviews, scenario.checks = list(reviews), ['none']
+    scenario.reviews, scenario.checks = ['pass'], ['none']
     scenario.review_count = scenario.development_count = scenario.publication_count = 0
     scenario.heads, scenario.role_calls, scenario.checkpoints, scenario.reviewed_heads = [], [], [], []
     scenario.edits = None
     assert scenario.run(approve=True).kind == 'complete'
     assert kernel.status(final)['phase'] == 'complete'
-    expected_roles = ['review', 'publication'] if reviews == ('pass',) else ['review', 'development', 'review', 'publication']
-    assert [call['role'] for call in scenario.role_calls] == expected_roles
+    assert [call['role'] for call in scenario.role_calls] == ['review', 'publication']
     assert all(write['subject'] == final for write in port.writes())
     assert port.pull_request('ticket:2') == prior_pr
     new_pr = port.pull_request(final)

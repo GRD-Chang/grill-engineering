@@ -17,13 +17,14 @@ import time
 from typing import Any
 
 from agent_run.error_safety import bounded_error
+from agent_run.github import GitHubReadError
 
 from .host_adapter import SystemdHost
 from .execution import ProcessExitUnknown
 from .kernel import Kernel
-from .model import AgentCall, Execution, KernelError, Step, World
+from .model import AgentCall, Execution, KernelError, ReadWait, Step, World
 from .native_host import managed_host_environment
-from .remote_effects import ObservationSuperseded, RemoteEffects
+from .remote_effects import EffectReadError, ObservationSuperseded, RemoteEffects
 from .role_prompt import render_role_prompt
 
 
@@ -88,6 +89,19 @@ class _Executor:
         with self.source_lock:
             return self.remote.observe(self.kernel, subject)
 
+    def observed(self, subject: str) -> World:
+        """Bind each I/O read to Core's current narrow business scope."""
+        token = self.kernel.begin_automatic_step(self.execution, subject)
+        waiting = self.kernel.guard_automatic_step(token, self.execution)
+        if waiting is not None:
+            raise ReadWait(waiting)
+        try:
+            world = self.observe(subject)
+        except GitHubReadError as error:
+            raise ReadWait(self.kernel.wait_for_read(token, self.execution, error.code, error.message)) from error
+        self.kernel.guard_automatic_step(token, self.execution, after_read=True)
+        return world
+
     def agent(self, call: AgentCall) -> None:
         try:
             prompt = render_role_prompt(call)
@@ -100,7 +114,7 @@ class _Executor:
         from .codex_execution import execute_selected_codex
 
         def authorize_source() -> None:
-            self.observe(call.subject)
+            self.authorize_agent_source(call)
 
         execute_selected_codex(
             self.kernel, call, identity=self.worker_identity, environment=self.environment,
@@ -109,12 +123,29 @@ class _Executor:
             authorize_source=authorize_source, cancelled=self.cancelled,
         )
 
+    def authorize_agent_source(self, call: AgentCall) -> None:
+        """Read for the original call; the process adapter consumes the wait."""
+        try:
+            self.observed(call.subject)
+        except KernelError as error:
+            if error.code == "automatic_step_paused":
+                raise ReadWait(Step("paused", call.subject, error.code)) from error
+            if error.code == "automatic_step_superseded":
+                raise ObservationSuperseded(error.code) from error
+            raise
+
     def effect(self, step: Step) -> Step:
         from .local_effects import LocalEffects
 
         effect = step.effect
         if effect is None:
             raise KernelError("effect_request_required")
+        token = self.kernel.begin_automatic_step(self.execution, effect.subject)
+        waiting = self.kernel.guard_automatic_step(
+            token, self.execution, readback=effect if step.kind == "reconcile" else None,
+        )
+        if waiting is not None:
+            raise ReadWait(waiting)
         port: RemoteEffects | LocalEffects
         if effect.operation in Kernel.REMOTE:
             port = self.remote
@@ -131,25 +162,25 @@ class _Executor:
             settled = self.kernel.reconcile(effect, result, self.execution)
             if settled.kind != "observe":
                 return settled
-            return self.kernel.reconcile(effect, result, self.execution, self.observe(effect.subject))
+            return self.kernel.reconcile(effect, result, self.execution, self.observed(effect.subject))
         if (effect.operation == "publication_commit" and not effect.payload.get("reuse_sha")
                 and not effect.payload.get("publication_commit_intent")):
             if not isinstance(port, LocalEffects):
                 raise KernelError("local_publication_required")
             effect = self.kernel.attach_publication_commit(
-                effect, port.prepare_publication(effect), self.execution, self.observe(effect.subject),
+                effect, port.prepare_publication(effect), self.execution, self.observed(effect.subject),
             )
         if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
             if not isinstance(port, RemoteEffects):
                 raise KernelError("remote_retirement_required")
             effect = self.kernel.attach_retirement(
-                effect, port.prepare_retirement(effect), self.execution, self.observe(effect.subject),
+                effect, port.prepare_retirement(effect), self.execution, self.observed(effect.subject),
             )
         dispatched = False
 
         def authorize() -> None:
             nonlocal dispatched
-            world = self.observe(effect.subject)
+            world = self.observed(effect.subject)
             resources = self.kernel.effect_resources(effect)
             inspections = (None if resources is None else
                            LocalEffects(self.remote.git).inspect_resources(resources))
@@ -161,7 +192,15 @@ class _Executor:
 
         # Authorization cancellation is not a failed external command. Only
         # the adapter's actual command result below can create that audit fact.
-        result = port.execute(effect, authorize)
+        try:
+            result = port.execute(effect, authorize)
+        except EffectReadError as error:
+            if dispatched and error.write_returncode != 0:
+                self.kernel.observe_effect_failure(effect, {
+                    "returncode": error.write_returncode,
+                    "message": bounded_error(error.write_diagnostic),
+                })
+            raise
         if dispatched and result.raw.get("write_returncode") not in (None, 0):
             self.kernel.observe_effect_failure(effect, {
                 "returncode": result.raw["write_returncode"],
@@ -172,23 +211,37 @@ class _Executor:
             return Step("progress", effect.subject)
         settled = self.kernel.reconcile(effect, result, self.execution)
         if settled.kind == "observe":
-            settled = self.kernel.reconcile(effect, result, self.execution, self.observe(effect.subject))
+            settled = self.kernel.reconcile(effect, result, self.execution, self.observed(effect.subject))
         return settled
 
     def advance(self, subject: str, *, cleanup: bool = False) -> Step:
         advance = self.kernel.advance_cleanup if cleanup else self.kernel.advance
+        token = self.kernel.begin_automatic_step(self.execution, subject, cleanup=cleanup)
+        read_token = token
         try:
             step = advance(subject, self.execution)
             if step.kind == "observe":
                 subject = step.subject
-                step = advance(subject, self.execution, self.observe(subject))
+                read_token = self.kernel.begin_automatic_step(self.execution, subject, cleanup=cleanup)
+                step = advance(subject, self.execution, self.observed(subject))
             if step.kind in {"effect", "reconcile"}:
-                return self.effect(step)
-            return step
+                read_token = self.kernel.begin_automatic_step(self.execution, step.subject, cleanup=cleanup)
+                step = self.effect(step)
+            return self.kernel.finish_automatic_step(token, self.execution, step)
+        except ReadWait as waiting:
+            return waiting.step
+        except GitHubReadError as error:
+            return self.kernel.wait_for_read(read_token, self.execution, error.code, error.message)
         except ObservationSuperseded:
             # Yield this obsolete read; sent effects retain their durable receipt
             # and the next ordinary advance chooses reconciliation, never replay.
-            return Step("progress", subject, "observation_superseded")
+            return Step("waiting", subject, "observation_superseded")
+        except KernelError as error:
+            if error.code == "automatic_step_superseded":
+                return Step("waiting", subject, "observation_superseded")
+            if error.code == "automatic_step_paused":
+                return Step("paused", subject, error.code)
+            raise
 
     def subjects(self, scheduling: Mapping[str, Any]) -> list[str]:
         with self.kernel.storage.transaction(write=False) as tx:
@@ -212,17 +265,30 @@ class _Executor:
         with self.kernel.storage.transaction(write=False) as tx:
             if not tx.rows("SELECT id FROM final_target") or tx.rows("SELECT id FROM subjects WHERE kind='final_run'"):
                 return False
+        token = self.kernel.begin_automatic_step(self.execution, None)
         try:
+            waiting = self.kernel.guard_automatic_step(token, self.execution)
+            if waiting is not None:
+                return False
             with self.source_lock:
                 head, default, proof = self.remote.final_observation(self.kernel)
+            self.kernel.guard_automatic_step(token, self.execution, after_read=True)
         except ObservationSuperseded:
             return False
+        except GitHubReadError as error:
+            self.kernel.wait_for_read(token, self.execution, error.code, error.message)
+            return False
+        except KernelError as error:
+            if error.code in {"automatic_step_superseded", "automatic_step_paused"}:
+                return False
+            raise
         try:
             self.kernel.activate_final(self.execution, head, default, ancestry=proof)
         except KernelError as error:
             if error.code in {"ticket_completion_required", "final_admission_closed"}:
                 return False
             raise
+        self.kernel.finish_automatic_step(token, self.execution, Step("progress", ""))
         return True
 
 

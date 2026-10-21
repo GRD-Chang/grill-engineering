@@ -521,21 +521,34 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
     assert _snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("kind,completed_phase", [(DeliveryKind.TICKET, "ticket_completed"),
+@pytest.mark.parametrize("kind,completed_phase", [(DeliveryKind.TICKET, "run_acceptance_pending"),
     (DeliveryKind.PARENT_ONLY, "completed"), (DeliveryKind.FINAL_RUN, "merged")])
 def test_public_delivery_boundaries_match_observed_02_meanings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, completed_phase: str,
 ) -> None:
-    # The old 013 actual observations retain all public status/history outputs.
-    # These candidate regression oracles preserve their concrete boundary
-    # meanings; a separate same-input capture must establish full equivalence.
+    from agent_run_kernel import Issue, ParentIssue, Requirements
+    from agent_run_kernel.offline import GraphScenario
+
+    # The former isolated Scenario had no original workspace ownership effect;
+    # its three cleanup-pending failures remain in the 742c evidence. Use actual
+    # source/workspace/Completion callers here. A completed Ticket in a full
+    # Parent awaits Run Acceptance (02 controller.py), unlike an isolated Ticket
+    # Run. This changed input is not an old/new same-input comparison.
     original_create = Kernel.create
 
     def configured_create(path, spec, **kwargs):
-        return original_create(path, replace(spec, language="en", repository_root=str(tmp_path.resolve())), **kwargs)
+        return original_create(path, replace(spec, language="en", repository="example/repository",
+                                             repository_root=str(tmp_path.resolve())), **kwargs)
 
     monkeypatch.setattr(Kernel, "create", staticmethod(configured_create))
-    scenario = Scenario(tmp_path / "scenario", kind)
+    tickets = () if kind == DeliveryKind.PARENT_ONLY else (2,)
+    source = Requirements(ParentIssue(1, "Full Parent", "Original requirements", tickets),
+                          () if not tickets else (Issue(2, "Ticket", "Original task", "OPEN",
+                                                        frozenset({"ready-for-agent"})),))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    if kind == DeliveryKind.FINAL_RUN:
+        assert scenario.run().kind == "complete"
+        scenario.select(scenario.activate_final())
     if kind != DeliveryKind.TICKET:
         assert scenario.run().kind == "approval"
         before = _snapshot(tmp_path)
@@ -551,7 +564,12 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     assert document["phase"] == completed_phase
     assert document["active_ticket"] is None
     assert (document["review_budget"] is not None) == (kind == DeliveryKind.FINAL_RUN)
-    assert document["next_action"] == ("agent-run run 1" if kind == DeliveryKind.TICKET else "无")
+    assert document["next_action"] == ("agent-run status 1 --repo example/repository"
+                                       if kind == DeliveryKind.TICKET else "无")
+    assert document["delivery_cleanup"]["status"] == "completed"
+    assert all(subject["phase"] == "complete" for subject in document["subjects"])
+    if kind != DeliveryKind.PARENT_ONLY:
+        assert [record["subject"] for record in scenario.kernel.source_status()["completions"]] == ["ticket:2"]
     assert document["progress"]["status"] == document["status"]
     assert document["progress"]["phase"] == completed_phase
     history = query.read(scenario.kernel.storage.path, "history").data
