@@ -145,6 +145,21 @@ def test_local_human_boundary_does_not_present_its_sibling_as_globally_paused(tm
     assert _snapshot(tmp_path) == before
 
 
+def test_stopped_run_shows_explicit_recovery_without_claiming_executor_exit(tmp_path: Path) -> None:
+    kernel = _create(tmp_path)
+    assert kernel.control("stop", "whole-run-stop") == "applied"
+    before = _snapshot(tmp_path)
+    document = query.read(kernel.storage.path, "status").data
+    assert document["status"] == "operator_stopped"
+    action = document["operator_actions"][0]
+    assert action["scope"] == "global" and action["run_paused"] is True
+    assert action["action"]["command"] == "resume"
+    assert action["action"]["ticket_number"] is None
+    assert document["executor_control"]["live_status"] == "unknown"
+    assert document["next_action"] == "agent-run resume 1 --repo example/project"
+    assert _snapshot(tmp_path) == before
+
+
 def test_parent_selector_rejects_multiple_runs_and_exact_id_remains_available(
     tmp_path: Path, capsys,
 ) -> None:

@@ -202,7 +202,7 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]]) ->
     result: list[dict[str, Any]] = []
     if run["stopped"] or run["blocked"]:
         result.append({"subject": None, "scope": "run", "reason": "operator_stopped" if run["stopped"] else run["blocked"],
-                       "action": "requeue" if run["blocked"] == "requeue_required" else "inspect", "evidence": None})
+                       "action": "resume" if run["stopped"] else "requeue" if run["blocked"] == "requeue_required" else "inspect", "evidence": None})
     for job in subjects:
         for gate in job["gates"]:
             action = ("requeue" if gate["code"] == "requeue_required" else "resume"
