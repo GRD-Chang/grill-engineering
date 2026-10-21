@@ -218,6 +218,15 @@ class LocalEffects:
 
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
         observed = self.reconcile(effect)
+        if (effect.operation == "integrate" and observed.disposition == "target"
+                and effect.candidate is not None and observed.commit == effect.candidate):
+            # An exact candidate can already contain both integration inputs.
+            # Even without a Git write, consuming it needs current dispatch authority.
+            authorize()
+            fresh = self.reconcile(effect)
+            if fresh != observed:
+                raise KernelError("local_effect_boundary_changed")
+            return fresh
         if observed.disposition != "prior":
             return observed
 
