@@ -65,3 +65,31 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
         assert scenario.run().kind == "approval"
         assert scenario.kernel.status(scenario.delivery.key)["resync"]["used"] == 1
         assert scenario.port.pull_request(scenario.delivery.key).number == initial["pr_number"]
+
+
+def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=0))
+    for _ in range(50):
+        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        if step.effect is not None and step.effect.operation == "integrate":
+            break
+        scenario.handle(step)
+    else:
+        raise AssertionError("Integration was not reached")
+    effect = step.effect
+    assert effect is not None
+    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+    scenario.port.execute(effect, lambda: scenario.kernel.guard_effect(effect, scenario.execution, scenario.world()))
+    source = scenario.port.external_remote_append(scenario.delivery.source_ref, {"foreign-source.txt": "Source work\n"}, "open-source")
+    scenario.port.external_remote_append(scenario.delivery.target_ref, {"foreign-target.txt": "Target work\n"}, "open-target")
+    scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world())
+    opened = scenario.kernel.status(scenario.delivery.key)["resync"]
+    assert (opened["used"], opened["window"], opened["open"]) == (0, 1, True)
+    assert scenario.run().kind == "approval"
+    completed = scenario.kernel.status(scenario.delivery.key)["resync"]
+    assert (completed["used"], completed["window"], completed["open"]) == (0, 1, False)
+    published = scenario.port.remote_commit(scenario.delivery.source_ref)
+    assert published is not None and scenario.port.git.is_ancestor(source.sha, published.sha)
+    assert scenario.port.git.run("show", published.sha + ":foreign-source.txt").stdout == "Source work\n"
+    assert scenario.port.git.run("show", published.sha + ":foreign-target.txt").stdout == "Target work\n"
+    assert scenario.development_count == 1

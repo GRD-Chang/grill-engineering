@@ -1331,7 +1331,7 @@ class Kernel:
                                         payload={"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN})
         integrated_phases = {"ready_publication", "publication_commit", "push", "pr", "checks", "approval", "merge"}
         changed_source = world.source is not None and world.source.sha != job["source_sha"]
-        if phase in integrated_phases | {"integration"} and not self._observe_integration_snapshot(tx, run, job, world):
+        if phase in integrated_phases | {"integration"} and not self._observe_integration_snapshot(tx, job, world):
             self._finish_final_failure(tx, run)
             return Step("paused", subject, "integration_snapshot")
         if (phase in integrated_phases and job["integration_target"]
@@ -1686,7 +1686,7 @@ class Kernel:
             payload = json.loads(tx.get(row["payload_id"], subject))
             live_source = None if world.source is None else world.source.sha
             if row["base_sha"] != world.target.sha or payload["source_sha"] != live_source:
-                self._observe_integration_snapshot(tx, run, job, world)
+                self._observe_integration_snapshot(tx, job, world)
                 tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
                 tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',ci_failure=NULL,version=version+1 WHERE id=?", (subject,))
                 return Step("progress", subject, "integration_snapshot_changed")
@@ -1777,7 +1777,7 @@ class Kernel:
                    (job["id"], previous["generation"] + 1, self._policy(tx.one("SELECT * FROM runs")).resync_limit))
         self._event(tx, job["id"], "resync_renewed", str(previous["generation"] + 1))
 
-    def _observe_integration_snapshot(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
+    def _observe_integration_snapshot(self, tx: Transaction, job: sqlite3.Row, world: World) -> bool:
         """Only an external change after a completed window spends allowance."""
         subject = job["id"]
         if world.source is None and job["pr_number"] is not None:

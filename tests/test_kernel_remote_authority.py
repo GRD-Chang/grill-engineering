@@ -23,12 +23,21 @@ def test_remote_source_advance_after_approval_prevents_merge_and_close(tmp_path:
     assert scenario.run().kind == "approval"
     target = scenario.port.remote_commit(scenario.delivery.target_ref)
     source = scenario.port.ref_commit(scenario.delivery.source_ref)
+    original_pr = scenario.port.pull_request(scenario.delivery.key)
+    original_counts = (scenario.development_count, scenario.review_count, scenario.publication_count)
     scenario.kernel.control("approve", "approve-exact-source", subject=scenario.delivery.key, world=scenario.world())
     third = scenario.port.external_remote_append(scenario.delivery.source_ref, {"foreign.txt": "New remote-only work\n"}, "remote-source")
     assert scenario.port.ref_commit(scenario.delivery.source_ref) == source
     assert scenario.world().pr.head == third
-    assert scenario.run().kind == "paused"
-    assert scenario.port.remote_commit(scenario.delivery.source_ref) == third
+    assert scenario.run().kind == "approval"
+    updated = scenario.port.remote_commit(scenario.delivery.source_ref)
+    assert updated is not None and scenario.port.git.is_ancestor(third.sha, updated.sha)
+    assert scenario.port.git.run("show", updated.sha + ":foreign.txt").stdout == "New remote-only work\n"
+    assert scenario.development_count == original_counts[0]
+    assert scenario.review_count == original_counts[1] + 1
+    assert scenario.publication_count == original_counts[2] + 1
+    assert scenario.kernel.status(scenario.delivery.key)["resync"]["used"] == 1
+    assert scenario.port.pull_request(scenario.delivery.key).number == original_pr.number
     assert scenario.port.remote_commit(scenario.delivery.target_ref) == target
     assert scenario.port.pull_request(scenario.delivery.key).state == "OPEN"
     assert not [write for write in scenario.port.writes() if write["operation"] in {"merge", "close"}]
