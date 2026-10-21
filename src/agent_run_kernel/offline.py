@@ -6,7 +6,7 @@ Its scripts control external outcomes, never internal kernel transitions.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import sqlite3
@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .effects import LocalGit
 from .kernel import Kernel
 from .model import (AgentCall, Checks, Commit, Delivery, DeliveryKind, Effect, EffectResult,
-                    KernelError, Policy, PullRequest, Role, RunSpec, Step, World, wire_json)
+                    KernelError, Policy, PullRequest, Requirements, Role, RunSpec, Step, World, wire_json)
 
 
 class LostResponse(OSError):
@@ -143,7 +143,21 @@ class OfflinePort:
         expected: str | None = None
         raw: dict[str, Any] = {}
         try:
-            if operation == "validation_checkout":
+            if operation == "workspace":
+                checkout = Path(payload["checkout"])
+                if payload["create_ref"]:
+                    existing = git.run("show-ref", "--verify", "--hash", effect.source_ref, check=False)
+                    if existing.returncode == 1:
+                        git.run("update-ref", effect.source_ref, effect.before_sha, "0" * len(effect.before_sha))
+                    elif existing.returncode != 0 or existing.stdout.strip() != effect.before_sha:
+                        raise KernelError("workspace_ref_changed")
+                if not checkout.exists():
+                    git.run("worktree", "add", "--detach", str(checkout), effect.before_sha)
+                common = git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()
+                commit = git.commit(git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip())
+                if Path(common).resolve() != (git.root / ".git").resolve() or commit.sha != effect.before_sha:
+                    raise KernelError("foreign_workspace")
+            elif operation == "validation_checkout":
                 checkout = Path(payload["checkout"])
                 if not checkout.exists():
                     git.run("worktree", "add", "--detach", str(checkout), payload["reviewed_commit"])
@@ -520,6 +534,81 @@ class Scenario:
                 "known_gaps": ["Ticket source branch and development checkout are retained after completion; no managed cleanup effect yet",
                                "Native GitHub Issue branch linking is not implemented by the synthetic remote adapter"],
                 "raw_effects": self.port.writes()}
+
+
+class GraphScenario(Scenario):
+    """Native source reader plus the same one-request driver, using real Git."""
+
+    def __init__(self, root: Path, requirements: Requirements, *, policy: Policy | None = None,
+                 reviews: Sequence[str] = ("pass",), initial_git: Mapping[str, Any] | None = None) -> None:
+        self.requirements = requirements
+        self.script = None
+        self.port = OfflinePort.create(root, initial_git)
+        base = self.port.git.commit("refs/heads/main")
+        run_ref = "refs/heads/run"
+        self.port.git.run("update-ref", run_ref, base.sha)
+        work = (root / "work").resolve()
+        work.mkdir()
+        deliveries = []
+        for number in requirements.parent.sub_issue_numbers:
+            source_ref = f"refs/heads/ticket-{number}"
+            checkout = work / f"ticket-{number}"
+            self.port.git.run("update-ref", source_ref, base.sha)
+            self.port.git.run("worktree", "add", "--detach", str(checkout), base.sha)
+            deliveries.append(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "untrusted", base, source_ref, run_ref, checkout=str(checkout)))
+        final = Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,
+                         run_ref, "refs/heads/main", checkout=str(work / "final-1"))
+        deliveries.append(final)
+        self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy())
+        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=requirements)
+        self.execution = self.kernel.claim_executor("offline-executor")
+        self.delivery = self.kernel.delivery(deliveries[0].key)
+        self.reviews, self.checks = list(reviews), ["none"]
+        self.review_count = self.development_count = self.publication_count = 0
+        self.heads: list[str] = []
+        self.role_calls: list[dict[str, Any]] = []
+        self.checkpoints: list[dict[str, Any]] = []
+        self.edits = None
+        self.reviewed_heads: list[str] = []
+
+    def select(self, subject: str) -> None:
+        self.delivery = self.kernel.delivery(subject)
+        self.heads = []
+
+    def refresh(self) -> dict[str, Any]:
+        with sqlite3.connect(self.port.database) as db:
+            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
+        source = replace(self.requirements, issues=tuple(
+            replace(issue, state="CLOSED" if issue.number in closed else issue.state,
+                    blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker for blocker in issue.blocked_by))
+            for issue in self.requirements.issues))
+        return self.kernel.refresh(source)
+
+    def world(self) -> World:
+        self.refresh()
+        self.delivery = self.kernel.delivery(self.delivery.key)
+        status = self.kernel.status(self.delivery.key)
+        source_ref = self.port.git.run("show-ref", "--verify", "--hash", self.delivery.source_ref, check=False)
+        source = self.port.git.commit(source_ref.stdout.strip()) if source_ref.returncode == 0 else None
+        target = self.port.git.commit(self.delivery.target_ref)
+        pr = self.port.pull_request(self.delivery.key)
+        checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
+        return World(status["source_parent_revision"], self.kernel.source_status()["observed_graph_revision"], status["source_revision"],
+                     target, source, pr, checks, status["completion_revision"],
+                     ((target.sha, source.sha),) if source is not None and self.port.git.is_ancestor(target.sha, source.sha) else ())
+
+    def agent(self, call: AgentCall) -> bytes:
+        raw = super().agent(call)
+        self.role_calls[-1]["subject"] = call.subject
+        return raw
+
+    def activate_final(self) -> str:
+        self.refresh()
+        head = self.port.git.commit("refs/heads/run")
+        default = self.port.git.commit("refs/heads/main")
+        records = self.kernel.source_status()["completions"]
+        ancestry = tuple((record["merge_sha"], head.sha) for record in records if self.port.git.is_ancestor(record["merge_sha"], head.sha))
+        return self.kernel.activate_final(self.execution, head, default, ancestry=ancestry)
 
 
 def main() -> None:

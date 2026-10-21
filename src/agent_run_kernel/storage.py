@@ -74,8 +74,19 @@ CREATE TABLE completions (
  subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
  revision TEXT NOT NULL, parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
  source_sha TEXT NOT NULL, merge_sha TEXT NOT NULL, tree TEXT NOT NULL,
- pr_number INTEGER NOT NULL, gate_mode TEXT NOT NULL, review_attempt TEXT,
+ pr_number INTEGER NOT NULL, gate_mode TEXT NOT NULL, review_attempt TEXT, development_attempt TEXT,
  comment_effect TEXT NOT NULL REFERENCES effects(id), close_effect TEXT NOT NULL REFERENCES effects(id),
+ PRIMARY KEY(subject,generation)
+);
+CREATE TABLE final_barriers (
+ subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
+ completion_revision TEXT NOT NULL, run_sha TEXT NOT NULL, default_sha TEXT NOT NULL,
+ evidence TEXT NOT NULL REFERENCES material(id), PRIMARY KEY(subject,generation)
+);
+CREATE TABLE retired_generations (
+ subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL, revision TEXT NOT NULL,
+ source_ref TEXT NOT NULL, checkout TEXT NOT NULL, source_sha TEXT NOT NULL,
+ candidate_sha TEXT, publication_sha TEXT, pr_number INTEGER, reason TEXT NOT NULL,
  PRIMARY KEY(subject,generation)
 );
 CREATE TABLE budgets (

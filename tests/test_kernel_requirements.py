@@ -4,7 +4,10 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Requirements, RunSpec, World
+import pytest
+
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Requirements, RunSpec, World
+from agent_run_kernel.offline import GraphScenario
 
 
 def native_input() -> dict:
@@ -39,3 +42,42 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
     status = kernel.status("ticket:4")
     world = World(status["parent_revision"], status["graph_revision"], status["revision"], Commit("base", "base-tree"))
     assert kernel.advance("ticket:4", token, world).reason == "blocked_by_incomplete_tickets"
+
+
+def test_real_ticket_close_receipts_create_completion_before_dependency_and_final(tmp_path: Path) -> None:
+    source = Requirements.from_wire(native_input()["initial_requirements"])
+    scenario = GraphScenario(tmp_path / "graph", source)
+    with pytest.raises(KernelError, match="ticket_completion_required"):
+        scenario.activate_final()
+    assert scenario.run().kind == "complete"
+    completed = scenario.kernel.source_status()["completions"]
+    assert [entry["subject"] for entry in completed] == ["ticket:3"]
+    assert completed[0]["source_sha"] == scenario.port.pull_request("ticket:3").head.sha
+    assert scenario.kernel.source_status()["frontier"] == ["ticket:4"]
+    scenario.select("ticket:4")
+    # Close has actually happened; a fresh source read sees CLOSED before its
+    # original receipt is consumed. It cannot substitute for Completion.
+    for _ in range(100):
+        step = scenario.step()
+        if step.effect is not None and step.effect.operation == "close":
+            break
+    else:
+        raise AssertionError("second Ticket never reached its close intent")
+    assert len(scenario.kernel.source_status()["completions"]) == 1
+    scenario.refresh()
+    with pytest.raises(KernelError, match="ticket_completion_required"):
+        scenario.activate_final()
+    assert scenario.run().kind == "complete"
+    before = scenario.port.git.commit("refs/heads/run")
+    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    final = scenario.activate_final()
+    scenario.select(final)
+    assert scenario.kernel.delivery(final).base == before
+    assert scenario.run().kind == "approval"
+    final_calls = [call for call in scenario.role_calls if call["subject"] == final]
+    assert [call["role"] for call in final_calls] == ["review", "publication"]
+    assert len(scenario.kernel.source_status()["completions"]) == 2
+    assert all(entry["tree"] for entry in scenario.kernel.source_status()["completions"])
+    assert scenario.port.git.commit("refs/heads/main") != scenario.port.git.commit("refs/heads/run")
+    scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
+    assert scenario.run().kind == "complete"
