@@ -104,9 +104,10 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                         assert row["dispatch_state"] == "exited" and row["exit_code"] == 0
                         assert row["backend_id"] == role["thread"] and row["raw_id"] and row["result_id"]
                         assert json.loads(tx.get(row["process_identity"], "parent:1"))["host_pid"] == children[0].pid
-                    # Parent-only has its own genuine Completion. No Ticket
-                    # Completion or deferred Final barrier may be invented.
-                    assert tx.rows("SELECT subject FROM completions WHERE subject='parent:1'")
+                    # Parent completion is its confirmed close receipt. The
+                    # completions table indexes Ticket-to-Final witnesses only.
+                    closed = tx.one("SELECT receipt_id FROM effects WHERE subject='parent:1' AND operation='close' AND status='confirmed'")
+                    assert json.loads(tx.get(closed["receipt_id"], "parent:1"))["disposition"] == "target"
                     assert not tx.rows("SELECT c.subject FROM completions c JOIN subjects s ON s.id=c.subject WHERE s.kind='ticket'")
                     assert not tx.rows("SELECT subject FROM final_barriers")
                 document = json.loads(state.read_text())
