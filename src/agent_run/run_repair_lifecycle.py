@@ -142,6 +142,7 @@ class RunRepairLifecycle:
                             break
                         if job.get("phase") not in {
                             "developing", "repairing", "committing_candidate", "candidate", "reviewing",
+                            "escalating",
                         }:
                             break
                     if job.get("phase") == "accepted":
