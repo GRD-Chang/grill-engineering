@@ -225,6 +225,94 @@ class Kernel:
                 raise KernelError("thread_identity_changed")
             tx.execute("UPDATE threads SET backend_id=? WHERE id=?", (reported_thread, call.thread_id))
 
+    def _invocation(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
+        row = tx.one("SELECT i.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision FROM invocations i JOIN attempts a ON a.id=i.attempt WHERE i.id=?", (call.invocation_id,))
+        if (row["attempt"] != call.attempt_id or row["subject"] != call.subject or row["thread"] != call.thread_id
+                or row["lease"] != call.lease_id or row["executor"] != call.execution.owner or row["epoch"] != call.execution.epoch
+                or row["role"] != call.role or row["purpose"] != call.purpose
+                or json.loads(tx.get(row["context_id"], call.subject)) != call.context):
+            raise KernelError("invocation_binding")
+        return row
+
+    def _agent_authority(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
+        run, job = self._owned(tx, call.subject, call.execution)
+        invocation = self._invocation(tx, call)
+        if (run["stopped"] or run["blocked"] or self._gates(tx, call.subject)
+                or invocation["generation"] != job["generation"] or job["current_attempt"] != call.attempt_id
+                or invocation["parent_revision"] != run["parent_revision"]
+                or invocation["graph_revision"] != run["graph_revision"] or invocation["revision"] != job["revision"]
+                or invocation["raw_id"] is not None or invocation["dispatch_state"] not in {"allocated", "sent", "started"}
+                or not tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))):
+            raise KernelError("agent_authority_changed")
+        return invocation
+
+    def dispatch_agent(self, call: AgentCall) -> bool:
+        """One durable launch claim. A repeated call never authorizes a restart."""
+        with self.storage.transaction() as tx:
+            invocation = self._invocation(tx, call)
+            if invocation["dispatch_state"] != "allocated":
+                return False
+            self._agent_authority(tx, call)
+            tx.execute("UPDATE invocations SET dispatch_state='sent' WHERE id=?", (call.invocation_id,))
+            self._event(tx, call.subject, "agent_dispatched", call.invocation_id)
+            return True
+
+    def guard_agent(self, call: AgentCall) -> None:
+        """Check after the driver has refreshed real source facts, before release."""
+        with self.storage.transaction(write=False) as tx:
+            invocation = self._agent_authority(tx, call)
+            if invocation["dispatch_state"] not in {"sent", "started"}:
+                raise KernelError("agent_not_dispatched")
+
+    def agent_started(self, call: AgentCall, process_identity: dict[str, Any]) -> None:
+        """Finite process binding may settle after revocation; it is no grant."""
+        required = {"pid", "start_token", "pgid", "host_pid", "host_start_token"}
+        if (not required <= process_identity.keys() or any(not process_identity[key] for key in required)
+                or type(process_identity["pid"]) is not int or process_identity["pid"] <= 1):
+            raise KernelError("invalid_process_identity")
+        with self.storage.transaction() as tx:
+            invocation = self._invocation(tx, call)
+            witness = tx.put(call.subject, "worker_process_identity", wire_json(process_identity))
+            if invocation["process_identity"] is not None:
+                if invocation["process_identity"] != witness:
+                    raise KernelError("process_identity_changed")
+                return
+            if invocation["dispatch_state"] not in {"sent", "unknown"}:
+                raise KernelError("agent_not_dispatched")
+            tx.execute("UPDATE invocations SET process_identity=?,dispatch_state='started' WHERE id=?", (witness, call.invocation_id))
+            self._event(tx, call.subject, "worker_started", call.invocation_id, witness)
+
+    def agent_start_unknown(self, call: AgentCall, evidence: dict[str, Any]) -> None:
+        with self.storage.transaction() as tx:
+            invocation = self._invocation(tx, call)
+            if invocation["dispatch_state"] in {"exited", "unavailable"}:
+                return
+            material = tx.put(call.subject, "worker_start_unknown", wire_json(evidence))
+            tx.execute("UPDATE invocations SET dispatch_state='unknown',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
+
+    def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str) -> None:
+        """A proven pre-launch failure pauses the allocated semantic Attempt."""
+        with self.storage.transaction() as tx:
+            invocation = self._invocation(tx, call)
+            if invocation["process_identity"] is not None or invocation["dispatch_state"] not in {"sent", "unavailable"}:
+                raise KernelError("worker_exit_unproven")
+            material = tx.put(call.subject, "worker_unavailable", wire_json({"code": code, "evidence": evidence}))
+            tx.execute("UPDATE invocations SET dispatch_state='unavailable',status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+            self._gate(tx, call.subject, "worker_unavailable", evidence=material)
+
+    def agent_exited(self, call: AgentCall, process_identity: dict[str, Any], returncode: int) -> None:
+        with self.storage.transaction() as tx:
+            invocation = self._invocation(tx, call)
+            if invocation["process_identity"] is None or json.loads(tx.get(invocation["process_identity"], call.subject)) != process_identity:
+                raise KernelError("process_identity_changed")
+            if invocation["exit_code"] is not None and invocation["exit_code"] != returncode:
+                raise KernelError("conflicting_exit")
+            tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=? WHERE id=?", (returncode, call.invocation_id))
+            tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+            self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"])
+
     def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
         """Read-only authority guard for each real successor mutation in an adapter."""
         with self.storage.transaction(write=False) as tx:
