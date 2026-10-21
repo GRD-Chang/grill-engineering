@@ -1,11 +1,13 @@
 """Pure native event projection uses real committed Core producers."""
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_run_kernel import Issue, Kernel, ParentIssue, Requirements, Step
+from agent_run_kernel import AgentCall, Issue, Kernel, ParentIssue, Requirements, Role, Step
+from agent_run_kernel.model import wire_json
 from agent_run_kernel.notification_events import events
 from agent_run_kernel.offline import GraphScenario
 
@@ -25,13 +27,9 @@ def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
         return result
 
 
-@pytest.mark.parametrize("mode", ["detailed", "concise"])
-def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
-    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Parent", "Original scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
+def _recorded_agents(scenario: GraphScenario, monkeypatch: pytest.MonkeyPatch,
+                     result: Callable[[AgentCall], bytes] | None = None,
+                     started: Callable[[AgentCall], None] | None = None) -> None:
     original_handle = scenario.handle
 
     def handle(step: Step) -> Step:
@@ -45,11 +43,22 @@ def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_fir
                    "host_pid": 10, "host_start_token": "synthetic-host"}
         assert scenario.kernel.dispatch_agent(call)
         scenario.kernel.agent_started(call, process)
-        scenario.kernel.receive(call, scenario.agent(call))
+        if started is not None:
+            started(call)
+        scenario.kernel.receive(call, (result or scenario.agent)(call))
         scenario.kernel.agent_exited(call, process, 0)
         return step
 
     monkeypatch.setattr(scenario, "handle", handle)
+
+@pytest.mark.parametrize("mode", ["detailed", "concise"])
+def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = GraphScenario(tmp_path, Requirements(
+        ParentIssue(1, "Parent", "Original scope", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
+    _recorded_agents(scenario, monkeypatch)
     consumed: list[str] = []
     for _ in range(100):
         step = scenario.step()
@@ -85,3 +94,142 @@ def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_fir
     assert [event["role"] for event in projected if event["kind"] == "stage_start"] == (
         ["review", "publication"] if mode == "detailed" else [])
     assert _project(scenario.kernel, mode) == projected
+
+
+@pytest.mark.parametrize("mode", ["detailed", "concise"])
+def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch, mode):
+    from agent_run.notification_event_facts import event_copy
+
+    scenario = GraphScenario(tmp_path, Requirements(
+        ParentIssue(1, "Parent", "Original scope", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
+        reviews=("pass", "fail", "pass"))
+    start_views = {}
+
+    def started(call):
+        if call.subject == "final:1" and call.role == Role.DEVELOPMENT:
+            start_views[call.attempt_id] = _project(scenario.kernel, mode)
+
+    _recorded_agents(scenario, monkeypatch, started=started)
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    first_review = repair = None
+    planned_id = None
+    for _ in range(100):
+        step = scenario.step()
+        projected = _project(scenario.kernel, mode)
+        if step.call is not None and step.call.role == Role.REVIEW and first_review is None:
+            first_review = step.call.attempt_id
+            started = [event for event in projected if event["kind"] == "acceptance_started"]
+            assert len(started) == 1 and started[0]["attempt_id"] == first_review
+            assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == first_review for event in projected)
+            assert not any(event["kind"] == "acceptance_repair" for event in projected)
+            assert scenario.step().kind == "progress"
+            planned = [event for event in _project(scenario.kernel, mode) if event["kind"] == "acceptance_repair"]
+            assert len(planned) == 1 and planned[0]["live"] is False
+            assert planned[0]["title"] == event_copy({"language": "zh"}, "acceptance_repair_planned")
+            planned_id = planned[0]["id"]
+            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == first_review
+                           for event in _project(scenario.kernel, mode))
+        elif step.call is not None and step.call.role == Role.DEVELOPMENT:
+            repair = step.call.attempt_id
+            milestones = [event for event in start_views[repair] if event["kind"] == "acceptance_repair"]
+            assert milestones[-1]["live"] is True
+            assert milestones[-1]["title"] == event_copy({"language": "zh"}, "acceptance_repair_active")
+            assert {event["id"] for event in milestones} == {planned_id}
+            assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == repair for event in projected)
+        promoted = [event for event in projected if event["kind"] == "acceptance_passed"]
+        if promoted:
+            assert first_review is not None and repair is not None
+            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == promoted[0]["attempt_id"]
+                           for event in projected)
+            break
+        assert step.kind not in {"paused", "waiting", "approval"}, step
+    else:
+        raise AssertionError("FullRun did not promote its actual repair Review")
+
+
+@pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])
+def test_human_result_uses_original_paused_material_even_after_resume(tmp_path, monkeypatch, role):
+    scenario = GraphScenario(tmp_path, Requirements(
+        ParentIssue(1, "Parent", "Original scope", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
+    reason = "Original human decision / 保留原文"
+    original = scenario.agent
+
+    def result(call):
+        raw = original(call)
+        if call.role != role:
+            return raw
+        if role == Role.REVIEW:
+            return wire_json({"checks": {lane: {"status": "blocked" if lane == "e2e" else "pass",
+                                                "evidence": reason if lane == "e2e" else "Passed exact lane",
+                                                "findings": []} for lane in ("e2e", "standards", "spec")}})
+        return wire_json({"result_kind": "human_blocker", "human_blockers": [reason],
+                          **({"summary": None} if role == Role.DEVELOPMENT else
+                             {"commit_message": None, "pr_title": None, "pr_body_markdown": None})})
+
+    _recorded_agents(scenario, monkeypatch, result)
+    for _ in range(100):
+        step = scenario.step()
+        if step.call is not None and step.call.role == role:
+            call = step.call
+            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id
+                           for event in _project(scenario.kernel, "detailed"))
+            assert scenario.step().kind == "paused"
+            break
+        assert step.kind not in {"paused", "waiting", "approval"}, step
+    else:
+        raise AssertionError("The selected role never returned its human artifact")
+    results = [event for event in _project(scenario.kernel, "detailed")
+               if event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id]
+    assert len(results) == 1 and reason in results[0]["summary"]
+    assert results[0]["status_code"] == ("review_blocked" if role == Role.REVIEW else "human_blocker")
+    assert results[0]["color"] == "yellow" and results[0]["next_step"]
+    assert not any(event["kind"] == "stage_end" for event in _project(scenario.kernel, "concise"))
+    scenario.kernel.control("resume", "answer-original", subject=call.subject,
+                            message="Use the original decision", world=scenario.world())
+    assert [event for event in _project(scenario.kernel, "detailed") if event["id"] == results[0]["id"]] == results
+
+
+def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    scenario = GraphScenario(tmp_path, Requirements(
+        ParentIssue(1, "Parent", "Original scope", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
+        reviews=("pass", "fail", "pass"))
+    start_views = {}
+
+    def started(call):
+        if call.subject == "final:1" and call.role == Role.DEVELOPMENT:
+            start_views[call.attempt_id] = _project(scenario.kernel, "detailed")
+
+    _recorded_agents(scenario, monkeypatch, started=started)
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    for _ in range(100):
+        step = scenario.step()
+        if step.call is not None and step.call.role == Role.REVIEW:
+            assert scenario.step().kind == "progress"
+            break
+        assert step.kind not in {"paused", "waiting", "approval"}, step
+    else:
+        raise AssertionError("The first overall Review did not return its failure")
+    original_generation = scenario.kernel.status("final:1")["generation"]
+    planned = [event for event in _project(scenario.kernel, "detailed") if event["kind"] == "acceptance_repair"]
+    assert len(planned) == 1 and planned[0]["live"] is False
+    scenario.requirements = replace(scenario.requirements, parent=replace(
+        scenario.requirements.parent, body="A revised whole-Run requirement before automatic repair started"))
+    scenario.refresh()
+    assert scenario.kernel.status("final:1")["phase"] == "refresh_final"
+    assert scenario.run().kind == "approval"
+    assert scenario.kernel.status("final:1")["generation"] == original_generation + 1
+    assert scenario.kernel.control("revise", "human-revision-after-refresh", subject="final:1",
+                                   world=scenario.world(), message="A separate maintainer revision") == "applied"
+    step = scenario.step()
+    assert step.call is not None and step.call.role == Role.DEVELOPMENT
+    assert step.call.context["repair_source"] == "human_revision"
+    current = start_views[step.call.attempt_id]
+    assert any(event["kind"] == "stage_start" and event.get("attempt_id") == step.call.attempt_id for event in current)
+    assert not any(event["kind"] == "acceptance_repair" and event["live"] for event in current)

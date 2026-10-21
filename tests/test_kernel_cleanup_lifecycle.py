@@ -10,15 +10,32 @@ that three new Scenario runs are an old/new same-input differential execution.
 from __future__ import annotations
 
 from pathlib import Path
+import json
+from dataclasses import replace
 from typing import Callable
 
 import pytest
 
 from agent_run_kernel import DeliveryKind, Effect, EffectResult, Kernel
-from agent_run_kernel.offline import OfflinePort, Scenario
+from agent_run_kernel.offline import GraphScenario, OfflinePort, Scenario
+from test_kernel_requirements import independent_source
 
 
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
+
+
+def _native_scenario(root: Path, kind: DeliveryKind) -> GraphScenario:
+    source = independent_source()
+    if kind == DeliveryKind.PARENT_ONLY:
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
+    elif kind == DeliveryKind.FINAL_RUN:
+        first = source.issues[0]
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
+    scenario = GraphScenario(root, source)
+    if kind == DeliveryKind.FINAL_RUN:
+        assert scenario.run().kind == "complete"
+        scenario.select(scenario.activate_final())
+    return scenario
 
 
 def _local_head(scenario: Scenario, ref: str) -> str | None:
@@ -27,11 +44,17 @@ def _local_head(scenario: Scenario, ref: str) -> str | None:
                  if line.partition("\t")[0] == ref), None)
 
 
+def _local_marker(scenario: Scenario) -> str:
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        return str(tx.one("SELECT e.before_sha FROM effects e JOIN subjects s ON s.id=e.subject AND s.generation=e.generation WHERE e.subject=? AND e.operation='workspace' AND e.status='confirmed'",
+                          (scenario.delivery.key,))[0])
+
+
 @pytest.mark.parametrize("kind", list(DeliveryKind))
 def test_completed_delivery_retires_only_its_recorded_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind)
+    scenario = _native_scenario(tmp_path / "scenario", kind)
     main = "refs/heads/main"
     main_before = scenario.port.git.commit(main)
     sibling = "refs/heads/other-active-ticket"
@@ -55,18 +78,27 @@ def test_completed_delivery_retires_only_its_recorded_resources(
                 pr = scenario.port.pull_request(scenario.delivery.key)
                 assert pr is not None and pr.merged is not None
                 assert effect.payload["branch_ref"] == scenario.delivery.source_ref
-                assert effect.payload["expected_head"] == pr.head.sha
+                assert effect.payload["expected_head"] == (_local_marker(scenario) if effect.operation == "cleanup_local_ref" else pr.head.sha)
                 if kind != DeliveryKind.TICKET:
                     assert pr.head.sha != pr.merged.sha
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
     assert scenario.run(approve=True).kind == "complete"
-    assert [effect.operation for effect in retired] == list(CLEANUP_OPERATIONS)
+    expected_operations = [op for op in CLEANUP_OPERATIONS if kind != DeliveryKind.FINAL_RUN or op != "cleanup_local_ref"]
+    assert [effect.operation for effect in retired] == expected_operations
     assert not checkout.exists()
     registry = scenario.port.git.run("worktree", "list", "--porcelain", "-z").stdout.split("\0")
     assert f"worktree {checkout}" not in registry
-    assert _local_head(scenario, scenario.delivery.source_ref) is None
+    if kind == DeliveryKind.FINAL_RUN:
+        # The offline remote mirror exists locally, but Final never created an
+        # owned local marker. Its publication cannot authorize deleting this ref.
+        assert _local_head(scenario, scenario.delivery.source_ref) is not None
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            omitted = tx.one("SELECT material_id FROM history WHERE subject=? AND kind='resource_not_owned' AND identity='cleanup_local_ref'", (scenario.delivery.key,))
+            assert json.loads(tx.get(omitted[0], scenario.delivery.key))["create_ref"] is False
+    else:
+        assert _local_head(scenario, scenario.delivery.source_ref) is None
     assert _local_head(scenario, sibling) == main_before.sha
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.merged is not None
@@ -88,7 +120,7 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """02 remote-delete dispatch race: completed business, foreign remote preserved."""
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
     foreign_heads: list[str] = []
@@ -142,7 +174,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """02 dirty completed Ticket: preserve checkout, local ref and remote ref."""
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     checkout = Path(scenario.delivery.checkout)
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
@@ -165,7 +197,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     assert cleanup["outcome"] == "third"
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.merged is not None
-    assert _local_head(scenario, scenario.delivery.source_ref) == pr.head.sha
+    assert _local_head(scenario, scenario.delivery.source_ref) == _local_marker(scenario)
     assert scenario.port.remote_refs()[scenario.delivery.source_ref] == pr.head.sha
     assert (checkout / "unsaved.txt").read_text() == "retain work after delivery\n"
     assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == attempts[0].payload["expected_head"]
@@ -177,7 +209,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"] == cleanup
     assert scenario.kernel.status(scenario.delivery.key)["budgets"] == durable["budgets"]
     assert (checkout / "unsaved.txt").read_text() == "retain work after delivery\n"
-    assert _local_head(scenario, scenario.delivery.source_ref) == pr.head.sha
+    assert _local_head(scenario, scenario.delivery.source_ref) == _local_marker(scenario)
     assert scenario.port.remote_refs()[scenario.delivery.source_ref] == pr.head.sha
     assert scenario.role_calls == calls_before
     assert scenario.port.writes() == writes_before

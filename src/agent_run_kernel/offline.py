@@ -326,8 +326,13 @@ class OfflinePort:
                 prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
                 if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
                     raise KernelError("remote_compare_and_swap")
-                self._sync_mirror(git, effect.source_ref, effect.before_sha)
-                git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                if operation == "run_branch":
+                    self._sync_mirror(git, effect.source_ref, effect.before_sha)
+                    git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                elif authorize is not None:
+                    # Publishing a detached SHA does not move the local
+                    # workspace marker created by the original workspace.
+                    authorize()
                 self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
             commit = git.commit(effect.after_sha)
         elif operation == "pr_write":
@@ -449,8 +454,11 @@ class OfflinePort:
                 row = db.execute("SELECT ref,sha,intent FROM links WHERE issue=?", (effect.payload["issue"],)).fetchone()
             return EffectResult("target" if row == (effect.payload["ref"], effect.payload["source_head"], effect.effect_id) else "prior" if row is None else "third")
         if operation in {"push", "run_branch"}:
-            actual = self.git.commit(effect.source_ref)
             remote = self.remote_refs().get(effect.source_ref)
+            if operation == "push":
+                return EffectResult("target" if remote == effect.after_sha else "prior" if remote in {None, effect.before_sha} else "third",
+                                    commit=None if remote is None else self.git.commit(remote))
+            actual = self.git.commit(effect.source_ref)
             return EffectResult("target" if actual.sha == remote == effect.after_sha else "prior" if actual.sha == effect.before_sha and remote in {None, effect.before_sha} else "third", commit=actual)
         if operation == "pr_write":
             pr = self.pull_request(effect.subject, effect.source_ref)
@@ -893,9 +901,12 @@ class GraphScenario(Scenario):
             self.port.git.run("update-ref", source_ref, base.sha)
             self.port.git.run("worktree", "add", "--detach", str(checkout), base.sha)
             deliveries.append(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "untrusted", base, source_ref, run_ref, checkout=str(checkout), owned_root=str(work), common_git_dir=common))
-        final = Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,
-                         run_ref, "refs/heads/main", checkout=str(work / "final-1"), owned_root=str(work), common_git_dir=common)
-        deliveries.append(final)
+        if deliveries:
+            deliveries.append(Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,
+                              run_ref, "refs/heads/main", checkout=str(work / "final-1"), owned_root=str(work), common_git_dir=common))
+        else:
+            deliveries.append(Delivery("parent:1", DeliveryKind.PARENT_ONLY, requirements.parent.number, "untrusted", base,
+                              "refs/heads/parent", "refs/heads/main", checkout=str(work / "parent-1"), owned_root=str(work), common_git_dir=common))
         self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy(),
                            language="zh", repository_root=str(self.port.git.root.resolve()), inputs=fixture_inputs())
         self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=requirements)

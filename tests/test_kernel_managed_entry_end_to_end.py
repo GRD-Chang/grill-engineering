@@ -427,8 +427,7 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
         assert channel.recv(1) == b'1'
 '''
-    gh = FAKE_GH.replace("d['issue_state']=body['state'];",
-        "d['source_graph']['issues']['2']['state']=body['state'].upper();d['issue_state']=body['state'];")
+    gh = FAKE_GH
     gh = gh.replace("'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
     gh = gh.replace("else: result=[d['prs']] if '--slurp' in args else d['prs']", """else:
             from urllib.parse import parse_qs, urlsplit
@@ -444,6 +443,39 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
                 observed = head('refs/heads/' + pull[field]['ref'])
                 if observed: pull[field]['sha'] = observed
 """)
+    # The shared leaf fixture represents one Ticket. Managed controls also
+    # observe their Parent (and original PR issue endpoints) independently.
+    closed_event = "d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})"
+    gh = gh.replace(closed_event, closed_event + ";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1])")
+    issue_start = gh.index("elif endpoint.startswith('repos/example/project/issues/'):\n")
+    issue_end = gh.index("\nelse:raise SystemExit('unexpected endpoint '+endpoint)", issue_start)
+    gh = gh[:issue_start] + r'''elif endpoint.startswith('repos/example/project/issues/'):
+    if d.get('issue_read_error') and method=='GET':
+        print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)
+    number=int(endpoint.split('/issues/',1)[1].split('/')[0])
+    graph=d['source_graph']
+    resource=graph['parent'] if number==graph['parent']['number'] else graph['issues'].get(str(number))
+    if resource is None:
+        resource=next((pull for pull in d['prs'] if pull['number']==number),None)
+    if resource is None:
+        print('HTTP 404 Issue not found',file=sys.stderr);raise SystemExit(1)
+    comments=d.setdefault('comments_by_issue',{}).setdefault(str(number),[])
+    events=d.setdefault('events_by_issue',{}).setdefault(str(number),[])
+    if endpoint.endswith('/comments'):
+        if method=='POST':
+            comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},'created_at':'2026-10-21T10:00:00Z'}
+            d['comments'].append(comment);comments.append(comment);result=comment
+        else:result=[comments] if '--slurp' in args else comments
+    elif endpoint.endswith('/events'):result=[events] if '--slurp' in args else events
+    elif method=='PATCH':
+        resource['state']=body['state'].upper()
+        d['issue_state']=body['state']
+        event='closed' if body['state']=='closed' else 'reopened'
+        at='2026-10-21T10:01:00Z' if event=='closed' else '2026-10-21T10:02:00Z'
+        observed={'id':len(d['events'])+1,'event':event,'actor':{'login':'publisher'},'created_at':at}
+        d['events'].append(observed);events.append(observed);result={'state':body['state']}
+    else:result={'number':number,'node_id':f'issue-node-{number}','state':resource.get('state','OPEN').lower()}
+''' + gh[issue_end:]
     _executable(binary / "gh", clone + gh)
     _executable(binary / "codex", codex)
     for name, value in {"PATH": str(binary) + os.pathsep + os.environ["PATH"], "REMOTE_TEST_STATE": str(state),

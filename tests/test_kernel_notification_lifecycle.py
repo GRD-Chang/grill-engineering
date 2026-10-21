@@ -10,30 +10,43 @@ import pytest
 from agent_run import notification_outbox as outbox
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Delivery, DeliveryKind, RunSpec
+from agent_run_kernel import DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.notifications import NativeNotifications
-from agent_run_kernel.offline import OfflinePort, Scenario
+from agent_run_kernel.offline import GraphScenario
+from test_kernel_requirements import independent_source
 
 
 def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
-                      *, reviews: tuple[str, ...] = ("pass",)) -> Scenario:
+                      *, reviews: tuple[str, ...] = ("pass",)) -> GraphScenario:
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language="en", notifications={"enabled": False, "mode": "concise"})
-    original_prepare = OfflinePort.prepare
+    original_create = Kernel.create
 
-    def prepare(port: OfflinePort, *args: Any, **kwargs: Any) -> tuple[RunSpec, Delivery]:
-        spec, delivery = original_prepare(port, *args, **kwargs)
+    def create(_cls: type[Kernel], path: Path, spec: RunSpec, **kwargs: Any) -> Kernel:
         spec = freeze_creation(spec, defaults,
                                prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
         assert spec.inputs is not None
         inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "concise",
                          "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-        return replace(spec, inputs=inputs), delivery
+        return original_create(path, replace(spec, language="en", inputs=inputs), **kwargs)
 
+    source = independent_source()
+    if kind == DeliveryKind.PARENT_ONLY:
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
+    else:
+        first = source.issues[0]
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
+    # Freeze only input configuration. Workspace and local marker ownership are
+    # produced by the real Core/effect path, never by a synthetic receipt.
     with monkeypatch.context() as patch:
-        patch.setattr(OfflinePort, "prepare", prepare)
-        return Scenario(tmp_path, kind, reviews=reviews)
+        patch.setattr(Kernel, "create", classmethod(create))
+        scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
+    if kind == DeliveryKind.FINAL_RUN:
+        assert scenario.run().kind == "complete"
+        scenario.select(scenario.activate_final())
+        scenario.reviews, scenario.review_count = list(reviews), 0
+    return scenario
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])

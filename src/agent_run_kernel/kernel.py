@@ -1492,6 +1492,28 @@ class Kernel:
                 return Step("observe", subject)
             operation = self.CLEANUP[cleanup["stage"]]
             head = cleanup["workspace_sha"] if operation == "cleanup_worktree" else cleanup["source_sha"]
+            if operation == "cleanup_local_ref":
+                workspaces = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND source_ref=? AND operation='workspace' AND status='confirmed'",
+                                     (subject, cleanup["generation"], cleanup["source_ref"]))
+                if len(workspaces) != 1:
+                    return Step("paused", subject, "cleanup_marker_unproven")
+                workspace = workspaces[0]
+                intent = json.loads(tx.get(workspace["payload_id"], subject))
+                receipt = json.loads(tx.get(workspace["receipt_id"], subject))
+                if (any(intent.get(key) != cleanup[key] for key in ("checkout", "owned_root", "common_git_dir"))
+                        or receipt.get("disposition") != "target" or not isinstance(receipt.get("commit"), dict)
+                        or receipt["commit"].get("sha") != workspace["before_sha"]):
+                    return Step("paused", subject, "cleanup_marker_unproven")
+                if intent.get("create_ref") is False:
+                    # Final's workspace is detached without creating a local
+                    # Run-branch head. A remote publication grants no local ownership.
+                    tx.execute("UPDATE resource_cleanup SET stage=stage+1 WHERE subject=? AND generation=?",
+                               (subject, cleanup["generation"]))
+                    self._event(tx, subject, "resource_not_owned", operation, workspace["payload_id"])
+                    return Step("progress", subject)
+                if intent.get("create_ref") is not True:
+                    return Step("paused", subject, "cleanup_marker_unproven")
+                head = workspace["before_sha"]
             payload = {"checkout": cleanup["checkout"], "owned_root": cleanup["owned_root"],
                        "common_git_dir": cleanup["common_git_dir"], "branch_ref": cleanup["source_ref"], "expected_head": head,
                        "remote": self._inputs(tx, run)["repository_remote"]}

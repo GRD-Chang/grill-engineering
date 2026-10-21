@@ -27,6 +27,7 @@ from agent_run.error_safety import bounded_error
 from agent_run.process_binding import _process_start_token as _start_token
 
 from .model import AgentCall
+from .remote_effects import ObservationSuperseded
 from .storage import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
@@ -236,6 +237,23 @@ def _execute(
     return result
 
 
+def _authorize_source(
+    kernel: Kernel, call: AgentCall, authorize_source: Callable[[], None] | None, deadline: float,
+) -> None:
+    if authorize_source is None:
+        return
+    while True:
+        try:
+            authorize_source()
+            return
+        except ObservationSuperseded:
+            # Only a proved obsolete read can be replaced. Keep this original
+            # call, lease and any bound bootstrap; never retry a Worker launch.
+            kernel.guard_agent(call)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Worker deadline expired during source authorization")
+
+
 def _run_dispatched(
     kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
     prompt: str, environment: Mapping[str, str], deadline: float,
@@ -254,8 +272,7 @@ def _run_dispatched(
             raise ValueError("Worker arguments are required")
         if not hasattr(os, "pidfd_open"):
             raise OSError("The local process adapter requires Linux pidfd")
-        if authorize_source is not None:
-            authorize_source()
+        _authorize_source(kernel, call, authorize_source, deadline)
         kernel.guard_agent(call)
         if capture is not None:
             capture.guard()
@@ -291,8 +308,7 @@ def _run_dispatched(
         identity = _identity(process.pid)
         kernel.agent_started(call, identity)
         bound = True
-        if authorize_source is not None:
-            authorize_source()
+        _authorize_source(kernel, call, authorize_source, deadline)
         kernel.guard_agent(call)
         if capture is not None:
             capture.guard()
