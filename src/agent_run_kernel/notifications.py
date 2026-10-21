@@ -102,6 +102,21 @@ class NativeNotifications:
 
     def _event(self, tx: Transaction, row: Any, state: dict[str, Any]) -> dict[str, Any] | None:
         subject = tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],))
+        if row["kind"] == "acceptance_promoted":
+            promotion = json.loads(tx.get(row["material_id"], row["subject"]))
+            review = tx.one("SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND role='review'",
+                            (row["identity"], row["subject"], row["generation"]))
+            if (subject["kind"] == "ticket" or promotion["review_attempt"] != review["id"]
+                    or review["outcome"] != "pass" or review["result_id"] is None):
+                raise ValueError("formal acceptance notification has no original Review")
+            acceptance_key = [row["generation"], promotion["promoted_sha"], review["base_sha"],
+                              review["expected_tree"], review["revision"], review["graph_revision"]]
+            return event_envelope(state, "acceptance_passed", acceptance_key,
+                                  event_copy(state, "parent_acceptance_passed" if subject["kind"] == "parent_only"
+                                             else "acceptance_passed"), "green",
+                                  summary=event_copy(state, "acceptance_passed_summary"),
+                                  attempt_id=review["id"], round=review["ordinal"],
+                                  phase=event_copy(state, "role_review"), execution_timing_complete=False)
         if row["kind"] == "effect_consumed" and self.config.get("mode") == "detailed":
             original = tx.rows("SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? "
                                "AND operation='pr_write' AND status='confirmed' AND receipt_id=?",

@@ -594,6 +594,21 @@ class Kernel:
                 return self._control(tx, kind, action_id, subject=subject, world=world,
                                      message=message, new_thread=new_thread, policy_overrides=policy_overrides)
 
+    def stop_task(self, action_id: str, *, subject: str | None = None) -> str:
+        """Revoke business work under the exact Task lock without a Host launch.
+
+        Unknown Host and Worker lifetimes remain owned and unretired. This
+        Action establishes neither their exit nor permission to replace them.
+        """
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            run_id, task = run["id"], self._task(run)
+        with locked_task(task) as location:
+            if read_task(location) != (run_id, self.storage.path.resolve()):
+                raise KernelError("task_location_identity")
+            with self.storage.transaction() as tx:
+                return self._control(tx, "stop", action_id, subject=subject)
+
     @staticmethod
     def _host_launch(tx: Transaction, row: sqlite3.Row) -> HostLaunch:
         value = json.loads(tx.get(row["request_id"], row["subject"]))
@@ -2213,6 +2228,7 @@ class Kernel:
                 return self._prepare_effect(tx, run, job, execution, world, "run_branch", before=job["source_sha"],
                                             after=job["integrated_sha"])
             tx.execute("UPDATE subjects SET phase='publish',version=version+1 WHERE id=?", (subject,))
+            self._acceptance_promoted(tx, self._job(tx, subject), world)
             return Step("progress", subject)
         if phase == "publication_commit":
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
@@ -2753,6 +2769,8 @@ class Kernel:
         if phase == "complete":
             self._release_integration(tx, subject)
         self._event(tx, subject, "effect_consumed", row["id"], row["receipt_id"])
+        if operation == "run_branch" and phase == "publish":
+            self._acceptance_promoted(tx, self._job(tx, subject), world)
         return Step("progress", subject)
 
     def _update_boundary(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> None:
@@ -2823,6 +2841,21 @@ class Kernel:
             evidence = tx.put(subject, "integration_snapshot", wire_json({"source_sha": source_sha, "target_sha": target.sha, "charged": charged}))
             self._event(tx, subject, "integration_snapshot", str(allowance["generation"]), evidence)
         return True
+
+    def _acceptance_promoted(self, tx: Transaction, job: sqlite3.Row, world: World) -> None:
+        """Record the actual full acceptance installation, beside its transition."""
+        if (job["kind"] == DeliveryKind.TICKET or not job["integrated_sha"] or not job["integrated_tree"]
+                or not self._review_current(tx, job, world)):
+            return
+        if job["kind"] == DeliveryKind.FINAL_RUN and (world.source is None or world.source.sha != job["source_sha"]):
+            return
+        material = tx.put(job["id"], "acceptance_promotion", wire_json({
+            "review_attempt": job["review_attempt"], "promoted_sha": job["integrated_sha"],
+            "promoted_tree": job["integrated_tree"], "source_sha": job["source_sha"],
+        }))
+        if not tx.rows("SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? AND material_id=? LIMIT 1",
+                       (job["id"], job["generation"], job["review_attempt"], material)):
+            self._event(tx, job["id"], "acceptance_promoted", job["review_attempt"], material)
 
     def _review_current(self, tx: Transaction, job: sqlite3.Row, world: World) -> bool:
         if not job["review_attempt"] or world.target is None:
