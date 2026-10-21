@@ -9,7 +9,7 @@ from typing import Any
 from agent_run.review_context import candidate_review_identity
 from agent_run.review_evidence import accepted_review_matches
 from agent_run.commit_messages import commit_messages_match
-from agent_run.development_review import DevelopmentReview, change_revision_changed, parent_review_identity
+from agent_run.development_review import DevelopmentReview, change_revision_changed
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
@@ -19,7 +19,6 @@ from agent_run.change_delivery import (
     ChangeDeliveryStateStore,
     ChangeJobContract,
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
-    latest_reviewer_thread,
     StaleDisposition,
 )
 from agent_run.change_delivery_fallback import fallback_publication_context
@@ -34,7 +33,6 @@ from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
-from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
 from agent_run.ticket_integration import delivery_base_sha, delivery_candidate_sha

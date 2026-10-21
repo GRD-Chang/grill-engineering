@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from agent_run.development_review import DevelopmentReview, change_revision_changed, parent_review_identity
 from agent_run.agents import AgentBackend
-from agent_run.artifacts import AcceptanceArtifact
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.approval_grant import (
     acceptance_fingerprint,
@@ -21,7 +19,6 @@ from agent_run.change_delivery import (
     ChangeDeliveryPublisher,
     ChangeDeliveryStateStore,
     ChangeJobContract,
-    latest_reviewer_thread,
     StaleDisposition,
 )
 from agent_run.delivery_policy import parent_only_budget_policy_for_job

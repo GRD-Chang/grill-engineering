@@ -9,7 +9,6 @@ and StateStore persistence are kept in their own seam.  In particular,
 neither layer gets a shortcut from development to a Run Branch write.
 """
 
-from copy import deepcopy
 from pathlib import Path
 import sys
 from typing import Any
@@ -19,17 +18,8 @@ from agent_run.agents import AgentBackend
 from agent_run.delivery_policy import change_review_budget_policy
 from agent_run.change_currentness import change_agent_is_current, reject_stale_change
 from agent_run.development_review import DevelopmentReview
-from agent_run.integration_development_budget import (
-    IntegrationDevelopmentExhausted, ensure_integration_development_available,
-)
 from agent_run.delivery_step import AgentWorkRequired, DeliveryStep, DeliveryStepKind
 from agent_run.change_delivery_integration import prepare_delivery_integration
-from agent_run.ci_recovery_budget import (
-    can_start_ci_repair,
-    ci_limit_for_job,
-    mark_ci_repair,
-    refund_ci_repair_without_candidate,
-)
 from agent_run.artifacts import record_human_blocker
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
@@ -42,19 +32,8 @@ from agent_run.external_supervision import (
 from agent_run.publication_operation_retry import record_publication_operation_failure
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
-from agent_run.semantic_attempt import (
-    pending_semantic_attempt,
-    release_semantic_attempt,
-)
-from agent_run.review_budget import (
-    ReviewBudgetPolicy,
-    can_start_development,
-    can_start_review,
-    ensure_budget,
-    mark_development,
-)
+from agent_run.review_budget import ReviewBudgetPolicy, ensure_budget
 
-from agent_run.agent_work import AgentWorkScope
 from agent_run.state_contract import require_current_run_state
 
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
@@ -71,12 +50,6 @@ from agent_run.change_delivery_contracts import (
     StaleDisposition as StaleDisposition,
     ChangeJobStopped,
 )
-from agent_run.change_delivery_fallback import (
-    fallback_candidate_is_eligible,
-    fallback_publication_context,
-    prepare_ticket_fallback,
-    previous_publication_authorization,
-)
 from agent_run.change_delivery_publication_agent import (
     invocation_boundary,
     invocation_identity,
@@ -88,7 +61,6 @@ from agent_run.change_delivery_state import (
     block_change_job,
     save_change_job,
     ChangeDeliveryStateStore as ChangeDeliveryStateStore,
-    require_mapping as _mapping,
 )
 from agent_run.change_delivery_threads import (
     latest_reviewer_thread as latest_reviewer_thread,

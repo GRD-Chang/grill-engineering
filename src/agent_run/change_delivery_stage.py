@@ -3,7 +3,7 @@ from __future__ import annotations
 """Host port shared by the focused Change Delivery stage modules."""
 
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery_contracts import (
