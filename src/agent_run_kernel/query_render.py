@@ -24,7 +24,11 @@ _COPY = {
            "no_runs": "无匹配运行", "active": "进行中", "completed": "业务已完成", "operator_stopped": "已主动停止",
            "blocked": "有阻塞", "observe": "继续观察", "inspect": "核对原始事实与诊断", "resume": "显式恢复原工作",
            "approve": "核验最终 PR 后批准", "requeue": "确认最新需求后重新排队", "local": "该 Ticket 及依赖工作",
-           "global": "整个交付运行", "unknown_live": "执行者当前活性未确认；查询不会恢复或停止任务"},
+           "global": "整个交付运行", "unknown_live": "执行者当前活性未确认；查询不会恢复或停止任务",
+           "notification_disabled": "本 Run 的冻结配置已禁用飞书通知",
+           "notification_configuration_unknown": "本 Run 未记录飞书通知配置",
+           "notification_journal_missing": "未记录飞书通知发送日志",
+           "notification_binding_unknown": "通知日志未记录收件人及配置的绑定回执"},
     "en": {"run": "Delivery Run", "status": "Status", "phase": "Phase", "subject": "Work subject", "unknown": "Not recorded",
            "next": "Next action", "model": "Model", "effort": "Reasoning effort", "history": "Work history", "budget": "Cumulative usage",
            "findings": "Current findings", "evidence": "Evidence", "duration": "Task elapsed seconds", "agent": "Agent",
@@ -34,7 +38,11 @@ _COPY = {
            "no_runs": "No matching Runs", "active": "Active", "completed": "Business completed", "operator_stopped": "Operator stopped",
            "blocked": "Blocked", "observe": "Continue observing", "inspect": "Inspect original facts and diagnostics", "resume": "Explicitly resume original work",
            "approve": "Verify and approve the final PR", "requeue": "Confirm new requirements and requeue", "local": "This Ticket and dependent work",
-           "global": "Whole Delivery Run", "unknown_live": "Executor liveness is unconfirmed; querying does not resume or stop work"},
+           "global": "Whole Delivery Run", "unknown_live": "Executor liveness is unconfirmed; querying does not resume or stop work",
+           "notification_disabled": "Feishu notifications disabled in this Run's frozen configuration",
+           "notification_configuration_unknown": "Feishu notification configuration not recorded for this Run",
+           "notification_journal_missing": "Feishu delivery journal not recorded",
+           "notification_binding_unknown": "Feishu journal recipient/configuration binding not recorded"},
 }
 
 _TERMS = {
@@ -109,6 +117,28 @@ def _body(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _notification_lines(document: QueryDocument) -> Iterator[str]:
+    facts = document.data.get("notifications")
+    if not isinstance(facts, Mapping):
+        return
+    copy = _COPY[document.language]
+    configuration = facts["configuration"]
+    disabled = isinstance(configuration, Mapping) and configuration.get("enabled") is False
+    if configuration is None:
+        yield copy["notification_configuration_unknown"]
+    elif disabled:
+        yield copy["notification_disabled"]
+    if facts.get("unavailable_reason"):
+        yield text("presentation.notification.unavailable", language=document.language, reason=facts["unavailable_reason"])
+    elif facts["journal_state"] == "missing" and not disabled:
+        yield copy["notification_journal_missing"]
+    count = facts["unconfirmed_count"]
+    if count:
+        yield text("presentation.notification.pending", language=document.language, count=count)
+    if facts["journal_state"] == "available":
+        yield copy["notification_binding_unknown"]
+
+
 def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     copy = _COPY[document.language]
     terms = _TERMS[document.language]
@@ -127,6 +157,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{copy['status']}: {terms.get(data['status'], copy.get(data['status'], data['status']))} | {copy['phase']}: {terms.get(data['phase'], data['phase'])}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
+    yield from _notification_lines(document)
     # Put actionable current boundaries before long Findings/evidence.
     for action in data["operator_actions"]:
         scope = copy["local"] if action["scope"] == "local" else copy["global"]

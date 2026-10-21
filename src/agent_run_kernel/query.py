@@ -13,6 +13,7 @@ import time
 from typing import Any, Literal, Mapping, Sequence
 
 from agent_run.task_identity import TaskKey
+from agent_run.notification_outbox import read_notifications
 
 from .model import KernelError, Role, artifact
 from .storage import QUERY_LIMIT, Storage, Transaction
@@ -551,6 +552,35 @@ def _control_history(tx: Transaction) -> list[dict[str, Any]]:
 
 
 
+def _notification_facts(tx: Transaction, run: Mapping[str, Any], path: Path) -> dict[str, Any]:
+    """Project the existing journal without claiming a configuration receipt."""
+    rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
+    inputs = _material(tx, rows[0]["material_id"], rows[0]["subject"]) if rows else {}
+    configuration = inputs.get("notifications") if isinstance(inputs, Mapping) else None
+    if not isinstance(configuration, Mapping):
+        configuration = None
+    journal = read_notifications(path.parent, run["id"])
+    reason = journal.get("unavailable_reason")
+    records = journal.get("records", [])
+    readable = not reason or "pending" in journal or "records" in journal
+    if any(not isinstance(item, Mapping) for item in records):
+        reason = "Invalid notification delivery record"
+        readable = False
+    result = dict(journal)
+    result.update({"configuration": configuration,
+                   "configuration_source": "run_snapshot" if configuration is not None else "unavailable",
+                   "journal_binding": {"status": "unknown", "reason": "not_recorded"},
+                   "journal_state": "unavailable" if not readable else "available" if journal else "missing",
+                   "unconfirmed_count": None})
+    if reason:
+        result["unavailable_reason"] = reason
+    if readable and journal:
+        result["unconfirmed_count"] = len(journal.get("pending", [])) + sum(
+            not item.get("cancelled") and bool(item.get("exhausted") or item.get("outcome") in ("failed", "unknown"))
+            for item in records)
+    return result
+
+
 def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
     from agent_run.github_identity import describe_identity
     from agent_run.messages import text
@@ -618,7 +648,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                 "policy_snapshot": json.loads(run["policy"]),
                 "subjects": subjects, "operator_actions": actions, "operator_action": actions[0] if actions else None,
                 "next_action": actions[0]["action"] if actions else "observe" if active else None,
-                "diagnostics": [], "notifications": None,
+                "diagnostics": [], "notifications": _notification_facts(tx, run, path),
                 "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "live_status": "unknown"},
                 "scheduling": {"active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject"),
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
@@ -628,7 +658,11 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
             data["progress"] = _progress(data)
             data["gate"] = "required_checks" if status == "waiting_checks" else None
-            data["unavailable_facts"] = ["host_liveness", "notifications", "host_activity_segments"]
+            data["unavailable_facts"] = ["host_liveness", "host_activity_segments", "notifications.journal_binding"]
+            if data["notifications"]["journal_state"] != "available":
+                data["unavailable_facts"].append("notifications")
+            if data["notifications"]["configuration"] is None:
+                data["unavailable_facts"].append("notifications.configuration")
             if kind == "history":
                 events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
                           [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
