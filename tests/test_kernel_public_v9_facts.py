@@ -108,6 +108,8 @@ def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successfu
     assert failures[0]['evidence']['type'] == 'LostResponse' and failures[0]['dispatch_serial'] == 1
     assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
     assert scenario.port.pull_request(scenario.delivery.key) is not None
+    ci = next(row for row in data['budget_windows'] if row['purpose'] == 'ci' and row['current'])
+    assert ci['review_limit'] is None and data['ci_recovery']['review_required'] is True
     assert _durable(tmp_path) == before
 
 
