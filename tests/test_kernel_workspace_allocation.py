@@ -93,5 +93,13 @@ def test_new_workspace_never_resets_a_foreign_preexisting_ticket_ref(tmp_path: P
     scenario.handle(step)
     assert scenario.port.git.commit(scenario.delivery.source_ref) == scenario.initial
     assert not Path(scenario.delivery.checkout).exists()
-    assert not [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "workspace"]
-    assert kernel.advance(subject, scenario.execution, scenario.world()).kind == "paused"
+    requests = [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "workspace"]
+    assert len(requests) == 1 and requests[0]["intent"] == effect.effect_id
+    assert kernel.status(subject)["gates"] == ["write_conflict"]
+    assert kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world()).kind == "paused"
+    readback = kernel.advance(subject, scenario.execution, scenario.world())
+    assert readback.kind == "reconcile" and readback.effect == effect
+    scenario.handle(readback)
+    assert [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "workspace"] == requests
+    assert scenario.port.git.commit(scenario.delivery.source_ref) == scenario.initial
+    assert not Path(scenario.delivery.checkout).exists()
