@@ -51,6 +51,7 @@ def controlled_manager(tmp_path: Path) -> tuple[SystemdHost, HostLaunch, Path, P
         "ControlGroup": "/unit-group", "MainPID": "0", "ControlPID": "0", "ExecMainCode": "1",
         "ExecMainStatus": "7", "ExecMainExitTimestamp": "@1700000000.25",
         "ExecMainExitTimestampMonotonic": "1234567",
+        "NFileDescriptorStore": "0",
     }
     response.write_text(json.dumps({"fields": fields, "launch_returncode": 0}))
     program = f"#!{sys.executable}\n" + f"""\
@@ -100,7 +101,9 @@ def test_launch_uses_exact_grant_and_unknown_response_never_retries(tmp_path: Pa
     assert "--unit=agent-run-nonce-3.service" in arguments
     assert '--description=agent-run-kernel:["run-1",3,"executor-3","nonce-3"]' in arguments
     assert "--property=Restart=no" in arguments and "--property=Type=exec" in arguments
-    assert "--property=KillMode=control-group" in arguments and "--property=RemainAfterExit=yes" in arguments
+    assert "--property=KillMode=control-group" in arguments and "--property=RemainAfterExit=no" in arguments
+    assert "--property=FileDescriptorStoreMax=1" in arguments
+    assert "--property=FileDescriptorStorePreserve=restart" in arguments and "--property=NotifyAccess=main" in arguments
     assert "--expand-environment=no" in arguments and "--collect" not in arguments
     assert f"--property=LoadCredential=agent-run-environment:{request.environment_carrier}" in arguments
     assert arguments[arguments.index("--") + 1:] == list(request.command)

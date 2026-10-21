@@ -11,6 +11,7 @@ import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, RunSpec
 from agent_run_kernel.model import Blocker, Issue, ParentIssue, Requirements, World
+from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.storage import Transaction
 
 
@@ -89,3 +90,30 @@ def test_refresh_returns_its_own_receipt_when_another_read_commits_after_it(
     assert receipt["remaining"] == {}
     assert receipt["observation"] < newer["observation"]
     assert Kernel(kernel.storage.path).source_status() == newer
+
+
+def test_graph_world_keeps_the_receipt_from_its_own_source_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)), (
+        Issue(2, "Ticket", "Original work", "OPEN", frozenset({"ready-for-agent"})),
+    ))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    newer = replace(source, parent=replace(source.parent, body="New requirement"),
+                    issues=(replace(source.issues[0], body="New work", blocked_by=(Blocker(9, "OPEN"),)),))
+    refresh = scenario.refresh
+    receipt = refresh()
+
+    def read_then_another_observation() -> dict:
+        own_receipt = refresh()
+        Kernel(scenario.kernel.storage.path).refresh(lambda: newer)
+        return own_receipt
+
+    monkeypatch.setattr(scenario, "refresh", read_then_another_observation)
+    world = scenario.world()
+    assert (world.parent_revision, world.graph_revision, world.revision) == (
+        receipt["observed_parent_revision"], receipt["observed_graph_revision"],
+        receipt["observed_issues"][0]["revision"],
+    )
+    assert world.completion_revision == receipt["completion_revisions"][0]["completion_revision"]
+    assert scenario.kernel.source_status()["observation"] > receipt["observation"]

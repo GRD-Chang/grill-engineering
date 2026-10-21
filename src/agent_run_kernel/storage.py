@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v10-exploration"
+PROTOCOL = "independent-delivery-kernel-v11-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -215,10 +215,11 @@ CREATE TABLE effects (
  parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, revision TEXT NOT NULL,
  generation INTEGER NOT NULL, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
  before_sha TEXT NOT NULL, after_sha TEXT, candidate_sha TEXT, candidate_tree TEXT,
- base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT NOT NULL,
+ base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT CHECK(actor IS NULL OR length(trim(actor))>0),
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
  attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0,
- CHECK((executor IS NOT NULL AND epoch IS NOT NULL) OR (status='confirmed' AND executor IS NULL AND epoch IS NULL))
+ CHECK((executor IS NOT NULL AND epoch IS NOT NULL) OR (status='confirmed' AND executor IS NULL AND epoch IS NULL)),
+ CHECK(actor IS NOT NULL OR status='confirmed' OR operation NOT IN ('push','run_branch','pr_write','merge','completion_comment','close','issue_link','cleanup_remote_ref'))
 );
 CREATE TABLE effect_failures (
  effect TEXT NOT NULL REFERENCES effects(id), dispatch_serial INTEGER NOT NULL,

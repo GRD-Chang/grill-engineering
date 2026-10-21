@@ -194,6 +194,49 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
 
 
+def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_step(tmp_path: Path) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
+    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+                           Policy(development_deadline_seconds=7.0)))
+    now = [100.25]
+    kernel.clock = lambda: now[0]
+    executor = kernel.claim_executor("executor")
+    world = World("parent", "graph", "requirements", base)
+    first = kernel.advance(delivery.key, executor, world).call
+    assert first is not None and kernel.dispatch_agent(first)
+    kernel.bind_thread(first, "original-backend-thread")
+    process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
+    kernel.agent_started(first, process)
+    kernel.receive(first, b"invalid structured output")
+    kernel.agent_exited(first, process, 0)
+    now[0] = 108.0
+    assert kernel.advance(delivery.key, executor, world).kind == "paused"
+    assert kernel.status(delivery.key)["gates"] == ["execution_failed"]
+    kernel.control("resume", "manual-format-continuation", subject=delivery.key)
+    now[0] = 200.25
+    resumed = kernel.advance(delivery.key, executor, world)
+    assert resumed.kind == "agent"
+    repair = resumed.call
+    assert repair is not None and repair.invocation_id != first.invocation_id
+    assert repair.attempt_id == first.attempt_id and repair.thread_id == first.thread_id
+    assert repair.output_ordinal == 1 and repair.mode == "output-repair"
+    assert repair.context["readonly"] is True and repair.context["contract_error"]
+    assert repair.reported_thread == "original-backend-thread"
+    assert repair.deadline_seconds == 7.0 and repair.deadline_at == 207.25
+    assert kernel.dispatch_agent(repair)
+    next_process = {**process, "pid": 24, "pgid": 24, "start_token": "repair-start"}
+    kernel.agent_started(repair, next_process)
+    kernel.receive(repair, b'{"result_kind":"development","summary":"Recovered original result","human_blockers":null}')
+    kernel.agent_exited(repair, next_process, 0)
+    assert kernel.advance(delivery.key, executor, world).kind == "progress"
+    assert kernel.status(delivery.key)["phase"] == "candidate"
+    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
+    with kernel.storage.transaction(write=False) as tx:
+        calls = tx.rows("SELECT recovery_kind,action_id FROM invocations ORDER BY rowid")
+        assert [tuple(row) for row in calls] == [(None, None), ("explicit", "manual-format-continuation")]
+
+
 def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")

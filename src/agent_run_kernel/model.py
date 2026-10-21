@@ -195,7 +195,7 @@ class PullRequest:
     title: str
     body: str
     state: str = "OPEN"
-    actor: str = "offline-publisher"
+    actor: str | None = None
     merged: Commit | None = None
     head_repository: str | None = None
 
@@ -232,6 +232,8 @@ class World:
     checks: Checks | None = None
     completion_revision: str = "no-tickets"
     ancestry: tuple[tuple[str, str], ...] = ()
+    publisher_actor: str | None = None
+    publisher_identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -309,7 +311,7 @@ class Effect:
     candidate: Commit | None
     base: Commit
     pr_number: int | None
-    actor: str
+    actor: str | None
     payload: Mapping[str, Any]
     execution: Execution
     dispatch_serial: int = 1

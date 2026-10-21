@@ -27,6 +27,7 @@ _PROPERTIES = (
     "Id", "Description", "LoadState", "ActiveState", "SubState", "InvocationID",
     "ControlGroup", "MainPID", "ControlPID", "ExecMainCode", "ExecMainStatus",
     "ExecMainExitTimestamp", "ExecMainExitTimestampMonotonic",
+    "NFileDescriptorStore",
 )
 
 
@@ -80,7 +81,9 @@ class SystemdHost:
                 self.systemd_run, "--user", f"--unit={request.unit_name}",
                 f"--description={request.description}", "--expand-environment=no",
                 "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
-                "--property=RemainAfterExit=yes", "--property=TimeoutStopSec=5s",
+                "--property=RemainAfterExit=no", "--property=TimeoutStopSec=5s",
+                "--property=FileDescriptorStoreMax=1", "--property=FileDescriptorStorePreserve=restart",
+                "--property=NotifyAccess=main",
                 f"--property=LoadCredential=agent-run-environment:{request.environment_carrier}",
                 "--", *request.command,
             ])
@@ -148,3 +151,16 @@ class SystemdHost:
             return observation
         except (OSError, ValueError, HostUnavailable):
             return HostObservation("unknown", request.unit_name, evidence="host_identity_or_exit_unproven")
+
+    def stored_descriptors(self, request: HostLaunch, observation: HostObservation) -> int | None:
+        """Read the store count only while the exact observed unit stays fixed."""
+        if observation.disposition not in {"running", "exited"}:
+            return None
+        try:
+            fields = self._fields(request.unit_name)
+            count = int(fields["NFileDescriptorStore"])
+            if count < 0 or self.observe(request) != observation or self._fields(request.unit_name) != fields:
+                return None
+            return count
+        except (OSError, ValueError, HostUnavailable):
+            return None

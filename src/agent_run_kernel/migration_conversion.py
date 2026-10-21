@@ -12,7 +12,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from .effects import LocalGit
 from .kernel import Kernel
@@ -25,7 +25,8 @@ from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Iss
 _POPULATED_INITIAL = frozenset({
     "schema_meta", "runs", "run_root", "run_condition_base", "run_parent_versions",
     "run_graph_versions", "run_graph_snapshots", "run_graph_scope_order",
-    "run_graph_ticket_slots", "run_graph_members", "run_frontier", "run_query_roots",
+    "run_graph_ticket_slots", "run_graph_blocker_slots", "run_graph_edges",
+    "run_graph_members", "run_frontier", "run_query_roots",
     "run_resume_roots", "run_timeline_events", "run_timeline_slots", "work_jobs",
     "work_job_slots", "work_job_layout", "work_invocation_roots", "work_evidence",
     "work_evidence_materials",
@@ -122,49 +123,95 @@ def _initial_facts(path: Path) -> _InitialFacts:
         ticket = job["value_ticket_number"]
         if (job["job_id"] != f"ticket:{ticket}:selection" or job["owner_kind"] != "ticket"
                 or job["owner_key"] != str(ticket) or job["stage"] is not None
-                or slot["job_id"] != job["job_id"] or layout["active_job_id"] != job["job_id"]
+                or slot["job_id"] != job["job_id"] or slot["container"] != "ticket_jobs"
+                or slot["slot"] != str(ticket) or layout["active_job_id"] != job["job_id"]
                 or counts.get("work_attempts", 0) or counts.get("work_invocations", 0)):
             raise MigrationRefused("unsupported_source_stage")
         parent = _one(db, "SELECT * FROM run_parent_versions WHERE run_id=? AND version_id=?",
                       (run["run_id"], root["value_parent_version_id"]))
         title = _evidence_value(db, run["run_id"], parent["title_id"], "parent.title")
         body = _evidence_value(db, run["run_id"], parent["body_id"], "parent.body")
-        graph = _one(db, "SELECT g.revision,s.evidence_id FROM run_graph_snapshots s "
+        graph = _one(db, "SELECT g.version_id,g.revision,s.evidence_id FROM run_graph_snapshots s "
                      "JOIN run_graph_versions g ON g.run_id=s.run_id AND g.version_id=s.version_id "
                      "WHERE s.run_id=? AND s.snapshot_id=?",
                      (run["run_id"], root["value_graph_snapshot_id"]))
         observation = _evidence_value(db, run["run_id"], graph["evidence_id"], "graph.observation")
-        order = [row[0] for row in db.execute("SELECT ticket_number FROM run_graph_scope_order "
-                                               "WHERE run_id=? AND snapshot_id=? ORDER BY position",
-                                               (run["run_id"], root["value_graph_snapshot_id"]))]
-        slots = [row[0] for row in db.execute("SELECT ticket_number FROM run_graph_ticket_slots "
-                                               "WHERE run_id=? AND snapshot_id=? ORDER BY position",
-                                               (run["run_id"], root["value_graph_snapshot_id"]))]
+        scope = db.execute("SELECT position,ticket_number FROM run_graph_scope_order "
+                           "WHERE run_id=? AND snapshot_id=? ORDER BY position",
+                           (run["run_id"], root["value_graph_snapshot_id"])).fetchall()
+        ticket_slots = db.execute("SELECT position,ticket_number,number_present FROM run_graph_ticket_slots "
+                                  "WHERE run_id=? AND snapshot_id=? ORDER BY position",
+                                  (run["run_id"], root["value_graph_snapshot_id"])).fetchall()
+        order = [row["ticket_number"] for row in scope]
         if (not isinstance(title, str) or not isinstance(body, str)
-                or not isinstance(observation, dict) or order != slots
-                or order != [ticket] or not isinstance(observation.get("tickets"), list)
-                or len(observation["tickets"]) != 1
+                or not isinstance(observation, dict) or not order or ticket not in order
+                or len(set(order)) != len(order)
+                or [row["position"] for row in scope] != list(range(len(scope)))
+                or [(row["position"], row["ticket_number"], row["number_present"])
+                    for row in ticket_slots] != [(index, number, 1) for index, number in enumerate(order)]
+                or not isinstance(observation.get("tickets"), list)
+                or len(observation["tickets"]) != len(order)
                 or observation.get("fields", {}).get("order_source") != "github_sub_issues"):
             raise MigrationRefused("source_requirements")
-        item = observation["tickets"][0]
+        member_numbers = [row[0] for row in db.execute(
+            "SELECT ticket_number FROM run_graph_members WHERE run_id=? AND version_id=? ORDER BY ticket_number",
+            (run["run_id"], graph["version_id"]))]
+        blocker_slots = db.execute(
+            "SELECT ticket_position,position,edge_id,number_present FROM run_graph_blocker_slots "
+            "WHERE run_id=? AND snapshot_id=? ORDER BY ticket_position,position",
+            (run["run_id"], root["value_graph_snapshot_id"])).fetchall()
+        edges = db.execute(
+            "SELECT edge_id,ticket_number,blocker_number FROM run_graph_edges "
+            "WHERE run_id=? AND version_id=?", (run["run_id"], graph["version_id"])).fetchall()
+        edge_by_id = {row["edge_id"]: row for row in edges}
+        if member_numbers != sorted(order) or len(edge_by_id) != len(edges):
+            raise MigrationRefused("source_requirements")
+        frontier = db.execute("SELECT position,ticket_number FROM run_frontier WHERE run_id=? ORDER BY position",
+                              (run["run_id"],)).fetchall()
+        eligible = [number for number, item in zip(order, observation["tickets"])
+                    if isinstance(item, dict) and isinstance(item.get("eligibility"), dict)
+                    and item["eligibility"].get("eligible") is True]
+        if ([row["position"] for row in frontier] != list(range(len(frontier)))
+                or [row["ticket_number"] for row in frontier] != eligible or ticket not in eligible):
+            raise MigrationRefused("source_selection")
         try:
-            issue = Issue(ticket, item["title"], item["body"], item["state"],
-                          frozenset(item["labels"]),
-                          tuple(Blocker(edge["number"], edge["state"]) for edge in item["blocked_by"]))
+            issues = []
+            used_edges: set[str] = set()
+            for position, number in enumerate(order):
+                item = observation["tickets"][position]
+                matching = [row for row in blocker_slots if row["ticket_position"] == position]
+                if ([row["position"] for row in matching] != list(range(len(matching)))
+                        or len(matching) != len(item["blocked_by"])):
+                    raise MigrationRefused("source_requirements")
+                blockers = []
+                for slot, value in zip(matching, item["blocked_by"]):
+                    edge = edge_by_id[slot["edge_id"]]
+                    if (slot["number_present"] != 1 or edge["ticket_number"] != number
+                            or edge["edge_id"] in used_edges):
+                        raise MigrationRefused("source_requirements")
+                    used_edges.add(edge["edge_id"])
+                    blockers.append(Blocker(edge["blocker_number"], value["state"]))
+                issues.append(Issue(number, item["title"], item["body"], item["state"],
+                                    frozenset(item["labels"]), tuple(blockers)))
+            if len(used_edges) != len(edges):
+                raise MigrationRefused("source_requirements")
             requirements = Requirements(ParentIssue(run["parent_number"], title, body,
-                                                    tuple(order), True), (issue,))
-        except (KeyError, TypeError, ValueError) as error:
+                                                    tuple(order), True), tuple(issues))
+        except (KeyError, IndexError, TypeError, ValueError) as error:
             raise MigrationRefused("source_requirements") from error
         parent_revision = Kernel._fingerprint({"title": title, "body": body})
         graph_revision = Kernel._fingerprint({
             "tickets": sorted(order),
-            "dependencies": {str(ticket): sorted(edge.number for edge in issue.blocked_by)},
+            "dependencies": {str(issue.number): sorted(edge.number for edge in issue.blocked_by)
+                             for issue in issues},
         })
         if (parent["revision"] != parent_revision
                 or root["value_accepted_parent_spec_revision"] != parent_revision
                 or graph["revision"] != graph_revision
                 or root["value_accepted_ticket_graph_revision"] != graph_revision
-                or item["content_revision"] != Kernel._fingerprint({"title": issue.title, "body": issue.body})):
+                or any(item["content_revision"] != Kernel._fingerprint({
+                    "title": issue.title, "body": issue.body})
+                    for item, issue in zip(observation["tickets"], issues))):
             raise MigrationRefused("source_revision")
         base = _one(db, "SELECT * FROM run_condition_base WHERE run_id=?", (run["run_id"],))
         if (not base["value_sha"] or not base["value_branch"]
@@ -226,11 +273,12 @@ def _git(root: Path, *args: str) -> str:
 def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repository_root: Path,
                        source_ref: str, checkout: Path, final_checkout: Path,
                        development_profile: Profile, review_profile: Profile,
-                       publication_profile: Profile) -> Kernel:
-    """Convert one idle selected Ticket; publish only after full copied-state validation.
+                       publication_profile: Profile,
+                       additional_workspaces: Mapping[int, tuple[str, Path]] | None = None) -> Kernel:
+    """Convert an idle accepted graph; publish only after full copied-state validation.
 
-    The caller supplies a new, unused work identity because the old selection
-    has not allocated a Ticket branch or worktree. All later states are refused.
+    The caller supplies new, unused work identities because no old Ticket in
+    this no-Attempt state has allocated a branch or worktree.
     """
     destination = destination.absolute()
     repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.resolve(),
@@ -250,31 +298,44 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _initial_facts(captured.path)
+        additional = additional_workspaces or {}
+        expected_additional = set(facts.requirements.parent.sub_issue_numbers) - {facts.ticket_number}
+        if set(additional) != expected_additional:
+            raise MigrationRefused("new_ticket_workspaces")
+        workspaces = {facts.ticket_number: (source_ref, checkout), **{
+            number: (ref, path.resolve()) for number, (ref, path) in additional.items()}}
+        if (len({ref for ref, _ in workspaces.values()}) != len(workspaces)
+                or len({path for _, path in workspaces.values()}) != len(workspaces)):
+            raise MigrationRefused("new_ticket_workspaces")
         if _git(repository_root, "rev-parse", "--show-toplevel") != str(repository_root):
             raise MigrationRefused("source_git")
-        for ref in (source_ref, f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}"):
+        for ref in (*[value[0] for value in workspaces.values()],
+                    f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}"):
             _git(repository_root, "check-ref-format", ref)
         if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{facts.run_branch}^{{commit}}") != facts.base_sha:
             raise MigrationRefused("source_git")
         if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{facts.base_branch}^{{commit}}") != facts.base_sha:
             raise MigrationRefused("source_git")
-        if _git(repository_root, "for-each-ref", "--format=%(refname)", source_ref):
-            raise MigrationRefused("new_source_ref_exists")
         tree = _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")
         if not tree:
             raise MigrationRefused("source_git")
-        if (not checkout.is_dir() or _git(checkout, "rev-parse", "--show-toplevel") != str(checkout)
-                or _git(checkout, "rev-parse", "HEAD") != facts.base_sha):
-            raise MigrationRefused("new_checkout")
-        if _git(checkout, "status", "--porcelain"):
-            raise MigrationRefused("new_checkout_dirty")
-        common_value = Path(_git(checkout, "rev-parse", "--git-common-dir") or "")
-        common = (common_value if common_value.is_absolute() else checkout / common_value).resolve()
-        if common != (repository_root / ".git").resolve():
-            raise MigrationRefused("new_checkout")
-        if checkout == repository_root:
-            raise MigrationRefused("new_checkout")
-        if final_checkout == checkout or final_checkout == repository_root or final_checkout.exists():
+        common = (repository_root / ".git").resolve()
+        for ref, path in workspaces.values():
+            if not ref.startswith("refs/heads/") or ref == "refs/heads/":
+                raise MigrationRefused("new_source_ref")
+            if _git(repository_root, "for-each-ref", "--format=%(refname)", ref):
+                raise MigrationRefused("new_source_ref_exists")
+            if (not path.is_dir() or path == repository_root
+                    or _git(path, "rev-parse", "--show-toplevel") != str(path)
+                    or _git(path, "rev-parse", "HEAD") != facts.base_sha):
+                raise MigrationRefused("new_checkout")
+            if _git(path, "status", "--porcelain"):
+                raise MigrationRefused("new_checkout_dirty")
+            common_value = Path(_git(path, "rev-parse", "--git-common-dir") or "")
+            found_common = (common_value if common_value.is_absolute() else path / common_value).resolve()
+            if found_common != common:
+                raise MigrationRefused("new_checkout")
+        if final_checkout == repository_root or final_checkout in {path for _, path in workspaces.values()} or final_checkout.exists():
             raise MigrationRefused("new_final_checkout")
         subject = f"ticket:{facts.ticket_number}"
         profile_document = {"preset": None, "profiles": {
@@ -291,10 +352,11 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
         )
         spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
                        facts.graph_revision,
-                       (Delivery(subject, DeliveryKind.TICKET, facts.ticket_number, "source-verified",
-                                 Commit(facts.base_sha, tree or ""), source_ref,
-                                 f"refs/heads/{facts.run_branch}", checkout=str(checkout),
-                                 owned_root=str(checkout.parent), common_git_dir=str(common)),
+                       (*tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "source-verified",
+                                        Commit(facts.base_sha, tree or ""), workspaces[number][0],
+                                        f"refs/heads/{facts.run_branch}", checkout=str(workspaces[number][1]),
+                                        owned_root=str(workspaces[number][1].parent), common_git_dir=str(common))
+                               for number in facts.requirements.parent.sub_issue_numbers),
                         Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN, facts.parent_number,
                                  facts.parent_revision, Commit(facts.base_sha, tree or ""),
                                  f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}",
@@ -313,7 +375,8 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
             # The old selection has no Ticket workspace or branch yet. Enter
             # the kernel's existing durable workspace effect so its normal
             # CAS, receipt, and unknown-outcome path allocates the new ref.
-            tx.execute("UPDATE subjects SET phase='workspace' WHERE id=?", (subject,))
+            for number in facts.requirements.parent.sub_issue_numbers:
+                tx.execute("UPDATE subjects SET phase='workspace' WHERE id=?", (f"ticket:{number}",))
             tx.execute("DELETE FROM history")
             for event in facts.timeline:
                 at = _created_at_epoch(event["value_at"])
@@ -331,15 +394,21 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
             tx.put(subject, "v6_import_identity", wire_json({
                 "source_sha256": snapshot.sha256, "source_protocol": snapshot.source_protocol,
                 "new_source_ref": source_ref, "new_checkout": str(checkout),
+                "new_ticket_workspaces": {str(number): {"source_ref": ref, "checkout": str(path)}
+                                          for number, (ref, path) in workspaces.items()},
                 "new_final_checkout": str(final_checkout),
                 "old_run_branch": facts.run_branch, "old_base_sha": facts.base_sha,
                 "new_profile_source": "explicit-migration-input",
                 "new_profiles": {key: asdict(value) for key, value in profiles.items()},
             }))
         status = kernel.status(subject)
+        selected = next(issue for issue in facts.requirements.issues if issue.number == facts.ticket_number)
         if (status["phase"] != "workspace" or status["pending_attempt"] is not None
                 or status["revision"] != Kernel._fingerprint({
-                    "title": facts.requirements.issues[0].title, "body": facts.requirements.issues[0].body})):
+                    "title": selected.title, "body": selected.body})):
+            raise MigrationRefused("converted_state")
+        if any(kernel.status(f"ticket:{number}")["phase"] != "workspace"
+               for number in facts.requirements.parent.sub_issue_numbers):
             raise MigrationRefused("converted_state")
         if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size
                for suffix in ("-wal", "-journal")):

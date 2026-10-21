@@ -12,15 +12,25 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Callable, Mapping, Sequence
 
+from agent_run.agent_profiles import resolve_profiles
+from agent_run.prompt_resources import resolve_resources
+
 from .effects import LocalGit
 from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_worktree
 from .kernel import Kernel
-from .model import (AgentCall, Checks, Commit, Delivery, DeliveryKind, Effect, EffectResult,
+from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult,
                     KernelError, Policy, PullRequest, Requirements, Role, RunSpec, Step, World, wire_json)
 
 
 class LostResponse(OSError):
     pass
+
+
+def fixture_inputs() -> CreationInputs:
+    """Explicit fixture configuration; never an implicit production fallback."""
+    return CreationInputs(resolve_profiles(preset="economy"), resolve_resources("zh"),
+                          {"source": "host"}, {"source": "host"}, {"enabled": False},
+                          {"source": "explicit-synthetic-fixture", "profile_preset": "economy"})
 
 
 def review_result(outcome: str) -> dict[str, Any]:
@@ -72,7 +82,9 @@ class OfflinePort:
                 CREATE TABLE receipts(id TEXT PRIMARY KEY,body BLOB NOT NULL);
                 CREATE TABLE writes(position INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT,subject TEXT,intent TEXT,facts BLOB);
                 CREATE TABLE closed(issue INTEGER PRIMARY KEY,intent TEXT,actor TEXT,merge_sha TEXT);
-                CREATE TABLE comments(intent TEXT PRIMARY KEY,issue INTEGER,actor TEXT,body BLOB);
+                CREATE TABLE comments(intent TEXT PRIMARY KEY,issue INTEGER,actor TEXT,body BLOB,
+                    baseline_event_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
                 CREATE TABLE refs(ref TEXT PRIMARY KEY,sha TEXT NOT NULL);
                 CREATE TABLE links(issue INTEGER PRIMARY KEY,ref TEXT NOT NULL,sha TEXT NOT NULL,intent TEXT NOT NULL);
             """)
@@ -111,7 +123,7 @@ class OfflinePort:
                             source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout),
                             owned_root=str(checkout.parent.resolve()), common_git_dir=str((self.git.root / ".git").resolve()))
         spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy(),
-                       language="zh", repository_root=str(self.git.root.resolve()))
+                       language="zh", repository_root=str(self.git.root.resolve()), inputs=fixture_inputs())
         return spec, delivery
 
     def pull_request(self, subject: str) -> PullRequest | None:
@@ -141,7 +153,8 @@ class OfflinePort:
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
                      target, source, pr, checks,
                      delivery.completion_revision,
-                     self.ancestry(source, target, witnesses))
+                     self.ancestry(source, target, witnesses), "offline-publisher",
+                     None if spec.inputs is None else spec.inputs.runner_identity)
 
     def ancestry(self, source: Commit | None, target: Commit, witnesses: Sequence[str]) -> tuple[tuple[str, str], ...]:
         before_heads = set(witnesses) | {target.sha}
@@ -310,12 +323,19 @@ class OfflinePort:
                     self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
                     self._write_pr_in(db, effect.subject, pr)
             elif operation == "completion_comment":
+                with sqlite3.connect(self.database) as db:
+                    closed = db.execute("SELECT rowid FROM closed WHERE issue=?", (payload["issue"],)).fetchone()
+                if closed is not None:
+                    return EffectResult("third")
                 if authorize is not None:
                     authorize()
                 with sqlite3.connect(self.database) as db:
-                    db.execute("INSERT OR IGNORE INTO comments VALUES (?,?,?,?)",
+                    db.execute("INSERT OR IGNORE INTO comments(intent,issue,actor,body,baseline_event_id) VALUES (?,?,?,?,0)",
                                (effect.effect_id, payload["issue"], effect.actor, wire_json(dict(payload))))
             elif operation == "close":
+                observed = self.reconcile(effect)
+                if observed.disposition != "prior":
+                    return observed
                 if authorize is not None:
                     authorize()
                 with sqlite3.connect(self.database) as db:
@@ -416,8 +436,16 @@ class OfflinePort:
                     return EffectResult("prior")
                 return EffectResult("target" if closed == (effect.effect_id, effect.actor, effect.payload["merge_sha"]) else "third")
             if operation == "completion_comment":
-                comment = db.execute("SELECT actor,body FROM comments WHERE intent=?", (effect.effect_id,)).fetchone()
-                return EffectResult("prior" if comment is None else "target" if comment[0] == effect.actor and comment[1] == wire_json(dict(effect.payload)) else "third")
+                comment = db.execute("SELECT actor,body,rowid,baseline_event_id,created_at FROM comments WHERE intent=?", (effect.effect_id,)).fetchone()
+                if comment is None:
+                    return EffectResult("prior")
+                if comment[0] != effect.actor or comment[1] != wire_json(dict(effect.payload)):
+                    return EffectResult("third")
+                intent = {"run_id": effect.execution.run_id, "subject": effect.subject, "issue": effect.payload["issue"],
+                          "merge_sha": effect.payload["merge_sha"], "actor": effect.actor, "effect_id": effect.effect_id,
+                          "pr_number": effect.pr_number, "kind": effect.payload["kind"], "comment_id": comment[2],
+                          "baseline_event_id": comment[3], "comment_created_at": comment[4], "comment_body": comment[1].decode()}
+                return EffectResult("target", raw={"close_intent": intent})
             receipt = db.execute("SELECT body FROM receipts WHERE id=?", (effect.effect_id,)).fetchone()
         if receipt is None:
             return EffectResult("prior")
@@ -570,13 +598,27 @@ class Scenario:
             self.kernel.receive(step.call, self.agent(step.call))
         elif step.kind == "effect" and step.effect is not None:
             effect = step.effect
-            if self.kernel.dispatch(effect, self.execution, self.world()):
+            dispatched = effect.operation != "close" and self.kernel.dispatch(effect, self.execution, self.world())
+
+            def authorize() -> None:
+                nonlocal dispatched
+                if not dispatched:
+                    if not self.kernel.dispatch(effect, self.execution, self.world()):
+                        raise KernelError("operation_cancelled")
+                    dispatched = True
+                self.kernel.guard_effect(effect, self.execution, self.world())
+
+            if dispatched or effect.operation == "close":
                 try:
-                    acknowledgement = self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
+                    acknowledgement = self.port.execute(effect, authorize)
                 except LostResponse as error:
                     self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
                 except Exception as error:
-                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                    if dispatched:
+                        self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                    else:
+                        self.kernel.reconcile(effect, EffectResult("unknown", raw={"type": type(error).__name__, "message": str(error)}),
+                                              self.execution, self.world())
                     raise
                 else:
                     if effect.operation == "issue_link":
@@ -793,7 +835,8 @@ class GraphScenario(Scenario):
         final = Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,
                          run_ref, "refs/heads/main", checkout=str(work / "final-1"), owned_root=str(work), common_git_dir=common)
         deliveries.append(final)
-        self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy())
+        self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy(),
+                           language="zh", repository_root=str(self.port.git.root.resolve()), inputs=fixture_inputs())
         self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=requirements)
         self.execution = self.kernel.claim_executor("offline-executor")
         self.delivery = self.kernel.delivery(deliveries[0].key)
@@ -820,7 +863,7 @@ class GraphScenario(Scenario):
         return self.kernel.refresh(read)
 
     def world(self) -> World:
-        self.refresh()
+        receipt = self.refresh()
         self.delivery = self.kernel.delivery(self.delivery.key)
         status = self.kernel.status(self.delivery.key)
         source = self.port.remote_commit(self.delivery.source_ref)
@@ -829,9 +872,13 @@ class GraphScenario(Scenario):
             raise KernelError("remote_target_missing")
         pr = self.port.pull_request(self.delivery.key)
         checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
-        return World(status["source_parent_revision"], self.kernel.source_status()["observed_graph_revision"], status["source_revision"],
-                     target, source, pr, checks, status["completion_revision"],
-                     self.port.ancestry(source, target, [status["source_sha"], *([status["resync"]["target_sha"]] if status["resync"]["target_sha"] is not None else [])]))
+        revision = (next(item["revision"] for item in receipt["observed_issues"] if item["issue"] == self.delivery.issue)
+                    if self.delivery.kind == DeliveryKind.TICKET else receipt["observed_parent_revision"])
+        completion = next(item["completion_revision"] for item in receipt["completion_revisions"] if item["subject"] == self.delivery.key)
+        return World(receipt["observed_parent_revision"], receipt["observed_graph_revision"], revision,
+                     target, source, pr, checks, completion,
+                     self.port.ancestry(source, target, [status["source_sha"], *([status["resync"]["target_sha"]] if status["resync"]["target_sha"] is not None else [])]),
+                     "offline-publisher", None if self.spec.inputs is None else self.spec.inputs.runner_identity)
 
     def agent(self, call: AgentCall) -> bytes:
         raw = super().agent(call)
@@ -840,12 +887,12 @@ class GraphScenario(Scenario):
         return raw
 
     def activate_final(self) -> str:
-        self.refresh()
+        receipt = self.refresh()
         head = self.port.remote_commit("refs/heads/run")
         default = self.port.remote_commit("refs/heads/main")
         if head is None or default is None:
             raise KernelError("final_source_missing")
-        records = self.kernel.source_status()["completions"]
+        records = receipt["completions"]
         ancestry = tuple((record["merge_sha"], head.sha) for record in records if self.port.git.is_ancestor(record["merge_sha"], head.sha))
         return self.kernel.activate_final(self.execution, head, default, ancestry=ancestry)
 

@@ -36,6 +36,7 @@ def identity() -> str:
 
 class Kernel:
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
+    REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref")
     def __init__(self, path: Path) -> None:
         self.storage = Storage(path)
         self.clock: Callable[[], float] = time.time
@@ -1048,6 +1049,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run, job = self._owned(tx, effect.subject, execution)
             row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            self._guard_publisher(tx, run, row, world)
             if effect.operation in self.CLEANUP:
                 if (row["status"] != "sent" or run["stopped"] or run["blocked"] or self._gates(tx, effect.subject)
                         or not self._cleanup_current(tx, job, row) or self._effect(tx, row, execution) != effect):
@@ -1375,7 +1377,7 @@ class Kernel:
 
     def _allocate(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, execution: Execution,
                   world: World, allow_agent: bool, pending: sqlite3.Row | None = None,
-                  recovery: sqlite3.Row | None = None) -> Step:
+                  recovery: sqlite3.Row | None = None, *, output_error: str | None = None) -> Step:
         subject = job["id"]
         if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
             return Step("waiting", subject, "previous_invocation_exit")
@@ -1447,6 +1449,8 @@ class Kernel:
                 blocked = artifact(role, tx.get(previous_output["raw_id"], subject))
                 context["prior_human_blockers"] = (blocked["human_blockers"] if role != Role.REVIEW else
                     [lane["evidence"] for lane in blocked["checks"].values() if lane["status"] == "blocked"])
+        if output_error is not None:
+            context.update(readonly=True, contract_error=output_error[:2000])
         context["semantic_continuation"] = pending is not None
         responses = tx.all("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"]))
         if responses:
@@ -1456,6 +1460,8 @@ class Kernel:
         backend_thread = tx.one("SELECT backend_id FROM threads WHERE id=?", (thread_id,))[0]
         mode = "fresh" if backend_thread is None else "resume"
         ordinal = 0 if previous_output is None else previous_output["ordinal"]
+        if output_error is not None:
+            ordinal += 1
         if ordinal and backend_thread is not None:
             mode = "output-repair"
         allocated_at = self.clock()
@@ -1702,6 +1708,8 @@ class Kernel:
             self._gate(tx, subject, "invalid_artifact", evidence=attempt["result_id"])
             return Step("paused", subject, "invalid_artifact")
         if self.clock() >= previous["deadline_at"]:
+            if attempt["resume_action"] is not None:
+                return self._allocate(tx, run, job, execution, world, allow_agent, attempt, output_error=error)
             self._gate(tx, subject, "execution_failed", evidence=attempt["result_id"])
             return Step("paused", subject, "invocation_deadline_exceeded")
         if not allow_agent:
@@ -1799,6 +1807,23 @@ class Kernel:
             raise KernelError("publication_tree_changed")
         if operation == "validation_checkout" and commit["sha"] != payload["reviewed_commit"]:
             raise KernelError("validation_commit_changed")
+        if operation == "completion_comment":
+            self._comment_close_intent(run, job, row, payload, result)
+
+    def _comment_close_intent(self, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row,
+                              payload: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
+        raw = result.get("raw")
+        intent = raw.get("close_intent") if isinstance(raw, dict) else None
+        binding = {"run_id": run["id"], "subject": job["id"], "issue": payload["issue"],
+                   "merge_sha": row["before_sha"], "actor": row["actor"], "effect_id": row["id"],
+                   "pr_number": row["pr_number"], "kind": payload["kind"]}
+        if (not isinstance(intent, dict) or any(intent.get(key) != value for key, value in binding.items())
+                or type(intent.get("baseline_event_id")) is not int or intent["baseline_event_id"] < 0
+                or type(intent.get("comment_id")) is not int or intent["comment_id"] <= 0
+                or not isinstance(intent.get("comment_created_at"), str) or not intent["comment_created_at"]
+                or not isinstance(intent.get("comment_body"), str) or not intent["comment_body"]):
+            raise KernelError("foreign_close_intent")
+        return dict(intent)
 
     def _settle_stale_effect(self, tx: Transaction, job: sqlite3.Row, row: sqlite3.Row) -> Step:
         """Save the original outcome without granting any successor operation."""
@@ -1981,8 +2006,12 @@ class Kernel:
             return self._prepare_effect(tx, run, job, execution, world, "completion_comment", before=job["merge_sha"],
                                         payload={"issue": job["issue"], "merge_sha": job["merge_sha"], "gate_mode": job["gate_mode"]})
         if phase == "close":
+            comment = tx.one("SELECT * FROM effects WHERE subject=? AND generation=? AND operation='completion_comment' AND status='confirmed' AND before_sha=?",
+                             (subject, job["generation"], job["merge_sha"]))
+            intent = self._comment_close_intent(run, job, comment, json.loads(tx.get(comment["payload_id"], subject)),
+                                                json.loads(tx.get(comment["receipt_id"], subject)))
             return self._prepare_effect(tx, run, job, execution, world, "close", before=job["merge_sha"],
-                                        payload={"issue": job["issue"], "merge_sha": job["merge_sha"]})
+                                        payload={"issue": job["issue"], "merge_sha": job["merge_sha"], "close_intent": intent})
         raise KernelError("prototype_step_unimplemented", phase)
 
     def _narrative_body(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, narrative: str) -> str:
@@ -2045,6 +2074,7 @@ class Kernel:
                         world: World, operation: str, *, before: str, after: str | None = None,
                         payload: dict[str, Any] | None = None) -> Step:
         subject, effect_id = job["id"], identity()
+        actor = self._publisher_actor(tx, run, world) if operation in self.REMOTE else None
         body = dict(payload or {})
         body["intent_token"] = effect_id
         body["integrated_sha"] = job["integrated_sha"]
@@ -2063,10 +2093,27 @@ class Kernel:
                    (effect_id, subject, operation, execution.owner, execution.epoch, run["parent_revision"],
                     run["graph_revision"], job["revision"], job["generation"], job["source_ref"], job["target_ref"],
                     before, after, job["candidate_sha"], job["candidate_tree"], world.target.sha, world.target.tree,
-                    job["pr_number"], "offline-publisher", payload_id))
+                    job["pr_number"], actor, payload_id))
         self._event(tx, subject, "effect_prepared", effect_id, payload_id)
         row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
         return Step("effect", subject, effect=self._effect(tx, row, execution))
+
+    def _publisher_actor(self, tx: Transaction, run: sqlite3.Row, world: World) -> str:
+        selected = self._inputs(tx, run).get("runner_identity")
+        actor = world.publisher_actor
+        if (selected is None or not isinstance(actor, str) or not actor.strip() or actor != actor.strip()
+                or world.publisher_identity != selected):
+            raise KernelError("publisher_identity_unproven")
+        placeholders = ",".join("?" for _ in self.REMOTE)
+        previous = tx.rows(f"SELECT actor FROM effects WHERE operation IN ({placeholders}) AND actor IS NOT NULL AND actor!=? LIMIT 1",
+                           (*self.REMOTE, actor))
+        if previous:
+            raise KernelError("publisher_identity_changed")
+        return actor
+
+    def _guard_publisher(self, tx: Transaction, run: sqlite3.Row, effect: sqlite3.Row, world: World) -> None:
+        if effect["operation"] in self.REMOTE and self._publisher_actor(tx, run, world) != effect["actor"]:
+            raise KernelError("publisher_identity_changed")
 
     def dispatch(self, effect: Effect, execution: Execution, world: World) -> bool:
         """Recheck authority immediately before the single external operation."""
@@ -2077,6 +2124,7 @@ class Kernel:
                 return False
             if self._effect(tx, row, execution) != effect:
                 raise KernelError("effect_binding")
+            self._guard_publisher(tx, run, row, world)
             if run["stopped"] or run["blocked"] or self._gates(tx, effect.subject):
                 return False
             if effect.operation in self.CLEANUP:
@@ -2119,7 +2167,18 @@ class Kernel:
             row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
             if row["status"] in {"confirmed", "observed"}:
                 return Step("progress", effect.subject)
-            if row["status"] != "sent":
+            original_target = row["status"] == "prepared" and row["attempts"] > 0 and result.disposition == "target"
+            if row["status"] == "prepared" and not original_target:
+                run, _ = self._owned(tx, effect.subject, execution)
+                if self._effect(tx, row, execution) != effect or result.disposition == "prior":
+                    raise KernelError("effect_not_dispatched")
+                evidence = tx.put(effect.subject, "effect_pre_dispatch_observation", wire_json(asdict(result)))
+                self._gate(tx, effect.subject, "write_conflict" if result.disposition in {"target", "third"} else "write_result_unknown",
+                           evidence=evidence)
+                self._event(tx, effect.subject, "effect_pre_dispatch_observed", effect.effect_id, evidence)
+                self._finish_final_failure(tx, run)
+                return Step("paused", effect.subject, "write_not_dispatched")
+            if row["status"] != "sent" and not original_target:
                 raise KernelError("effect_not_dispatched")
             if self._effect(tx, row, effect.execution) != effect:
                 raise KernelError("effect_binding")
@@ -2291,7 +2350,9 @@ class Kernel:
         elif operation == "close":
             phase = "complete"
             if run["source_sequence"] is not None and job["kind"] == DeliveryKind.TICKET:
-                comment = tx.one("SELECT id FROM effects WHERE subject=? AND generation=? AND operation='completion_comment' AND status='confirmed' ORDER BY rowid DESC LIMIT 1", (subject, job["generation"]))
+                payload = json.loads(tx.get(row["payload_id"], subject))
+                comment = tx.one("SELECT id FROM effects WHERE id=? AND subject=? AND generation=? AND operation='completion_comment' AND status='confirmed'",
+                                 (payload["close_intent"]["effect_id"], subject, job["generation"]))
                 if not job["merge_sha"] or not job["publication_sha"] or not job["pr_number"] or not job["gate_mode"]:
                     raise KernelError("completion_evidence_missing")
                 tx.execute("INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",

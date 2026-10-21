@@ -14,8 +14,21 @@ from agent_run_kernel.migration import MigrationRefused, capture_v6
 from agent_run_kernel.migration_conversion import convert_initial_v6
 from agent_run_kernel.migration_active import convert_returned_publication_v6
 from agent_run_kernel.migration_completed import convert_completed_ticket_v6
-from agent_run_kernel.model import Commit, Policy, Profile, RunSpec, World
-from agent_run_kernel.offline import OfflinePort, Scenario
+from agent_run_kernel.kernel import Kernel
+from agent_run_kernel.model import (Commit, CreationInputs, KernelError, Policy, Profile,
+                                    Requirements, RunSpec, World)
+from agent_run_kernel.offline import GraphScenario, OfflinePort, Scenario
+
+
+def _imported_inputs(kernel: Kernel) -> CreationInputs:
+    """Use the converter's frozen native material, never the current user defaults."""
+    with kernel.storage.transaction(write=False) as tx:
+        inputs = tx.one("SELECT subject,material_id FROM run_inputs")
+        body = json.loads(tx.get(inputs["material_id"], inputs["subject"]))
+        revision = tx.one("SELECT subject,material_id FROM profile_revisions WHERE id=1")
+        profiles = json.loads(tx.get(revision["material_id"], revision["subject"]))
+    return CreationInputs(profiles, body["prompt_resources"], body["worker_identity"],
+                          body["runner_identity"], body["notifications"], body["provenance"])
 
 
 def test_fixed_c696_unknown_display_refuses_initial_conversion_without_replay(tmp_path: Path) -> None:
@@ -114,7 +127,8 @@ def test_fixed_4aba_v6_copy_converts_and_new_runtime_completes_ticket(tmp_path: 
     scenario.initial = port.git.commit("refs/heads/main")
     scenario.spec = RunSpec(facts["run"]["run_id"], facts["run"]["repository"],
                             facts["run"]["parent_number"], initial["parent_revision"],
-                            initial["graph_revision"], (delivery,), Policy())
+                            initial["graph_revision"], (delivery,), Policy(),
+                            inputs=_imported_inputs(kernel))
     scenario.delivery = delivery
     scenario.kernel = kernel
     scenario.execution = kernel.claim_executor("fixed-oracle-executor")
@@ -131,6 +145,97 @@ def test_fixed_4aba_v6_copy_converts_and_new_runtime_completes_ticket(tmp_path: 
     assert kernel.status(delivery.key)["phase"] == "complete"
     assert any(write["operation"] == "merge" for write in port.writes())
     assert any(write["operation"] == "completion_comment" for write in port.writes())
+    assert source.read_bytes() == snapshot.path.read_bytes()
+
+
+def test_fixed_13e_idle_graph_converts_then_completes_dependencies_and_final(tmp_path: Path) -> None:
+    oracle = Path(__file__).resolve().parents[3] / "results" / "kernel-initial-graph-observation-v2"
+    source = oracle / "kernel-initial-graph-v6.sqlite3"
+    bundle = oracle / "kernel-initial-graph-v6.bundle"
+    github = oracle / "kernel-initial-graph-github.json"
+    observed = oracle / "kernel-initial-graph-v6.json"
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == "eb74936b5b71b194ca657a617b5ba078c31e689bed55e040d9f22fd438e827b8"
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == "5f4f9374d94a96c915d39862e1c491d72f74e3c0a65eec58bcc8cb72dd7043fb"
+    assert hashlib.sha256(github.read_bytes()).hexdigest() == "9dccc4637568d2b597e2dd0292b4a504260d022967bf65962723de1e22c05ab4"
+    assert hashlib.sha256(observed.read_bytes()).hexdigest() == "426ceb76f15040f674fb04df2e1f112c86fc41e562f68d2687541d3abb4fd2f9"
+    facts = json.loads(observed.read_text(encoding="utf-8"))
+    github_facts = json.loads(github.read_text(encoding="utf-8"))
+    requirements = Requirements.from_wire(github_facts)
+    assert facts["order"] == [2, 3] and facts["layout"]["active_job_id"] == "ticket:2:selection"
+    snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
+    root = tmp_path / "new-runtime"
+    port = OfflinePort.create(root)
+    run_branch = facts["root"]["value_run_branch"]
+    base_sha = facts["refs"][run_branch][0]
+    assert github_facts["default_branch"] == "main"
+    assert facts["refs"][run_branch][0] == github_facts["default_head_sha"]
+    port.git.run("fetch", str(bundle), "refs/heads/main:refs/remotes/v6/main",
+                 f"refs/heads/{run_branch}:refs/remotes/v6/run")
+    assert port.git.commit("refs/remotes/v6/main").sha == base_sha
+    assert port.git.commit("refs/remotes/v6/run").sha == base_sha
+    port.git.run("reset", "--hard", base_sha)
+    port.git.run("update-ref", f"refs/heads/{run_branch}", base_sha)
+    with sqlite3.connect(port.database) as db:
+        db.execute("UPDATE refs SET sha=? WHERE ref='refs/heads/main'", (base_sha,))
+        db.execute("INSERT INTO refs VALUES (?,?)", (f"refs/heads/{run_branch}", base_sha))
+    work = root / "work"
+    work.mkdir()
+    for number in (2, 3):
+        port.git.run("worktree", "add", "--detach", str(work / f"ticket-{number}"), base_sha)
+    refs = {number: f"refs/heads/agent-run/{facts['run']['run_id']}/converted-ticket-{number}"
+            for number in (2, 3)}
+    kernel = convert_initial_v6(
+        snapshot, root / "kernel.sqlite3", repository_root=port.git.root,
+        source_ref=refs[2], checkout=work / "ticket-2", final_checkout=work / "final",
+        development_profile=Profile("fixture-development", "high"),
+        review_profile=Profile("fixture-review", "high"),
+        publication_profile=Profile("fixture-publication", "high"),
+        additional_workspaces={3: (refs[3], work / "ticket-3")})
+    assert all(port.ref_commit(ref) is None for ref in refs.values())
+    assert [kernel.status(f"ticket:{number}")["phase"] for number in (2, 3)] == ["workspace", "workspace"]
+    assert kernel.source_status()["remaining"] == {"ticket:3": "blocked_by_incomplete_tickets"}
+    scenario = GraphScenario.__new__(GraphScenario)
+    scenario.requirements = requirements
+    scenario.script = None
+    scenario.port = port
+    scenario.initial = port.git.commit("refs/heads/main")
+    scenario.spec = RunSpec(facts["run"]["run_id"], facts["run"]["repository"],
+                            facts["run"]["parent_number"], kernel.status("ticket:2")["parent_revision"],
+                            kernel.status("ticket:2")["graph_revision"],
+                            tuple(kernel.delivery(f"ticket:{number}") for number in (2, 3)), Policy(),
+                            inputs=_imported_inputs(kernel))
+    scenario.kernel = kernel
+    scenario.execution = kernel.claim_executor("fixed-graph-executor")
+    scenario.delivery = kernel.delivery("ticket:2")
+    scenario.reviews = ["pass"]
+    scenario.checks = ["none"]
+    scenario.review_count = scenario.development_count = scenario.publication_count = 0
+    scenario.heads = []
+    scenario.role_calls = []
+    scenario.checkpoints = []
+    scenario.edits = None
+    scenario.reviewed_heads = []
+    base = port.remote_commit("refs/heads/main")
+    assert base is not None
+    with pytest.raises(KernelError, match="ticket_completion_required"):
+        kernel.activate_final(scenario.execution, base, base, ancestry=())
+    assert scenario.run().kind == "complete"
+    assert [entry["subject"] for entry in kernel.source_status()["completions"]] == ["ticket:2"]
+    scenario.select("ticket:3")
+    assert scenario.run().kind == "complete"
+    assert [entry["subject"] for entry in kernel.source_status()["completions"]] == ["ticket:2", "ticket:3"]
+    scenario.refresh()
+    head = port.remote_commit(f"refs/heads/{run_branch}")
+    default = port.remote_commit("refs/heads/main")
+    assert head is not None and default is not None
+    ancestry = tuple((entry["merge_sha"], head.sha) for entry in kernel.source_status()["completions"]
+                     if port.git.is_ancestor(entry["merge_sha"], head.sha))
+    final = kernel.activate_final(scenario.execution, head, default, ancestry=ancestry)
+    scenario.select(final)
+    assert scenario.run().kind == "approval"
+    kernel.control("approve", "fixed-graph-final-approval", subject=final, world=scenario.world())
+    assert scenario.run().kind == "complete"
+    assert kernel.status(final)["phase"] == "complete"
     assert source.read_bytes() == snapshot.path.read_bytes()
 
 def test_fixed_8d_returned_publication_consumes_old_raw_without_new_agent(tmp_path: Path) -> None:
@@ -202,7 +307,8 @@ def test_fixed_8d_returned_publication_consumes_old_raw_without_new_agent(tmp_pa
     scenario.port = port
     scenario.initial = port.git.commit("refs/heads/main")
     scenario.spec = RunSpec(facts["run_id"], facts["repository"], facts["parent_number"],
-                            current["parent_revision"], current["graph_revision"], (delivery,), Policy())
+                            current["parent_revision"], current["graph_revision"], (delivery,), Policy(),
+                            inputs=_imported_inputs(kernel))
     scenario.delivery = delivery
     scenario.kernel = kernel
     scenario.execution = kernel.claim_executor("returned-publication-executor")
