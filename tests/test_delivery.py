@@ -33,7 +33,6 @@ from agent_run.change_delivery import (
     ChangeDeliveryAdapter,
     ChangeDeliveryEngine,
     ChangeJobContract,
-    fallback_publication_context,
 )
 from agent_run.cli_presentation import _public_ci_recovery
 from agent_run.guidance_actions import next_action_fact
@@ -54,7 +53,7 @@ from agent_run.ticket_state import TicketState
 from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
 from agent_run.review_budget import TICKET_POLICY
 from agent_run.development_review import DevelopmentReview
-from agent_run.change_delivery_fallback import prepare_ticket_fallback
+from agent_run.change_delivery_fallback import fallback_publication_context, prepare_ticket_fallback
 
 from support.seeding import write_fixture
 from support.ticket_scenarios import published_ticket

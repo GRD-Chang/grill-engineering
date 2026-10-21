@@ -5,6 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent_run.development_review import DevelopmentReview
+from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.change_delivery_contracts import ChangeJobContract
+from agent_run.change_delivery_state import ChangeDeliveryStateStore
 from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github import GitHubReadError
 from agent_run.review_attempt import begin_review, consume_review_result
@@ -46,14 +49,20 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
         current_effective_revision=lambda **_kwargs: "revision",
     )
 
-    def review_work():
-        return DevelopmentReview(
-            git=SimpleNamespace(resolve=lambda _ref: "tree"), github=github, agents=None,
-            states=SimpleNamespace(save_run=lambda *_args: None,
-                                   ticket_pause_requested=lambda *_args: False),
+    def review_engine():
+        git = SimpleNamespace(resolve=lambda _ref: "tree")
+        states = SimpleNamespace(save_run=lambda *_args: None,
+                                 ticket_pause_requested=lambda *_args: False)
+        work = DevelopmentReview(git=git, github=github, agents=None, states=states)
+        return ChangeDeliveryEngine(
+            git=git, github=github, agents=None,
+            contract=ChangeJobContract(label="ticket-3", branch="ticket/3", base_branch="run",
+                                       review_budget_policy=TICKET_POLICY),
+            adapter=SimpleNamespace(), publisher=SimpleNamespace(),
+            state_store=ChangeDeliveryStateStore(states, "review-run"), work=work,
         )
 
-    step = review_work().advance_change(state, job, tmp_path, scope="ticket")
+    step = review_engine().advance(state, job, tmp_path)
     assert step.kind == DeliveryStepKind.WAITING
     assert status_reads == [11]
     assert state["external_wait"]["code"] == "github_read_failed"
@@ -65,7 +74,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     assert pending["pending_review_result"]["artifact"] == artifact.raw
     assert pending["pending_semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
     github.record_agent_run_status = lambda *_args, **_kwargs: None
-    review_work().advance_change(reloaded, pending, tmp_path, scope="ticket")
+    review_engine().advance(reloaded, pending, tmp_path)
     assert pending["phase"] == "accepted"
     assert "pending_review_result" not in pending
     assert "pending_semantic_attempt" not in pending
