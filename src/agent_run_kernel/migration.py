@@ -29,7 +29,7 @@ SOURCE_PROTOCOL = "sqlite-work-records-v6"
 _DATABASE_LIMIT = 256 * 1024 * 1024
 _SQLITE_PENDING_BYTE = 0x40000000
 _SQLITE_LOCK_BYTES = 512
-_REQUIRED_TABLES = frozenset({
+SOURCE_TABLES = frozenset({
     "schema_meta", "runs", "work_jobs", "work_attempts", "work_attempt_versions",
     "work_invocations", "work_evidence", "work_evidence_materials",
 })
@@ -51,8 +51,12 @@ class SourceSnapshot:
     table_rows: tuple[tuple[str, int], ...]
 
 
-@contextmanager
-def _offline_source(path: Path) -> Iterator[int]:
+def source_identity(path: Path) -> os.stat_result:
+    """Check the inode before opening it; this does not prove another Host's exit.
+
+    Closing any new descriptor for an already held source could release this
+    process's POSIX capture lock. Both capture and admission must refuse first.
+    """
     if path.is_symlink():
         raise MigrationRefused("source_symlink")
     info = path.stat()
@@ -71,6 +75,12 @@ def _offline_source(path: Path) -> Iterator[int]:
             continue
         if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
             raise MigrationRefused("source_not_offline")
+    return info
+
+
+@contextmanager
+def _offline_source(path: Path) -> Iterator[int]:
+    info = source_identity(path)
     descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         opened = os.fstat(descriptor)
@@ -140,7 +150,7 @@ def _inspect_copy(path: Path) -> tuple[str, tuple[tuple[str, int], ...]]:
         if len(schema) > 512 or any(kind not in {"table", "index"} for kind, _, _ in schema):
             raise MigrationRefused("snapshot_schema")
         tables = [name for kind, name, _ in schema if kind == "table"]
-        if not _REQUIRED_TABLES <= set(tables):
+        if not SOURCE_TABLES <= set(tables):
             raise MigrationRefused("snapshot_schema")
         metadata_count, metadata_size = connection.execute(
             "SELECT count(*),coalesce(sum(length(CAST(key AS BLOB))+length(CAST(value AS BLOB))),0) FROM schema_meta"

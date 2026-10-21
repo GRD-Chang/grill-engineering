@@ -29,7 +29,8 @@ from .model import (
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
 from .configuration import checkpoint_policy
-from .task_location import bind_task, locked_task, read_task
+from .task_location import bind_task, read_task
+from .legacy_admission import locked_admission
 
 
 def identity() -> str:
@@ -50,7 +51,7 @@ class Kernel:
         if spec.repository_root is None:
             raise KernelError("task_workspace_unknown")
         task = TaskKey(Path(spec.repository_root), spec.repository, spec.parent_issue)
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             prior = read_task(location)
             if prior is not None:
                 existing = cls(prior[1])
@@ -1005,7 +1006,7 @@ class Kernel:
     @classmethod
     def open_task(cls, task: TaskKey) -> Kernel | None:
         """Find unfinished work under the original Task admission lock."""
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             prior = read_task(location)
             if prior is None:
                 return None
@@ -1058,7 +1059,7 @@ class Kernel:
             elif continuation_of is not None:
                 raise KernelError("abandon_continuation_boundary")
             run_id, task = run["id"], self._task(run)
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             prior = read_task(location)
             if prior is not None and prior != (run_id, self.storage.path.resolve()):
                 if not Kernel(prior[1])._replaceable(task, prior[0]):
@@ -1136,7 +1137,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             run_id, task = run["id"], self._task(run)
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction() as tx:
@@ -1162,7 +1163,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             run_id, task = run["id"], self._task(run)
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction() as tx:
@@ -1174,7 +1175,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             run_id, task = run["id"], self._task(run)
-        with locked_task(task) as location:
+        with locked_admission(task) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction() as tx:
