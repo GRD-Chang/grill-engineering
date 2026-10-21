@@ -49,6 +49,7 @@ def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None,
     runner_identity: Mapping[str, Any] | None = None,
     timeout: float | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drain both pipes; never return a truncated patch or other Git result."""
     if input is not None and len(input) > MAX_GIT_OUTPUT_BYTES:
@@ -56,10 +57,16 @@ def run_git(
     data = input.encode() if input is not None else b""
     if len(data) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
-    from agent_run.runner_transport import runner_git_environment, redact_transport_output
-
-    remote = bool(arguments[1:2] and arguments[1] in {"clone", "fetch", "push", "pull", "ls-remote"})
-    environment = runner_git_environment(runner_identity, cwd=cwd) if remote else git_environment()
+    remote = environment is None and bool(arguments[1:2] and arguments[1] in {"clone", "fetch", "push", "pull", "ls-remote"})
+    if environment is not None:
+        if runner_identity is not None:
+            raise GitError("Explicit Git environment cannot override a selected Runner identity")
+        environment = dict(environment)
+    elif remote:
+        from agent_run.runner_transport import runner_git_environment
+        environment = runner_git_environment(runner_identity, cwd=cwd)
+    else:
+        environment = git_environment()
     executable = _git_executable(environment.get("PATH", os.defpath))
     process = subprocess.Popen(
         [executable, *arguments[1:]], cwd=cwd,
@@ -138,6 +145,7 @@ def run_git(
                 opened_stream.close()
     error = stderr.decode("utf-8", errors="replace")
     if remote:
+        from agent_run.runner_transport import redact_transport_output
         error = redact_transport_output(error, environment)
     # Replacement decoding may expand invalid bytes; the diagnostic is byte bounded too.
     encoded = error.encode()

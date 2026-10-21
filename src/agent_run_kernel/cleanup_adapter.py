@@ -132,7 +132,7 @@ def cleanup_remote_ref(git: LocalGit, effect: Effect) -> EffectResult:
 
 
 def _worktree(effect: Effect) -> tuple[Path, Path, Path, str, str] | None:
-    identity = _ref(effect, "cleanup_worktree")
+    identity = _ref(effect, "validation_cleanup" if effect.operation == "validation_cleanup" else "cleanup_worktree")
     values = [effect.payload.get(key) for key in ("checkout", "owned_root", "common_git_dir")]
     if identity is None or any(not isinstance(value, str) or not value or "\0" in value for value in values):
         return None
@@ -174,7 +174,8 @@ def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
                 or symbolic.returncode not in {0, 1}
                 or (symbolic.returncode == 0 and symbolic.stdout.strip() != ref)):
             return _result("third", "worktree_identity_changed")
-        if _read(git, "status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout:
+        if (effect.operation != "validation_cleanup"
+                and _read(git, "status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
             return _result("third", "worktree_dirty")
         return _result("prior", "worktree_owned", attached=symbolic.returncode == 0)
     except (KernelError, OSError, RuntimeError, subprocess.SubprocessError):
@@ -232,7 +233,7 @@ def _hold_ref(git: LocalGit, checkout: Path, ref: str, expected: str) -> Iterato
 
 
 def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
-    """Retire only the recorded clean checkout, retaining HEAD locks through removal."""
+    """Retain HEAD locks; only disposable Review validation may contain test outputs."""
     observed = inspect_worktree(git, effect)
     if observed.disposition != "prior":
         return observed
@@ -250,7 +251,8 @@ def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
             if verified.disposition != "prior":
                 return verified
             _authority(git)
-            git.run("worktree", "remove", str(checkout), check=False)
+            options = ("--force",) if effect.operation == "validation_cleanup" else ()
+            git.run("worktree", "remove", *options, str(checkout), check=False)
     except KernelError as error:
         if error.code not in {"cleanup_lock_timeout", "cleanup_lock_failed"}:
             raise

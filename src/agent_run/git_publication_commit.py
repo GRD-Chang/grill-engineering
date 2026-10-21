@@ -41,17 +41,17 @@ def observe_publication_commit(
     return True
 
 
-def install_publication_commit(
+def prepare_publication_commit(
     git: PublicationCommitGit,
     checkout: Path,
     *,
     tree: str,
     parents: list[str],
     message: str,
-    intent: dict[str, Any],
-    save_intent: Callable[[], None],
-) -> str:
-    """Persist exact bytes/SHA before writing; read back before replay or reset."""
+    intent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read exact bytes/SHA; an existing intent never re-reads identity or time."""
+    intent = {} if intent is None else dict(intent)
 
     def read(*arguments: str, input: str | None = None) -> str:
         result = git._run_in(checkout, *arguments, input=input)
@@ -77,7 +77,6 @@ def install_publication_commit(
             "tree_sha": tree, "parents": parents, "message": message,
             "raw_commit": raw, "expected_sha": expected_sha,
         })
-        save_intent()
     raw = intent.get("raw_commit", "")
     expected_sha = intent.get("expected_sha", "")
     if not (
@@ -101,6 +100,33 @@ def install_publication_commit(
         and read("hash-object", "-t", "commit", "--stdin", input=raw).strip() == expected_sha
     ):
         raise GitError("publication commit intent contains inconsistent object bytes")
+    return intent
+
+
+def install_publication_commit(
+    git: PublicationCommitGit,
+    checkout: Path,
+    *,
+    tree: str,
+    parents: list[str],
+    message: str,
+    intent: dict[str, Any],
+    save_intent: Callable[[], None],
+) -> str:
+    """Persist exact bytes/SHA before writing; read back before replay or reset."""
+    prepared = prepare_publication_commit(git, checkout, tree=tree, parents=parents,
+                                          message=message, intent=intent)
+    if not intent:
+        intent.update(prepared)
+        save_intent()
+    raw, expected_sha = str(intent["raw_commit"]), str(intent["expected_sha"])
+
+    def read(*arguments: str, input: str | None = None) -> str:
+        result = git._run_in(checkout, *arguments, input=input)
+        if result.returncode != 0:
+            raise GitError(result.stderr.strip() or "could not verify publication commit")
+        return result.stdout
+
     if not observe_publication_commit(git, checkout, intent):
         written = read("hash-object", "-w", "-t", "commit", "--stdin", input=raw).strip()
         if written != expected_sha:

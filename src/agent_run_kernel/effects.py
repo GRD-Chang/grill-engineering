@@ -1,9 +1,4 @@
-"""Real local Git adapter used by the executable offline exploration.
-
-It implements mechanical Git verbs only. It never chooses a role, successor,
-budget, approval or recovery policy. All paths belong to a newly created local
-fixture; this adapter is intentionally not wired to a user's repository.
-"""
+"""Mechanical Git verbs shared by managed delivery and isolated fixtures."""
 
 from __future__ import annotations
 
@@ -11,6 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 from typing import Callable, Iterable
+
+from agent_run.git_errors import GitError
+from agent_run.git_output import run_git
 
 from .model import Commit, KernelError
 
@@ -21,23 +19,31 @@ class LocalGit:
         self.authorize = authorize
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                         "GIT_AUTHOR_NAME": "Offline Publisher", "GIT_AUTHOR_EMAIL": "offline@example.invalid",
-                         "GIT_COMMITTER_NAME": "Offline Publisher", "GIT_COMMITTER_EMAIL": "offline@example.invalid",
-                         "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00"})
+                         "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1"})
 
     def run(self, *arguments: str, cwd: Path | None = None, input_text: str | None = None,
             check: bool = True) -> subprocess.CompletedProcess[str]:
         command = ("git", "-C", str(cwd or self.root), *arguments)
-        if arguments and arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge"}:
+        if arguments and (arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge"}
+                          or arguments[0] == "hash-object" and "-w" in arguments):
             if self.authorize is not None:
                 self.authorize()
-        result = subprocess.run(command, input=input_text, text=True, capture_output=True,
-                                timeout=30, env=self.env, check=False)
-        if len(result.stdout.encode()) + len(result.stderr.encode()) > 4 * 1024 * 1024:
-            raise KernelError("git_output_limit")
+        try:
+            result = run_git(list(command), cwd=cwd or self.root, input=input_text,
+                             timeout=30, environment=self.env)
+        except GitError as error:
+            raise KernelError("git_operation_failed", str(error)) from error
         if check and result.returncode:
             raise KernelError("git_operation_failed", repr({"command": command, "returncode": result.returncode,
                               "stdout": result.stdout, "stderr": result.stderr}))
+        return result
+
+    def _run_in(self, directory: Path, *arguments: str, input: str | None = None,
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        """The existing exact-object helper's narrow Git command protocol."""
+        result = self.run(*arguments, cwd=directory, input_text=input, check=False)
+        if result.returncode and not (arguments[:2] == ("config", "--get") and result.returncode == 1):
+            raise KernelError("git_operation_failed", result.stderr)
         return result
 
     def conflict_checkout(self, checkout: Path, target: str) -> dict[str, object]:
@@ -63,28 +69,37 @@ class LocalGit:
 
     def make_commit(self, tree: str, parents: Iterable[str], message: str) -> Commit:
         arguments: list[str] = ["commit-tree", tree]
-        for parent in dict.fromkeys(parents):
+        parents = tuple(parents)
+        for parent in parents:
             arguments.extend(("-p", parent))
         sha = self.run(*arguments, input_text=message + "\n").stdout.strip()
+        if self.parents(sha) != parents:
+            raise KernelError("commit_parents_changed")
         return self.commit(sha)
 
-    def candidate(self, checkout: Path, before: str, token: str) -> tuple[Commit, bool]:
+    def candidate(self, checkout: Path, before: str, token: str,
+                  parents: tuple[str, ...]) -> tuple[Commit, bool]:
+        if not parents or parents[0] != before or len(parents) not in {1, 2} or len(set(parents)) != len(parents):
+            raise KernelError("candidate_parent_identity")
         actual = self.run("rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        merge = self.run("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=checkout, check=False)
+        if merge.returncode not in {0, 1}:
+            raise KernelError("candidate_merge_unknown")
+        merge_head = merge.stdout.strip() if merge.returncode == 0 else None
         if actual != before:
-            message = self.run("show", "-s", "--format=%B", actual).stdout.strip()
-            if message != f"candidate {token}" or before not in self.parents(actual):
+            message = self.run("show", "-s", "--format=%B", actual).stdout.rstrip("\n")
+            if (message != f"candidate {token}" or self.parents(actual) != parents or merge_head is not None
+                    or self.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
                 raise KernelError("candidate_checkout_changed")
             self.run("diff", "--check", before, actual, cwd=checkout)
             return self.commit(actual), False
+        if merge_head != (parents[1] if len(parents) == 2 else None):
+            raise KernelError("candidate_merge_changed")
         self.run("add", "--all", cwd=checkout)
         self.run("diff", "--cached", "--check", cwd=checkout)
         tree = self.run("write-tree", cwd=checkout).stdout.strip()
-        if tree == self.commit(before).tree:
+        if tree == self.commit(before).tree and len(parents) == 1:
             return self.commit(before), True
-        parents = [before]
-        merge = self.run("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=checkout, check=False)
-        if merge.returncode == 0:
-            parents.append(merge.stdout.strip())
         result = self.make_commit(tree, parents, f"candidate {token}")
         self.run("reset", "--hard", result.sha, cwd=checkout)
         return result, False
