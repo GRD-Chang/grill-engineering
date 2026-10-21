@@ -1,4 +1,4 @@
-"""Read-only status/history/discovery entry point for native Kernel databases."""
+"""Public native query and personal-settings entry point."""
 from __future__ import annotations
 
 import argparse

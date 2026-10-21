@@ -31,12 +31,7 @@ class QueryError(ValueError):
 
 
 def _all(tx: Transaction, sql: str, values: Sequence[Any] = ()) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    while True:
-        rows = tx.rows(sql + " LIMIT 128 OFFSET ?", (*values, len(result)))
-        result.extend(dict(row) for row in rows)
-        if len(rows) < 128:
-            return result
+    return [dict(row) for row in tx.all(sql, values)]
 
 
 def _material(tx: Transaction, identity: str | None, subject: str) -> Any:
