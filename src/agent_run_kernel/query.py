@@ -182,7 +182,7 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list
 
 
 def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> list[dict[str, Any]]:
-    sql = """SELECT i.*,t.role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
+    sql = """SELECT i.*,a.role,t.role AS binding_role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
              JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread WHERE a.subject=?"""
     values: tuple[Any, ...] = (subject,)
     if attempt is not None:
@@ -192,7 +192,7 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
     for row in result:
         if row.pop("thread_subject") != subject:
             raise QueryError("incompatible_run_state", "Invocation has a missing or foreign Thread binding")
-        profile = recorded_profile(tx, row["profile_revision"])["profiles"][row["role"]]
+        profile = recorded_profile(tx, row["profile_revision"])["profiles"][row["binding_role"]]
         row.update({"model": profile["model"], "effort": profile["reasoning_effort"], "profile_reference": profile["reference"]})
         row["allocated_at"] = _timestamp(row["allocated_at"])
         outputs = _all(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (row["id"],))

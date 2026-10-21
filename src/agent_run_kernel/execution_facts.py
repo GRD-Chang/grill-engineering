@@ -73,7 +73,7 @@ def _timing(samples: list[dict[str, Any]]) -> dict[str, Any]:
 def execution_facts(tx: Transaction, row: Mapping[str, Any], *, attempt_id: str | None = None,
                     whole_run: bool = False) -> dict[str, Any]:
     """Aggregate original allocations through this history record, never process lifetime."""
-    sql = ("SELECT i.id,i.attempt,a.subject,a.role,t.profile_revision,t.subject AS thread_subject "
+    sql = ("SELECT i.id,i.attempt,a.subject,a.role,t.role AS binding_role,t.profile_revision,t.subject AS thread_subject "
            "FROM invocations i JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread "
            "WHERE EXISTS (SELECT 1 FROM history h WHERE h.kind='agent_allocated' AND h.identity=i.id AND h.position<=?)")
     values: tuple[Any, ...] = (row["position"],)
@@ -85,7 +85,7 @@ def execution_facts(tx: Transaction, row: Mapping[str, Any], *, attempt_id: str 
         values += (attempt_id,)
     samples: list[dict[str, Any]] = []
     for invocation in tx.all(sql + " ORDER BY i.rowid", values):
-        profile = (recorded_profile(tx, invocation["profile_revision"])["profiles"].get(invocation["role"], {})
+        profile = (recorded_profile(tx, invocation["profile_revision"])["profiles"].get(invocation["binding_role"], {})
                    if invocation["thread_subject"] == invocation["subject"] else {})
         outputs = tx.all("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (invocation["id"],))
         for output in outputs:

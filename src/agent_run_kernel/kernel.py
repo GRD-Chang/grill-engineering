@@ -1716,13 +1716,9 @@ class Kernel:
                           "WHERE h.kind='v6_original_cutover' LIMIT 2")
         if not origins:
             return None
-        ownership = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
-                            "WHERE h.kind='v6_local_ref_ownership' AND h.identity=? LIMIT 2", (cleanup["source_ref"],))
-        imports = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
-                         "WHERE h.kind='v6_completed_import' AND h.identity=? LIMIT 2", (run["id"],))
-        if len(origins) != 1 or len(ownership) != 1 or len(imports) != 1:
+        if len(origins) != 1:
             raise KernelError("cleanup_marker_unproven")
-        anchor, fact, imported = origins[0], ownership[0], imports[0]
+        anchor = origins[0]
         original = json.loads(tx.get(anchor["material_id"], anchor["subject"]))
         if not isinstance(original, dict):
             raise KernelError("cleanup_marker_unproven")
@@ -1730,12 +1726,75 @@ class Kernel:
             origin = read_source_fence(source_fence(original))
         except KernelError as error:
             raise KernelError("cleanup_marker_unproven") from error
-        value = json.loads(tx.get(fact["material_id"], fact["subject"]))
-        proof = json.loads(tx.get(imported["material_id"], imported["subject"]))
         if (anchor["material_purpose"] != "v6_original_cutover" or anchor["identity"] != origin["nonce"]
                 or origin["run_id"] != run["id"] or origin["target_db"] != str(self.storage.path)
-                or origin["task_fingerprint"] != self._task(run).fingerprint
-                or fact["material_purpose"] != "v6_local_ref_ownership" or fact["subject"] != imported["subject"]
+                or origin["task_fingerprint"] != self._task(run).fingerprint):
+            raise KernelError("cleanup_marker_unproven")
+        returned = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                           "WHERE h.kind='v6_returned_import' LIMIT 2")
+        if returned:
+            layouts = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                              "WHERE h.kind='v6_original_layout' LIMIT 2")
+            if len(returned) != 1 or len(layouts) != 1:
+                raise KernelError("cleanup_marker_unproven")
+            imported, layout_fact = returned[0], layouts[0]
+            proof = json.loads(tx.get(imported["material_id"], imported["subject"]))
+            layout = json.loads(tx.get(layout_fact["material_id"], layout_fact["subject"]))
+            sources = tx.rows("SELECT * FROM subjects WHERE id=? AND kind='ticket' AND generation=1", (imported["subject"],))
+            if len(sources) != 1:
+                raise KernelError("cleanup_marker_unproven")
+            source = sources[0]
+            checkout = Path(origin["target_db"]).parent.parent / "worktrees" / run["id"] / f"ticket-{source['issue']}"
+            record = {"table": "work_jobs", "key": [run["id"], f"ticket:{source['issue']}:generation:1"]}
+            if (imported["material_purpose"] != "v6_returned_import" or imported["identity"] != origin["source_sha256"]
+                    or imported["subject"] != anchor["subject"]
+                    or imported["generation"] != 1 or layout_fact["generation"] != 1 or job["generation"] != 1
+                    or layout_fact["subject"] != imported["subject"]
+                    or layout_fact["material_purpose"] != "v6_original_layout" or layout_fact["identity"] != origin["nonce"]
+                    or not isinstance(proof, dict) or not isinstance(layout, dict)
+                    or proof.get("resource_mode") != "existing-verified" or proof.get("source_sha256") != origin["source_sha256"]
+                    or proof.get("source_record") != record or proof.get("original_layout") != layout
+                    or proof.get("run_ref") != source["target_ref"]
+                    or layout.get("version") != 1 or layout.get("nonce") != origin["nonce"]
+                    or layout.get("source_sha256") != origin["source_sha256"] or layout.get("source_uuid") != origin["source_uuid"]
+                    or layout.get("repository_root") != run["repository_root"]
+                    or layout.get("source_ref") != source["source_ref"]
+                    or layout.get("before_head") != "ref: " + source["source_ref"] + "\n"
+                    or not isinstance(layout.get("expected_oid"), str)
+                    or len(layout["expected_oid"]) not in {40, 64}
+                    or any(character not in "0123456789abcdef" for character in layout["expected_oid"])
+                    or any(layout.get(key) != source[key] for key in ("checkout", "owned_root", "common_git_dir"))
+                    or source["checkout"] != str(checkout) or source["owned_root"] != str(checkout.parent)
+                    or source["common_git_dir"] != str(Path(run["repository_root"]) / ".git")
+                    or cleanup["source_ref"] != job["source_ref"]
+                    or any(cleanup[key] != job[key] for key in ("checkout", "owned_root", "common_git_dir"))):
+                raise KernelError("cleanup_marker_unproven")
+            if job["kind"] == DeliveryKind.TICKET and job["id"] == imported["subject"]:
+                # Native work advances the detached checkout; the original
+                # local branch remains at its independently authenticated OID.
+                head = cleanup["workspace_sha"] if cleanup["stage"] == 0 else layout["expected_oid"]
+            elif job["kind"] == DeliveryKind.FINAL_RUN and cleanup["stage"] == 1:
+                run_ref = proof.get("run_ref_ownership")
+                if (not isinstance(run_ref, dict) or set(run_ref) != {"source_ref", "expected_oid", "source_record"}
+                        or run_ref["source_ref"] != proof["run_ref"] or run_ref["source_ref"] != cleanup["source_ref"]
+                        or run_ref["source_record"] != {"table": "run_root", "key": [run["id"]]}
+                        or not isinstance(run_ref["expected_oid"], str) or len(run_ref["expected_oid"]) not in {40, 64}
+                        or any(character not in "0123456789abcdef" for character in run_ref["expected_oid"])):
+                    raise KernelError("cleanup_marker_unproven")
+                head = run_ref["expected_oid"]
+            else:
+                raise KernelError("cleanup_marker_unproven")
+            return head, origin["source_uuid"]
+        ownership = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                            "WHERE h.kind='v6_local_ref_ownership' AND h.identity=? LIMIT 2", (cleanup["source_ref"],))
+        imports = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                         "WHERE h.kind='v6_completed_import' AND h.identity=? LIMIT 2", (run["id"],))
+        if len(origins) != 1 or len(ownership) != 1 or len(imports) != 1:
+            raise KernelError("cleanup_marker_unproven")
+        fact, imported = ownership[0], imports[0]
+        value = json.loads(tx.get(fact["material_id"], fact["subject"]))
+        proof = json.loads(tx.get(imported["material_id"], imported["subject"]))
+        if (fact["material_purpose"] != "v6_local_ref_ownership" or fact["subject"] != imported["subject"]
                 or imported["material_purpose"] != "v6_completed_import_identity"
                 or not isinstance(proof, dict)
                 or proof.get("resource_mode") != "existing-verified"
@@ -1960,6 +2019,8 @@ class Kernel:
                 or json.loads(tx.get(row["context_id"], call.subject)) != call.context):
             raise KernelError("invocation_binding")
         binding = tx.one("SELECT * FROM threads WHERE id=?", (call.thread_id,))
+        if not self._thread_role_matches(self._job(tx, call.subject), call.role, binding):
+            raise KernelError("thread_role_binding")
         profile, reference = self._thread_profile(tx, binding)
         if call.profile != profile or call.profile_revision != binding["profile_revision"] or call.profile_reference != reference:
             raise KernelError("invocation_binding")
@@ -2329,6 +2390,8 @@ class Kernel:
                     tx.execute("UPDATE attempts SET new_thread=1 WHERE id=?", (job["current_attempt"],))
                 elif new_thread and job["phase"] == "development":
                     tx.execute("UPDATE subjects SET development_thread=NULL WHERE id=?", (subject,))
+                elif new_thread and job["phase"] == "publish":
+                    feedback_scope = {subject: {"generation": job["generation"], "attempt": None, "role": "publish"}}
                 if job["current_attempt"] and not self._gates(tx, subject):
                     tx.execute("UPDATE attempts SET resume_action=? WHERE id=?", (action_id, job["current_attempt"]))
                 if job["phase"] in {"development", "review", "publish"}:
@@ -2423,7 +2486,7 @@ class Kernel:
                                                                      "feedback_scope": feedback_scope, "requeue": requeue_scope, "abandonment": abandonment}))
         tx.execute("UPDATE actions SET receipt_id=? WHERE id=?", (receipt, action_id))
         self._event(tx, material_owner, "control_applied", action_id, receipt)
-        if kind == "resume" and subject is None and (message is not None or new_thread):
+        if kind == "resume" and (subject is None or feedback_scope) and (message is not None or new_thread):
             self._event(tx, material_owner, "run_feedback_pending", action_id, receipt)
         return str(tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0])
 
@@ -2694,6 +2757,34 @@ class Kernel:
         value = self._profile_document(tx, thread["profile_revision"])["profiles"][thread["role"]]
         return Profile(value["model"], value["reasoning_effort"]), value["reference"]
 
+    @staticmethod
+    def _thread_role_matches(job: sqlite3.Row, role: Role, thread: sqlite3.Row) -> bool:
+        return bool(thread["subject"] == job["id"] and (thread["role"] == role.value
+                    or role == Role.PUBLICATION and job["kind"] != DeliveryKind.FINAL_RUN
+                    and thread["role"] == Role.DEVELOPMENT))
+
+    def _publication_thread(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> str | None:
+        """Use an existing Publication context, then bounded Development context.
+
+        A shared backend has one immutable binding. Its semantic Publication
+        Attempt changes role, never the Development binding's profile.
+        """
+        if job["kind"] == DeliveryKind.FINAL_RUN:
+            return None
+        previous = tx.rows("SELECT i.thread FROM attempts a JOIN invocations i ON i.attempt=a.id "
+                           "JOIN threads t ON t.id=i.thread WHERE a.subject=? AND a.generation=? "
+                           "AND a.role='publication' AND t.role='publication' AND t.backend_id IS NOT NULL "
+                           "ORDER BY a.ordinal DESC,i.rowid DESC LIMIT 1", (job["id"], job["generation"]))
+        if previous:
+            return str(previous[0][0])
+        publication = self._profile_document(tx, run["profile_revision"])["profiles"]["publication"]
+        attempts = tx.one("SELECT count(*) FROM attempts WHERE subject=? AND generation=? AND role='publication'",
+                          (job["id"], job["generation"]))[0]
+        # The original selection observes the newly allocated role ordinal.
+        if publication["reference"] == "development" and attempts + 1 < 4:
+            return job["development_thread"]
+        return None
+
     def configure_task_profiles(self, action_id: str, *, preset: str | None = None,
                                 overrides: ProfileOverrides | None = None) -> int:
         """Configure future Threads only under this exact published Task's lock."""
@@ -2782,7 +2873,7 @@ class Kernel:
             receipt = json.loads(tx.get(action["receipt_id"], owner))
             scope = receipt["feedback_scope"].get(subject)
             if scope is not None and scope["generation"] == job["generation"]:
-                if feedback["message"] is not None:
+                if feedback["message"] is not None and action["subject"] is None:
                     response = tx.put(subject, "human_response", feedback["message"].encode())
                     self._event(tx, subject, "human_response", action["id"], response)
                 force_new_thread = force_new_thread or bool(feedback["new_thread"] and (
@@ -2804,11 +2895,13 @@ class Kernel:
             thread_id = previous["thread"]
         elif pending is None and role == Role.DEVELOPMENT and not policy.new_thread_per_development and not force_new_thread:
             thread_id = job["development_thread"]
+        elif pending is None and role == Role.PUBLICATION and not force_new_thread:
+            thread_id = self._publication_thread(tx, run, job)
         if thread_id is None:
             thread_id = identity()
             tx.execute("INSERT INTO threads(id,subject,role,profile_revision) VALUES (?,?,?,?)", (thread_id, subject, role.value, run["profile_revision"]))
         binding = tx.one("SELECT * FROM threads WHERE id=?", (thread_id,))
-        if binding["subject"] != subject or binding["role"] != role.value:
+        if not self._thread_role_matches(job, role, binding):
             raise KernelError("thread_role_binding")
         profile, reference = self._thread_profile(tx, binding)
         if role == Role.DEVELOPMENT:
