@@ -253,7 +253,8 @@ class _HistoricalPublisherScenario(Scenario):
         return replace(super().world(), publisher_actor=self.original_actor)
 
 
-def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -> None:
+def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path], *,
+                    reviews: tuple[str, ...] = ('pass',)) -> None:
     """Reuse the existing native driver, with copied old Git/external facts."""
     report = json.loads(paths['report'].read_text())
     run_id = report['source_identity']['run_id']
@@ -295,13 +296,15 @@ def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -
                                 profiles, inputs['prompt_resources'], inputs['worker_identity'],
                                 inputs['runner_identity'], inputs['notifications'], inputs['provenance']))
     scenario.initial = default
-    scenario.reviews, scenario.checks = ['pass'], ['none']
+    assert reviews in {('pass',), ('fail', 'pass')}
+    scenario.reviews, scenario.checks = list(reviews), ['none']
     scenario.review_count = scenario.development_count = scenario.publication_count = 0
     scenario.heads, scenario.role_calls, scenario.checkpoints, scenario.reviewed_heads = [], [], [], []
     scenario.edits = None
     assert scenario.run(approve=True).kind == 'complete'
     assert kernel.status(final)['phase'] == 'complete'
-    assert [call['role'] for call in scenario.role_calls] == ['review', 'publication']
+    expected_roles = ['review', 'publication'] if reviews == ('pass',) else ['review', 'development', 'review', 'publication']
+    assert [call['role'] for call in scenario.role_calls] == expected_roles
     assert all(write['subject'] == final for write in port.writes())
     assert port.pull_request('ticket:2') == prior_pr
     new_pr = port.pull_request(final)

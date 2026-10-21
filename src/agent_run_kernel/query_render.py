@@ -28,7 +28,11 @@ _COPY = {
            "notification_disabled": "本 Run 的冻结配置已禁用飞书通知",
            "notification_configuration_unknown": "本 Run 未记录飞书通知配置",
            "notification_journal_missing": "未记录飞书通知发送日志",
-           "notification_binding_unknown": "通知日志未记录收件人及配置的绑定回执"},
+           "notification_binding_unknown": "通知日志未记录收件人及配置的绑定回执",
+           "resume_label": "最近恢复", "resume_applied": "已应用；尚未观察到目标进展",
+           "resume_unconfirmed": "已记录请求；应用尚未确认", "resume_started": "已记录目标进展",
+           "resume_failed": "目标执行失败", "resume_human_action": "目标需要人工处理",
+           "worker_exit_wait": "原 Worker 退出尚未确认"},
     "en": {"run": "Delivery Run", "status": "Status", "phase": "Phase", "subject": "Work subject", "unknown": "Not recorded",
            "next": "Next action", "model": "Model", "effort": "Reasoning effort", "history": "Work history", "budget": "Cumulative usage",
            "findings": "Current findings", "evidence": "Evidence", "duration": "Task elapsed seconds", "agent": "Agent",
@@ -42,7 +46,11 @@ _COPY = {
            "notification_disabled": "Feishu notifications disabled in this Run's frozen configuration",
            "notification_configuration_unknown": "Feishu notification configuration not recorded for this Run",
            "notification_journal_missing": "Feishu delivery journal not recorded",
-           "notification_binding_unknown": "Feishu journal recipient/configuration binding not recorded"},
+           "notification_binding_unknown": "Feishu journal recipient/configuration binding not recorded",
+           "resume_label": "Resume", "resume_applied": "applied; target progress not yet observed",
+           "resume_unconfirmed": "request recorded; application unconfirmed", "resume_started": "Target progress recorded",
+           "resume_failed": "Target execution failed", "resume_human_action": "Target needs human action",
+           "worker_exit_wait": "Worker exit not yet confirmed"},
 }
 
 _TERMS = {
@@ -158,6 +166,19 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
     yield from _notification_lines(document)
+    latest = data.get("latest_resume")
+    if isinstance(latest, Mapping):
+        progress = latest.get("progress")
+        outcome = progress.get("resume_outcome") if isinstance(progress, Mapping) else None
+        label = copy.get("resume_" + str(outcome), copy["resume_applied"] if latest["applied"] else copy["resume_unconfirmed"])
+        owner = next((job for job in data["subjects"] if job["subject"] == latest["subject"]), None)
+        target = f"#{owner['issue']}" if owner else copy["global"]
+        yield f"{copy['resume_label']}: {latest['action_id']} — {target} — {label}"
+        if isinstance(progress, Mapping) and progress.get("reason_code"):
+            reason = str(progress["reason_code"])
+            yield terms.get(reason, reason)
+    for wait in data.get("resume_waits", []):
+        yield f"{copy['worker_exit_wait']}: #{wait['issue']} ({wait['invocation']})"
     # Put actionable current boundaries before long Findings/evidence.
     for action in data["operator_actions"]:
         scope = copy["local"] if action["scope"] == "local" else copy["global"]

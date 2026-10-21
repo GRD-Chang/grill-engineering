@@ -24,7 +24,9 @@ from agent_run.notification_event_facts import event_copy, event_envelope
 from agent_run.notification_transport import send
 from agent_run.process_binding import _process_start_token
 
-from .notification_events import events as history_events
+from .execution_facts import execution_facts
+from .notification_events import events as history_events, resume_facts
+from .notification_progress import obsolete_progress
 from .query import notification_boundaries
 from .storage import Storage, Transaction
 
@@ -36,7 +38,8 @@ Send = Callable[..., Mapping[str, Any]]
 class NativeNotifications:
     """Deliver only committed native events for one exact Run and owned directory."""
 
-    def __init__(self, database: Path, state_root: Path, *, transport: Send = send) -> None:
+    def __init__(self, database: Path, state_root: Path, *, transport: Send = send,
+                 exit_notice: Mapping[str, Any] | None = None) -> None:
         if (database.is_symlink() or state_root.is_symlink()
                 or not database.is_file() or not state_root.is_dir()
                 or database.parent.resolve() != state_root.resolve()):
@@ -44,6 +47,8 @@ class NativeNotifications:
         self.database = database
         self.state_root = state_root
         self.transport = transport
+        self.exit_notice = dict(exit_notice) if exit_notice is not None else None
+        self.exit_event_id: str | None = None
         self.storage = Storage(database)
         with self.storage.transaction(write=False) as tx:
             self.run_id, self.binding, self.config, self.state = self._run(tx)
@@ -170,6 +175,13 @@ class NativeNotifications:
                 raise ValueError("notification Run or recipient binding changed")
             view = notification_boundaries(tx, self.database)
             terminal = self._terminal_event(view)
+            if terminal is not None and view["status"] == "completed":
+                closure = view["closures"][0]
+                original = tx.one("SELECT * FROM history WHERE kind='effect_consumed' AND identity=? AND material_id=?",
+                                  (closure["effect_id"], closure["receipt_id"]))
+                timing = execution_facts(tx, original, whole_run=True)
+                total = timing.pop("execution_seconds", None)
+                terminal.update(timing, total_seconds=total)
             highwater = view["highwater"]
             if cursor < highwater:
                 rows = tx.rows("SELECT position,subject,generation,phase,status FROM history "
@@ -191,6 +203,17 @@ class NativeNotifications:
                 cursor = rows[-1]["position"]
             actions = {self._gate_slot(item["subject"], item.get("generation"), item["reason"]): item
                        for item in view["actions"]}
+            resumes: dict[str, dict[str, Any]] = {}
+            for key, action in actions.items():
+                if action["subject"] is None:
+                    continue
+                original = tx.rows("SELECT h.* FROM history h JOIN gates g ON g.subject=h.subject "
+                                   "AND g.code=h.identity AND g.evidence IS h.material_id "
+                                   "WHERE h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? "
+                                   "ORDER BY h.position DESC LIMIT 1",
+                                   (action["subject"], action.get("generation"), action["reason"]))
+                if original:
+                    resumes[key] = resume_facts(tx, original[0])
             caught_up = cursor == highwater
             # Never send an intermediate historical gate as a current card.
             # Each call reads at most 128 snapshots, then persists its cursor.
@@ -205,6 +228,7 @@ class NativeNotifications:
                                       "sequence": document["sequence"]}
             document["native_boundary_cursor"] = cursor
             document["native_boundary_catching_up"] = not caught_up
+            self._compress_progress(tx, document, view, added=highwater > document.get("native_cursor", 0))
         current = {key: value["sequence"] for key, value in slots.items()}
         for item in list(document["pending"]):
             event = item["event"]
@@ -221,7 +245,7 @@ class NativeNotifications:
             return True
         for key, action in actions.items():
             occurrence = current[key]
-            if slots[key].get("enqueued") or len(document["pending"]) >= outbox.MAX_PENDING:
+            if slots[key].get("enqueued"):
                 continue
             reason = action["reason"]
             title_key = ("stopped" if reason == "operator_stopped" else "approval"
@@ -239,17 +263,45 @@ class NativeNotifications:
                                    scope=action["scope"],
                                    summary="; ".join(str(value) for value in action["reasons"]),
                                    next_step=action["next_action"])
+            facts = resumes.get(key)
+            if facts:
+                event.update(facts)
+                event["summary"] = (event_copy(self.state, "resume_" + facts["resume_outcome"])
+                                    + event_copy(self.state, "separator") + event["summary"])
             outbox.enqueue(document, event, time.time())
             slots[key]["enqueued"] = True
         if terminal is not None:
             receipts = document.setdefault("native_terminal_receipts", [])
             if not isinstance(receipts, list) or any(not isinstance(key, str) for key in receipts):
                 raise ValueError("invalid native terminal notification receipts")
-            if terminal["id"] not in receipts and len(document["pending"]) < outbox.MAX_PENDING:
+            if terminal["id"] not in receipts:
                 outbox.enqueue(document, terminal, time.time())
                 receipts.append(terminal["id"])
                 del receipts[:-outbox.MAX_RECORDS]
         return False
+
+    def _compress_progress(self, tx: Transaction, document: dict[str, Any], view: dict[str, Any], *, added: bool) -> None:
+        """Retire delivery backlog from this exact read snapshot, preserving results."""
+        ordinary = [item for item in document["pending"] if not item.get("important")
+                    and not item["event"].get("current") and not item["event"].get("terminal")
+                    and item["event"]["kind"] != "executor_exit" and item["outcome"] != "sending"]
+        pressure = sum(not item["event"].get("current") for item in document["pending"]) > outbox.MAX_PENDING - 17
+        if (document.get("unavailable_reason") or pressure
+                or added and any(item["outcome"] in {"failed", "unknown"} for item in ordinary)):
+            obsolete = obsolete_progress(tx, [item["event"] for item in ordinary],
+                                         self.config.get("mode", "concise"),
+                                         current_boundary=bool(view["actions"] or view["is_terminal"] or view["abandonment"] is not None))
+            for item in ordinary:
+                if item["event"]["id"] in obsolete:
+                    outbox.cancel_item(document, item, "original progress no longer current")
+            # Capacity is a delivery policy, not evidence that an unknown
+            # source became obsolete. Keep its original result and budget.
+            if pressure:
+                for item in ordinary:
+                    if sum(not entry["event"].get("current") for entry in document["pending"]) <= outbox.MAX_PENDING - 17:
+                        break
+                    if item in document["pending"]:
+                        outbox.cancel_item(document, item, "pending capacity")
 
     def observe_committed(self) -> None:
         """Observe healthy facts, or request one sender-owned fault recovery."""
@@ -308,14 +360,74 @@ class NativeNotifications:
                 and event_id not in document["milestones"]):
             document["milestones"].append(event_id)
 
+    def _exit_validity(self) -> dict[str, tuple[dict[str, Any], bool]]:
+        # Startup Host identity may require a read-only manager call. Keep it
+        # outside both the journal claim and condition locks.
+        document = outbox.read_notifications(self.state_root, self.run_id)
+        return {item["event"]["id"]: (item["event"], self._exit_current(item["event"]))
+                for item in document.get("pending", []) if item["event"]["kind"] == "executor_exit"}
+
+    @staticmethod
+    def _cancel_exit_notices(document: dict[str, Any],
+                             validity: dict[str, tuple[dict[str, Any], bool]]) -> None:
+        for item in list(document["pending"]):
+            event = item["event"]
+            if validity.get(event["id"]) == (event, False):
+                outbox.cancel_item(document, item, "original Host exit no longer current")
+
+    def _exit_current(self, event: Mapping[str, Any]) -> bool:
+        from .host_exit_notifications import host_exit_current
+        evidence = event.get("exit_evidence")
+        return isinstance(evidence, dict) and host_exit_current(self.database, evidence)
+
+    def _observe_exit_notice(self) -> bool:
+        from .host_exit_notifications import host_exit_event
+        assert self.exit_notice is not None
+        event = host_exit_event(self.database, self.exit_notice)
+        validity = self._exit_validity()
+        with outbox.transaction(self.state_root, self.run_id) as document:
+            binding = [self.run_id, *self.binding]
+            if (document.get("native_binding") not in (None, binding)
+                    or (not document.get("native_run_start") and document.get("native_binding") is None
+                        and any(document[key] for key in ("pending", "records", "seen")))):
+                raise ValueError("existing notification journal has no native receipt")
+            document["native_binding"] = binding
+            outbox.settle(document, time.time())
+            self._cancel_exit_notices(document, validity)
+            if event is not None:
+                self.exit_event_id = event["id"]
+                if (event["id"] not in document["seen"]
+                        and not any(item["event"]["id"] == event["id"] for item in document["pending"])
+                        and not any(item["id"] == event["id"] for item in document["records"])):
+                    prior = document.get("executor_exit")
+                    if prior is not None and (not isinstance(prior, dict) or prior.get("run_id") != self.run_id
+                                              or type(prior.get("epoch")) is not int):
+                        raise ValueError("invalid original Host exit receipt")
+                    if prior is None or prior["epoch"] < self.exit_notice["epoch"]:
+                        document["executor_exit"] = dict(self.exit_notice)
+                    outbox.enqueue(document, event, time.time())
+                    if sum(not entry["event"].get("current") for entry in document["pending"]) > outbox.MAX_PENDING:
+                        item = document["pending"][-1]
+                        item.update(outcome="failed", reason="notification queue full before delivery",
+                                    exhausted=True, exhaustion_reason="pending_capacity")
+                        outbox.retire(document, item)
+                    document["seen"].append(event["id"])
+                    del document["seen"][:-outbox.MAX_RECORDS]
+        self._more = False
+        return True
+
     def _observe_committed(self) -> bool:
         """Read only committed facts; claim no transport while a kernel lock is held."""
         if not self.enabled or self.closed or self._shutdown:
             return False
         try:
+            if self.exit_notice is not None:
+                return self._observe_exit_notice()
             for _ in range(64):
+                validity = self._exit_validity()
                 with outbox.transaction(self.state_root, self.run_id) as document:
                     outbox.settle(document, time.time())
+                    self._cancel_exit_notices(document, validity)
                     if not document.get("native_run_start"):
                         journal = outbox.notification_path(self.state_root, self.run_id)
                         if ((journal.exists() or journal.is_symlink())
@@ -327,7 +439,7 @@ class NativeNotifications:
                         outbox.enqueue(document, event, time.time())
                         document["native_run_start"] = True
                     boundary_more = self._boundaries(document)
-                    full = len(document["pending"]) > outbox.MAX_PENDING - 17
+                    full = sum(not item["event"].get("current") for item in document["pending"]) > outbox.MAX_PENDING - 17
                     cursor = document.get("native_cursor", 0)
                     if type(cursor) is not int or cursor < 0:
                         raise ValueError("invalid native notification cursor")
@@ -335,6 +447,12 @@ class NativeNotifications:
                     for event in events:
                         self._enqueue_history(document, event, time.time())
                     document["native_cursor"] = position
+                    if events and any(item["outcome"] in {"failed", "unknown"} and not item.get("important")
+                                      for item in document["pending"]):
+                        with self.storage.transaction(write=False) as tx:
+                            if not self._same_binding(*self._run(tx)):
+                                raise ValueError("notification Run or recipient binding changed")
+                            self._compress_progress(tx, document, notification_boundaries(tx, self.database), added=True)
                 with self.condition:
                     self.condition.notify_all()
                 self._more = more
@@ -377,6 +495,7 @@ class NativeNotifications:
                     active_event_id, active_result, active_attempt, returned_at = None, None, None, None
                 if not self._observe_committed():
                     continue
+                validity = self._exit_validity()
                 with self.condition:
                     if self._shutdown:
                         return
@@ -387,9 +506,14 @@ class NativeNotifications:
                     with outbox.transaction(self.state_root, self.run_id) as document:
                         document.pop("unavailable_reason", None)
                         outbox.settle(document, time.time())
-                        pending = document["pending"]
-                        inflight = any(item["outcome"] == "sending" for item in pending)
-                        item = None if inflight else next((item for item in pending if not item.get("cancelled")
+                        self._cancel_exit_notices(document, validity)
+                        all_pending = document["pending"]
+                        pending = [item for item in all_pending
+                                   if self.exit_notice is None or item["event"]["id"] == self.exit_event_id]
+                        inflight = any(item["outcome"] == "sending" for item in all_pending)
+                        item = None if inflight else next((item for item in sorted(pending, key=lambda entry: not entry.get("important")) if not item.get("cancelled")
+                                                            and (item["event"]["kind"] != "executor_exit"
+                                                                 or validity.get(item["event"]["id"]) == (item["event"], True))
                                                             and not (document.get("native_boundary_catching_up")
                                                                      and item["event"].get("current")
                                                                      and item["event"].get("kind") == "boundary")
@@ -425,11 +549,22 @@ class NativeNotifications:
                 except Exception as error:
                     result = {"outcome": "failed", "reason": bounded_error(str(error))}
                 else:
-                    try:
-                        result = self.transport(self.config, card(event), identity, self.cancel,
-                                                timeout_seconds=max(0.0, deadline_at - time.time()))
-                    except Exception as error:
-                        result = {"outcome": "unknown", "reason": bounded_error(str(error))}
+                    if event["kind"] == "executor_exit" and not self._exit_current(event):
+                        result = {"outcome": "failed", "reason": "original Host exit no longer current",
+                                  "not_sent": True}
+                    else:
+                        try:
+                            options: dict[str, Any] = {"timeout_seconds": max(0.0, deadline_at - time.time())}
+                            if event["kind"] == "executor_exit":
+                                exit_event = event
+                                options["is_current"] = lambda: self._exit_current(exit_event)
+                            result = self.transport(self.config, card(event), identity, self.cancel, **options)
+                        except Exception as error:
+                            from .host_exit_notifications import HostExitUnavailable
+                            if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
+                                result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
+                            else:
+                                result = {"outcome": "unknown", "reason": bounded_error(str(error))}
                 returned_at = time.time()
                 active_result = dict(result)
                 assert active_event_id is not None
@@ -447,7 +582,10 @@ class NativeNotifications:
             claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event_id
                           and entry.get("owner") == self.owner), None)
             if claim is not None:
-                outbox.finish_attempt(claim, result, returned_at)
+                not_sent = result.get("not_sent") is True
+                outbox.finish_attempt(claim, {key: value for key, value in result.items() if key != "not_sent"}, returned_at)
+                if not_sent:
+                    claim["attempt_history"][-1]["not_sent"] = True
                 outbox.settle(document, time.time())
 
     def _finish_not_sent(self, event_id: str, attempt: int, failed_at: float) -> None:
@@ -493,3 +631,9 @@ class NativeNotifications:
             except Exception:
                 pass
         self.closed = True
+
+
+def deliver_host_exit_notice(database: Path, state_root: Path, notice: Mapping[str, Any]) -> None:
+    """Drain one exact Host-exit receipt through the existing bounded sender."""
+    observer = NativeNotifications(database, state_root, exit_notice=notice)
+    observer.close()

@@ -15,6 +15,8 @@ from typing import Any, Literal, Mapping, Sequence
 from agent_run.task_identity import TaskKey
 from agent_run.notification_outbox import read_notifications
 
+from .execution_facts import activity, recorded_profile
+from .notification_events import resume_facts
 from .model import KernelError, Role, artifact
 from .storage import QUERY_LIMIT, Storage, Transaction
 from .task_location import read_task, task_path
@@ -179,35 +181,6 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list
     return candidates
 
 
-def _activity(tx: Transaction, invocation: str, ordinal: int, subject: str) -> tuple[list[dict[str, Any]], float | None]:
-    events = _all(tx, "SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? ORDER BY observed_at,identity", (invocation, ordinal))
-    start = None
-    elapsed = 0.0
-    valid = bool(events)
-    for event in events:
-        event["observed_at"] = _timestamp(event["observed_at"])
-        event["active"] = bool(event["active"])
-        event["evidence"] = _material(tx, event["evidence"], subject)
-        if event["active"]:
-            if start is not None:
-                valid = False
-            start = event["observed_at"]
-        elif start is None:
-            valid = False
-        else:
-            elapsed += event["observed_at"] - start
-            start = None
-    return events, elapsed if valid and start is None else None
-
-
-def _profile(tx: Transaction, revision: int) -> dict[str, Any]:
-    row = tx.one("SELECT subject,material_id FROM profile_revisions WHERE id=?", (revision,))
-    value = _material(tx, row["material_id"], row["subject"])
-    if not isinstance(value, dict) or not isinstance(value.get("profiles"), dict):
-        raise QueryError("incompatible_run_state", "Invalid recorded Profile Revision")
-    return value
-
-
 def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> list[dict[str, Any]]:
     sql = """SELECT i.*,t.role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
              JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread WHERE a.subject=?"""
@@ -219,7 +192,7 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
     for row in result:
         if row.pop("thread_subject") != subject:
             raise QueryError("incompatible_run_state", "Invocation has a missing or foreign Thread binding")
-        profile = _profile(tx, row["profile_revision"])["profiles"][row["role"]]
+        profile = recorded_profile(tx, row["profile_revision"])["profiles"][row["role"]]
         row.update({"model": profile["model"], "effort": profile["reasoning_effort"], "profile_reference": profile["reference"]})
         row["allocated_at"] = _timestamp(row["allocated_at"])
         outputs = _all(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (row["id"],))
@@ -230,7 +203,9 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
                 output[field] = _timestamp(output[field])
             output["raw_return"] = _material(tx, output["raw_id"], subject)
             output["failure_evidence"] = _material(tx, output["start_evidence"], subject)
-            output["activity"], output["elapsed_seconds"] = _activity(tx, row["id"], output["ordinal"], subject)
+            measured = activity(tx, row["id"], output["ordinal"], subject)
+            output["activity"] = measured.pop("events")
+            output.update(measured)
             output["process_span_seconds"] = (output["exited_at"] - output["started_at"]
                 if output["started_at"] is not None and output["exited_at"] is not None
                 and output["exited_at"] >= output["started_at"] else None)
@@ -570,6 +545,42 @@ def _control_history(tx: Transaction) -> list[dict[str, Any]]:
     return actions
 
 
+def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Display original acceptance and the shared exact-target outcome facts."""
+    resumes: list[dict[str, Any]] = []
+    for action in control:
+        if action["kind"] != "resume":
+            continue
+        successors = _all(tx, "SELECT id FROM invocations WHERE action_id=? ORDER BY rowid", (action["id"],))
+        started = tx.one("SELECT min(o.started_at) FROM invocation_outputs o JOIN invocations i "
+                         "ON i.id=o.invocation WHERE i.action_id=?", (action["id"],))[0]
+        receipt = action["receipt"]
+        resumes.append({"action_id": action["id"], "subject": action["subject"], "status": action["status"],
+                        "payload": action["payload"], "receipt": receipt,
+                        "applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
+                        "successor_invocations": [row["id"] for row in successors],
+                        "started_at": _timestamp(started), "progress": None})
+    if not resumes:
+        return resumes
+    by_action = {row["action_id"]: row for row in resumes}
+    for row in tx.all("SELECT * FROM history WHERE position>(SELECT min(h.position) FROM history h "
+                      "JOIN actions a ON a.id=h.identity WHERE h.kind='control_applied' AND a.kind='resume') "
+                      "ORDER BY position"):
+        facts = resume_facts(tx, dict(row))
+        if facts and facts["action_id"] in by_action:
+            by_action[facts["action_id"]]["progress"] = facts
+    return resumes
+
+
+def _resume_waits(run: Mapping[str, Any], subjects: list[dict[str, Any]],
+                  leases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Name outstanding original Workers after Stop, without accepting a Resume."""
+    stopped = {job["subject"]: job for job in subjects if run["stopped"]
+               or any(gate["code"] == "operator_stopped" for gate in job["gates"])}
+    return [{**lease, "issue": stopped[lease["subject"]]["issue"], "reason": "worker_exit_unproven"}
+            for lease in leases if lease["subject"] in stopped]
+
+
 
 def _notification_facts(tx: Transaction, run: Mapping[str, Any], path: Path) -> dict[str, Any]:
     """Project the existing journal without claiming a configuration receipt."""
@@ -604,14 +615,14 @@ def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
     from agent_run.github_identity import describe_identity
     from agent_run.messages import text
 
-    profiles = _profile(tx, run["profile_revision"])
+    profiles = recorded_profile(tx, run["profile_revision"])
     rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
     inputs = _material(tx, rows[0]["material_id"], rows[0]["subject"]) if rows else {}
     if not isinstance(inputs, dict):
         raise QueryError("incompatible_run_state", "Invalid frozen creation inputs")
     bindings = []
     for thread in _all(tx, "SELECT * FROM threads ORDER BY rowid"):
-        profile = _profile(tx, thread["profile_revision"])["profiles"][thread["role"]]
+        profile = recorded_profile(tx, thread["profile_revision"])["profiles"][thread["role"]]
         bindings.append({"thread_identity": thread["id"], "thread_id": thread["backend_id"],
                          "role": thread["role"], "profile_revision": thread["profile_revision"],
                          "model": profile["model"], "reasoning_effort": profile["reasoning_effort"],
@@ -697,6 +708,10 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
+            control = _control_history(tx)
+            resumes = _resume_history(tx, control)
+            data["latest_resume"] = resumes[-1] if resumes else None
+            data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
             data["abandonment"] = abandonment
             data["multi_ticket"] = _multi_ticket(tx, run, subjects, data["scheduling"])
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
@@ -725,18 +740,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     attempt["artifact"] = _material(tx, attempt["result_id"], attempt["subject"])
                     attempt.pop("context_id")
                     attempt.update({"attempt_id": attempt["id"], "work_subject": attempt["subject"], "budget_window": attempt["window"]})
-                control = _control_history(tx)
                 all_invocations = [invocation for job in subjects for invocation in _invocations(tx, job["subject"])]
-                resumes = []
-                for action in control:
-                    if action["kind"] != "resume":
-                        continue
-                    successors = [row for row in all_invocations if row["action_id"] == action["id"]]
-                    started = [output["started_at"] for row in successors for output in row["outputs"] if output["started_at"] is not None]
-                    resumes.append({"action_id": action["id"], "subject": action["subject"], "status": action["status"],
-                                    "payload": action["payload"], "receipt": action["receipt"],
-                                    "successor_invocations": [row["id"] for row in successors],
-                                    "started_at": min(started) if started else None})
                 data.update({"timeline": events, "timeline_continuation": [],
                              "semantic_agent_attempts": attempts,
                              "agent_invocations": all_invocations,

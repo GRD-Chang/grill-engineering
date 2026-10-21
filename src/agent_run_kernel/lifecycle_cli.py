@@ -133,8 +133,10 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
                                     replacement=replacement,
                                     resource_inspections=resource_inspections, discard_worktree=discard_worktree,
                                     continuation_of=continuation_of)
+        from .host_exit_notifications import exit_properties
+        properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
         handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
-        observed = launch_handoff(kernel, action_id, manager, handoff)
+        observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
         return {"result": "accepted", "status": "action_" + action_status, "run_id": request.run_id,
@@ -163,8 +165,10 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
         if kernel.host_dispatched(action_id):
             observed = reconcile_handoff(kernel, action_id, manager)
         else:
+            from .host_exit_notifications import exit_properties
+            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
             handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
-            observed = launch_handoff(kernel, action_id, manager, handoff)
+            observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action = tx.one("SELECT kind,status FROM actions WHERE id=?", (action_id,))
         return {"result": "attached", "status": "action_" + action["status"], "run_id": request.run_id,

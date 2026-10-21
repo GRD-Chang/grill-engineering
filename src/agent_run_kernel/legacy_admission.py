@@ -23,7 +23,8 @@ from agent_run.task_identity import TaskKey
 
 from .migration import SOURCE_PROTOCOL, SOURCE_TABLES, source_identity
 from .model import KernelError, wire_json
-from .task_location import locked_task
+from .storage import Storage
+from .task_location import locked_task, read_task, task_path
 
 
 _SOURCE_FENCE_PREFIX = "original-source-to-native/1:"
@@ -86,6 +87,94 @@ def read_source_fence(protocol: str) -> dict[str, str]:
     if source_fence(receipt) != protocol:
         raise _refuse()
     return receipt
+
+
+def origin_reference(database: Path, task: TaskKey, run_id: str) -> dict[str, str] | None:
+    """Read this native Run's immutable origin reference, without deciding replacement."""
+    if database.is_symlink() or database.resolve() != database:
+        raise _refuse()
+    storage = Storage(database)
+    with storage.transaction(write=False) as tx:
+        rows = tx.rows("SELECT subject,kind,identity,material_id FROM history WHERE kind IN ('v6_original_cutover','v6_source_origin')", limit=2)
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise _refuse()
+        run = tx.one("SELECT id,repository,parent_issue,repository_root FROM runs")
+        if (run["id"] != run_id or run["repository_root"] != str(task.workspace)
+                or run["repository"].lower() != task.repository or run["parent_issue"] != task.parent_number):
+            raise _refuse()
+        row = rows[0]
+        material = tx.one("SELECT purpose FROM material WHERE id=?", (row["material_id"],))
+        body = tx.get(row["material_id"], row["subject"])
+        value = json.loads(body)
+        if material[0] != row["kind"] or wire_json(value) != body:
+            raise _refuse()
+        if row["kind"] == "v6_original_cutover":
+            receipt = _fence_material(value)
+            if (receipt["run_id"] != run_id or receipt["target_db"] != str(database)
+                    or receipt["task_fingerprint"] != task.fingerprint or row["identity"] != receipt["nonce"]):
+                raise _refuse()
+            return {"origin_db": str(database), "nonce": receipt["nonce"]}
+        if (not isinstance(value, dict) or set(value) != {"origin_db", "nonce"}
+                or not all(isinstance(item, str) for item in value.values())
+                or row["identity"] != value["nonce"]
+                or len(value["nonce"]) != 32 or any(character not in "0123456789abcdef" for character in value["nonce"])
+                or not Path(value["origin_db"]).is_absolute() or Path(value["origin_db"]).resolve() != Path(value["origin_db"])
+                or database != Path(value["origin_db"]).parent.parent / run_id / "kernel.sqlite3"):
+            raise _refuse()
+        return {"origin_db": value["origin_db"], "nonce": value["nonce"]}
+
+
+def _original_transfer(task: TaskKey, source: _Source, path: Path,
+                       db: sqlite3.Connection, protocol: str) -> dict[str, str] | None:
+    """Verify the retired source and its initial native proof; never interpret old work."""
+    receipt = read_source_fence(protocol)
+    old_tasks = db.execute("SELECT task_id,workspace,repository,parent_number,run_id FROM control_tasks LIMIT 2").fetchall()
+    old_runs = db.execute("SELECT run_id,repository,parent_number FROM runs LIMIT 2").fetchall()
+    if len(old_tasks) != 1 or len(old_runs) != 1:
+        raise _refuse()
+    old_task = old_tasks[0]
+    transferred = TaskKey(Path(old_task[1]), old_task[2], old_task[3])
+    managed = ManagedWorkspace.for_repository(transferred.repository)
+    if (transferred.workspace != task.workspace or transferred.workspace != managed.repository_root.resolve()
+            or source.state != managed.state_root or path.resolve() != path
+            or receipt["source_db"] != str(path) or receipt["task_fingerprint"] != transferred.fingerprint
+            or old_task[0] != transferred.fingerprint or old_task[4] != receipt["run_id"]
+            or old_runs != [(receipt["run_id"], transferred.repository, transferred.parent_number)]
+            or receipt["target_db"] != str(managed.state_root / receipt["run_id"] / "kernel.sqlite3")):
+        raise _refuse()
+    roots = db.execute("SELECT value_checkout_identity FROM run_root WHERE run_id=? LIMIT 2", (receipt["run_id"],)).fetchall()
+    marker = transferred.workspace / ".git" / "agent-run-checkout-id"
+    if (roots != [(receipt["source_uuid"],)] or marker.is_symlink() or not marker.is_file()
+            or marker.stat().st_nlink != 1 or marker.stat().st_size != 33
+            or marker.read_bytes() != receipt["source_uuid"].encode("ascii") + b"\n"):
+        raise _refuse()
+    origin = Path(receipt["target_db"])
+    reference = {"origin_db": str(origin), "nonce": receipt["nonce"]}
+    if origin_reference(origin, transferred, receipt["run_id"]) != reference:
+        raise _refuse()
+    with Storage(origin).transaction(write=False) as tx:
+        proof = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_original_cutover'")
+        imported = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h JOIN material m ON m.id=h.material_id WHERE h.kind='v6_completed_import'")
+        records = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h JOIN material m ON m.id=h.material_id WHERE h.kind='v6_record_import'")
+        imported_body = json.loads(tx.get(imported["material_id"], imported["subject"]))
+        record_body = json.loads(tx.get(records["material_id"], records["subject"]))
+        if (tx.get(proof["material_id"], proof["subject"]) != wire_json(receipt)
+                or imported["identity"] != receipt["run_id"] or imported["purpose"] != "v6_completed_import_identity"
+                or imported_body.get("source_sha256") != receipt["source_sha256"]
+                or imported_body.get("resource_mode") != "existing-verified"
+                or imported_body.get("copied_repository_root") != str(transferred.workspace)
+                or records["identity"] != receipt["run_id"] or records["purpose"] != "v6_record_manifest"
+                or record_body.get("source", {}).get("sha256") != receipt["source_sha256"]
+                or record_body.get("source", {}).get("run_id") != receipt["run_id"]):
+            raise _refuse()
+    if transferred != task:
+        return None  # The sole retired old Task cannot authorize or block another Parent.
+    current = read_task(task_path(task))
+    if current is None or origin_reference(current[1], task, current[0]) != reference:
+        raise _refuse()
+    return reference
 
 
 def _sources(task: TaskKey) -> tuple[_Source, ...]:
@@ -159,7 +248,7 @@ def legacy_task_lock(task: TaskKey, state_root: Path) -> Iterator[None]:
         yield
 
 
-def _check(task: TaskKey, source: _Source) -> None:
+def _check(task: TaskKey, source: _Source) -> dict[str, str] | None:
     sentinel = source.state / "task-control" / (task.fingerprint + ".json")
     if sentinel.exists() or sentinel.is_symlink():
         raise _refuse()
@@ -169,7 +258,7 @@ def _check(task: TaskKey, source: _Source) -> None:
     if not path.exists():
         if source.run_id:
             raise _refuse()
-        return
+        return None
     before = source_identity(path)
     db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0, isolation_level=None)
     try:
@@ -177,8 +266,18 @@ def _check(task: TaskKey, source: _Source) -> None:
         db.execute("PRAGMA trusted_schema=OFF")
         db.execute("BEGIN")
         # A retired *copy* is not authority to admit against the original.
-        if db.execute("SELECT key,value FROM schema_meta").fetchmany(2) != [("protocol", SOURCE_PROTOCOL)]:
+        metadata = db.execute("SELECT key,value FROM schema_meta").fetchmany(2)
+        if len(metadata) != 1 or metadata[0][0] != "protocol":
             raise _refuse()
+        if metadata[0][1] != SOURCE_PROTOCOL:
+            try:
+                transfer = _original_transfer(task, source, path, db, metadata[0][1])
+            except (KernelError, KeyError, TypeError, AttributeError) as error:
+                raise _refuse() from error
+            after = path.stat()
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise _refuse()
+            return transfer
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchmany(513)}
         if not SOURCE_TABLES <= tables or "control_tasks" not in tables:
             raise _refuse()
@@ -200,6 +299,7 @@ def _check(task: TaskKey, source: _Source) -> None:
         after = path.stat()
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             raise _refuse()
+        return None
     finally:
         db.close()
 
@@ -215,8 +315,12 @@ def locked_admission(task: TaskKey) -> Iterator[Path]:
             location = held.enter_context(locked_task(task))
             if _sources(task) != sources:
                 raise _refuse()
-            for source in sources:
-                _check(task, source)
+            transfers = [_check(task, source) for source in sources]
+            current = read_task(location)
+            if current is not None:
+                origin = origin_reference(current[1], task, current[0])
+                if origin is not None and origin not in transfers:
+                    raise _refuse()
         except (OSError, ValueError, sqlite3.Error) as error:
             raise _refuse() from error
         yield location

@@ -25,7 +25,7 @@ from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
                         _require_no_v6_notification_journal, capture_v6)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
-from .migration_records import RECORD_TABLES, _preserve_copy
+from .migration_records import RECORD_TABLES, V6RecordReader, _preserve_copy
 from .migration_quiescence import read_v6_host_exit
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
                     KernelError, ParentIssue, Policy, Profile, Requirements, Role,
@@ -653,6 +653,7 @@ def convert_completed_ticket_v6(
     repository_root: Path, final_checkout: Path, profile_snapshot: Path,
     github_snapshot: Path, observation_snapshot: Path, original_report: Path,
     existing_verified: bool = False,
+    source_origin: Mapping[str, str] | None = None,
 ) -> Kernel:
     """Import a copied, offline single-Ticket completion and its source records.
 
@@ -662,6 +663,9 @@ def convert_completed_ticket_v6(
     source authority, publishes a Task, activates Final or launches a Host.
     """
     destination = destination.absolute()
+    origin = None if source_origin is None else dict(source_origin)
+    if origin is not None and not existing_verified:
+        raise MigrationRefused('source_origin_resources')
     repository_root, final_checkout = repository_root.absolute(), final_checkout.absolute()
     if not existing_verified and (destination.exists() or destination.is_symlink() or repository_root.exists()
             or repository_root.is_symlink()
@@ -812,7 +816,7 @@ def convert_completed_ticket_v6(
                                      common_git_dir=str(common))),
                            facts.policy, facts.language, str(repository_root), facts.inputs)
             candidate = Path(directory) / "kernel.sqlite3"
-            kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
+            kernel = Kernel.create(candidate, spec, requirements=facts.requirements, source_origin=origin)
             with kernel.storage.transaction() as tx:
                 native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
                 tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
@@ -834,7 +838,11 @@ def convert_completed_ticket_v6(
                             f"refs/heads/{facts.run_branch}", facts.base_sha, facts.base_sha))
                 tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
                 tx.execute("DELETE FROM integration_queue WHERE subject=?", (subject,))
-                tx.execute("DELETE FROM history")
+                if origin is None:
+                    tx.execute("DELETE FROM history")
+                else:
+                    tx.execute("DELETE FROM history WHERE kind!='v6_original_cutover' OR identity!=?",
+                               (origin['nonce'],))
                 for event in facts.timeline:
                     payload = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
                                "values": {key: value for key, value in event.items()
@@ -926,6 +934,34 @@ def convert_completed_ticket_v6(
                 raise MigrationRefused("source_document_changed")
             _preserve_copy(copied, kernel, run_id=facts.run_id, subject=subject,
                            profile_document=profile_body)
+            if origin is not None:
+                reader = V6RecordReader(kernel)
+                original_root = reader.row('run_root', [facts.run_id])
+                with kernel.storage.transaction() as tx:
+                    anchor = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_original_cutover' AND identity=?",
+                                    (origin['nonce'],))
+                    imported = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_completed_import'")
+                    original_import = json.loads(tx.get(imported['material_id'], imported['subject']))
+                    if (tx.get(anchor['material_id'], anchor['subject']) != wire_json(origin)
+                            or origin['target_db'] != str(destination.resolve())
+                            or origin['source_db'] != str(snapshot.source.resolve())
+                            or origin['source_sha256'] != snapshot.sha256
+                            or reader.source['sha256'] != snapshot.sha256
+                            or original_import['source_sha256'] != snapshot.sha256
+                            or original_root['value_checkout_identity'] != origin['source_uuid']
+                            or original_root['value_run_branch'] != facts.run_branch):
+                        raise MigrationRefused('source_origin_provenance')
+                    # Transfer the authenticated old RunRoot responsibility,
+                    # without claiming native workspace execution created it.
+                    source_ref = 'refs/heads/' + facts.run_branch
+                    ownership = tx.put(subject, 'v6_local_ref_ownership', wire_json({
+                        'origin_nonce': origin['nonce'], 'source_ref': source_ref,
+                        'expected_oid': facts.integrated_sha,
+                        'source_record': {'table': 'run_root', 'key': [facts.run_id]},
+                    }))
+                    tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                               'VALUES (?,?,?,?,1,?)',
+                               (subject, 'v6_local_ref_ownership', source_ref, ownership, kernel.clock()))
             latest_requirements = Requirements(facts.requirements.parent,
                                                (replace(facts.requirements.issues[0], state="CLOSED"),))
             # This is the sealed copy's verified GitHub readback, not a new

@@ -7,6 +7,7 @@ returned request. A raw return and its business consumption commit separately.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 from datetime import datetime
 import hashlib
@@ -30,7 +31,7 @@ from .model import (
 from .storage import CURRENT_LIMIT, Storage, Transaction
 from .configuration import checkpoint_policy
 from .task_location import bind_task, read_task
-from .legacy_admission import locked_admission
+from .legacy_admission import locked_admission, origin_reference, read_source_fence, source_fence
 
 
 def identity() -> str:
@@ -53,19 +54,27 @@ class Kernel:
         task = TaskKey(Path(spec.repository_root), spec.repository, spec.parent_issue)
         with locked_admission(task) as location:
             prior = read_task(location)
+            origin: dict[str, str] | None = None
             if prior is not None:
                 existing = cls(prior[1])
                 if not existing._replaceable(task, prior[0]):
                     return existing
+                origin = origin_reference(prior[1], task, prior[0])
             kernel = cls.create(path, spec, requirements=requirements)
+            kernel._carry_source_origin(task, spec.run_id, origin)
             bind_task(location, spec.run_id, kernel.storage.path)
             return kernel
 
     @classmethod
     def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements | None = None,
-               fixture_evidence: Mapping[str, Any] | None = None) -> Kernel:
+               fixture_evidence: Mapping[str, Any] | None = None,
+               source_origin: Mapping[str, str] | None = None) -> Kernel:
         if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
             raise ValueError("one or more uniquely identified deliveries are required")
+        origin = None if source_origin is None else read_source_fence(source_fence(source_origin))
+        if origin is not None and (spec.repository_root is None or origin["run_id"] != spec.run_id
+                or origin["task_fingerprint"] != TaskKey(Path(spec.repository_root), spec.repository, spec.parent_issue).fingerprint):
+            raise KernelError("source_origin_identity")
         profiles = ({"preset": None, "profiles": {
             role.value: {"model": getattr(spec.policy, role.value + "_profile").model,
                          "reasoning_effort": getattr(spec.policy, role.value + "_profile").effort,
@@ -137,6 +146,11 @@ class Kernel:
             if fixture_evidence is not None:
                 for delivery in spec.deliveries:
                     tx.put(delivery.key, "fixture_evidence", wire_json(fixture_evidence))
+            if origin is not None:
+                # This is the converter's final publication intent, even when
+                # creation uses a temporary inode. It grants no execution.
+                material = tx.put(owner, "v6_original_cutover", wire_json(origin))
+                kernel._event(tx, owner, "v6_original_cutover", origin["nonce"], material)
         return kernel
 
     def _add_delivery(self, tx: Transaction, run_id: str, policy: Policy, delivery: Delivery) -> None:
@@ -987,6 +1001,26 @@ class Kernel:
             raise KernelError("task_workspace_unknown")
         return TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
 
+    def _carry_source_origin(self, task: TaskKey, run_id: str, origin: Mapping[str, str] | None) -> None:
+        """Commit the fixed origin before publishing a legally replaced Task binding."""
+        if origin is None:
+            return
+        if self.storage.path != Path(origin["origin_db"]).parent.parent / run_id / "kernel.sqlite3":
+            raise KernelError("legacy_requires_offline_migration")
+        present = origin_reference(self.storage.path, task, run_id)
+        if present is not None:
+            if present != origin:
+                raise KernelError("legacy_requires_offline_migration")
+            return
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            if (run["id"] != run_id or self._task(run) != task
+                    or tx.rows("SELECT identity FROM history WHERE kind IN ('v6_original_cutover','v6_source_origin') LIMIT 1")):
+                raise KernelError("legacy_requires_offline_migration")
+            owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+            material = tx.put(owner, "v6_source_origin", wire_json(dict(origin)))
+            self._event(tx, owner, "v6_source_origin", origin["nonce"], material)
+
     def _replaceable(self, task: TaskKey, run_id: str) -> bool:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
@@ -1050,6 +1084,7 @@ class Kernel:
             raise KernelError("policy_override_boundary")
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
+            original_source = bool(tx.rows("SELECT identity FROM history WHERE kind IN ('v6_original_cutover','v6_source_origin') LIMIT 1"))
             abandoned = self._abandon_action(tx)
             if abandoned is not None:
                 if (kind != "abandon" or continuation_of != abandoned["id"] or abandoned["status"] != "pending"
@@ -1061,9 +1096,14 @@ class Kernel:
             run_id, task = run["id"], self._task(run)
         with locked_admission(task) as location:
             prior = read_task(location)
+            if original_source and prior != (run_id, self.storage.path.resolve()):
+                if (prior is None or origin_reference(self.storage.path, task, run_id)
+                        != origin_reference(prior[1], task, prior[0])):
+                    raise KernelError("legacy_requires_offline_migration")
             if prior is not None and prior != (run_id, self.storage.path.resolve()):
                 if not Kernel(prior[1])._replaceable(task, prior[0]):
                     raise KernelError("task_run_busy")
+                self._carry_source_origin(task, run_id, origin_reference(prior[1], task, prior[0]))
             if prior != (run_id, self.storage.path.resolve()):
                 bind_task(location, run_id, self.storage.path)
             # A crash here preserves the bound, fully created Run even without a PID.
@@ -1308,21 +1348,30 @@ class Kernel:
                     and (group == host["cgroup"] or group.startswith(host["cgroup"].rstrip("/") + "/")))
 
     def claim_executor(self, owner: str) -> Execution:
-        with self.storage.transaction() as tx:
+        with self.storage.transaction(write=False) as tx:
+            original_source = bool(tx.rows("SELECT identity FROM history WHERE kind IN ('v6_original_cutover','v6_source_origin') LIMIT 1"))
             run = tx.one("SELECT * FROM runs")
-            if self._abandon_action(tx) is not None:
-                raise KernelError("run_abandoned")
-            if tx.rows("SELECT owner FROM hosts LIMIT 1"):
-                raise KernelError("managed_host_required")
-            if run["stopped"]:
-                raise KernelError("operator_stopped")
-            if tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND status='pending' LIMIT 1", (run["id"],)):
-                raise KernelError("executor_exit_unproven")
-            if run["executor"] is not None and run["executor"] != owner:
-                raise KernelError("executor_exit_unproven")
-            epoch = run["epoch"] if run["executor"] == owner else run["epoch"] + 1
-            tx.execute("UPDATE runs SET executor=?,epoch=?", (owner, epoch))
-            return Execution(run["id"], owner, epoch)
+        with ExitStack() as admission:
+            if original_source:
+                task = self._task(run)
+                location = admission.enter_context(locked_admission(task))
+                if read_task(location) != (run["id"], self.storage.path.resolve()):
+                    raise KernelError("legacy_requires_offline_migration")
+            with self.storage.transaction() as tx:
+                run = tx.one("SELECT * FROM runs")
+                if self._abandon_action(tx) is not None:
+                    raise KernelError("run_abandoned")
+                if tx.rows("SELECT owner FROM hosts LIMIT 1"):
+                    raise KernelError("managed_host_required")
+                if run["stopped"]:
+                    raise KernelError("operator_stopped")
+                if tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND status='pending' LIMIT 1", (run["id"],)):
+                    raise KernelError("executor_exit_unproven")
+                if run["executor"] is not None and run["executor"] != owner:
+                    raise KernelError("executor_exit_unproven")
+                epoch = run["epoch"] if run["executor"] == owner else run["epoch"] + 1
+                tx.execute("UPDATE runs SET executor=?,epoch=?", (owner, epoch))
+                return Execution(run["id"], owner, epoch)
 
     def confirm_executor_exit(self, execution: Execution, exited_invocations: tuple[str, ...] = ()) -> None:
         """Consume exact Host exit evidence; no PID guessing or replacement claim.
@@ -1452,6 +1501,44 @@ class Kernel:
                 return self._allocate(tx, run, job, execution, world, allow_agent)
             return self._mechanical(tx, run, job, execution, world)
 
+    def _imported_local_ref(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                            cleanup: sqlite3.Row) -> tuple[str, str] | None:
+        origins = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                          "WHERE h.kind='v6_original_cutover' LIMIT 2")
+        if not origins:
+            return None
+        ownership = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                            "WHERE h.kind='v6_local_ref_ownership' AND h.identity=? LIMIT 2", (cleanup["source_ref"],))
+        imports = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                         "WHERE h.kind='v6_completed_import' AND h.identity=? LIMIT 2", (run["id"],))
+        if len(origins) != 1 or len(ownership) != 1 or len(imports) != 1 or job["kind"] != DeliveryKind.FINAL_RUN:
+            raise KernelError("cleanup_marker_unproven")
+        anchor, fact, imported = origins[0], ownership[0], imports[0]
+        original = json.loads(tx.get(anchor["material_id"], anchor["subject"]))
+        if not isinstance(original, dict):
+            raise KernelError("cleanup_marker_unproven")
+        try:
+            origin = read_source_fence(source_fence(original))
+        except KernelError as error:
+            raise KernelError("cleanup_marker_unproven") from error
+        value = json.loads(tx.get(fact["material_id"], fact["subject"]))
+        proof = json.loads(tx.get(imported["material_id"], imported["subject"]))
+        if (anchor["material_purpose"] != "v6_original_cutover" or anchor["identity"] != origin["nonce"]
+                or origin["run_id"] != run["id"] or origin["target_db"] != str(self.storage.path)
+                or origin["task_fingerprint"] != self._task(run).fingerprint
+                or fact["material_purpose"] != "v6_local_ref_ownership" or fact["subject"] != imported["subject"]
+                or imported["material_purpose"] != "v6_completed_import_identity"
+                or not isinstance(proof, dict)
+                or proof.get("resource_mode") != "existing-verified"
+                or proof.get("source_sha256") != origin["source_sha256"]
+                or proof.get("copied_repository_root") != run["repository_root"]
+                or not isinstance(value, dict) or set(value) != {"origin_nonce", "source_ref", "expected_oid", "source_record"}
+                or value["origin_nonce"] != origin["nonce"] or value["source_ref"] != cleanup["source_ref"]
+                or value["source_record"] != {"table": "run_root", "key": [run["id"]]}
+                or not isinstance(value["expected_oid"], str) or value["expected_oid"] != proof.get("integrated_sha")):
+            raise KernelError("cleanup_marker_unproven")
+        return value["expected_oid"], origin["source_uuid"]
+
     def advance_cleanup(self, subject: str, execution: Execution, world: World | None = None) -> Step:
         """Bounded program work; cleanup never owns an Agent or integration seat."""
         with self.storage.transaction() as tx:
@@ -1492,6 +1579,7 @@ class Kernel:
                 return Step("observe", subject)
             operation = self.CLEANUP[cleanup["stage"]]
             head = cleanup["workspace_sha"] if operation == "cleanup_worktree" else cleanup["source_sha"]
+            source_uuid = None
             if operation == "cleanup_local_ref":
                 workspaces = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND source_ref=? AND operation='workspace' AND status='confirmed'",
                                      (subject, cleanup["generation"], cleanup["source_ref"]))
@@ -1505,18 +1593,29 @@ class Kernel:
                         or receipt["commit"].get("sha") != workspace["before_sha"]):
                     return Step("paused", subject, "cleanup_marker_unproven")
                 if intent.get("create_ref") is False:
-                    # Final's workspace is detached without creating a local
-                    # Run-branch head. A remote publication grants no local ownership.
-                    tx.execute("UPDATE resource_cleanup SET stage=stage+1 WHERE subject=? AND generation=?",
-                               (subject, cleanup["generation"]))
-                    self._event(tx, subject, "resource_not_owned", operation, workspace["payload_id"])
-                    return Step("progress", subject)
-                if intent.get("create_ref") is not True:
+                    try:
+                        original = self._imported_local_ref(tx, run, job, cleanup)
+                    except KernelError as error:
+                        if error.code != "cleanup_marker_unproven":
+                            raise
+                        return Step("paused", subject, error.code)
+                    if original is None:
+                        # An ordinary detached Final workspace creates no
+                        # local branch. Remote publication grants no ownership.
+                        tx.execute("UPDATE resource_cleanup SET stage=stage+1 WHERE subject=? AND generation=?",
+                                   (subject, cleanup["generation"]))
+                        self._event(tx, subject, "resource_not_owned", operation, workspace["payload_id"])
+                        return Step("progress", subject)
+                    head, source_uuid = original
+                elif intent.get("create_ref") is True:
+                    head = workspace["before_sha"]
+                else:
                     return Step("paused", subject, "cleanup_marker_unproven")
-                head = workspace["before_sha"]
             payload = {"checkout": cleanup["checkout"], "owned_root": cleanup["owned_root"],
                        "common_git_dir": cleanup["common_git_dir"], "branch_ref": cleanup["source_ref"], "expected_head": head,
                        "remote": self._inputs(tx, run)["repository_remote"]}
+            if source_uuid is not None:
+                payload["source_uuid"] = source_uuid
             step = self._prepare_effect(tx, run, job, execution, world, operation, before=head, payload=payload)
             assert step.effect is not None
             tx.execute("UPDATE resource_cleanup SET effect_id=? WHERE subject=? AND generation=?", (step.effect.effect_id, subject, job["generation"]))

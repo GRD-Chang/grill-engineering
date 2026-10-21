@@ -90,6 +90,109 @@ def _human(kernel: Kernel, message: str = "Need the original decision / 保留�
     assert kernel.advance("ticket:2", execution, world).kind == "paused"
 
 
+def test_latest_resume_distinguishes_application_from_the_target_start_and_ignores_sibling_progress(
+    tmp_path: Path, capsys,
+) -> None:
+    from io import StringIO
+    from agent_run_kernel.query_render import render
+
+    base = Commit("base", "base-tree")
+    deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
+        f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
+    kernel = _create(tmp_path, deliveries=deliveries)
+    _human(kernel)
+    execution = kernel.claim_executor("query-executor")
+    world = World("parent-v1", "graph-v1", "ticket-v1", base)
+    sibling = kernel.advance("ticket:3", execution, world).call
+    assert sibling is not None
+    # Allocate the sibling before re-enqueueing Ticket 2, respecting the real
+    # FIFO. Its physical start below still follows the target's Resume.
+    assert kernel.control("resume", "resume-target-2", subject="ticket:2", message="Original answer") == "applied"
+    assert kernel.dispatch_agent(sibling)
+    # This is a recorded Core process-observation seam, not a real child process.
+    sibling_process = {"pid": 23, "pgid": 23, "start_token": "query-sibling",
+                       "host_pid": 10, "host_start_token": "query-host"}
+    kernel.agent_started(sibling, sibling_process)
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--json")) == 0
+    document = json.loads(capsys.readouterr().out)
+    latest = document["latest_resume"]
+    assert latest["action_id"] == "resume-target-2" and latest["subject"] == "ticket:2"
+    assert latest["status"] == "applied" and latest["progress"] is None
+    for style in ("plain", "rich"):
+        stream = StringIO()
+        render(query.read(kernel.storage.path, "status"), style=style, details=False, stream=stream)
+        assert "Resume: resume-target-2" in stream.getvalue()
+        assert "applied; target progress not yet observed" in stream.getvalue()
+    history = query.read(kernel.storage.path, "history").data
+    assert history["latest_resume"] == latest
+    assert history["agent_resumes"][-1] == latest
+    assert _snapshot(tmp_path) == before
+
+    kernel.agent_exited(sibling, sibling_process, 0)
+    target = kernel.advance("ticket:2", execution, world).call
+    assert target is not None and kernel.dispatch_agent(target)
+    target_process = {**sibling_process, "pid": 22, "pgid": 22, "start_token": "query-target"}
+    kernel.agent_started(target, target_process)
+    before = _snapshot(tmp_path)
+    latest = query.read(kernel.storage.path, "status").data["latest_resume"]
+    assert latest["status"] == "applied"
+    assert latest["progress"]["resume_outcome"] == "started"
+    assert latest["progress"]["action_id"] == "resume-target-2"
+    assert latest["progress"]["work_subject"] == "ticket:2"
+    assert latest["progress"]["invocation_id"] == target.invocation_id
+    assert latest["progress"]["invocation_id"] != sibling.invocation_id
+    assert _snapshot(tmp_path) == before
+    kernel.agent_exited(target, target_process, 2, failure_kind="fatal")
+    before = _snapshot(tmp_path)
+    failed = query.read(kernel.storage.path, "status")
+    assert failed.data["latest_resume"]["progress"]["resume_outcome"] == "failed"
+    assert failed.data["latest_resume"]["progress"]["work_subject"] == "ticket:2"
+    assert failed.data["latest_resume"]["progress"]["reason_code"] == "execution_failed"
+    stream = StringIO()
+    render(failed, style="plain", details=False, stream=stream)
+    assert "Target execution failed" in stream.getvalue()
+    assert query.read(kernel.storage.path, "history").data["agent_resumes"][-1] == failed.data["latest_resume"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accepted_resume(
+    tmp_path: Path,
+) -> None:
+    from io import StringIO
+    from agent_run_kernel import KernelError
+    from agent_run_kernel.query_render import render
+
+    kernel = _create(tmp_path)
+    execution = kernel.claim_executor("query-executor")
+    call = kernel.advance("ticket:2", execution,
+        World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))).call
+    assert call is not None and kernel.dispatch_agent(call)
+    process = {"pid": 22, "pgid": 22, "start_token": "query-target",
+               "host_pid": 10, "host_start_token": "query-host"}
+    kernel.agent_started(call, process)
+    assert kernel.control("stop", "stop-target-2", subject="ticket:2") == "applied"
+    with pytest.raises(KernelError, match="worker_exit_unproven"):
+        kernel.control("resume", "rejected-resume-2", subject="ticket:2")
+    before = _snapshot(tmp_path)
+    document = query.read(kernel.storage.path, "status")
+    assert document.data["latest_resume"] is None
+    waits = document.data["resume_waits"]
+    assert len(waits) == 1
+    assert waits[0]["subject"] == "ticket:2" and waits[0]["issue"] == 2
+    assert waits[0]["invocation"] == call.invocation_id
+    assert waits[0]["reason"] == "worker_exit_unproven"
+    stream = StringIO()
+    render(document, style="plain", details=False, stream=stream)
+    assert "Worker exit not yet confirmed: #2" in stream.getvalue()
+    history = query.read(kernel.storage.path, "history").data
+    assert history["agent_resumes"] == []
+    assert not any(action["id"] == "rejected-resume-2" for action in history["actions"])
+    assert _snapshot(tmp_path) == before
+    kernel.agent_exited(call, process, -15)
+    assert query.read(kernel.storage.path, "status").data["resume_waits"] == []
+
+
 def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

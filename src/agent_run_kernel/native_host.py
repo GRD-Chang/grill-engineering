@@ -50,7 +50,8 @@ class HostEnvironment:
     receipt: dict[str, Any]
 
 
-def launch_handoff(kernel: Kernel, action_id: str, manager: SystemdHost, handoff: Handoff) -> HostObservation | None:
+def launch_handoff(kernel: Kernel, action_id: str, manager: SystemdHost, handoff: Handoff, *,
+                   exit_properties: tuple[str, ...] = ()) -> HostObservation | None:
     """Persist the original guardian receipt before the sole authorized launch."""
     request = kernel.host_request(action_id)
     if handoff.receipt.get("request_digest") != _digest(request):
@@ -64,7 +65,8 @@ def launch_handoff(kernel: Kernel, action_id: str, manager: SystemdHost, handoff
         ))
         return True
 
-    observed = manager.launch(request, dispatch=dispatch)
+    observed = (manager.launch(request, dispatch=dispatch, exit_properties=exit_properties) if exit_properties
+                else manager.launch(request, dispatch=dispatch))
     # Pending already records the uncertain launch. A late CLI reply cannot
     # downgrade a newer readiness fact reported by the actual Host process.
     if observed is not None and observed.disposition != "unknown":
@@ -87,6 +89,13 @@ def _environment(value: object) -> dict[str, str]:
     ):
         raise HandoffError("Invalid captured environment")
     return dict(value)
+
+
+def _runner_witness(runner_lock: Path) -> dict[str, Any]:
+    held = runner_lock.stat()
+    return {"package_root": str(Path(__file__).resolve().parents[1]),
+            "python": sys.executable, "lock": str(runner_lock.resolve()),
+            "device": held.st_dev, "inode": held.st_ino}
 
 
 def _unlink_owned(path: Path, identity: tuple[int, int] | None) -> None:
@@ -134,6 +143,7 @@ def prepare_handoff(
         "nonce": request.nonce, "request_digest": _digest(request), "deadline": deadline,
         "socket": str(endpoint), "boot_id": _BOOT.read_text().strip(),
         "pid_namespace": os.readlink("/proc/self/ns/pid"),
+        "runner": _runner_witness(runner_lock),
     }
     body = {"version": 1, "receipt": receipt, "runner_lock": str(runner_lock.resolve()), "environment": captured}
     if len(_encode(body)) > _LIMIT - 4096:
@@ -252,7 +262,8 @@ def _guardian(arguments: list[str]) -> int:
             os.close(ack_fd)
 
 
-def _read_carrier(request: HostLaunch, credential: Path, runner_lock: Path) -> tuple[dict[str, str], dict[str, Any]]:
+def _read_carrier(request: HostLaunch, credential: Path, runner_lock: Path, *,
+                  check_expiry: bool = True) -> tuple[dict[str, str], dict[str, Any]]:
     descriptor = os.open(credential, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor, "rb") as source:
         info = os.fstat(source.fileno())
@@ -271,9 +282,22 @@ def _read_carrier(request: HostLaunch, credential: Path, runner_lock: Path) -> t
     if (receipt.get("nonce") != request.nonce or receipt.get("request_digest") != _digest(request)
             or receipt.get("boot_id") != _BOOT.read_text().strip()
             or receipt.get("pid_namespace") != os.readlink("/proc/self/ns/pid")
-            or type(deadline) not in {int, float} or not math.isfinite(deadline) or time.monotonic() >= deadline):
+            or receipt.get("runner") != _runner_witness(runner_lock)
+            or type(deadline) not in {int, float} or not math.isfinite(deadline)
+            or (check_expiry and time.monotonic() >= deadline)):
         raise HandoffError("Environment credential is expired or bound elsewhere")
     return _environment(value.get("environment")), receipt
+
+
+def read_exit_environment(request: HostLaunch, *, runner_lock: Path, credential: Path) -> HostEnvironment:
+    """Read the original manager credential after expiry, without claiming startup.
+
+    The post-exit caller already owns the original Runner's shared lease. Its
+    manager-owned credential survives the one-shot source carrier and guardian.
+    All identity and private-file checks remain the startup reader's checks.
+    """
+    environment, receipt = _read_carrier(request, credential, runner_lock, check_expiry=False)
+    return HostEnvironment(environment, receipt)
 
 
 @contextmanager

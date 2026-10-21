@@ -915,6 +915,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                     assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
                 assert kernel.status(final)["phase"] == "approval"
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
+                assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
                 approve_started = time.monotonic()
                 code, approved = public("approve", accepted["run_id"])
                 assert code == 0 and approved["status"] == "action_pending" and approved["host"] == "running", approved
@@ -934,14 +935,25 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert kernel.status(final)["phase"] == "complete"
                 assert kernel.status(final)["generation"] == renewed["generation"]
                 assert kernel.status(final)["pr_number"] == final_before["pr_number"]
-                assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
+                assert kernel.status(final)["source_sha"] == original_run_head
+                absent = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "show-ref", "--verify", "--quiet",
+                                         final_delivery.source_ref], capture_output=True, timeout=min(3, remaining()))
+                assert absent.returncode == 1  # Successful terminal cleanup retires the owned Run Branch.
                 events = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
-                fresh = [event for event in events if Path(event["checkout"]).name == "ticket-2-g2"]
+                with kernel.storage.transaction(write=False) as tx:
+                    ticket_threads = {row[0] for row in tx.all(
+                        "SELECT t.backend_id FROM attempts a JOIN invocations i ON i.attempt=a.id JOIN threads t ON t.id=i.thread "
+                        "WHERE a.subject='ticket:2' AND a.generation=2")}
+                    final_threads = {row[0] for row in tx.all(
+                        "SELECT t.backend_id FROM attempts a JOIN invocations i ON i.attempt=a.id JOIN threads t ON t.id=i.thread "
+                        "WHERE a.subject=? AND a.generation=?", (final, renewed["generation"]))}
+                fresh = [event for event in events if event["thread"] in ticket_threads]
                 assert [event["role"] for event in fresh] == ["development", "review", "publication"]
                 assert fresh[0]["requirement"]["body"] == fresh_body
                 assert f"https://github.com/example/project/issues/2" in fresh[0]["prompt"]
                 assert fresh[0]["thread"] != original_event["thread"]
-                fresh_final = [event for event in events if Path(event["checkout"]).name == "final-1-g2"]
+                assert fresh[1]["checkout"] != fresh[0]["checkout"]  # Review keeps its original isolated checkout.
+                fresh_final = [event for event in events if event["thread"] in final_threads]
                 assert [event["role"] for event in fresh_final] == ["review", "publication"]
                 with kernel.storage.transaction(write=False) as tx:
                     assert all(dict(tx.one("SELECT * FROM threads WHERE id=?", (thread["id"],))) == thread for thread in original_threads)
@@ -951,8 +963,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                                      "JOIN attempts a ON a.id=i.attempt WHERE a.subject='ticket:2'")
                     assert {row["generation"] for row in workers} == {1, 2}
                     assert all(json.loads(tx.get(row["process_identity"], "ticket:2"))["host_pid"] == children[0].pid for row in workers)
-                branch = kernel.delivery("ticket:2").target_ref
-                assert _git(tmp_path / "origin.git", "show", branch + ":requeue-evidence.txt") == fresh_body
+                assert _git(tmp_path / "origin.git", "show", original_run_head + ":requeue-evidence.txt") == fresh_body
                 assert json.loads(state.read_text())["source_graph"]["issues"]["2"]["state"] == "CLOSED"
                 assert len(json.loads(state.read_text())["prs"]) == 2
                 assert next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == final_before["pr_number"])["merged"]

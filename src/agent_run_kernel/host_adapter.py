@@ -63,7 +63,8 @@ class SystemdHost:
         except OSError as error:
             raise HostUnavailable("The user systemd manager cannot be contacted") from error
 
-    def launch(self, request: HostLaunch, *, dispatch: Callable[[], bool]) -> HostObservation | None:
+    def launch(self, request: HostLaunch, *, dispatch: Callable[[], bool],
+               exit_properties: tuple[str, ...] = ()) -> HostObservation | None:
         """Consume exactly one Kernel launch grant; never retry an unknown start."""
         if not dispatch():
             return None
@@ -81,10 +82,12 @@ class SystemdHost:
                 self.systemd_run, "--user", f"--unit={request.unit_name}",
                 f"--description={request.description}", "--expand-environment=no",
                 "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
-                "--property=RemainAfterExit=no", "--property=TimeoutStopSec=5s",
+                "--property=RemainAfterExit=no",
+                *(("--property=TimeoutStopSec=5s",) if not exit_properties else ()),
                 "--property=FileDescriptorStoreMax=1", "--property=FileDescriptorStorePreserve=restart",
                 "--property=NotifyAccess=main",
                 f"--property=LoadCredential=agent-run-environment:{request.environment_carrier}",
+                *("--property=" + value for value in exit_properties),
                 "--", *request.command,
             ])
             if result.returncode != 0:
@@ -107,6 +110,31 @@ class SystemdHost:
         if not set(_PROPERTIES) <= fields.keys():
             raise ValueError("Incomplete unit observation")
         return fields
+
+    def exit_identity(self, request: HostLaunch, invocation_id: str) -> bool:
+        """Read the exact unit identity while its post-exit hook is still alive.
+
+        ControlPID/cgroup settlement is deliberately irrelevant here: this
+        proves neither whole-Host exit nor release of its retained lease.
+        """
+        if not re.fullmatch(r"[0-9a-f]{32}", invocation_id) or int(invocation_id, 16) == 0:
+            return False
+        try:
+            keys = ("Id", "Description", "InvocationID", "LoadState")
+            expected = (request.unit_name, request.description, invocation_id, "loaded")
+            first = self._fields(request.unit_name)
+            if (first["LoadState"] != "loaded" or not re.fullmatch(r"[0-9a-f]{32}", first["InvocationID"])
+                    or int(first["InvocationID"], 16) == 0):
+                raise HostUnavailable("Host exit identity is unavailable")
+            if tuple(first[key] for key in keys) != expected:
+                return False
+            second = self._fields(request.unit_name)
+            if (second["LoadState"] != "loaded" or not re.fullmatch(r"[0-9a-f]{32}", second["InvocationID"])
+                    or int(second["InvocationID"], 16) == 0):
+                raise HostUnavailable("Host exit identity is unavailable")
+            return tuple(second[key] for key in keys) == expected
+        except (OSError, ValueError) as error:
+            raise HostUnavailable("Host exit identity is unavailable") from error
 
     def observe(self, request: HostLaunch) -> HostObservation:
         """Read twice around physical evidence; this never mutates the Kernel."""

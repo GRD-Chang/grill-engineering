@@ -4,7 +4,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 from typing import Any
@@ -103,6 +105,21 @@ class LocalEffects:
             actual = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
             if Path(actual).resolve() != Path(common):
                 raise KernelError("foreign_local_checkout")
+            if "source_uuid" in effect.payload:
+                original = effect.payload["source_uuid"]
+                if (not isinstance(original, str) or len(original) != 32
+                        or any(character not in "0123456789abcdef" for character in original)):
+                    raise KernelError("foreign_local_checkout")
+                descriptor = os.open(Path(common) / "agent-run-checkout-id",
+                                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as marker:
+                    physical = os.fstat(marker.fileno())
+                    if (not stat.S_ISREG(physical.st_mode) or physical.st_nlink != 1
+                            or physical.st_size != 33 or marker.read(34) != original.encode("ascii") + b"\n"):
+                        raise KernelError("foreign_local_checkout")
+                symbolic = self.git.run("symbolic-ref", "-q", effect.source_ref, check=False)
+                if symbolic.returncode != 1:
+                    raise KernelError("foreign_local_checkout" if symbolic.returncode == 0 else "local_read_failed")
         if effect.operation != "validation_cleanup":
             return effect
         return replace(effect, payload={**effect.payload,
