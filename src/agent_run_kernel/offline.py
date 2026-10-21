@@ -889,8 +889,9 @@ class GraphScenario(Scenario):
         base = self.port.git.commit("refs/heads/main")
         self.initial = base
         run_ref = "refs/heads/run"
-        self.port.git.run("update-ref", run_ref, base.sha)
-        self.port._remote_cas(run_ref, base.sha, base.sha)
+        if requirements.parent.sub_issue_numbers:
+            self.port.git.run("update-ref", run_ref, base.sha)
+            self.port._remote_cas(run_ref, base.sha, base.sha)
         work = (root / "work").resolve()
         work.mkdir()
         deliveries = []

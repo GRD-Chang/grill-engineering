@@ -57,6 +57,9 @@ def test_completed_delivery_retires_only_its_recorded_resources(
     scenario = _native_scenario(tmp_path / "scenario", kind)
     main = "refs/heads/main"
     main_before = scenario.port.git.commit(main)
+    if kind == DeliveryKind.PARENT_ONLY:
+        assert scenario.port.git.run("for-each-ref", "--format=%(refname)").stdout.splitlines() == [main]
+        assert scenario.port.remote_refs() == {main: main_before.sha}
     sibling = "refs/heads/other-active-ticket"
     scenario.port.git.run("update-ref", sibling, main_before.sha)
     checkout = Path(scenario.delivery.checkout)
@@ -100,6 +103,9 @@ def test_completed_delivery_retires_only_its_recorded_resources(
     else:
         assert _local_head(scenario, scenario.delivery.source_ref) is None
     assert _local_head(scenario, sibling) == main_before.sha
+    if kind == DeliveryKind.PARENT_ONLY:
+        assert scenario.port.git.run("for-each-ref", "--format=%(refname)").stdout.splitlines() == [main, sibling]
+        assert set(scenario.port.remote_refs()) == {main}
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.merged is not None
     assert scenario.kernel.status(scenario.delivery.key)["issue_link"]["state"] == "linked"
