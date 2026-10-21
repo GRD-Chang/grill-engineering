@@ -1,0 +1,518 @@
+"""Controlled real CLI processes exercise the Codex transport, never a service."""
+
+import json
+import os
+from collections.abc import Mapping
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+import pytest
+
+from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Profile, RunSpec, World
+from agent_run_kernel.codex_execution import execute_codex
+from agent_run_kernel.execution import ProcessExit
+from agent_run_kernel.offline import Scenario, review_result
+
+
+RAW = b'{"result_kind":"development","summary":"Implemented by the local CLI process.","human_blockers":null}'
+
+
+def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentCall, World]:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = tmp_path / "runner-state"
+    state.mkdir()
+    base = Commit("base", "tree")
+    world = World("parent-v1", "graph-v1", "ticket-v1", base)
+    spec = RunSpec("codex-boundaries", "example/repository", 1, "parent-v1", "graph-v1", (
+        Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
+                 "refs/heads/ticket", "refs/heads/run", checkout=str(checkout)),
+    ), Policy(development_profile=Profile("bound-model", "high"),
+              review_profile=Profile("bound-review-model", "high"),
+              publication_profile=Profile("bound-publication-model", "high")))
+    kernel = Kernel.create(state / "kernel.sqlite3", spec)
+    call = kernel.advance("ticket:2", kernel.claim_executor("local-cli-executor"), world).call
+    assert call is not None
+    return kernel, call, world
+
+
+def local_codex(kernel: Kernel, call: AgentCall, tmp_path: Path, program: str) -> ProcessExit | None:
+    executable = tmp_path / "local-codex"
+    executable.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n" + program)
+    executable.chmod(0o700)
+    credential = tmp_path / "selected-hosts.yml"
+    credential.write_text("github.com:\n  oauth_token: local-fixture-only\n")
+    credential.chmod(0o600)
+    return execute_codex(
+        kernel, call, executable=str(executable), prompt="Continue the allocated task.",
+        environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
+        hidden_paths=(), authorize_source=lambda: None, timeout=5,
+    )
+
+
+@pytest.mark.parametrize("raw", [RAW, b'{"result_kind":"development","summary":42}'], ids=["valid", "invalid"])
+def test_nonzero_exit_preserves_owned_final_raw_for_kernel_decision(tmp_path: Path, raw: bytes) -> None:
+    kernel, call, world = allocated_codex(tmp_path)
+    result = local_codex(kernel, call, tmp_path, f"""\
+print(json.dumps({{"type": "thread.started", "thread_id": "original-thread"}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
+raise SystemExit(7)
+""")
+    assert result is not None and result.returncode == 7 and result.raw == raw
+    with pytest.raises(ChildProcessError):
+        os.waitpid(int(result.identity["pid"]), os.WNOHANG)
+    reopened = Kernel(kernel.storage.path)
+    before = reopened.status(call.subject)
+    assert before["pending_return"] is True and before["gates"] == []
+    assert before["phase"] == "development" and before["pending_attempt"] == call.attempt_id
+    assert before["budgets"]["requirements"]["developments_used"] == 1
+    assert reopened.scheduling()["active"] == []
+    step = reopened.advance(call.subject, call.execution, world, allow_agent=False)
+    assert step.kind == ("progress" if raw == RAW else "needs_agent")
+    assert reopened.status(call.subject)["gates"] == []
+    if raw != RAW:
+        step = reopened.advance(call.subject, call.execution, world)
+        assert step.call is not None and step.call.mode == "resume"
+        assert step.call.invocation_id != call.invocation_id and step.call.thread_id == call.thread_id
+
+
+@pytest.mark.parametrize("events", [
+    ("original-thread",), ("different-thread",), ("original-thread", "different-thread"),
+], ids=["same-thread", "drift", "two-ids"])
+def test_real_resume_preserves_original_thread_and_rejects_changed_events(
+    tmp_path: Path, events: tuple[str, ...],
+) -> None:
+    kernel, first, world = allocated_codex(tmp_path)
+    failed = local_codex(kernel, first, tmp_path, """\
+assert sys.argv[1:3] == ['exec', '--json']
+print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
+raise SystemExit(1)
+""")
+    assert failed is not None and failed.returncode == 1 and failed.raw == b""
+    reopened = Kernel(kernel.storage.path)
+    assert reopened.status(first.subject)["gates"] == []
+    assert reopened.scheduling()["active"] == []
+    resumed = reopened.advance(first.subject, first.execution, world).call
+    assert resumed is not None and resumed.mode == "resume"
+    assert resumed.reported_thread == "original-thread" and resumed.thread_id == first.thread_id
+    assert resumed.attempt_id == first.attempt_id and resumed.invocation_id != first.invocation_id
+    assert resumed.profile == first.profile
+    program = f"""\
+assert sys.argv[1:4] == ['exec', 'resume', '--json']
+assert sys.argv[5] == 'original-thread'
+assert sys.argv[sys.argv.index('--model') + 1] == 'bound-model'
+assert sys.argv[sys.argv.index('--config') + 1] == 'model_reasoning_effort="high"'
+assert sys.stdin.read() == 'Continue the allocated task.'
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
+for thread in {events!r}:
+    print(json.dumps({{"type": "thread.started", "thread_id": thread}}), flush=True)
+"""
+    if events == ("original-thread",):
+        result = local_codex(reopened, resumed, tmp_path, program)
+        assert result is not None and result.returncode == 0 and result.raw == RAW
+    else:
+        with pytest.raises(ValueError, match="different Thread ID"):
+            local_codex(reopened, resumed, tmp_path, program)
+    after = Kernel(kernel.storage.path)
+    status = after.status(first.subject)
+    assert status["pending_return"] is (events == ("original-thread",))
+    assert status["gates"] == ([] if events == ("original-thread",) else ["execution_failed"])
+    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert after.scheduling()["active"] == []
+    exits = [event["identity"] for event in after.history(first.subject) if event["kind"] == "worker_exited"]
+    assert exits == [first.invocation_id, resumed.invocation_id]
+    after.bind_thread(resumed, "original-thread")
+    with pytest.raises(KernelError, match="thread_identity_changed"):
+        after.bind_thread(resumed, "different-thread")
+
+
+@pytest.mark.parametrize("replacement", ["missing", "symlink"])
+def test_stdout_artifact_cannot_replace_missing_or_symlinked_final(tmp_path: Path, replacement: str) -> None:
+    kernel, call, _ = allocated_codex(tmp_path)
+    with pytest.raises(OSError):
+        local_codex(kernel, call, tmp_path, f"""\
+print(json.dumps({{"type": "thread.started", "thread_id": "original-thread"}}), flush=True)
+print({RAW.decode()!r}, flush=True)
+output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
+output.unlink()
+if {replacement!r} == 'symlink':
+    target = Path.cwd() / 'unowned-final'
+    target.write_bytes({RAW!r})
+    output.symlink_to(target)
+""")
+    reopened = Kernel(kernel.storage.path)
+    status = reopened.status(call.subject)
+    assert status["pending_return"] is False and status["gates"] == ["execution_failed"]
+    assert status["pending_attempt"] == call.attempt_id and status["candidate"] is None
+    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert reopened.scheduling()["active"] == []
+    assert any(event["kind"] == "worker_exited" and event["identity"] == call.invocation_id
+               for event in reopened.history(call.subject))
+    assert not any(event["kind"] == "raw_returned" for event in reopened.history(call.subject))
+
+
+def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
+    call = None
+    for _ in range(8):
+        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        if step.call is not None:
+            call = step.call
+            break
+        assert step.kind in {"effect", "progress"}, step
+        scenario.handle(step)
+    assert call is not None and call.role.value == "review" and call.context["readonly"] is True
+    checkout = Path(call.context["checkout"])
+    original = (checkout / "README.md").read_bytes()
+    raw = json.dumps(review_result("pass")).encode()
+    result = local_codex(scenario.kernel, call, tmp_path, f"""\
+import errno
+assert Path.cwd() == Path({str(checkout)!r})
+assert Path('README.md').read_bytes() == {original!r}
+for name in ('README.md', 'forbidden-new-file'):
+    try:
+        Path(name).write_text('Unauthorized checkout mutation')
+    except OSError as error:
+        assert error.errno == errno.EROFS
+    else:
+        raise AssertionError('The allocated read-only checkout was writable')
+output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
+scratch = output.parent / 'review-runtime-output'
+scratch.write_text('Runtime output outside the reviewed checkout is writable')
+assert scratch.read_text().startswith('Runtime output')
+scratch.unlink()
+print(json.dumps({{"type": "thread.started", "thread_id": "review-thread"}}), flush=True)
+output.write_bytes({raw!r})
+""")
+    assert result is not None and result.returncode == 0 and result.raw == raw
+    assert (checkout / "README.md").read_bytes() == original
+    assert not (checkout / "forbidden-new-file").exists()
+    assert scenario.kernel.status(call.subject)["pending_return"] is True
+    assert scenario.kernel.scheduling()["active"] == []
+
+
+def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = tmp_path / "runner-state"
+    state.mkdir()
+    path = state / "kernel.sqlite3"
+    base = Commit("base", "tree")
+    world = World("parent-v1", "graph-v1", "ticket-v1", base)
+    spec = RunSpec("codex-process", "example/repository", 1, "parent-v1", "graph-v1", (
+        Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
+                 "refs/heads/ticket", "refs/heads/run", checkout=str(checkout)),
+    ), Policy(development_profile=Profile("bound-model", "high")))
+    created = Kernel.create(path, spec)
+    execution = created.claim_executor("local-cli-executor")
+    call = created.advance("ticket:2", execution, world).call
+    assert call is not None and call.mode == "fresh" and call.reported_thread is None
+    runner = tmp_path / "runner-private"
+    runner.mkdir()
+    secret = runner / "private-key"
+    secret.write_text("Runner-only-secret-must-stay-hidden")
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    inherited_key = ssh / "id_ed25519"
+    inherited_key.write_text("Unselected host SSH identity must be hidden")
+    credential = tmp_path / "selected-hosts.yml"
+    credential.write_text(json.dumps({"github.com": {"oauth_token": "copied-test-credential"}}))
+    credential.chmod(0o600)
+    home = tmp_path / "copied-codex-home"
+    home.mkdir()
+    (home / "auth.json").write_text("Copied test configuration, never an online credential.")
+    started, bound = checkout / "cli-started", checkout / "thread-bound"
+    executable = tmp_path / "local-codex"
+    executable.write_text(f"#!{sys.executable}\n" + f"""\
+import json, os, stat, sys, time
+from pathlib import Path
+arguments = sys.argv[1:]
+assert arguments[:4] == ['exec', '--json', '--color', 'never']
+assert arguments[arguments.index('--model') + 1] == 'bound-model'
+assert arguments[arguments.index('--config') + 1] == 'model_reasoning_effort="high"'
+assert Path.cwd() == Path({str(checkout)!r})
+assert os.environ.get('CUSTOM_RUNNER_PAT') is None
+assert os.environ.get('AGENT_RUN_INTERNAL_CONTROL_TOKEN') is None
+assert not any(name in os.environ for name in ('GH_TOKEN', 'GITHUB_TOKEN'))
+for hidden in ({str(secret)!r}, {str(path)!r}, {str(credential)!r}, {str(inherited_key)!r}):
+    try:
+        observed = Path(hidden).read_bytes()
+    except OSError:
+        pass
+    else:
+        assert observed == b'', 'Runner data was visible to the Worker'
+hosts = json.loads((Path(os.environ['GH_CONFIG_DIR']) / 'hosts.yml').read_text())
+assert hosts == {{'github.com': {{'oauth_token': 'copied-test-credential'}}}}
+assert (Path(os.environ['CODEX_HOME']) / 'auth.json').read_text().startswith('Copied test')
+schema = Path(arguments[arguments.index('--output-schema') + 1])
+assert stat.S_IMODE(schema.parent.stat().st_mode) == 0o700
+assert stat.S_IMODE(schema.stat().st_mode) == 0o600
+assert set(json.loads(schema.read_text())['required']) == {{'result_kind', 'summary', 'human_blockers'}}
+assert sys.stdin.read() == 'Perform this one allocated development task.'
+Path({str(started)!r}).write_text(str(os.getpid()))
+# A discarded oversized event must not bind a conflicting Thread. A valid
+# event immediately after it must survive fragmented multibyte decoding.
+oversized = json.dumps({{'type': 'thread.started', 'thread_id': 'discarded-thread', 'padding': 'x' * 70000}})
+sys.stdout.buffer.write(oversized.encode() + b'\\nnot-json\\n')
+event = (json.dumps({{'type': 'thread.started', 'thread_id': 'local-cli-thread', 'note': '界'}}, ensure_ascii=False) + '\\n').encode()
+split = event.index('界'.encode()) + 1
+sys.stdout.buffer.write(event[:17]); sys.stdout.buffer.flush()
+sys.stdout.buffer.write(event[17:split]); sys.stdout.buffer.flush()
+sys.stdout.buffer.write(event[split:]); sys.stdout.buffer.flush()
+deadline = time.monotonic() + 3
+while not Path({str(bound)!r}).exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('The real Thread event was not durably bound')
+    time.sleep(0.01)
+sys.stdout.write('{{"result_kind":"development","summary":"This is only stdout telemetry","human_blockers":null}}\\n')
+output = Path(arguments[arguments.index('--output-last-message') + 1])
+assert output.parent == schema.parent
+output.write_bytes({RAW!r})
+""")
+    executable.chmod(0o700)
+
+    class ObserveDurableThread(Kernel):
+        def bind_thread(self, exact_call: AgentCall, reported_thread: str) -> None:
+            super().bind_thread(exact_call, reported_thread)
+            bound.write_text("The original Kernel accepted this exact Thread.")
+
+    checks = 0
+
+    def authorize_source() -> None:
+        nonlocal checks
+        checks += 1
+        assert not started.exists()
+
+    result = execute_codex(
+        ObserveDurableThread(path), call, executable=str(executable),
+        prompt="Perform this one allocated development task.",
+        environment={"PATH": os.defpath, "HOME": str(tmp_path), "CODEX_HOME": str(home),
+                     "GH_TOKEN": "Wrong-inherited-identity", "GITHUB_TOKEN": "Wrong-fallback",
+                     "CUSTOM_RUNNER_PAT": "Runner-private-token", "AGENT_RUN_INTERNAL_CONTROL_TOKEN": "Runner-control"},
+        credential_file=credential, hidden_paths=(runner,), hidden_environment=("CUSTOM_RUNNER_PAT",),
+        timeout=5, authorize_source=authorize_source,
+    )
+    assert result is not None and result.returncode == 0 and result.raw == RAW
+    assert checks == 2 and int(started.read_text()) != os.getpid()
+    reopened = Kernel(path)
+    assert reopened.status(call.subject)["pending_return"] is True
+    assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+    assert reopened.scheduling()["active"] == []
+    with pytest.raises(KernelError, match="thread_identity_changed"):
+        reopened.bind_thread(call, "another-thread")
+    assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
+
+
+@pytest.mark.parametrize("error,capacity", [
+    ({"codex_error_info": "server_overloaded", "message": "Temporarily overloaded"}, True),
+    ({"codex_error_info": "usage_limit", "message": "Selected model is at capacity. Please try a different model."}, False),
+    ({"codex_error_info": {"unknown": "machine"}, "message": "Selected model is at capacity. Please try a different model."}, False),
+    ({"message": "Selected model is at capacity. Please try a different model."}, True),
+    (None, False),
+], ids=["machine-capacity", "machine-precedes-message", "unknown-machine", "legacy-message", "stderr-only"])
+def test_real_terminal_facts_control_only_kernel_recovery(tmp_path: Path, error: object, capacity: bool) -> None:
+    kernel, first, world = allocated_codex(tmp_path)
+    now = [kernel.clock()]
+    kernel.clock = lambda: now[0]
+    program = f"""\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+print(json.dumps({{'type': 'turn.started'}}), flush=True)
+if {error!r} is not None:
+    print(json.dumps({{'type': 'turn.failed', 'error': {error!r}}}), flush=True)
+sys.stderr.write('Selected model is at capacity. Please try a different model.')
+raise SystemExit(7)
+"""
+    result = local_codex(kernel, first, tmp_path, program)
+    assert result is not None and result.returncode == 7 and result.raw == b""
+    assert kernel.scheduling()["active"] == []
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=? AND ordinal=?", (first.invocation_id, first.output_ordinal))
+        assert output["failure_kind"] == ("capacity" if capacity else "ordinary")
+        assert tx.get(output["raw_id"], first.subject) == b""
+        failure = json.loads(tx.get(output["start_evidence"], first.subject))
+        if error is None:
+            assert failure["diagnostic"] is None
+        else:
+            assert failure["diagnostic"]["message"] == error["message"]
+            assert failure["diagnostic"]["machine_present"] is ("codex_error_info" in error)
+        rows = tx.rows("SELECT active FROM worker_activity WHERE invocation=? ORDER BY identity", (first.invocation_id,))
+        assert [row[0] for row in rows] == ([1] if error is None else [1, 0])
+    kernel.configure_profiles("later-model", overrides={"development_model": "new-model"})
+    exited_at = now[0]
+    now[0] = exited_at + (29.999 if capacity else 2)
+    if capacity:
+        assert kernel.advance(first.subject, first.execution, world).kind == "waiting"
+        assert kernel.scheduling()["active"] == []
+        now[0] = exited_at + 30
+    recovered = kernel.advance(first.subject, first.execution, world).call
+    assert recovered is not None and recovered.mode == "resume"
+    assert recovered.attempt_id == first.attempt_id and recovered.thread_id == first.thread_id
+    assert recovered.invocation_id != first.invocation_id and recovered.output_ordinal == 0
+    assert recovered.deadline_at == now[0] + first.deadline_seconds
+    assert recovered.profile == first.profile and recovered.profile_revision == first.profile_revision
+    assert recovered.profile_reference == first.profile_reference
+    second = local_codex(kernel, recovered, tmp_path, program)
+    assert second is not None and second.returncode == 7
+    next_step = kernel.advance(first.subject, first.execution, world)
+    assert next_step.kind == ("waiting" if capacity else "paused")
+    assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
+    assert kernel.scheduling()["active"] == []
+
+
+@pytest.mark.parametrize("raw", [b"", b'{"result_kind":"development","summary":42}'], ids=["empty", "invalid"])
+def test_real_format_repair_keeps_exact_output_identity_deadline_and_profile(tmp_path: Path, raw: bytes) -> None:
+    kernel, first, world = allocated_codex(tmp_path)
+    now = [kernel.clock()]
+    kernel.clock = lambda: now[0]
+    result = local_codex(kernel, first, tmp_path, f"""\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
+""")
+    assert result is not None and result.raw == raw and result.returncode == 0
+    kernel.configure_profiles("later-model", overrides={"development_model": "new-model"})
+    now[0] += 2
+    repair = kernel.advance(first.subject, first.execution, world).call
+    assert repair is not None and repair.mode == "output-repair"
+    assert repair.invocation_id == first.invocation_id and repair.output_ordinal == first.output_ordinal + 1
+    assert repair.deadline_at == first.deadline_at and repair.deadline_seconds == first.deadline_seconds
+    assert repair.thread_id == first.thread_id and repair.reported_thread == "original-thread"
+    assert repair.profile == first.profile and repair.profile_revision == first.profile_revision
+    assert repair.profile_reference == first.profile_reference and repair.context["readonly"] is True
+    repaired = local_codex(kernel, repair, tmp_path, f"""\
+import errno
+assert sys.argv[1:4] == ['exec', 'resume', '--json'] and sys.argv[5] == 'original-thread'
+assert sys.argv[sys.argv.index('--model') + 1] == 'bound-model'
+try:
+    Path('illegal-repair-write').write_text('No second development mutation')
+except OSError as error:
+    assert error.errno == errno.EROFS
+else:
+    raise AssertionError('Output repair checkout was writable')
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
+""")
+    assert repaired is not None and repaired.raw == RAW and repaired.returncode == 0
+    with kernel.storage.transaction(write=False) as tx:
+        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
+        assert [row["ordinal"] for row in outputs] == [0, 1]
+        assert [tx.get(row["raw_id"], first.subject) for row in outputs] == [raw, RAW]
+        assert all(row["exit_code"] == 0 and row["dispatch_state"] == "exited" for row in outputs)
+        assert outputs[0]["process_identity"] != outputs[1]["process_identity"]
+    assert kernel.advance(first.subject, first.execution, world).kind == "progress"
+    assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.parametrize("events", [(), ("turn.started",), ("turn.started", "turn.completed")], ids=["unknown", "missing-end", "complete"])
+def test_real_activity_never_infers_a_turn_from_process_lifetime(tmp_path: Path, events: tuple[str, ...]) -> None:
+    kernel, call, _ = allocated_codex(tmp_path)
+    result = local_codex(kernel, call, tmp_path, f"""\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+for event in {events!r}:
+    print(json.dumps({{'type': event, 'tool_output': 'private tool output'}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
+""")
+    assert result is not None and result.returncode == 0
+    with kernel.storage.transaction(write=False) as tx:
+        rows = tx.rows("SELECT * FROM worker_activity WHERE invocation=? ORDER BY identity", (call.invocation_id,))
+        assert [row["active"] for row in rows] == [int(event == "turn.started") for event in events]
+        assert all(row["ordinal"] == call.output_ordinal for row in rows)
+        evidence = [json.loads(tx.get(row["evidence"], call.subject)) for row in rows]
+        assert [item["type"] for item in evidence] == list(events)
+        assert "private tool output" not in repr(evidence)
+        assert tx.one("SELECT exit_code FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))[0] == 0
+
+
+def test_real_failure_diagnostic_projects_redacts_and_bounds_before_persistence(tmp_path: Path) -> None:
+    kernel, call, _ = allocated_codex(tmp_path)
+    message = "API request failed: " + json.dumps({
+        "request_id": "private-request", "status": 429,
+        "error": {"type": "invalid_request_error", "code": "invalid_api_key",
+                  "message": "Authorization: Bearer sk-persisted-secret " + "界" * 4000,
+                  "headers": {"authorization": "Bearer private-header"},
+                  "response_body": {"customer": "private-customer"}},
+    })
+    result = local_codex(kernel, call, tmp_path, f"""\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+print(json.dumps({{'type': 'turn.failed', 'error': {{'codex_error_info': 'usage_limit', 'message': {message!r}}}}}), flush=True)
+raise SystemExit(7)
+""")
+    assert result is not None and result.returncode == 7
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one("SELECT start_evidence FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
+        stored = tx.get(output[0], call.subject)
+        diagnostic = json.loads(stored)["diagnostic"]
+        assert diagnostic["machine"] == '"usage_limit"'
+        assert diagnostic["sanitized"] is True and diagnostic["truncated"] is True
+        assert len(json.dumps(diagnostic, ensure_ascii=False).encode()) <= 8192
+        assert "[REDACTED]" in diagnostic["message"]
+        assert all(secret.encode() not in stored for secret in (
+            "sk-persisted-secret", "private-header", "private-customer", "private-request",
+        ))
+
+
+def test_real_capacity_event_cannot_authorize_recovery_after_corrupt_capture(tmp_path: Path) -> None:
+    kernel, call, world = allocated_codex(tmp_path)
+    observed = Path(call.context["checkout"]) / "terminal-observed"
+
+    class ObserveTerminal(Kernel):
+        def observe_worker_activity(self, exact_call: AgentCall, observation_id: str, *, active: bool,
+                                    observed_at: float, evidence: Mapping[str, Any]) -> None:
+            super().observe_worker_activity(exact_call, observation_id, active=active,
+                                            observed_at=observed_at, evidence=evidence)
+            if not active:
+                observed.write_text("The terminal event reached the Kernel")
+
+    kernel = ObserveTerminal(kernel.storage.path)
+    with pytest.raises(UnicodeDecodeError):
+        local_codex(kernel, call, tmp_path, f"""\
+import time
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+print(json.dumps({{'type': 'turn.failed', 'error': {{'codex_error_info': 'server_overloaded'}}}}), flush=True)
+deadline = time.monotonic() + 3
+while not Path({str(observed)!r}).exists():
+    assert time.monotonic() < deadline, 'The actual terminal event was not observed'
+    time.sleep(0.01)
+sys.stdout.buffer.write(b'\\xff'); sys.stdout.buffer.flush()
+raise SystemExit(7)
+""")
+    assert observed.exists()
+    assert kernel.status(call.subject)["gates"] == ["execution_failed"]
+    assert kernel.advance(call.subject, call.execution, world).kind == "paused"
+    assert kernel.scheduling()["active"] == []
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
+        assert output["failure_kind"] == "fatal" and output["raw_id"] is None
+        failure = json.loads(tx.get(output["start_evidence"], call.subject))
+        assert failure["diagnostic"]["machine"] == '"server_overloaded"'
+        assert tx.one("SELECT count(*) FROM invocations WHERE attempt=?", (call.attempt_id,))[0] == 1
+
+
+def test_real_format_repair_process_uses_only_the_original_remaining_deadline(tmp_path: Path) -> None:
+    kernel, first, world = allocated_codex(tmp_path)
+    result = local_codex(kernel, first, tmp_path, """\
+print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
+""")
+    assert result is not None and result.raw == b""
+    remaining = first.deadline_at - 0.5
+    kernel.clock = lambda: remaining
+    repair = kernel.advance(first.subject, first.execution, world).call
+    assert repair is not None and repair.invocation_id == first.invocation_id and repair.output_ordinal == 1
+    assert repair.deadline_at == first.deadline_at
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        local_codex(kernel, repair, tmp_path, """\
+import time
+print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
+time.sleep(10)
+""")
+    assert time.monotonic() - started < 2, "Repair reset the original remaining deadline"
+    assert kernel.scheduling()["active"] == []
+    with kernel.storage.transaction(write=False) as tx:
+        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
+        assert len(outputs) == 2 and outputs[1]["dispatch_state"] == "exited"
+        identity = json.loads(tx.get(outputs[1]["process_identity"], first.subject))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(identity["pid"], os.WNOHANG)
+    assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1

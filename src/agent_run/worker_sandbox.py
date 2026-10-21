@@ -1,114 +1,40 @@
 from __future__ import annotations
 
 import codecs
-import json
-import logging
-import os
-import select
-import signal
 import shutil
 import subprocess
-import sys
-import threading
-import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
-from agent_run.git_output import git_environment
+
+_JSONL_LINE_BYTES = 64 * 1024
 
 
 class WorkerSandboxError(RuntimeError):
     pass
 
 
-class WorkerDeadlineExceeded(WorkerSandboxError):
-    pass
-
-
-class WorkerExitUnknownError(WorkerSandboxError):
-    """Keep Worker ownership unresolved until an independent exit check."""
-
-
-_STREAM_CHUNK_BYTES = 64 * 1024
-_STDOUT_CAPTURE_BYTES = 64 * 1024
-_STDERR_CAPTURE_BYTES = 64 * 1024
-_JSONL_LINE_BYTES = 64 * 1024
-_WORKER_BOOTSTRAP = """\
-import os
-import sys
-import time
-gate = int(sys.argv[1])
-deadline = float(sys.argv[2])
-try:
-    released = os.read(gate, 1)
-finally:
-    os.close(gate)
-if released != b"1":
-    raise SystemExit(125)
-if deadline >= 0 and time.monotonic() >= deadline:
-    raise SystemExit(124)
-os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
-"""
-
-
-class _BoundedBytesTail:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self._value = bytearray()
-
-    def append(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        self._value.extend(chunk[-self.limit :])
-        if len(self._value) > self.limit:
-            del self._value[: len(self._value) - self.limit]
-
-    def text(self) -> str:
-        return bytes(self._value).decode("utf-8", errors="replace")
-
-
 class _BoundedJsonlStream:
-    """Incrementally retain a bounded JSONL tail and critical event lines."""
+    """Deliver complete bounded JSONL lines to the invocation capture."""
 
     def __init__(
         self,
         *,
-        capture_bytes: int = _STDOUT_CAPTURE_BYTES,
         line_bytes: int = _JSONL_LINE_BYTES,
         on_line: Callable[[str], None] | None = None,
     ) -> None:
-        self.capture_bytes = capture_bytes
         self.line_bytes = line_bytes
         self.on_line = on_line
-        self._tail = _BoundedBytesTail(capture_bytes)
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._line = ""
         self._discarding_line = False
-        self._pinned: dict[str, str] = {}
 
     def feed(self, chunk: bytes) -> None:
-        self._tail.append(chunk)
         self._consume(self._decoder.decode(chunk))
 
     def finish(self) -> None:
         self._consume(self._decoder.decode(b"", final=True), final=True)
-
-    def text(self) -> str:
-        # Critical lines share the same byte budget as the ordinary tail;
-        # pinning must not silently turn a bounded capture into an unbounded one.
-        per_line = max(1, self.capture_bytes // max(1, len(self._pinned) + 1))
-        pinned_lines = [
-            line
-            for line in self._pinned.values()
-            if len(line.encode("utf-8")) <= per_line
-        ]
-        pinned = "\n".join(pinned_lines)
-        prefix = f"{pinned}\n" if pinned else ""
-        prefix_bytes = prefix.encode("utf-8")
-        remaining = max(0, self.capture_bytes - len(prefix_bytes))
-        tail_bytes = self._tail.text().encode("utf-8")[-remaining:] if remaining else b""
-        return (prefix_bytes + tail_bytes).decode("utf-8", errors="ignore")
 
     def _consume(self, value: str, *, final: bool = False) -> None:
         for part in value.splitlines(keepends=True):
@@ -133,19 +59,6 @@ class _BoundedJsonlStream:
     def _handle_line(self, line: str) -> None:
         if self.on_line is not None:
             self.on_line(line)
-        try:
-            value: object = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(value, dict):
-            return
-        event_type = value.get("type")
-        if event_type == "thread.started":
-            self._pinned["thread.started"] = line
-        elif event_type in {"task_complete", "turn.failed"}:
-            self._pinned[str(event_type)] = line
-        elif "error" in value:
-            self._pinned["error"] = line
 
 
 def native_worker_environment(
@@ -168,59 +81,6 @@ def native_worker_environment(
         result["GH_CONFIG_DIR"] = str(gh_config)
         result["GH_PROMPT_DISABLED"] = "1"
     return result
-
-
-def worker_environment(
-    gh_config: Path, github_read_token: str
-) -> dict[str, str]:
-    _validate_inherited_github_host()
-    environment = {
-        key: value
-        for key, value in git_environment().items()
-        if not key.startswith(("AGENT_RUN_EXECUTOR_", "AGENT_RUN_INTERNAL_"))
-        and key
-        not in {
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_ENTERPRISE_TOKEN",
-            "GITHUB_ENTERPRISE_TOKEN",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-            "SSH_AUTH_SOCK",
-            "AGENT_RUN_GITHUB_APP_ID",
-            "AGENT_RUN_GITHUB_APP_INSTALLATION_ID",
-            "AGENT_RUN_GITHUB_APP_PRIVATE_KEY",
-            "AGENT_RUN_GITHUB_READ_PERMISSIONS",
-            "AGENT_RUN_GITHUB_READ_TOKEN",
-            "GH_HOST",
-            "DBUS_SESSION_BUS_ADDRESS",
-        }
-    }
-    gh_config.mkdir(parents=True, exist_ok=True)
-    environment.update(
-        {
-            "GH_CONFIG_DIR": str(gh_config),
-            "XDG_CONFIG_HOME": str(gh_config.parent),
-            "GH_TOKEN": github_read_token,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": "/bin/false",
-            "SSH_ASKPASS": "/bin/false",
-            "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "credential.helper",
-            "GIT_CONFIG_VALUE_0": "",
-        }
-    )
-    return environment
-
-
-def _validate_inherited_github_host() -> None:
-    host = os.environ.get("GH_HOST", "").strip()
-    if host and host.casefold() != "github.com":
-        raise WorkerSandboxError("Worker GitHub read host is not authorized")
 
 
 def bubblewrap_command(
@@ -462,337 +322,3 @@ def _git_metadata_paths(checkout: Path) -> tuple[Path, ...]:
             if value
         )
     return tuple(dict.fromkeys(paths))
-
-
-def run_worker_process(
-    arguments: list[str],
-    *,
-    cwd: Path,
-    prompt: str,
-    environment: dict[str, str],
-    timeout: float,
-    deadline_at_monotonic: float | None = None,
-    on_stdout_line: Callable[[str], None] | None = None,
-    abort_event: threading.Event | None = None,
-    abort_reason: Callable[[], str] | None = None,
-    on_process_started: Callable[[int], None] | None = None,
-    on_process_released: Callable[[], None] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    from agent_run.executor_host import _process_start_token
-    from agent_run.worker_control import check_worker_control
-
-    check_worker_control()
-    gate_write: int | None = None
-    if on_process_started is None and on_process_released is None:
-        process = subprocess.Popen(
-            arguments,
-            cwd=cwd,
-            env=environment,
-            text=False,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    else:
-        gate_read, gate_write = os.pipe()
-        try:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    _WORKER_BOOTSTRAP,
-                    str(gate_read),
-                    str(
-                        deadline_at_monotonic
-                        if deadline_at_monotonic is not None
-                        else -1.0
-                    ),
-                    *arguments,
-                ],
-                cwd=cwd,
-                env=environment,
-                text=False,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                pass_fds=(gate_read,),
-            )
-        finally:
-            os.close(gate_read)
-    start_token = _process_start_token(process.pid)
-
-    def terminate() -> None:
-        try:
-            _terminate_process_group(process, start_token=start_token)
-        except OSError as error:
-            message = f"Worker pid={process.pid} exit unknown; process control failed: {error}"
-            logging.getLogger(__name__).error("%s", message)
-            raise WorkerExitUnknownError(message) from error
-
-    try:
-        if on_process_started is not None:
-            on_process_started(process.pid)
-        check_worker_control()
-        if gate_write is not None:
-            if (
-                deadline_at_monotonic is not None
-                and time.monotonic() >= deadline_at_monotonic
-            ):
-                raise WorkerDeadlineExceeded("Codex worker timed out")
-            os.write(gate_write, b"1")
-            # Registration, persistence and control checks ran while the
-            # bootstrap was blocked. Timing may start only after releasing it.
-            if on_process_released is not None:
-                on_process_released()
-            if (
-                deadline_at_monotonic is not None
-                and time.monotonic() >= deadline_at_monotonic
-            ):
-                raise WorkerDeadlineExceeded("Codex worker timed out")
-    except BaseException:
-        if gate_write is not None:
-            os.close(gate_write)
-        try:
-            terminate()
-            process.wait()
-        finally:
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe is not None:
-                    pipe.close()
-        raise
-    else:
-        if gate_write is not None:
-            os.close(gate_write)
-    stdin = process.stdin
-    stdout_pipe = process.stdout
-    stderr_pipe = process.stderr
-    callback_errors: list[BaseException] = []
-    reader_errors: list[BaseException] = []
-    writer_errors: list[BaseException] = []
-    stdout_capture: _BoundedJsonlStream | None = None
-    stderr_capture: _BoundedBytesTail | None = None
-    stdout_reader: threading.Thread | None = None
-    stderr_reader: threading.Thread | None = None
-    stdin_writer: threading.Thread | None = None
-    wait_error: BaseException | None = None
-    stream_stop = threading.Event()
-
-    def join_started(thread: threading.Thread | None) -> None:
-        # A signal or a start failure may leave a later thread unstarted.
-        # Thread.join() raises for that case, so use ident as the public
-        # indication that start() created a thread.
-        if thread is not None and thread.ident is not None:
-            thread.join(timeout=1)
-
-    try:
-        # Everything after Popen succeeds belongs to the process lifetime.
-        # In particular, a signal while constructing the first Thread must
-        # still reach the cleanup below; no worker may escape because the
-        # reader/writer objects were not all assigned yet.
-        assert stdin is not None
-        assert stdout_pipe is not None
-        assert stderr_pipe is not None
-
-        def forward_stdout_line(line: str) -> None:
-            if on_stdout_line is not None and not callback_errors:
-                try:
-                    on_stdout_line(line)
-                except BaseException as error:
-                    callback_errors.append(error)
-                    terminate()
-
-        stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
-        stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
-
-        def read_stdout() -> None:
-            try:
-                while not stream_stop.is_set():
-                    if not select.select([stdout_pipe], [], [], 0.1)[0]:
-                        continue
-                    chunk = os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    stdout_capture.feed(chunk)
-                stdout_capture.finish()
-            except BaseException as error:
-                reader_errors.append(error)
-
-        def read_stderr() -> None:
-            try:
-                while not stream_stop.is_set():
-                    if not select.select([stderr_pipe], [], [], 0.1)[0]:
-                        continue
-                    chunk = os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    stderr_capture.append(chunk)
-            except BaseException as error:
-                reader_errors.append(error)
-
-        def write_stdin() -> None:
-            try:
-                os.set_blocking(stdin.fileno(), False)
-                pending = memoryview(prompt.encode("utf-8"))
-                while pending and not stream_stop.is_set():
-                    if not select.select([], [stdin], [], 0.1)[1]:
-                        continue
-                    try:
-                        pending = pending[os.write(stdin.fileno(), pending[:_STREAM_CHUNK_BYTES]):]
-                    except BlockingIOError:
-                        continue
-            except BrokenPipeError:
-                return
-            except BaseException as error:
-                writer_errors.append(error)
-            finally:
-                stdin.close()
-
-        stdout_reader = threading.Thread(
-            target=read_stdout,
-            daemon=True,
-            name=f"agent-run-worker-{process.pid}-stdout",
-        )
-        stderr_reader = threading.Thread(
-            target=read_stderr,
-            daemon=True,
-            name=f"agent-run-worker-{process.pid}-stderr",
-        )
-        stdin_writer = threading.Thread(
-            target=write_stdin,
-            daemon=True,
-            name=f"agent-run-worker-{process.pid}-stdin",
-        )
-        # Keep process ownership and all thread startup inside the same
-        # cleanup boundary.  Popen has already created a process group, so a
-        # SIGINT between these start() calls must still terminate that group.
-        stdout_reader.start()
-        stderr_reader.start()
-        stdin_writer.start()
-        deadline = (
-            deadline_at_monotonic
-            if deadline_at_monotonic is not None
-            else time.monotonic() + timeout
-        )
-        while process.poll() is None:
-            if callback_errors or reader_errors or writer_errors:
-                wait_error = (callback_errors or reader_errors or writer_errors)[0]
-                break
-            check_worker_control()
-            if abort_event is not None and abort_event.is_set():
-                wait_error = WorkerSandboxError(
-                    abort_reason() if abort_reason is not None else "Worker credential renewal expired"
-                )
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                wait_error = WorkerDeadlineExceeded("Codex worker timed out")
-                break
-            try:
-                process.wait(timeout=min(0.1, remaining))
-            except subprocess.TimeoutExpired:
-                continue
-    except BaseException as error:
-        wait_error = error
-    finally:
-        try:
-            terminate()
-        except WorkerExitUnknownError as error:
-            # Unknown process ownership is not permission to kill it. Stop our
-            # pipe threads independently, retain the unresolved process fact.
-            stream_stop.set()
-            wait_error = error
-        join_started(stdin_writer)
-        join_started(stdout_reader)
-        join_started(stderr_reader)
-        if stdin_writer is not None and stdin_writer.is_alive() and stdin is not None:
-            stdin.close()
-            join_started(stdin_writer)
-        if (
-            stdout_reader is not None
-            and stdout_reader.is_alive()
-            and stdout_pipe is not None
-        ):
-            stdout_pipe.close()
-            join_started(stdout_reader)
-        if (
-            stderr_reader is not None
-            and stderr_reader.is_alive()
-            and stderr_pipe is not None
-        ):
-            stderr_pipe.close()
-            join_started(stderr_reader)
-        for pipe in (stdin, stdout_pipe, stderr_pipe):
-            if pipe is not None:
-                pipe.close()
-    if isinstance(wait_error, WorkerExitUnknownError):
-        # Persistence callback errors explain the stop trigger, but cannot
-        # erase the independent fact that this process has not proven exit.
-        if callback_errors:
-            raise wait_error from callback_errors[0]
-        raise wait_error
-    if callback_errors:
-        raise callback_errors[0]
-    if wait_error is not None:
-        raise wait_error
-    if reader_errors:
-        raise reader_errors[0]
-    if writer_errors:
-        raise writer_errors[0]
-    assert stdout_capture is not None
-    assert stderr_capture is not None
-    return subprocess.CompletedProcess(
-        arguments,
-        process.returncode,
-        stdout_capture.text(),
-        stderr_capture.text(),
-    )
-
-
-def _terminate_process_group(process: subprocess.Popen[Any], *, start_token: str | None) -> None:
-    from agent_run.executor_host import _process_start_token
-
-    def require_identity() -> None:
-        current = _process_start_token(process.pid)
-        if (start_token is None or (current is not None and current != start_token)
-                or (current is None and process.poll() is None)):
-            message = f"Worker pid={process.pid} ownership/exit unknown; no process group signal sent"
-            logging.getLogger(__name__).error("%s", message)
-            raise WorkerExitUnknownError(message)
-
-    def reap() -> None:
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired as error:
-            message = f"Worker pid={process.pid} exit unknown after process group termination"
-            logging.getLogger(__name__).error("%s", message)
-            raise WorkerExitUnknownError(message) from error
-
-    # Popen owns the child and its session. Check the captured start identity
-    # before each group signal, including cleanup after the child was reaped.
-    require_identity()
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        # The original Popen remains our child even if its group disappeared.
-        # Reap it before the caller can release its Ticket work lease.
-        if process.poll() is None:
-            process.kill()
-        reap()
-        return
-    deadline = time.monotonic() + 0.2
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.01)
-    else:
-        require_identity()
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    if process.poll() is None:
-        reap()

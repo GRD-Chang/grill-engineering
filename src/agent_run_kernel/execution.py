@@ -9,6 +9,7 @@ This is a local process adapter, not a systemd/cgroup or live Codex adapter.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 import math
 import os
@@ -28,6 +29,7 @@ from .model import AgentCall
 from .storage import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
+    from .codex_execution import _CodexCapture
     from .kernel import Kernel
 
 
@@ -109,13 +111,13 @@ def _terminate(process: subprocess.Popen[bytes], identity: Mapping[str, int | st
 
 
 def _drain(
-    process: subprocess.Popen[bytes], prompt: str, timeout: float,
+    process: subprocess.Popen[bytes], prompt: str, deadline: float,
     kernel: Kernel, call: AgentCall, identity: Mapping[str, int | str],
+    capture: _CodexCapture | None,
 ) -> tuple[bytes, str]:
     raw, errors = bytearray(), bytearray()
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     remaining_input = memoryview(prompt.encode("utf-8"))
-    deadline = time.monotonic() + timeout
     with selectors.DefaultSelector() as selector:
         for stream, label in ((process.stdout, "raw"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
@@ -148,9 +150,12 @@ def _drain(
                 if not chunk:
                     selector.unregister(key.fileobj)
                 elif key.data == "raw":
-                    if len(raw) + len(chunk) > MATERIAL_LIMIT:
-                        raise ValueError("Worker return exceeds the material limit; no truncated return saved")
-                    raw.extend(chunk)
+                    if capture is not None:
+                        capture.feed(chunk)
+                    else:
+                        if len(raw) + len(chunk) > MATERIAL_LIMIT:
+                            raise ValueError("Worker return exceeds the material limit; no truncated return saved")
+                        raw.extend(chunk)
                 else:
                     errors.extend(chunk)
                     del errors[:-_CHUNK]
@@ -170,8 +175,65 @@ def execute(
     discovered, changed, or retried here; credential_file is an existing
     selected Worker credential reference, never its secret contents.
     """
+    return _execute(
+        kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
+        environment=environment, timeout=timeout, authorize_source=authorize_source,
+        credential_file=credential_file,
+    )
+
+
+def _execute(
+    kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
+    prompt: str, environment: Mapping[str, str], timeout: float | None,
+    authorize_source: Callable[[], None] | None,
+    credential_file: Path | None = None, capture: _CodexCapture | None = None,
+) -> ProcessExit | None:
+    started = time.monotonic()
     if not kernel.dispatch_agent(call):
         return None
+    configured = call.deadline_at - kernel.clock()
+    supplied = call.deadline_seconds if timeout is None else timeout
+    try:
+        if not math.isfinite(supplied) or supplied <= 0:
+            raise ValueError("A positive finite execution timeout is required")
+        deadline = min(time.monotonic() + configured, started + supplied)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired before preparation")
+    except BaseException as error:
+        kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+        raise
+    resources = ExitStack()
+    if capture is not None:
+        try:
+            resources.enter_context(capture)
+        except BaseException as error:
+            kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+            if isinstance(error, OSError):
+                return None
+            raise
+        arguments, cwd, environment = capture.arguments, capture.cwd, capture.environment
+    try:
+        result = _run_dispatched(
+            kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
+            environment=environment, deadline=deadline, authorize_source=authorize_source,
+            credential_file=credential_file, capture=capture,
+        )
+    except BaseException as error:
+        try:
+            resources.close()
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
+    resources.close()
+    return result
+
+
+def _run_dispatched(
+    kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
+    prompt: str, environment: Mapping[str, str], deadline: float,
+    authorize_source: Callable[[], None] | None,
+    credential_file: Path | None, capture: _CodexCapture | None,
+) -> ProcessExit | None:
     if credential_file is not None:
         try:
             with credential_file.open("rb"):
@@ -180,13 +242,15 @@ def execute(
             kernel.agent_unavailable(call, "worker_credentials_unavailable", "Selected Worker credentials are unavailable")
             return None
     try:
-        if not arguments or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("Worker arguments and positive finite timeout are required")
+        if not arguments:
+            raise ValueError("Worker arguments are required")
         if not hasattr(os, "pidfd_open"):
             raise OSError("The local process adapter requires Linux pidfd")
         if authorize_source is not None:
             authorize_source()
         kernel.guard_agent(call)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired during preparation")
     except BaseException as error:
         kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
         raise
@@ -220,10 +284,12 @@ def execute(
         if authorize_source is not None:
             authorize_source()
         kernel.guard_agent(call)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired before process release")
         os.write(gate_write, b"1")
         os.close(gate_write)
         gate_write = -1
-        raw, stderr = _drain(process, prompt, timeout, kernel, call, identity)
+        raw, stderr = _drain(process, prompt, deadline, kernel, call, identity, capture)
     except BaseException as error:
         failure = error
     finally:
@@ -257,9 +323,24 @@ def execute(
             "observed_exit": process.returncode,
         })
         raise failure or ProcessExitUnknown("Worker binding commit is unknown")
+    framed = failure is None and process.returncode == 0
+    capture_failed = False
+    if capture is not None:
+        try:
+            raw = capture.finish()
+            framed = True
+        except BaseException as output_error:
+            capture_failed = True
+            framed = False
+            if stderr:
+                output_error.add_note(f"Worker stderr: {stderr}")
+            if failure is None:
+                failure = output_error
+            else:
+                failure.add_note(f"Final Worker output unavailable: {type(output_error).__name__}")
     raw_settlement_failed = False
     try:
-        if failure is None and process.returncode == 0:
+        if framed:
             # Actual exit is already proved. Raw settlement is independent
             # of Stop and of the separate exit-fact transaction below.
             kernel.receive(call, raw)
@@ -274,7 +355,9 @@ def execute(
             kernel.agent_exited(
                 call, identity, process.returncode,
                 failure=None if failure is None else type(failure).__name__,
-                failure_kind="fatal" if raw_settlement_failed else "ordinary",
+                failure_kind=("fatal" if raw_settlement_failed or capture_failed else
+                              capture.failure_kind if capture is not None else "ordinary"),
+                diagnostic=capture.diagnostic if capture is not None else None,
             )
         except BaseException as exit_error:
             if failure is not None:
