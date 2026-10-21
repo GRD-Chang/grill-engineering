@@ -6,7 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent_run.delivery_step import DeliveryStepKind
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
+from agent_run.delivery_step import AgentWorkRequired, DeliveryStepKind
 from agent_run.external_supervision import (
     ensure_supervision_window,
     is_github_convergence_error,
@@ -124,6 +125,15 @@ class RunRepairLifecycle:
                             # snapshot before reviewing the actual Candidate.
                             try:
                                 prepared = work.integrate_repair_candidate(state, job, checkout)
+                            except InitialCredentialUnavailable as error:
+                                work.wait_for_change_credential(
+                                    state, job, scope="repair", http_status=error.http_status,
+                                )
+                                break
+                            except AgentWorkRequired:
+                                # The previous conflict work returned to Git
+                                # checks; another unit needs its own work step.
+                                continue
                             except GitHubReadError as error:
                                 if not is_github_convergence_error(error.code):
                                     raise
