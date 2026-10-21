@@ -56,11 +56,13 @@ class NativeNotifications:
         self.failure_reason: str | None = None
         self.thread: threading.Thread | None = None
         self._more = False
+        self._shutdown = False
+        self._recovery_requested = False
+        self._fault_serial = 0
         if self.enabled:
             self.observe_committed()
-            if self.failure_reason is None:
-                self.thread = threading.Thread(target=self._work, name="kernel-notifications", daemon=True)
-                self.thread.start()
+            self.thread = threading.Thread(target=self._work, name="kernel-notifications", daemon=True)
+            self.thread.start()
 
     @staticmethod
     def _run(tx: Transaction) -> tuple[str, tuple[str, int], dict[str, Any], dict[str, Any]]:
@@ -280,16 +282,51 @@ class NativeNotifications:
         return False
 
     def observe_committed(self) -> None:
-        """Read only committed facts; claim no transport while a kernel lock is held."""
-        if not self.enabled or self.closed or self.cancel.is_set():
+        """Observe healthy facts, or request one sender-owned fault recovery."""
+        if not self.enabled or self.closed or self._shutdown:
             return
+        with self.condition:
+            if self.failure_reason is not None:
+                self._recovery_requested = True
+                self.condition.notify_all()
+                return
+        self._observe_committed()
+
+    def _pause(self, error: Exception) -> None:
+        reason = bounded_error(str(error))
+        # Every journal fault write/clear follows condition -> outbox order.
+        # A late report or recovery cannot overwrite a newer fault receipt.
+        with self.condition:
+            self.failure_reason = reason
+            self._fault_serial += 1
+            self.cancel.set()
+            self.condition.notify_all()
+            try:
+                existed = outbox.notification_path(self.state_root, self.run_id).exists()
+                with outbox.transaction(self.state_root, self.run_id) as document:
+                    if (existed and not document.get("native_run_start")
+                            and document.get("native_binding") != [self.run_id, *self.binding]):
+                        return
+                    if not existed:
+                        document["native_binding"] = [self.run_id, *self.binding]
+                    document["unavailable_reason"] = reason
+                    document["delivery_error"] = {"reason": reason, "observed_at": time.time()}
+            except Exception:
+                pass  # Best effort after the original transaction rolled back.
+        print(f"飞书通知不可用（开发继续）：{reason}", file=sys.stderr)
+
+    def _observe_committed(self) -> bool:
+        """Read only committed facts; claim no transport while a kernel lock is held."""
+        if not self.enabled or self.closed or self._shutdown:
+            return False
         try:
             for _ in range(64):
                 with outbox.transaction(self.state_root, self.run_id) as document:
                     outbox.settle(document, time.time())
                     if not document.get("native_run_start"):
                         journal = outbox.notification_path(self.state_root, self.run_id)
-                        if journal.exists() or journal.is_symlink():
+                        if ((journal.exists() or journal.is_symlink())
+                                and document.get("native_binding") != [self.run_id, *self.binding]):
                             raise ValueError("existing notification journal has no native receipt")
                         started = datetime.fromtimestamp(self.state["created_at"], UTC).isoformat()
                         event = event_envelope(self.state, "run_start", self.run_id,
@@ -309,25 +346,53 @@ class NativeNotifications:
                     self.condition.notify_all()
                 self._more = more
                 if not more or full or boundary_more:
-                    return
+                    return True
+            return True
         except Exception as error:
-            self.failure_reason = bounded_error(str(error))
-            self.cancel.set()
-            print(f"飞书通知不可用（开发继续）：{self.failure_reason}", file=sys.stderr)
-            with self.condition:
-                self.condition.notify_all()
+            self._pause(error)
+            return False
 
     def _work(self) -> None:
         active_event_id: str | None = None
-        while not self.cancel.is_set():
+        active_result: dict[str, Any] | None = None
+        active_attempt: int | None = None
+        returned_at: float | None = None
+        while not self._shutdown:
             try:
-                # Each claim/retry rereads committed facts. A business commit
-                # can outlive its callback (for example, after a Host crash).
-                self.observe_committed()
-                if self.cancel.is_set():
-                    return
                 with self.condition:
+                    while (self.failure_reason is not None and not self._recovery_requested
+                           and not self.closing and not self._shutdown):
+                        self.condition.wait()
+                    if self._shutdown:
+                        return
+                    recovering = self.failure_reason is not None
+                    if recovering and not self._recovery_requested:
+                        return  # A normal close already made its one recovery attempt.
+                    serial = self._fault_serial
+                    self._recovery_requested = False
+                # A returned physical result survives journal failure in this
+                # one active slot. Persist it before recovering or claiming.
+                if active_event_id is not None:
+                    if active_result is not None:
+                        assert returned_at is not None
+                        self._finish_result(active_event_id, active_result, returned_at)
+                    else:
+                        # The claim may have reached os.replace before a final
+                        # fsync error. No transport call occurred in this path.
+                        assert active_attempt is not None and returned_at is not None
+                        self._finish_not_sent(active_event_id, active_attempt, returned_at)
+                    active_event_id, active_result, active_attempt, returned_at = None, None, None, None
+                if not self._observe_committed():
+                    continue
+                with self.condition:
+                    if self._shutdown:
+                        return
+                    if serial != self._fault_serial:
+                        continue
+                    if not recovering and (self.failure_reason is not None or self.cancel.is_set()):
+                        continue
                     with outbox.transaction(self.state_root, self.run_id) as document:
+                        document.pop("unavailable_reason", None)
                         outbox.settle(document, time.time())
                         pending = document["pending"]
                         inflight = any(item["outcome"] == "sending" for item in pending)
@@ -343,12 +408,15 @@ class NativeNotifications:
                                                             "started_at": time.time(), "outcome": "sending"})
                             event = dict(item["event"])
                             active_event_id = event["id"]
+                            active_attempt = item["attempts"]
                             deadline_at = float(item["deadline_at"])
                         else:
                             event = None
                             deadline_at = 0.0
                             wait = min((max(0.0, min(entry["next_attempt_at"], entry["deadline_at"]) - time.time())
                                         for entry in pending), default=0.1)
+                    self.failure_reason = None
+                    self.cancel.clear()
                     if event is None:
                         if self.closing and not pending and not self._more:
                             return
@@ -369,43 +437,66 @@ class NativeNotifications:
                                                 timeout_seconds=max(0.0, deadline_at - time.time()))
                     except Exception as error:
                         result = {"outcome": "unknown", "reason": bounded_error(str(error))}
-                with outbox.transaction(self.state_root, self.run_id) as document:
-                    claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event["id"]
-                                  and entry.get("owner") == self.owner), None)
-                    if claim is not None:
-                        outbox.finish_attempt(claim, dict(result), time.time())
-                        outbox.settle(document, time.time())
-                active_event_id = None
+                returned_at = time.time()
+                active_result = dict(result)
+                assert active_event_id is not None
+                self._finish_result(active_event_id, active_result, returned_at)
+                active_event_id, active_result, active_attempt, returned_at = None, None, None, None
             except Exception as error:
-                self.failure_reason = bounded_error(str(error))
-                print(f"飞书通知不可用（开发继续）：{self.failure_reason}", file=sys.stderr)
-                if active_event_id is not None:
-                    try:
-                        with outbox.transaction(self.state_root, self.run_id) as document:
-                            claim = next((entry for entry in document["pending"]
-                                          if entry["event"]["id"] == active_event_id
-                                          and entry.get("owner") == self.owner), None)
-                            if claim is not None:
-                                outbox.finish_attempt(claim, {"outcome": "unknown",
-                                                                   "reason": self.failure_reason}, time.time())
-                                outbox.settle(document, time.time())
-                    except Exception:
-                        pass
-                return
+                # Keep an exact uncertain journal claim; it is known unsent,
+                # unlike an external request whose ACK was actually lost.
+                if active_event_id is not None and returned_at is None:
+                    returned_at = time.time()
+                self._pause(error)
+
+    def _finish_result(self, event_id: str, result: dict[str, Any], returned_at: float) -> None:
+        with outbox.transaction(self.state_root, self.run_id) as document:
+            claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event_id
+                          and entry.get("owner") == self.owner), None)
+            if claim is not None:
+                outbox.finish_attempt(claim, result, returned_at)
+                outbox.settle(document, time.time())
+
+    def _finish_not_sent(self, event_id: str, attempt: int, failed_at: float) -> None:
+        with outbox.transaction(self.state_root, self.run_id) as document:
+            claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event_id
+                          and entry.get("owner") == self.owner and entry["attempts"] == attempt
+                          and entry["outcome"] == "sending"), None)
+            if claim is not None:
+                outbox.finish_attempt(claim, {"outcome": "failed",
+                                             "reason": "journal claim interrupted before transport"}, failed_at)
+                claim["attempt_history"][-1]["not_sent"] = True
+                outbox.settle(document, time.time())
 
     def close(self, *, drain: bool = True) -> None:
         if not self.enabled or self.closed:
             return
         with self.condition:
             self.closing = True
-            if not drain:
+            if drain:
+                self._recovery_requested = True
+            else:
+                self._shutdown = True
                 self.cancel.set()
             self.condition.notify_all()
         if self.thread is not None and drain:
             self.thread.join(timeout=CLOSE_TIMEOUT_SECONDS)
-        self.cancel.set()
         with self.condition:
+            self._shutdown = True
+            self.cancel.set()
             self.condition.notify_all()
         if self.thread is not None:
             self.thread.join(timeout=2)
+        if drain and self.failure_reason is not None:
+            try:
+                with outbox.transaction(self.state_root, self.run_id) as document:
+                    if (document.get("native_run_start")
+                            or document.get("native_binding") == [self.run_id, *self.binding]):
+                        for item in document["pending"]:
+                            if item["attempts"] == 0:
+                                item.update(outcome="failed", reason=self.failure_reason)
+                        document["unavailable_reason"] = self.failure_reason
+                        document["delivery_error"] = {"reason": self.failure_reason, "observed_at": time.time()}
+            except Exception:
+                pass
         self.closed = True
