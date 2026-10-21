@@ -21,7 +21,7 @@ from agent_run.runner_installer import (
     InstallerError,
     _read_active,
 )
-from agent_run.systemd_executor_host import execution_readiness
+from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
 from agent_run.process_cleanup import (
     capture_process_scope,
     child_subreaper,
@@ -71,7 +71,7 @@ def _collect() -> dict[str, object]:
         ),
         "checks": list(installation_keys),
     }
-    execution = execution_readiness()
+    execution = _execution_readiness()
     execution_keys = (
         "git", "codex", "openssl", "bubblewrap", "github", "worker_read_provider",
     )
@@ -92,6 +92,19 @@ def _collect() -> dict[str, object]:
         "installation_readiness": installation,
         "execution_readiness": execution,
     }
+
+
+def _execution_readiness() -> dict[str, object]:
+    """Use the same concrete admission probe as the native execution Host."""
+    host = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
+                       systemd_run=shutil.which("systemd-run") or "systemd-run",
+                       environment=os.environ)
+    try:
+        host.preflight()
+    except HostUnavailable as error:
+        return {"status": "unavailable", "host": "systemd-user", "linger_required": False,
+                "reason": str(error)}
+    return {"status": "ok", "host": "systemd-user", "linger_required": False, "reason": None}
 
 
 def _python_check() -> dict[str, object]:

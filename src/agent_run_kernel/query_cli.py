@@ -52,6 +52,9 @@ def _parser(language: str) -> argparse.ArgumentParser:
             child.add_argument("--details", action="store_true")
             child.add_argument("--after", type=int, default=0)
             child.add_argument("--limit", type=int)
+    doctor = commands.add_parser("doctor", language=language,
+        help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
+    doctor.add_argument("--json", action="store_true", dest="as_json")
     personal_settings.add_parsers(commands, language)
     return parser
 
@@ -120,6 +123,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
+        if parsed.command == "doctor":
+            from agent_run.doctor import run as diagnose
+            return diagnose(as_json=parsed.as_json)
         if parsed.command in {"settings", "policy"}:
             if parsed.command == "settings" and parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
                 candidate = _select(parsed, _candidates(parsed))[0]
