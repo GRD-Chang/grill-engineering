@@ -201,3 +201,76 @@ def test_parent_real_git_check_retries_original_failure(git_repo: Path) -> None:
     assert job["integration_development_budget"]["used"] == 2
     assert git.checkout_head(git_repo) == job["parent_integration"]["head_sha"]
     assert git._run_in(git_repo, "status", "--porcelain=v1").stdout == ""
+
+
+@pytest.mark.parametrize("kind", ["ticket", "parent_only"])
+def test_cached_integration_summary_rejects_changed_requirements_before_git(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    from copy import deepcopy
+    import support.conflict_invocations as conflicts
+    from agent_run.change_delivery_contracts import ChangeJobStopped
+    from agent_run.git import GitRepository
+    from agent_run.state import StateStore
+    from support.state import persist_run_fixture
+
+    state, store, job, work = conflicts.prepared_conflict(git_repo, kind)
+    calls = 0
+
+    def develop(request: dict[str, Any]) -> DevelopmentResult:
+        nonlocal calls
+        calls += 1
+        event = request["_invocation_event"]
+        event("started", requested_thread_id="conflict-thread", attempt_count=1)
+        event("thread_started", reported_thread_id="conflict-thread")
+        event("completed", reported_thread_id="conflict-thread")
+        return DevelopmentResult("conflict-thread", "Resolved the recorded integration scene")
+
+    work.agents = SimpleNamespace(develop=develop)
+    finish_name = "finish_ticket_snapshot" if kind == "ticket" else "finish_parent_snapshot"
+
+    def interrupted_finish(**_kwargs: Any) -> Any:
+        raise RuntimeError("interrupt after saved summary before Git")
+
+    monkeypatch.setattr(conflicts, finish_name, interrupted_finish)
+    with pytest.raises(RuntimeError, match="after saved summary"):
+        conflicts.run_conflict(work, state, job, git_repo)
+    saved = StateStore(store.root).load_current_run(state["run_id"])
+    assert saved is not None
+    saved_job = saved["ticket_jobs"]["3"] if kind == "ticket" else saved["parent_job"]
+    assert saved_job[work.conflict_key]["development_summary"] == "Resolved the recorded integration scene"
+    attempt_id = saved_job["pending_semantic_attempt"]["attempt_id"]
+    budget = deepcopy(saved_job["integration_development_budget"])
+    candidate = saved_job["candidate_sha"]
+    if kind == "ticket":
+        fixture = git_repo / "github.json"
+        facts = json.loads(fixture.read_text())
+        facts["issues"]["3"]["body"] += "\nChanged Ticket requirement."
+        fixture.write_text(json.dumps(facts))
+    else:
+        # The Parent read in a resumed caller now observes a different revision.
+        saved["parent"]["revision"] = "sha256:" + "b" * 64
+        persist_run_fixture(store, str(saved["run_id"]), saved)
+    resumed = work.states.load_current_run(str(saved["run_id"]))
+    assert resumed is not None
+    resumed_job = resumed["ticket_jobs"]["3"] if kind == "ticket" else resumed["parent_job"]
+    if kind == "ticket":
+        resumed["active_ticket_job"] = resumed_job
+
+    def forbidden_finish(**_kwargs: Any) -> Any:
+        raise AssertionError("stale cached summary reached Git closeout")
+
+    monkeypatch.setattr(conflicts, finish_name, forbidden_finish)
+    with pytest.raises(ChangeJobStopped):
+        conflicts.run_conflict(work, resumed, resumed_job, git_repo)
+    rejected = StateStore(store.root).load_current_run(str(saved["run_id"]))
+    assert rejected is not None
+    rejected_job = rejected["ticket_jobs"]["3"] if kind == "ticket" else rejected["parent_job"]
+    assert rejected_job["blocked_reason"] == "effective_revision_mismatch"
+    assert rejected_job["candidate_sha"] == candidate
+    assert rejected_job["integration_development_budget"] == budget
+    assert "pending_semantic_attempt" not in rejected_job
+    assert rejected_job["semantic_attempt_history"][-1]["attempt_id"] == attempt_id
+    assert rejected_job["semantic_attempt_history"][-1]["outcome"] == "currentness_invalidated"
+    assert calls == 1
+    assert GitRepository(git_repo).checkout_head(git_repo) == candidate
