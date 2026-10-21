@@ -83,8 +83,15 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
         assert command in output.getvalue() and "Original failure / 原始问题" in output.getvalue()
     history = read_only(kernel, tmp_path, "history").data
     assert history["supervision"] == window
-    assert any(event["kind"] == "paused" and event["evidence"].get("scope_id") == window["scope_id"]
-               for event in history["events"] if isinstance(event.get("evidence"), dict))
+    # timeline is the complete machine audit; events is its human projection.
+    paused, = [event for event in history["timeline"] if event["kind"] == "paused"
+               and isinstance(event["evidence"], dict)
+               and event["evidence"].get("scope_id") == window["scope_id"]]
+    assert paused["identity"] == "supervision_timeout" and paused["evidence"] == window["timeout"]
+    projected, = [event for event in history["events"] if event["kind"] == paused["kind"]
+                  and event["identity"] == paused["identity"] and event["subject"] == paused["subject"]
+                  and event["generation"] == paused["generation"]]
+    assert projected["details"] == [paused["evidence"]]
     assert kernel.control("stop", "retire-original-executor") == "applied"
     kernel.confirm_executor_exit(execution)
     assert kernel.control("resume", "explicit-original-resume") == "applied"
