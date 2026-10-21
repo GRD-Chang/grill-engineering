@@ -232,6 +232,7 @@ class Kernel:
                         tx.execute("UPDATE runs SET stopped=1 WHERE id=?", (run["id"],))
                     targets = tx.rows("SELECT id FROM subjects WHERE run_id=?", (run["id"],))
                 else:
+                    assert subject is not None  # job exists only for an explicit subject.
                     self._gate(tx, subject, "operator_stopped")
                     tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
                     targets = [job]
@@ -249,6 +250,7 @@ class Kernel:
                         raise KernelError("no_resumable_boundary")
                     tx.execute("UPDATE runs SET stopped=0 WHERE id=?", (run["id"],))
                 else:
+                    assert subject is not None
                     if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
                         raise KernelError("worker_exit_unproven")
                     gates = self._gates(tx, subject)
@@ -287,6 +289,7 @@ class Kernel:
             else:
                 if job is None or world is None or job["phase"] != "approval" or job["kind"] == DeliveryKind.TICKET:
                     raise KernelError("no_approval_boundary")
+                assert subject is not None
                 if (run["stopped"] or run["blocked"] or self._gates(tx, subject)
                         or not self._current(tx, job, run, world) or not self._published(tx, run, job, world)
                         or not self._review_current(tx, job, world)):
@@ -910,7 +913,7 @@ class Kernel:
         if not job["review_attempt"]:
             return False
         review = tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],))
-        return (review["outcome"] == "pass" and review["revision"] == job["revision"]
+        return bool(review["outcome"] == "pass" and review["revision"] == job["revision"]
                 and review["candidate_sha"] == job["candidate_sha"] and review["candidate_tree"] == job["candidate_tree"]
                 and review["base_sha"] == world.target.sha and review["expected_tree"] == job["expected_tree"]
                 and review["completion_revision"] == job["completion_revision"])
@@ -943,7 +946,7 @@ class Kernel:
         if not job["grant_id"] or not self._review_current(tx, job, world):
             return False
         grant = tx.one("SELECT * FROM grants WHERE id=?", (job["grant_id"],))
-        return (grant["pr_number"] == job["pr_number"] and grant["head_sha"] == job["publication_sha"]
+        return bool(grant["pr_number"] == job["pr_number"] and grant["head_sha"] == job["publication_sha"]
                 and grant["base_sha"] == world.target.sha and grant["review_attempt"] == job["review_attempt"]
                 and grant["checks_id"] == job["checks_id"] and grant["revision"] == job["revision"]
                 and grant["parent_revision"] == run["parent_revision"] and grant["graph_revision"] == run["graph_revision"]

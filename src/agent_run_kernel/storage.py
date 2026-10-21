@@ -154,6 +154,8 @@ class Transaction:
         if not 1 <= limit <= 128:
             raise KernelError("query_limit")
         description = self.execute(f"SELECT * FROM ({sql}) LIMIT 0", parameters).description
+        if description is None:
+            raise KernelError("query_shape")
         columns = ['"' + field[0].replace('"', '""') + '"' for field in description]
         sizes = ",".join(f"CASE WHEN typeof({column}) IN ('text','blob') THEN length(CAST({column} AS BLOB)) ELSE 16 END" for column in columns)
         # SQLite measures bytes before any selected body crosses into Python.

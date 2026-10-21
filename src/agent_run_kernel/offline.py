@@ -126,7 +126,10 @@ class OfflinePort:
         operation = effect.operation
         payload = effect.payload
         git = LocalGit(self.git.root, authorize)
-        commit, pr, expected, raw = None, None, None, {}
+        commit: Commit | None = None
+        pr: PullRequest | None = None
+        expected: str | None = None
+        raw: dict[str, Any] = {}
         try:
             if operation == "candidate":
                 commit, no_change = git.candidate(Path(payload["checkout"]), effect.before_sha, effect.effect_id)
@@ -143,7 +146,7 @@ class OfflinePort:
                             if error.code != "integration_failed":
                                 raise
                             raw = git.conflict_checkout(Path(payload["checkout"]), target)
-                            self._receipt(effect, EffectResult("failure", commit=self.git.commit(raw["head"]), raw=raw))
+                            self._receipt(effect, EffectResult("failure", commit=self.git.commit(str(raw["head"])), raw=raw))
                             return
                         git.install_checkout(Path(payload["checkout"]), commit.sha)
                 expected = commit.tree
@@ -338,13 +341,14 @@ class Scenario:
         if step.kind == "agent" and step.call is not None:
             self.kernel.receive(step.call, self.agent(step.call))
         elif step.kind == "effect" and step.effect is not None:
-            if self.kernel.dispatch(step.effect, self.execution, self.world()):
+            effect = step.effect
+            if self.kernel.dispatch(effect, self.execution, self.world()):
                 try:
-                    self.port.execute(step.effect, lambda: self.kernel.guard_effect(step.effect, self.execution, self.world()))
+                    self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
                 except LostResponse:
                     pass
                 else:
-                    self.kernel.reconcile(step.effect, self.port.reconcile(step.effect), self.execution, self.world())
+                    self.kernel.reconcile(effect, self.port.reconcile(effect), self.execution, self.world())
         elif step.kind == "reconcile" and step.effect is not None:
             self.kernel.reconcile(step.effect, self.port.reconcile(step.effect), self.execution, self.world())
         self.checkpoints.append(self.kernel.status(self.delivery.key))

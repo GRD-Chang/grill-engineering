@@ -5,10 +5,11 @@ from dataclasses import replace
 import json
 import subprocess
 import sys
+import sqlite3
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel import Checks, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
 from agent_run_kernel.offline import Scenario, review_result
 from agent_run_kernel.model import Effect, EffectResult, wire_json
 
@@ -201,6 +202,9 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
     assert second.context["human_responses"] == ["Decision: retain original formatting.\r\n"]
     assert "human_responses" not in first.context
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
+    first_raw = wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": ["Provide the external decision."]})
+    kernel.receive(first, first_raw)
+    assert kernel.scheduling()["active"] == [{"id": second.lease_id, "subject": "ticket:2", "invocation": second.invocation_id}]
 
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))
@@ -323,4 +327,25 @@ def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(
         scenario.kernel.control("stop", "cancel-resumed-final")
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
+
+
+def test_failed_approval_rolls_back_action_material_grant_and_business_facts(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    assert scenario.run().kind == "approval"
+    world = scenario.world()
+    assert world.pr is not None
+    changed = replace(world, checks=Checks(world.pr.number, world.pr.head.sha, "pass", (("new-required-check", "pass"),)))
+
+    def independent_snapshot() -> dict[str, list[tuple[object, ...]]]:
+        with sqlite3.connect(f"file:{scenario.kernel.storage.path}?mode=ro", uri=True) as connection:
+            return {table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                    for table in ("actions", "grants", "material", "history", "subjects", "budgets")}
+
+    before = independent_snapshot()
+    writes = scenario.port.writes()
+    with pytest.raises(KernelError, match="approval_checks_changed"):
+        scenario.kernel.control("approve", "atomic-approval", subject=scenario.delivery.key, world=changed)
+    assert independent_snapshot() == before
+    assert scenario.port.writes() == writes
+    assert scenario.kernel.control("approve", "atomic-approval", subject=scenario.delivery.key, world=world) == "pending"
 
