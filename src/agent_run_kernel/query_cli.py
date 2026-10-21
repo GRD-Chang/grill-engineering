@@ -15,16 +15,18 @@ from agent_run.messages import error_detail
 from agent_run.git_errors import GitError
 from agent_run.github import GitHubReadError
 from agent_run.runner_lease import RunnerLeaseError
-from agent_run.managed_workspace import normalize_repository
+from agent_run.managed_workspace import ManagedWorkspace, normalize_repository
 from agent_run.paths import app_data_root
+from agent_run.task_identity import TaskKey
 
 from .model import KernelError
 from .host_adapter import HostUnavailable
 from .native_host import HandoffError
 
 from . import personal_settings
-from .query import QueryDocument, QueryError, discover, read
+from .query import QueryDocument, QueryError, discover, read, task_binding, task_published
 from .query_render import render, render_settings, safe_text
+from .task_location import read_task_bindings
 
 
 class _Parser(argparse.ArgumentParser):
@@ -105,13 +107,15 @@ def _managed_state_roots(repository: str | None) -> list[Path]:
             raise QueryError("run_locator_invalid", f"Managed state path is not a directory: {path}")
         return True
 
-    if not directory(base):
-        return []
     if repository is not None:
         owner_name, repository_name = repository.split("/")
-        paths = (base / owner_name, base / owner_name / repository_name,
+        paths = (base, base / owner_name, base / owner_name / repository_name,
                  base / owner_name / repository_name / "state")
-        return [paths[-1]] if all(directory(path) for path in paths) else []
+        for path in paths:
+            directory(path)
+        return [paths[-1]]
+    if not directory(base):
+        return []
     roots = []
     visited = 0
     for owner in base.iterdir():
@@ -127,12 +131,16 @@ def _managed_state_roots(repository: str | None) -> list[Path]:
                 _repository(owner.name + "/" + checkout.name)
             except QueryError:
                 continue
-            if directory(checkout) and directory(checkout / "state"):
+            if directory(checkout):
+                directory(checkout / "state")
                 roots.append(checkout / "state")
     return roots
 
 
 def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
+    published: dict[Path, str] | None = None
+    repository: str | None = None
+    selected_task: TaskKey | None = None
     if parsed.state_dir is not None:
         roots = [parsed.state_dir]
     elif getattr(parsed, "data_root", None) is not None:
@@ -142,9 +150,62 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
         if repository is None and not getattr(parsed, "run_id", None):
             repository = _cwd_repository()
         roots = _managed_state_roots(repository)
+        published = {}
+        base = app_data_root() / "repositories"
+        if repository is not None and parsed.parent is not None:
+            workspace = ManagedWorkspace.for_repository(repository)
+            selected_task = TaskKey(workspace.repository_root, repository, parsed.parent)
+            binding = task_binding(selected_task)
+            bindings = iter(()) if binding is None else iter((binding,))
+        else:
+            bindings = read_task_bindings()
+        for run_id, database in bindings:
+            exact = getattr(parsed, "run_id", None)
+            if exact and run_id != exact:
+                continue
+            try:
+                relative = database.relative_to(base)
+            except ValueError:
+                if selected_task is not None:
+                    raise QueryError("run_locator_invalid", "Task publication is outside managed state")
+                continue
+            if len(relative.parts) < 4 or relative.parts[2] != "state":
+                if selected_task is not None:
+                    raise QueryError("run_locator_invalid", "Task publication is outside managed state")
+                continue
+            try:
+                bound_repository = _repository(relative.parts[0] + "/" + relative.parts[1])
+            except QueryError:
+                continue
+            if repository is not None and bound_repository != repository:
+                if selected_task is not None:
+                    raise QueryError("run_locator_invalid", "Task publication names another managed repository")
+                continue
+            scoped_root = _managed_state_roots(bound_repository)[0]
+            if scoped_root not in roots:
+                roots.append(scoped_root)
+            path = database.resolve()
+            if not path.is_relative_to(scoped_root.resolve()):
+                raise QueryError("run_locator_conflict", f"Task database escaped its managed state directory: {database}")
+            if path in published and published[path] != run_id:
+                raise QueryError("run_locator_conflict", f"Conflicting Task publications: {path}")
+            published[path] = run_id
     result: dict[str, dict[str, Any]] = {}
     for root in roots:
-        for candidate in discover(root):
+        for candidate in discover(root, published=published):
+            if published is not None:
+                exact = getattr(parsed, "run_id", None)
+                if (selected_task is not None and Path(candidate["database"]).resolve() in published
+                        and (candidate["repository"].lower() != selected_task.repository
+                             or candidate["parent"] != selected_task.parent_number
+                             or candidate["repository_root"] != str(selected_task.workspace))):
+                    raise QueryError("run_locator_conflict", "Task publication and database identities differ")
+                if ((repository is not None and candidate["repository"].lower() != repository)
+                        or (parsed.parent is not None and candidate["parent"] != parsed.parent)
+                        or (exact and candidate["run_id"] != exact)):
+                    continue
+                if not task_published(candidate) and not candidate["is_terminal"]:
+                    continue
             result[str(Path(candidate["database"]).resolve())] = candidate
             if len(result) > 256:
                 raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
@@ -167,6 +228,11 @@ def _select(parsed: argparse.Namespace, candidates: list[dict[str, Any]]) -> lis
                and (parsed.parent is None or item["parent"] == parsed.parent)]
     if parsed.command == "runs":
         return sorted(matches, key=lambda item: (item["repository"], item["parent"], item["run_id"]))
+    if (not exact and parsed.parent is not None and parsed.state_dir is None
+            and getattr(parsed, "data_root", None) is None):
+        current = [item for item in matches if task_published(item)]
+        if current:
+            matches = current
     if not exact and parsed.parent is None:
         matches = [item for item in matches if not item["is_terminal"]]
     if not matches:

@@ -91,7 +91,7 @@ class NativeNotifications:
             run_id, binding, config, state = self._run(tx)
             if not self._same_binding(run_id, binding, config, state):
                 raise ValueError("notification Run or recipient binding changed")
-            history = tx.rows("SELECT position,subject,kind,identity,generation,created_at "
+            history = tx.rows("SELECT position,subject,kind,identity,generation,created_at,material_id "
                               "FROM history WHERE position>? ORDER BY position LIMIT 16", (after,), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
@@ -102,6 +102,26 @@ class NativeNotifications:
 
     def _event(self, tx: Transaction, row: Any, state: dict[str, Any]) -> dict[str, Any] | None:
         subject = tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],))
+        if row["kind"] == "effect_consumed" and self.config.get("mode") == "detailed":
+            original = tx.rows("SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? "
+                               "AND operation='pr_write' AND status='confirmed' AND receipt_id=?",
+                               (row["identity"], row["subject"], row["generation"], row["material_id"]))
+            if original:
+                intent = json.loads(tx.get(original[0]["payload_id"], row["subject"]))
+                # An edit or an absent prior field is not a creation fact.
+                if "prior" not in intent or intent["prior"] is not None:
+                    return None
+                receipt = json.loads(tx.get(row["material_id"], row["subject"]))
+                pr = receipt.get("pr")
+                if (receipt.get("disposition") != "target" or not isinstance(pr, dict)
+                        or pr.get("repository") != self.binding[0]
+                        or type(pr.get("number")) is not int or pr["number"] <= 0):
+                    return None
+                number = pr["number"]
+                return event_envelope(state, "pr_created", number,
+                                      event_copy(state, "pr_created", number=number), "green",
+                                      summary=event_copy(state, "pr_summary"),
+                                      url=f"https://github.com/{pr['repository']}/pull/{number}")
         if row["kind"] == "worker_started":
             first = tx.one("SELECT min(position) FROM history WHERE subject=? AND kind='worker_started'",
                            (row["subject"],))[0]

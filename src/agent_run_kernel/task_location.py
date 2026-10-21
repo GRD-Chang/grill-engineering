@@ -49,6 +49,26 @@ def read_task(path: Path) -> tuple[str, Path] | None:
     return value["run_id"], Path(value["database"])
 
 
+def read_task_bindings() -> Iterator[tuple[str, Path]]:
+    """Enumerate valid pointers without letting unrelated damaged files block reads.
+
+    A valid pointer to a damaged database is still yielded for caller diagnosis.
+    Exact Task admission uses read_task directly and continues to fail closed.
+    """
+    try:
+        with os.scandir(app_data_root() / "native-task-locations") as entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    try:
+                        binding = read_task(Path(entry.path))
+                    except (KernelError, OSError):
+                        continue
+                    if binding is not None:
+                        yield binding
+    except FileNotFoundError:
+        return
+
+
 def bind_task(path: Path, run_id: str, database: Path) -> None:
     body = wire_json({"run_id": run_id, "database": str(database.resolve())})
     if len(body) > 8192:

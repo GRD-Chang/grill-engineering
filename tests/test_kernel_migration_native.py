@@ -5,14 +5,16 @@ from contextlib import closing
 import hashlib
 import json
 import sqlite3
+import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import agent_run_kernel.migration_completed as completed_module
 from agent_run_kernel.migration import MigrationRefused, capture_v6
 from agent_run_kernel.migration_conversion import convert_initial_v6
-from agent_run_kernel.migration_active import convert_returned_publication_v6
+from agent_run_kernel.migration_active import convert_returned_role_v6
 from agent_run_kernel.migration_completed import convert_completed_ticket_v6
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.model import (Commit, CreationInputs, KernelError, Policy, Profile,
@@ -29,6 +31,67 @@ def _imported_inputs(kernel: Kernel) -> CreationInputs:
         profiles = json.loads(tx.get(revision["material_id"], revision["subject"]))
     return CreationInputs(profiles, body["prompt_resources"], body["worker_identity"],
                           body["runner_identity"], body["notifications"], body["provenance"])
+
+
+def _restore_returned_checkout(
+    root: Path, paths: dict[str, Path], facts: dict[str, Any], external: dict[str, Any],
+) -> tuple[OfflinePort, Path]:
+    port = OfflinePort.create(root)
+    run_branch = f"agent-run/{facts['run_id']}/run"
+    ticket_branch = f"agent-run/{facts['run_id']}/ticket-3"
+    base = external["default_head_sha"]
+    assert external["delivery"]["published_branches"][ticket_branch] == base
+    port.git.run("fetch", str(paths[".bundle"]), "refs/heads/main:refs/remotes/v6/main",
+                 f"refs/heads/{run_branch}:refs/remotes/v6/run",
+                 f"refs/heads/{ticket_branch}:refs/remotes/v6/ticket")
+    assert port.git.commit("refs/remotes/v6/main").sha == base
+    assert port.git.commit("refs/remotes/v6/run").sha == base
+    assert port.git.commit("refs/remotes/v6/ticket").sha == facts["ticket_checkout_head"]
+    port.git.run("reset", "--hard", base)
+    port.git.run("update-ref", f"refs/heads/{run_branch}", base)
+    port.git.run("update-ref", f"refs/heads/{ticket_branch}", facts["ticket_checkout_head"])
+    with sqlite3.connect(port.database) as db:
+        db.execute("UPDATE refs SET sha=? WHERE ref='refs/heads/main'", (base,))
+        db.execute("INSERT INTO refs VALUES (?,?)", (f"refs/heads/{run_branch}", base))
+        db.execute("INSERT INTO refs VALUES (?,?)", (f"refs/heads/{ticket_branch}", base))
+    checkout = root / "work" / "ticket-3"
+    checkout.parent.mkdir()
+    port.git.run("worktree", "add", "--detach", str(checkout), facts["ticket_checkout_head"])
+    with tarfile.open(paths["-checkout.tar"], "r:") as archive:
+        for member in archive:
+            assert member.isfile() and not Path(member.name).is_absolute() and ".." not in Path(member.name).parts
+            stream = archive.extractfile(member)
+            assert stream is not None
+            destination = checkout / member.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(stream.read())
+    assert port.git.run("status", "--porcelain", cwd=checkout).stdout.strip().splitlines() == facts["ticket_checkout_status"]
+    return port, checkout
+
+
+def test_disabled_v6_notifications_still_refuse_an_existing_old_journal(tmp_path: Path) -> None:
+    oracle = Path(__file__).resolve().parents[3] / "results" / "kernel-initial-observation"
+    original = oracle / "kernel-initial-v6.sqlite3"
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == "64a39d083111ad3625b7da038c2904040da32eb0790415a06a029ff334af1203"
+    old_root = tmp_path / "old"
+    old_root.mkdir()
+    source = old_root / "state.sqlite3"
+    source.write_bytes(original.read_bytes())
+    snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
+    run_id = json.loads((oracle / "kernel-initial-v6.json").read_text(encoding="utf-8"))["run"]["run_id"]
+    journal = old_root / "notifications" / (hashlib.sha256(run_id.encode()).hexdigest()[:32] + ".json")
+    journal.parent.mkdir()
+    journal.write_text('{"seen":[]}', encoding="utf-8")
+    destination = tmp_path / "new.sqlite3"
+    with pytest.raises(MigrationRefused, match="unsupported_source_notification_journal"):
+        convert_initial_v6(snapshot, destination, repository_root=tmp_path / "new-repo",
+                           source_ref="refs/heads/converted-ticket", checkout=tmp_path / "checkout",
+                           final_checkout=tmp_path / "final",
+                           development_profile=Profile("fixture-development", "high"),
+                           review_profile=Profile("fixture-review", "high"),
+                           publication_profile=Profile("fixture-publication", "high"))
+    assert not destination.exists()
+    assert journal.read_text(encoding="utf-8") == '{"seen":[]}'
 
 
 def test_fixed_c696_unknown_display_refuses_initial_conversion_without_replay(tmp_path: Path) -> None:
@@ -70,6 +133,48 @@ def test_fixed_c696_unknown_display_refuses_initial_conversion_without_replay(tm
                            publication_profile=Profile("fixture-publication", "high"))
     assert not destination.exists()
     assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in expected} == expected
+
+
+def test_returned_development_refuses_unknown_external_write_without_consuming_return(tmp_path: Path) -> None:
+    oracle = Path(__file__).resolve().parents[3] / "results" / "kernel-returned-development-bound-observation"
+    original = oracle / "kernel-returned-development.sqlite3"
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == "357705ded49a1a6cba7feb9dc89920f97642db65e603e0b5a42ae3068a918728"
+    source = tmp_path / "synthetic.sqlite3"
+    source.write_bytes(original.read_bytes())
+    observed = json.loads((oracle / "kernel-returned-development.json").read_text(encoding="utf-8"))
+    paths = {suffix: oracle / ("kernel-returned-development" + suffix) for suffix in
+             (".sqlite3", ".json", "-profile.json", "-github.json", ".bundle", "-checkout.tar")}
+    original_hashes = {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()}
+    external = json.loads(paths["-github.json"].read_text(encoding="utf-8"))
+    root = tmp_path / "continued"
+    port, checkout = _restore_returned_checkout(root, paths, observed, external)
+    body = '{"display_attempted":true,"status":"indeterminate"}'
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    with closing(sqlite3.connect(source)) as db:
+        db.execute("INSERT INTO work_evidence_materials VALUES (?,?,?)", (digest, body, len(body)))
+        db.execute("INSERT INTO work_evidence VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (observed["run_id"], "synthetic-unknown-display", "job:ticket:3:generation:1",
+                    "linked_branch_display", 1, digest, len(body), digest, None, None))
+        db.execute("UPDATE work_jobs SET value_linked_branch_display=? WHERE stage='developing'",
+                   ("synthetic-unknown-display",))
+        db.commit()
+    snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
+    observed["source_sha256"] = snapshot.sha256
+    observation = tmp_path / "synthetic-observation.json"
+    observation.write_text(json.dumps(observed), encoding="utf-8")
+    destination = root / "kernel.sqlite3"
+    with pytest.raises(MigrationRefused):
+        convert_returned_role_v6(
+            snapshot, destination, repository_root=port.git.root,
+            checkout=checkout, final_checkout=root / "work" / "final",
+            profile_snapshot=oracle / "kernel-returned-development-profile.json",
+            github_snapshot=oracle / "kernel-returned-development-github.json",
+            observation_snapshot=observation, remote_source_sha=observed["ticket_checkout_head"],
+            remote_target_sha=observed["ticket_checkout_head"], checkout_archive=paths["-checkout.tar"])
+    assert not destination.exists()
+    assert port.writes() == []
+    assert source.read_bytes() == snapshot.path.read_bytes()
+    assert {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()} == original_hashes
 
 
 def test_fixed_4aba_v6_copy_converts_and_new_runtime_completes_ticket(tmp_path: Path) -> None:
@@ -275,10 +380,10 @@ def test_fixed_8d_returned_publication_consumes_old_raw_without_new_agent(tmp_pa
     checkout = root / "work" / "ticket-3"
     checkout.parent.mkdir()
     port.git.run("worktree", "add", "--detach", str(checkout), candidate_sha)
-    kernel = convert_returned_publication_v6(
+    kernel = convert_returned_role_v6(
         snapshot, root / "kernel.sqlite3", repository_root=port.git.root,
         checkout=checkout, final_checkout=root / "work" / "final", profile_snapshot=profile,
-        observation_snapshot=observation,
+        observation_snapshot=observation, github_snapshot=github,
         remote_source_sha=remote_base, remote_target_sha=target_base)
     subject = "ticket:3"
     assert kernel.status(subject)["pending_attempt"] == facts["pending_attempt"]["attempt_id"]
@@ -324,9 +429,112 @@ def test_fixed_8d_returned_publication_consumes_old_raw_without_new_agent(tmp_pa
     assert boundary.kind == "complete"
     assert kernel.status(subject)["phase"] == "complete"
     assert scenario.role_calls == []
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject=? AND purpose='requirements'",
+                            (subject,))) == (1, 1)
     assert any(write["operation"] == "merge" for write in port.writes())
     assert any(write["operation"] == "completion_comment" for write in port.writes())
     assert source.read_bytes() == snapshot.path.read_bytes()
+
+
+@pytest.mark.parametrize("role", ["development", "reviewer"])
+def test_bound_returned_role_consumes_exact_old_raw(tmp_path: Path, role: str) -> None:
+    oracle = Path(__file__).resolve().parents[3] / "results" / f"kernel-returned-{role}-bound-observation"
+    name = "kernel-returned-" + role
+    paths = {suffix: oracle / (name + suffix) for suffix in
+             (".sqlite3", ".json", "-profile.json", "-github.json", ".bundle", "-checkout.tar")}
+    known = {
+      "development": {
+        ".sqlite3": "357705ded49a1a6cba7feb9dc89920f97642db65e603e0b5a42ae3068a918728",
+        ".json": "ff1f972f6996a9829423cbd96488c112f84c7a2507f43f8d3d3bda9d89e4aba9",
+        "-profile.json": "c17bf3aa1553dc3aaa0914771d045efffab6019620213af4d45ec584d7d51898",
+        "-github.json": "88e4c45ee0865c5543666fb5ace720c447bce0f6a7854e473413944882385bd7",
+        ".bundle": "b051561c7fe23eb11dbf0194e7c29f428aa5b9d035f2ece7bef173993856a8c4",
+        "-checkout.tar": "66fa44450a0034bcbcb1c0ae06f82c40baf8a280ff4f086fb64fab39a6c06e6c",
+      },
+      "reviewer": {
+        ".sqlite3": "0fc6daa20c4147a4fda55d8edd8eb69eb71bb98a40369adb3c618b68dca57ee3",
+        ".json": "d4f24c6a2b77a597d8ff47a46c2b81b0f6942f3bb9874234a2b19e4098179f77",
+        "-profile.json": "89f94880b3ea883d3bab7539869df133e90bd8b410f46dd6460a9c048d2520d3",
+        "-github.json": "8587bb9b673b51a578f8bf233bf14b43b13c6a6799e08441f891db6b004a230f",
+        ".bundle": "8e1df5d237c2837e1c1ccb92d683129d208d19c264befa7c2ab46a98c72116ac",
+        "-checkout.tar": "d60bbea4d74d72c47e344e1af4cfc19cd3776ae3ccc2a33b85934a3d240d56ec",
+      },
+    }
+    expected = known[role]
+    assert {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()} == expected
+    facts = json.loads(paths[".json"].read_text(encoding="utf-8"))
+    external = json.loads(paths["-github.json"].read_text(encoding="utf-8"))
+    assert facts["checkout_archive_sha256"] == expected["-checkout.tar"]
+    assert facts["role"] == role
+    assert facts["ticket_checkout_status"] == (["?? delivered.txt"] if role == "development" else [])
+    snapshot = capture_v6(paths[".sqlite3"], tmp_path / "captured.sqlite3")
+    root = tmp_path / "continued"
+    port, checkout = _restore_returned_checkout(root, paths, facts, external)
+    ticket_branch = f"agent-run/{facts['run_id']}/ticket-3"
+    base = external["default_head_sha"]
+    kernel = convert_returned_role_v6(
+        snapshot, root / "kernel.sqlite3", repository_root=port.git.root,
+        checkout=checkout, final_checkout=root / "work" / "final",
+        profile_snapshot=paths["-profile.json"], observation_snapshot=paths[".json"],
+        github_snapshot=paths["-github.json"],
+        checkout_archive=paths["-checkout.tar"], remote_source_sha=base, remote_target_sha=base)
+    subject = "ticket:3"
+    assert kernel.status(subject)["phase"] == ("development" if role == "development" else "review")
+    assert kernel.status(subject)["pending_attempt"] == facts["pending_attempt"]["attempt_id"]
+    assert port.ref_commit(f"refs/heads/{ticket_branch}").sha == base
+    if role == "reviewer":
+        assert port.git.commit(f"refs/agent-run-kernel-migration/{facts['run_id']}/ticket-3").sha == facts["ticket_checkout_head"]
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM invocations")[0] == 0
+        assert tx.one("SELECT count(*) FROM attempts")[0] == (1 if role == "development" else 2)
+        assert tuple(tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject=? AND purpose='requirements'",
+                            (subject,))) == (1, 0)
+        witnesses = [json.loads(tx.get(row[0], subject)) for row in
+                     tx.rows("SELECT material_id FROM history WHERE kind='imported_invocation' ORDER BY position")]
+        witness = witnesses[-1]
+        assert witness["bound_version"]["version_id"] != witness["current_version"]["version_id"]
+        assert witness["invocation"]["input_fingerprint"] == facts["completed_invocation"]["input_fingerprint"]
+        if role == "development":
+            intent = tx.one("SELECT id FROM material WHERE subject=? AND purpose='v6_candidate_commit_intent'", (subject,))
+            assert json.loads(tx.get(intent[0], subject)) == {
+                "run_id": "run-1-337b38adb81b2187", "job_id": "ticket:3:generation:1",
+                "presence_hex": "0f", "nulls_hex": "00", "value_kind": "candidate_commit",
+                "value_expected_head": "82bce20949af5a8edcd11278407738529f0d8a4b",
+                "value_attempt": 1, "value_token": "3aba31594f394d4d990be548de2182ce",
+            }
+    assert port.writes() == []
+    delivery = kernel.delivery(subject)
+    current = kernel.status(subject)
+    scenario = Scenario.__new__(Scenario)
+    scenario.script = None
+    scenario.port = port
+    scenario.initial = port.git.commit("refs/heads/main")
+    scenario.spec = RunSpec(facts["run_id"], facts["repository"], facts["parent_number"],
+                            current["parent_revision"], current["graph_revision"], (delivery,), Policy(),
+                            inputs=_imported_inputs(kernel))
+    scenario.delivery = delivery
+    scenario.kernel = kernel
+    scenario.execution = kernel.claim_executor("returned-role-executor")
+    scenario.reviews = ["pass"]
+    scenario.checks = ["none"]
+    scenario.review_count = scenario.development_count = scenario.publication_count = 0
+    scenario.heads = []
+    scenario.role_calls = []
+    scenario.checkpoints = []
+    scenario.edits = None
+    scenario.reviewed_heads = []
+    assert scenario.run().kind == "complete"
+    assert kernel.status(subject)["phase"] == "complete"
+    assert [call["role"] for call in scenario.role_calls] == (
+        ["review", "publication"] if role == "development" else ["publication"])
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject=? AND purpose='requirements'",
+                            (subject,))) == (1, 1)
+    assert any(write["operation"] == "candidate" for write in port.writes()) == (role == "development")
+    assert any(write["operation"] == "merge" for write in port.writes())
+    assert paths[".sqlite3"].read_bytes() == snapshot.path.read_bytes()
+    assert {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()} == expected
 
 
 def test_fixed_3f_completed_ticket_imports_completion_without_rewriting_effects(tmp_path: Path) -> None:

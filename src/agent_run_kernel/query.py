@@ -12,8 +12,11 @@ import sqlite3
 import time
 from typing import Any, Literal, Mapping, Sequence
 
+from agent_run.task_identity import TaskKey
+
 from .model import KernelError, Role, artifact
 from .storage import QUERY_LIMIT, Storage, Transaction
+from .task_location import read_task, task_path
 
 
 @dataclass(frozen=True)
@@ -106,13 +109,32 @@ def header(path: Path) -> dict[str, Any]:
         raise QueryError("incompatible_run_state", str(error)) from error
 
 
-def discover(root: Path) -> list[dict[str, Any]]:
+def task_binding(task: TaskKey) -> tuple[str, Path] | None:
+    """Read an exact Task publication without creating its admission lock."""
+    try:
+        return read_task(task_path(task))
+    except (KernelError, OSError) as error:
+        raise QueryError("run_locator_invalid", f"Cannot read Task publication: {error}") from error
+
+
+def task_published(candidate: Mapping[str, Any]) -> bool:
+    """Check the exact Task pointer; enumeration alone does not publish a Run."""
+    if candidate["repository_root"] is None:
+        return False
+    task = TaskKey(Path(candidate["repository_root"]), candidate["repository"], candidate["parent"])
+    binding = task_binding(task)
+    return binding == (candidate["run_id"], Path(candidate["database"]).resolve())
+
+
+def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list[dict[str, Any]]:
     """Discover canonical databases without creating a locator or repairing one."""
-    if not root.exists():
+    if not root.exists() and published is None:
         return []
     if root.is_symlink():
         raise QueryError("run_locator_invalid", "State directory is a symbolic link")
     paths: list[Path] = [root] if root.is_file() else []
+    if published is not None:
+        paths.extend(path for path in published if path.is_relative_to(root.resolve()) and path not in paths)
     if root.is_dir():
         def unreadable(error: OSError) -> None:
             raise QueryError("run_locator_invalid", f"Cannot read state directory: {error}") from error
@@ -121,14 +143,29 @@ def discover(root: Path) -> list[dict[str, Any]]:
             if visited >= 4096:
                 raise QueryError("query_limit", "Discovery directory limit; provide --state-dir")
             if "kernel.sqlite3" in files:
-                paths.append(Path(directory) / "kernel.sqlite3")
-                if len(paths) > 256:
+                path = Path(directory) / "kernel.sqlite3"
+                if path not in paths:
+                    paths.append(path)
+                if published is None and len(paths) > 256:
                     raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
     candidates: list[dict[str, Any]] = []
     for path in paths:
+        expected = None if published is None else published.get(path.resolve())
         if path.is_symlink():
+            if published is not None and expected is None:
+                continue
             raise QueryError("run_locator_conflict", f"Symbolic database path: {path}")
-        candidates.append(header(path))
+        try:
+            candidate = header(path)
+        except QueryError:
+            if published is not None and expected is None:
+                continue
+            raise
+        if expected is not None and candidate["run_id"] != expected:
+            raise QueryError("run_locator_conflict", f"Task publication names a different Run: {path}")
+        candidates.append(candidate)
+        if published is None and len(candidates) > 256:
+            raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
     return candidates
 
 

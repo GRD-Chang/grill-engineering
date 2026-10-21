@@ -27,6 +27,7 @@ from .model import (
     Delivery, Policy, Profile, PullRequest, Purpose, Requirements, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
+from .configuration import checkpoint_policy
 from .task_location import bind_task, locked_task, read_task
 
 
@@ -79,9 +80,7 @@ class Kernel:
             validate_resources(dict(spec.inputs.prompt_resources))
             validate_identity_snapshot(spec.inputs.worker_identity)
             validate_identity_snapshot(spec.inputs.runner_identity)
-        policy = asdict(spec.policy)
-        for role in Role:
-            del policy[role.value + "_profile"]
+        policy = cls._policy_values(spec.policy)
         Storage.create(path)
         kernel = cls(path)
         with kernel.storage.transaction() as tx:
@@ -442,7 +441,7 @@ class Kernel:
             tx.execute("DELETE FROM issue_links WHERE subject=?", (subject,))
             tx.execute("UPDATE runs SET parent_revision=?", (run["observed_parent_revision"],))
             for budget in tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,)):
-                limits = self._budget_limits(self._policy(run), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
+                limits = self._budget_limits(self._subject_policy(tx, job), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
                 tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1", (subject, budget["purpose"]))
                 tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required) VALUES (?,?,?,?,?,?)",
                            (subject, budget["purpose"], budget["window"] + 1, *limits, budget["review_required"]))
@@ -519,14 +518,18 @@ class Kernel:
 
     def admit_host(self, action_id: str, *, kind: str, command: tuple[str, ...], environment_carrier: Path,
                    preflight: Callable[[], None], subject: str | None = None, world: World | None = None,
-                   message: str | None = None, new_thread: bool = False) -> HostLaunch:
+                   message: str | None = None, new_thread: bool = False,
+                   policy_overrides: Mapping[str, Any] | None = None) -> HostLaunch:
         """Bind one Task and apply its explicit control with the same Host intent."""
-        if (kind not in {"run", "resume", "approve"} or not action_id or not command
+        if (kind not in {"run", "resume", "approve", "revise"} or not action_id or not command
                 or any(not part or "\0" in part for part in command) or not environment_carrier.is_absolute()):
             raise KernelError("host_request_invalid")
         preflight()  # External I/O precedes both Task binding and durable Action.
         intent = {"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
-                  "command": list(command), "environment_carrier": str(environment_carrier)}
+                  "command": list(command), "environment_carrier": str(environment_carrier),
+                  "policy_overrides": dict(policy_overrides or {})}
+        if kind == "run" and policy_overrides:
+            raise KernelError("policy_override_boundary")
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             run_id, task = run["id"], self._task(run)
@@ -562,7 +565,8 @@ class Kernel:
                                (action_id, run_id, kind, subject, payload, receipt))
                     self._event(tx, material_owner, "control_applied", action_id, receipt)
                 else:
-                    self._control(tx, kind, action_id, subject=subject, world=world, message=message, new_thread=new_thread)
+                    self._control(tx, kind, action_id, subject=subject, world=world, message=message,
+                                  new_thread=new_thread, policy_overrides=policy_overrides)
                 epoch = tx.one("SELECT epoch FROM runs")[0] + 1
                 owner, nonce = identity(), identity()
                 request = HostLaunch(run_id, epoch, owner, nonce, "agent-run-kernel-" + nonce + ".service", command, environment_carrier)
@@ -574,7 +578,8 @@ class Kernel:
                 return request
 
     def control_host(self, request: HostLaunch, kind: str, action_id: str, *, subject: str | None = None,
-                     world: World | None = None, message: str | None = None, new_thread: bool = False) -> str:
+                     world: World | None = None, message: str | None = None, new_thread: bool = False,
+                     policy_overrides: Mapping[str, Any] | None = None) -> str:
         """Apply an explicit action through the exact current Task and Host."""
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
@@ -587,7 +592,7 @@ class Kernel:
                 run = tx.one("SELECT * FROM runs")
                 self._executor_owned(tx, run, Execution(request.run_id, request.owner, request.epoch))
                 return self._control(tx, kind, action_id, subject=subject, world=world,
-                                     message=message, new_thread=new_thread)
+                                     message=message, new_thread=new_thread, policy_overrides=policy_overrides)
 
     @staticmethod
     def _host_launch(tx: Transaction, row: sqlite3.Row) -> HostLaunch:
@@ -1165,22 +1170,26 @@ class Kernel:
                 raise KernelError("merge_authority_changed")
 
     def control(self, kind: str, action_id: str, *, subject: str | None = None,
-                world: World | None = None, message: str | None = None, new_thread: bool = False) -> str:
+                world: World | None = None, message: str | None = None, new_thread: bool = False,
+                policy_overrides: Mapping[str, Any] | None = None) -> str:
         """Apply one explicit operator intent atomically, with its application receipt.
 
         The offline prototype calls this trusted interface directly. Host launch,
         public capability isolation and process-exit proofs are separate adapters.
         """
         with self.storage.transaction() as tx:
-            return self._control(tx, kind, action_id, subject=subject, world=world, message=message, new_thread=new_thread)
+            return self._control(tx, kind, action_id, subject=subject, world=world, message=message,
+                                 new_thread=new_thread, policy_overrides=policy_overrides)
 
     def _control(self, tx: Transaction, kind: str, action_id: str, *, subject: str | None = None,
-                 world: World | None = None, message: str | None = None, new_thread: bool = False) -> str:
-        if kind not in {"stop", "resume", "approve"}:
+                 world: World | None = None, message: str | None = None, new_thread: bool = False,
+                 policy_overrides: Mapping[str, Any] | None = None) -> str:
+        if kind not in {"stop", "resume", "approve", "revise"}:
             raise KernelError("prototype_control_unimplemented", kind)
         run = tx.one("SELECT * FROM runs")
         material_owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-        payload = wire_json({"kind": kind, "subject": subject, "message": message, "new_thread": new_thread})
+        payload = wire_json({"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
+                             "policy_overrides": dict(policy_overrides or {})})
         prior = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
         if prior:
             if tx.get(prior[0]["payload_id"], material_owner) != payload:
@@ -1189,9 +1198,21 @@ class Kernel:
         if run["final_action"]:
             raise KernelError("final_approval_noncancellable")
         job = None if subject is None else self._job(tx, subject)
+        if message is not None and (not message.strip() or len(message.encode()) > 8192):
+            raise KernelError("human_response_boundary")
+        if policy_overrides:
+            if (kind != "resume" or job is None or "ticket_development_workers" in policy_overrides
+                    or not any(gate["code"] in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}
+                               for gate in self._gates(tx, job["id"]))):
+                raise KernelError("policy_override_boundary")
+            policy = checkpoint_policy(self._subject_policy(tx, job), policy_overrides)
+            policy_id = tx.put(job["id"], "delivery_policy", wire_json(self._policy_values(policy)))
+            tx.execute("UPDATE subjects SET policy_id=? WHERE id=?", (policy_id, job["id"]))
+            job = self._job(tx, job["id"])
         payload_id = tx.put(material_owner, "control_intent", payload)
         tx.execute("INSERT INTO actions(id,run_id,kind,subject,payload_id,status) VALUES (?,?,?,?,?,'applied')",
                    (action_id, run["id"], kind, subject, payload_id))
+        feedback_scope: dict[str, dict[str, Any]] = {}
         if kind == "stop":
             if job is None:
                 if not run["stopped"] and run["executor"] is not None:
@@ -1219,8 +1240,13 @@ class Kernel:
                 if not run["stopped"]:
                     raise KernelError("no_resumable_boundary")
                 tx.execute("UPDATE runs SET stopped=0 WHERE id=?", (run["id"],))
-                tx.execute("UPDATE attempts SET resume_action=? WHERE id IN (SELECT current_attempt FROM subjects WHERE run_id=?)",
+                tx.execute("UPDATE attempts SET resume_action=? WHERE id IN (SELECT s.current_attempt FROM subjects s WHERE s.run_id=? AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id))",
                            (action_id, run["id"]))
+                if message is not None or new_thread:
+                    feedback_scope = {row["id"]: {"generation": row["generation"], "attempt": row["current_attempt"],
+                                                   "role": row["phase"] if row["phase"] in {"development", "review", "publish"} else None}
+                                      for row in tx.all("SELECT s.* FROM subjects s WHERE s.run_id=? AND s.phase!='complete' AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id) AND NOT EXISTS (SELECT 1 FROM dependencies d JOIN subjects p ON p.id=d.predecessor WHERE d.subject=s.id AND p.phase!='complete')", (run["id"],))
+                                      if self._eligibility(tx, row) is None}
             else:
                 assert subject is not None
                 if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
@@ -1229,14 +1255,12 @@ class Kernel:
                 if not gates:
                     raise KernelError("no_resumable_boundary")
                 if message is not None:
-                    if not message.strip() or len(message.encode()) > 8192:
-                        raise KernelError("human_response_boundary")
                     response = tx.put(subject, "human_response", message.encode())
                     self._event(tx, subject, "human_response", action_id, response)
                 for gate in gates:
                     code = gate["code"]
                     if code in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}:
-                        self._renew(tx, run, job, gate["purpose"])
+                        self._renew(tx, job, gate["purpose"])
                     elif code == "integration_resync_exhausted":
                         self._renew_resync(tx, job)
                     elif code == "human_blocker":
@@ -1271,6 +1295,22 @@ class Kernel:
                 if job["grant_id"] and job["phase"] in {"merge", "completion_comment", "close"}:
                     tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
                     tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
+        elif kind == "revise":
+            if (job is None or subject is None or world is None or message is None
+                    or job["kind"] != DeliveryKind.FINAL_RUN or job["phase"] != "approval"):
+                raise KernelError("no_revision_boundary")
+            if (run["stopped"] or run["blocked"] or self._gates(tx, subject)
+                    or tx.rows("SELECT id FROM leases WHERE subject=?", (subject,))
+                    or self._pending_effect(tx, subject) is not None
+                    or not self._current(tx, job, run, world) or not self._published(tx, run, job, world)
+                    or not self._review_current(tx, job, world)):
+                raise KernelError("revision_currentness")
+            feedback = tx.put(subject, "maintainer_revision", message.encode())
+            self._renew(tx, job, Purpose.INTEGRATION.value, new_cycle=True)
+            tx.execute("UPDATE subjects SET phase='development',purpose='integration',repair_source='human_revision',last_failure=?,current_attempt=NULL,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,gate_mode=NULL,resume_purpose=NULL,version=version+1 WHERE id=?",
+                       (feedback, subject))
+            self._event(tx, subject, "revision_requested", action_id, feedback)
+            self._ready(tx, subject, "work_queue")
         else:
             if job is None or world is None or job["phase"] != "approval" or job["kind"] == DeliveryKind.TICKET:
                 raise KernelError("no_approval_boundary")
@@ -1294,28 +1334,33 @@ class Kernel:
             tx.execute("UPDATE subjects SET phase='merge',grant_id=?,version=version+1 WHERE id=?", (grant_id, subject))
             tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
             tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
-        receipt = tx.put(material_owner, "control_receipt", wire_json({"action": action_id, "kind": kind, "applied": True}))
+        receipt = tx.put(material_owner, "control_receipt", wire_json({"action": action_id, "kind": kind, "applied": True,
+                                                                     "feedback_scope": feedback_scope}))
         tx.execute("UPDATE actions SET receipt_id=? WHERE id=?", (receipt, action_id))
         self._event(tx, material_owner, "control_applied", action_id, receipt)
+        if kind == "resume" and subject is None and (message is not None or new_thread):
+            self._event(tx, material_owner, "run_feedback_pending", action_id, receipt)
         return "pending" if kind == "approve" else "applied"
 
-    def _renew(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, purpose: str) -> None:
+    def _renew(self, tx: Transaction, job: sqlite3.Row, purpose: str, *, new_cycle: bool = False) -> None:
         old = tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (job["id"], purpose))
         tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND window=?", (job["id"], purpose, old["window"]))
-        developments, reviews, limit = 0, 0, old["development_limit"]
+        policy = self._subject_policy(tx, job)
+        limit, review_limit = self._budget_limits(policy, DeliveryKind(job["kind"]))[Purpose(purpose)]
+        developments, reviews = 0, 0
         if purpose == Purpose.CI:
             reviews = old["reviews_used"]  # CI Reviewer count is cumulative, not a renewable quota.
-        if purpose == Purpose.INTEGRATION and job["kind"] == DeliveryKind.FINAL_RUN:
+        if purpose == Purpose.INTEGRATION and job["kind"] == DeliveryKind.FINAL_RUN and not new_cycle:
             developments = 0 if old["developments_used"] >= old["development_limit"] else old["developments_used"]
             reviews = 0 if old["review_limit"] is not None and old["reviews_used"] >= old["review_limit"] else old["reviews_used"]
         if purpose == Purpose.INTEGRATION and job["kind"] != DeliveryKind.FINAL_RUN:
             # This policy extends an accumulated allowance instead of erasing use.
             developments, reviews = old["developments_used"], old["reviews_used"]
-            policy = self._policy(run)
-            limit += policy.run_repairs if job["kind"] == DeliveryKind.PARENT_ONLY else policy.integration_developments
+            limit += old["development_limit"]
+        review_required = job["kind"] != DeliveryKind.TICKET or purpose == Purpose.REQUIREMENTS or (purpose == Purpose.CI and policy.ticket_ci_review)
         tx.execute("INSERT INTO budgets VALUES (?,?,?,?,?,?,?,?,1)",
-                   (job["id"], purpose, old["window"] + 1, developments, reviews, limit, old["review_limit"], old["review_required"]))
-        self._event(tx, job["id"], "budget_renewed", f"{purpose}:{old['window'] + 1}")
+                   (job["id"], purpose, old["window"] + 1, developments, reviews, limit, review_limit, review_required))
+        self._event(tx, job["id"], "budget_renewed", f"{purpose}:{old['window'] + 1}", job["policy_id"])
 
     def status(self, subject: str) -> dict[str, Any]:
         with self.storage.transaction(write=False) as tx:
@@ -1331,6 +1376,7 @@ class Kernel:
             return {
                 "subject": subject, "kind": job["kind"], "phase": job["phase"], "purpose": job["purpose"],
                 "generation": job["generation"], "version": job["version"],
+                "policy": self._policy_values(self._subject_policy(tx, job)), "policy_id": job["policy_id"],
                 "revision": job["revision"], "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
                 "completion_revision": job["completion_revision"],
                 "source_sha": job["source_sha"], "integration_target": job["integration_target"],
@@ -1504,8 +1550,26 @@ class Kernel:
             return world.target is None and world.source is None and world.pr is None
         return world.target is not None and row["base_sha"] == world.target.sha
 
+    @staticmethod
+    def _policy_values(policy: Policy) -> dict[str, Any]:
+        values = asdict(policy)
+        for role in Role:
+            del values[role.value + "_profile"]
+        return values
+
     def _policy(self, run: sqlite3.Row) -> Policy:
-        return Policy(**json.loads(run["policy"]))
+        return self._decode_policy(run["policy"])
+
+    def _decode_policy(self, raw: bytes) -> Policy:
+        values = json.loads(raw)
+        if not isinstance(values, dict) or values.keys() != self._policy_values(Policy()).keys():
+            raise KernelError("policy_snapshot_invalid")
+        return Policy(**values)
+
+    def _subject_policy(self, tx: Transaction, job: sqlite3.Row) -> Policy:
+        if job["policy_id"] is None:
+            return self._policy(tx.one("SELECT * FROM runs WHERE id=?", (job["run_id"],)))
+        return self._decode_policy(tx.get(job["policy_id"], job["id"]))
 
     def _store_profiles(self, tx: Transaction, subject: str, profiles: Mapping[str, Any], source: Mapping[str, Any]) -> int:
         revision = tx.one("SELECT coalesce(max(id),0)+1 FROM profile_revisions")[0]
@@ -1587,7 +1651,29 @@ class Kernel:
             return self._prepare_effect(tx, run, job, execution, world, "validation_checkout", before=job["workspace_sha"],
                                         payload={"reviewed_commit": job["integrated_sha"] or job["candidate_sha"]})
         tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
-        policy = self._policy(run)
+        policy = self._subject_policy(tx, job)
+        force_new_thread = False
+        bound_feedback: list[str] = []
+        feedback_actions = tx.all("SELECT a.* FROM history p JOIN actions a ON a.id=p.identity WHERE p.kind='run_feedback_pending' AND a.run_id=? AND NOT EXISTS (SELECT 1 FROM history b WHERE b.kind IN ('run_feedback_bound','run_feedback_retired') AND b.identity=a.id) ORDER BY p.position", (run["id"],))
+        live_generations = {(row["id"], row["generation"]) for row in tx.all("SELECT id,generation FROM subjects")} if feedback_actions else set()
+        for action in feedback_actions:
+            owner = tx.one("SELECT subject FROM material WHERE id=?", (action["payload_id"],))[0]
+            feedback = json.loads(tx.get(action["payload_id"], owner))
+            receipt = json.loads(tx.get(action["receipt_id"], owner))
+            scope = receipt["feedback_scope"].get(subject)
+            if scope is not None and scope["generation"] == job["generation"]:
+                if feedback["message"] is not None:
+                    response = tx.put(subject, "human_response", feedback["message"].encode())
+                    self._event(tx, subject, "human_response", action["id"], response)
+                force_new_thread = force_new_thread or bool(feedback["new_thread"] and (
+                    (pending is not None and pending["id"] == scope["attempt"])
+                    or (pending is None and scope["attempt"] is None and scope["role"] == job["phase"])))
+                if pending is not None and force_new_thread:
+                    tx.execute("UPDATE attempts SET new_thread=1 WHERE id=?", (pending["id"],))
+                    pending = tx.one("SELECT * FROM attempts WHERE id=?", (pending["id"],))
+                bound_feedback.append(action["id"])
+            elif not any((key, value["generation"]) in live_generations for key, value in receipt["feedback_scope"].items()):
+                self._event(tx, owner, "run_feedback_retired", action["id"], action["receipt_id"])
         attempt_id = pending["id"] if pending is not None else identity()
         previous_output = None if pending is None else tx.one(
             "SELECT i.*,o.* FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id WHERE i.id=? ORDER BY ordinal DESC LIMIT 1",
@@ -1596,7 +1682,7 @@ class Kernel:
         if pending is not None and not pending["new_thread"]:
             previous = tx.one("SELECT thread FROM invocations WHERE id=?", (pending["current_invocation"],))
             thread_id = previous["thread"]
-        elif pending is None and role == Role.DEVELOPMENT and not policy.new_thread_per_development:
+        elif pending is None and role == Role.DEVELOPMENT and not policy.new_thread_per_development and not force_new_thread:
             thread_id = job["development_thread"]
         if thread_id is None:
             thread_id = identity()
@@ -1661,6 +1747,8 @@ class Kernel:
         tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (lease_id, subject, invocation_id, execution.owner, execution.epoch))
         tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
         self._event(tx, subject, "agent_allocated", invocation_id)
+        for action_id in bound_feedback:
+            self._event(tx, subject, "run_feedback_bound", action_id, context_id)
         call = AgentCall(attempt_id, invocation_id, subject, role, Purpose(job["purpose"]), thread_id,
                          lease_id, execution, context, profile, deadline_seconds, deadline_at, mode, backend_thread, ordinal,
                          binding["profile_revision"], reference)
@@ -1714,7 +1802,11 @@ class Kernel:
             context["work_source"] = "ci"
             if job["ci_failure"]:
                 context["ci_evidence"] = json.loads(tx.get(job["ci_failure"], job["id"]))
-        if role == Role.DEVELOPMENT and job["repair_source"] is not None:
+        revisions = tx.rows("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='revision_requested' ORDER BY position DESC LIMIT 1",
+                            (job["id"], job["generation"]))
+        if revisions:
+            context["human_feedback"] = tx.get(revisions[0][0], job["id"]).decode()
+        if role == Role.DEVELOPMENT and job["repair_source"] not in {None, "human_revision"}:
             field = {"acceptance": "acceptance_artifact", "integration": "integration_evidence",
                      "git_integrity": "git_integrity_evidence", "required_checks": "ci_evidence"}[job["repair_source"]]
             material = job["ci_failure"] if job["repair_source"] == "required_checks" else job["last_failure"]
@@ -1754,7 +1846,7 @@ class Kernel:
         if role == Role.REVIEW:
             facts = {key: context[key] for key in (
                 "acceptance_scope", "revision", "parent_revision", "graph_revision", "completion_revision",
-                "requirements", "ticket_completions", "work_source", "ci_evidence",
+                "requirements", "ticket_completions", "work_source", "ci_evidence", "human_feedback",
             ) if key in context}
             facts["current_review_identity"] = self._review_identity(context)
             full = {"base_sha": context["base_sha"], "candidate_sha": context["reviewed_commit"]}
@@ -2279,6 +2371,11 @@ class Kernel:
             target = tx.one("SELECT * FROM final_target")
             source_ref, target_ref = target["source_ref"], target["target_ref"]
             base = Commit(job["base_sha"], job["base_tree"])
+        elif operation in self.CLEANUP:
+            closed = tx.one("SELECT source_ref,target_ref,base_sha,base_tree FROM effects WHERE subject=? AND generation=? AND operation='close' AND status='confirmed'",
+                            (subject, job["generation"]))
+            source_ref, target_ref = closed["source_ref"], closed["target_ref"]
+            base = Commit(closed["base_sha"], closed["base_tree"])
         else:
             source_ref, target_ref, base = job["source_ref"], job["target_ref"], self._require_target(world)
         body = dict(payload or {})
@@ -2666,7 +2763,7 @@ class Kernel:
             raise KernelError("resync_allowance_not_exhausted")
         tx.execute("UPDATE resync_allowances SET current=0 WHERE subject=? AND current=1", (job["id"],))
         tx.execute("INSERT INTO resync_allowances(subject,generation,allowance) VALUES (?,?,?)",
-                   (job["id"], previous["generation"] + 1, self._policy(tx.one("SELECT * FROM runs")).resync_limit))
+                   (job["id"], previous["generation"] + 1, self._subject_policy(tx, job).resync_limit))
         self._event(tx, job["id"], "resync_renewed", str(previous["generation"] + 1))
 
     def _observe_integration_snapshot(self, tx: Transaction, job: sqlite3.Row, world: World) -> bool:

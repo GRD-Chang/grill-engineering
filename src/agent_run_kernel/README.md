@@ -32,6 +32,19 @@ retain the original effect's exact authority across I/O and uncertain replies.
 Roles retain the strict Artifact contracts. Public query readers use Storage
 read-only transactions without reconstructing a mutable Run.
 
+Deliveries initially share the unique immutable creation policy. Explicit
+Resume at an exhausted budget checkpoint may freeze a new policy material
+for that delivery's future windows, resolving only supplied overrides against
+its frozen values. Historical invocations, charged windows and sibling
+deliveries retain their evidence. Budget renewal history identifies an
+overridden policy material; a null reference denotes the creation policy.
+Whole-Run Resume feedback binds to the next actual FIFO Agent allocation;
+another Ticket's local gate does not receive that feedback or resume authority.
+Accepted Actions retain their original generation scope and bind feedback in
+order, even when another Stop/Resume occurs before the next Agent allocation.
+This schema is the v14 exploration protocol and rejects earlier exploration
+databases rather than silently adding missing policy or control fields.
+
 Implemented representative paths include all three delivery kinds, initial
 and integration review/development loops, CI repairs, explicit approval,
 Stop/Resume with permanent epoch retirement, raw return reuse, independent

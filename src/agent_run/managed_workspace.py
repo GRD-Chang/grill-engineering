@@ -13,11 +13,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import Any, Mapping
 
 from agent_run.messages import error_message
-if TYPE_CHECKING:
-    from agent_run.git import GitRepository
 from agent_run.git_errors import GitError
 from agent_run.git_output import git_environment, run_git
 from agent_run.paths import app_data_root
@@ -60,11 +58,6 @@ class ManagedWorkspace:
     @property
     def state_root(self) -> Path:
         return self.root / "state"
-
-    def open(self) -> GitRepository:
-        """Legacy object entry; native callers use the same pure path validation."""
-        from agent_run.git import GitRepository
-        return GitRepository(self.open_path())
 
     def open_path(self) -> Path:
         """Validate an existing workspace without loading the legacy runtime."""
@@ -109,14 +102,6 @@ class ManagedWorkspace:
             return {"repository": self.repository, "remote_url": document["remote_url"]}
         except (OSError, ValueError) as error:
             raise ManagedWorkspaceError(error_message("workspace.error.unreadable")) from error
-
-    def ensure(
-        self, remote_url: str | None = None, *, identity: dict[str, str] | None = None,
-        runner_identity: Mapping[str, Any] | None = None,
-    ) -> GitRepository:
-        """Legacy object entry over the same clone/path implementation."""
-        from agent_run.git import GitRepository
-        return GitRepository(self.ensure_path(remote_url, identity=identity, runner_identity=runner_identity))
 
     def ensure_path(
         self, remote_url: str | None = None, *, identity: dict[str, str] | None = None,

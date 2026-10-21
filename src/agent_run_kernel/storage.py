@@ -17,7 +17,7 @@ from agent_run.sqlite_runtime import require_wal_runtime
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v11-exploration"
+PROTOCOL = "independent-delivery-kernel-v14-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -50,7 +50,7 @@ CREATE TABLE subjects (
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
  ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT,
  validation_checkout TEXT, validation_cleanup TEXT, owned_root TEXT NOT NULL DEFAULT '', common_git_dir TEXT NOT NULL DEFAULT '',
- refresh_revision TEXT
+ refresh_revision TEXT, policy_id TEXT REFERENCES material(id)
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
@@ -249,6 +249,7 @@ CREATE TABLE history (
  kind TEXT NOT NULL, identity TEXT NOT NULL, material_id TEXT REFERENCES material(id),
  generation INTEGER NOT NULL, created_at REAL NOT NULL, phase TEXT, purpose TEXT, status TEXT
 );
+CREATE INDEX history_action_facts ON history(kind,identity);
 """
 
 

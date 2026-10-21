@@ -285,7 +285,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         workspace.open_path()
         original = attach(kernel, requested_action=parsed.command, manager=manager,
                           environment=environment, runner_lock=runner_lock)
-        if original is not None:
+        if original is not None and original["host"] != "running":
             original["language"] = run["language"]
             return original
         with kernel.storage.transaction(write=False) as tx:
@@ -318,10 +318,19 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         # Root owns the selected Executor command, including sealed loader facts.
         from .executor import command
         action_id = uuid4().hex
-        result = submit(kernel, parsed.command, action_id=action_id,
-                        command=command(database, action_id, runner_lock, environment), manager=manager,
-                        environment=environment, runner_lock=runner_lock, subject=subject, world=world,
-                        message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False))
+        if original is not None:
+            request = kernel.host_request(original["action_id"])
+            kernel.control_host(request, parsed.command, action_id, subject=subject, world=world,
+                message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False))
+            with kernel.storage.transaction(write=False) as tx:
+                action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
+            result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
+                "action_id": action_id, "action": parsed.command, "host": "running", "host_unit": request.unit_name}
+        else:
+            result = submit(kernel, parsed.command, action_id=action_id,
+                            command=command(database, action_id, runner_lock, environment), manager=manager,
+                            environment=environment, runner_lock=runner_lock, subject=subject, world=world,
+                            message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False))
         result["language"] = run["language"]
         return result
 

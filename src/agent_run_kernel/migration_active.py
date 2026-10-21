@@ -1,4 +1,4 @@
-"""A narrow v6 returned-Publication import from a copied, stopped source.
+"""A narrow v6 returned-role import from a copied, stopped source.
 
 This imports completed synchronous old calls as historical evidence.  It never
 invents a native executor, process lease, or Invocation for old calls.
@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import tarfile
 from typing import Any, Mapping
 
 from .kernel import Kernel
@@ -28,6 +30,7 @@ _ACTIVE_TABLES = frozenset({
     "work_job_layout", "work_job_slots", "work_job_archives", "work_job_review_artifacts",
     "work_job_acceptance_record", "work_job_review_budget", "work_job_ci_recovery",
     "work_job_integration_resync", "work_job_archive_roots", "work_attempts",
+    "work_job_candidate_commit_intent",
     "work_attempt_versions", "work_attempt_current", "work_attempt_returns",
     "work_attempt_result_members", "work_job_attempt_roots", "work_job_attempt_history",
     "work_invocations", "work_invocation_roots", "work_invocation_current",
@@ -36,6 +39,18 @@ _ACTIVE_TABLES = frozenset({
     "run_graph_ticket_slots", "run_frontier", "run_condition_base", "run_query_roots",
     "run_timeline_events", "run_timeline_slots", "run_resume_roots",
 })
+
+# These are durable publication intents, write outcomes or remote identities,
+# not proof that the current role return is the only unconsumed work.  Their
+# reconciliation is outside this returned-only converter.  Linked Branch
+# display is also unsupported here even when its outcome is already known.
+_RETURNED_WRITE_FIELDS = (
+    "value_publication", "value_publication_sha", "value_publication_parent_sha",
+    "value_publication_prior_published_sha", "value_published_sha",
+    "value_published_head_sha", "value_published_integration_head_sha",
+    "value_integrated_publication_sha", "value_pr_number", "value_pull_number",
+    "value_linked_branch_display", "value_branch_publication_observation",
+)
 
 
 @dataclass(frozen=True)
@@ -69,10 +84,12 @@ class _Active:
     base_sha: str
     ticket: int
     source_ref: str
-    candidate_sha: str
-    candidate_tree: str
-    integration_target: str
+    candidate_sha: str | None
+    candidate_tree: str | None
+    integration_target: str | None
     resync_window: int
+    pending_role: Role
+    candidate_intent: dict[str, Any] | None
     calls: tuple[_Call, ...]
     bindings: tuple[dict[str, Any], ...]
     evidence: tuple[dict[str, Any], ...]
@@ -137,6 +154,41 @@ def _read_profile(path: Path) -> tuple[dict[str, Any], str]:
     return document, hashlib.sha256(original).hexdigest()
 
 
+def _verify_checkout_archive(path: Path, checkout: Path, expected_sha: str) -> None:
+    """Bind copied checkout bytes to the same stopped-source observation."""
+    metadata = path.lstat()
+    if (path.is_symlink() or not path.is_file() or metadata.st_nlink != 1
+            or metadata.st_size > 32 * 1024 * 1024):
+        raise MigrationRefused("source_checkout_archive")
+    body = path.read_bytes()
+    if hashlib.sha256(body).hexdigest() != expected_sha:
+        raise MigrationRefused("source_checkout_archive")
+    expected: dict[Path, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as archive:
+            for member in archive:
+                relative = Path(member.name)
+                if (not member.isfile() or relative.is_absolute() or not relative.parts
+                        or any(part in {"", ".", "..", ".git"} for part in relative.parts)
+                        or relative in expected or member.size > 16 * 1024 * 1024):
+                    raise MigrationRefused("source_checkout_archive")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise MigrationRefused("source_checkout_archive")
+                expected[relative] = stream.read()
+    except (OSError, tarfile.TarError, ValueError) as error:
+        raise MigrationRefused("source_checkout_archive") from error
+    paths = [path for path in checkout.rglob("*") if ".git" not in path.relative_to(checkout).parts]
+    if any(path.is_symlink() or not (path.is_file() or path.is_dir()) for path in paths):
+        raise MigrationRefused("source_checkout_archive")
+    actual = {path.relative_to(checkout): path for path in paths if path.is_file()}
+    if set(actual) != set(expected):
+        raise MigrationRefused("source_checkout_archive")
+    for relative, file in actual.items():
+        if file.is_symlink() or file.stat().st_nlink != 1 or file.read_bytes() != expected[relative]:
+            raise MigrationRefused("source_checkout_archive")
+
+
 def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                  source_sha: str) -> _Active:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
@@ -147,16 +199,6 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                   for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
         if any(count and name not in _ACTIVE_TABLES for name, count in counts.items()):
             raise MigrationRefused("unsupported_source_relations")
-        exact = {"runs": 1, "run_root": 1, "run_condition_base": 1, "work_jobs": 2,
-                 "work_job_layout": 1, "work_attempts": 3, "work_attempt_current": 3,
-                 "work_attempt_returns": 3, "work_invocations": 3,
-                 "work_invocation_history": 3, "work_job_attempt_roots": 1,
-                 "work_job_attempt_history": 2, "work_job_review_budget": 1,
-                 "work_invocation_current": 2, "work_job_review_artifacts": 1,
-                 "work_job_acceptance_record": 1, "work_job_integration_resync": 1,
-                 "work_job_ci_recovery": 1}
-        if any(counts.get(table) != expected for table, expected in exact.items()):
-            raise MigrationRefused("unsupported_source_stage")
         run = _one(db, "SELECT * FROM runs")
         run_id = run["run_id"]
         root = _one(db, "SELECT * FROM run_root WHERE run_id=?", (run_id,))
@@ -164,20 +206,43 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
         job = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id=?",
                    (run_id, layout["active_job_id"]))
         ticket = job["value_ticket_number"]
+        pending_role = {"developing": Role.DEVELOPMENT, "reviewing": Role.REVIEW,
+                        "accepted": Role.PUBLICATION}.get(job["stage"])
+        if pending_role is None:
+            raise MigrationRefused("unsupported_source_stage")
+        count = {Role.DEVELOPMENT: 1, Role.REVIEW: 2, Role.PUBLICATION: 3}[pending_role]
+        exact = {"runs": 1, "run_root": 1, "run_condition_base": 1, "work_jobs": 2,
+                 "work_job_layout": 1, "work_attempts": count, "work_attempt_current": count,
+                 "work_attempt_returns": count, "work_invocations": count,
+                 "work_invocation_history": count, "work_job_attempt_roots": 1,
+                 "work_job_attempt_history": count - 1, "work_job_review_budget": 1,
+                 "work_invocation_current": 2, "work_job_review_artifacts": int(count == 3),
+                 "work_job_acceptance_record": int(count == 3),
+                 "work_job_integration_resync": int(count == 3),
+                 "work_job_candidate_commit_intent": int(count == 1),
+                 "work_job_ci_recovery": 1}
+        if any(counts.get(table) != expected for table, expected in exact.items()):
+            raise MigrationRefused("unsupported_source_stage")
         if (run["status"] != "active" or root["value_language"] not in {"zh", "en"}
-                or job["job_id"] != f"ticket:{ticket}:generation:1" or job["stage"] != "accepted"
+                or job["job_id"] != f"ticket:{ticket}:generation:1"
                 or job["owner_kind"] != "ticket" or job["owner_key"] != str(ticket)
                 or job["value_ticket_branch_initialized"] != 1
                 or job["value_ticket_branch"] != f"agent-run/{run_id}/ticket-{ticket}"
-                or job["value_base_sha"] is None or job["value_candidate_sha"] is None
-                or job["value_publication_attempts"] != 1
-                or job["value_modification_attempts"] != 1
-                or job["value_validation_attempts"] != 1):
+                or job["value_base_sha"] is None
+                or job["value_modification_attempts"] != int(count > 1)
+                or job["value_validation_attempts"] != int(count > 1)
+                or job["value_publication_attempts"] != (1 if count == 3 else None)
+                or (job["value_candidate_sha"] is None) != (count == 1)):
             raise MigrationRefused("unsupported_source_stage")
         selected = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id!=?",
                         (run_id, job["job_id"]))
         if selected["job_id"] != f"ticket:{ticket}:selection" or selected["stage"] is not None:
             raise MigrationRefused("unsupported_source_stage")
+        if (any(row[field] is not None for row in (job, selected) for field in _RETURNED_WRITE_FIELDS)
+                or db.execute("SELECT 1 FROM work_evidence WHERE run_id=? AND kind IN "
+                              "('linked_branch_display','branch_publication_observation') LIMIT 1",
+                              (run_id,)).fetchone() is not None):
+            raise MigrationRefused("unsupported_source_job_facts")
         parent = _one(db, "SELECT * FROM run_parent_versions WHERE run_id=? AND version_id=?",
                       (run_id, root["value_parent_version_id"]))
         title = _evidence(db, run_id, parent["title_id"], owner=f"run:{run_id}", kind="parent.title")
@@ -242,10 +307,11 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                                  "frozen_evidence_ids": frozen_ids, "profile_sha256": profile_sha,
                                  "profiles": "old-profile-store", "notifications": "old-not-configured"})
         bindings = profile.get("bindings")
-        if not isinstance(bindings, list) or len(bindings) != 2:
+        if not isinstance(bindings, list) or len(bindings) != min(count, 2):
             raise MigrationRefused("source_profile_bindings")
         by_thread = {row.get("thread_id"): row for row in bindings if isinstance(row, dict)}
-        if len(by_thread) != 2 or {row.get("role") for row in bindings} != {"development", "review"}:
+        expected_bindings = {"development"} if count == 1 else {"development", "review"}
+        if len(by_thread) != len(bindings) or {row.get("role") for row in bindings} != expected_bindings:
             raise MigrationRefused("source_profile_bindings")
         roots = _one(db, "SELECT * FROM work_job_attempt_roots WHERE run_id=? AND job_id=?",
                      (run_id, job["job_id"]))
@@ -255,14 +321,14 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                                  (run_id,)).fetchall()
         active_invocations = db.execute("SELECT * FROM work_invocation_current WHERE run_id=?",
                                         (run_id,)).fetchall()
-        if ([row["position"] for row in history] != [0, 1]
-                or [row["position"] for row in inv_history] != [0, 1, 2]
-                or roots["pending_present"] != 1 or roots["history_count"] != 2
-                or {row["started_at"] for row in active_invocations} != {inv_history[2]["started_at"]}
+        if ([row["position"] for row in history] != list(range(count - 1))
+                or [row["position"] for row in inv_history] != list(range(count))
+                or roots["pending_present"] != 1 or roots["history_count"] != count - 1
+                or {row["started_at"] for row in active_invocations} != {inv_history[-1]["started_at"]}
                 or {row["reference_kind"] for row in active_invocations} != {"active", "ticket"}):
             raise MigrationRefused("unsupported_source_attempt_history")
         ordered_ids = [row["attempt_id"] for row in history] + [roots["pending_attempt_id"]]
-        if len(set(ordered_ids)) != 3:
+        if len(set(ordered_ids)) != count:
             raise MigrationRefused("source_attempt_identity")
         calls: list[_Call] = []
         previous_end = 0.0
@@ -283,12 +349,12 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
             if (attempt["job_id"] != job["job_id"] or attempt["work_subject"] != f"ticket:{ticket}"
                     or attempt["generation"] != 1 or attempt["ordinal"] != 1
                     or attempt["role"] != ("development", "reviewer", "publication")[index]
-                    or version["status"] != ("pending" if index == 2 else "completed")
-                    or (index == 0 and version["outcome"] != "candidate")
-                    or (index == 1 and (version["outcome"] != "acceptance_artifact"
-                                        or version["budget_consumed"] != 1))
-                    or version["returned_result_evidence_id"] != (returned["evidence_id"] if index == 2 else None)
-                    or (index < 2 and history[index]["version_id"] != current["version_id"])
+                    or version["status"] != ("pending" if index == count - 1 else "completed")
+                    or (index == 0 and count > 1 and version["outcome"] != "candidate")
+                    or (index == 1 and count == 3 and (version["outcome"] != "acceptance_artifact"
+                                                         or version["budget_consumed"] != 1))
+                    or version["returned_result_evidence_id"] != (returned["evidence_id"] if index == count - 1 else None)
+                    or (index < count - 1 and history[index]["version_id"] != current["version_id"])
                     or invocation["attempt_id"] != attempt_id
                     or invocation["raw_result_evidence_id"] != returned["evidence_id"]
                     or invocation["status"] != "completed" or invocation["ended_at"] is None
@@ -336,52 +402,79 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
             calls.append(_Call(attempt_id, role, attempt["ordinal"], thread_id,
                                dict(invocation), dict(bound), dict(version), raw,
                                returned["evidence_id"], normalized))
-        if (calls[2].invocation["requested_thread_id"] != calls[0].thread_id
-                or calls[2].thread_id != calls[0].thread_id):
+        if (count == 3 and (calls[2].invocation["requested_thread_id"] != calls[0].thread_id
+                or calls[2].thread_id != calls[0].thread_id)):
             raise MigrationRefused("source_publication_thread")
         if counts.get("work_invocation_segments", 0) or counts.get("work_invocation_wait_intervals", 0):
             raise MigrationRefused("unsupported_source_process")
         budget = _one(db, "SELECT * FROM work_job_review_budget WHERE run_id=? AND job_id=?",
                       (run_id, job["job_id"]))
         if (budget["value_window"] != 1 or budget["value_development_attempts"] != 1
-                or budget["value_reviewer_invocations"] != 1 or budget["value_final_ci_fix_used"] != 0):
+                or budget["value_reviewer_invocations"] != int(count == 3)
+                or budget["value_final_ci_fix_used"] != 0):
             raise MigrationRefused("unsupported_source_budget")
-        review = _one(db, "SELECT * FROM work_job_review_artifacts WHERE run_id=? AND job_id=?",
-                      (run_id, job["job_id"]))
-        accepted = _one(db, "SELECT * FROM work_job_acceptance_record WHERE run_id=? AND job_id=?",
-                        (run_id, job["job_id"]))
-        accepted_artifact = _one(db, "SELECT evidence_id FROM work_evidence WHERE run_id=? AND "
-                                 "kind='acceptance_record.artifact'", (run_id,))[0]
-        if (review["candidate_sha"] != job["value_candidate_sha"]
-                or review["reviewed_base_sha"] != base["value_sha"]
-                or review["reviewer_thread_id"] != calls[1].thread_id
-                or review["artifact_id"] != job["value_acceptance_artifact"]
-                or accepted["value_acceptance_scope"] != "change_job"
-                or accepted["value_artifact"] != accepted_artifact
-                or accepted["value_reviewed_base_sha"] != base["value_sha"]
-                or accepted["value_reviewed_candidate_sha"] != job["value_candidate_sha"]
-                or accepted["value_reviewed_candidate_tree"] is None
-                or accepted["value_reviewer_thread_id"] != calls[1].thread_id):
-            raise MigrationRefused("source_acceptance")
-        integration = _evidence(db, run_id, job["value_ticket_integration"],
-                                owner=f"job:{job['job_id']}", kind="ticket_integration")
-        if (not isinstance(integration, dict)
-                or integration.get("base_sha") != base["value_sha"]
-                or integration.get("source_sha") != base["value_sha"]
-                or integration.get("candidate_sha") != job["value_candidate_sha"]
-                or integration.get("head_sha") != job["value_candidate_sha"]
-                or integration.get("candidate_tree") != integration.get("head_tree")
-                or accepted["value_reviewed_candidate_tree"] != integration.get("candidate_tree")
-                or integration.get("target_sha") != base["value_sha"]
-                or integration.get("conflict_paths") != []):
-            raise MigrationRefused("source_integration")
-        resync = _one(db, "SELECT * FROM work_job_integration_resync WHERE run_id=? AND job_id=?",
-                      (run_id, job["job_id"]))
-        if (resync["value_generation"] != 1 or resync["value_window"] != 1
-                or resync["value_used"] != 0 or resync["value_limit"] != policy.resync_limit
-                or resync["value_open"] != 0 or resync["value_source_sha"] != base["value_sha"]
-                or resync["value_target_sha"] != integration["target_sha"]):
-            raise MigrationRefused("source_resync")
+        candidate_intent: dict[str, Any] | None = None
+        if count == 1:
+            intent = _one(db, "SELECT * FROM work_job_candidate_commit_intent WHERE run_id=? AND job_id=?",
+                          (run_id, job["job_id"]))
+            if (intent["value_kind"] != "candidate_commit" or intent["value_attempt"] != 1
+                    or intent["value_expected_head"] != base["value_sha"]
+                    or not intent["value_token"]):
+                raise MigrationRefused("unsupported_source_candidate_intent")
+            candidate_intent = _wire_row(dict(intent))
+        integration_target: str | None = None
+        candidate_tree: str | None = None
+        resync_window = 1
+        if count == 3:
+            review = _one(db, "SELECT * FROM work_job_review_artifacts WHERE run_id=? AND job_id=?",
+                          (run_id, job["job_id"]))
+            accepted = _one(db, "SELECT * FROM work_job_acceptance_record WHERE run_id=? AND job_id=?",
+                            (run_id, job["job_id"]))
+            accepted_artifact = _one(db, "SELECT evidence_id FROM work_evidence WHERE run_id=? AND "
+                                     "kind='acceptance_record.artifact'", (run_id,))[0]
+            if (review["candidate_sha"] != job["value_candidate_sha"]
+                    or review["reviewed_base_sha"] != base["value_sha"]
+                    or review["reviewer_thread_id"] != calls[1].thread_id
+                    or review["artifact_id"] != job["value_acceptance_artifact"]
+                    or accepted["value_acceptance_scope"] != "change_job"
+                    or accepted["value_artifact"] != accepted_artifact
+                    or accepted["value_reviewed_base_sha"] != base["value_sha"]
+                    or accepted["value_reviewed_candidate_sha"] != job["value_candidate_sha"]
+                    or accepted["value_reviewed_candidate_tree"] is None
+                    or accepted["value_reviewer_thread_id"] != calls[1].thread_id):
+                raise MigrationRefused("source_acceptance")
+            integration = _evidence(db, run_id, job["value_ticket_integration"],
+                                    owner=f"job:{job['job_id']}", kind="ticket_integration")
+            if (not isinstance(integration, dict)
+                    or integration.get("base_sha") != base["value_sha"]
+                    or integration.get("source_sha") != base["value_sha"]
+                    or integration.get("candidate_sha") != job["value_candidate_sha"]
+                    or integration.get("head_sha") != job["value_candidate_sha"]
+                    or integration.get("candidate_tree") != integration.get("head_tree")
+                    or accepted["value_reviewed_candidate_tree"] != integration.get("candidate_tree")
+                    or integration.get("target_sha") != base["value_sha"]
+                    or integration.get("conflict_paths") != []):
+                raise MigrationRefused("source_integration")
+            resync = _one(db, "SELECT * FROM work_job_integration_resync WHERE run_id=? AND job_id=?",
+                          (run_id, job["job_id"]))
+            if (resync["value_generation"] != 1 or resync["value_window"] != 1
+                    or resync["value_used"] != 0 or resync["value_limit"] != policy.resync_limit
+                    or resync["value_open"] != 0 or resync["value_source_sha"] != base["value_sha"]
+                    or resync["value_target_sha"] != integration["target_sha"]):
+                raise MigrationRefused("source_resync")
+            integration_target = integration["target_sha"]
+            candidate_tree = integration["candidate_tree"]
+            resync_window = resync["value_window"]
+        elif count == 2:
+            review_context = _evidence(db, run_id, calls[-1].current_version["review_context_evidence_id"],
+                                       owner=f"attempt:{calls[-1].attempt_id}", kind="review_context")
+            identity = (review_context.get("facts", {}).get("current_review_identity")
+                        if isinstance(review_context, dict) else None)
+            if (not isinstance(identity, dict) or identity.get("reviewed_base_sha") != base["value_sha"]
+                    or identity.get("reviewed_candidate_sha") != job["value_candidate_sha"]
+                    or not isinstance(identity.get("reviewed_candidate_tree"), str)):
+                raise MigrationRefused("source_review_identity")
+            candidate_tree = identity["reviewed_candidate_tree"]
         evidence = tuple({"evidence_id": row["evidence_id"], "owner_id": row["owner_id"],
                           "kind": row["kind"], "version": row["version"],
                           "source_evidence_id": row["source_evidence_id"],
@@ -401,8 +494,8 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                        graph_revision, _created_at_epoch(run["created_at"]), root["value_language"],
                        requirements, policy, inputs, root["value_run_branch"], base["value_branch"],
                        base["value_sha"], ticket, f"refs/heads/{job['value_ticket_branch']}",
-                       job["value_candidate_sha"], integration["candidate_tree"],
-                       integration["target_sha"], resync["value_window"],
+                       job["value_candidate_sha"], candidate_tree,
+                       integration_target, resync_window, pending_role, candidate_intent,
                        tuple(calls), tuple(bindings), evidence, timeline)
     except sqlite3.Error as error:
         raise MigrationRefused("source_corrupt") from error
@@ -410,10 +503,11 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
         db.close()
 
 
-def convert_returned_publication_v6(
+def convert_returned_role_v6(
     snapshot: SourceSnapshot, destination: Path, *, repository_root: Path,
-    checkout: Path, final_checkout: Path, profile_snapshot: Path,
+    checkout: Path, final_checkout: Path, profile_snapshot: Path, github_snapshot: Path,
     observation_snapshot: Path, remote_source_sha: str, remote_target_sha: str,
+    checkout_archive: Path | None = None,
 ) -> Kernel:
     """Import a sealed synchronous-oracle return, never a live Host invocation.
 
@@ -451,15 +545,35 @@ def convert_returned_publication_v6(
             raise MigrationRefused("snapshot_changed")
         facts = _read_active(copied.path, profile, profile_sha, snapshot.sha256)
         _require_no_v6_notification_journal(snapshot, facts.run_id)
+        try:
+            github_bytes = github_snapshot.read_bytes()
+            github = json.loads(github_bytes)
+        except (OSError, UnicodeError, ValueError) as error:
+            raise MigrationRefused("source_github_observation") from error
+        branches = github.get("delivery", {}).get("published_branches") if isinstance(github, dict) else None
+        if (len(github_bytes) > 4 * 1024 * 1024 or not isinstance(branches, dict)
+                or hashlib.sha256(github_bytes).hexdigest() != observed.get("fixture_sha256")
+                or github.get("repository") != facts.repository
+                or github.get("default_branch") != facts.base_branch
+                or github.get("default_head_sha") != remote_target_sha
+                or branches.get(facts.run_branch) != facts.base_sha
+                or branches.get(facts.source_ref.removeprefix("refs/heads/")) != remote_source_sha):
+            raise MigrationRefused("source_github_observation")
         completed = observed.get("completed_invocation")
         pending = observed.get("pending_attempt")
+        old_phase = {Role.DEVELOPMENT: "developing", Role.REVIEW: "reviewing",
+                     Role.PUBLICATION: "accepted"}[facts.pending_role]
         if (observed.get("run_id") != facts.run_id or not isinstance(completed, dict)
                 or not isinstance(pending, dict)
                 or not isinstance(completed.get("semantic_attempt"), dict)
-                or pending.get("attempt_id") != facts.calls[2].attempt_id
-                or completed["semantic_attempt"].get("attempt_id") != facts.calls[2].attempt_id
-                or completed.get("started_at") != facts.calls[2].invocation["started_at"]
-                or completed.get("ended_at") != facts.calls[2].invocation["ended_at"]
+                or (facts.pending_role != Role.PUBLICATION and observed.get("job_phase") != old_phase)
+                or (facts.pending_role != Role.PUBLICATION
+                    and observed.get("role") not in {facts.pending_role.value,
+                                                      "reviewer" if facts.pending_role == Role.REVIEW else facts.pending_role.value})
+                or pending.get("attempt_id") != facts.calls[-1].attempt_id
+                or completed["semantic_attempt"].get("attempt_id") != facts.calls[-1].attempt_id
+                or completed.get("started_at") != facts.calls[-1].invocation["started_at"]
+                or completed.get("ended_at") != facts.calls[-1].invocation["ended_at"]
                 or completed.get("status") != "completed"
                 or completed.get("execution_segments") != []):
             raise MigrationRefused("source_quiescence_unproved")
@@ -467,15 +581,35 @@ def convert_returned_publication_v6(
             raise MigrationRefused("source_git")
         for ref in (facts.source_ref, f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}"):
             _git(repository_root, "check-ref-format", ref)
-        if (remote_source_sha != facts.base_sha or remote_target_sha != facts.integration_target
+        if (remote_source_sha != facts.base_sha
+                or remote_target_sha != (facts.integration_target or facts.base_sha)
                 or _git(repository_root, "rev-parse", f"refs/heads/{facts.run_branch}^{{commit}}") != facts.base_sha
                 or _git(repository_root, "rev-parse", f"refs/heads/{facts.base_branch}^{{commit}}") != facts.base_sha
-                or _git(repository_root, "rev-parse", f"{facts.source_ref}^{{commit}}") != facts.candidate_sha
-                or _git(repository_root, "rev-parse", f"{facts.candidate_sha}^{{tree}}") != facts.candidate_tree):
+                or _git(repository_root, "rev-parse", f"{facts.source_ref}^{{commit}}") != (facts.candidate_sha or facts.base_sha)
+                or (facts.candidate_sha is not None and
+                    _git(repository_root, "rev-parse", f"{facts.candidate_sha}^{{tree}}") != facts.candidate_tree)):
             raise MigrationRefused("source_git")
+        checkout_head = facts.candidate_sha or facts.base_sha
         if (not checkout.is_dir() or _git(checkout, "rev-parse", "--show-toplevel") != str(checkout)
-                or _git(checkout, "rev-parse", "HEAD") != facts.candidate_sha
-                or _git(checkout, "status", "--porcelain") or checkout == repository_root):
+                or _git(checkout, "rev-parse", "HEAD") != checkout_head
+                or checkout == repository_root):
+            raise MigrationRefused("source_checkout")
+        status = _git(checkout, "status", "--porcelain").splitlines()
+        if (status != observed.get("ticket_checkout_status", [] if facts.pending_role == Role.PUBLICATION else None)
+                or observed.get("ticket_checkout_head") != checkout_head):
+            raise MigrationRefused("source_checkout")
+        if checkout_archive is not None:
+            archive_sha = observed.get("checkout_archive_sha256")
+            if not isinstance(archive_sha, str):
+                raise MigrationRefused("source_checkout_archive")
+            _verify_checkout_archive(checkout_archive, checkout, archive_sha)
+        elif facts.pending_role == Role.DEVELOPMENT:
+            raise MigrationRefused("source_checkout_archive_required")
+        if facts.pending_role == Role.DEVELOPMENT:
+            if (not status or _git(checkout, "diff", "--cached", "--name-only")
+                    or facts.candidate_sha is not None):
+                raise MigrationRefused("source_checkout")
+        elif status:
             raise MigrationRefused("source_checkout")
         common_value = Path(_git(checkout, "rev-parse", "--git-common-dir") or "")
         common = (common_value if common_value.is_absolute() else checkout / common_value).resolve()
@@ -485,7 +619,7 @@ def convert_returned_publication_v6(
             raise MigrationRefused("new_final_checkout")
         archive_ref = f"refs/agent-run-kernel-migration/{facts.run_id}/ticket-{facts.ticket}"
         _git(repository_root, "check-ref-format", archive_ref)
-        if _git(repository_root, "for-each-ref", "--format=%(refname)", archive_ref):
+        if facts.candidate_sha is not None and _git(repository_root, "for-each-ref", "--format=%(refname)", archive_ref):
             raise MigrationRefused("migration_archive_exists")
         subject = f"ticket:{facts.ticket}"
         spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
@@ -504,21 +638,29 @@ def convert_returned_publication_v6(
                        str(repository_root), facts.inputs)
         candidate = Path(directory) / "kernel.sqlite3"
         kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
+        phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review",
+                 Role.PUBLICATION: "publish"}[facts.pending_role]
         with kernel.storage.transaction() as tx:
             native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
             tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
-            tx.execute("UPDATE subjects SET phase='publish',current_attempt=?,review_attempt=?,"
+            tx.execute("UPDATE subjects SET phase=?,current_attempt=?,review_attempt=?,"
                        "development_thread=?,candidate_sha=?,candidate_tree=?,workspace_sha=?,"
-                       "expected_tree=?,integrated_sha=?,integrated_tree=?,integration_target=?,gate_mode='review' "
-                       "WHERE id=?", (facts.calls[2].attempt_id, facts.calls[1].attempt_id,
+                       "expected_tree=?,integrated_sha=?,integrated_tree=?,integration_target=?,gate_mode=? "
+                       "WHERE id=?", (phase, facts.calls[-1].attempt_id,
+                                      facts.calls[1].attempt_id if facts.pending_role == Role.PUBLICATION else None,
                                       facts.calls[0].thread_id, facts.candidate_sha, facts.candidate_tree,
-                                      facts.candidate_sha, facts.candidate_tree, facts.candidate_sha,
-                                      facts.candidate_tree, facts.integration_target, subject))
-            tx.execute("UPDATE budgets SET developments_used=1,reviews_used=1 "
-                       "WHERE subject=? AND purpose='requirements' AND window=1", (subject,))
-            tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
-                       (subject, facts.resync_window, 1, facts.source_ref,
-                        f"refs/heads/{facts.run_branch}", facts.base_sha, facts.integration_target))
+                                      facts.candidate_sha or facts.base_sha, facts.candidate_tree,
+                                      facts.candidate_sha if facts.pending_role == Role.PUBLICATION else None,
+                                      facts.candidate_tree if facts.pending_role == Role.PUBLICATION else None,
+                                      facts.integration_target,
+                                      "review" if facts.pending_role == Role.PUBLICATION else None, subject))
+            tx.execute("UPDATE budgets SET developments_used=1,reviews_used=? "
+                       "WHERE subject=? AND purpose='requirements' AND window=1",
+                       (int(facts.pending_role == Role.PUBLICATION), subject))
+            if facts.pending_role == Role.PUBLICATION:
+                tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
+                           (subject, facts.resync_window, 1, facts.source_ref,
+                            f"refs/heads/{facts.run_branch}", facts.base_sha, facts.integration_target))
             tx.execute("DELETE FROM history")
             for event in facts.timeline:
                 at = _created_at_epoch(event["value_at"])
@@ -531,6 +673,8 @@ def convert_returned_publication_v6(
                                                    event["event_id"], material, at))
             for entry in facts.evidence:
                 tx.put(subject, "v6_evidence", wire_json(entry))
+            if facts.candidate_intent is not None:
+                tx.put(subject, "v6_candidate_commit_intent", wire_json(facts.candidate_intent))
             for binding in facts.bindings:
                 tx.execute("INSERT INTO threads(id,subject,role,profile_revision,backend_id) VALUES (?,?,?,1,?)",
                            (binding["thread_id"], subject, binding["role"], binding["thread_id"]))
@@ -556,7 +700,16 @@ def convert_returned_publication_v6(
                     # The old review_context evidence binds the exact candidate
                     # but contains no reviewer checkout path.  Preserve that
                     # absence instead of claiming the Ticket checkout was it.
-                    context_witness["checkout"] = None
+                    # Successor Publication consumes the native review identity;
+                    # these revisions identify the verified continuation boundary,
+                    # while the original bound input remains above unchanged.
+                    context_witness.update(
+                        checkout=None, base_sha=facts.base_sha,
+                        reviewed_commit=facts.candidate_sha, reviewed_tree=facts.candidate_tree,
+                        revision=native["revision"], parent_revision=facts.parent_revision,
+                        graph_revision=facts.graph_revision,
+                        completion_revision=native["completion_revision"],
+                    )
                 context = tx.put(subject, "v6_attempt_input_witness", wire_json(context_witness))
                 result = tx.put(subject, "v6_normalized_artifact", wire_json(call.native_artifact))
                 tx.execute("""INSERT INTO attempts(
@@ -567,9 +720,10 @@ def convert_returned_publication_v6(
                            (call.attempt_id, subject, index, call.role.value, facts.parent_revision,
                             facts.graph_revision, native["revision"],
                             facts.base_sha, facts.candidate_sha, facts.candidate_tree, facts.candidate_tree,
-                            native["completion_revision"], context, result, "returned" if index == 3 else "consumed",
-                            1 if index == 2 else 0,
-                            None if index == 3 else "pass" if index == 2 else "development"))
+                            native["completion_revision"], context, result,
+                            "returned" if index == len(facts.calls) else "consumed",
+                            1 if index == 2 and facts.pending_role == Role.PUBLICATION else 0,
+                            None if index == len(facts.calls) else "pass" if index == 2 else "development"))
                 original = {"attempt_id": call.attempt_id, "old_role_ordinal": call.old_ordinal,
                             "thread_id": call.thread_id, "raw_evidence_id": call.raw_evidence_id,
                             "returned": call.returned, "invocation": _wire_row(call.invocation),
@@ -584,31 +738,39 @@ def convert_returned_publication_v6(
                 "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
                 "source_ref": facts.source_ref, "candidate_sha": facts.candidate_sha,
                 "candidate_tree": facts.candidate_tree, "remote_source_sha": remote_source_sha,
-                "remote_target_sha": remote_target_sha, "archive_ref": archive_ref,
-                "checkout": str(checkout), "mirror_conversion": "candidate-to-remote-base",
+                "remote_target_sha": remote_target_sha,
+                "archive_ref": archive_ref if facts.candidate_sha is not None else None,
+                "checkout": str(checkout),
+                "mirror_conversion": "candidate-to-remote-base" if facts.candidate_sha is not None else "none",
                 "source_backend": "completed-synchronous-oracle",
             }))
-        if (kernel.status(subject)["pending_attempt"] != facts.calls[2].attempt_id
-                or kernel.status(subject)["phase"] != "publish"):
+        if (kernel.status(subject)["pending_attempt"] != facts.calls[-1].attempt_id
+                or kernel.status(subject)["phase"] != phase):
             raise MigrationRefused("converted_state")
         if _read_profile(profile_snapshot)[1] != profile_sha:
             raise MigrationRefused("source_profile_changed")
         if hashlib.sha256(observation_snapshot.read_bytes()).hexdigest() != observation_sha:
             raise MigrationRefused("source_observation_changed")
+        if hashlib.sha256(github_snapshot.read_bytes()).hexdigest() != observed["fixture_sha256"]:
+            raise MigrationRefused("source_github_observation_changed")
+        if checkout_archive is not None:
+            _verify_checkout_archive(checkout_archive, checkout, observed["checkout_archive_sha256"])
         # This is only the caller's isolated copied repository.  Keep the old
         # candidate reachable before normalizing the local mirror to the
         # observed remote parent.  The old source and its ref are untouched.
-        zeros = "0" * len(facts.candidate_sha)
+        zeros = "0" * len(facts.base_sha)
         archived = normalized = linked = False
         try:
-            _git(repository_root, "update-ref", archive_ref, facts.candidate_sha, zeros)
-            archived = True
-            _git(repository_root, "update-ref", facts.source_ref, remote_source_sha, facts.candidate_sha)
-            normalized = True
-            if (_git(repository_root, "rev-parse", archive_ref) != facts.candidate_sha
+            if facts.candidate_sha is not None:
+                _git(repository_root, "update-ref", archive_ref, facts.candidate_sha, zeros)
+                archived = True
+                _git(repository_root, "update-ref", facts.source_ref, remote_source_sha, facts.candidate_sha)
+                normalized = True
+            if ((facts.candidate_sha is not None and
+                 _git(repository_root, "rev-parse", archive_ref) != facts.candidate_sha)
                     or _git(repository_root, "rev-parse", facts.source_ref) != remote_source_sha
-                    or _git(checkout, "rev-parse", "HEAD") != facts.candidate_sha
-                    or _git(checkout, "status", "--porcelain")):
+                    or _git(checkout, "rev-parse", "HEAD") != checkout_head
+                    or _git(checkout, "status", "--porcelain").splitlines() != status):
                 raise MigrationRefused("mirror_conversion")
             if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size
                    for suffix in ("-wal", "-journal")):
@@ -627,10 +789,10 @@ def convert_returned_publication_v6(
             if linked and destination.samefile(candidate):
                 destination.unlink()
             try:
-                if normalized:
+                if normalized and facts.candidate_sha is not None:
                     _git(repository_root, "update-ref", facts.source_ref,
                          facts.candidate_sha, remote_source_sha)
-                if archived:
+                if archived and facts.candidate_sha is not None:
                     _git(repository_root, "update-ref", "-d", archive_ref, facts.candidate_sha)
             except MigrationRefused as error:
                 # No target database was activated.  The candidate remains

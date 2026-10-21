@@ -235,7 +235,7 @@ def test_interrupted_read_returns_130_without_advancing_or_writing(
     kernel = _create(tmp_path)
     before = _snapshot(tmp_path)
 
-    def interrupted(_root):
+    def interrupted(_root, **_kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(query_cli, "discover", interrupted)
