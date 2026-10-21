@@ -93,3 +93,41 @@ def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_pa
     assert scenario.port.git.run("show", published.sha + ":foreign-source.txt").stdout == "Source work\n"
     assert scenario.port.git.run("show", published.sha + ":foreign-target.txt").stdout == "Target work\n"
     assert scenario.development_count == 0
+
+
+def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path: Path) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
+    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+                           Policy(development_deadline_seconds=7.0)))
+    now = [100.25]
+    kernel.clock = lambda: now[0]
+    executor = kernel.claim_executor("executor")
+    world = World("parent", "graph", "requirements", base)
+    first = kernel.advance(delivery.key, executor, world).call
+    assert first is not None and kernel.dispatch_agent(first)
+    kernel.bind_thread(first, "backend-thread")
+    process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
+    kernel.agent_started(first, process)
+    kernel.receive(first, b"invalid structured output")
+    kernel.agent_exited(first, process, 0)
+    now[0] = 102.5
+    repair_step = kernel.advance(delivery.key, executor, world)
+    assert repair_step.kind == "agent"
+    repair = repair_step.call
+    assert repair is not None and repair.mode == "output-repair"
+    assert repair.invocation_id == first.invocation_id and repair.thread_id == first.thread_id
+    assert repair.lease_id != first.lease_id and repair.deadline_at == 107.25
+    assert repair.context["readonly"] is True and repair.reported_thread == "backend-thread"
+    assert kernel.dispatch_agent(repair)
+    kernel.agent_exited(first, process, 0)  # A delayed duplicate exit cannot revoke the repair.
+    kernel.guard_agent(repair)
+    next_process = {**process, "pid": 24, "pgid": 24, "start_token": "repair-start"}
+    kernel.agent_started(repair, next_process)
+    kernel.receive(repair, b'{"result_kind":"development","summary":"Valid result","human_blockers":null}')
+    kernel.agent_exited(repair, next_process, 0)
+    assert kernel.advance(delivery.key, executor, world).kind == "progress"
+    assert kernel.status(delivery.key)["phase"] == "candidate"
+    returned = [event for event in kernel.history(delivery.key) if event["kind"] == "raw_returned"]
+    assert len(returned) == 2 and returned[0]["material_id"] != returned[1]["material_id"]
+    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
