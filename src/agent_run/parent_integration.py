@@ -232,8 +232,6 @@ def _prepare_snapshot(
         candidate_matches = isinstance(prior, dict) and candidate in {prior.get("candidate_sha"), prior.get("head_sha")}
         source_matches = isinstance(prior, dict) and (prior.get("source_sha") == source or own_source)
     if isinstance(prior, dict) and candidate_matches and source_matches and prior.get("target_sha") == target:
-        if isinstance(pending, dict):
-            return ParentSnapshotResult(status="conflict", conflict=pending)
         # Ticket's existing local record validator remains at its caller gate.
         return ParentSnapshotResult(status="clean", record=prior)
     if scope == "ticket" and isinstance(prior, dict):
