@@ -1331,7 +1331,7 @@ class Kernel:
             old = None if world.pr is None else {"title": world.pr.title, "body": world.pr.body}
             return self._prepare_effect(tx, run, job, execution, world, "pr_write", before=job["publication_sha"],
                                         after=job["publication_sha"], payload={"title": narrative["pr_title"],
-                                        "body": self._narrative_body(run, job, narrative["pr_body_markdown"]), "prior": old})
+                                        "body": self._narrative_body(tx, run, job, narrative["pr_body_markdown"]), "prior": old})
         if phase == "checks":
             if not self._published(tx, run, job, world):
                 return Step("paused", subject, "published_head")
@@ -1385,7 +1385,7 @@ class Kernel:
             narrative = json.loads(tx.get(publication[0], subject))
             return self._prepare_effect(tx, run, job, execution, world, "merge", before=world.target.sha,
                                         after=job["publication_sha"], payload={"method": "squash" if job["kind"] == DeliveryKind.TICKET else "merge",
-                                        "commit_message": narrative["commit_message"],
+                                        "commit_message": narrative["commit_message"] if job["kind"] == DeliveryKind.TICKET else f"merge: Delivery Run {job['source_ref'].removeprefix('refs/heads/')}",
                                         "parents": [world.target.sha] + ([] if job["kind"] == DeliveryKind.TICKET else [job["publication_sha"]])})
         if phase == "completion_comment":
             return self._prepare_effect(tx, run, job, execution, world, "completion_comment", before=job["merge_sha"],
@@ -1395,12 +1395,21 @@ class Kernel:
                                         payload={"issue": job["issue"], "merge_sha": job["merge_sha"]})
         raise KernelError("prototype_step_unimplemented", phase)
 
-    def _narrative_body(self, run: sqlite3.Row, job: sqlite3.Row, narrative: str) -> str:
+    def _narrative_body(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, narrative: str) -> str:
         header = f"Parent Issue: #{run['parent_issue']}\n"
         if job["kind"] == DeliveryKind.TICKET:
             header += f"Primary Ticket: #{job['issue']}\nDelivery Type: Ticket\n\n"
         else:
             header += "Delivery Type: " + ("Parent-only" if job["kind"] == DeliveryKind.PARENT_ONLY else "Final Run") + "\n\n"
+            if job["kind"] == DeliveryKind.FINAL_RUN:
+                tickets = [(row["issue"], row["title"]) for row in tx.rows("SELECT s.issue,v.title FROM subjects s JOIN requirement_versions v ON v.issue=s.issue AND v.revision=s.revision WHERE s.kind='ticket' ORDER BY s.issue")]
+                seed = tx.rows("SELECT id FROM material WHERE subject=? AND purpose='fixture_evidence'", (job["id"],))
+                if not tickets and seed:
+                    historical = json.loads(tx.get(seed[0][0], job["id"])).get("ticket")
+                    if historical:
+                        tickets = [(historical["number"], historical["title"])]
+                if tickets:
+                    header += "## Completed Tickets\n\n" + "\n".join(f"- #{number}: {title}" for number, title in tickets) + "\n\n"
         return header + narrative.strip()
 
     def _last_attempt(self, tx: Transaction, subject: str, role: Role) -> str:

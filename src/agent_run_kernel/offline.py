@@ -473,6 +473,7 @@ class Scenario:
                             concurrency=frozen["ticket_development_workers"])
             checks = neutral_script["external"]["required_checks"]
         self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
+        self.initial = self.port.git.commit("refs/heads/main")
         self.spec, self.delivery = self.port.prepare(kind, policy=policy,
             ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"] if neutral_script.get("ticket") else 1,
             repository="example/repository" if neutral_script is None else neutral_script["repository"],
@@ -631,8 +632,12 @@ class Scenario:
         pr = self.port.pull_request(self.delivery.key)
         if pr is None or pr.merged is None or not self.reviewed_heads:
             raise KernelError("neutral_cut_not_reached")
-        heads = {"initial": self.delivery.base.sha, "candidate": self.reviewed_heads[-1],
+        heads = {"initial": self.initial.sha, "candidate": self.reviewed_heads[-1],
                  "published": pr.head.sha, "integrated": pr.merged.sha}
+        source_label = {DeliveryKind.TICKET: "ticket", DeliveryKind.PARENT_ONLY: "parent", DeliveryKind.FINAL_RUN: "run"}[self.delivery.kind]
+        target_label = "run" if self.delivery.kind == DeliveryKind.TICKET else "main"
+        labels = {self.delivery.source_ref: source_label, self.delivery.target_ref: target_label, "refs/heads/main": "main"}
+        delivery_type = {DeliveryKind.TICKET: "Ticket", DeliveryKind.PARENT_ONLY: "Parent-only", DeliveryKind.FINAL_RUN: "Final Run"}[self.delivery.kind]
         identities: dict[str, list[str]] = {}
         for name, head in heads.items():
             identities.setdefault(head, []).append(name)
@@ -652,7 +657,7 @@ class Scenario:
         refs: dict[str, Any] = {}
         for line in self.port.git.run("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads").stdout.splitlines():
             ref, head = line.split()
-            name = {self.delivery.source_ref: "ticket", self.delivery.target_ref: "run", "refs/heads/main": "main"}.get(ref, ref)
+            name = labels.get(ref, ref)
             refs[name] = head_identity(head)
         with sqlite3.connect(self.port.database) as db:
             closed = db.execute("SELECT issue,intent,actor,merge_sha FROM closed ORDER BY issue").fetchall()
@@ -661,19 +666,29 @@ class Scenario:
         mutations: list[dict[str, Any]] = []
         for _, issue, _, raw in comments:
             body = json.loads(raw)
-            mutations.append({"action": "completion_comment", "ticket_number": issue,
-                              "pr_number": pr.number, "integrated_sha": head_identity(body["merge_sha"])})
+            mutation = {"action": "completion_comment" if self.delivery.kind == DeliveryKind.TICKET else "parent_completion_comment",
+                        "ticket_number" if self.delivery.kind == DeliveryKind.TICKET else "parent_number": issue,
+                        "pr_number": pr.number, "integrated_sha": head_identity(body["merge_sha"])}
+            if self.delivery.kind != DeliveryKind.TICKET:
+                mutation["delivery_type"] = delivery_type
+            mutations.append(mutation)
         for issue, _, _, merge_sha in closed:
-            mutations.append({"action": "close_issue", "ticket_number": issue,
-                              "pr_number": pr.number, "integrated_sha": head_identity(merge_sha)})
+            mutation = {"action": "close_issue" if self.delivery.kind == DeliveryKind.TICKET else "close_parent_issue",
+                        "ticket_number" if self.delivery.kind == DeliveryKind.TICKET else "parent_number": issue,
+                        "pr_number": pr.number, "integrated_sha": head_identity(merge_sha)}
+            if self.delivery.kind != DeliveryKind.TICKET:
+                mutation["delivery_type"] = delivery_type
+            mutations.append(mutation)
         for write in self.port.writes():
             if write["operation"] == "cleanup_remote_ref" and self.delivery.source_ref not in self.port.remote_refs():
-                mutations.append({"action": "delete_managed_branch", "branch": "ticket"})
+                mutations.append({"action": "delete_managed_branch", "branch": source_label})
         current = self.kernel.status(self.delivery.key)
         projected = self.observable(script["id"], Step("complete", self.delivery.key))
-        display_attempts = [{"issue_number": issue, "branch": "ticket" if ref == self.delivery.source_ref else ref,
+        display_attempts = [{"issue_number": issue, "branch": labels.get(ref, ref),
                              "head_sha": head_identity(head)} for issue, ref, head, _ in linked]
-        context_paths = {"development": self.delivery.checkout, "review": current["reviewed_checkout"], "publication": self.delivery.checkout}
+        context_paths = {"review": current["reviewed_checkout"], "publication": self.delivery.checkout}
+        if self.development_count:
+            context_paths = {"development": self.delivery.checkout, **context_paths}
         listing = self.port.git.run("worktree", "list", "--porcelain", "-z").stdout
         registry = listing.split("\0")
         registered = []
@@ -687,23 +702,23 @@ class Scenario:
             registered.append({"path": path, "repository": Path(path) == self.port.git.root,
                                "checkout_roles": [role for role, checkout in context_paths.items() if checkout == path],
                                "exists": Path(path).exists(), "head": head_identity(values["HEAD"]),
-                               "branch": None if branch is None else {self.delivery.source_ref: "ticket", self.delivery.target_ref: "run", "refs/heads/main": "main"}.get(branch, branch),
+                               "branch": None if branch is None else labels.get(branch, branch),
                                "detached": "detached" in fields, "prunable": values.get("prunable")})
         return {"schema": "kernel-neutral-ticket-observation/1", "input_sha256": input_digest,
                 "implementation": "independent-kernel-exploration", "cut": script["cut"],
                 "roles": projected["role_calls"], "raw_backend_calls": {"development": self.development_count,
                     "review": self.review_count, "publication": self.publication_count},
-                "status": "ticket_completed" if current["phase"] == "complete" else current["phase"],
-                "approval_required": False, "budget": {"initial_development": current["budgets"]["requirements"]["developments_used"],
-                    "initial_review": current["budgets"]["requirements"]["reviews_used"]},
+                "status": ("ticket_completed" if self.delivery.kind == DeliveryKind.TICKET else "completed") if current["phase"] == "complete" else current["phase"],
+                "approval_required": False, "budget": {"initial_development": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["developments_used"],
+                    "initial_review": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["reviews_used"]},
                 "commits": {name: actual_commit(head) for name, head in heads.items()}, "local_refs": refs,
-                "published_refs": {{self.delivery.source_ref: "ticket", self.delivery.target_ref: "run"}.get(ref, ref): head_identity(head)
+                "published_refs": {labels.get(ref, ref): head_identity(head)
                                    for ref, head in self.port.remote_refs().items() if ref in {self.delivery.source_ref, self.delivery.target_ref}},
                 "pull_request": {"title": pr.title, "body": pr.body, "state": pr.state,
-                                 "primary_ticket": self.delivery.issue},
+                                 "primary_ticket": self.delivery.issue if self.delivery.kind == DeliveryKind.TICKET else None},
                 "closed_issues": [row[0] for row in closed], "mutations": mutations,
                 "native_branch_display": {"observed": True, "calls": [{**attempt, "result": "linked"} for attempt in display_attempts],
-                                          "fixture_attempts": display_attempts, "linked_branches": {str(issue): "ticket" if ref == self.delivery.source_ref else ref for issue, ref, _, _ in linked},
+                                          "fixture_attempts": display_attempts, "linked_branches": {str(issue): labels.get(ref, ref) for issue, ref, _, _ in linked},
                                           "durable_outcome": {"display_attempted": current["issue_link"] is not None,
                                                               "status": None if current["issue_link"] is None else current["issue_link"]["state"]}},
                 "post_close_worktrees": {"observed": True, "registrations": registered,
@@ -722,6 +737,7 @@ class GraphScenario(Scenario):
         self.script = None
         self.port = OfflinePort.create(root, initial_git)
         base = self.port.git.commit("refs/heads/main")
+        self.initial = base
         run_ref = "refs/heads/run"
         self.port.git.run("update-ref", run_ref, base.sha)
         self.port._remote_cas(run_ref, base.sha, base.sha)

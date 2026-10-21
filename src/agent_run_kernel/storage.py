@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v3-exploration"
+PROTOCOL = "independent-delivery-kernel-v4-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
