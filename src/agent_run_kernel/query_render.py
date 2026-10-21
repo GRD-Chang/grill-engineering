@@ -32,7 +32,10 @@ _COPY = {
            "resume_label": "最近恢复", "resume_applied": "已应用；尚未观察到目标进展",
            "resume_unconfirmed": "已记录请求；应用尚未确认", "resume_started": "已记录目标进展",
            "resume_failed": "目标执行失败", "resume_human_action": "目标需要人工处理",
-           "worker_exit_wait": "原 Worker 退出尚未确认"},
+           "worker_exit_wait": "原 Worker 退出尚未确认", "supervision": "外部事实监督",
+           "github_convergence": "GitHub 事实收敛", "required_checks": "必要检查",
+           "remaining": "剩余秒数", "retry_count": "已记录重试", "deadline": "截止时间",
+           "timeout_resume": "超时后的恢复命令"},
     "en": {"run": "Delivery Run", "status": "Status", "phase": "Phase", "subject": "Work subject", "unknown": "Not recorded",
            "next": "Next action", "model": "Model", "effort": "Reasoning effort", "history": "Work history", "budget": "Cumulative usage",
            "findings": "Current findings", "evidence": "Evidence", "duration": "Task elapsed seconds", "agent": "Agent",
@@ -50,7 +53,10 @@ _COPY = {
            "resume_label": "Resume", "resume_applied": "applied; target progress not yet observed",
            "resume_unconfirmed": "request recorded; application unconfirmed", "resume_started": "Target progress recorded",
            "resume_failed": "Target execution failed", "resume_human_action": "Target needs human action",
-           "worker_exit_wait": "Worker exit not yet confirmed"},
+           "worker_exit_wait": "Worker exit not yet confirmed", "supervision": "External fact supervision",
+           "github_convergence": "GitHub convergence", "required_checks": "Required checks",
+           "remaining": "Seconds remaining", "retry_count": "Recorded retries", "deadline": "Deadline",
+           "timeout_resume": "Resume command after timeout"},
 }
 
 _TERMS = {
@@ -166,6 +172,15 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
     yield from _notification_lines(document)
+    for window in data.get("supervision_windows", []):
+        target = window["subject"] or copy["global"]
+        deadline, zone = _time(window["deadline"])
+        yield (f"{copy['supervision']}: {target} — {copy.get(window['kind'], window['kind'])} | "
+               f"{copy['remaining']}: {window['remaining_seconds']} | {copy['retry_count']}: {window['retry_count']}")
+        yield f"{copy['deadline']}: {deadline} ({zone})"
+        if window["latest_observation"] is not None:
+            yield _body(window["latest_observation"])
+        yield f"{copy['timeout_resume']}: {window['timeout_resume_action']}"
     latest = data.get("latest_resume")
     if isinstance(latest, Mapping):
         progress = latest.get("progress")

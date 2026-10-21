@@ -278,15 +278,58 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
             "pending_writes": effects, "delivery_cleanup": dict(cleanup[0]) if cleanup else None}
 
 
+def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
+    """Read canonical wait scopes; only a recorded Core gate proves timeout."""
+    run = tx.one("SELECT * FROM runs")
+    timeouts: dict[str | None, Any] = {}
+    if run["blocked"] == "supervision_timeout":
+        paused = tx.rows("SELECT h.material_id,h.subject FROM history h JOIN material m ON m.id=h.material_id "
+                         "JOIN waits w ON w.subject IS NULL AND w.scope_id=json_extract(CAST(m.body AS TEXT),'$.scope_id') "
+                         "AND w.kind=json_extract(CAST(m.body AS TEXT),'$.kind') "
+                         "WHERE h.kind='paused' AND h.identity='supervision_timeout' "
+                         "AND m.purpose='supervision_timeout' ORDER BY h.position DESC LIMIT 1")
+        if paused:
+            timeouts[None] = _material(tx, paused[0]["material_id"], paused[0]["subject"])
+    for gate in tx.all("SELECT subject,evidence FROM gates WHERE code='supervision_timeout'"):
+        timeouts[gate["subject"]] = _material(tx, gate["evidence"], gate["subject"])
+    rows = _all(tx, "SELECT w.*,m.subject AS scope_owner,m.purpose AS scope_purpose,"
+                "e.subject AS evidence_owner,e.purpose AS evidence_purpose,s.kind AS delivery_kind,s.issue "
+                "FROM waits w JOIN material m ON m.id=w.scope_id LEFT JOIN material e ON e.id=w.evidence "
+                "LEFT JOIN subjects s ON s.id=w.subject ORDER BY w.deadline,w.scope_id,w.kind")
+    result = []
+    for row in rows:
+        scope = _material(tx, row["scope_id"], row["scope_owner"])
+        if row["scope_purpose"] != "supervision_scope" or not isinstance(scope, dict) or scope.get("subject") != row["subject"]:
+            raise QueryError("incompatible_run_state", "Invalid recorded supervision scope")
+        if row["evidence"] is not None and row["evidence_purpose"] != "github_read_observation":
+            raise QueryError("incompatible_run_state", "Invalid recorded supervision observation")
+        timeout = timeouts.get(row["subject"])
+        timed_out = isinstance(timeout, dict) and timeout.get("scope_id") == row["scope_id"] and timeout.get("kind") == row["kind"]
+        command = f"agent-run resume {run['parent_issue']} --repo {run['repository']}"
+        if row["delivery_kind"] == "ticket":
+            command += f" --ticket {row['issue']}"
+        deadline = _timestamp(row["deadline"])
+        result.append({"subject": row["subject"], "kind": row["kind"], "scope_id": row["scope_id"], "scope": scope,
+            "started_at": _timestamp(row["started_at"]), "deadline": deadline,
+            "remaining_seconds": 0 if timed_out else max(0, int(deadline - now)) if deadline is not None else None,
+            "retry_count": row["retry_count"], "next_retry_at": _timestamp(row["next_retry_at"]),
+            "latest_observation": _material(tx, row["evidence"], row["evidence_owner"]),
+            "timed_out": timed_out, "timeout": timeout if timed_out else None,
+            "head_sha": None, "base_sha": None,
+            "next_action": command, "timeout_resume_action": command, "resume_action": command})
+    return result
+
+
 def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
-                      abandonment: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+                      abandonment: Mapping[str, Any] | None = None,
+                      supervision_windows: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
     """Describe recorded gates; this does not decide whether a command will apply."""
     if abandonment is not None:
         return []  # The permanent fence supersedes ordinary business gates.
     result: list[dict[str, Any]] = []
     if run["stopped"] or run["blocked"]:
         result.append({"subject": None, "scope": "run", "reason": "operator_stopped" if run["stopped"] else run["blocked"],
-                       "action": "resume" if run["stopped"] else "requeue" if run["blocked"] == "requeue_required" else "inspect", "evidence": None})
+                       "action": "resume" if run["stopped"] or run["blocked"] == "supervision_timeout" else "requeue" if run["blocked"] == "requeue_required" else "inspect", "evidence": None})
     for job in subjects:
         for gate in job["gates"]:
             action = ("requeue" if gate["code"] == "requeue_required" else "resume"
@@ -306,6 +349,10 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
         operation = item["action"]
         reason = item["reason"]
         artifact = item["evidence"]
+        if reason == "supervision_timeout":
+            waits = [window for window in supervision_windows if window["subject"] == item["subject"] and window["timed_out"]]
+            if waits:
+                artifact = {**(artifact if isinstance(artifact, Mapping) else {}), "supervision_windows": waits}
         pending = owner["pending_attempt"] if owner else None
         invocation = pending["invocations"][-1] if pending and pending["invocations"] else None
         kind = ("final_approval" if operation == "approve" else "review_budget_checkpoint" if "budget_exhausted" in reason
@@ -529,7 +576,9 @@ def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[s
                 "ci_developments_used": ci.get("developments_used"), "ci_development_limit": ci.get("development_limit"),
                 "integration_development_used": integration.get("developments_used"), "integration_development_limit": integration.get("development_limit"),
                 "integration_resync_used": job["integration_resync"]["used"], "integration_resync_limit": job["integration_resync"]["limit"]},
-            "pause_requested": None, "resume_accepted": None, "stop_wait_reason": None, "supervision": None, "recovery_action": None})
+            "pause_requested": None, "resume_accepted": None, "stop_wait_reason": None,
+            "supervision": job.get("supervision"), "supervision_windows": job.get("supervision_windows", []),
+            "recovery_action": None})
     return {"executor_activity": "unknown", "work_concurrency_limit": run["concurrency"],
             "work_slots_active": len(active), "integration_holder": run["integration_holder"],
             "integration_queue": scheduling["integration_fifo"], "tickets": views}
@@ -661,6 +710,7 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
     """
     run = dict(tx.one("SELECT * FROM runs"))
     subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
+    windows = supervision(tx, time.time())
     location = _header(tx, path)
     abandonment = location["abandonment"]
     closures = _all(tx, "SELECT e.subject,e.generation,e.id AS effect_id,e.receipt_id,e.pr_number "
@@ -668,7 +718,8 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
         "WHERE s.kind!='ticket' AND e.operation='close' AND e.status='confirmed' ORDER BY e.rowid")
     for closure in closures:
         closure["receipt"] = _material(tx, closure["receipt_id"], closure["subject"])
-    return {"actions": _operator_actions(run, subjects, abandonment=abandonment),
+    return {"actions": _operator_actions(run, subjects, abandonment=abandonment, supervision_windows=windows),
+            "supervision_windows": windows,
             "generations": {job["subject"]: job["generation"] for job in subjects},
             "status": _public_status(run, subjects, location["is_terminal"], abandonment=abandonment),
             "is_terminal": location["is_terminal"], "abandonment": abandonment,
@@ -696,8 +747,13 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     raise QueryError("query_limit", "Public response exceeds its bounded limit")
                 return QueryDocument("settings", language, settings)
             subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
+            windows = supervision(tx, time.time())
+            for subject in subjects:
+                subject_windows = [window for window in windows if window["subject"] == subject["subject"]]
+                subject["supervision_windows"] = subject_windows
+                subject["supervision"] = subject_windows[0] if len(subject_windows) == 1 else None
             abandonment = location["abandonment"]
-            actions = _operator_actions(run, subjects, abandonment=abandonment)
+            actions = _operator_actions(run, subjects, abandonment=abandonment, supervision_windows=windows)
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
             complete = location["is_terminal"]
@@ -723,6 +779,9 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
+            run_windows = [window for window in windows if window["subject"] is None]
+            data["supervision"] = run_windows[0] if len(run_windows) == 1 else windows[0] if len(windows) == 1 else None
+            data["supervision_windows"] = windows
             control = _control_history(tx, latest_resume_only=kind == "status")
             resumes = _resume_history(tx, control)
             data["latest_resume"] = resumes[-1] if resumes else None
