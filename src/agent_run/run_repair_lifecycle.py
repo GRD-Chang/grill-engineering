@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-"""Run Repair job construction and Change Delivery lifecycle orchestration."""
+"""Run Repair work construction, integration and exact Run Branch delivery."""
 
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agent_run.change_delivery import (
-    ChangeDeliveryEngine,
-    ChangeDeliveryStateStore,
-    ChangeJobContract,
+from agent_run.delivery_step import DeliveryStepKind
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
 )
+from agent_run.github import GitHubReadError
 from agent_run.resume_materials import require_change_checkout
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_policy import run_repair_budget_policy_for_job
@@ -24,12 +26,14 @@ from agent_run.run_repair_cycle import (
     uses_merge_resolution,
 )
 from agent_run.review_budget import ensure_budget
-from agent_run.run_repair_currentness import RunRepairObservationPending
-from agent_run.run_repair_delivery import (
-    RunRepairAdapter,
-    RunRepairPublisher,
+from agent_run.run_repair_currentness import (
+    RunRepairObservationPending,
+    RunRepairWorkStale,
 )
-from agent_run.change_delivery_integration import prepare_delivery_integration
+from agent_run.run_repair_integration import (
+    needs_repair_integration,
+    prepare_repair_integration,
+)
 from agent_run.run_repair_write import update_run_branch
 from agent_run.run_parent_integration import ensure_run_repair_base
 from agent_run.run_thread_identity import prior_thread_identities
@@ -46,7 +50,7 @@ if TYPE_CHECKING:
 
 
 class RunRepairLifecycle:
-    """Own one Run Repair Job lifecycle while the engine remains its façade."""
+    """Integrate reviewed repair work and prove its exact Run Branch result."""
 
     def __init__(
         self, owner: RunAcceptanceEngine, promotion: RunRepairPromotion
@@ -76,7 +80,7 @@ class RunRepairLifecycle:
                 )
                 branch = str(job["repair_branch"])
                 job["repair_checkout"] = str(checkout)
-                self._sync_repair_cycle_counters(run, job)
+                sync_repair_cycle_counters(run, job)
                 self.owner.git.prepare_ticket_checkout(
                     branch=branch, base_sha=str(job["base_sha"]), checkout=checkout
                 )
@@ -116,8 +120,49 @@ class RunRepairLifecycle:
                         job["integration_conflict_paths"] = list(
                             self.owner.git.integration_conflict_paths(checkout)
                         )
+                work = self.owner.work
                 try:
-                    self._repair_engine(state, job).run(state, job, checkout)
+                    while True:
+                        work._bind_change(state, job, "repair")
+                        if job.get("phase") == "candidate" and job.get("attempt_kind") != "ci_repair":
+                            # Parent repair integrates the live source/target
+                            # snapshot before reviewing the actual Candidate.
+                            with work.agent_work.step(job, allow_agent=True):
+                                prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
+                                    work, state, job, checkout,
+                                )
+                            if not prepared:
+                                if job.get("phase") == "candidate":
+                                    continue
+                                break
+                        step = work.advance_change(
+                            state, job, checkout, scope="repair", allow_agent=True,
+                        )
+                        if step.kind is not DeliveryStepKind.CONTINUE:
+                            break
+                        if job.get("phase") not in {
+                            "developing", "repairing", "committing_candidate", "candidate", "reviewing",
+                        }:
+                            break
+                    if job.get("phase") == "accepted":
+                        work._bind_change(state, job, "repair")
+                        if job.get("attempt_kind") == "ci_repair":
+                            job["attempt_kind"] = "ordinary"
+                            self.owner._save(state)
+                        with work.agent_work.step(job, allow_agent=True):
+                            prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
+                                work, state, job, checkout,
+                            )
+                        if not prepared:
+                            if job.get("phase") == "candidate":
+                                continue
+                        elif update_run_branch(self.owner, self.promotion, state, job):
+                            break
+                except RunRepairWorkStale:
+                    # The Work already closed/detached the original Attempt.
+                    # Preserve/rebind it before this same durability window saves.
+                    self.promotion.invalidate_stale(state, job, checkout)
+                    self.owner._save(state)
                 except MergeConflictError as error:
                     if not self._convert_squash_repair_conflict(
                         state, job, checkout, error
@@ -125,27 +170,26 @@ class RunRepairLifecycle:
                         raise
                     preserve_checkout = True
                     continue
-                if job.get("phase") == "accepted":
-                    engine = self._repair_engine(state, job)
-                    # This integration stage runs outside Change.advance, but
-                    # may need conflict Development under the same admission.
-                    with engine.agent_work.step(job, allow_agent=True):
-                        prepared = prepare_delivery_integration(engine, state, job, checkout)
-                    if not prepared:
-                        if job.get("phase") == "candidate":
-                            continue
-                    elif update_run_branch(self.owner, self.promotion, state, job):
-                        break
-                self._sync_repair_cycle_counters(run, job)
+                except GitHubReadError as error:
+                    if not is_github_convergence_error(error.code):
+                        raise
+                    wait_for_github_convergence(
+                        state, code=error.code, message=str(error),
+                        waiting_for=f"run-repair-{job['repair_attempt']}",
+                    )
+                    ensure_supervision_window(state)
+                    self.owner._save(state)
+                    work.agent_work.defer()
+                sync_repair_cycle_counters(run, job)
                 pause_human_blocked_repair_cycle(run, job)
                 self.owner._save(state)
-                preserve_checkout = self._repair_checkout_is_active(job)
+                preserve_checkout = repair_checkout_is_active(job)
                 break
         except RunRepairObservationPending:
             preserve_checkout = True
             return "waiting"
         finally:
-            if job is not None and self._repair_checkout_is_active(job):
+            if job is not None and repair_checkout_is_active(job):
                 preserve_checkout = True
             if (
                 job is not None
@@ -220,7 +264,7 @@ class RunRepairLifecycle:
         job.pop("pending_review_result", None)
         run = self.owner._run_state(state)
         run["phase"] = "repairing"
-        self._sync_repair_cycle_counters(run, job)
+        sync_repair_cycle_counters(run, job)
         state.update(
             {
                 "status": "run_acceptance_pending",
@@ -266,43 +310,6 @@ class RunRepairLifecycle:
         )
         job.pop("integration_squash_conversion_required", None)
         self.owner._save(state)
-
-    def _repair_engine(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> ChangeDeliveryEngine:
-        github = self.owner.github
-        requests = self.owner.repair_requests
-        currentness = self.owner.repair_currentness
-        if github is None or requests is None or currentness is None:
-            raise ValueError("Run Repair requires the Publisher")
-        run_state = self.owner._run_state(state)
-        policy = run_repair_budget_policy_for_job(
-            job,
-            state_snapshot=run_state.get("policy_snapshot")
-            or state.get("policy_snapshot"),
-        )
-        return ChangeDeliveryEngine(
-            git=self.owner.git,
-            github=github,
-            agents=self.owner.agents,
-            contract=ChangeJobContract(
-                label=f"run-repair-{job['repair_attempt']}",
-                branch=str(job["repair_branch"]),
-                base_branch=str(state["run_branch"]),
-                review_budget_policy=policy,
-            ),
-            adapter=RunRepairAdapter(
-                git=self.owner.git,
-                requests=requests,
-                candidate_acceptance=self.owner.candidate_acceptance,
-                currentness=currentness,
-                currentness_reader=self.owner.currentness_reader,
-                default_head_sha=self.owner.default_head_sha,
-            ),
-            publisher=RunRepairPublisher(self.owner, self.promotion),
-            state_store=ChangeDeliveryStateStore(self.owner.states, str(state["run_id"])),
-            development_only=True,
-        )
 
     def _repair_job(
         self,
@@ -385,7 +392,7 @@ class RunRepairLifecycle:
                 else f"agent-run-repair/{state['run_id']}/{generation}-generation-{generation}"
             ),
             "base_sha": base_sha,
-            "default_base_sha": self.owner._default_head(state),
+            "default_base_sha": self.owner.work._default_head(state),
             "repair_base_run_head_sha": base_sha,
             "parent_revision": self.owner._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self.owner._mapping(state, "ticket_graph")["revision"],
@@ -462,7 +469,7 @@ class RunRepairLifecycle:
         windows = run.setdefault("repair_integration_budgets", {})
         windows[str(generation)] = {"policy_snapshot": deepcopy(job["policy_snapshot"])}
         run["repair_job"] = job
-        self._sync_repair_cycle_counters(run, job)
+        sync_repair_cycle_counters(run, job)
         self.owner._save(state)
         self._complete_pending_repair_trigger(state, job)
         return job
@@ -482,28 +489,13 @@ class RunRepairLifecycle:
         job.pop("repair_trigger_pending", None)
         self.owner._save(state)
 
-    @staticmethod
-    def _repair_checkout_is_active(job: dict[str, Any]) -> bool:
-        return repair_checkout_is_active(job)
-
-    @staticmethod
-    def _sync_repair_cycle_counters(
-        run: dict[str, Any], job: dict[str, Any]
-    ) -> None:
-        sync_repair_cycle_counters(run, job)
-
-    def _prepare_repair_validation(
-        self, _checkout: Path, job: dict[str, Any], validation: Path
-    ) -> None:
-        self.owner.candidate_acceptance.prepare_validation(job, validation)
-
     def _repair_trigger(
         self,
         state: dict[str, Any],
         repair_source: str,
         repair_request: dict[str, Any],
     ) -> dict[str, Any] | None:
-        currentness = self.owner.repair_currentness
+        currentness = self.owner.work.repair_currentness
         if currentness is None:
             raise ValueError("Run Repair requires the Publisher")
         return currentness.create_trigger(state, repair_source, repair_request)

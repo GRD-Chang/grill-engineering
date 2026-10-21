@@ -20,6 +20,10 @@ from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state import StateStore
 
 
+class RunRepairWorkStale(Exception):
+    """Yield invalidated repair work to its existing Run lifecycle owner."""
+
+
 class RunRepairObservationPending(Exception):
     """Stop this pass while Controller supervises a recoverable GitHub read."""
 

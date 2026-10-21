@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.agent_execution import execute_agent_work, select_development_thread
 from agent_run.agents import DevelopmentResult, HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker, record_human_blocker
@@ -15,7 +16,6 @@ from agent_run.change_delivery_threads import (
 from agent_run.human_responses import current_human_response_history
 from agent_run.review_budget import can_start_development, ensure_budget, mark_development
 from agent_run.run_currentness import ticket_completion_records
-from agent_run.run_development_review import RunDevelopmentReview
 from agent_run.semantic_attempt import allocate_semantic_attempt, pending_semantic_attempt
 
 if TYPE_CHECKING:
@@ -34,10 +34,10 @@ def resolve_run_integration_work(
     if not isinstance(conflict, dict):
         raise ValueError("Run integration conflict record is missing")
     attempt = pending_semantic_attempt(run, role="development")
-    policy = owner._run_budget_policy(state, run)
+    policy = run_repair_budget_policy_for_job(run, state_snapshot=state.get("policy_snapshot"))
     if attempt is None and not conflict.get("development_summary"):
         if not can_start_development(run, policy):
-            RunDevelopmentReview(owner, state, run).checkpoint("modification_budget_exhausted")
+            owner.work.checkpoint_run(state, run, "modification_budget_exhausted")
             return False
         mark_development(run, policy, attempt_kind="ordinary")
     if not conflict.get("development_summary"):
@@ -63,7 +63,7 @@ def resolve_run_integration_work(
         )
         request = {
             "acceptance_scope": "run",
-            "parent_issue_url": owner._issue_url(state, int(state["parent"]["number"])),
+            "parent_issue_url": f"https://github.com/{state['repository']}/issues/{state['parent']['number']}",
             "run_id": state["run_id"],
             "repository": state["repository"],
             "parent": state["parent"],
@@ -83,7 +83,7 @@ def resolve_run_integration_work(
         github = owner.github
         assert github is not None
         def scene_is_current() -> bool:
-            if not owner._refresh_run_currentness(state):
+            if not owner.work._refresh_run_currentness(state):
                 return False
             source_branch = str(state["run_branch"])
             target_branch = str(state["base"]["branch"])

@@ -16,7 +16,7 @@ from agent_run.required_checks_observation import (
 )
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_parent_integration import observe_run_repair_snapshot
-from agent_run.run_repair_cycle import escalate_repair, uses_merge_resolution
+from agent_run.run_repair_cycle import sync_repair_cycle_counters, uses_merge_resolution
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
     controller_reprepare_intent,
@@ -41,10 +41,10 @@ class RunRepairPromotion:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         current_default = (
-            self.owner.candidate_acceptance.default_head_sha
+            self.owner.work.candidate_acceptance.default_head_sha
             or str(self.owner._mapping(state, "base")["sha"])
         )
-        currentness = self.owner.repair_currentness
+        currentness = self.owner.work.repair_currentness
         if (
             currentness is not None
             and current_default != job.get("default_base_sha")
@@ -135,8 +135,8 @@ class RunRepairPromotion:
                     "candidate_sha": integrated,
                 }
             )
-        self.owner.default_head_sha = default_head
-        self.owner.candidate_acceptance.update_default_head(default_head)
+        self.owner.work.default_head_sha = default_head
+        self.owner.work.candidate_acceptance.update_default_head(default_head)
         stale_keys = [
             "acceptance_record",
             "acceptance_artifact",
@@ -194,7 +194,7 @@ class RunRepairPromotion:
             job["controller_candidate_reprepare"] = controller_reprepare_intent(job)
         run = self.owner._run_state(state)
         run["phase"] = "repairing"
-        self.owner._sync_repair_cycle_counters(run, job)
+        sync_repair_cycle_counters(run, job)
         publication = state.get("run_publication")
         if isinstance(publication, dict) and publication.get("phase") not in {
             "merged",
@@ -242,7 +242,7 @@ class RunRepairPromotion:
         job["modification_attempts"] = pending_attempt
         job["code_modification_attempts"] = pending_attempt
         job.pop("pending_attempt", None)
-        self.owner._sync_repair_cycle_counters(self.owner._run_state(state), job)
+        sync_repair_cycle_counters(self.owner._run_state(state), job)
 
     def complete_integration_reprepare(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -318,11 +318,11 @@ class RunRepairPromotion:
     def _repair_trigger_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
-        currentness = self.owner.repair_currentness
+        currentness = self.owner.work.repair_currentness
         if currentness is None:
             raise ValueError("Run Repair requires the Publisher")
         return currentness.trigger_is_current(
-            state, job, default_head_sha=self.owner._default_head(state)
+            state, job, default_head_sha=self.owner.work._default_head(state)
         )
 
     def after_update(
@@ -342,12 +342,12 @@ class RunRepairPromotion:
         ):
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
-        if not self.owner._refresh_run_currentness(state):
+        if not self.owner.work._refresh_run_currentness(state):
             return False
         if not self._repair_trigger_is_current(state, job):
             self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
-        promoted = self.owner._candidate_promotion_record(state, job, integrated)
+        promoted = self.owner.work.candidate_acceptance.promotion_record(state, job, integrated)
         if promoted is None:
             # A written Candidate is not automatically an accepted Run.  Any
             # mismatch at this seam discards the Candidate and starts a fresh
@@ -474,8 +474,3 @@ class RunRepairPromotion:
         state["terminal_kind"] = "run_acceptance_passed"
         state["diagnostics"] = []
         return True
-
-    def _escalate_repair(
-        self, state: dict[str, Any], job: dict[str, Any], code: str
-    ) -> None:
-        escalate_repair(state, self.owner._run_state(state), job, code)

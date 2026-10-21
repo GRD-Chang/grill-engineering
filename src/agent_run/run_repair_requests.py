@@ -10,9 +10,7 @@ from typing import Any
 from agent_run.delivery_budget import delivery_budget_owner
 
 from agent_run.artifacts import AcceptanceArtifact
-from agent_run.change_delivery import (
-    latest_reviewer_thread,
-)
+from agent_run.change_delivery_threads import latest_reviewer_thread
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
