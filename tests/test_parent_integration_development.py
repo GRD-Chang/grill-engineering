@@ -10,10 +10,10 @@ import pytest
 
 from agent_run.agents import DevelopmentResult
 from agent_run.delivery_policy import DeliveryPolicy
-from agent_run.delivery_step import AgentWorkRequired
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.development_review import DevelopmentReview
 from agent_run.git_errors import GitError
-from agent_run.parent_only_integration import resolve_parent_conflict
+from agent_run.parent_integration import finish_parent_snapshot
 
 
 def _scene() -> dict[str, Any]:
@@ -62,15 +62,16 @@ def _state(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve(work: DevelopmentReview, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-    work._bind_change(state, job, "parent-only")
     while True:
-        # Delivery admission allows one Agent per step. A failed Git check
-        # yields before the next Development; the caller admits that step.
-        try:
-            with work.agent_work.step(job, allow_agent=True):
-                return resolve_parent_conflict(work, state, job, checkout, record_key="parent_integration")
-        except AgentWorkRequired:
-            continue
+        step = work.develop_integration(state, job, checkout, scope="parent-only", allow_agent=True)
+        if step.kind != DeliveryStepKind.CONTINUE:
+            return False
+        result = finish_parent_snapshot(
+            git=work.git, github=work.github, state_store=work.state_store,
+            state=state, job=job, checkout=checkout,
+        )
+        if result.status != "conflict":
+            return True
 
 
 def test_parent_git_failure_returns_exact_evidence_and_charges_each_new_work(tmp_path: Path) -> None:

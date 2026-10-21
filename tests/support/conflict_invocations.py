@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
@@ -13,9 +14,12 @@ from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.git import GitRepository
-from agent_run.integration_development import resolve_integration_work
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
-from agent_run.parent_only_integration import resolve_parent_conflict
+from agent_run.parent_integration import (
+    finish_ticket_snapshot, finish_parent_snapshot, finish_repair_snapshot,
+)
+from agent_run.ticket_work import TicketWorkAdmission
 from agent_run.review_budget import new_budget
 from agent_run.revisions import effective_revision
 from support.run_artifacts import _passing_artifact
@@ -136,6 +140,13 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         repair_currentness=RunRepairCurrentness(fixture_git, github, scoped),
     )
     stage._bind_change(state, job, {"ticket": "ticket", "parent_only": "parent-only", "run_repair": "repair"}[kind])
+    # Invocation corruption tests exclude scheduler state: their deliberately
+    # invalid durable input must remain readable only by the rejection oracle,
+    # not by an unrelated lease-release transaction on leaving the role step.
+    if kind == "ticket":
+        stage.agent_work.admission = Mock(
+            spec=TicketWorkAdmission, acquire=Mock(return_value="conflict-fixture-lease"),
+        )
     stage.conflict_key = key
     stage.kind = kind
     stage.save(state)
@@ -144,16 +155,14 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
 
 def run_conflict(stage: Any, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
     scope = {"ticket": "ticket", "parent_only": "parent-only", "run_repair": "repair"}[stage.kind]
-    stage._bind_change(state, job, scope)
-    # This fixture exercises Invocation persistence and corrupt-state rejection,
-    # outside Ticket scheduling. A scheduler lease would need a further valid
-    # Run read to release after the tests deliberately persist invalid input.
-    # Keep real per-step Agent admission without acquiring that unrelated lease.
-    stage.agent_work.admission = None
-    with stage.agent_work.step(job, allow_agent=True):
-        if stage.kind == "ticket":
-            return resolve_integration_work(stage, state, job, checkout)
-        return resolve_parent_conflict(
-            stage, state, job, checkout,
-            record_key=stage.conflict_key.removesuffix("_conflict"),
-        )
+    step = stage.develop_integration(state, job, checkout, scope=scope, allow_agent=True)
+    if step.kind != DeliveryStepKind.CONTINUE:
+        return False
+    finish = {
+        "ticket": finish_ticket_snapshot,
+        "parent_only": finish_parent_snapshot,
+        "run_repair": finish_repair_snapshot,
+    }[stage.kind]
+    result = finish(git=stage.git, github=stage.github, state_store=stage.state_store,
+                    state=state, job=job, checkout=checkout)
+    return result.status == "clean"

@@ -11,13 +11,15 @@ import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine, ChangeJobContract
 from agent_run.development_review import DevelopmentReview, parent_review_identity
+from agent_run.change_delivery_state import ChangeDeliveryStateStore
+from agent_run.parent_only_integration import prepare_parent_integration
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.parent_integration import (
     ParentHistoryRewritten,
-    finish_parent_snapshot_conflict,
+    finish_parent_snapshot,
     prepare_parent_snapshot,
 )
 from agent_run.parent_delivery_loop import ParentDeliveryAdapter
@@ -55,6 +57,21 @@ def _setup(git_repo: Path, tmp_path: Path) -> tuple[Path, GitRepository, GhGitHu
     return collaborator, git, GhGitHubPublisher("example/project", git), base
 
 
+
+def _snapshot_context(saved: list[int] | None = None) -> tuple[dict, ChangeDeliveryStateStore]:
+    state = {"run_id": "snapshot", "base": {"branch": "main"}}
+    states = SimpleNamespace(save_run=lambda *_args: saved.append(1) if saved is not None else None)
+    return state, ChangeDeliveryStateStore(states, "snapshot")
+
+
+def _parent_engine(git: GitRepository, github: GhGitHubPublisher, work: DevelopmentReview) -> ChangeDeliveryEngine:
+    return ChangeDeliveryEngine(
+        git=git, github=github, agents=None,
+        contract=ChangeJobContract(label="parent-only", branch="parent", base_branch="main"),
+        adapter=ParentDeliveryAdapter(git, github), publisher=None,
+        state_store=SimpleNamespace(save=lambda value: value), work=work,
+    )
+
 def test_parent_snapshot_preserves_local_and_both_remote_heads(
     git_repo: Path, tmp_path: Path
 ) -> None:
@@ -68,14 +85,13 @@ def test_parent_snapshot_preserves_local_and_both_remote_heads(
     target = _commit(collaborator, "target.txt", "target\n")
     _git(collaborator, "push", "origin", "main")
     policy = DeliveryPolicy().snapshot()
-    subject: dict = {"base_sha": base, "policy_snapshot": policy}
+    subject: dict = {"base_sha": base, "candidate_sha": candidate, "parent_branch": "parent", "policy_snapshot": policy}
     saved: list[int] = []
+    state, state_store = _snapshot_context(saved)
 
     result = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=candidate,
-        policy_snapshot=policy, record_key="parent_integration",
-        save=lambda: saved.append(1),
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
 
     assert result.status == "clean"
@@ -84,22 +100,18 @@ def test_parent_snapshot_preserves_local_and_both_remote_heads(
     assert all(git.is_ancestor(sha, result.record["head_sha"]) for sha in (candidate, source, target))
     assert subject["integration_resync"]["used"] == 0
     assert saved
+    subject["candidate_sha"] = result.record["head_sha"]
     unchanged = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main",
-        candidate_sha=result.record["head_sha"], policy_snapshot=policy,
-        record_key="parent_integration", save=lambda: saved.append(1),
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert unchanged.record == result.record
     assert subject.get("parent_integration_history") is None
     _git(git_repo, "push", "origin", f"{result.record['head_sha']}:refs/heads/parent")
     subject["published_sha"] = result.record["head_sha"]
     readback = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main",
-        candidate_sha=result.record["head_sha"], policy_snapshot=policy,
-        record_key="parent_integration", save=lambda: saved.append(1),
-        own_source_write=result.record["head_sha"],
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert readback.record == result.record
     assert subject["integration_resync"]["used"] == 0
@@ -113,16 +125,17 @@ def test_published_parent_source_requires_append_history(
     _git(git_repo, "checkout", "-b", "parent")
     candidate = _commit(git_repo, "agent.txt", "agent\n")
     policy = DeliveryPolicy().snapshot()
-    subject: dict = {"base_sha": base, "policy_snapshot": policy}
+    subject: dict = {"base_sha": base, "candidate_sha": candidate, "parent_branch": "parent", "policy_snapshot": policy}
+    state, state_store = _snapshot_context()
     first = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=candidate,
-        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert first.record is not None
     published = str(first.record["head_sha"])
     _git(git_repo, "push", "origin", f"{published}:refs/heads/parent")
     subject["published_sha"] = published
+    subject["candidate_sha"] = published
     _git(collaborator, "checkout", "parent")
     if remote_change == "append":
         _git(collaborator, "fetch", "origin", "parent")
@@ -137,10 +150,8 @@ def test_published_parent_source_requires_append_history(
         _git(collaborator, "push", "--force", "origin", f"{base}:refs/heads/parent")
 
     prepare = lambda: prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=published,
-        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
-        own_source_write=published,
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     if remote_change == "append":
         result = prepare()
@@ -166,12 +177,12 @@ def test_parent_conflict_resolution_keeps_both_histories(
     source = _commit(collaborator, "README.md", "human\n")
     _git(collaborator, "push", "origin", "parent")
     policy = DeliveryPolicy().snapshot()
-    subject: dict = {"base_sha": base, "policy_snapshot": policy}
+    subject: dict = {"base_sha": base, "candidate_sha": candidate, "parent_branch": "parent", "policy_snapshot": policy}
+    state, state_store = _snapshot_context()
 
     pending = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=candidate,
-        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert pending.status == "conflict"
     assert pending.conflict is not None
@@ -180,15 +191,14 @@ def test_parent_conflict_resolution_keeps_both_histories(
     later_target = _commit(collaborator, "later.txt", "later\n")
     _git(collaborator, "push", "origin", "main")
     resumed = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=candidate,
-        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert resumed.conflict == pending.conflict
     (git_repo / "README.md").write_text("agent and human\n", encoding="utf-8")
-    done = finish_parent_snapshot_conflict(
-        git=git, subject=subject, checkout=git_repo,
-        record_key="parent_integration", save=lambda: None,
+    done = finish_parent_snapshot(
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert done.status == "clean"
     assert done.record is not None
@@ -229,8 +239,9 @@ def test_parent_only_new_combination_preserves_initial_work_budget(
         git=git, github=github, agents=None,
         states=SimpleNamespace(save_run=lambda *_args: None),
     )
+    engine = _parent_engine(git, github, work)
 
-    assert work.integrate_parent_candidate(state, job, git_repo) is False
+    assert prepare_parent_integration(engine, state, job, git_repo) is False
     assert job["phase"] == "candidate"
     assert job["base_sha"] == target
     assert job["candidate_sha"] == job["parent_integration"]["head_sha"]
@@ -266,9 +277,10 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
         git=git, github=github, agents=None,
         states=SimpleNamespace(save_run=lambda *_args: None),
     )
-    assert work.integrate_parent_candidate(state, job, git_repo) is False
+    engine = _parent_engine(git, github, work)
+    assert prepare_parent_integration(engine, state, job, git_repo) is False
     assert job["parent_integration_stage"] is True
-    assert work.integrate_parent_candidate(state, job, git_repo) is True
+    assert prepare_parent_integration(engine, state, job, git_repo) is True
     first_window = job["review_budget"]["window"]
     first_head = job["candidate_sha"]
     ci_candidate = _commit(git_repo, "ci-fix.txt", "fixed\n")
@@ -283,7 +295,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
     ci_budget = {"window": 1, "developments_used": 1}
     job["ci_recovery"] = ci_budget
 
-    assert work.integrate_parent_candidate(state, job, git_repo) is False
+    assert prepare_parent_integration(engine, state, job, git_repo) is False
     assert job["phase"] == "candidate"
     assert job["review_budget"]["window"] == first_window
     assert job["integration_resync"]["used"] == 1
@@ -292,7 +304,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
     assert job["candidate_sha"] == record["head_sha"]
     assert job["base_sha"] == target
     assert all(git.is_ancestor(sha, record["head_sha"]) for sha in (ci_candidate, target))
-    assert work.integrate_parent_candidate(state, job, git_repo) is True
+    assert prepare_parent_integration(engine, state, job, git_repo) is True
     assert job["review_budget"]["window"] == first_window
 
 
@@ -332,7 +344,7 @@ def test_parent_ci_candidate_reviews_before_rejoining_integration(
         **parent_review_identity(git, state, job),
         "reviewer_thread_id": "demand-reviewer", "artifact": job["acceptance_artifact"],
     }
-    assert work.integrate_parent_candidate(state, job, git_repo) is True
+    assert prepare_parent_integration(engine, state, job, git_repo) is True
     assert "parent_integration_stage" not in job
     assert job["review_budget"]["window"] == 1
 
@@ -384,18 +396,18 @@ def test_second_conflict_stage_requires_its_own_resolution(
     target = _commit(collaborator, "README.md", "target\n")
     _git(collaborator, "push", "origin", "main")
     policy = DeliveryPolicy().snapshot()
-    subject: dict = {"base_sha": base, "policy_snapshot": policy}
+    subject: dict = {"base_sha": base, "candidate_sha": candidate, "parent_branch": "parent", "policy_snapshot": policy}
+    state, state_store = _snapshot_context()
     first = prepare_parent_snapshot(
-        git=git, github=github, subject=subject, checkout=git_repo,
-        source_branch="parent", target_branch="main", candidate_sha=candidate,
-        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert first.conflict is not None and first.conflict["stage"] == "source"
     (git_repo / "README.md").write_text("agent and human\n", encoding="utf-8")
     subject["parent_integration_conflict"]["development_summary"] = "resolved source"
-    second = finish_parent_snapshot_conflict(
-        git=git, subject=subject, checkout=git_repo,
-        record_key="parent_integration", save=lambda: None,
+    second = finish_parent_snapshot(
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert second.conflict is not None and second.conflict["stage"] == "target"
     assert "development_summary" not in second.conflict
@@ -407,14 +419,14 @@ def test_second_conflict_stage_requires_its_own_resolution(
     with monkeypatch.context() as patcher:
         patcher.setattr(git, "integrate_remote_heads", crash_after_resolution)
         with pytest.raises(OSError, match="crash"):
-            finish_parent_snapshot_conflict(
-                git=git, subject=subject, checkout=git_repo,
-                record_key="parent_integration", save=lambda: None,
+            finish_parent_snapshot(
+                git=git, github=github, state_store=state_store, state=state,
+                job=subject, checkout=git_repo,
             )
     assert subject["parent_integration_conflict"]["resolved_stages"] == ["source", "target"]
-    done = finish_parent_snapshot_conflict(
-        git=git, subject=subject, checkout=git_repo,
-        record_key="parent_integration", save=lambda: None,
+    done = finish_parent_snapshot(
+        git=git, github=github, state_store=state_store, state=state,
+        job=subject, checkout=git_repo,
     )
     assert done.record is not None
     assert all(git.is_ancestor(sha, done.record["head_sha"]) for sha in (candidate, source, target))

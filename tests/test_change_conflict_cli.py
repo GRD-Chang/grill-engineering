@@ -156,7 +156,10 @@ def test_public_resume_preserves_conflict_attempt_and_queries(
         assert persisted["active_agent_invocation"] == resumed["active_agent_invocation"]
         assert persisted["status"] == resumed["status"]
     else:
-        resumed_job.pop(stage.conflict_key)
+        assert stage.conflict_key not in resumed_job
+        record = resumed_job["ticket_integration" if kind == "ticket" else "run_repair_integration"]
+        assert record["candidate_sha"] == candidate
+        assert record["source_sha"] == record["target_sha"] == record["head_sha"] == candidate
     stage.save(resumed)
     persisted = StateStore(store.root).load_current_run(run_id)
     assert persisted is not None
