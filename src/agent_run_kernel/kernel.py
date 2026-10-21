@@ -101,7 +101,7 @@ class Kernel:
             Purpose.INTEGRATION: (policy.run_repairs, policy.run_repairs + 1)
             if kind == DeliveryKind.FINAL_RUN else (policy.run_repairs if kind == DeliveryKind.PARENT_ONLY else policy.integration_developments,
                                                    0 if kind == DeliveryKind.TICKET else None),
-            Purpose.CI: (policy.ci_developments, None),
+            Purpose.CI: (policy.ticket_ci_developments if kind == DeliveryKind.TICKET else policy.parent_ci_developments, None),
         }
 
     @staticmethod
@@ -609,13 +609,20 @@ class Kernel:
         if (row["attempt"] != call.attempt_id or row["subject"] != call.subject or row["thread"] != call.thread_id
                 or row["lease"] != call.lease_id or row["executor"] != call.execution.owner or row["epoch"] != call.execution.epoch
                 or row["role"] != call.role or row["purpose"] != call.purpose
+                or row["mode"] != call.mode or row["requested_thread"] != call.reported_thread
+                or row["deadline_seconds"] != call.deadline_seconds or row["deadline_at"] != call.deadline_at
                 or json.loads(tx.get(row["context_id"], call.subject)) != call.context):
+            raise KernelError("invocation_binding")
+        profile = tx.one("SELECT model,effort FROM threads WHERE id=?", (call.thread_id,))
+        if call.profile != Profile(profile["model"], profile["effort"]):
             raise KernelError("invocation_binding")
         return row
 
     def _agent_authority(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
         run, job = self._owned(tx, call.subject, call.execution)
         invocation = self._invocation(tx, call)
+        if self.clock() >= invocation["deadline_at"]:
+            raise KernelError("invocation_deadline_exceeded")
         if (run["stopped"] or run["blocked"] or self._gates(tx, call.subject)
                 or invocation["generation"] != job["generation"] or job["current_attempt"] != call.attempt_id
                 or invocation["parent_revision"] != run["parent_revision"]
@@ -1065,15 +1072,21 @@ class Kernel:
             context["human_responses"] = [tx.get(row[0], subject).decode() for row in responses]
         invocation_id, lease_id = identity(), identity()
         context_id = tx.put(subject, "role_context", wire_json(context))
-        tx.execute("INSERT INTO invocations(id,attempt,thread,context_id,executor,epoch,lease,status,allocated_at) VALUES (?,?,?,?,?,?,?,'running',?)",
-                   (invocation_id, attempt_id, thread_id, context_id, execution.owner, execution.epoch, lease_id, self.clock()))
+        backend_thread = tx.one("SELECT backend_id FROM threads WHERE id=?", (thread_id,))[0]
+        mode = "fresh" if backend_thread is None else "resume"
+        allocated_at = self.clock()
+        deadline_seconds = {Role.DEVELOPMENT: policy.development_deadline_seconds, Role.REVIEW: policy.review_deadline_seconds,
+                            Role.PUBLICATION: policy.publication_deadline_seconds}[role]
+        deadline_at = allocated_at + deadline_seconds
+        tx.execute("INSERT INTO invocations(id,attempt,thread,context_id,executor,epoch,lease,status,allocated_at,mode,requested_thread,deadline_seconds,deadline_at) VALUES (?,?,?,?,?,?,?,'running',?,?,?,?,?)",
+                   (invocation_id, attempt_id, thread_id, context_id, execution.owner, execution.epoch, lease_id, allocated_at,
+                    mode, backend_thread, deadline_seconds, deadline_at))
         tx.execute("UPDATE attempts SET current_invocation=?,status='running',new_thread=0 WHERE id=?", (invocation_id, attempt_id))
         tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (lease_id, subject, invocation_id, execution.owner, execution.epoch))
         tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
         self._event(tx, subject, "agent_allocated", invocation_id)
-        backend_thread = tx.one("SELECT backend_id FROM threads WHERE id=?", (thread_id,))[0]
         call = AgentCall(attempt_id, invocation_id, subject, role, Purpose(job["purpose"]), thread_id,
-                         lease_id, execution, context, profile, "fresh" if backend_thread is None else "resume", backend_thread)
+                         lease_id, execution, context, profile, deadline_seconds, deadline_at, mode, backend_thread)
         return Step("agent", subject, call=call)
 
     def _context(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World, role: Role) -> dict[str, Any]:

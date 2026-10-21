@@ -472,8 +472,12 @@ class Scenario:
             frozen = neutral_script["policy"]
             policy = Policy(ticket_rounds=frozen["ticket_review_rounds"], parent_rounds=frozen["parent_only_paired_rounds"],
                             run_repairs=frozen["run_repair_rounds"], integration_developments=frozen["ticket_integration_development_limit"],
-                            ci_developments=frozen["ticket_ci_development_limit"], ticket_ci_review=frozen["ticket_ci_review"],
-                            concurrency=frozen["ticket_development_workers"])
+                            ticket_ci_developments=frozen["ticket_ci_development_limit"], parent_ci_developments=frozen["parent_ci_development_limit"],
+                            resync_limit=frozen["integration_resync_limit"], ticket_ci_review=frozen["ticket_ci_review"],
+                            concurrency=frozen["ticket_development_workers"],
+                            development_deadline_seconds=frozen["invocation_deadlines"]["development"],
+                            review_deadline_seconds=frozen["invocation_deadlines"]["review"],
+                            publication_deadline_seconds=frozen["invocation_deadlines"]["publication"])
             checks = neutral_script["external"]["required_checks"]
         self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
         self.initial = self.port.git.commit("refs/heads/main")

@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v5-exploration"
+PROTOCOL = "independent-delivery-kernel-v6-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -138,7 +138,8 @@ CREATE TABLE invocations (
  status TEXT NOT NULL, raw_id TEXT REFERENCES material(id), output_repairs INTEGER NOT NULL DEFAULT 0,
  dispatch_state TEXT NOT NULL DEFAULT 'allocated', process_identity TEXT REFERENCES material(id),
  exit_code INTEGER, start_evidence TEXT REFERENCES material(id), allocated_at REAL NOT NULL,
- dispatched_at REAL, started_at REAL, returned_at REAL, exited_at REAL
+ dispatched_at REAL, started_at REAL, returned_at REAL, exited_at REAL,
+ mode TEXT NOT NULL, requested_thread TEXT, deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL
 );
 CREATE TABLE work_queue (
  subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE
