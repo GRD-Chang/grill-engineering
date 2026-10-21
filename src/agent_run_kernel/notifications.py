@@ -285,6 +285,29 @@ class NativeNotifications:
                 pass  # Best effort after the original transaction rolled back.
         print(f"飞书通知不可用（开发继续）：{reason}", file=sys.stderr)
 
+    @staticmethod
+    def _enqueue_history(document: dict[str, Any], event: dict[str, Any], now: float) -> None:
+        """Observe one fact again without assigning it another delivery budget."""
+        event_id = event["id"]
+        pending = next((item for item in document["pending"] if item["event"]["id"] == event_id), None)
+        if pending is not None:
+            # Once a physical attempt exists, its payload and idempotency key
+            # stay paired. An unsent planned card may become its active view.
+            if pending["attempts"] == 0 and pending["outcome"] == "pending":
+                pending["event"] = event
+        elif (event_id in document["seen"] or event_id in document["milestones"]
+              or any(item["id"] == event_id for item in document["records"])):
+            return
+        else:
+            outbox.enqueue(document, event, now)
+            document["seen"].append(event_id)
+            del document["seen"][:-outbox.MAX_RECORDS]
+        # These identities are bounded by the Run's fixed subject set, and
+        # survive rolling result history just like the original first nodes.
+        if (event["kind"] in {"parent_started", "ticket_started", "acceptance_started", "acceptance_repair"}
+                and event_id not in document["milestones"]):
+            document["milestones"].append(event_id)
+
     def _observe_committed(self) -> bool:
         """Read only committed facts; claim no transport while a kernel lock is held."""
         if not self.enabled or self.closed or self._shutdown:
@@ -310,7 +333,7 @@ class NativeNotifications:
                         raise ValueError("invalid native notification cursor")
                     events, more, position = (([], True, cursor) if full or boundary_more else self._page(cursor))
                     for event in events:
-                        outbox.enqueue(document, event, time.time())
+                        self._enqueue_history(document, event, time.time())
                     document["native_cursor"] = position
                 with self.condition:
                     self.condition.notify_all()
