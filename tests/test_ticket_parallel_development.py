@@ -1173,11 +1173,11 @@ def test_controller_refresh_observes_operator_stop_after_its_save(
 def test_pause_during_last_ci_review_keeps_charged_budget_and_attempt(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agent_run.change_delivery as development
+    import agent_run.development_review as development
     import agent_run.ticket_scheduling as scheduling
 
     committing, dispatch_checked = Event(), Event()
-    commit_candidate = development.commit_candidate
+    commit_candidate = development.DevelopmentReview._commit_candidate
     wait = scheduling.wait
 
     def held_commit(stage, current, job, checkout):
@@ -1193,7 +1193,7 @@ def test_pause_during_last_ci_review_keeps_charged_budget_and_attempt(
             dispatch_checked.set()
         return wait(*args, **kwargs)
 
-    monkeypatch.setattr(development, 'commit_candidate', held_commit)
+    monkeypatch.setattr(development.DevelopmentReview, '_commit_candidate', held_commit)
     monkeypatch.setattr(scheduling, 'wait', observed_dispatch)
     state, states, git, fixture = _run(
         git_repo, (2,), ticket_ci_development_limit=1, ticket_ci_review=True,
