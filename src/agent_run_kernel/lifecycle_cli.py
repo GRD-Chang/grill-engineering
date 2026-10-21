@@ -171,6 +171,60 @@ def _active_runner() -> bool:
     return Path(__file__).resolve().is_relative_to(active)
 
 
+def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
+         environment: Mapping[str, str], runner_lock: Path) -> dict[str, Any]:
+    """Freeze creation inputs outside the sole Core Task creation transaction."""
+    from uuid import uuid4
+    from agent_run.github import GhGitHubReader
+    from agent_run.github_identity import identity_overrides
+    from agent_run.managed_workspace import ManagedWorkspace
+    from agent_run.task_identity import TaskKey
+    from agent_run.user_defaults import UserDefaultsStore
+    from .kernel import Kernel
+    from .model import KernelError
+    from .executor import command
+
+    directory = Path.cwd()
+    repository = parsed.repo or GhGitHubReader(working_directory=directory).repository_hint()
+    if repository is None:
+        raise KernelError("workspace_required", "Select --repo OWNER/NAME or a Git checkout")
+    workspace = ManagedWorkspace.for_repository(repository)
+    if parsed.state_dir is not None and parsed.state_dir.resolve() != workspace.state_root.resolve():
+        raise KernelError("managed_state_identity", "run requires the repository's managed state directory")
+    kernel = Kernel.open_task(TaskKey(workspace.repository_root, workspace.repository, parsed.parent))
+    if kernel is None:
+        overrides: dict[str, str | bool | None] = {
+            f"{role}_{field}": getattr(parsed, f"{role}_{field}")
+            for role in ("development", "review", "publication") for field in ("model", "effort")
+            if getattr(parsed, f"{role}_{field}") is not None}
+        if parsed.publication_from_development or parsed.publication_reference == "development":
+            overrides["publication_from_development"] = True
+        database, spec, requirements = prepare_creation(parsed.parent, workspace.repository,
+            source_directory=directory, defaults=UserDefaultsStore(), preset=parsed.profile_preset,
+            profile_overrides=overrides, policy_overrides=personal_settings._policy_values(parsed),
+            identity_overrides=identity_overrides(parsed), disable_notifications=parsed.no_notifications,
+            notification_mode=parsed.notification_mode)
+        # A competing creator can win during external preparation. Use only
+        # Core's returned Run, including its frozen identity and language.
+        kernel = Kernel.create_task(database, spec, requirements=requirements)
+    with kernel.storage.transaction(write=False) as tx:
+        run = tx.one("SELECT id,language,repository_root FROM runs")
+        if run["language"] not in {"en", "zh"} or run["repository_root"] != str(workspace.repository_root):
+            raise KernelError("creation_metadata_missing")
+        parsed._run_language = run["language"]
+    workspace.open_path()
+    original = attach(kernel, requested_action="run", manager=manager, environment=environment, runner_lock=runner_lock)
+    if original is not None:
+        original["language"] = run["language"]
+        return original
+    action_id = uuid4().hex
+    result = submit(kernel, "run", action_id=action_id,
+        command=command(kernel.storage.path, action_id, runner_lock, environment),
+        manager=manager, environment=environment, runner_lock=runner_lock)
+    result["language"] = run["language"]
+    return result
+
+
 def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     """Locate an exact managed Run and submit through sole Kernel admission."""
     import json
@@ -185,14 +239,21 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     from .query_cli import _candidates, _select
     from .remote_effects import RemoteEffects
 
-    if parsed.command not in {"resume", "approve"}:
+    if parsed.command not in {"run", "resume", "approve"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
     _require_github_host()
-    if personal_settings._policy_values(parsed):
+    if parsed.command != "run" and personal_settings._policy_values(parsed):
         raise KernelError("resume_policy_not_connected", "Explicit checkpoint policy update requires Kernel admission")
     environment = dict(os.environ)
     runner_lock = default_runner_lock_path(environment)
     with runner_usage_lease(runner_lock):
+        if parsed.command == "run":
+            if not _active_runner():
+                raise HostUnavailable("Lifecycle commands require the installed Active Runner")
+            manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
+                systemd_run=shutil.which("systemd-run") or "systemd-run", environment=environment)
+            manager.preflight()
+            return _run(parsed, manager=manager, environment=environment, runner_lock=runner_lock)
         selection = argparse.Namespace(**vars(parsed))
         selection.parent = None
         if selection.run_id.isdecimal():
@@ -209,6 +270,11 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
             workspace = workspace_for_root(Path(run["repository_root"]))
             if not database.is_relative_to(workspace.state_root.resolve()):
                 raise KernelError("managed_state_identity")
+            from .task_location import read_task, task_path
+            from agent_run.task_identity import TaskKey
+            task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
+            if read_task(task_path(task)) != (run["id"], database):
+                raise KernelError("task_run_unpublished", "This database is not the published Run for its Task")
             stored = tx.one("SELECT subject,material_id FROM run_inputs")
             inputs = json.loads(tx.get(stored["material_id"], stored["subject"]))
         if not _active_runner():
