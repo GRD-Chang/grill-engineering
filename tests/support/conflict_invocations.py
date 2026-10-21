@@ -13,6 +13,7 @@ from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.git import GitRepository
+from agent_run.integration_development import resolve_integration_work
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.parent_only_integration import resolve_parent_conflict
 from agent_run.review_budget import new_budget
@@ -54,6 +55,10 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
         job = state["ticket_jobs"]["3"]
         job.update(common)
         job["ticket_branch_generation"] = 1
+        # First-generation naming from DeliveryEngine._new_job_fields; this
+        # accepted Ticket fixture owns a real local ref at its recorded base.
+        job["ticket_branch"] = f"agent-run/{state['run_id']}/ticket-3"
+        git.ensure_run_branch(job["ticket_branch"], base)
         job["policy_snapshot"] = dict(state["policy_snapshot"])
         ticket = state["ticket_graph"]["tickets"]["3"]
         job["effective_revision"] = effective_revision(
@@ -138,10 +143,16 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
 
 
 def run_conflict(stage: Any, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-    if stage.kind == "ticket":
-        return stage.resolve_ticket_integration(state, job, checkout)
-    stage._bind_change(state, job, "parent-only" if stage.kind == "parent_only" else "repair")
+    scope = {"ticket": "ticket", "parent_only": "parent-only", "run_repair": "repair"}[stage.kind]
+    stage._bind_change(state, job, scope)
+    # This fixture exercises Invocation persistence and corrupt-state rejection,
+    # outside Ticket scheduling. A scheduler lease would need a further valid
+    # Run read to release after the tests deliberately persist invalid input.
+    # Keep real per-step Agent admission without acquiring that unrelated lease.
+    stage.agent_work.admission = None
     with stage.agent_work.step(job, allow_agent=True):
+        if stage.kind == "ticket":
+            return resolve_integration_work(stage, state, job, checkout)
         return resolve_parent_conflict(
             stage, state, job, checkout,
             record_key=stage.conflict_key.removesuffix("_conflict"),
