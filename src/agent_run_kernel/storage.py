@@ -277,6 +277,15 @@ class Transaction:
             raise KernelError("missing_or_ambiguous_fact")
         return rows[0]
 
+    def all(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        """Read a collection in physical pages within this transaction's budget."""
+        result: list[sqlite3.Row] = []
+        while True:
+            page = self.rows(f"SELECT * FROM ({sql}) LIMIT 128 OFFSET ?", (*parameters, len(result)))
+            result.extend(page)
+            if len(page) < 128:
+                return result
+
     def put(self, subject: str, purpose: str, body: bytes) -> str:
         if len(body) > MATERIAL_LIMIT:
             raise KernelError("material_limit")

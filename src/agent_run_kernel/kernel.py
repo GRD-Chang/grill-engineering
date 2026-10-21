@@ -183,7 +183,7 @@ class Kernel:
         tx.execute("UPDATE runs SET source_sequence=?,observed_parent_revision=?,observed_graph_revision=?",
                    (sequence, parent_revision, graph_revision))
         if initial:
-            initial_jobs = {row["issue"]: row["id"] for row in tx.rows("SELECT id,issue FROM subjects WHERE kind='ticket'")}
+            initial_jobs = {row["issue"]: row["id"] for row in tx.all("SELECT id,issue FROM subjects WHERE kind='ticket'")}
             for issue in source.issues:
                 for blocker in issue.blocked_by:
                     if issue.number in initial_jobs and blocker.number in initial_jobs:
@@ -198,7 +198,7 @@ class Kernel:
                 graph_problem = "dependency_cycle"
                 break
             remaining -= ready
-        jobs = tx.rows("SELECT * FROM subjects")
+        jobs = tx.all("SELECT * FROM subjects")
         reopened = any(job["kind"] == DeliveryKind.TICKET and job["phase"] == "complete"
                        and job["issue"] in by_number and by_number[job["issue"]].state.upper() != "CLOSED" for job in jobs)
         blocked: str | None
@@ -254,12 +254,12 @@ class Kernel:
         if job["phase"] == "complete" and self._completion(tx, job) is not None:
             return "completed"
         # Local dependency authority is Completion, never the live CLOSED flag.
-        for predecessor in tx.rows("SELECT s.* FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (job["id"],)):
+        for predecessor in tx.all("SELECT s.* FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (job["id"],)):
             if self._completion(tx, predecessor) is None:
                 return "blocked_by_incomplete_tickets"
         if facts[0]["state"] != "OPEN":
             return "ticket_closed"
-        if tx.rows("SELECT blocker FROM dependency_facts WHERE issue=? AND state!='CLOSED' AND blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket')", (job["issue"],)):
+        if tx.rows("SELECT blocker FROM dependency_facts WHERE issue=? AND state!='CLOSED' AND blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket') LIMIT 1", (job["issue"],)):
             return "blocked_by_open_issues"
         if not tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (job["id"], job["generation"])):
             labels: set[str] = set(json.loads(facts[0]["labels"]))
@@ -273,7 +273,7 @@ class Kernel:
     def source_status(self) -> dict[str, Any]:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
-            jobs = tx.rows("SELECT s.* FROM subjects s LEFT JOIN issue_facts i ON i.issue=s.issue ORDER BY i.position,s.issue")
+            jobs = tx.all("SELECT s.* FROM subjects s LEFT JOIN issue_facts i ON i.issue=s.issue ORDER BY i.position,s.issue")
             frontier, remaining = [], {}
             for job in jobs:
                 if job["kind"] != DeliveryKind.TICKET:
@@ -305,13 +305,13 @@ class Kernel:
                     "accepted_parent_revision": run["accepted_parent_revision"], "graph_change_summary": summary,
                     "graph_revision": run["graph_revision"], "observed_graph_revision": run["observed_graph_revision"],
                     "observation": run["source_sequence"], "final_subject": final,
-                    "completions": [dict(row) for row in tx.rows("SELECT * FROM completions ORDER BY subject,generation")]}
+                    "completions": [dict(row) for row in tx.all("SELECT * FROM completions ORDER BY subject,generation")]}
 
     def delivery(self, subject: str) -> Delivery:
         """Current resource identity for an external reader; no state machine."""
         with self.storage.transaction(write=False) as tx:
             job = self._job(tx, subject)
-            dependencies = tuple(row[0] for row in tx.rows("SELECT predecessor FROM dependencies WHERE subject=? ORDER BY predecessor", (subject,)))
+            dependencies = tuple(row[0] for row in tx.all("SELECT predecessor FROM dependencies WHERE subject=? ORDER BY predecessor", (subject,)))
             return Delivery(subject, DeliveryKind(job["kind"]), job["issue"], job["revision"], Commit(job["base_sha"], job["base_tree"]),
                             job["source_ref"], job["target_ref"], dependencies, job["completion_revision"], job["checkout"], job["owned_root"], job["common_git_dir"])
 
@@ -326,7 +326,7 @@ class Kernel:
             existing = tx.rows("SELECT id FROM subjects WHERE kind='final_run'")
             if existing:
                 return str(existing[0][0])
-            jobs = tx.rows("SELECT * FROM subjects WHERE kind='ticket' ORDER BY issue")
+            jobs = tx.all("SELECT * FROM subjects WHERE kind='ticket' ORDER BY issue")
             completed = [self._completion(tx, job) for job in jobs]
             if not jobs or any(completion is None for completion in completed):
                 raise KernelError("ticket_completion_required")
@@ -403,7 +403,7 @@ class Kernel:
             tx.execute("DELETE FROM gates WHERE subject=?", (subject,))
             self._release_integration(tx, subject)
             tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
-            if not tx.rows("SELECT subject FROM gates WHERE code='requeue_required'"):
+            if not tx.rows("SELECT subject FROM gates WHERE code='requeue_required' LIMIT 1"):
                 tx.execute("UPDATE runs SET blocked=NULL WHERE blocked='requeue_required'")
             self._event(tx, subject, "generation_requeued", action_id, payload)
             return "applied"
@@ -434,7 +434,7 @@ class Kernel:
             run = tx.one("SELECT * FROM runs")
             if run["stopped"]:
                 raise KernelError("operator_stopped")
-            if tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND status='pending'", (run["id"],)):
+            if tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND status='pending' LIMIT 1", (run["id"],)):
                 raise KernelError("executor_exit_unproven")
             if run["executor"] is not None and run["executor"] != owner:
                 raise KernelError("executor_exit_unproven")
@@ -454,7 +454,7 @@ class Kernel:
                              (execution.run_id, execution.owner, execution.epoch))
             if retired["status"] == "exited":
                 return
-            leases = tx.rows("SELECT * FROM leases WHERE executor=? AND epoch=?", (execution.owner, execution.epoch))
+            leases = tx.all("SELECT * FROM leases WHERE executor=? AND epoch=?", (execution.owner, execution.epoch))
             if {row["invocation"] for row in leases} != set(exited_invocations):
                 raise KernelError("worker_exit_unproven")
             for lease in leases:
@@ -505,7 +505,7 @@ class Kernel:
             eligibility = self._eligibility(tx, job)
             if eligibility is not None:
                 return Step("waiting", subject, eligibility)
-            dependencies = tx.rows("SELECT s.phase FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (subject,))
+            dependencies = tx.all("SELECT s.phase FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (subject,))
             if any(row[0] != "complete" for row in dependencies):
                 return Step("waiting", subject, "dependencies")
             if job["current_attempt"]:
@@ -877,7 +877,7 @@ class Kernel:
                         tx.execute("UPDATE runs SET stopped=1,epoch=epoch+1 WHERE id=?", (run["id"],))
                     else:
                         tx.execute("UPDATE runs SET stopped=1 WHERE id=?", (run["id"],))
-                    targets = tx.rows("SELECT id FROM subjects WHERE run_id=?", (run["id"],))
+                    targets = tx.all("SELECT id FROM subjects WHERE run_id=?", (run["id"],))
                 else:
                     assert subject is not None  # job exists only for an explicit subject.
                     self._gate(tx, subject, "operator_stopped")
@@ -1026,16 +1026,16 @@ class Kernel:
                                            "review_required": bool(row["review_required"])} for row in budgets},
                 "resource_cleanup": next((dict(row) for row in tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))), None),
                 "issue_link": next((dict(row) for row in tx.rows("SELECT * FROM issue_links WHERE subject=?", (subject,))), None),
-                "retired_generations": [dict(row) for row in tx.rows("SELECT * FROM retired_generations WHERE subject=? ORDER BY generation", (subject,))],
+                "retired_generations": [dict(row) for row in tx.all("SELECT * FROM retired_generations WHERE subject=? ORDER BY generation", (subject,))],
             }
 
     def scheduling(self) -> dict[str, Any]:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT concurrency,integration_holder FROM runs")
             return {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
-                    "active": [dict(row) for row in tx.rows("SELECT id,subject,invocation FROM leases ORDER BY subject")],
-                    "work_fifo": [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")],
-                    "integration_fifo": [row[0] for row in tx.rows("SELECT subject FROM integration_queue ORDER BY ready")]}
+                    "active": [dict(row) for row in tx.all("SELECT id,subject,invocation FROM leases ORDER BY subject")],
+                    "work_fifo": [row[0] for row in tx.all("SELECT subject FROM work_queue ORDER BY ready")],
+                    "integration_fifo": [row[0] for row in tx.all("SELECT subject FROM integration_queue ORDER BY ready")]}
 
     def history(self, subject: str, *, after: int = 0, limit: int = 128) -> list[dict[str, Any]]:
         if not 1 <= limit <= 128:
@@ -1205,7 +1205,7 @@ class Kernel:
             context = json.loads(tx.get(previous_output["context_id"] if previous_output["ordinal"] else pending["context_id"], subject))
             if role == Role.REVIEW:
                 context["checkout"] = job["validation_checkout"]
-            responses = tx.rows("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"]))
+            responses = tx.all("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"]))
             context["human_responses"] = [tx.get(row[0], subject).decode() for row in responses]
         invocation_id, lease_id = identity(), identity()
         context_id = tx.put(subject, "role_context", wire_json(context))
@@ -1283,7 +1283,7 @@ class Kernel:
             if job["kind"] == DeliveryKind.TICKET:
                 numbers.append((job["issue"], job["revision"], "requirements"))
             if job["kind"] == DeliveryKind.FINAL_RUN:
-                numbers.extend((row["issue"], row["revision"], "completed_ticket") for row in tx.rows("SELECT issue,revision FROM subjects WHERE kind='ticket' ORDER BY issue"))
+                numbers.extend((row["issue"], row["revision"], "completed_ticket") for row in tx.all("SELECT issue,revision FROM subjects WHERE kind='ticket' ORDER BY issue"))
             context["requirements"] = []
             for number, revision, responsibility in numbers:
                 requirement: dict[str, Any] = {"number": number, "revision": revision, "responsibility": responsibility,
@@ -1662,7 +1662,7 @@ class Kernel:
         else:
             header += "Delivery Type: " + ("Parent-only" if job["kind"] == DeliveryKind.PARENT_ONLY else "Final Run") + "\n\n"
             if job["kind"] == DeliveryKind.FINAL_RUN:
-                tickets = [(row["issue"], row["title"]) for row in tx.rows("SELECT s.issue,v.title FROM subjects s JOIN requirement_versions v ON v.issue=s.issue AND v.revision=s.revision WHERE s.kind='ticket' ORDER BY s.issue")]
+                tickets = [(row["issue"], row["title"]) for row in tx.all("SELECT s.issue,v.title FROM subjects s JOIN requirement_versions v ON v.issue=s.issue AND v.revision=s.revision WHERE s.kind='ticket' ORDER BY s.issue")]
                 seed = tx.rows("SELECT id FROM material WHERE subject=? AND purpose='fixture_evidence'", (job["id"],))
                 if not tickets and seed:
                     historical = json.loads(tx.get(seed[0][0], job["id"])).get("ticket")
