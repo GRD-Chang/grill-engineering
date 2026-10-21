@@ -3510,6 +3510,16 @@ class Kernel:
         subject, phase = job["id"], job["phase"]
         target = self._require_target(world)
         if phase == "workspace":
+            if (job["kind"] == DeliveryKind.TICKET and world.source is None and world.pr is None
+                    and all(job[key] is None for key in ("current_attempt", "development_thread", "candidate_sha", "integrated_sha", "publication_sha", "pr_number"))
+                    and job["base_sha"] == job["source_sha"] == job["workspace_sha"]
+                    and not tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (subject, job["generation"]))
+                    and not tx.rows("SELECT id FROM effects WHERE subject=? AND generation=? AND operation='workspace' LIMIT 1", (subject, job["generation"]))):
+                # Job allocation fixes the dependency-visible Run head once.
+                # A durable workspace intent, including a failed one, keeps it.
+                tx.execute("UPDATE subjects SET base_sha=?,base_tree=?,source_sha=?,workspace_sha=? WHERE id=?",
+                           (target.sha, target.tree, target.sha, target.sha, subject))
+                job = self._job(tx, subject)
             return self._prepare_effect(tx, run, job, execution, world, "workspace", before=job["source_sha"],
                                         payload={"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN})
         integrated_phases = {"ready_publication", "publication_commit", "push", "pr", "checks", "approval", "merge"}

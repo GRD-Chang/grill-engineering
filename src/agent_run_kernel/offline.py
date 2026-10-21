@@ -938,8 +938,8 @@ class GraphScenario(Scenario):
         for number in requirements.parent.sub_issue_numbers:
             source_ref = f"refs/heads/ticket-{number}"
             checkout = work / f"ticket-{number}"
-            self.port.git.run("update-ref", source_ref, base.sha)
-            self.port.git.run("worktree", "add", "--detach", str(checkout), base.sha)
+            # Name the resource only. The first workspace effect creates its
+            # ref and checkout at the Core's allocated dependency-visible head.
             deliveries.append(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "untrusted", base, source_ref, run_ref, checkout=str(checkout), owned_root=str(work), common_git_dir=common))
         if deliveries:
             deliveries.append(Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,

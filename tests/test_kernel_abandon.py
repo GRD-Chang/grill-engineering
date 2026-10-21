@@ -147,6 +147,10 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
 def managed_abandon_scenario(tmp_path: Path) -> tuple[GraphScenario, HostLaunch]:
     scenario = GraphScenario(tmp_path / "abandon", independent_source())
     kernel = scenario.kernel
+    workspace = kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+    assert workspace.effect is not None and workspace.effect.operation == "workspace"
+    scenario.handle(workspace)
+    assert kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
     kernel.control("stop", "retire-offline")
     kernel.confirm_executor_exit(scenario.execution)
     kernel.control("resume", "prepare-managed")

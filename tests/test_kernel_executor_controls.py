@@ -104,8 +104,8 @@ def test_native_executor_abandons_before_the_remote_run_branch_is_created(
     scenario = GraphScenario(tmp_path / "scenario", independent_source())
     kernel, subject = scenario.kernel, scenario.delivery.key
     # Admit the managed Host without advancing any business effect. The native
-    # transport below contains only main, even though this fixture provides
-    # clean original owned checkouts for the cleanup to inspect and remove.
+    # transport below contains only main. Unallocated resources are named but
+    # absent, as at formal creation before the first workspace effect.
     kernel.control("stop", "retire-offline")
     kernel.confirm_executor_exit(scenario.execution)
     kernel.control("resume", "prepare-managed")
@@ -133,7 +133,7 @@ def test_native_executor_abandons_before_the_remote_run_branch_is_created(
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM effects")
     resources = kernel.generation_resources()
-    assert resources and any(Path(resource.checkout).exists() for resource in resources)
+    assert resources and all(not Path(resource.checkout).exists() for resource in resources)
     inspections = LocalEffects(driver.remote.git).inspect_resources(resources)
     assert kernel.control_host(request, "abandon", "abandon-before-run-branch",
                                resource_inspections=inspections) == "pending"
