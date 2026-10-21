@@ -766,7 +766,8 @@ class Kernel:
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
                     and invocation["current_invocation"] == call.invocation_id and self._latest_output(tx, invocation)
-                    and job["generation"] == invocation["generation"] and failure_kind == "fatal"):
+                    and job["generation"] == invocation["generation"] and failure_kind == "fatal"
+                    and invocation["raw_id"] is None):
                 self._gate(tx, call.subject, "execution_failed", evidence=material)
 
     def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
