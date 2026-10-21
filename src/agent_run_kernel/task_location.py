@@ -14,11 +14,15 @@ from agent_run.task_identity import TaskKey
 from .model import KernelError, wire_json
 
 
+def task_path(task: TaskKey) -> Path:
+    """Name the existing identity pointer without creating any directory."""
+    return app_data_root() / "native-task-locations" / (task.fingerprint + ".json")
+
+
 @contextmanager
 def locked_task(task: TaskKey) -> Iterator[Path]:
-    root = app_data_root() / "native-task-locations"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = root / (task.fingerprint + ".json")
+    path = task_path(task)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

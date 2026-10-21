@@ -42,6 +42,22 @@ class Kernel:
         self.clock: Callable[[], float] = time.time
 
     @classmethod
+    def create_task(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:
+        """Create or reuse one Task after external creation reads have finished."""
+        if spec.repository_root is None:
+            raise KernelError("task_workspace_unknown")
+        task = TaskKey(Path(spec.repository_root), spec.repository, spec.parent_issue)
+        with locked_task(task) as location:
+            prior = read_task(location)
+            if prior is not None:
+                existing = cls(prior[1])
+                if not existing._replaceable(task, prior[0]):
+                    return existing
+            kernel = cls.create(path, spec, requirements=requirements)
+            bind_task(location, spec.run_id, kernel.storage.path)
+            return kernel
+
+    @classmethod
     def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements | None = None,
                fixture_evidence: Mapping[str, Any] | None = None) -> Kernel:
         if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
