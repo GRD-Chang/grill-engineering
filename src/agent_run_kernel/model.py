@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -98,6 +99,14 @@ class RunSpec:
     graph_revision: str
     deliveries: tuple[Delivery, ...]
     policy: Policy = field(default_factory=Policy)
+    language: str | None = None
+    repository_root: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.language not in {None, "zh", "en"}:
+            raise ValueError("language must be explicitly zh or en")
+        if self.repository_root is not None and not Path(self.repository_root).is_absolute():
+            raise ValueError("repository_root must be absolute")
 
 
 @dataclass(frozen=True)

@@ -53,9 +53,10 @@ class Kernel:
                     raise KernelError("delivery_scope")
                 if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
                     raise KernelError("final_target_required")
-            tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy) VALUES (?,?,?,?,?,?,?,?)",
+            tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy,language,repository_root,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
-                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(asdict(spec.policy))))
+                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(asdict(spec.policy)),
+                        spec.language, None if spec.repository_root is None else str(Path(spec.repository_root).resolve()), kernel.clock()))
             for delivery in spec.deliveries:
                 if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
                     tx.execute("INSERT INTO final_target VALUES (?,?,?,?,?,?)", (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout, delivery.owned_root, delivery.common_git_dir))
@@ -573,7 +574,7 @@ class Kernel:
                 return
             if invocation["status"] not in {"running", "interrupted"}:
                 raise KernelError("invocation_already_settled")
-            tx.execute("UPDATE invocations SET raw_id=?,status='returned' WHERE id=?", (material, call.invocation_id))
+            tx.execute("UPDATE invocations SET raw_id=?,status='returned',returned_at=? WHERE id=?", (material, self.clock(), call.invocation_id))
             # A late, superseded invocation is history only, never current work.
             tx.execute("UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=?",
                        (material, call.attempt_id, call.invocation_id))
@@ -588,7 +589,7 @@ class Kernel:
                     else:
                         self._charge_review(tx, attempt)
             tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
-            self._event(tx, call.subject, "raw_returned", call.invocation_id, material)
+            self._event(tx, call.subject, "raw_returned", call.invocation_id, material, generation=invocation["generation"])
 
     def bind_thread(self, call: AgentCall, reported_thread: str) -> None:
         """Persist a real backend thread.started event, separate from logical ID."""
@@ -632,7 +633,7 @@ class Kernel:
             if invocation["dispatch_state"] != "allocated":
                 return False
             self._agent_authority(tx, call)
-            tx.execute("UPDATE invocations SET dispatch_state='sent' WHERE id=?", (call.invocation_id,))
+            tx.execute("UPDATE invocations SET dispatch_state='sent',dispatched_at=? WHERE id=?", (self.clock(), call.invocation_id))
             self._event(tx, call.subject, "agent_dispatched", call.invocation_id)
             return True
 
@@ -658,8 +659,8 @@ class Kernel:
                 return
             if invocation["dispatch_state"] not in {"sent", "unknown"}:
                 raise KernelError("agent_not_dispatched")
-            tx.execute("UPDATE invocations SET process_identity=?,dispatch_state='started' WHERE id=?", (witness, call.invocation_id))
-            self._event(tx, call.subject, "worker_started", call.invocation_id, witness)
+            tx.execute("UPDATE invocations SET process_identity=?,dispatch_state='started',started_at=? WHERE id=?", (witness, self.clock(), call.invocation_id))
+            self._event(tx, call.subject, "worker_started", call.invocation_id, witness, generation=invocation["generation"])
 
     def agent_start_unknown(self, call: AgentCall, evidence: dict[str, Any]) -> None:
         with self.storage.transaction() as tx:
@@ -708,9 +709,9 @@ class Kernel:
     def _process_exit(self, tx: Transaction, call: AgentCall, invocation: sqlite3.Row, returncode: int, failure: str | None) -> None:
         if invocation["exit_code"] is not None and invocation["exit_code"] != returncode:
             raise KernelError("conflicting_exit")
-        tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=? WHERE id=?", (returncode, call.invocation_id))
+        tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=?,exited_at=coalesce(exited_at,?) WHERE id=?", (returncode, self.clock(), call.invocation_id))
         tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
-        self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"])
+        self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"], generation=invocation["generation"])
         if invocation["raw_id"] is None and (returncode != 0 or failure is not None):
             material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure}))
             tx.execute("UPDATE invocations SET status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
@@ -1060,12 +1061,12 @@ class Kernel:
             context = json.loads(tx.get(pending["context_id"], subject))
             if role == Role.REVIEW:
                 context["checkout"] = job["validation_checkout"]
-            responses = tx.rows("SELECT material_id FROM history WHERE subject=? AND kind='human_response' ORDER BY position", (subject,))
+            responses = tx.rows("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"]))
             context["human_responses"] = [tx.get(row[0], subject).decode() for row in responses]
         invocation_id, lease_id = identity(), identity()
         context_id = tx.put(subject, "role_context", wire_json(context))
-        tx.execute("INSERT INTO invocations(id,attempt,thread,context_id,executor,epoch,lease,status) VALUES (?,?,?,?,?,?,?,'running')",
-                   (invocation_id, attempt_id, thread_id, context_id, execution.owner, execution.epoch, lease_id))
+        tx.execute("INSERT INTO invocations(id,attempt,thread,context_id,executor,epoch,lease,status,allocated_at) VALUES (?,?,?,?,?,?,?,'running',?)",
+                   (invocation_id, attempt_id, thread_id, context_id, execution.owner, execution.epoch, lease_id, self.clock()))
         tx.execute("UPDATE attempts SET current_invocation=?,status='running',new_thread=0 WHERE id=?", (invocation_id, attempt_id))
         tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (lease_id, subject, invocation_id, execution.owner, execution.epoch))
         tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
@@ -1765,5 +1766,8 @@ class Kernel:
                 and grant["parent_revision"] == run["parent_revision"] and grant["graph_revision"] == run["graph_revision"]
                 and grant["completion_revision"] == job["completion_revision"])
 
-    def _event(self, tx: Transaction, subject: str, kind: str, event_id: str, material: str | None = None) -> None:
-        tx.execute("INSERT INTO history(subject,kind,identity,material_id) VALUES (?,?,?,?)", (subject, kind, event_id, material))
+    def _event(self, tx: Transaction, subject: str, kind: str, event_id: str, material: str | None = None, *, generation: int | None = None) -> None:
+        if generation is None:
+            generation = tx.one("SELECT generation FROM subjects WHERE id=?", (subject,))[0]
+        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)",
+                   (subject, kind, event_id, material, generation, self.clock()))
