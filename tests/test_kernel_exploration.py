@@ -71,6 +71,8 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
     target = scenario.port.git.commit(scenario.delivery.target_ref)
     assert len(scenario.port.git.parents(target.sha)) == (1 if kind == DeliveryKind.TICKET else 2)
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
+    assert scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.find("validation.tmp") == -1
+    assert not list((scenario.port.root / "work").glob("review-*"))
 
 
 def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_review(tmp_path: Path) -> None:

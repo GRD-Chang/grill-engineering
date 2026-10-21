@@ -122,6 +122,11 @@ class Kernel:
                 return Step("effect", subject, effect=self._effect(tx, pending, execution))
             if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                 return Step("paused", subject, self._pause_reason(tx, subject, run))
+            if job["validation_cleanup"]:
+                if not self._current(tx, job, run, world):
+                    return Step("paused", subject, "currentness")
+                return self._prepare_effect(tx, run, job, execution, world, "validation_cleanup", before=job["workspace_sha"],
+                                            payload={"checkout": job["validation_cleanup"]})
             if job["phase"] == "complete":
                 return Step("complete", subject)
             dependencies = tx.rows("SELECT s.phase FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (subject,))
@@ -442,6 +447,9 @@ class Kernel:
         count = tx.one("SELECT count(*) FROM leases")[0]
         if first != subject or count >= run["concurrency"]:
             return Step("waiting", subject, "agent_capacity")
+        if role == Role.REVIEW and not job["validation_checkout"]:
+            return self._prepare_effect(tx, run, job, execution, world, "validation_checkout", before=job["workspace_sha"],
+                                        payload={"reviewed_commit": job["integrated_sha"] or job["candidate_sha"]})
         tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
         policy = self._policy(run)
         profile = {Role.DEVELOPMENT: policy.development_profile, Role.REVIEW: policy.review_profile,
@@ -480,6 +488,8 @@ class Kernel:
         else:
             # A continuation retains the semantic input, adding only immutable human responses.
             context = json.loads(tx.get(pending["context_id"], subject))
+            if role == Role.REVIEW:
+                context["checkout"] = job["validation_checkout"]
             responses = tx.rows("SELECT material_id FROM history WHERE subject=? AND kind='human_response' ORDER BY position", (subject,))
             context["human_responses"] = [tx.get(row[0], subject).decode() for row in responses]
         invocation_id, lease_id = identity(), identity()
@@ -503,7 +513,10 @@ class Kernel:
             "repair_source": job["repair_source"],
             "graph_revision": run["graph_revision"], "completion_revision": job["completion_revision"],
             "base_sha": job["base_sha"] if job["purpose"] == Purpose.REQUIREMENTS else world.target.sha,
-            "candidate_sha": job["candidate_sha"], "candidate_tree": job["candidate_tree"], "checkout": job["checkout"],
+            "candidate_sha": job["candidate_sha"], "candidate_tree": job["candidate_tree"],
+            "checkout": job["validation_checkout"] if role == Role.REVIEW else job["checkout"],
+            "readonly": role != Role.DEVELOPMENT,
+            "reviewed_commit": job["integrated_sha"] or job["candidate_sha"],
             "expected_tree": job["expected_tree"], "full_scope": job["kind"],
         }
         for key in ("last_failure", "ci_failure"):
@@ -536,12 +549,15 @@ class Kernel:
             return Step("paused", subject, "stale_return")
         outcome = review_outcome(result) if role == Role.REVIEW else result["result_kind"]
         if outcome in {"human_blocker", "blocked"}:
+            if role == Role.REVIEW:
+                self._retire_validation(tx, job)
             tx.execute("UPDATE attempts SET status='human',outcome=? WHERE id=?", (outcome, attempt["id"]))
             self._gate(tx, subject, "human_blocker", evidence=attempt["result_id"])
             return Step("paused", subject, "human_blocker")
         if role == Role.DEVELOPMENT:
             phase = "candidate"
         elif role == Role.REVIEW:
+            self._retire_validation(tx, job)
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (attempt["id"], subject))
             if outcome == "fail":
                 tx.execute("UPDATE subjects SET last_failure=? WHERE id=?", (attempt["result_id"], subject))
@@ -562,6 +578,12 @@ class Kernel:
     def _pending_effect(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
         rows = tx.rows("SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed')", (subject,))
         return rows[0] if rows else None
+
+    def _retire_validation(self, tx: Transaction, job: sqlite3.Row) -> None:
+        if job["validation_checkout"]:
+            if job["validation_cleanup"]:
+                raise KernelError("validation_cleanup_unsettled")
+            tx.execute("UPDATE subjects SET validation_cleanup=validation_checkout,validation_checkout=NULL WHERE id=?", (job["id"],))
 
     def _effect(self, tx: Transaction, row: sqlite3.Row, execution: Execution) -> Effect:
         return Effect(row["id"], row["subject"], row["operation"],
@@ -614,7 +636,7 @@ class Kernel:
             old = None if world.pr is None else {"title": world.pr.title, "body": world.pr.body}
             return self._prepare_effect(tx, run, job, execution, world, "pr_write", before=job["publication_sha"],
                                         after=job["publication_sha"], payload={"title": narrative["pr_title"],
-                                        "body": narrative["pr_body_markdown"], "prior": old})
+                                        "body": self._narrative_body(run, job, narrative["pr_body_markdown"]), "prior": old})
         if phase == "checks":
             if not self._published(tx, run, job, world):
                 return Step("paused", subject, "published_head")
@@ -671,6 +693,14 @@ class Kernel:
                                         payload={"issue": job["issue"], "merge_sha": job["merge_sha"]})
         raise KernelError("prototype_step_unimplemented", phase)
 
+    def _narrative_body(self, run: sqlite3.Row, job: sqlite3.Row, narrative: str) -> str:
+        header = f"Parent Issue: #{run['parent_issue']}\n"
+        if job["kind"] == DeliveryKind.TICKET:
+            header += f"Primary Ticket: #{job['issue']}\nDelivery Type: Ticket\n\n"
+        else:
+            header += "Delivery Type: " + ("Parent-only" if job["kind"] == DeliveryKind.PARENT_ONLY else "Final Run") + "\n\n"
+        return header + narrative.strip()
+
     def _last_attempt(self, tx: Transaction, subject: str, role: Role) -> str:
         return str(tx.one("SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1", (subject, role.value))[0])
 
@@ -719,6 +749,8 @@ class Kernel:
         body["integrated_sha"] = job["integrated_sha"]
         body["integrated_tree"] = job["integrated_tree"]
         body["kind"] = job["kind"]
+        if operation == "validation_checkout":
+            body["checkout"] = str(Path(job["checkout"]).parent / ("review-" + effect_id))
         payload_id = tx.put(subject, "effect_intent", wire_json(body))
         tx.execute("""INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,
             graph_revision,revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
@@ -810,11 +842,24 @@ class Kernel:
             tx.execute("UPDATE subjects SET phase='development',purpose=?,repair_source=?,resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,workspace_sha=?,version=version+1 WHERE id=?",
                        (purpose, "integration" if operation == "integrate" else "git_integrity", job["purpose"], row["receipt_id"],
                         job["workspace_sha"] if commit is None else commit["sha"], subject))
+            if operation == "integrate":
+                # The original CI observation remains immutable in checks/history;
+                # current integration work receives the actual Git failure only.
+                tx.execute("UPDATE subjects SET ci_failure=NULL WHERE id=?", (subject,))
             self._release_integration(tx, subject)
             return Step("progress", subject)
-        if operation in {"candidate", "integrate", "publication_commit", "merge"} and not commit:
+        if operation in {"validation_checkout", "candidate", "integrate", "publication_commit", "merge"} and not commit:
             raise KernelError("effect_receipt_incomplete", operation)
-        if operation == "candidate":
+        if operation == "validation_checkout":
+            payload = json.loads(tx.get(row["payload_id"], subject))
+            if commit["sha"] != payload["reviewed_commit"]:
+                raise KernelError("validation_commit_changed")
+            tx.execute("UPDATE subjects SET validation_checkout=? WHERE id=?", (payload["checkout"], subject))
+            phase = job["phase"]
+        elif operation == "validation_cleanup":
+            tx.execute("UPDATE subjects SET validation_cleanup=NULL WHERE id=?", (subject,))
+            phase = job["phase"]
+        elif operation == "candidate":
             if job["purpose"] == Purpose.CI and result["raw"].get("no_change"):
                 tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
                 tx.execute("UPDATE subjects SET phase='development' WHERE id=?", (subject,))

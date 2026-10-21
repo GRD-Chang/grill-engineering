@@ -45,16 +45,26 @@ class OfflinePort:
         self.force_read: dict[str, str] = {}
 
     @classmethod
-    def create(cls, root: Path) -> OfflinePort:
+    def create(cls, root: Path, initial_git: Mapping[str, Any] | None = None) -> OfflinePort:
         authority = root / "authority"
         authority.mkdir(parents=True, exist_ok=False)
         port = cls(root)
+        if initial_git is not None:
+            port.git.env.update({"GIT_AUTHOR_NAME": initial_git["author_name"], "GIT_AUTHOR_EMAIL": initial_git["author_email"],
+                                 "GIT_COMMITTER_NAME": initial_git["author_name"], "GIT_COMMITTER_EMAIL": initial_git["author_email"],
+                                 "GIT_AUTHOR_DATE": initial_git["date"], "GIT_COMMITTER_DATE": initial_git["date"]})
         port.git.run("init", "--initial-branch=main")
         port.git.run("config", "maintenance.auto", "false")
         port.git.run("config", "gc.auto", "0")
-        (authority / "README.md").write_text("Synthetic repository, no user data.\n")
+        initial_files = {"README.md": "Synthetic repository, no user data.\n"} if initial_git is None else initial_git["initial_files"]
+        for name, body in initial_files.items():
+            path = authority / name
+            if not path.resolve().is_relative_to(authority.resolve()) or ".git" in path.parts:
+                raise KernelError("invalid_fixture_path")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
         port.git.run("add", "--all")
-        port.git.run("commit", "-m", "initial fixture")
+        port.git.run("commit", "-m", "initial fixture" if initial_git is None else initial_git["initial_message"])
         with sqlite3.connect(port.database) as db:
             db.executescript("""
                 CREATE TABLE prs(number INTEGER PRIMARY KEY,subject TEXT UNIQUE,body BLOB NOT NULL);
@@ -65,10 +75,11 @@ class OfflinePort:
             """)
         return port
 
-    def prepare(self, kind: DeliveryKind, *, policy: Policy | None = None) -> tuple[RunSpec, Delivery]:
+    def prepare(self, kind: DeliveryKind, *, policy: Policy | None = None,
+                ticket_number: int = 2, repository: str = "example/repository") -> tuple[RunSpec, Delivery]:
         base = self.git.commit("refs/heads/main")
         source = base
-        key = {DeliveryKind.TICKET: "ticket:2", DeliveryKind.PARENT_ONLY: "parent:1", DeliveryKind.FINAL_RUN: "final:1"}[kind]
+        key = {DeliveryKind.TICKET: f"ticket:{ticket_number}", DeliveryKind.PARENT_ONLY: "parent:1", DeliveryKind.FINAL_RUN: "final:1"}[kind]
         source_ref = "refs/heads/run" if kind == DeliveryKind.FINAL_RUN else "refs/heads/task"
         target_ref = "refs/heads/run" if kind == DeliveryKind.TICKET else "refs/heads/main"
         if kind == DeliveryKind.FINAL_RUN:
@@ -84,9 +95,9 @@ class OfflinePort:
         checkout = self.root / "work" / key.replace(":", "-")
         checkout.parent.mkdir(exist_ok=True)
         self.git.run("worktree", "add", "--detach", str(checkout), source.sha)
-        delivery = Delivery(key, kind, 2 if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
+        delivery = Delivery(key, kind, ticket_number if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
                             source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout))
-        spec = RunSpec("offline-run", "example/repository", 1, "parent-v1", "graph-v1", (delivery,), policy or Policy())
+        spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy())
         return spec, delivery
 
     def pull_request(self, subject: str) -> PullRequest | None:
@@ -126,12 +137,24 @@ class OfflinePort:
         operation = effect.operation
         payload = effect.payload
         git = LocalGit(self.git.root, authorize)
+        git.env = self.git.env.copy()
         commit: Commit | None = None
         pr: PullRequest | None = None
         expected: str | None = None
         raw: dict[str, Any] = {}
         try:
-            if operation == "candidate":
+            if operation == "validation_checkout":
+                checkout = Path(payload["checkout"])
+                if not checkout.exists():
+                    git.run("worktree", "add", "--detach", str(checkout), payload["reviewed_commit"])
+                self._validation_identity(git, checkout, payload["reviewed_commit"])
+                commit = git.commit(payload["reviewed_commit"])
+            elif operation == "validation_cleanup":
+                checkout = Path(payload["checkout"])
+                if checkout.exists():
+                    self._validation_identity(git, checkout)
+                    git.run("worktree", "remove", "--force", str(checkout))
+            elif operation == "candidate":
                 commit, no_change = git.candidate(Path(payload["checkout"]), effect.before_sha, effect.effect_id)
                 raw = {"parents": git.parents(commit.sha), "no_change": no_change}
             elif operation == "integrate":
@@ -212,6 +235,14 @@ class OfflinePort:
             self.lose_response.remove(operation)
             raise LostResponse(f"{operation} took effect; response lost")
 
+    def _validation_identity(self, git: LocalGit, checkout: Path, expected: str | None = None) -> None:
+        if checkout.parent != self.root / "work" or not checkout.name.startswith("review-"):
+            raise KernelError("foreign_validation_checkout")
+        common = Path(git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()).resolve()
+        head = git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        if common != (git.root / ".git").resolve() or (expected is not None and head != expected):
+            raise KernelError("foreign_validation_checkout")
+
     def reconcile(self, effect: Effect) -> EffectResult:
         if effect.operation in self.force_read:
             return EffectResult(self.force_read[effect.operation])
@@ -287,9 +318,21 @@ class OfflinePort:
 class Scenario:
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
                  checks: Sequence[str] = ("none",), policy: Policy | None = None,
-                 edits: Sequence[Mapping[str, str]] | None = None) -> None:
-        self.port = OfflinePort.create(root)
-        self.spec, self.delivery = self.port.prepare(kind, policy=policy)
+                 edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None) -> None:
+        self.script = neutral_script
+        if neutral_script is not None:
+            if neutral_script["schema"] != "kernel-neutral-ticket/1" or kind != DeliveryKind.TICKET:
+                raise KernelError("unsupported_neutral_script")
+            frozen = neutral_script["policy"]
+            policy = Policy(ticket_rounds=frozen["ticket_review_rounds"], parent_rounds=frozen["parent_only_paired_rounds"],
+                            run_repairs=frozen["run_repair_rounds"], integration_developments=frozen["ticket_integration_development_limit"],
+                            ci_developments=frozen["ticket_ci_development_limit"], ticket_ci_review=frozen["ticket_ci_review"],
+                            concurrency=frozen["ticket_development_workers"])
+            checks = neutral_script["external"]["required_checks"]
+        self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
+        self.spec, self.delivery = self.port.prepare(kind, policy=policy,
+            ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"],
+            repository="example/repository" if neutral_script is None else neutral_script["repository"])
         self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec)
         self.execution = self.kernel.claim_executor("offline-executor")
         self.reviews = list(reviews)
@@ -301,6 +344,7 @@ class Scenario:
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
         self.edits = edits
+        self.reviewed_heads: list[str] = []
 
     def world(self) -> World:
         pr = self.port.pull_request(self.delivery.key)
@@ -316,18 +360,32 @@ class Scenario:
         self.kernel.bind_thread(call, call.reported_thread or "offline-" + call.thread_id)
         if call.role == Role.DEVELOPMENT:
             self.development_count += 1
-            edits = ({f"development-{self.development_count}.txt": f"Change {self.development_count}\n"} if self.edits is None
+            script_step = None if self.script is None else self.script["agents"]["development"][self.development_count - 1]
+            edits = (script_step["edits"] if script_step is not None else
+                     {f"development-{self.development_count}.txt": f"Change {self.development_count}\n"} if self.edits is None
                      else self.edits[min(self.development_count - 1, len(self.edits) - 1)])
             for name, body in edits.items():
                 path = Path(call.context["checkout"]) / name
+                if not path.resolve().is_relative_to(Path(call.context["checkout"]).resolve()) or ".git" in Path(name).parts:
+                    raise KernelError("invalid_fixture_path")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(body)
-            return wire_json({"result_kind": "development", "summary": f"Changed synthetic behavior {self.development_count}", "human_blockers": None})
+            return wire_json(script_step["wire"] if script_step is not None else
+                             {"result_kind": "development", "summary": f"Changed synthetic behavior {self.development_count}", "human_blockers": None})
         if call.role == Role.REVIEW:
+            # A Reviewer may produce temporary test files in its own checkout.
+            assert Path(call.context["checkout"]) != Path(self.delivery.checkout)
+            assert self.port.git.run("rev-parse", "HEAD", cwd=Path(call.context["checkout"])).stdout.strip() == call.context["reviewed_commit"]
+            (Path(call.context["checkout"]) / "validation.tmp").write_text("Reviewer temporary file\n")
+            self.reviewed_heads.append(call.context["candidate_sha"])
             outcome = self.reviews[min(self.review_count, len(self.reviews) - 1)]
             self.review_count += 1
+            if self.script is not None:
+                return wire_json(self.script["agents"]["review"][self.review_count - 1])
             return wire_json(review_result(outcome))
         self.publication_count += 1
+        if self.script is not None:
+            return wire_json(self.script["agents"]["publication"][self.publication_count - 1])
         return wire_json({"result_kind": "publication", "commit_message": f"feat: synthetic behavior {self.publication_count}\n\nValidated change.",
                           "pr_title": f"feat: synthetic behavior {self.publication_count}",
                           "pr_body_markdown": f"Synthetic scenario with recorded evidence {self.publication_count}.", "human_blockers": None})
@@ -404,6 +462,65 @@ class Scenario:
                 "final": self.kernel.status(self.delivery.key), "terminal": boundary.kind,
                 "world": asdict(world), "git_evidence": refs}
 
+    def neutral_observation(self, script: Mapping[str, Any], input_digest: str) -> dict[str, Any]:
+        """Actual same-input facts; cleanup differences are deliberately retained."""
+        import hashlib
+        pr = self.port.pull_request(self.delivery.key)
+        if pr is None or pr.merged is None or not self.reviewed_heads:
+            raise KernelError("neutral_cut_not_reached")
+        heads = {"initial": self.delivery.base.sha, "candidate": self.reviewed_heads[-1],
+                 "published": pr.head.sha, "integrated": pr.merged.sha}
+        identities: dict[str, list[str]] = {}
+        for name, head in heads.items():
+            identities.setdefault(head, []).append(name)
+
+        def head_identity(head: str) -> list[str] | str:
+            return identities.get(head, head)
+
+        def actual_commit(head: str) -> dict[str, Any]:
+            files: dict[str, Any] = {}
+            for path in self.port.git.run("ls-tree", "-r", "--name-only", head).stdout.splitlines():
+                content = self.port.git.run("show", f"{head}:{path}").stdout
+                files[path] = {"utf8": content, "sha256": hashlib.sha256(content.encode()).hexdigest()}
+            return {"sha": head, "tree": self.port.git.commit(head).tree,
+                    "parents": [head_identity(parent) for parent in self.port.git.parents(head)],
+                    "message": self.port.git.run("show", "-s", "--format=%B", head).stdout.strip(), "files": files}
+
+        refs: dict[str, Any] = {}
+        for line in self.port.git.run("for-each-ref", "--format=%(refname) %(objectname)", "refs/heads").stdout.splitlines():
+            ref, head = line.split()
+            name = {self.delivery.source_ref: "ticket", self.delivery.target_ref: "run", "refs/heads/main": "main"}.get(ref, ref)
+            refs[name] = head_identity(head)
+        with sqlite3.connect(self.port.database) as db:
+            closed = db.execute("SELECT issue,intent,actor,merge_sha FROM closed ORDER BY issue").fetchall()
+            comments = db.execute("SELECT intent,issue,actor,body FROM comments ORDER BY rowid").fetchall()
+        mutations: list[dict[str, Any]] = []
+        for _, issue, _, raw in comments:
+            body = json.loads(raw)
+            mutations.append({"action": "completion_comment", "ticket_number": issue,
+                              "pr_number": pr.number, "integrated_sha": head_identity(body["merge_sha"])})
+        for issue, _, _, merge_sha in closed:
+            mutations.append({"action": "close_issue", "ticket_number": issue,
+                              "pr_number": pr.number, "integrated_sha": head_identity(merge_sha)})
+        current = self.kernel.status(self.delivery.key)
+        projected = self.observable(script["id"], Step("complete", self.delivery.key))
+        return {"schema": "kernel-neutral-ticket-observation/1", "input_sha256": input_digest,
+                "implementation": "independent-kernel-exploration", "cut": script["cut"],
+                "roles": projected["role_calls"], "raw_backend_calls": {"development": self.development_count,
+                    "review": self.review_count, "publication": self.publication_count},
+                "status": "ticket_completed" if current["phase"] == "complete" else current["phase"],
+                "approval_required": False, "budget": {"initial_development": current["budgets"]["requirements"]["developments_used"],
+                    "initial_review": current["budgets"]["requirements"]["reviews_used"]},
+                "commits": {name: actual_commit(head) for name, head in heads.items()}, "local_refs": refs,
+                "published_refs": {name: head for name, head in refs.items() if name in {"ticket", "run"}},
+                "pull_request": {"title": pr.title, "body": pr.body, "state": pr.state,
+                                 "primary_ticket": self.delivery.issue},
+                "closed_issues": [row[0] for row in closed], "mutations": mutations,
+                "publication_wire": script["agents"]["publication"][0], "cross_architecture_compared": False,
+                "known_gaps": ["Ticket source branch and development checkout are retained after completion; no managed cleanup effect yet",
+                               "Native GitHub Issue branch linking is not implemented by the synthetic remote adapter"],
+                "raw_effects": self.port.writes()}
+
 
 def main() -> None:
     import argparse
@@ -412,6 +529,7 @@ def main() -> None:
     parser.add_argument("--scenario", required=True, choices=("ticket-normal", "ticket-review-repair", "ticket-fallback",
                         "parent-only-normal", "full-parent-normal", "full-parent-review-repair"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--input", type=Path, help="Exact neutral Ticket script, shared with the unchanged baseline adapter")
     args = parser.parse_args()
     configurations = {
         "ticket-normal": (DeliveryKind.TICKET, ("pass",), "complete"),
@@ -422,10 +540,14 @@ def main() -> None:
         "full-parent-review-repair": (DeliveryKind.FINAL_RUN, ("fail", "pass"), "publication_pending"),
     }
     kind, reviews, cut = configurations[args.scenario]
-    scenario = Scenario(args.root, kind, reviews=reviews)
+    script = None if args.input is None else json.loads(args.input.read_text(encoding="utf-8"))
+    scenario = Scenario(args.root, kind, reviews=reviews, neutral_script=script)
     boundary = scenario.run(approve=kind != DeliveryKind.TICKET, cut=cut)
     result = {"schema": "kernel-observable-trace/1", "implementation": "independent-kernel-exploration",
               "cross_architecture_compared": False, "scenarios": [scenario.observable(args.scenario, boundary)]}
+    if script is not None:
+        import hashlib
+        result["neutral_observation"] = scenario.neutral_observation(script, hashlib.sha256(args.input.read_bytes()).hexdigest())
     args.output.write_bytes(wire_json(result) + b"\n")
     print(json.dumps({"scenario": args.scenario, "terminal": boundary.kind, "output": str(args.output)}))
 

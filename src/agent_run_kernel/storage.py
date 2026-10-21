@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v1-exploration"
+PROTOCOL = "independent-delivery-kernel-v2-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -43,7 +43,8 @@ CREATE TABLE subjects (
  publication_sha TEXT, publication_tree TEXT, pr_number INTEGER,
  checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
- ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT
+ ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT,
+ validation_checkout TEXT, validation_cleanup TEXT
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
