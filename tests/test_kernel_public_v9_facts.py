@@ -123,3 +123,29 @@ def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_rene
     action = next(item for item in data['operator_actions'] if item['reason'] == 'integration_resync_exhausted')
     assert action['operation'] == 'resume' and action['action']['command'] == 'resume'
     assert _durable(tmp_path) == before
+
+
+def test_resume_application_receipt_does_not_claim_start_before_the_bound_successor(tmp_path: Path) -> None:
+    kernel, world = _kernel(tmp_path)
+    kernel.clock = lambda: 100.0
+    executor = kernel.claim_executor('executor')
+    first = kernel.advance('ticket', executor, world).call
+    assert first is not None
+    kernel.receive(first, b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Need original decision"]}')
+    assert kernel.advance('ticket', executor, world).kind == 'paused'
+    assert kernel.control('resume', 'exact-response', subject='ticket', message='Original response') == 'applied'
+    before_start = read(kernel.storage.path, 'history').data['agent_resumes'][0]
+    assert before_start['status'] == 'applied' and before_start['started_at'] is None
+    assert before_start['successor_invocations'] == []
+    successor = kernel.advance('ticket', executor, world).call
+    assert successor is not None and kernel.dispatch_agent(successor)
+    kernel.bind_thread(successor, 'real-resumed-thread')
+    process = {'pid': 21, 'pgid': 21, 'start_token': 'successor', 'host_pid': 10, 'host_start_token': 'host'}
+    kernel.agent_started(successor, process)
+    before = _durable(tmp_path)
+    data = read(kernel.storage.path, 'history').data
+    resumed = data['agent_resumes'][0]
+    assert resumed['successor_invocations'] == [successor.invocation_id]
+    assert resumed['started_at'] == 100.0 and resumed['payload']['message'] == 'Original response'
+    assert successor.attempt_id == first.attempt_id
+    assert _durable(tmp_path) == before

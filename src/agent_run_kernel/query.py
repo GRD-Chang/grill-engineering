@@ -616,10 +616,17 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     attempt.pop("context_id")
                     attempt.update({"attempt_id": attempt["id"], "work_subject": attempt["subject"], "budget_window": attempt["window"]})
                 control = _control_history(tx)
-                resumes = [{"action_id": action["id"], "subject": action["subject"], "status": action["status"],
-                            "payload": action["payload"], "receipt": action["receipt"], "started_at": None}
-                           for action in control if action["kind"] == "resume"]
                 all_invocations = [invocation for job in subjects for invocation in _invocations(tx, job["subject"])]
+                resumes = []
+                for action in control:
+                    if action["kind"] != "resume":
+                        continue
+                    successors = [row for row in all_invocations if row["action_id"] == action["id"]]
+                    started = [output["started_at"] for row in successors for output in row["outputs"] if output["started_at"] is not None]
+                    resumes.append({"action_id": action["id"], "subject": action["subject"], "status": action["status"],
+                                    "payload": action["payload"], "receipt": action["receipt"],
+                                    "successor_invocations": [row["id"] for row in successors],
+                                    "started_at": min(started) if started else None})
                 data.update({"timeline": events, "timeline_continuation": [],
                              "semantic_agent_attempts": attempts,
                              "agent_invocations": all_invocations,
