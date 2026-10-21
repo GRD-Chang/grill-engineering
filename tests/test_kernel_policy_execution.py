@@ -95,7 +95,8 @@ def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_pa
     assert scenario.development_count == 0
 
 
-def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path: Path) -> None:
+@pytest.mark.parametrize("invalid_output", [b"invalid structured output", b"\x00" * (1024 * 1024)], ids=["small", "escaped-limit"])
+def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path: Path, invalid_output: bytes) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
     kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
@@ -109,7 +110,7 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
     kernel.bind_thread(first, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
-    kernel.receive(first, b"invalid structured output")
+    kernel.receive(first, invalid_output)
     kernel.agent_exited(first, process, 0)
     now[0] = 102.5
     repair_step = kernel.advance(delivery.key, executor, world)
@@ -160,6 +161,15 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     kernel.agent_started(second, next_process)
     kernel.agent_exited(second, next_process, 1)
     assert kernel.advance(delivery.key, executor, world).kind == "paused"
+    kernel.control("resume", "manual-thread-replacement", subject=delivery.key, new_thread=True)
+    third = kernel.advance(delivery.key, executor, world).call
+    assert third is not None and third.attempt_id == first.attempt_id and third.thread_id != first.thread_id
+    assert kernel.dispatch_agent(third)
+    kernel.bind_thread(third, "replacement-backend-thread")
+    third_process = {**process, "pid": 25, "pgid": 25, "start_token": "third-start"}
+    kernel.agent_started(third, third_process)
+    kernel.agent_exited(third, third_process, 1)
+    assert kernel.advance(delivery.key, executor, world).kind == "paused"
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
 
 
@@ -178,4 +188,37 @@ def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: 
     assert kernel.advance(delivery.key, executor, world).kind == "paused"
     assert kernel.scheduling()["active"] == []
     assert kernel.dispatch_agent(call) is False
+    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
+
+
+def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp_path: Path) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
+    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+                           Policy(development_deadline_seconds=7.0)))
+    now = [100.25]
+    kernel.clock = lambda: now[0]
+    executor = kernel.claim_executor("executor")
+    world = World("parent", "graph", "requirements", base)
+    call = kernel.advance(delivery.key, executor, world).call
+    assert call is not None and kernel.dispatch_agent(call)
+    kernel.bind_thread(call, "backend-thread")
+    process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
+    kernel.agent_started(call, process)
+    now[0] = 101.5
+    kernel.agent_exited(call, process, 1, failure="machine:server_overloaded", failure_kind="capacity")
+    now[0] = 131.499
+    assert kernel.advance(delivery.key, executor, world).kind == "waiting"
+    assert kernel.scheduling()["active"] == []
+    now[0] = 131.5
+    recovered = kernel.advance(delivery.key, executor, world).call
+    assert recovered is not None and recovered.invocation_id != call.invocation_id
+    assert recovered.thread_id == call.thread_id and recovered.deadline_at == 138.5
+    assert kernel.dispatch_agent(recovered)
+    second_process = {**process, "pid": 24, "pgid": 24, "start_token": "second-start"}
+    kernel.agent_started(recovered, second_process)
+    kernel.agent_exited(recovered, second_process, 1, failure="machine:server_overloaded", failure_kind="capacity")
+    now[0] = 161.5
+    assert kernel.advance(delivery.key, executor, replace(world, revision="changed-requirements")).kind == "paused"
+    assert kernel.scheduling()["active"] == []
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1

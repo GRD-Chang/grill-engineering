@@ -141,12 +141,15 @@ CREATE TABLE attempts (
  base_sha TEXT NOT NULL, candidate_sha TEXT, candidate_tree TEXT, expected_tree TEXT,
  completion_revision TEXT NOT NULL, context_id TEXT NOT NULL REFERENCES material(id),
  current_invocation TEXT, result_id TEXT REFERENCES material(id), status TEXT NOT NULL,
- accounted INTEGER NOT NULL DEFAULT 0, outcome TEXT, new_thread INTEGER NOT NULL DEFAULT 0, UNIQUE(subject,ordinal)
+ accounted INTEGER NOT NULL DEFAULT 0, outcome TEXT, new_thread INTEGER NOT NULL DEFAULT 0,
+ resume_action TEXT REFERENCES actions(id), UNIQUE(subject,ordinal)
 );
 CREATE TABLE invocations (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
  executor TEXT NOT NULL, epoch INTEGER NOT NULL, status TEXT NOT NULL, allocated_at REAL NOT NULL,
- deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL
+ deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL,
+ predecessor TEXT REFERENCES invocations(id), recovery_kind TEXT CHECK(recovery_kind IN ('ordinary','capacity','explicit')),
+ action_id TEXT REFERENCES actions(id)
 );
 CREATE TABLE invocation_outputs (
  invocation TEXT NOT NULL REFERENCES invocations(id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 2),
@@ -156,6 +159,7 @@ CREATE TABLE invocation_outputs (
  exit_code INTEGER, start_evidence TEXT REFERENCES material(id), allocated_at REAL NOT NULL,
  dispatched_at REAL, started_at REAL, returned_at REAL, exited_at REAL,
  mode TEXT NOT NULL, requested_thread TEXT,
+ failure_kind TEXT CHECK(failure_kind IN ('ordinary','capacity','fatal')), recovery_ready_at REAL,
  PRIMARY KEY(invocation,ordinal)
 );
 CREATE TABLE work_queue (
