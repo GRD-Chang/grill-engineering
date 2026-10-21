@@ -135,12 +135,9 @@ class OfflinePort:
                      ((target.sha, source.sha),) if source is not None and self.git.is_ancestor(target.sha, source.sha) else ())
 
     def ref_commit(self, ref: str) -> Commit | None:
-        result = self.git.run("show-ref", "--verify", "--hash", ref, check=False)
-        if result.returncode == 1:
-            return None
-        if result.returncode != 0:
-            raise KernelError("ref_read_failed")
-        return self.git.commit(result.stdout.strip())
+        result = self.git.run("for-each-ref", "--format=%(refname)%09%(objectname)", ref)
+        heads = [line.partition("\t")[2] for line in result.stdout.splitlines() if line.partition("\t")[0] == ref]
+        return None if not heads else self.git.commit(heads[0])
 
     def remote_refs(self) -> dict[str, str]:
         with sqlite3.connect(self.database) as db:
@@ -155,8 +152,11 @@ class OfflinePort:
 
     def _write_pr(self, subject: str, pr: PullRequest) -> None:
         with sqlite3.connect(self.database) as db:
-            db.execute("INSERT INTO prs VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET body=excluded.body",
-                       (pr.number, subject, wire_json(asdict(pr))))
+            self._write_pr_in(db, subject, pr)
+
+    def _write_pr_in(self, db: sqlite3.Connection, subject: str, pr: PullRequest) -> None:
+        db.execute("INSERT INTO prs VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET body=excluded.body",
+                   (pr.number, subject, wire_json(asdict(pr))))
 
     def _receipt(self, effect: Effect, result: EffectResult) -> None:
         with sqlite3.connect(self.database) as db:
@@ -194,10 +194,10 @@ class OfflinePort:
             elif operation == "workspace":
                 checkout = Path(payload["checkout"])
                 if payload["create_ref"]:
-                    existing = git.run("show-ref", "--verify", "--hash", effect.source_ref, check=False)
-                    if existing.returncode == 1:
+                    existing = self.ref_commit(effect.source_ref)
+                    if existing is None:
                         git.run("update-ref", effect.source_ref, effect.before_sha, "0" * len(effect.before_sha))
-                    elif existing.returncode != 0 or existing.stdout.strip() != effect.before_sha:
+                    elif existing.sha != effect.before_sha:
                         raise KernelError("workspace_ref_changed")
                 if not checkout.exists():
                     git.run("worktree", "add", "--detach", str(checkout), effect.before_sha)
@@ -716,8 +716,7 @@ class GraphScenario(Scenario):
         self.refresh()
         self.delivery = self.kernel.delivery(self.delivery.key)
         status = self.kernel.status(self.delivery.key)
-        source_ref = self.port.git.run("show-ref", "--verify", "--hash", self.delivery.source_ref, check=False)
-        source = self.port.git.commit(source_ref.stdout.strip()) if source_ref.returncode == 0 else None
+        source = self.port.ref_commit(self.delivery.source_ref)
         target = self.port.git.commit(self.delivery.target_ref)
         pr = self.port.pull_request(self.delivery.key)
         checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
