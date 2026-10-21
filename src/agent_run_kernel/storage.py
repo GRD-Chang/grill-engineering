@@ -45,7 +45,7 @@ CREATE TABLE subjects (
  checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
  ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT,
- validation_checkout TEXT, validation_cleanup TEXT
+ validation_checkout TEXT, validation_cleanup TEXT, owned_root TEXT NOT NULL DEFAULT '', common_git_dir TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
@@ -68,7 +68,8 @@ CREATE TABLE source_observations (
  graph_revision TEXT NOT NULL, body BLOB NOT NULL
 );
 CREATE TABLE final_target (
- id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL, checkout TEXT NOT NULL
+ id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL, checkout TEXT NOT NULL,
+ owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL
 );
 CREATE TABLE completions (
  subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
@@ -87,7 +88,20 @@ CREATE TABLE retired_generations (
  subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL, revision TEXT NOT NULL,
  source_ref TEXT NOT NULL, checkout TEXT NOT NULL, source_sha TEXT NOT NULL,
  candidate_sha TEXT, publication_sha TEXT, pr_number INTEGER, reason TEXT NOT NULL,
+ validation_checkout TEXT, validation_cleanup TEXT,
  PRIMARY KEY(subject,generation)
+);
+CREATE TABLE resource_cleanup (
+ subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
+ source_ref TEXT NOT NULL, source_sha TEXT NOT NULL, checkout TEXT NOT NULL, workspace_sha TEXT NOT NULL,
+ owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL, stage INTEGER NOT NULL DEFAULT 0,
+ state TEXT NOT NULL DEFAULT 'pending', effect_id TEXT REFERENCES effects(id), outcome TEXT,
+ PRIMARY KEY(subject,generation)
+);
+CREATE TABLE issue_links (
+ subject TEXT PRIMARY KEY REFERENCES subjects(id), generation INTEGER NOT NULL,
+ source_ref TEXT NOT NULL, source_sha TEXT NOT NULL, issue INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'pending', effect_id TEXT NOT NULL REFERENCES effects(id)
 );
 CREATE TABLE budgets (
  subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
@@ -155,7 +169,7 @@ CREATE TABLE effects (
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
  attempts INTEGER NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent','observed');
+CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link');
 CREATE TABLE checks (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), pr_number INTEGER NOT NULL,
  head_sha TEXT NOT NULL, result TEXT NOT NULL, material_id TEXT NOT NULL REFERENCES material(id)

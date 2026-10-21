@@ -85,6 +85,8 @@ class Delivery:
     dependencies: tuple[str, ...] = ()
     completion_revision: str = "no-tickets"
     checkout: str = ""
+    owned_root: str = ""
+    common_git_dir: str = ""
 
 
 @dataclass(frozen=True)
