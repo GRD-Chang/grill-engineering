@@ -658,6 +658,10 @@ class Kernel:
         scope = self._abandon_scope(tx, action)
         for effect_id in scope["unsettled"]:
             row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+            if row["operation"] == "issue_link":
+                # Optional display keeps its original indeterminate audit;
+                # it cannot block the Action or acquire readback acknowledgements.
+                continue
             if row["status"] == "sent":
                 return Step("reconcile", row["subject"], effect=self._effect(tx, row, execution))
             if row["status"] == "observed":
