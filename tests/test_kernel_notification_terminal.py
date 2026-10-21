@@ -44,8 +44,8 @@ def test_terminal_notification_keeps_close_cleanup_and_completed_as_distinct_fac
     assert observe() == []
     assert scenario.step().kind == 'progress'
     with scenario.kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT state FROM resource_cleanup')[0] != 'complete'
-        assert tx.one("SELECT count(*) FROM effects WHERE operation='close' AND status='confirmed'")[0] == 1
+        assert tx.one('SELECT state FROM resource_cleanup WHERE subject=?', (scenario.delivery.key,))[0] != 'complete'
+        assert tx.one("SELECT count(*) FROM effects WHERE subject=? AND operation='close' AND status='confirmed'", (scenario.delivery.key,))[0] == 1
     pending = observe()
     assert len(pending) == 1
     assert rendered[-1]['header']['template'] == 'yellow'
