@@ -1,14 +1,14 @@
 """One factual document rendered as machine JSON, plain text or safe Rich text."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from datetime import UTC, datetime
 import json
 import re
 from typing import Any, Literal, TextIO
 import unicodedata
 
-from .query import QueryDocument, QueryError
+from .query import QueryDocument, QueryError, review_findings
 from .storage import QUERY_LIMIT
 
 
@@ -107,20 +107,6 @@ def _body(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _findings(value: Any) -> Iterator[str]:
-    if not isinstance(value, Mapping):
-        return
-    if value.get("human_blockers"):
-        yield _body(value["human_blockers"])
-    checks = value.get("checks")
-    if not isinstance(checks, Mapping):
-        return
-    for lane in checks.values():
-        if isinstance(lane, Mapping) and lane.get("status") in {"fail", "blocked"}:
-            for finding in lane.get("findings", []):
-                yield _body(finding)
-
-
 def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     copy = _COPY[document.language]
     terms = _TERMS[document.language]
@@ -171,7 +157,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             yield f"  {copy['cleanup']}: {copy['complete'] if cleanup['state'] == 'complete' else copy['pending']}"
         review = job["review"]
         if review and review["outcome"] != "pass":
-            for finding in _findings(review["artifact"]):
+            for finding in review_findings(review["artifact"]):
                 yield f"{copy['findings']}: {finding}"
     if document.kind == "history":
         yield copy["history"]
@@ -197,7 +183,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             elif details and evidence is not None:
                 yield f"  {copy['evidence']}: {_body(evidence)}"
             if event["kind"] == "role_consumed":
-                for finding in _findings(evidence):
+                for finding in review_findings(evidence):
                     yield f"{copy['findings']}: {finding if details or len(finding) <= 1000 else finding[:1000] + ' [truncated; --details]'}"
         if details:
             for attempt in data["semantic_agent_attempts"]:

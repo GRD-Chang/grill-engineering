@@ -12,7 +12,7 @@ import sqlite3
 import time
 from typing import Any, Literal, Mapping, Sequence
 
-from .model import KernelError
+from .model import KernelError, Role, artifact
 from .storage import QUERY_LIMIT, Storage, Transaction
 
 
@@ -62,6 +62,24 @@ def _timestamp(value: Any) -> float | None:
     except (OverflowError, OSError, ValueError) as error:
         raise QueryError("incompatible_run_state", "Recorded timestamp is outside the supported calendar range") from error
     return float(value)
+
+
+def review_findings(value: Any) -> list[str]:
+    """Select original human-facing evidence without translating or deciding it."""
+    if not isinstance(value, Mapping):
+        return []
+    blockers = value.get("human_blockers")
+    result = [item for item in blockers if isinstance(item, str)] if isinstance(blockers, list) else []
+    checks = value.get("checks")
+    if isinstance(checks, Mapping):
+        for lane in checks.values():
+            if isinstance(lane, Mapping) and lane.get("status") in {"fail", "blocked"}:
+                findings = lane.get("findings")
+                if isinstance(findings, list):
+                    result.extend(item for item in findings if isinstance(item, str))
+                if lane.get("status") == "blocked" and isinstance(lane.get("evidence"), str):
+                    result.append(lane["evidence"])
+    return result
 
 
 def _header(tx: Transaction, path: Path) -> dict[str, Any]:
@@ -160,7 +178,7 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
     if job["review_attempt"]:
         attempt = tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["review_attempt"], subject))
         review = {"attempt_id": attempt["id"], "outcome": attempt["outcome"],
-                  "artifact": _material(tx, attempt["result_id"], subject)}
+                  "artifact": artifact(Role.REVIEW, tx.get(attempt["result_id"], subject)) if attempt["result_id"] else None}
     effects = _all(tx, "SELECT id,operation,status,attempts,before_sha,after_sha FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY rowid", (subject,))
     cleanup = tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))
     checks = None
@@ -352,7 +370,7 @@ def _progress(data: Mapping[str, Any]) -> dict[str, Any]:
             "round_progress": data["review_budget"], "integration_development": data["integration_development"],
             "integration_resync": data["integration_resync"], "ci_recovery": data["ci_recovery"],
             "run_repair": data["run_repair"], "next_action": data["next_action"],
-            "conclusion": None, "findings": [] if job is None or job["review"] is None else job["review"]["artifact"]}
+            "conclusion": None, "findings": [] if job is None or job["review"] is None else review_findings(job["review"]["artifact"])}
 
 
 def _history_views(data: Mapping[str, Any], subjects: list[dict[str, Any]], events: list[dict[str, Any]],
@@ -393,9 +411,9 @@ def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[s
         ci = budgets.get("ci", {})
         integration = budgets.get("integration", {})
         checks = job["required_checks"]
-        blockers = tx.rows("SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (job["subject"],))
+        blockers = _all(tx, "SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (job["subject"],))
         views.append({"ticket_number": job["issue"], "phase": _public_phase(job["phase"]),
-            "blocked_by": [row[0] for row in blockers], "blocked_reason": job["gates"][0]["code"] if job["gates"] else None,
+            "blocked_by": [row["issue"] for row in blockers], "blocked_reason": job["gates"][0]["code"] if job["gates"] else None,
             "execution_activity": "unknown", "has_work_slot": job["subject"] in active,
             "holds_integration": run["integration_holder"] == job["subject"],
             "work_queue_position": work_positions.get(job["subject"]), "queue_position": integration_positions.get(job["subject"]),
@@ -424,10 +442,10 @@ def _control_history(tx: Transaction) -> list[dict[str, Any]]:
     return actions
 
 
-def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limit: int = 128,
+def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limit: int | None = None,
          expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
-    if after < 0 or not 1 <= limit <= 128:
-        raise QueryError("query_limit", "History requires after >= 0 and 1 <= limit <= 128")
+    if after < 0 or (limit is not None and not 1 <= limit <= 128):
+        raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
     try:
         with Storage(path).transaction(write=False) as tx:
             location = _header(tx, path)
@@ -462,8 +480,8 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                 "diagnostics": [], "notifications": None,
                 "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "live_status": "unknown"},
                 "scheduling": {"active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject"),
-                               "work_fifo": [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")],
-                               "integration_fifo": [row[0] for row in tx.rows("SELECT subject FROM integration_queue ORDER BY ready")]}}
+                               "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
+                               "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
             data["multi_ticket"] = _multi_ticket(tx, run, subjects, data["scheduling"])
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
@@ -472,8 +490,8 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
             data["unavailable_facts"] = ["host_liveness", "notifications", "agent_execution_segments",
                                          "publication_failure_count", "output_attempt_history"]
             if kind == "history":
-                rows = tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))
-                events = [dict(row) for row in rows]
+                events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
+                          [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
                 for event in events:
                     if (not isinstance(event["position"], int) or isinstance(event["position"], bool)
                             or not isinstance(event["generation"], int) or event["generation"] < 1

@@ -60,7 +60,7 @@ def _parser(language: str) -> argparse.ArgumentParser:
         if command == "history":
             child.add_argument("--details", action="store_true")
             child.add_argument("--after", type=int, default=0)
-            child.add_argument("--limit", type=int, default=128)
+            child.add_argument("--limit", type=int)
     return parser
 
 
@@ -137,7 +137,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 language = candidate["language"]
             kind: Literal["history", "status"] = "history" if parsed.command == "history" else "status"
             document = read(Path(candidate["database"]), kind,
-                            after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", 128),
+                            after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", None),
                             expected_run=candidate["run_id"], expected_repository=candidate["repository"].lower())
         style: Literal["json", "rich", "plain"] = "json" if parsed.as_json else "rich" if (not getattr(parsed, "plain", False)
                 and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"

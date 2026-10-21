@@ -29,14 +29,43 @@ def test_missing_exact_query_is_actionable_and_does_not_create_storage(
 
 def _create(root: Path, run_id: str = "run-query", *, language: str | None = "en",
             repository: str = "example/project", parent: int = 1,
-            repository_root: Path | None = None) -> Kernel:
+            repository_root: Path | None = None, deliveries: tuple[Delivery, ...] | None = None) -> Kernel:
     base = Commit("base", "base-tree")
     spec = RunSpec(run_id, repository, parent, "parent-v1", "graph-v1",
-                   (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
+                   deliveries or (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
                              "refs/heads/ticket", "refs/heads/run"),),
                    Policy(development_profile=Profile("recorded-development-model", "high")),
                    language=language, repository_root=str(repository_root or root / "checkout"))
     return Kernel.create(root / run_id / "kernel.sqlite3", spec)
+
+
+def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(tmp_path: Path) -> None:
+    base = Commit("base", "base-tree")
+    independent = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
+        f"refs/heads/ticket-{number}", "refs/heads/run") for number in range(2, 132))
+    dependent = Delivery("ticket:999", DeliveryKind.TICKET, 999, "ticket-v1", base,
+        "refs/heads/ticket-999", "refs/heads/run", dependencies=tuple(job.key for job in independent[:129]))
+    kernel = _create(tmp_path, deliveries=(*independent, dependent))
+    # Real local Stop/Resume actions produce 260 audit entries and place each
+    # independent Ticket in FIFO order without synthetic SQL queue records.
+    for job in independent:
+        assert kernel.control("stop", "stop-" + job.key, subject=job.key) == "applied"
+        assert kernel.control("resume", "resume-" + job.key, subject=job.key) == "applied"
+    execution = kernel.claim_executor("queue-executor")
+    world = World("parent-v1", "graph-v1", "ticket-v1", base)
+    assert kernel.advance(independent[0].key, execution, world).call is not None
+    before = _snapshot(tmp_path)
+    document = query.read(kernel.storage.path, "status").data
+    assert document["scheduling"]["work_fifo"] == [job.key for job in independent[1:]]
+    assert len(document["scheduling"]["work_fifo"]) == 129
+    ticket = next(item for item in document["multi_ticket"]["tickets"] if item["ticket_number"] == 999)
+    assert ticket["blocked_by"] == [job.issue for job in independent[:129]]
+    history = query.read(kernel.storage.path, "history").data
+    assert len(history["timeline"]) >= 260
+    assert history["history_page"]["has_more"] is False
+    first = query.read(kernel.storage.path, "history", limit=17).data
+    assert len(first["timeline"]) == 17 and first["history_page"]["has_more"] is True
+    assert _snapshot(tmp_path) == before
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
