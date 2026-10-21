@@ -20,7 +20,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     job = {
         "base_sha": "base", "candidate_sha": "candidate", "phase": "reviewing",
         "pr_number": 11, "review_budget": new_budget(), "review_budget_history": [],
-        "ticket_number": 3, "ticket_branch": "ticket/3",
+        "ticket_number": 3, "ticket_branch": "ticket/3", "ticket_branch_generation": 1,
         "effective_revision": "revision",
     }
     attempt = begin_review(
@@ -39,6 +39,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
              "active_ticket_job": job, "ticket_integration_queue": [], "ticket_integration_holder": None}
 
     status_reads: list[int] = []
+    cancelled_waiters: list[tuple[int, int]] = []
 
     def status_read_failure(number, *_args, **_kwargs):
         status_reads.append(number)
@@ -54,6 +55,11 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
         states = SimpleNamespace(save_run=lambda *_args: None,
                                  ticket_pause_requested=lambda *_args: False)
         work = DevelopmentReview(git=git, github=github, agents=None, states=states)
+        # This narrow status-read test has no real work queue. Observe only
+        # the admission cancellation required by the real supervision path.
+        work.agent_work.admission = SimpleNamespace(
+            cancel_waiter=lambda number, generation: cancelled_waiters.append((number, generation)),
+        )
         return ChangeDeliveryEngine(
             git=git, github=github, agents=None,
             contract=ChangeJobContract(label="ticket-3", branch="ticket/3", base_branch="run",
@@ -65,6 +71,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     step = review_engine().advance(state, job, tmp_path)
     assert step.kind == DeliveryStepKind.WAITING
     assert status_reads == [11]
+    assert cancelled_waiters == [(3, 1)]
     assert state["diagnostics"][0]["code"] == "github_read_failed"
     # Failure recording may persist the mutated in-memory state. That snapshot
     # must retain the answer and its Attempt until remote readback succeeds.

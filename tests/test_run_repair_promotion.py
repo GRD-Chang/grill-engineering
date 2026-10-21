@@ -104,53 +104,54 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
     ],
 )
 def test_run_repair_promotion_rejects_each_authority_binding(
-    git_repo: Path, mismatch: str,
+    git_repo: Path, mismatch: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
 
-    class PromotionMismatchEngine(RunAcceptanceEngine):
-        def _candidate_promotion_record(
-            self,
-            live_state: dict[str, Any],
-            job: dict[str, Any],
-            integrated: str,
-        ) -> dict[str, Any] | None:
-            record = job["acceptance_record"]
-            if mismatch == "candidate_tree":
-                record["reviewed_candidate_tree"] = "mismatched-candidate-tree"
-            elif mismatch == "repair_base":
-                record["repair_base_run_head_sha"] = "mismatched-repair-base"
-            elif mismatch == "actual_run_tree":
-                subprocess.run(
-                    [
-                        "git",
-                        "update-ref",
-                        f"refs/heads/{live_state['run_branch']}",
-                        git.resolve("main"),
-                    ],
-                    cwd=git.root,
-                    check=True,
-                )
-            elif mismatch == "default_head":
-                record["reviewed_default_base_sha"] = integrated
-            elif mismatch == "parent_revision":
-                live_state["parent"]["revision"] = "mismatched-parent-revision"
-            elif mismatch == "graph_revision":
-                live_state["ticket_graph"]["revision"] = "mismatched-graph-revision"
-            elif mismatch == "completion_records":
-                live_state["ticket_jobs"]["2"]["effective_revision"] = (
-                    "mismatched-completion-revision"
-                )
-            return super()._candidate_promotion_record(live_state, job, integrated)
-
     agents = ScriptedRunAgents()
-    result = PromotionMismatchEngine(
-        git=git,
-        states=states,
-        agents=agents,
+    engine = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
         github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
+    )
+    promotion_record = engine.candidate_acceptance.promotion_record
+    applied: list[str] = []
+
+    def mismatched_promotion_record(
+        live_state: dict[str, Any], job: dict[str, Any], integrated: str,
+    ) -> dict[str, Any] | None:
+        applied.append(mismatch)
+        record = job["acceptance_record"]
+        if mismatch == "candidate_tree":
+            record["reviewed_candidate_tree"] = "mismatched-candidate-tree"
+        elif mismatch == "repair_base":
+            record["repair_base_run_head_sha"] = "mismatched-repair-base"
+        elif mismatch == "actual_run_tree":
+            subprocess.run(
+                [
+                    "git",
+                    "update-ref",
+                    f"refs/heads/{live_state['run_branch']}",
+                    git.resolve("main"),
+                ],
+                cwd=git.root,
+                check=True,
+            )
+        elif mismatch == "default_head":
+            record["reviewed_default_base_sha"] = integrated
+        elif mismatch == "parent_revision":
+            live_state["parent"]["revision"] = "mismatched-parent-revision"
+        elif mismatch == "graph_revision":
+            live_state["ticket_graph"]["revision"] = "mismatched-graph-revision"
+        elif mismatch == "completion_records":
+            live_state["ticket_jobs"]["2"]["effective_revision"] = (
+                "mismatched-completion-revision"
+            )
+        return promotion_record(live_state, job, integrated)
+
+    monkeypatch.setattr(engine.candidate_acceptance, "promotion_record", mismatched_promotion_record)
+    result = engine.accept(str(state["run_id"]))
+    assert applied == [mismatch]
 
     run = result["run_acceptance"]
     assert result["status"] == "run_acceptance_pending"
