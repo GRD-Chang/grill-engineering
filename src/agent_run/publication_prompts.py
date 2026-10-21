@@ -62,18 +62,25 @@ def _publication_evidence(request: dict[str, Any]) -> str:
     ci_repair = request.get("ci_repair_publication_context")
     artifact = request.get("acceptance_artifact")
     if isinstance(ci_repair, dict):
-        return resource(request, "publication/ci-repair-evidence").format(
+        evidence = resource(request, "publication/ci-repair-evidence").format(
             pretty(ci_repair)
         )
-    if isinstance(fallback, dict):
-        return (
+    elif isinstance(fallback, dict):
+        evidence = (
             resource(request, "publication/fallback-evidence").format(pretty(fallback))
         )
-    if isinstance(artifact, dict):
-        return (
+    elif isinstance(artifact, dict):
+        evidence = (
             resource(request, "publication/accepted-evidence")
             + "\n" + pretty(artifact)
         )
-    raise ValueError(
-        "Publication requires acceptance_artifact, fallback_publication_context, or ci_repair_publication_context"
-    )
+    else:
+        raise ValueError(
+            "Publication requires acceptance_artifact, fallback_publication_context, or ci_repair_publication_context"
+        )
+    feedback = request.get("human_feedback")
+    if feedback is not None:
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise ValueError("Publication human_feedback must retain the original maintainer message")
+        evidence += "\n\n" + resource(request, "context/human-response").format(pretty({"human_feedback": feedback}))
+    return evidence
