@@ -69,6 +69,13 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
         scenario.activate_final()
     assert scenario.run().kind == "complete"
     before = scenario.port.git.commit("refs/heads/run")
+    original_completions = scenario.kernel.source_status()["completions"]
+    scenario.requirements = replace(source, parent=replace(source.parent, body="Clarified overall Parent outcome."),
+                                    issues=tuple(replace(issue, title="Post-completion title edit", body="Edited after delivery")
+                                                 if issue.number == 3 else issue for issue in source.issues))
+    scenario.refresh()
+    assert scenario.kernel.source_status()["completions"] == original_completions
+    assert scenario.kernel.source_status()["blocked"] is None
     scenario.kernel = Kernel(scenario.kernel.storage.path)
     final = scenario.activate_final()
     scenario.select(final)
@@ -76,8 +83,82 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert scenario.run().kind == "approval"
     final_calls = [call for call in scenario.role_calls if call["subject"] == final]
     assert [call["role"] for call in final_calls] == ["review", "publication"]
+    context = final_calls[0]["context"]
+    assert context["requirements"][0]["body"] == "Clarified overall Parent outcome."
+    assert context["requirements"][1]["title"] == "Deliver one ticket"
+    assert context["requirements"][1]["body"] == source.issues[0].body
+    assert all(entry["review"]["artifact"]["checks"]["spec"]["status"] == "pass" for entry in context["ticket_completions"])
+    assert all(entry["development"]["artifact"]["summary"] for entry in context["ticket_completions"])
     assert len(scenario.kernel.source_status()["completions"]) == 2
     assert all(entry["tree"] for entry in scenario.kernel.source_status()["completions"])
     assert scenario.port.git.commit("refs/heads/main") != scenario.port.git.commit("refs/heads/run")
     scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
     assert scenario.run().kind == "complete"
+
+
+def independent_source() -> Requirements:
+    source = Requirements.from_wire(native_input()["initial_requirements"])
+    return replace(source, issues=tuple(replace(issue, blocked_by=()) for issue in source.issues))
+
+
+def demand_world(kernel: Kernel, subject: str) -> World:
+    state = kernel.status(subject)
+    return World(state["source_parent_revision"], kernel.source_status()["observed_graph_revision"], state["source_revision"], Commit("base", "base-tree"))
+
+
+def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(tmp_path: Path) -> None:
+    kernel, source = source_run(tmp_path / "run.sqlite3", independent_source())
+    token = kernel.claim_executor("executor")
+    first = kernel.advance("ticket:3", token, demand_world(kernel, "ticket:3")).call
+    second = kernel.advance("ticket:4", token, demand_world(kernel, "ticket:4")).call
+    assert first is not None and second is not None
+    raw = b'{"result_kind":"development","summary":"retained exact return","human_blockers":null}'
+    kernel.receive(second, raw)
+    kernel.receive(first, raw)
+    before = kernel.status("ticket:3")
+    changed = replace(source, issues=tuple(replace(issue, body=issue.body + "\nNew requirement") if issue.number == 4 else issue for issue in source.issues))
+    kernel.refresh(changed)
+    assert kernel.source_status()["blocked"] == "requeue_required"
+    assert kernel.advance("ticket:3", token, demand_world(kernel, "ticket:3")).kind == "paused"
+    old = kernel.delivery("ticket:4")
+    replacement = replace(old, source_ref="refs/heads/ticket-4-g2", checkout=str(tmp_path / "work-g2"))
+    world = demand_world(kernel, "ticket:4")
+    assert kernel.requeue("ticket:4", "exact-requeue", replacement, world) == "applied"
+    assert kernel.requeue("ticket:4", "exact-requeue", replacement, world) == "applied"
+    assert kernel.status("ticket:4")["generation"] == 2
+    assert kernel.status("ticket:4")["retired_generations"][0]["source_ref"] == old.source_ref
+    assert kernel.status("ticket:3") == before
+    assert kernel.source_status()["blocked"] is None
+    with pytest.raises(KernelError, match="action_identity_changed"):
+        kernel.requeue("ticket:4", "exact-requeue", replace(replacement, source_ref="refs/heads/foreign"), world)
+    kernel.receive(second, raw)  # Old exact raw is history only after replacement.
+    assert kernel.status("ticket:4")["pending_attempt"] is None
+    assert kernel.advance("ticket:3", token, demand_world(kernel, "ticket:3"), allow_agent=False).kind == "progress"
+    assert kernel.status("ticket:3")["budgets"]["requirements"]["developments_used"] == 1
+
+
+def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_authority(tmp_path: Path) -> None:
+    kernel, source = source_run(tmp_path / "run.sqlite3", independent_source())
+    token = kernel.claim_executor("original")
+    calls = [kernel.advance(subject, token, demand_world(kernel, subject)).call for subject in ("ticket:3", "ticket:4")]
+    kernel.control("stop", "operator-stop")
+    removed = replace(source, parent=replace(source.parent, sub_issue_numbers=(4,)), issues=(source.issues[1],))
+    kernel.refresh(removed)
+    assert kernel.source_status()["blocked"] == "unsupported_scope_change"
+    assert kernel.source_status()["stopped"] is True
+    assert kernel.source_status()["frontier"] == []
+    for call in calls:
+        assert call is not None
+        kernel.receive(call, b'{"result_kind":"development","summary":"late retained","human_blockers":null}')
+        assert kernel.status(call.subject)["pending_return"] is True
+        with pytest.raises(KernelError, match="executor_fenced"):
+            kernel.advance(call.subject, token, demand_world(kernel, call.subject))
+    kernel.refresh(source)
+    assert kernel.source_status()["blocked"] is None
+    assert kernel.source_status()["stopped"] is True
+    kernel.confirm_executor_exit(token)
+    kernel.control("resume", "explicit-resume")
+    replacement = kernel.claim_executor("replacement")
+    for subject in ("ticket:3", "ticket:4"):
+        assert kernel.advance(subject, replacement, demand_world(kernel, subject), allow_agent=False).kind == "progress"
+        assert kernel.status(subject)["budgets"]["requirements"]["developments_used"] == 1

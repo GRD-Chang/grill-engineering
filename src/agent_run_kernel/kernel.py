@@ -177,7 +177,8 @@ class Kernel:
                 revision = parent_revision if job["kind"] != DeliveryKind.TICKET else (facts[0][0] if facts else job["revision"])
                 has_work = bool(tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (job["id"], job["generation"])))
                 if has_work and (revision != job["revision"] or changed_parent):
-                    self._gate(tx, job["id"], "requeue_required")
+                    self._gate(tx, job["id"], "final_reacceptance_unimplemented" if job["kind"] == DeliveryKind.FINAL_RUN else "requeue_required")
+                    tx.execute("UPDATE subjects SET grant_id=NULL WHERE id=?", (job["id"],))
                     parent_in_use = parent_in_use or changed_parent
                 elif not has_work:
                     tx.execute("UPDATE subjects SET revision=? WHERE id=?", (revision, job["id"]))
@@ -185,7 +186,9 @@ class Kernel:
                 tx.execute("UPDATE runs SET parent_revision=?", (parent_revision,))
             if tx.rows("SELECT subject FROM gates WHERE code='requeue_required' LIMIT 1"):
                 blocked = "requeue_required"
-        managed = {None, "missing_ticket", "dependency_cycle", "unsupported_scope_change", "requeue_required"}
+            elif tx.rows("SELECT subject FROM gates WHERE code='final_reacceptance_unimplemented' LIMIT 1"):
+                blocked = "final_reacceptance_unimplemented"
+        managed = {None, "missing_ticket", "dependency_cycle", "unsupported_scope_change", "requeue_required", "final_reacceptance_unimplemented"}
         if run["blocked"] in managed:
             tx.execute("UPDATE runs SET blocked=?", (blocked,))
         owner = jobs[0]["id"]
@@ -299,6 +302,8 @@ class Kernel:
         with self.storage.transaction() as tx:
             job = self._job(tx, subject)
             run = tx.one("SELECT * FROM runs")
+            if job["kind"] == DeliveryKind.FINAL_RUN:
+                raise KernelError("final_reacceptance_required")
             prior = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
             if prior:
                 command = json.loads(tx.get(prior[0]["payload_id"], subject))
@@ -405,6 +410,11 @@ class Kernel:
                 return Step("effect", subject, effect=self._effect(tx, pending, execution))
             if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                 return Step("paused", subject, self._pause_reason(tx, subject, run))
+            optional = tx.rows("SELECT e.* FROM effects e JOIN issue_links l ON l.effect_id=e.id WHERE l.subject=? AND l.state='pending' AND e.status='prepared'", (subject,))
+            if optional:
+                if not self._current(tx, job, run, world):
+                    return Step("paused", subject, "currentness")
+                return Step("effect", subject, effect=self._effect(tx, optional[0], execution))
             if job["validation_cleanup"]:
                 if not self._current(tx, job, run, world):
                     return Step("paused", subject, "currentness")
@@ -596,9 +606,20 @@ class Kernel:
             invocation = self._invocation(tx, call)
             if invocation["dispatch_state"] in {"exited", "unavailable"}:
                 return
+            known = evidence.get("process_identity")
+            observed_exit = evidence.get("observed_exit")
+            if (invocation["process_identity"] is not None and isinstance(known, dict) and type(observed_exit) is int
+                    and wire_json(known) == tx.get(invocation["process_identity"], call.subject)):
+                self._process_exit(tx, call, invocation, observed_exit, "start_acknowledgement_unknown")
+                return
             material = tx.put(call.subject, "worker_start_unknown", wire_json(evidence))
             tx.execute("UPDATE invocations SET dispatch_state='unknown',start_evidence=? WHERE id=?", (material, call.invocation_id))
-            self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
+            run = tx.one("SELECT * FROM runs")
+            job = self._job(tx, call.subject)
+            if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
+                    and job["generation"] == invocation["generation"] and job["current_attempt"] == call.attempt_id
+                    and invocation["current_invocation"] == call.invocation_id and not self._gates(tx, call.subject)):
+                self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
 
     def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str) -> None:
         """A proven pre-launch failure pauses the allocated semantic Attempt."""
@@ -622,20 +643,23 @@ class Kernel:
             invocation = self._invocation(tx, call)
             if invocation["process_identity"] is None or json.loads(tx.get(invocation["process_identity"], call.subject)) != process_identity:
                 raise KernelError("process_identity_changed")
-            if invocation["exit_code"] is not None and invocation["exit_code"] != returncode:
-                raise KernelError("conflicting_exit")
-            tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=? WHERE id=?", (returncode, call.invocation_id))
-            tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
-            self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"])
-            if invocation["raw_id"] is None and (returncode != 0 or failure is not None):
-                material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure}))
-                tx.execute("UPDATE invocations SET status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
-                run = tx.one("SELECT * FROM runs")
-                job = self._job(tx, call.subject)
-                if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
-                        and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
-                        and invocation["current_invocation"] == call.invocation_id and job["generation"] == invocation["generation"]):
-                    self._gate(tx, call.subject, "execution_failed", evidence=material)
+            self._process_exit(tx, call, invocation, returncode, failure)
+
+    def _process_exit(self, tx: Transaction, call: AgentCall, invocation: sqlite3.Row, returncode: int, failure: str | None) -> None:
+        if invocation["exit_code"] is not None and invocation["exit_code"] != returncode:
+            raise KernelError("conflicting_exit")
+        tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=? WHERE id=?", (returncode, call.invocation_id))
+        tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+        self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"])
+        if invocation["raw_id"] is None and (returncode != 0 or failure is not None):
+            material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure}))
+            tx.execute("UPDATE invocations SET status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
+            run = tx.one("SELECT * FROM runs")
+            job = self._job(tx, call.subject)
+            if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
+                    and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
+                    and invocation["current_invocation"] == call.invocation_id and job["generation"] == invocation["generation"]):
+                self._gate(tx, call.subject, "execution_failed", evidence=material)
 
     def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
         """Read-only authority guard for each real successor mutation in an adapter."""
@@ -731,6 +755,13 @@ class Kernel:
                                 tx.execute("UPDATE attempts SET result_id=NULL,status='continuing' WHERE id=?", (job["current_attempt"],))
                         elif code in {"worker_unavailable", "execution_failed"}:
                             pass  # Explicitly continue the same charged Attempt.
+                        elif code == "worker_start_unknown":
+                            if not job["current_attempt"]:
+                                raise KernelError("worker_exit_unproven")
+                            invocation = tx.one("SELECT i.* FROM invocations i JOIN attempts a ON a.current_invocation=i.id WHERE a.id=?", (job["current_attempt"],))
+                            if invocation["dispatch_state"] != "exited" or invocation["process_identity"] is None:
+                                raise KernelError("worker_exit_unproven")
+                            tx.execute("UPDATE invocations SET status='interrupted' WHERE id=? AND raw_id IS NULL", (invocation["id"],))
                         elif code == "publication_retry_exhausted":
                             tx.execute("UPDATE effects SET attempts=0 WHERE subject=? AND status='sent'", (subject,))
                         elif code == "write_conflict":
@@ -801,11 +832,16 @@ class Kernel:
             budgets = tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,))
             pending = None if not job["current_attempt"] else tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
             observed = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+            reviewed_checkout = None
+            if job["review_attempt"]:
+                original = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))[0]
+                reviewed_checkout = json.loads(tx.get(original, subject))["checkout"]
             return {
                 "subject": subject, "kind": job["kind"], "phase": job["phase"], "purpose": job["purpose"],
                 "generation": job["generation"], "version": job["version"],
                 "revision": job["revision"], "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
                 "completion_revision": job["completion_revision"],
+                "reviewed_checkout": reviewed_checkout,
                 "source_revision": (job["revision"] if job["phase"] == "complete" or not observed else observed[0][0]),
                 "source_parent_revision": run["observed_parent_revision"] or run["parent_revision"],
                 "pending_attempt": job["current_attempt"], "pending_return": bool(pending and pending["result_id"]),

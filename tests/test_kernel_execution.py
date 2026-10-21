@@ -1,11 +1,20 @@
 """Real local processes cross the allocated-call seam, never live Agent services."""
 
 from pathlib import Path
+import json
 import os
+import select
+import signal
+import subprocess
 import sys
+from typing import Any
 
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, World
+import pytest
+
+from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
 from agent_run_kernel.execution import execute
+from agent_run_kernel.model import Requirements
+from agent_run.process_cleanup import child_subreaper
 
 
 RAW = b'{"result_kind":"development","summary":"saved local work","human_blockers":null}'
@@ -66,3 +75,199 @@ def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_p
     assert canary.read_text() == "ran\n"
     assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+def test_stopped_epoch_can_settle_its_exact_late_process_return_without_advancing(tmp_path: Path) -> None:
+    path, _, call, world = allocated(tmp_path)
+
+    class StopBeforeSettlement(Kernel):
+        def receive(self, exact_call: AgentCall, raw: bytes) -> None:
+            # execute has already observed actual process exit, but the raw
+            # transaction has not started. This is the real revocation window.
+            self.control("stop", "stop-before-raw")
+            super().receive(exact_call, raw)
+
+    kernel = StopBeforeSettlement(path)
+    result = execute(
+        kernel, call, arguments=[sys.executable, "-I", "-c", f"import sys; sys.stdout.buffer.write({RAW!r})"],
+        cwd=tmp_path, prompt="", environment={"PATH": os.defpath}, timeout=5,
+    )
+    assert result is not None and result.returncode == 0 and result.raw == RAW
+    reopened = Kernel(path)
+    status = reopened.status(call.subject)
+    assert status["stopped"] is True and status["pending_return"] is True
+    assert status["phase"] == "development" and status["candidate"] is None
+    assert status["gates"] == []
+    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert reopened.scheduling()["active"] == []
+    with pytest.raises(KernelError, match="executor_fenced"):
+        reopened.advance(call.subject, call.execution, world)
+
+
+def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tmp_path: Path) -> None:
+    path, kernel, call, world = allocated(tmp_path)
+    credential = tmp_path / "selected-worker-credential"
+    canary = tmp_path / "agent-executed"
+    arguments = [sys.executable, "-I", "-c", (
+        f"from pathlib import Path; import sys; Path({str(canary)!r}).write_text('ran'); "
+        f"sys.stdout.buffer.write({RAW!r})"
+    )]
+    assert execute(
+        kernel, call, arguments=arguments, cwd=tmp_path, prompt="",
+        environment={"PATH": os.defpath}, timeout=5, credential_file=credential,
+    ) is None
+    reopened = Kernel(path)
+    paused = reopened.status(call.subject)
+    assert paused["pending_attempt"] == call.attempt_id and paused["gates"] == ["worker_unavailable"]
+    assert paused["budgets"]["requirements"]["developments_used"] == 1
+    assert not canary.exists() and reopened.scheduling()["active"] == []
+    credential.write_text("Controlled reference availability; no online secret.")
+    reopened.control("resume", "resume-selected-identity", subject=call.subject)
+    resumed = reopened.advance(call.subject, call.execution, world)
+    assert resumed.call is not None
+    assert resumed.call.attempt_id == call.attempt_id and resumed.call.invocation_id != call.invocation_id
+    assert resumed.call.thread_id == call.thread_id
+    result = execute(
+        reopened, resumed.call, arguments=arguments, cwd=tmp_path, prompt="",
+        environment={"PATH": os.defpath}, timeout=5, credential_file=credential,
+    )
+    assert result is not None and result.returncode == 0 and result.raw == RAW
+    assert canary.read_text() == "ran"
+    assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+def test_committed_binding_response_loss_settles_actual_exit_and_resumes_same_attempt(tmp_path: Path) -> None:
+    path, _, call, world = allocated(tmp_path)
+    canary = tmp_path / "agent-starts"
+
+    class LostBindingResponse(Kernel):
+        def agent_started(self, exact_call: AgentCall, identity: dict[str, Any]) -> None:
+            super().agent_started(exact_call, identity)
+            raise OSError("The durable binding response was lost")
+
+    arguments = [sys.executable, "-I", "-c", (
+        f"from pathlib import Path; import sys; Path({str(canary)!r}).open('a').write('ran\\n'); "
+        f"sys.stdout.buffer.write({RAW!r})"
+    )]
+    with pytest.raises(OSError, match="binding response"):
+        execute(LostBindingResponse(path), call, arguments=arguments, cwd=tmp_path, prompt="",
+                environment={"PATH": os.defpath}, timeout=5)
+    reopened = Kernel(path)
+    assert not canary.exists()
+    assert any(event["kind"] == "worker_started" and event["identity"] == call.invocation_id
+               for event in reopened.history(call.subject))
+    assert reopened.scheduling()["active"] == []
+    assert reopened.status(call.subject)["gates"] == ["execution_failed"]
+    reopened.control("resume", "resume-after-exact-exit", subject=call.subject)
+    resumed = reopened.advance(call.subject, call.execution, world).call
+    assert resumed is not None and resumed.attempt_id == call.attempt_id
+    assert resumed.invocation_id != call.invocation_id
+    result = execute(reopened, resumed, arguments=arguments, cwd=tmp_path, prompt="",
+                     environment={"PATH": os.defpath}, timeout=5)
+    assert result is not None and result.returncode == 0
+    assert canary.read_text() == "ran\n"
+    assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork") or not hasattr(os, "pidfd_open"), reason="requires Linux pidfd/fork")
+def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(tmp_path: Path) -> None:
+    path, kernel, call, _ = allocated(tmp_path)
+    canary = tmp_path / "forbidden-agent-work"
+    read_fd, write_fd = os.pipe()
+    arguments = [sys.executable, "-I", "-c", f"from pathlib import Path; Path({str(canary)!r}).write_text('ran')"]
+    with child_subreaper():
+        executor: int | None = os.fork()
+        if executor == 0:
+            os.close(read_fd)
+
+            class HeldBinding(Kernel):
+                def agent_started(self, exact_call: AgentCall, identity: dict[str, Any]) -> None:
+                    os.write(write_fd, str(identity["pid"]).encode("ascii"))
+                    os.close(write_fd)
+                    signal.pause()
+
+            try:
+                execute(HeldBinding(path), call, arguments=arguments, cwd=tmp_path, prompt="",
+                        environment={"PATH": os.defpath}, timeout=5)
+            finally:
+                os._exit(0)
+        os.close(write_fd)
+        unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
+        worker, pidfd = None, None
+        try:
+            assert select.select([read_fd], [], [], 5)[0] == [read_fd]
+            worker = int(os.read(read_fd, 32))
+            pidfd = os.pidfd_open(worker)
+            assert execute(kernel, call, arguments=arguments, cwd=tmp_path, prompt="",
+                           environment={"PATH": os.defpath}, timeout=5) is None
+            assert len(kernel.scheduling()["active"]) == 1
+            assert executor is not None
+            os.kill(executor, signal.SIGKILL)
+            os.waitpid(executor, 0)
+            executor = None
+            assert select.select([pidfd], [], [], 5)[0] == [pidfd]
+            assert not canary.exists() and unrelated.poll() is None
+            os.waitpid(worker, 0)
+            worker = None
+            # Actual exit is proved to this observer, but no forged Kernel
+            # confirmation or second dispatch may clear the original lease.
+            assert len(Kernel(path).scheduling()["active"]) == 1
+            assert Kernel(path).status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+        finally:
+            os.close(read_fd)
+            if executor is not None:
+                try:
+                    os.kill(executor, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(executor, 0)
+            if pidfd is not None:
+                if not select.select([pidfd], [], [], 0)[0]:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                os.close(pidfd)
+            if worker is not None:
+                os.waitpid(worker, 0)
+            unrelated.kill()
+            unrelated.wait(timeout=3)
+
+
+def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) -> None:
+    source_path = tmp_path / "requirements.json"
+    source = {"parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issue_numbers": []}, "issues": []}
+    source_path.write_text(json.dumps(source))
+    requirements = Requirements.from_wire(json.loads(source_path.read_text()))
+    base = Commit("base", "base-tree")
+    spec = RunSpec("source-process", "example/repository", 1, "read-source", "read-graph", (
+        Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "read-source", base,
+                 "refs/heads/task", "refs/heads/main", checkout=str(tmp_path)),
+    ))
+    kernel = Kernel.create(tmp_path / "kernel.sqlite3", spec, requirements=requirements)
+    execution = kernel.claim_executor("source-executor")
+    status = kernel.source_status()
+    delivery = kernel.delivery("parent:1")
+    world = World(status["parent_revision"], status["graph_revision"], delivery.revision, base)
+    call = kernel.advance("parent:1", execution, world).call
+    assert call is not None
+    canary = tmp_path / "stale-agent-ran"
+    reads = 0
+
+    def refresh_source() -> None:
+        nonlocal reads
+        kernel.refresh(Requirements.from_wire(json.loads(source_path.read_text())))
+        reads += 1
+        if reads == 1:
+            source["parent"]["body"] = "Requirement changed while the bootstrap was blocked"
+            source_path.write_text(json.dumps(source))
+
+    with pytest.raises(KernelError):
+        execute(
+            kernel, call, arguments=[sys.executable, "-I", "-c", f"from pathlib import Path; Path({str(canary)!r}).write_text('ran')"],
+            cwd=tmp_path, prompt="", environment={"PATH": os.defpath}, timeout=5,
+            authorize_source=refresh_source,
+        )
+    assert reads == 2 and not canary.exists()
+    paused = Kernel(tmp_path / "kernel.sqlite3").status(call.subject)
+    assert paused["gates"] == ["requeue_required"]
+    assert paused["phase"] == "development" and paused["pending_return"] is False
+    assert paused["budgets"]["requirements"]["developments_used"] == 1
+    assert kernel.scheduling()["active"] == []

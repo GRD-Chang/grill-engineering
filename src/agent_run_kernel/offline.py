@@ -13,6 +13,7 @@ import sqlite3
 from typing import Any, Callable, Mapping, Sequence
 
 from .effects import LocalGit
+from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_worktree
 from .kernel import Kernel
 from .model import (AgentCall, Checks, Commit, Delivery, DeliveryKind, Effect, EffectResult,
                     KernelError, Policy, PullRequest, Requirements, Role, RunSpec, Step, World, wire_json)
@@ -38,9 +39,9 @@ def _pr(data: dict[str, Any]) -> PullRequest:
 
 class OfflinePort:
     def __init__(self, root: Path) -> None:
-        self.root = root
-        self.git = LocalGit(root / "authority")
-        self.database = root / "remote.sqlite3"
+        self.root = root.resolve()
+        self.git = LocalGit(self.root / "authority")
+        self.database = self.root / "remote.sqlite3"
         self.lose_response: set[str] = set()
         self.force_read: dict[str, str] = {}
 
@@ -72,6 +73,8 @@ class OfflinePort:
                 CREATE TABLE writes(position INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT,subject TEXT,intent TEXT,facts BLOB);
                 CREATE TABLE closed(issue INTEGER PRIMARY KEY,intent TEXT,actor TEXT,merge_sha TEXT);
                 CREATE TABLE comments(intent TEXT PRIMARY KEY,issue INTEGER,actor TEXT,body BLOB);
+                CREATE TABLE refs(ref TEXT PRIMARY KEY,sha TEXT NOT NULL);
+                CREATE TABLE links(issue INTEGER PRIMARY KEY,ref TEXT NOT NULL,sha TEXT NOT NULL,intent TEXT NOT NULL);
             """)
         return port
 
@@ -92,11 +95,15 @@ class OfflinePort:
             self.git.run("switch", "main")
         self.git.run("update-ref", source_ref, source.sha)
         self.git.run("update-ref", target_ref, base.sha)
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (source_ref, source.sha))
+            db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (target_ref, base.sha))
         checkout = self.root / "work" / key.replace(":", "-")
         checkout.parent.mkdir(exist_ok=True)
         self.git.run("worktree", "add", "--detach", str(checkout), source.sha)
         delivery = Delivery(key, kind, ticket_number if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
-                            source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout))
+                            source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout),
+                            owned_root=str(checkout.parent.resolve()), common_git_dir=str((self.git.root / ".git").resolve()))
         spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy())
         return spec, delivery
 
@@ -106,6 +113,8 @@ class OfflinePort:
         if row is None:
             return None
         pr = _pr(json.loads(row[0]))
+        if pr.state == "MERGED":
+            return pr
         # GitHub's base/head are live remote facts, not frozen intent fields.
         return PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref,
                            self.git.commit(pr.source_ref), self.git.commit(pr.target_ref), pr.title, pr.body,
@@ -118,11 +127,31 @@ class OfflinePort:
             details = () if checks_result == "none" else (("required", checks_result),)
             checks = Checks(pr.number, pr.head.sha, checks_result, details,
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
+        source = self.ref_commit(delivery.source_ref)
+        target = self.git.commit(delivery.target_ref)
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
-                     self.git.commit(delivery.target_ref), self.git.commit(delivery.source_ref), pr, checks,
+                     target, source, pr, checks,
                      delivery.completion_revision,
-                     ((self.git.commit(delivery.target_ref).sha, self.git.commit(delivery.source_ref).sha),)
-                     if self.git.is_ancestor(self.git.commit(delivery.target_ref).sha, self.git.commit(delivery.source_ref).sha) else ())
+                     ((target.sha, source.sha),) if source is not None and self.git.is_ancestor(target.sha, source.sha) else ())
+
+    def ref_commit(self, ref: str) -> Commit | None:
+        result = self.git.run("show-ref", "--verify", "--hash", ref, check=False)
+        if result.returncode == 1:
+            return None
+        if result.returncode != 0:
+            raise KernelError("ref_read_failed")
+        return self.git.commit(result.stdout.strip())
+
+    def remote_refs(self) -> dict[str, str]:
+        with sqlite3.connect(self.database) as db:
+            return dict(db.execute("SELECT ref,sha FROM refs ORDER BY ref"))
+
+    def _remote_cas(self, ref: str, before: str, after: str) -> None:
+        with sqlite3.connect(self.database) as db:
+            row = db.execute("SELECT sha FROM refs WHERE ref=?", (ref,)).fetchone()
+            if row is not None and row[0] not in {before, after}:
+                raise KernelError("remote_compare_and_swap")
+            db.execute("INSERT INTO refs VALUES (?,?) ON CONFLICT(ref) DO UPDATE SET sha=excluded.sha", (ref, after))
 
     def _write_pr(self, subject: str, pr: PullRequest) -> None:
         with sqlite3.connect(self.database) as db:
@@ -133,7 +162,7 @@ class OfflinePort:
         with sqlite3.connect(self.database) as db:
             db.execute("INSERT OR REPLACE INTO receipts VALUES (?,?)", (effect.effect_id, wire_json(asdict(result))))
 
-    def execute(self, effect: Effect, authorize: Callable[[], None] | None = None) -> None:
+    def execute(self, effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
         operation = effect.operation
         payload = effect.payload
         git = LocalGit(self.git.root, authorize)
@@ -142,8 +171,27 @@ class OfflinePort:
         pr: PullRequest | None = None
         expected: str | None = None
         raw: dict[str, Any] = {}
+        outcome: EffectResult | None = None
         try:
-            if operation == "workspace":
+            if operation == "cleanup_worktree":
+                outcome = cleanup_worktree(git, effect)
+            elif operation == "cleanup_local_ref":
+                outcome = cleanup_local_ref(git, effect)
+            elif operation == "cleanup_remote_ref":
+                outcome = self._inspect_remote_cleanup(effect)
+                if outcome.disposition == "prior":
+                    if authorize is not None:
+                        authorize()
+                    with sqlite3.connect(self.database) as db:
+                        db.execute("DELETE FROM refs WHERE ref=? AND sha=?", (payload["branch_ref"], payload["expected_head"]))
+                    outcome = self._inspect_remote_cleanup(effect)
+            elif operation == "issue_link":
+                if authorize is not None:
+                    authorize()
+                with sqlite3.connect(self.database) as db:
+                    db.execute("INSERT OR IGNORE INTO links VALUES (?,?,?,?)", (payload["issue"], payload["ref"], payload["source_head"], effect.effect_id))
+                outcome = EffectResult("target", raw={"acknowledged_status": "linked"})
+            elif operation == "workspace":
                 checkout = Path(payload["checkout"])
                 if payload["create_ref"]:
                     existing = git.run("show-ref", "--verify", "--hash", effect.source_ref, check=False)
@@ -198,6 +246,7 @@ class OfflinePort:
                 if effect.after_sha is None:
                     raise KernelError("missing_write_target")
                 git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                self._remote_cas(effect.source_ref, effect.before_sha, effect.after_sha)
                 commit = git.commit(effect.after_sha)
             elif operation == "pr_write":
                 if authorize is not None:
@@ -217,6 +266,7 @@ class OfflinePort:
                     raise KernelError("merge_compare_and_swap")
                 commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
                 git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
+                self._remote_cas(effect.target_ref, effect.before_sha, commit.sha)
                 pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
                                  pr.title, pr.body, "MERGED", effect.actor, commit)
                 self._write_pr(effect.subject, pr)
@@ -241,13 +291,23 @@ class OfflinePort:
                 raise
             self._receipt(effect, EffectResult("failure", raw={"code": error.code, "evidence": str(error)}))
             return
-        self._receipt(effect, EffectResult("target", commit, expected, pr, raw))
+        result = outcome or EffectResult("target", commit, expected, pr, raw)
+        self._receipt(effect, result)
         with sqlite3.connect(self.database) as db:
             db.execute("INSERT INTO writes(operation,subject,intent,facts) VALUES (?,?,?,?)",
                        (operation, effect.subject, effect.effect_id, wire_json({"before": effect.before_sha, "after": effect.after_sha})))
         if operation in self.lose_response:
             self.lose_response.remove(operation)
             raise LostResponse(f"{operation} took effect; response lost")
+        return result
+
+    def _inspect_remote_cleanup(self, effect: Effect) -> EffectResult:
+        if effect.operation != "cleanup_remote_ref" or effect.payload["branch_ref"] != effect.source_ref:
+            return EffectResult("third")
+        with sqlite3.connect(self.database) as db:
+            row = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
+        return EffectResult("target" if row is None else "prior" if row[0] == effect.payload["expected_head"] else "third",
+                            raw={"observed_head": None if row is None else row[0]})
 
     def _validation_identity(self, git: LocalGit, checkout: Path, expected: str | None = None) -> None:
         if checkout.parent != self.root / "work" or not checkout.name.startswith("review-"):
@@ -261,9 +321,20 @@ class OfflinePort:
         if effect.operation in self.force_read:
             return EffectResult(self.force_read[effect.operation])
         operation = effect.operation
+        if operation == "cleanup_worktree":
+            return inspect_worktree(self.git, effect)
+        if operation == "cleanup_local_ref":
+            return inspect_local_ref(self.git, effect)
+        if operation == "cleanup_remote_ref":
+            return self._inspect_remote_cleanup(effect)
+        if operation == "issue_link":
+            with sqlite3.connect(self.database) as db:
+                row = db.execute("SELECT ref,sha,intent FROM links WHERE issue=?", (effect.payload["issue"],)).fetchone()
+            return EffectResult("target" if row == (effect.payload["ref"], effect.payload["source_head"], effect.effect_id) else "prior" if row is None else "third")
         if operation in {"push", "run_branch"}:
             actual = self.git.commit(effect.source_ref)
-            return EffectResult("target" if actual.sha == effect.after_sha else "prior" if actual.sha == effect.before_sha else "third", commit=actual)
+            remote = self.remote_refs().get(effect.source_ref)
+            return EffectResult("target" if actual.sha == remote == effect.after_sha else "prior" if actual.sha == effect.before_sha and remote in {None, effect.before_sha} else "third", commit=actual)
         if operation == "pr_write":
             pr = self.pull_request(effect.subject)
             if pr is None:
@@ -325,7 +396,18 @@ class OfflinePort:
         if candidate.sha == before.sha:
             candidate = self.git.make_commit(before.tree, (before.sha,), "external append " + token)
         self.git.compare_and_swap(ref, before.sha, candidate.sha)
+        if ref in self.remote_refs():
+            self._remote_cas(ref, before.sha, candidate.sha)
         self.git.run("worktree", "remove", str(checkout))
+        return candidate
+
+    def external_remote_append(self, ref: str, files: Mapping[str, str], token: str) -> Commit:
+        before = self.remote_refs()[ref]
+        temporary = "refs/heads/remote-actor-" + token
+        self.git.run("update-ref", temporary, before)
+        candidate = self.external_append(temporary, files, token)
+        self.git.run("update-ref", "-d", temporary, candidate.sha)
+        self._remote_cas(ref, before, candidate.sha)
         return candidate
 
 
@@ -416,11 +498,15 @@ class Scenario:
             effect = step.effect
             if self.kernel.dispatch(effect, self.execution, self.world()):
                 try:
-                    self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
+                    acknowledgement = self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
                 except LostResponse:
                     pass
                 else:
-                    self.kernel.reconcile(effect, self.port.reconcile(effect), self.execution, self.world())
+                    if effect.operation == "issue_link":
+                        if acknowledgement is not None:
+                            self.kernel.acknowledge_link(effect, acknowledgement)
+                    else:
+                        self.kernel.reconcile(effect, self.port.reconcile(effect), self.execution, self.world())
         elif step.kind == "reconcile" and step.effect is not None:
             self.kernel.reconcile(step.effect, self.port.reconcile(step.effect), self.execution, self.world())
         self.checkpoints.append(self.kernel.status(self.delivery.key))
@@ -434,8 +520,19 @@ class Scenario:
             if step.kind == "approval" and approve:
                 self.kernel.control("approve", f"approval-{self.publication_count}", subject=self.delivery.key, world=self.world())
             elif step.kind in {"complete", "paused", "approval", "waiting"}:
+                if step.kind == "complete":
+                    self.cleanup()
                 return step
         raise AssertionError("offline driver failed to reach a stable observable boundary")
+
+    def cleanup(self, *, max_steps: int = 16) -> Step:
+        for _ in range(max_steps):
+            step = self.kernel.advance_cleanup(self.delivery.key, self.execution, self.world())
+            self.handle(step)
+            current = self.kernel.status(self.delivery.key)["resource_cleanup"]
+            if step.kind in {"complete", "paused", "waiting"} or (current and current["outcome"] in {"third", "unknown"}):
+                return step
+        return Step("waiting", self.delivery.key, "cleanup_pending")
 
     def trace(self) -> dict[str, Any]:
         return {"role_calls": self.role_calls, "checkpoints": self.checkpoints,
@@ -464,7 +561,9 @@ class Scenario:
         refs = {}
         import hashlib
         for name, ref in (("source", self.delivery.source_ref), ("target", self.delivery.target_ref)):
-            commit = self.port.git.commit(ref)
+            commit = self.port.ref_commit(ref)
+            if commit is None:
+                continue
             paths = self.port.git.run("ls-tree", "-r", "--name-only", commit.sha).stdout.splitlines()
             refs[name] = {"sha": commit.sha, "tree": commit.tree, "parents": list(self.port.git.parents(commit.sha)),
                           "files": {path: hashlib.sha256(self.port.git.run("show", f"{commit.sha}:{path}").stdout.encode()).hexdigest() for path in paths}}
@@ -508,6 +607,7 @@ class Scenario:
         with sqlite3.connect(self.port.database) as db:
             closed = db.execute("SELECT issue,intent,actor,merge_sha FROM closed ORDER BY issue").fetchall()
             comments = db.execute("SELECT intent,issue,actor,body FROM comments ORDER BY rowid").fetchall()
+            linked = db.execute("SELECT issue,ref,sha,intent FROM links ORDER BY issue").fetchall()
         mutations: list[dict[str, Any]] = []
         for _, issue, _, raw in comments:
             body = json.loads(raw)
@@ -516,8 +616,29 @@ class Scenario:
         for issue, _, _, merge_sha in closed:
             mutations.append({"action": "close_issue", "ticket_number": issue,
                               "pr_number": pr.number, "integrated_sha": head_identity(merge_sha)})
+        for write in self.port.writes():
+            if write["operation"] == "cleanup_remote_ref" and self.delivery.source_ref not in self.port.remote_refs():
+                mutations.append({"action": "delete_managed_branch", "branch": "ticket"})
         current = self.kernel.status(self.delivery.key)
         projected = self.observable(script["id"], Step("complete", self.delivery.key))
+        display_attempts = [{"issue_number": issue, "branch": "ticket" if ref == self.delivery.source_ref else ref,
+                             "head_sha": head_identity(head)} for issue, ref, head, _ in linked]
+        context_paths = {"development": self.delivery.checkout, "review": current["reviewed_checkout"], "publication": self.delivery.checkout}
+        listing = self.port.git.run("worktree", "list", "--porcelain", "-z").stdout
+        registry = listing.split("\0")
+        registered = []
+        for block in listing.split("\0\0"):
+            fields = block.split("\0")
+            if not fields[0].startswith("worktree "):
+                continue
+            path = fields[0][len("worktree "):]
+            values = dict(field.split(" ", 1) for field in fields[1:] if " " in field)
+            branch = values.get("branch")
+            registered.append({"path": path, "repository": Path(path) == self.port.git.root,
+                               "checkout_roles": [role for role, checkout in context_paths.items() if checkout == path],
+                               "exists": Path(path).exists(), "head": head_identity(values["HEAD"]),
+                               "branch": None if branch is None else {self.delivery.source_ref: "ticket", self.delivery.target_ref: "run", "refs/heads/main": "main"}.get(branch, branch),
+                               "detached": "detached" in fields, "prunable": values.get("prunable")})
         return {"schema": "kernel-neutral-ticket-observation/1", "input_sha256": input_digest,
                 "implementation": "independent-kernel-exploration", "cut": script["cut"],
                 "roles": projected["role_calls"], "raw_backend_calls": {"development": self.development_count,
@@ -526,13 +647,19 @@ class Scenario:
                 "approval_required": False, "budget": {"initial_development": current["budgets"]["requirements"]["developments_used"],
                     "initial_review": current["budgets"]["requirements"]["reviews_used"]},
                 "commits": {name: actual_commit(head) for name, head in heads.items()}, "local_refs": refs,
-                "published_refs": {name: head for name, head in refs.items() if name in {"ticket", "run"}},
+                "published_refs": {{self.delivery.source_ref: "ticket", self.delivery.target_ref: "run"}.get(ref, ref): head_identity(head)
+                                   for ref, head in self.port.remote_refs().items() if ref in {self.delivery.source_ref, self.delivery.target_ref}},
                 "pull_request": {"title": pr.title, "body": pr.body, "state": pr.state,
                                  "primary_ticket": self.delivery.issue},
                 "closed_issues": [row[0] for row in closed], "mutations": mutations,
+                "native_branch_display": {"observed": True, "calls": [{**attempt, "result": "linked"} for attempt in display_attempts],
+                                          "fixture_attempts": display_attempts, "linked_branches": {str(issue): "ticket" if ref == self.delivery.source_ref else ref for issue, ref, _, _ in linked},
+                                          "durable_outcome": {"display_attempted": current["issue_link"] is not None,
+                                                              "status": None if current["issue_link"] is None else current["issue_link"]["state"]}},
+                "post_close_worktrees": {"observed": True, "registrations": registered,
+                                         "role_checkouts": {role: {"observed": True, "path": path, "exists": Path(path).exists(), "registered": f"worktree {path}" in registry} for role, path in context_paths.items()}},
                 "publication_wire": script["agents"]["publication"][0], "cross_architecture_compared": False,
-                "known_gaps": ["Ticket source branch and development checkout are retained after completion; no managed cleanup effect yet",
-                               "Native GitHub Issue branch linking is not implemented by the synthetic remote adapter"],
+                "known_gaps": ["GitHub Issue branch linking uses a persistent synthetic remote, not the native online API"],
                 "raw_effects": self.port.writes()}
 
 
@@ -550,14 +677,15 @@ class GraphScenario(Scenario):
         work = (root / "work").resolve()
         work.mkdir()
         deliveries = []
+        common = str((self.port.git.root / ".git").resolve())
         for number in requirements.parent.sub_issue_numbers:
             source_ref = f"refs/heads/ticket-{number}"
             checkout = work / f"ticket-{number}"
             self.port.git.run("update-ref", source_ref, base.sha)
             self.port.git.run("worktree", "add", "--detach", str(checkout), base.sha)
-            deliveries.append(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "untrusted", base, source_ref, run_ref, checkout=str(checkout)))
+            deliveries.append(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "untrusted", base, source_ref, run_ref, checkout=str(checkout), owned_root=str(work), common_git_dir=common))
         final = Delivery("final:1", DeliveryKind.FINAL_RUN, requirements.parent.number, "untrusted", base,
-                         run_ref, "refs/heads/main", checkout=str(work / "final-1"))
+                         run_ref, "refs/heads/main", checkout=str(work / "final-1"), owned_root=str(work), common_git_dir=common)
         deliveries.append(final)
         self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy())
         self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=requirements)
@@ -600,6 +728,7 @@ class GraphScenario(Scenario):
     def agent(self, call: AgentCall) -> bytes:
         raw = super().agent(call)
         self.role_calls[-1]["subject"] = call.subject
+        self.role_calls[-1]["context"] = dict(call.context)
         return raw
 
     def activate_final(self) -> str:
