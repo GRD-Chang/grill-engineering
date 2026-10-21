@@ -232,7 +232,7 @@ class OfflinePort:
                                 raise
                             raw = git.conflict_checkout(Path(payload["checkout"]), target)
                             self._receipt(effect, EffectResult("failure", commit=self.git.commit(str(raw["head"])), raw=raw))
-                            return
+                            return None
                         git.install_checkout(Path(payload["checkout"]), commit.sha)
                 expected = commit.tree
                 raw = {"parents": git.parents(commit.sha)}
@@ -290,7 +290,7 @@ class OfflinePort:
             if operation not in {"candidate", "integrate"}:
                 raise
             self._receipt(effect, EffectResult("failure", raw={"code": error.code, "evidence": str(error)}))
-            return
+            return None
         result = outcome or EffectResult("target", commit, expected, pr, raw)
         self._receipt(effect, result)
         with sqlite3.connect(self.database) as db:

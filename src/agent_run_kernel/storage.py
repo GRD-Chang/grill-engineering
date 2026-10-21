@@ -26,7 +26,7 @@ SCHEMA = """
 CREATE TABLE meta (protocol TEXT NOT NULL);
 CREATE TABLE runs (
  id TEXT PRIMARY KEY, repository TEXT NOT NULL, parent_issue INTEGER NOT NULL,
- parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
+ parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, accepted_parent_revision TEXT NOT NULL,
  concurrency INTEGER NOT NULL CHECK(concurrency>0), policy BLOB NOT NULL,
  executor TEXT, epoch INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0,
  final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT,

@@ -50,9 +50,9 @@ class Kernel:
                     raise KernelError("delivery_scope")
                 if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
                     raise KernelError("final_target_required")
-            tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,concurrency,policy) VALUES (?,?,?,?,?,?,?)",
+            tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy) VALUES (?,?,?,?,?,?,?,?)",
                        (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
-                        spec.graph_revision, spec.policy.concurrency, wire_json(asdict(spec.policy))))
+                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(asdict(spec.policy))))
             for delivery in spec.deliveries:
                 if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
                     tx.execute("INSERT INTO final_target VALUES (?,?,?,?,?,?)", (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout, delivery.owned_root, delivery.common_git_dir))
@@ -237,11 +237,26 @@ class Kernel:
                     continue
                 if reason is not None:
                     remaining[job["id"]] = reason
-                elif not run["blocked"] and not run["stopped"] and not self._gates(tx, job["id"]):
-                    frontier.append(job["id"])
+                else:
+                    gates = self._gates(tx, job["id"])
+                    if gates:
+                        remaining[job["id"]] = gates[0]["code"]
+                    elif not run["blocked"] and not run["stopped"]:
+                        frontier.append(job["id"])
             final = next((job["id"] for job in jobs if job["kind"] == DeliveryKind.FINAL_RUN), None)
+            summary: dict[str, Any] = {}
+            if run["source_sequence"] is not None:
+                accepted = json.loads(tx.one("SELECT body FROM source_observations ORDER BY sequence LIMIT 1")[0])
+                observed = json.loads(tx.one("SELECT body FROM source_observations WHERE sequence=?", (run["source_sequence"],))[0])
+                old_members, new_members = set(accepted["parent"]["sub_issue_numbers"]), set(observed["parent"]["sub_issue_numbers"])
+                old_edges = {(issue["number"], blocker["number"]) for issue in accepted["issues"] for blocker in issue["blocked_by"] if issue["number"] in old_members}
+                new_edges = {(issue["number"], blocker["number"]) for issue in observed["issues"] for blocker in issue["blocked_by"] if issue["number"] in new_members}
+                summary = {"added_tickets": sorted(new_members - old_members), "removed_tickets": sorted(old_members - new_members),
+                           "added_dependencies": [{"ticket_number": number, "blocked_by": blocker} for number, blocker in sorted(new_edges - old_edges)],
+                           "removed_dependencies": [{"ticket_number": number, "blocked_by": blocker} for number, blocker in sorted(old_edges - new_edges)]}
             return {"frontier": frontier, "remaining": remaining, "blocked": run["blocked"], "stopped": bool(run["stopped"]),
                     "parent_revision": run["parent_revision"], "observed_parent_revision": run["observed_parent_revision"],
+                    "accepted_parent_revision": run["accepted_parent_revision"], "graph_change_summary": summary,
                     "graph_revision": run["graph_revision"], "observed_graph_revision": run["observed_graph_revision"],
                     "observation": run["source_sequence"], "final_subject": final,
                     "completions": [dict(row) for row in tx.rows("SELECT * FROM completions ORDER BY subject,generation")]}
