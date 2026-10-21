@@ -20,7 +20,6 @@ from agent_run.parent_integration import (
     finish_parent_snapshot_conflict,
     prepare_parent_snapshot,
 )
-from agent_run.parent_only_integration import prepare_parent_integration
 from agent_run.parent_delivery_loop import ParentDeliveryAdapter
 from agent_run.review_budget import new_budget
 from support.cli import load_only_run_state, run_internal_stage, stdout_json
@@ -222,16 +221,16 @@ def test_parent_only_new_combination_preserves_initial_work_budget(
         "modification_attempts": 1,
         "validation_attempts": 1,
     }
-    state = {"policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
+    state = {"run_id": "parent-run", "base": {"branch": "main"},
+             "policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
     job["effective_revision"] = "revision"
-    stage = SimpleNamespace(
-        git=git, github=github,
-        contract=SimpleNamespace(branch="parent", base_branch="main"),
-        adapter=ParentDeliveryAdapter(git, github),
-        save=lambda _state: None,
+    job["parent_branch"] = "parent"
+    work = DevelopmentReview(
+        git=git, github=github, agents=None,
+        states=SimpleNamespace(save_run=lambda *_args: None),
     )
 
-    assert prepare_parent_integration(stage, state, job, git_repo) is False
+    assert work.integrate_parent_candidate(state, job, git_repo) is False
     assert job["phase"] == "candidate"
     assert job["base_sha"] == target
     assert job["candidate_sha"] == job["parent_integration"]["head_sha"]
@@ -259,17 +258,17 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
         "review_budget_history": [],
         "modification_attempts": 1, "validation_attempts": 1,
     }
-    state = {"policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
+    state = {"run_id": "parent-run", "base": {"branch": "main"},
+             "policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
     job["effective_revision"] = "revision"
-    stage = SimpleNamespace(
-        git=git, github=github,
-        contract=SimpleNamespace(branch="parent", base_branch="main"),
-        adapter=ParentDeliveryAdapter(git, github),
-        save=lambda _state: None,
+    job["parent_branch"] = "parent"
+    work = DevelopmentReview(
+        git=git, github=github, agents=None,
+        states=SimpleNamespace(save_run=lambda *_args: None),
     )
-    assert prepare_parent_integration(stage, state, job, git_repo) is False
+    assert work.integrate_parent_candidate(state, job, git_repo) is False
     assert job["parent_integration_stage"] is True
-    assert prepare_parent_integration(stage, state, job, git_repo) is True
+    assert work.integrate_parent_candidate(state, job, git_repo) is True
     first_window = job["review_budget"]["window"]
     first_head = job["candidate_sha"]
     ci_candidate = _commit(git_repo, "ci-fix.txt", "fixed\n")
@@ -284,7 +283,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
     ci_budget = {"window": 1, "developments_used": 1}
     job["ci_recovery"] = ci_budget
 
-    assert prepare_parent_integration(stage, state, job, git_repo) is False
+    assert work.integrate_parent_candidate(state, job, git_repo) is False
     assert job["phase"] == "candidate"
     assert job["review_budget"]["window"] == first_window
     assert job["integration_resync"]["used"] == 1
@@ -293,7 +292,7 @@ def test_parent_ci_candidate_integrates_moving_default_before_its_review(
     assert job["candidate_sha"] == record["head_sha"]
     assert job["base_sha"] == target
     assert all(git.is_ancestor(sha, record["head_sha"]) for sha in (ci_candidate, target))
-    assert prepare_parent_integration(stage, state, job, git_repo) is True
+    assert work.integrate_parent_candidate(state, job, git_repo) is True
     assert job["review_budget"]["window"] == first_window
 
 

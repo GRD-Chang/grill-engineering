@@ -5,30 +5,40 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent_run.change_delivery_publication_agent import invocation_boundary
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.ci_recovery_budget import new_ticket_ci_recovery_budget
 from agent_run.controller import Controller
+from agent_run.development_review import DevelopmentReview
+from agent_run.run_candidate_acceptance import CandidateRunAcceptance
+from agent_run.run_repair_currentness import RunRepairCurrentness
+from agent_run.run_currentness import ticket_completion_records
 from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.parent_only_integration import resolve_parent_conflict
-from agent_run.review_budget import new_budget, policy_for_subject
+from agent_run.review_budget import new_budget
 from agent_run.revisions import effective_revision
 from support.run_artifacts import _passing_artifact
+from support.run_scenarios import _completed_run
 from agent_run.object_state import object_store
 from agent_run.state import StateStore
-from agent_run.ticket_integration import _resolve_conflict
 from support.delivery_agents import issue
 from support.seeding import write_fixture
 from support.state import persist_run_fixture
 
 
 def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, state_root: Path | None = None) -> tuple[dict[str, Any], StateStore, dict[str, Any], Any]:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)} if kind == "ticket" else {})
-    store = StateStore(state_root or git_repo / ".agent-run")
-    git = GitRepository(git_repo)
-    state, _ = Controller(FixtureGitHubReader(fixture), git, store).start(1)
-    base = git.resolve("HEAD")
+    if kind == "run_repair":
+        # A Run Repair belongs to the completed Ticket Run, with its real Run
+        # ref and completion facts; an empty graph selects Parent-only delivery.
+        state, store, git = _completed_run(git_repo, state_root=state_root)
+        fixture = git_repo / "github.json"
+        base = git.resolve(str(state["run_branch"]))
+    else:
+        fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)} if kind == "ticket" else {})
+        store = StateStore(state_root or git_repo / ".agent-run")
+        git = GitRepository(git_repo)
+        state, _ = Controller(FixtureGitHubReader(fixture), git, store).start(1)
+        base = git.resolve("HEAD")
     common = dict(phase=phase, base_sha=base, candidate_sha=base,
                   modification_attempts=1, development_thread_id="conflict-thread")
     budgets = dict(
@@ -66,12 +76,12 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
             )]
         state["active_ticket_job"] = job
         state["ticket_integration_holder"] = 3 if phase == "accepted" else None
-        subject = "ticket:3"
         key = "integration_conflict"
     elif kind == "parent_only":
         job = common
         job["parent_generation"] = 1
         job["parent_branch"] = "parent"
+        job["effective_revision"] = state["parent"]["revision"]
         job["policy_snapshot"] = dict(state["policy_snapshot"])
         if phase == "candidate":
             job["parent_integration"] = dict(
@@ -80,17 +90,22 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
                 head_tree=git.resolve(f"{base}^{{tree}}"), conflict_paths=[],
             )
         state["parent_job"] = job
-        subject = f"parent-only:{state['run_id']}"
         key = "parent_integration_conflict"
     else:
         job = common
-        job.update(repair_generation=1, repair_mode="squash", policy_snapshot=dict(state["policy_snapshot"]))
+        job.update(
+            repair_generation=1, repair_attempt=1, repair_branch="run-repair",
+            repair_mode="squash", policy_snapshot=dict(state["policy_snapshot"]),
+            default_base_sha=state["base"]["sha"],
+            parent_revision=state["parent"]["revision"],
+            ticket_graph_revision=state["ticket_graph"]["revision"],
+            ticket_completion_records=ticket_completion_records(state),
+        )
         state["run_acceptance"] = dict(phase="repairing", repair_job=job,
             reviewer_thread_ids=[], development_thread_history=[],
             policy_snapshot=dict(state["policy_snapshot"]),
             **budgets,
             repair_integration_budgets={"1": {"policy_snapshot": dict(state["policy_snapshot"])}})
-        subject = f"run-repair:{state['run_id']}"
         key = "run_repair_integration_conflict"
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,
                     stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0,
@@ -98,26 +113,24 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     persist_run_fixture(store, str(state["run_id"]), state)
     scoped = object_store(store, parent_scope=kind != "ticket")
     assert scoped.load_current_run(str(state["run_id"])) is not None
-    stage = SimpleNamespace(
-        require_agent_work=lambda _role: None,
-        release_agent_work=lambda: None,
-        adapter=SimpleNamespace(
-            invocation_identity=lambda state, job: (subject, 1),
-            development_request=lambda state, job, checkout: {"thread_id": job.get("development_thread_id")},
-            development_thread_is_allowed=lambda state, thread: True,
-        ),
-        contract=SimpleNamespace(label="ticket-3" if kind == "ticket" else kind),
-        review_budget_policy=lambda: policy_for_subject({
-            "ticket": "ticket-3", "parent_only": "parent-only", "run_repair": "run-repair",
-        }[kind]),
-        save=lambda current: scoped.save_run(str(current["run_id"]), current),
-        _invocation_boundary=invocation_boundary,
-        _agent_is_current=lambda state, job: True,
-        _reject_stale=lambda *args: None,
-        git=SimpleNamespace(checkout_head=lambda checkout: base, commit_parents=lambda head: [base, base], commit_integration_work=lambda *args, **kwargs: base,
-                            is_ancestor=lambda *args: True, resolve=git.resolve,
-                            integrate_remote_heads=lambda *args, **kwargs: SimpleNamespace(status="clean", head_sha=base)),
+    # Only Git effects and remote reads are controlled here. Identity, request
+    # construction, invocation recording and role-result consumption belong to
+    # the same DevelopmentReview used by delivery callers.
+    fixture_git = SimpleNamespace(
+        checkout_head=lambda checkout: base,
+        commit_parents=lambda head: [base, base],
+        commit_integration_work=lambda *args, **kwargs: base,
+        is_ancestor=lambda *args: True,
+        resolve=git.resolve,
+        integrate_remote_heads=lambda *args, **kwargs: SimpleNamespace(status="clean", head_sha=base),
     )
+    github = FixtureGitHubPublisher(fixture, git)
+    stage: Any = DevelopmentReview(
+        git=fixture_git, states=scoped, agents=None, github=github,
+        candidate_acceptance=CandidateRunAcceptance(fixture_git),
+        repair_currentness=RunRepairCurrentness(fixture_git, github, scoped),
+    )
+    stage._bind_change(state, job, {"ticket": "ticket", "parent_only": "parent-only", "run_repair": "repair"}[kind])
     stage.conflict_key = key
     stage.kind = kind
     stage.save(state)
@@ -126,5 +139,10 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
 
 def run_conflict(stage: Any, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
     if stage.kind == "ticket":
-        return _resolve_conflict(stage, state, job, checkout)
-    return resolve_parent_conflict(stage, state, job, checkout, record_key=stage.conflict_key.removesuffix("_conflict"))
+        return stage.resolve_ticket_integration(state, job, checkout)
+    stage._bind_change(state, job, "parent-only" if stage.kind == "parent_only" else "repair")
+    with stage.agent_work.step(job, allow_agent=True):
+        return resolve_parent_conflict(
+            stage, state, job, checkout,
+            record_key=stage.conflict_key.removesuffix("_conflict"),
+        )
