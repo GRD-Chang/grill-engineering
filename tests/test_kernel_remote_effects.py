@@ -328,7 +328,9 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
     assert port.execute(push, lambda: None).disposition == "target"
     real_git = shutil.which("git")
     log = tmp_path / "git-environment.jsonl"
-    wrapper = tmp_path / "bin" / "git"
+    transport = tmp_path / "transport-bin"
+    transport.mkdir()
+    wrapper = transport / "git"
     wrapper.write_text("#!" + sys.executable + "\n" +
         "import json,os,subprocess,sys\n" +
         "with open(" + repr(str(log)) + ", 'a') as f: f.write(json.dumps({'args':sys.argv[1:],'token':os.environ.get('GH_TOKEN'),'config':os.environ.get('GIT_CONFIG_COUNT')})+'\\n')\n" +
@@ -337,6 +339,8 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
         "env=os.environ.copy();env['GIT_ALLOW_PROTOCOL']='file'\n" +
         "raise SystemExit(subprocess.run([" + repr(real_git) + ",*sys.argv[1:]],env=env).returncode)\n")
     wrapper.chmod(0o755)
+    # Give the selected transport a new PATH after fixture Git was resolved.
+    monkeypatch.setenv("PATH", str(transport) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("SYNTHETIC_RUNNER_PAT", "frozen-synthetic-test-token")
     monkeypatch.setenv("GH_TOKEN", "unselected-inherited-test-token")
     identity = {"source": "pat", "pat": {"env": "SYNTHETIC_RUNNER_PAT"}}

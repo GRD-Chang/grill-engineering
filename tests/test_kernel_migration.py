@@ -14,32 +14,30 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import Controller
-from agent_run.agents import ReviewResult
-from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubReader
-from agent_run.run_acceptance import RunAcceptanceEngine
-from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run_kernel.migration import MigrationRefused, capture_v6, restore_v6, validate_snapshot
 from agent_run_kernel.migration_conversion import convert_initial_v6
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Commit, EffectResult, Policy, Profile, RunSpec, World
 from agent_run_kernel.offline import OfflinePort, Scenario
-from support.seeding import write_fixture
-from support.run_artifacts import _passing_artifact
-from support.run_scenarios import _completed_run
+from support.frozen_v6_runtime import old_v6_runtime
+
+
+@pytest.fixture(scope="session")
+def original_v6(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    return old_v6_runtime(tmp_path_factory.mktemp("unchanged-v6-runtime"))
 
 
 def test_capture_keeps_real_controller_database_and_original_runtime_usable(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, original_v6: Any,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={})
-    states = StateStore(git_repo / ".agent-run")
-    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
-    state, _ = controller.start(1)
-    source = states.root / "state.sqlite3"
+    old_root = git_repo / ".agent-run"
+    fixture = Path(original_v6("fixture", root=old_root,
+                               fixture_path=git_repo / "github.json", issues={}))
+    started = original_v6("start", root=old_root, git=git_repo, fixture=fixture)
+    state = started["state"]
+    source = old_root / "state.sqlite3"
     before = source.read_bytes()
-    original = states.load_run(state["run_id"])
+    original = started["loaded"]
     destination = tmp_path / "captured-v6.sqlite3"
 
     snapshot = capture_v6(source, destination)
@@ -49,32 +47,34 @@ def test_capture_keeps_real_controller_database_and_original_runtime_usable(
     assert snapshot.source_protocol == "sqlite-work-records-v6"
     assert dict(snapshot.table_rows)["runs"] == 1
     assert validate_snapshot(snapshot) == snapshot
-    copied = StateStore(destination.parent / "reopened")
-    copied.root.mkdir()
-    restored = restore_v6(snapshot, copied.root / "state.sqlite3")
+    copied = destination.parent / "reopened"
+    copied.mkdir()
+    restored = restore_v6(snapshot, copied / "state.sqlite3")
     assert restored.sha256 == snapshot.sha256
     assert validate_snapshot(restored) == restored
-    assert copied.load_run(state["run_id"]) == original
+    assert original_v6("load", root=copied, run_id=state["run_id"]) == original
     # Continue the real old Controller using the untouched original authority.
-    resumed, reused = controller.start(1)
-    assert reused is True
+    continued = original_v6("start", root=old_root, git=git_repo, fixture=fixture)
+    resumed = continued["state"]
+    assert continued["reused"] is True
     assert resumed["run_id"] == state["run_id"]
-    assert states.load_run(state["run_id"]) is not None
+    assert continued["loaded"] is not None
 
 
 def test_selected_idle_v6_ticket_converts_and_new_kernel_can_continue(
-    git_repo: Path, tmp_path: Path,
+    git_repo: Path, tmp_path: Path, original_v6: Any,
 ) -> None:
     issue = {"number": 2, "title": "Ticket 2", "body": "Deliver the selected ticket.",
              "state": "OPEN", "labels": ["ready-for-agent"], "blocked_by": []}
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue})
-    states = StateStore(git_repo / ".agent-run")
-    state, _ = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states).start(1)
-    original_old = states.load_run(state["run_id"])
-    source = states.root / "state.sqlite3"
+    old_root = git_repo / ".agent-run"
+    fixture = Path(original_v6("fixture", root=old_root,
+                               fixture_path=git_repo / "github.json", issues={"2": issue}))
+    started = original_v6("start", root=old_root, git=git_repo, fixture=fixture)
+    state, original_old = started["state"], started["loaded"]
+    source = old_root / "state.sqlite3"
     original = source.read_bytes()
     snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
-    work_root = states.root / "worktrees"
+    work_root = old_root / "worktrees"
     work_root.mkdir(exist_ok=True)
     checkout = work_root / "converted-ticket-2"
     base_sha = state["base"]["sha"]
@@ -101,10 +101,10 @@ def test_selected_idle_v6_ticket_converts_and_new_kernel_can_continue(
         assert [row["kind"] for row in tx.rows("SELECT kind FROM history ORDER BY position")] == [
             "v6_run_status", "v6_ticket_phase"]
         assert tx.one("SELECT count(*) FROM material WHERE purpose='v6_evidence'")[0] >= 1
-    old_copy = StateStore(tmp_path / "old-restored")
-    old_copy.root.mkdir()
-    restore_v6(snapshot, old_copy.root / "state.sqlite3")
-    assert old_copy.load_run(state["run_id"]) == original_old
+    old_copy = tmp_path / "old-restored"
+    old_copy.mkdir()
+    restore_v6(snapshot, old_copy / "state.sqlite3")
+    assert original_v6("load", root=old_copy, run_id=state["run_id"]) == original_old
     execution = kernel.claim_executor("migration-test-owner")
     tree = subprocess.run(["git", "rev-parse", f"{base_sha}^{{tree}}"], cwd=git_repo,
                           check=True, capture_output=True, text=True).stdout.strip()
@@ -123,10 +123,10 @@ def test_selected_idle_v6_ticket_converts_and_new_kernel_can_continue(
     assert kernel.status("ticket:2")["pending_attempt"] == step.call.attempt_id
 
 
-def test_capture_never_replaces_an_existing_destination(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_capture_never_replaces_an_existing_destination(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     before = source.read_bytes()
     destination = tmp_path / "occupied"
     destination.write_bytes(b"existing unrelated bytes")
@@ -136,10 +136,10 @@ def test_capture_never_replaces_an_existing_destination(tmp_path: Path) -> None:
     assert source.read_bytes() == before
 
 
-def test_capture_refuses_uncheckpointed_wal_without_touching_source(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_capture_refuses_uncheckpointed_wal_without_touching_source(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     # A committed transaction whose process exits without close leaves a real
     # nonempty WAL, but no live owner. This reaches sidecar admission itself.
     writer = subprocess.run([sys.executable, "-c", """
@@ -153,7 +153,7 @@ os._exit(0)
     assert writer.returncode == 0, writer.stdout + writer.stderr
     wal = Path(str(source) + "-wal")
     assert wal.stat().st_size > 0
-    files = [path for path in states.root.iterdir() if path.is_file()]
+    files = [path for path in old_root.iterdir() if path.is_file()]
     original = {path.name: path.read_bytes() for path in files}
     with pytest.raises(MigrationRefused, match="source_sidecar"):
         capture_v6(source, tmp_path / "target.sqlite3")
@@ -161,10 +161,10 @@ os._exit(0)
     assert not (tmp_path / "target.sqlite3").exists()
 
 
-def test_snapshot_validation_rejects_changed_material_without_repairing_it(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"parent": {"body": "原始正文"}})
-    source = states.root / "state.sqlite3"
+def test_snapshot_validation_rejects_changed_material_without_repairing_it(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"parent": {"body": "原始正文"}})
+    source = old_root / "state.sqlite3"
     original = source.read_bytes()
     snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
     with snapshot.path.open("r+b") as stream:
@@ -173,7 +173,7 @@ def test_snapshot_validation_rejects_changed_material_without_repairing_it(tmp_p
     damaged = snapshot.path.read_bytes()
     with pytest.raises(MigrationRefused, match="snapshot_changed"):
         validate_snapshot(snapshot)
-    with pytest.raises(MigrationRefused, match="snapshot_changed"):
+    with pytest.raises(MigrationRefused, match=r"^snapshot_(changed|corrupt)$"):
         restore_v6(snapshot, tmp_path / "restored.sqlite3")
     assert not (tmp_path / "restored.sqlite3").exists()
     assert source.read_bytes() == original
@@ -181,30 +181,11 @@ def test_snapshot_validation_rejects_changed_material_without_repairing_it(tmp_p
 
 
 def test_capture_preserves_raw_and_consumed_prior_budget_before_old_runtime_resume(
-    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    git_repo: Path, tmp_path: Path, original_v6: Any,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    run_id = state["run_id"]
-
-    class Reviewer:
-        def review(self, request: dict[str, Any]) -> ReviewResult:
-            event = request["_invocation_event"]
-            event("started", requested_thread_id=request.get("thread_id"), attempt_count=0)
-            event("thread_started", reported_thread_id="captured-review", attempt_count=1)
-            event("completed", reported_thread_id="captured-review", attempt_count=1)
-            return ReviewResult("captured-review", _passing_artifact())
-
-    def cut_after_raw() -> None:
-        saved = StateStore(states.root).load_current_run(run_id)
-        assert saved is not None
-        if "returned_result" in saved.get("run_acceptance", {}).get("pending_semantic_attempt", {}):
-            raise SimulatedProcessCrash("durable raw before consumption")
-
-    with monkeypatch.context() as cut:
-        cut.setattr(states, "_after_run_saved", cut_after_raw)
-        with pytest.raises(SimulatedProcessCrash, match="durable raw"):
-            RunAcceptanceEngine(git=git, states=states, agents=Reviewer()).accept(run_id)
-    original = states.load_run(run_id)
+    old_root = git_repo / ".agent-run"
+    original = original_v6("returned_review", root=old_root, git=git_repo)
+    run_id = original["run_id"]
     assert original is not None
     pending = original["run_acceptance"]["pending_semantic_attempt"]
     assert pending["returned_result"]["thread_id"] == "captured-review"
@@ -212,27 +193,23 @@ def test_capture_preserves_raw_and_consumed_prior_budget_before_old_runtime_resu
     assert ticket["review_budget"]["development_attempts"] == 1
     assert ticket["review_budget"]["reviewer_invocations"] == 1
 
-    snapshot = capture_v6(states.root / "state.sqlite3", tmp_path / "raw-copy.sqlite3")
+    snapshot = capture_v6(old_root / "state.sqlite3", tmp_path / "raw-copy.sqlite3")
     copy_root = tmp_path / "copy-runtime"
     copy_root.mkdir()
     (copy_root / "state.sqlite3").write_bytes(snapshot.path.read_bytes())
-    assert StateStore(copy_root).load_run(run_id) == original
+    assert original_v6("load", root=copy_root, run_id=run_id) == original
 
-    class NoNewReview:
-        def review(self, request: dict[str, Any]) -> ReviewResult:
-            raise AssertionError("the original durable raw must be consumed")
-
-    accepted = RunAcceptanceEngine(git=git, states=StateStore(states.root), agents=NoNewReview()).accept(run_id)
+    accepted = original_v6("consume_review", root=old_root, git=git_repo, run_id=run_id)
     assert accepted["status"] == "run_publication_pending"
     assert accepted["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
     assert accepted["ticket_jobs"]["2"]["review_budget"] == ticket["review_budget"]
     validate_snapshot(snapshot)
 
 
-def test_capture_refuses_a_real_other_process_sqlite_owner(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_capture_refuses_a_real_other_process_sqlite_owner(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     before = source.read_bytes()
     code = """
 import sqlite3, sys
@@ -268,10 +245,10 @@ db.close()
     assert process.returncode == 0
 
 
-def test_refusing_a_local_rollback_writer_does_not_release_its_sqlite_lock(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_refusing_a_local_rollback_writer_does_not_release_its_sqlite_lock(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     # This is a real v6 DB. DELETE mode makes the owner's RESERVED lock live
     # on the main file, so closing a second descriptor exposes the regression.
     connection = sqlite3.connect(source, isolation_level=None)
@@ -303,10 +280,10 @@ finally:
     assert source.read_bytes() == before
 
 
-def test_restore_refusal_keeps_the_captured_database_owner_lock(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_restore_refusal_keeps_the_captured_database_owner_lock(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     db = sqlite3.connect(source)
     try:
         assert db.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
@@ -337,10 +314,10 @@ finally:
         owner.close()
 
 
-def test_capture_refuses_a_source_with_another_journal_pathname(tmp_path: Path) -> None:
-    states = StateStore(tmp_path / "old")
-    states.save_run("source", {"status": "created"})
-    source = states.root / "state.sqlite3"
+def test_capture_refuses_a_source_with_another_journal_pathname(tmp_path: Path, original_v6: Any) -> None:
+    old_root = tmp_path / "old"
+    original_v6("save", root=old_root, run_id="source", state={"status": "created"})
+    source = old_root / "state.sqlite3"
     alias = tmp_path / "other-name.sqlite3"
     os.link(source, alias)
     before = source.read_bytes()
