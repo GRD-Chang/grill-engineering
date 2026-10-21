@@ -65,7 +65,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     step = review_engine().advance(state, job, tmp_path)
     assert step.kind == DeliveryStepKind.WAITING
     assert status_reads == [11]
-    assert state["external_wait"]["code"] == "github_read_failed"
+    assert state["diagnostics"][0]["code"] == "github_read_failed"
     # Failure recording may persist the mutated in-memory state. That snapshot
     # must retain the answer and its Attempt until remote readback succeeds.
     reloaded = deepcopy(state)
