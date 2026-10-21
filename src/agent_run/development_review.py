@@ -260,25 +260,209 @@ class DevelopmentReview:
                 ),
             )
 
-    def integrate_repair_candidate(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-        from agent_run.run_repair_integration import needs_repair_integration, prepare_repair_integration
-        self._bind_change(state, job, "repair")
-        with self.agent_work.step(job, allow_agent=True):
-            if not needs_repair_integration(self, job):
-                return True
-            return prepare_repair_integration(self, state, job, checkout)
+    def develop_integration(
+        self, state: dict[str, Any], subject: dict[str, Any], checkout: Path,
+        *, scope: Literal["ticket", "parent-only", "repair", "run"],
+        allow_agent: bool = False,
+    ) -> DeliveryStep:
+        """Consume one Development result for the current exact Git scene.
 
-    def integrate_parent_candidate(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-        from agent_run.parent_only_integration import prepare_parent_integration
-        self._bind_change(state, job, "parent-only")
-        with self.agent_work.step(job, allow_agent=True):
-            return prepare_parent_integration(self, state, job, checkout)
+        The caller continues the same scene through its concrete Git finish
+        operation. Admission, allowances and role facts stay here; no ordinary
+        Candidate intent or delivery phase is created by integration work.
+        """
+        run_scope = scope == "run"
+        if scope == "run":
+            self._scope, self._current_job = "run", subject
+        else:
+            self._bind_change(state, subject, scope)
+        scene_key = {
+            "ticket": "integration_conflict",
+            "parent-only": "parent_integration_conflict",
+            "repair": "run_repair_integration_conflict",
+            "run": "run_integration_conflict",
+        }[scope]
+        scene = _mapping(subject, scene_key)
+        with self.agent_work.step(subject, allow_agent=allow_agent):
+            # A proved Ticket resolution already closed its semantic work.
+            if scope == "ticket" and isinstance(scene.get("resolution_sha"), str):
+                if self.git.checkout_head(checkout) != scene["resolution_sha"]:
+                    raise GitError("Recorded integration resolution no longer matches checkout")
+                return self._step_result(state, subject)
+            existing = pending_semantic_attempt(subject, role="development")
+            needs_result = (
+                not scene.get("development_summary") if run_scope
+                else "development_summary" not in scene
+            )
+            # Repair and Run historically resume a saved summary directly.
+            # Ticket and Parent still recheck currentness before Git closeout.
+            if not needs_result and (run_scope or scope == "repair" and existing is None):
+                return self._step_result(state, subject)
+            integration_budget = scope in {"ticket", "parent-only"}
+            owner = delivery_budget_owner(state, subject)
+            policy = self._run_budget_policy(state, subject) if run_scope else self.review_budget_policy()
+            if existing is None:
+                if integration_budget:
+                    try:
+                        ensure_integration_development_available(subject, policy_snapshot=subject["policy_snapshot"])
+                    except IntegrationDevelopmentExhausted:
+                        self._block(state, subject, "integration_development_exhausted",
+                                    "Integration Development allowance is exhausted; resume explicitly to renew it")
+                        state["terminal_kind"] = "waiting_human"
+                        self.save(state)
+                        return self._step_result(state, subject)
+                elif needs_result and not can_start_development(owner, policy):
+                    if run_scope:
+                        self.checkpoint_run(state, subject, "modification_budget_exhausted")
+                    else:
+                        self._checkpoint_budget(state, subject, "modification_budget_exhausted",
+                                                "Parent integration Development allowance is exhausted")
+                    return DeliveryStep(DeliveryStepKind.PAUSED, str(subject["phase"]),
+                                        "modification_budget_exhausted")
+            if needs_result:
+                # A denied second unit must not allocate or consume allowance.
+                self.require_agent_work("integration_conflict")
+                if existing is None and not integration_budget:
+                    mark_development(owner, policy, attempt_kind="ordinary")
+            select_development_thread(state, subject, new_attempt=existing is None)
+            ordinal_key = (
+                "run_repair_integration_conflict_ordinal" if scope == "repair"
+                else "integration_conflict_agent_ordinal"
+            )
+            if existing is None:
+                subject[ordinal_key] = max(
+                    0 if run_scope else int(subject.get("modification_attempts", 0)),
+                    int(subject.get(ordinal_key, 0)),
+                ) + 1
+            if run_scope:
+                work_subject, generation = f"run-integration:{state['run_id']}", int(subject["acceptance_generation"])
+                boundary = {
+                    "source_sha": scene["source_sha"],
+                    "target_sha": scene["target_sha"],
+                    "candidate_sha": scene["candidate_sha"],
+                    "parent_revision": state["parent"]["revision"],
+                    "ticket_graph_revision": state["ticket_graph"]["revision"],
+                }
+            else:
+                work_subject, generation = self._identity(state, subject)
+                boundary = self._invocation_boundary(subject)
+            attempt = allocate_semantic_attempt(
+                subject, role="development", work_subject=work_subject,
+                generation=generation, currentness_boundary=boundary,
+                ordinal=int(subject[ordinal_key]), budget_owner=owner,
+                budget_window=int(
+                    subject["integration_development_budget"]["window"] if integration_budget
+                    else ensure_budget(owner, policy)["window"]
+                ),
+            )
+            if integration_budget:
+                acquire_integration_development(subject, attempt_id=attempt["attempt_id"],
+                                                policy_snapshot=subject["policy_snapshot"])
+            scene["attempts"] = 1
+            repair_input = {
+                "repair_source": "integration", "work_source": "integration",
+                "integration_evidence": json.dumps(scene, ensure_ascii=False, sort_keys=True,
+                                                   indent=None if run_scope else 2),
+            }
+            if run_scope:
+                completions = ticket_completion_records(state)
+                request = {
+                    "acceptance_scope": "run",
+                    "parent_issue_url": f"https://github.com/{state['repository']}/issues/{state['parent']['number']}",
+                    "run_id": state["run_id"], "repository": state["repository"],
+                    "parent": state["parent"], "ticket_graph": state["ticket_graph"],
+                    "ticket_completion_records": completions,
+                    "base_sha": scene["target_sha"], "head_sha": self.git.checkout_head(checkout),
+                    "checkout": str(checkout), "thread_id": subject.get("development_thread_id"),
+                    "human_response_history": current_human_response_history(subject, generation=generation),
+                    "prior_human_blockers": subject.get("prior_human_blockers", []),
+                    **repair_input,
+                }
+            else:
+                request_job = subject.copy()
+                request_job.update(repair_input)
+                request = self._development_request(state, request_job, checkout)
+                request.update(repair_input)
+                self.save(state)
 
-    def resolve_ticket_integration(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
-        from agent_run.integration_development import resolve_integration_work
-        self._bind_change(state, job, "ticket")
-        with self.agent_work.step(job, allow_agent=True):
-            return resolve_integration_work(self, state, job, checkout)
+            def scene_is_current() -> bool:
+                if not run_scope:
+                    return self._agent_is_current(state, subject)
+                assert self._candidate_acceptance is not None
+                if not self._candidate_acceptance.refresh_currentness(state, self.currentness_reader):
+                    return False
+                assert self.github is not None
+                source_branch, target_branch = str(state["run_branch"]), str(state["base"]["branch"])
+                source, target = self.github.live_branch_heads(source_branch, target_branch)
+                if source is None:
+                    return False
+                self.git.fetch_remote_commit(source_branch, source)
+                self.git.fetch_remote_commit(target_branch, target)
+                return (
+                    self.git.is_ancestor(str(scene["source_sha"]), source)
+                    and self.git.is_ancestor(str(scene["target_sha"]), target)
+                    and state["parent"]["revision"] == boundary["parent_revision"]
+                    and state["ticket_graph"]["revision"] == boundary["ticket_graph_revision"]
+                    and ticket_completion_records(state) == completions
+                )
+
+            if needs_result:
+                try:
+                    result = cast(DevelopmentResult | HumanBlockerResult, execute_agent_work(
+                        state, subject, request, attempt, agents=self.agents, save=self.save,
+                        phase="run_integration_conflict" if run_scope else "integration_conflict",
+                        boundary=boundary, is_current=scene_is_current,
+                    ))
+                finally:
+                    self.release_agent_work()
+                require_development_thread(subject, result.thread_id, requested_thread=request.get("thread_id"))
+                if not run_scope:
+                    clear_initial_credential_wait(state, work_subject=self.contract.label)
+                    if scope != "repair" and not self._thread_allowed(state, result.thread_id):
+                        raise ValueError("Change Job Development Thread is not independent")
+                _record_development_thread(subject, result.thread_id, result.replaced_thread_id)
+                subject.pop("development_new_thread", None)
+                subject.pop("development_failure_resume", None)
+                if isinstance(result, HumanBlockerResult):
+                    if run_scope:
+                        record_human_blocker(state, subject, resume_phase="pending", blocked_phase="ready_for_human",
+                                             blockers=result.human_blockers, code="agent_requires_human")
+                        scene["human_blockers"] = list(result.human_blockers)
+                        self.save(state)
+                    else:
+                        self._wait_for_human(state, subject, phase="accepted",
+                                             blockers=result.human_blockers, code="agent_requires_human")
+                    return self._step_result(state, subject)
+                if integration_budget and not result.summary.strip():
+                    raise ValueError("Integration Development result is incomplete")
+                if run_scope:
+                    error_code, message = None, ""
+                    if not result.summary.strip():
+                        error_code, message = "integration_conflict_unresolved", "Conflict Agent returned no result"
+                    elif not scene_is_current():
+                        error_code = "run_integration_failed"
+                        message = "Run integration work no longer matches the recorded requirements or source/target"
+                    if error_code is not None:
+                        subject.update(execution_resume_phase=subject["phase"], phase="ready_for_human", blocked_reason=error_code)
+                        state.update(status="ready_for_human", terminal_kind="waiting_human",
+                                     diagnostics=[{"code": error_code, "message": message}])
+                        self.save(state)
+                        return self._step_result(state, subject)
+                elif scope == "repair" and (not isinstance(result.summary, str) or not result.summary.strip()):
+                    self._block(state, subject, "integration_conflict_unresolved", "Conflict Agent returned no result")
+                    state["terminal_kind"] = "waiting_human"
+                    self.save(state)
+                    return self._step_result(state, subject)
+                scene["development_summary"] = result.summary
+                clear_current_human_blocker(subject)
+                self.save(state)
+            if integration_budget or scope == "repair" and needs_result:
+                self._reject_stale(
+                    state, subject, checkout,
+                    "Parent conflict resolution was discarded after requirements changed" if scope == "repair"
+                    else "Integration work was discarded after requirements changed",
+                )
+            return self._step_result(state, subject)
 
     def wait_for_change_credential(
         self, state: dict[str, Any], job: dict[str, Any], *,
@@ -1227,7 +1411,7 @@ class DevelopmentReview:
             if isinstance(
                 job.get("run_integration"),
                 dict,
-            ) and not run_integration_record_is_valid(self, state):
+            ) and not run_integration_record_is_valid(self.git, state):
                 raise ValueError("Run Acceptance requires the current integrated Run Branch")
             resume_initial_credential_wait(state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT)
         else:
@@ -1426,7 +1610,7 @@ class DevelopmentReview:
                 and (not isinstance(
                     job.get("run_integration"),
                     dict,
-                ) or run_integration_remote_is_current(self, state))
+                ) or run_integration_remote_is_current(self.git, self.github, state))
                 and self.git.resolve(str(state["run_branch"])) == boundary["reviewed_head_sha"]
                 and self._candidate_acceptance.default_head(state) == boundary["reviewed_default_base_sha"]
                 and state["parent"]["revision"] == request["parent"]["revision"]
@@ -1658,8 +1842,8 @@ class DevelopmentReview:
         refreshed = self._candidate_acceptance.refresh_currentness(state, self.currentness_reader)
         integration = run.get("run_integration")
         integration_current = not isinstance(integration, dict) or (
-            run_integration_record_is_valid(self, state)
-            and run_integration_remote_is_current(self, state)
+            run_integration_record_is_valid(self.git, state)
+            and run_integration_remote_is_current(self.git, self.github, state)
         )
         if (
             refreshed and integration_current and isinstance(integration, dict)
