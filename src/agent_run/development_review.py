@@ -384,22 +384,7 @@ class DevelopmentReview:
         )
         self.save(state)
 
-    def _pause_ticket_if_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        from agent_run.ticket_pause import can_pause_ticket, pause_ticket
-        if self._scope != "ticket" or not can_pause_ticket(job) or not self._ticket_stop_requested(
-            state,
-            job,
-        ):
-            return False
-        pause_ticket(state, job)
-        self.save(state)
-        return True
 
-    def _ticket_stop_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return self._scope == "ticket" and self.states.ticket_pause_requested(
-            str(state["run_id"]),
-            int(job["ticket_number"]),
-        )
 
     def require_agent_work(self, role: str) -> None:
         self.agent_work.require(role)
@@ -1129,16 +1114,13 @@ class DevelopmentReview:
         allow_agent: bool = False,
     ) -> DeliveryStep:
         self._bind_change(state, job, scope)
-        if scope == "ticket":
-            from agent_run.ticket_phase import sync_active_ticket_job
-            if state.get("active_ticket_job") is not job:
-                raise ValueError("Delivery step requires the active Ticket Job")
-            sync_active_ticket_job(state)
+        # Change delivery has already checked active Ticket, budget, pause and
+        # unknown PR writes, in that order. Repair enters directly and keeps
+        # its own canonical budget gate here.
         with self.agent_work.step(job, allow_agent=allow_agent):
             try:
-                ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
-                if self._pause_ticket_if_requested(state, job):
-                    return self._step_result(state, job)
+                if scope == "repair":
+                    ensure_budget(delivery_budget_owner(state, job), self.review_budget_policy())
                 phase = job["phase"]
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
@@ -1193,13 +1175,13 @@ class DevelopmentReview:
                     str(job["phase"]),
                     "work_capacity" if self.agent_work.capacity_wait else work.role,
                 )
-            except ChangeJobStopped:
-                return self._step_result(state, job, waiting=True)
             except InitialCredentialUnavailable as error:
+                if scope != "repair":
+                    raise
                 self.wait_for_change_credential(state, job, scope=scope, http_status=error.http_status)
                 return self._step_result(state, job, waiting=True)
             except GitHubReadError as error:
-                if not is_github_convergence_error(error.code):
+                if scope != "repair" or not is_github_convergence_error(error.code):
                     raise
                 wait_for_github_convergence(
                     state,
