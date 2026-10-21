@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v2-exploration"
+PROTOCOL = "independent-delivery-kernel-v3-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -29,7 +29,8 @@ CREATE TABLE runs (
  parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
  concurrency INTEGER NOT NULL CHECK(concurrency>0), policy BLOB NOT NULL,
  executor TEXT, epoch INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0,
- final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT
+ final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT,
+ source_sequence INTEGER, observed_parent_revision TEXT, observed_graph_revision TEXT
 );
 CREATE TABLE subjects (
  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
@@ -49,6 +50,33 @@ CREATE TABLE subjects (
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
  PRIMARY KEY(subject,predecessor)
+);
+CREATE TABLE requirement_versions (
+ issue INTEGER NOT NULL, revision TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+ PRIMARY KEY(issue,revision)
+);
+CREATE TABLE issue_facts (
+ issue INTEGER PRIMARY KEY, revision TEXT NOT NULL, state TEXT NOT NULL, labels BLOB NOT NULL,
+ position INTEGER NOT NULL
+);
+CREATE TABLE dependency_facts (
+ issue INTEGER NOT NULL, blocker INTEGER NOT NULL, state TEXT NOT NULL,
+ PRIMARY KEY(issue,blocker)
+);
+CREATE TABLE source_observations (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, parent_revision TEXT NOT NULL,
+ graph_revision TEXT NOT NULL, body BLOB NOT NULL
+);
+CREATE TABLE final_target (
+ id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL, checkout TEXT NOT NULL
+);
+CREATE TABLE completions (
+ subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
+ revision TEXT NOT NULL, parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
+ source_sha TEXT NOT NULL, merge_sha TEXT NOT NULL, tree TEXT NOT NULL,
+ pr_number INTEGER NOT NULL, gate_mode TEXT NOT NULL, review_attempt TEXT,
+ comment_effect TEXT NOT NULL REFERENCES effects(id), close_effect TEXT NOT NULL REFERENCES effects(id),
+ PRIMARY KEY(subject,generation)
 );
 CREATE TABLE budgets (
  subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
@@ -80,7 +108,9 @@ CREATE TABLE invocations (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
  context_id TEXT NOT NULL REFERENCES material(id),
  executor TEXT NOT NULL, epoch INTEGER NOT NULL, lease TEXT NOT NULL UNIQUE,
- status TEXT NOT NULL, raw_id TEXT REFERENCES material(id), output_repairs INTEGER NOT NULL DEFAULT 0
+ status TEXT NOT NULL, raw_id TEXT REFERENCES material(id), output_repairs INTEGER NOT NULL DEFAULT 0,
+ dispatch_state TEXT NOT NULL DEFAULT 'allocated', process_identity TEXT REFERENCES material(id),
+ exit_code INTEGER, start_evidence TEXT REFERENCES material(id)
 );
 CREATE TABLE work_queue (
  subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE

@@ -99,6 +99,56 @@ class RunSpec:
 
 
 @dataclass(frozen=True)
+class Blocker:
+    number: int
+    state: str
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str
+    body: str
+    state: str
+    labels: frozenset[str] = frozenset()
+    blocked_by: tuple[Blocker, ...] = ()
+
+
+@dataclass(frozen=True)
+class ParentIssue:
+    number: int
+    title: str
+    body: str
+    sub_issue_numbers: tuple[int, ...] = ()
+    sub_issue_order_reliable: bool = True
+
+
+@dataclass(frozen=True)
+class Requirements:
+    """Exact source facts, without accepted scope or scheduling decisions."""
+    parent: ParentIssue
+    issues: tuple[Issue, ...]
+
+    def __post_init__(self) -> None:
+        numbers = [issue.number for issue in self.issues]
+        if len(set(numbers)) != len(numbers) or len(set(self.parent.sub_issue_numbers)) != len(self.parent.sub_issue_numbers):
+            raise ValueError("duplicate source Issue")
+        if any(number < 1 for number in (*numbers, self.parent.number, *self.parent.sub_issue_numbers)):
+            raise ValueError("Issue numbers must be positive")
+
+    @classmethod
+    def from_wire(cls, data: Mapping[str, Any]) -> Requirements:
+        parent = data["parent"]
+        issues = data["issues"]
+        values = issues.values() if isinstance(issues, dict) else issues
+        return cls(ParentIssue(parent["number"], parent["title"], parent["body"],
+                               tuple(parent["sub_issues"]), parent["sub_issue_order_reliable"]),
+                   tuple(Issue(value["number"], value["title"], value["body"], value["state"],
+                               frozenset(value["labels"]), tuple(Blocker(item["number"], item["state"])
+                                                              for item in value["blocked_by"])) for value in values))
+
+
+@dataclass(frozen=True)
 class PullRequest:
     number: int
     repository: str

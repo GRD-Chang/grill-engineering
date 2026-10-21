@@ -7,7 +7,8 @@ returned request. A raw return and its business consumption commit separately.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -17,7 +18,7 @@ from uuid import uuid4
 
 from .model import (
     AgentCall, Commit, DeliveryKind, Effect, EffectResult, Execution, KernelError,
-    Policy, Profile, Purpose, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
+    Delivery, Policy, Profile, Purpose, Requirements, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
 
@@ -32,42 +33,79 @@ class Kernel:
         self.clock: Callable[[], float] = time.time
 
     @classmethod
-    def create(cls, path: Path, spec: RunSpec) -> Kernel:
+    def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements | None = None) -> Kernel:
         if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
             raise ValueError("one or more uniquely identified deliveries are required")
-        storage = Storage.create(path)
-        with storage.transaction() as tx:
+        Storage.create(path)
+        kernel = cls(path)
+        with kernel.storage.transaction() as tx:
+            if requirements is not None:
+                if requirements.parent.number != spec.parent_issue:
+                    raise KernelError("parent_identity")
+                parent_revision, graph_revision = kernel._source_revisions(requirements)
+                spec = replace(spec, parent_revision=parent_revision, graph_revision=graph_revision)
+                tickets = {delivery.issue for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
+                if tickets != set(requirements.parent.sub_issue_numbers):
+                    raise KernelError("delivery_scope")
+                if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
+                    raise KernelError("final_target_required")
             tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,concurrency,policy) VALUES (?,?,?,?,?,?,?)",
                        (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
                         spec.graph_revision, spec.policy.concurrency, wire_json(asdict(spec.policy))))
             for delivery in spec.deliveries:
-                final = delivery.kind == DeliveryKind.FINAL_RUN
-                tx.execute("""INSERT INTO subjects(
-                    id,run_id,kind,issue,revision,phase,purpose,source_ref,target_ref,
-                    base_sha,base_tree,source_sha,candidate_sha,candidate_tree,completion_revision,checkout,workspace_sha)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                           (delivery.key, spec.run_id, delivery.kind.value, delivery.issue, delivery.revision,
-                            "integration" if final else "development",
-                            Purpose.INTEGRATION.value if final else Purpose.REQUIREMENTS.value,
-                            delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.tree,
-                            delivery.base.sha, delivery.base.sha if final else None,
-                            delivery.base.tree if final else None, delivery.completion_revision,
-                            delivery.checkout, delivery.base.sha))
-                limits = {
-                    Purpose.REQUIREMENTS: (spec.policy.ticket_rounds + 1, spec.policy.ticket_rounds)
-                    if delivery.kind == DeliveryKind.TICKET else (spec.policy.parent_rounds, spec.policy.parent_rounds),
-                    Purpose.INTEGRATION: (spec.policy.run_repairs, spec.policy.run_repairs + 1)
-                    if final else (spec.policy.run_repairs if delivery.kind == DeliveryKind.PARENT_ONLY else spec.policy.integration_developments,
-                                   0 if delivery.kind == DeliveryKind.TICKET else None),
-                    Purpose.CI: (spec.policy.ci_developments, None),
-                }
-                for purpose, (development_limit, review_limit) in limits.items():
-                    tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,1,?,?)",
-                               (delivery.key, purpose.value, development_limit, review_limit))
+                if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
+                    tx.execute("INSERT INTO final_target VALUES (?,?,?,?)", (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout))
+                    continue
+                if requirements is not None:
+                    issue = next((issue for issue in requirements.issues if issue.number == delivery.issue), None)
+                    revision = spec.parent_revision if delivery.kind == DeliveryKind.PARENT_ONLY else (
+                        "unread" if issue is None else kernel._fingerprint({"title": issue.title, "body": issue.body}))
+                    delivery = replace(delivery, revision=revision, dependencies=())
+                kernel._add_delivery(tx, spec.run_id, spec.policy, delivery)
             for delivery in spec.deliveries:
                 for predecessor in delivery.dependencies:
                     tx.execute("INSERT INTO dependencies VALUES (?,?)", (delivery.key, predecessor))
-        return cls(path)
+            if requirements is not None:
+                kernel._refresh(tx, requirements, initial=True)
+        return kernel
+
+    def _add_delivery(self, tx: Transaction, run_id: str, policy: Policy, delivery: Delivery) -> None:
+        final = delivery.kind == DeliveryKind.FINAL_RUN
+        tx.execute("""INSERT INTO subjects(
+            id,run_id,kind,issue,revision,phase,purpose,source_ref,target_ref,
+            base_sha,base_tree,source_sha,candidate_sha,candidate_tree,completion_revision,checkout,workspace_sha)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (delivery.key, run_id, delivery.kind.value, delivery.issue, delivery.revision,
+                    "workspace" if final else "development", Purpose.INTEGRATION.value if final else Purpose.REQUIREMENTS.value,
+                    delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.tree,
+                    delivery.base.sha, delivery.base.sha if final else None, delivery.base.tree if final else None,
+                    delivery.completion_revision, delivery.checkout, delivery.base.sha))
+        # Seed-only Final fixtures already have their explicitly supplied checkout.
+        if final and Path(delivery.checkout).is_dir():
+            tx.execute("UPDATE subjects SET phase='integration' WHERE id=?", (delivery.key,))
+        limits = {
+            Purpose.REQUIREMENTS: (policy.ticket_rounds + 1, policy.ticket_rounds)
+            if delivery.kind == DeliveryKind.TICKET else (policy.parent_rounds, policy.parent_rounds),
+            Purpose.INTEGRATION: (policy.run_repairs, policy.run_repairs + 1)
+            if final else (policy.run_repairs if delivery.kind == DeliveryKind.PARENT_ONLY else policy.integration_developments,
+                           0 if delivery.kind == DeliveryKind.TICKET else None),
+            Purpose.CI: (policy.ci_developments, None),
+        }
+        for purpose, (development_limit, review_limit) in limits.items():
+            tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,1,?,?)",
+                       (delivery.key, purpose.value, development_limit, review_limit))
+
+    @staticmethod
+    def _fingerprint(value: Any) -> str:
+        return "sha256:" + hashlib.sha256(wire_json(value)).hexdigest()
+
+    def _source_revisions(self, requirements: Requirements) -> tuple[str, str]:
+        parent = requirements.parent
+        members = sorted(parent.sub_issue_numbers)
+        return (self._fingerprint({"title": parent.title, "body": parent.body}),
+                self._fingerprint({"tickets": members, "dependencies": {
+                    str(issue.number): sorted(blocker.number for blocker in issue.blocked_by)
+                    for issue in requirements.issues if issue.number in members}}))
 
     def claim_executor(self, owner: str) -> Execution:
         with self.storage.transaction() as tx:
