@@ -136,6 +136,8 @@ def test_remote_heads_are_independent_of_local_refs_and_missing_is_not_read_fail
     git = LocalGit(root)
     git.run('init', '--bare', str(remote))
     git.run('init', '-b', 'main')
+    git.run('config', '--local', 'user.name', 'Source fixture author')
+    git.run('config', '--local', 'user.email', 'source-fixture@example.invalid')
     git.run('config', 'gc.auto', '0')
     (root / 'initial.txt').write_text('Original input\n')
     git.run('add', 'initial.txt')

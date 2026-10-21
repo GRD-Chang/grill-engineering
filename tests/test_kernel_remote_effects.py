@@ -18,6 +18,8 @@ def _fixture(tmp_path, monkeypatch):
     repo.mkdir()
     git = LocalGit(repo)
     git.run("init", "--initial-branch=main")
+    git.run("config", "--local", "user.name", "Remote fixture author")
+    git.run("config", "--local", "user.email", "remote-fixture@example.invalid")
     git.run("config", "gc.auto", "0")
     (repo / "base").write_text("original\n")
     git.run("add", ".")
@@ -377,6 +379,8 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
     other = tmp_path / "external-clone"
     git.run("clone", "--branch", "delivery", str(tmp_path / "origin.git"), str(other))
     external = LocalGit(other)
+    external.run("config", "--local", "user.name", "Independent fixture author")
+    external.run("config", "--local", "user.email", "independent-fixture@example.invalid")
     (other / "external-change").write_text("actual remote-only bytes\n")
     external.run("add", ".")
     external.run("commit", "-m", "external source append")
@@ -469,6 +473,8 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     other = tmp_path / "final-external"
     scenario.port.git.run("clone", "--branch", "run", str(remote), str(other))
     external = LocalGit(other)
+    external.run("config", "--local", "user.name", "Independent fixture author")
+    external.run("config", "--local", "user.email", "independent-fixture@example.invalid")
     (other / "external-run-change").write_text("independent completed-run append\n")
     external.run("add", ".")
     external.run("commit", "-m", "later run head")
