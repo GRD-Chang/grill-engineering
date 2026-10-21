@@ -77,8 +77,10 @@ def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     job = output["subjects"][0]
     assert output["run_id"] == "run-query"
     assert output["repository"] == "example/project"
-    assert output["operator_actions"][0]["scope"] == "ticket"
-    assert output["operator_actions"][0]["action"] == "resume"
+    assert output["operator_actions"][0]["scope"] == "local"
+    assert output["operator_actions"][0]["action"]["command"] == "resume"
+    assert output["operator_actions"][0]["action"]["ticket_number"] == 2
+    assert output["operator_actions"][0]["trigger_invocation"]["model"] == "recorded-development-model"
     pending = job["pending_attempt"]
     assert pending["result"]["human_blockers"] == ["Need the original decision / 保留原文"]
     invocation = pending["invocations"][0]
@@ -175,6 +177,13 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
     document = query.read(kernel.storage.path, "history")
     response = next(event for event in document.data["timeline"] if event["kind"] == "human_response")
     assert response["evidence"] == "保持原文\r\nDo exactly this.\n"
+    action = next(row for row in document.data["actions"] if row["id"] == "original-response")
+    assert action["status"] == "applied"
+    assert action["payload"]["message"] == "保持原文\r\nDo exactly this.\n"
+    assert action["receipt"]["applied"] is True
+    assert document.data["resume_audit"][0]["action_id"] == "original-response"
+    assert document.data["agent_resumes"][0]["started_at"] is None
+    assert document.data["summary"]["rounds"]["ticket_development"] == 1
     observed: list[int] = []
     after = 0
     for _ in range(20):

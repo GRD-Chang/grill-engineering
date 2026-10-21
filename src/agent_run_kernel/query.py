@@ -130,7 +130,7 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
     for row in result:
         if row.pop("thread_subject") != subject:
             raise QueryError("incompatible_run_state", "Invocation has a missing or foreign Thread binding")
-        for field in ("allocated_at", "started_at", "returned_at", "exited_at"):
+        for field in ("allocated_at", "dispatched_at", "started_at", "returned_at", "exited_at"):
             row[field] = _timestamp(row.get(field))
         row["process_span_seconds"] = (row["exited_at"] - row["started_at"]
                                   if row["started_at"] is not None and row["exited_at"] is not None
@@ -163,6 +163,11 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
                   "artifact": _material(tx, attempt["result_id"], subject)}
     effects = _all(tx, "SELECT id,operation,status,attempts,before_sha,after_sha FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY rowid", (subject,))
     cleanup = tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))
+    checks = None
+    if job["checks_id"]:
+        check = dict(tx.one("SELECT * FROM checks WHERE id=? AND subject=?", (job["checks_id"], subject)))
+        check["evidence"] = _material(tx, check["material_id"], subject)
+        checks = check
     title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?", (job["issue"], job["revision"]))
     return {"subject": subject, "kind": job["kind"], "issue": job["issue"],
             "title": title[0][0] if title else None, "phase": job["phase"], "purpose": job["purpose"],
@@ -170,7 +175,7 @@ def _subject(tx: Transaction, job: dict[str, Any]) -> dict[str, Any]:
             "candidate_sha": job["candidate_sha"], "publication_sha": job["publication_sha"],
             "integrated_sha": job["integrated_sha"], "pr_number": job["pr_number"],
             "ci_evidence": _material(tx, job["ci_failure"], subject),
-            "gates": gates, "budgets": budgets, "pending_attempt": pending, "review": review,
+            "gates": gates, "budgets": budgets, "pending_attempt": pending, "review": review, "required_checks": checks,
             "pending_writes": effects, "delivery_cleanup": dict(cleanup[0]) if cleanup else None}
 
 
@@ -192,6 +197,41 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]]) ->
         if job["phase"] == "approval":
             result.append({"subject": job["subject"], "issue": job["issue"], "generation": job["generation"],
                            "scope": "run", "reason": "final_approval", "action": "approve", "evidence": None})
+    owners = {job["subject"]: job for job in subjects}
+    for item in result:
+        owner = owners.get(item["subject"])
+        local = item["scope"] == "ticket"
+        operation = item["action"]
+        reason = item["reason"]
+        artifact = item["evidence"]
+        pending = owner["pending_attempt"] if owner else None
+        invocation = pending["invocations"][-1] if pending and pending["invocations"] else None
+        kind = ("final_approval" if operation == "approve" else "review_budget_checkpoint" if "budget_exhausted" in reason
+                else "execution_failure" if reason == "execution_failed" else reason)
+        command = f"agent-run {operation} {run['parent_issue']} --repo {run['repository']}"
+        if local and operation == "resume":
+            command += f" --ticket {item['issue']}"
+        object_label = f"Ticket #{owner['issue']}" if local and owner else f"Parent Issue #{owner['issue']}" if owner and owner["kind"] == "parent_only" else "Delivery Run"
+        item.update({"operation": operation, "scope": "local" if local else "global", "work_subject": item["subject"],
+            "location": owner["subject"] if local and owner else "parent" if owner and owner["kind"] == "parent_only" else "run_publication" if owner else "run",
+            "phase": _public_phase(owner["phase"]) if owner else None,
+            "status_code": "parent_approval_pending" if operation == "approve" and owner and owner["kind"] == "parent_only" else
+                           "run_approval_pending" if operation == "approve" else reason,
+            "action_kind": kind, "type": {"final_approval": "Final Approval", "human_blocker": "Human Blocker",
+                "review_budget_checkpoint": "Review Budget Checkpoint", "execution_failure": "Execution Failure",
+                "operator_stopped": "Operator Stopped", "supervision_timeout": "Supervision Timeout Pause"}.get(kind, kind),
+            "action": {"kind": "command" if operation != "inspect" else "inspect", "command": operation if operation != "inspect" else None,
+                       "selector": run["id"], "ticket_number": item.get("issue") if local else None},
+            "object": object_label, "role": pending["role"] if pending else None, "run_paused": not local,
+            "trigger_invocation": invocation if reason == "human_blocker" else None,
+            "preserved": "；".join(part for part in (f"Candidate {owner['candidate_sha']}" if owner and owner["candidate_sha"] else "",
+                         f"PR #{owner['pr_number']}" if owner and owner["pr_number"] else "") if part) or None,
+            "reasons": artifact.get("human_blockers", [reason]) if reason == "human_blocker" and isinstance(artifact, Mapping) else [reason],
+            "evidence": {"operator_gate": {"code": reason, "detail": artifact},
+                         "human_blockers": artifact.get("human_blockers") if isinstance(artifact, Mapping) else None,
+                         "diagnostics": None, "failure_evidence": artifact if reason != "human_blocker" else None,
+                         "execution_failure": artifact if reason == "execution_failed" else None, "blocked_reason": reason},
+            "next_action": command if operation != "inspect" else "Inspect original facts and diagnostics"})
     return result
 
 
@@ -286,12 +326,7 @@ def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: 
                  cleanup: Mapping[str, Any] | None) -> str:
     if actions:
         action = actions[0]
-        if action["action"] in {"resume", "approve", "requeue"}:
-            command = f"agent-run {action['action']} {run['parent_issue']} --repo {run['repository']}"
-            if action["scope"] == "ticket" and action["action"] == "resume":
-                command += f" --ticket {action['issue']}"
-            return command
-        return "Inspect original facts and diagnostics"
+        return str(action["next_action"])
     if cleanup and cleanup["status"] == "cleanup_pending":
         return f"agent-run resume {run['id']}"
     if status == "ticket_completed":
@@ -339,8 +374,54 @@ def _history_views(data: Mapping[str, Any], subjects: list[dict[str, Any]], even
             "phase": None, "status": None, "role": None, "round": None,
             "details": [] if event["evidence"] is None else [event["evidence"]]})
     return {"events": projected, "execution_activity": "unknown",
-            "scheduler": {"activity": "unknown", "failure": None}, "multi_ticket": None,
+            "scheduler": {"activity": "unknown", "failure": None}, "multi_ticket": data["multi_ticket"],
             "summary": {"rounds": rounds, "elapsed_seconds": data["elapsed_seconds"]}, "time_zone": "UTC"}
+
+
+def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[str, Any]],
+                  scheduling: Mapping[str, Any]) -> dict[str, Any] | None:
+    tickets = [job for job in subjects if job["kind"] == "ticket"]
+    if not tickets:
+        return None
+    active = {row["subject"] for row in scheduling["active"]}
+    work_positions = {key: position for position, key in enumerate(scheduling["work_fifo"], 1)}
+    integration_positions = {key: position for position, key in enumerate(scheduling["integration_fifo"], 1)}
+    views = []
+    for job in tickets:
+        budgets = {row["purpose"]: row for row in job["budgets"] if row["current"]}
+        required = budgets.get("requirements", {})
+        ci = budgets.get("ci", {})
+        integration = budgets.get("integration", {})
+        checks = job["required_checks"]
+        blockers = tx.rows("SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (job["subject"],))
+        views.append({"ticket_number": job["issue"], "phase": _public_phase(job["phase"]),
+            "blocked_by": [row[0] for row in blockers], "blocked_reason": job["gates"][0]["code"] if job["gates"] else None,
+            "execution_activity": "unknown", "has_work_slot": job["subject"] in active,
+            "holds_integration": run["integration_holder"] == job["subject"],
+            "work_queue_position": work_positions.get(job["subject"]), "queue_position": integration_positions.get(job["subject"]),
+            "invocation": job["pending_attempt"]["invocations"][-1] if job["pending_attempt"] and job["pending_attempt"]["invocations"] else None,
+            "pending_write": job["pending_writes"][0] if job["pending_writes"] else None,
+            "required_checks": None if checks is None else {"head_sha": checks["head_sha"], "pr_number": checks["pr_number"],
+                "result": checks["result"], "evidence": checks["evidence"]},
+            "usage": {"development_attempts": required.get("developments_used"), "development_limit": required.get("development_limit"),
+                "reviewer_invocations": required.get("reviews_used"), "review_limit": required.get("review_limit"),
+                "ci_developments_used": ci.get("developments_used"), "ci_development_limit": ci.get("development_limit"),
+                "integration_development_used": integration.get("developments_used"), "integration_development_limit": integration.get("development_limit"),
+                "integration_resync_used": None, "integration_resync_limit": None},
+            "pause_requested": None, "resume_accepted": None, "stop_wait_reason": None, "supervision": None, "recovery_action": None})
+    return {"executor_activity": "unknown", "work_concurrency_limit": run["concurrency"],
+            "work_slots_active": len(active), "integration_holder": run["integration_holder"],
+            "integration_queue": scheduling["integration_fifo"], "tickets": views}
+
+
+def _control_history(tx: Transaction) -> list[dict[str, Any]]:
+    actions = _all(tx, "SELECT * FROM actions ORDER BY rowid")
+    first_owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+    for action in actions:
+        owner = action["subject"] or first_owner
+        action["payload"] = _material(tx, action["payload_id"], owner)
+        action["receipt"] = _material(tx, action["receipt_id"], owner)
+    return actions
 
 
 def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limit: int = 128,
@@ -384,6 +465,7 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                                "work_fifo": [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row[0] for row in tx.rows("SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
+            data["multi_ticket"] = _multi_ticket(tx, run, subjects, data["scheduling"])
             data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
             data["progress"] = _progress(data)
             data["gate"] = "required_checks" if status == "waiting_checks" else None
@@ -405,14 +487,19 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                 for attempt in attempts:
                     attempt["artifact"] = _material(tx, attempt["result_id"], attempt["subject"])
                     attempt.pop("context_id")
+                    attempt.update({"attempt_id": attempt["id"], "work_subject": attempt["subject"], "budget_window": attempt["window"]})
+                control = _control_history(tx)
+                resumes = [{"action_id": action["id"], "subject": action["subject"], "status": action["status"],
+                            "payload": action["payload"], "receipt": action["receipt"], "started_at": None}
+                           for action in control if action["kind"] == "resume"]
                 data.update({"timeline": events, "timeline_continuation": [],
                              "semantic_agent_attempts": attempts,
                              "agent_invocations": [invocation for job in subjects for invocation in _invocations(tx, job["subject"])],
                              "publication_operation_retries": None,
                              "effect_operations": _all(tx, "SELECT id,subject,operation,attempts,status FROM effects ORDER BY rowid"),
                              "budget_windows": [budget for job in subjects for budget in job["budgets"]],
-                             "output_attempts": None, "agent_resumes": None, "resume_audit": None,
-                             "actions": _all(tx, "SELECT id,kind,subject,status FROM actions ORDER BY rowid"),
+                             "output_attempts": None, "agent_resumes": resumes, "resume_audit": resumes,
+                             "actions": control,
                              "history_page": {"after": after, "next_after": next_after, "has_more": has_more}})
                 data.update(_history_views(data, subjects, events, attempts))
             if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:

@@ -141,17 +141,16 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield copy["unknown_live"]
     # Put actionable current boundaries before long Findings/evidence.
     for action in data["operator_actions"]:
-        scope = copy["local"] if action["scope"] == "ticket" else copy["global"]
+        scope = copy["local"] if action["scope"] == "local" else copy["global"]
         target = f"#{action['issue']}" if action.get("issue") else data["repository"]
         yield f"{copy['gates']}: {target} — {terms.get(action['reason'], action['reason'])} ({copy['scope']}: {scope})"
-        command = f"agent-run {action['action']} {data['parent']['number']} --repo {data['repository']}"
-        if action["scope"] == "ticket" and action["action"] == "resume":
-            command += f" --ticket {action['issue']}"
-        yield f"{copy['next']}: {copy[action['action']]}" + (f" — {command}" if action["action"] != "inspect" else "")
+        operation = action["operation"]
+        yield f"{copy['next']}: {copy[operation]}" + (f" — {action['next_action']}" if operation != "inspect" else "")
         if action["evidence"] is not None:
             yield _body(action["evidence"])
     if not data["operator_actions"]:
-        yield f"{copy['next']}: {copy.get(data['next_action'], data['next_action']) or copy['complete']}"
+        next_action = copy["complete"] if data["next_action"] == "无" else copy.get(data["next_action"], data["next_action"])
+        yield f"{copy['next']}: {next_action or copy['complete']}"
     for job in data["subjects"]:
         yield f"{copy['subject']}: #{job['issue']} {job['title'] or ''} — {terms.get(job['phase'], job['phase'])} ({terms.get(job['purpose'], job['purpose'])})"
         pending = job["pending_attempt"]
