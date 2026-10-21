@@ -20,37 +20,119 @@ from agent_run.agent_invocation import fail_interrupted_invocation
 from agent_run.agent_return import restore_agent_return
 from agent_run.agent_work import AgentWorkScope
 from agent_run.agents import AgentBackend, DevelopmentResult, HumanBlockerResult, ReviewResult
-from agent_run.artifacts import AcceptanceArtifact, clear_current_human_blocker, record_human_blocker
+from agent_run.artifacts import (
+    AcceptanceArtifact,
+    clear_current_human_blocker,
+    record_human_blocker,
+)
 from agent_run.change_delivery_contracts import ChangeJobContract, ChangeJobStopped
 from agent_run.change_delivery_fallback import preserve_required_checks_publication_authorization
 from agent_run.change_delivery_review import record_change_status
 from agent_run.change_delivery_publication_agent import invocation_boundary
-from agent_run.change_delivery_state import ChangeDeliveryStateStore, save_change_job, block_change_job, require_mapping as _mapping
-from agent_run.change_delivery_threads import record_development_thread as _record_development_thread, record_reviewer as _record_reviewer, require_development_thread, latest_reviewer_thread
-from agent_run.ci_recovery_budget import checkpoint_after_reviewer_failure, ci_limit_for_job, ci_repair_budget_context, ci_reviewer_budget_context, ci_review_required, can_start_ci_repair, mark_ci_repair, refund_ci_repair_without_candidate, observe_repairable_ci_failure
-from agent_run.credential_availability import clear_initial_credential_wait, resume_initial_credential_wait, wait_for_initial_credential
+from agent_run.change_delivery_state import (
+    ChangeDeliveryStateStore,
+    save_change_job,
+    block_change_job,
+    require_mapping as _mapping,
+)
+from agent_run.change_delivery_threads import (
+    record_development_thread as _record_development_thread,
+    record_reviewer as _record_reviewer,
+    require_development_thread,
+    latest_reviewer_thread,
+)
+from agent_run.ci_recovery_budget import (
+    checkpoint_after_reviewer_failure,
+    ci_limit_for_job,
+    ci_repair_budget_context,
+    ci_reviewer_budget_context,
+    ci_review_required,
+    can_start_ci_repair,
+    mark_ci_repair,
+    refund_ci_repair_without_candidate,
+    observe_repairable_ci_failure,
+)
+from agent_run.credential_availability import (
+    clear_initial_credential_wait,
+    resume_initial_credential_wait,
+    wait_for_initial_credential,
+)
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.delivery_budget import delivery_budget_owner
-from agent_run.delivery_policy import change_review_budget_policy, ticket_budget_policy_for_job, parent_only_budget_policy_for_job, run_repair_budget_policy_for_job
+from agent_run.delivery_policy import (
+    change_review_budget_policy,
+    ticket_budget_policy_for_job,
+    parent_only_budget_policy_for_job,
+    run_repair_budget_policy_for_job,
+)
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.delivery_step import AgentWorkRequired, DeliveryStep, DeliveryStepKind
-from agent_run.external_supervision import ensure_supervision_window, is_github_convergence_error, wait_for_github_convergence
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.git import GitRepository, MergeConflictError
 from agent_run.git_errors import GitError, GitIntegrityError
 from agent_run.github import GitHubReadError
 from agent_run.human_responses import current_human_response_history
-from agent_run.integration_development_budget import IntegrationDevelopmentExhausted, ensure_integration_development_available, acquire_integration_development
+from agent_run.integration_development_budget import (
+    IntegrationDevelopmentExhausted,
+    ensure_integration_development_available,
+    acquire_integration_development,
+)
 from agent_run.integration_record_contract import require_completed_ticket_integration_records
 from agent_run.required_checks_observation import clear_required_checks_observation
-from agent_run.review_attempt import begin_review, consume_review_result, finish_review_result, remember_review, review_ordinal
-from agent_run.review_budget import ReviewBudgetPolicy, can_start_development, can_start_review, ensure_budget, mark_development, repair_budget_context, reviewer_budget_context, previous_review_context
-from agent_run.review_context import prepare_review_context, review_context_for_result, review_record_identity, run_acceptance_record, review_context_is_current, candidate_review_identity
-from agent_run.review_evidence import review_record_matches, run_review_identity, accepted_review_matches
+from agent_run.review_attempt import (
+    begin_review,
+    consume_review_result,
+    finish_review_result,
+    remember_review,
+    review_ordinal,
+)
+from agent_run.review_budget import (
+    ReviewBudgetPolicy,
+    can_start_development,
+    can_start_review,
+    ensure_budget,
+    mark_development,
+    repair_budget_context,
+    reviewer_budget_context,
+    previous_review_context,
+)
+from agent_run.review_context import (
+    prepare_review_context,
+    review_context_for_result,
+    review_record_identity,
+    run_acceptance_record,
+    review_context_is_current,
+    candidate_review_identity,
+)
+from agent_run.review_evidence import (
+    review_record_matches,
+    run_review_identity,
+    accepted_review_matches,
+)
 from agent_run.run_candidate_acceptance import CandidateRunAcceptance
-from agent_run.run_currentness import RunCurrentnessReader, refresh_run_currentness, run_currentness_boundary, ticket_completion_records, ticket_fallback_records, ticket_ci_repair_records, ticket_integration_records
+from agent_run.run_currentness import (
+    RunCurrentnessReader,
+    refresh_run_currentness,
+    run_currentness_boundary,
+    ticket_completion_records,
+    ticket_fallback_records,
+    ticket_ci_repair_records,
+    ticket_integration_records,
+)
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_thread_identity import prior_thread_identities
-from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt, detach_active_invocation, pending_semantic_attempt, release_semantic_attempt, require_controller_reprepare_intent
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+    release_semantic_attempt,
+    require_controller_reprepare_intent,
+)
 from agent_run.state import StateStore
 
 _RUN_ACCEPTANCE_CREDENTIAL_SUBJECT = "run-acceptance"
@@ -110,8 +192,6 @@ def after_review(
     return ReviewDecision.REPAIR
 
 
-
-
 class DevelopmentReview:
     def __init__(
         self, *, git: GitRepository, states: StateStore, agents: AgentBackend,
@@ -128,7 +208,9 @@ class DevelopmentReview:
         self.repair_currentness = RunRepairCurrentness(git, github, states) if github is not None else None
         from agent_run.ticket_state import TicketState
         from agent_run.ticket_work import TicketWorkAdmission
-        admission = TicketWorkAdmission(states.states, states.run_id) if isinstance(states, TicketState) else None
+        admission = None
+        if isinstance(states, TicketState):
+            admission = TicketWorkAdmission(states.states, states.run_id)
         self.agent_work = AgentWorkScope(admission)
         self._scope: str = "run"
         self._current_job: dict[str, Any] | None = None
@@ -141,20 +223,49 @@ class DevelopmentReview:
             from agent_run.ticket_state import TicketState
             from agent_run.ticket_work import TicketWorkAdmission
             assert self.github is not None
-            self.contract = ChangeJobContract(label=f"ticket-{job['ticket_number']}", branch=str(job["ticket_branch"]), base_branch=str(state["run_branch"]), review_budget_policy=ticket_budget_policy_for_job(job, state_snapshot=state.get("policy_snapshot")))
+            self.contract = ChangeJobContract(
+                label=f"ticket-{job['ticket_number']}",
+                branch=str(job["ticket_branch"]),
+                base_branch=str(state["run_branch"]),
+                review_budget_policy=ticket_budget_policy_for_job(
+                    job,
+                    state_snapshot=state.get("policy_snapshot"),
+                ),
+            )
             if self.agent_work.admission is None:
-                self.agent_work.admission = TicketWorkAdmission(self.states.states if isinstance(self.states, TicketState) else self.states, run_id)
+                self.agent_work.admission = TicketWorkAdmission(
+                    self.states.states if isinstance(self.states, TicketState) else self.states,
+                    run_id,
+                )
         elif scope == "parent-only":
             assert self.github is not None
-            self.contract = ChangeJobContract(label="parent-only", branch=str(job["parent_branch"]), base_branch=str(state["base"]["branch"]), review_budget_policy=parent_only_budget_policy_for_job(job, state_snapshot=state.get("policy_snapshot")))
+            self.contract = ChangeJobContract(
+                label="parent-only",
+                branch=str(job["parent_branch"]),
+                base_branch=str(state["base"]["branch"]),
+                review_budget_policy=parent_only_budget_policy_for_job(
+                    job,
+                    state_snapshot=state.get("policy_snapshot"),
+                ),
+            )
         else:
-            self.contract = ChangeJobContract(label=f"run-repair-{job['repair_attempt']}", branch=str(job["repair_branch"]), base_branch=str(state["run_branch"]), review_budget_policy=run_repair_budget_policy_for_job(job, state_snapshot=state.get("policy_snapshot")))
+            self.contract = ChangeJobContract(
+                label=f"run-repair-{job['repair_attempt']}",
+                branch=str(job["repair_branch"]),
+                base_branch=str(state["run_branch"]),
+                review_budget_policy=run_repair_budget_policy_for_job(
+                    job,
+                    state_snapshot=state.get("policy_snapshot"),
+                ),
+            )
 
     def integrate_repair_candidate(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
         from agent_run.run_repair_integration import needs_repair_integration, prepare_repair_integration
         self._bind_change(state, job, "repair")
         with self.agent_work.step(job, allow_agent=True):
-            return not needs_repair_integration(self, job) or prepare_repair_integration(self, state, job, checkout)
+            if not needs_repair_integration(self, job):
+                return True
+            return prepare_repair_integration(self, state, job, checkout)
 
     def integrate_parent_candidate(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> bool:
         from agent_run.parent_only_integration import prepare_parent_integration
@@ -181,10 +292,20 @@ class DevelopmentReview:
         if self._scope == "run":
             self.states.save_run(str(state["run_id"]), state)
             return state
-        return save_change_job(self.state_store, state, self._current_job, label=self.contract.label, development_only=self._scope == "repair" or self.development_only)
+        return save_change_job(
+            self.state_store,
+            state,
+            self._current_job,
+            label=self.contract.label,
+            development_only=self._scope == "repair" or self.development_only,
+        )
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
-        return change_review_budget_policy(self.contract.label, self.contract.review_budget_policy, self._current_job)
+        return change_review_budget_policy(
+            self.contract.label,
+            self.contract.review_budget_policy,
+            self._current_job,
+        )
 
     def _run_budget_policy(self, state: dict[str, Any], run: dict[str, Any]) -> ReviewBudgetPolicy:
         return run_repair_budget_policy_for_job(run, state_snapshot=state.get("policy_snapshot"))
@@ -214,7 +335,11 @@ class DevelopmentReview:
         default = self._default_head(state)
         assert self.repair_currentness is not None
         return (default == job.get("default_base_sha")
-                and not self.repair_currentness.non_default_revision_changed(state, job, default_head_sha=default))
+                and not self.repair_currentness.non_default_revision_changed(
+                    state,
+                    job,
+                    default_head_sha=default,
+                ))
 
     def _reject_stale(self, state: dict[str, Any], job: dict[str, Any], checkout: Path, message: str) -> None:
         if review_context_is_current(job) and self._agent_is_current(state, job):
@@ -230,22 +355,51 @@ class DevelopmentReview:
         raise ChangeJobStopped()
 
     def _block(self, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> bool:
-        return block_change_job(self.state_store, state, job, label=self.contract.label, development_only=self._scope == "repair" or self.development_only, code=code, message=message)
+        return block_change_job(
+            self.state_store,
+            state,
+            job,
+            label=self.contract.label,
+            development_only=self._scope == "repair" or self.development_only,
+            code=code,
+            message=message,
+        )
 
-    def _wait_for_human(self, state: dict[str, Any], job: dict[str, Any], *, phase: str, blockers: tuple[str, ...], code: str = "agent_requires_human") -> None:
-        record_human_blocker(state, job, resume_phase=phase, blocked_phase="blocked", blockers=blockers, code=code)
+    def _wait_for_human(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        *,
+        phase: str,
+        blockers: tuple[str, ...],
+        code: str = "agent_requires_human",
+    ) -> None:
+        record_human_blocker(
+            state,
+            job,
+            resume_phase=phase,
+            blocked_phase="blocked",
+            blockers=blockers,
+            code=code,
+        )
         self.save(state)
 
     def _pause_ticket_if_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
         from agent_run.ticket_pause import can_pause_ticket, pause_ticket
-        if self._scope != "ticket" or not can_pause_ticket(job) or not self._ticket_stop_requested(state, job):
+        if self._scope != "ticket" or not can_pause_ticket(job) or not self._ticket_stop_requested(
+            state,
+            job,
+        ):
             return False
         pause_ticket(state, job)
         self.save(state)
         return True
 
     def _ticket_stop_requested(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return self._scope == "ticket" and self.states.ticket_pause_requested(str(state["run_id"]), int(job["ticket_number"]))
+        return self._scope == "ticket" and self.states.ticket_pause_requested(
+            str(state["run_id"]),
+            int(job["ticket_number"]),
+        )
 
     def require_agent_work(self, role: str) -> None:
         self.agent_work.require(role)
@@ -270,27 +424,63 @@ class DevelopmentReview:
             return f"ticket:{job['ticket_number']}", int(job.get("ticket_branch_generation", 1))
         return f"parent-only:{state['run_id']}", int(job.get("parent_generation", 1))
 
-    def _development_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
+    def _development_request(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        checkout: Path,
+    ) -> dict[str, Any]:
         if self._scope == "repair":
             from agent_run.run_repair_requests import RunRepairRequests
             assert self.github is not None
             return RunRepairRequests(self.git, self.github).development(state, job, checkout)
         request = self._change_request(state, job, checkout)
-        request.update(head_sha=self.git.checkout_head(checkout), thread_id=None if job.get("development_new_thread") else job.get("development_thread_id"))
+        request.update(
+            head_sha=self.git.checkout_head(checkout),
+            thread_id=None if job.get("development_new_thread") else job.get("development_thread_id"),
+        )
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
         source = job.get("repair_source")
-        if self._scope == "parent-only" and job.get("pending_attempt_kind", job.get("next_attempt_kind")) == "integration" and source == "acceptance":
-            request.update(repair_source="integration", work_source="integration", integration_evidence=json.dumps({"acceptance_artifact": _mapping(job, "acceptance_artifact"), "parent_integration": _mapping(job, "parent_integration")}, ensure_ascii=False, sort_keys=True, indent=2))
+        if self._scope == "parent-only" and job.get(
+            "pending_attempt_kind",
+            job.get("next_attempt_kind"),
+        ) == "integration" and source == "acceptance":
+            request.update(
+                repair_source="integration",
+                work_source="integration",
+                integration_evidence=json.dumps(
+                    {
+                        "acceptance_artifact": _mapping(job, "acceptance_artifact"),
+                        "parent_integration": _mapping(job, "parent_integration"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ),
+            )
         elif source in {"git_integrity", "acceptance", "required_checks"}:
-            evidence = {"git_integrity": "git_integrity_evidence", "acceptance": "acceptance_artifact", "required_checks": "ci_evidence"}[source]
+            evidence = {
+                "git_integrity": "git_integrity_evidence",
+                "acceptance": "acceptance_artifact",
+                "required_checks": "ci_evidence",
+            }[source]
             request.update(repair_source=source, **{evidence: _mapping(job, evidence)})
         return request
 
     def _change_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
         parent = dict(_mapping(state, "parent"))
         parent["url"] = f"https://github.com/{state['repository']}/issues/{parent['number']}"
-        request = {"acceptance_scope": "ticket" if self._scope == "ticket" else "parent_only", "parent_issue_url": parent["url"], "run_id": state["run_id"], "repository": str(state["repository"]), "parent": parent, "effective_revision": job["effective_revision"], "base_sha": job["base_sha"], "checkout": str(checkout)}
+        request = {
+            "acceptance_scope": "ticket" if self._scope == "ticket" else "parent_only",
+            "parent_issue_url": parent["url"],
+            "run_id": state["run_id"],
+            "repository": str(state["repository"]),
+            "parent": parent,
+            "effective_revision": job["effective_revision"],
+            "base_sha": job["base_sha"],
+            "checkout": str(checkout),
+        }
         if self._scope == "ticket":
             ticket = dict(state["ticket_graph"]["tickets"][str(job["ticket_number"])])
             ticket["url"] = f"https://github.com/{state['repository']}/issues/{job['ticket_number']}"
@@ -301,31 +491,67 @@ class DevelopmentReview:
             request["human_response_history"] = history
         return request
 
-    def _change_review_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
+    def _change_review_request(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        checkout: Path,
+    ) -> dict[str, Any]:
         request = self._change_request(state, job, checkout)
-        identity = candidate_review_identity(job, self.git) if self._scope == "ticket" else parent_review_identity(self.git, state, job)
-        request.update(candidate_sha=job["candidate_sha"], current_review_identity=identity, thread_id=latest_reviewer_thread(job) if (job.get("review_human_blocker_resume") or job.get("review_resume_thread_id")) and not job.get("review_new_thread") else None)
+        identity = (
+            candidate_review_identity(job, self.git)
+            if self._scope == "ticket"
+            else parent_review_identity(self.git, state, job)
+        )
+        resumed = (
+            job.get("review_human_blocker_resume") or job.get("review_resume_thread_id")
+        ) and not job.get("review_new_thread")
+        request.update(
+            candidate_sha=job["candidate_sha"],
+            current_review_identity=identity,
+            thread_id=latest_reviewer_thread(job) if resumed else None,
+        )
         if self._scope == "ticket":
             previous = previous_review_context(job)
             if previous is not None:
-                request.update(previous_acceptance_artifact=previous["artifact"], previous_review_identity=previous["identity"])
+                request.update(
+                    previous_acceptance_artifact=previous["artifact"],
+                    previous_review_identity=previous["identity"],
+                )
         else:
             previous = self._compatible_parent_baseline(state, job)
             baseline = self._compatible_parent_baseline(state, job, accepted_only=True)
             if baseline is not None:
                 request["parent_acceptance_baseline"] = baseline
             if previous is not None:
-                request.update(previous_acceptance_artifact=previous["artifact"], previous_review_identity={key: previous[key] for key in identity})
+                request.update(
+                    previous_acceptance_artifact=previous["artifact"],
+                    previous_review_identity={key: previous[key] for key in identity},
+                )
             if isinstance(job.get("parent_integration"), dict):
                 request.update(work_source="integration", integration_record=job["parent_integration"])
         return request
 
-    def _compatible_parent_baseline(self, state: dict[str, Any], job: dict[str, Any], *, accepted_only: bool = False) -> dict[str, Any] | None:
+    def _compatible_parent_baseline(
+        self, state: dict[str, Any], job: dict[str, Any], *, accepted_only: bool = False
+    ) -> dict[str, Any] | None:
         for key in ("acceptance_record", "previous_parent_acceptance_record"):
             record = job.get(key)
-            if not isinstance(record, dict) or record.get("acceptance_scope") != "parent_only" or record.get("parent_number") != state["parent"]["number"] or record.get("effective_revision") != job.get("effective_revision") or change_revision_changed(self.github, state, job):
+            if not isinstance(record, dict) or (
+                record.get("acceptance_scope") != "parent_only"
+                or record.get("parent_number") != _mapping(state, "parent")["number"]
+                or record.get("effective_revision") != job.get("effective_revision")
+                or change_revision_changed(self.github, state, job)
+            ):
                 continue
-            if not all(isinstance(record.get(field), str) and record[field] for field in ("reviewed_base_sha", "reviewed_candidate_sha", "reviewed_candidate_tree", "expected_merge_tree", "reviewer_thread_id")):
+            identity_fields = (
+                "reviewed_base_sha", "reviewed_candidate_sha",
+                "reviewed_candidate_tree", "expected_merge_tree", "reviewer_thread_id",
+            )
+            if not all(
+                isinstance(record.get(field), str) and record[field]
+                for field in identity_fields
+            ):
                 continue
             try:
                 artifact = AcceptanceArtifact.parse(record.get("artifact"))
@@ -333,36 +559,75 @@ class DevelopmentReview:
                 continue
             if accepted_only and not artifact.is_accepted:
                 continue
-            if not any(check["status"] == "blocked" for check in artifact.checks.values()):
+            if not any(
+                check["status"] == "blocked" for check in artifact.checks.values()
+            ):
                 return record
         return None
 
-    def _acceptance_is_current(self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]) -> bool:
+    def _acceptance_is_current(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        acceptance: dict[str, Any],
+    ) -> bool:
         if self._scope == "repair":
-            return self.candidate_acceptance.is_current(state, job, acceptance) and self._agent_is_current(state, job)
+            return self.candidate_acceptance.is_current(
+                state,
+                job,
+                acceptance,
+            ) and self._agent_is_current(state, job)
         if change_revision_changed(self.github, state, job):
             return False
         try:
-            identity = ({"acceptance_scope": "change_job", **candidate_review_identity(job, self.git), "effective_revision": job.get("effective_revision")} if self._scope == "ticket" else parent_review_identity(self.git, state, job))
+            identity = ({
+                "acceptance_scope": "change_job",
+                **candidate_review_identity(job, self.git),
+                "effective_revision": job.get("effective_revision"),
+            } if self._scope == "ticket" else parent_review_identity(self.git, state, job))
             return accepted_review_matches(acceptance, identity, job.get("acceptance_artifact"))
         except (GitError, ValueError, KeyError):
             return False
 
     def _thread_allowed(self, state: dict[str, Any], thread_id: str) -> bool:
-        return self._scope != "repair" or thread_id not in prior_thread_identities(state, state["run_acceptance"])
+        return self._scope != "repair" or thread_id not in prior_thread_identities(
+            state,
+            state["run_acceptance"],
+        )
 
     def _commit_work_candidate(self, checkout: Path, job: dict[str, Any], attempt: int) -> str | None:
         if self._scope == "repair":
             from agent_run.run_repair_delivery import commit_repair_candidate
             return commit_repair_candidate(self.git, checkout, job, attempt)
-        return self.git.commit_candidate(checkout, ticket_number=int(job["ticket_number"]) if self._scope == "ticket" else 0, attempt=attempt, expected_head=str(job.get("managed_checkout_head") or job.get("candidate_sha") or job["base_sha"]), candidate_intent=job.get("candidate_commit_intent") if isinstance(job.get("candidate_commit_intent"), dict) else None)
+        return self.git.commit_candidate(
+            checkout,
+            ticket_number=int(job["ticket_number"]) if self._scope == "ticket" else 0,
+            attempt=attempt,
+            expected_head=str(job.get("managed_checkout_head") or job.get("candidate_sha") or job["base_sha"]),
+            candidate_intent=job.get("candidate_commit_intent") if isinstance(
+                job.get("candidate_commit_intent"),
+                dict,
+            ) else None,
+        )
 
     def _resume_after_initial_credential(self, state: dict[str, Any], job: dict[str, Any]) -> None:
         if resume_initial_credential_wait(state, work_subject=self.contract.label):
             self.save(state)
 
-    def _wait_for_initial_credential(self, state: dict[str, Any], job: dict[str, Any], *, http_status: int | None) -> None:
-        wait_for_initial_credential(state, work_subject=self.contract.label, phase=str(job["phase"]), resume_status=str(state.get("status", "active")), http_status=http_status)
+    def _wait_for_initial_credential(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        *,
+        http_status: int | None,
+    ) -> None:
+        wait_for_initial_credential(
+            state,
+            work_subject=self.contract.label,
+            phase=str(job["phase"]),
+            resume_status=str(state.get("status", "active")),
+            http_status=http_status,
+        )
         ensure_supervision_window(state)
         self.save(state)
 
@@ -726,7 +991,10 @@ class DevelopmentReview:
                 job["attempt_kind"] = "ci_repair"
                 job["next_attempt_kind"] = "ci_repair"
                 decision = observe_repairable_ci_failure(
-                    delivery_budget_owner(state, job), head_sha=delivery_budget_owner(state, job)["ci_recovery"]["failure_head"],
+                    delivery_budget_owner(
+                        state,
+                        job,
+                    ), head_sha=delivery_budget_owner(state, job)["ci_recovery"]["failure_head"],
                     limit=limit, is_ticket=self.contract.label.startswith("ticket-"),
                 )
                 if decision != "exhausted":
@@ -758,7 +1026,10 @@ class DevelopmentReview:
         if job["attempt_kind"] == "integration":
             # Integration findings go back to Git checks before any next review.
             job["phase"] = "accepted"
-            if isinstance(job.get("acceptance_record"), dict) and AcceptanceArtifact.parse(job["acceptance_record"].get("artifact")).is_accepted:
+            if isinstance(
+                job.get("acceptance_record"),
+                dict,
+            ) and AcceptanceArtifact.parse(job["acceptance_record"].get("artifact")).is_accepted:
                 job["previous_parent_acceptance_record"] = job["acceptance_record"]
             job.pop("acceptance_record", None)
             job.pop("approval_grant", None)
@@ -848,7 +1119,15 @@ class DevelopmentReview:
         return True
 
 
-    def advance_change(self, state: dict[str, Any], job: dict[str, Any], checkout: Path, *, scope: ChangeScope, allow_agent: bool = False) -> DeliveryStep:
+    def advance_change(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        checkout: Path,
+        *,
+        scope: ChangeScope,
+        allow_agent: bool = False,
+    ) -> DeliveryStep:
         self._bind_change(state, job, scope)
         if scope == "ticket":
             from agent_run.ticket_phase import sync_active_ticket_job
@@ -864,7 +1143,12 @@ class DevelopmentReview:
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
                 elif phase == "committing_candidate":
-                    self._reject_stale(state, job, checkout, "Candidate was not created after requirements changed")
+                    self._reject_stale(
+                        state,
+                        job,
+                        checkout,
+                        "Candidate was not created after requirements changed",
+                    )
                     if not self._commit_candidate(state, job, checkout):
                         return self._step_result(state, job, waiting=True)
                 elif phase in {"candidate", "reviewing"}:
@@ -878,7 +1162,10 @@ class DevelopmentReview:
                         self.save(state)
                     else:
                         owner = delivery_budget_owner(state, job)
-                        if job.get("attempt_kind") == "ci_repair" and not ci_review_required(owner, is_ticket=scope == "ticket"):
+                        if job.get("attempt_kind") == "ci_repair" and not ci_review_required(
+                            owner,
+                            is_ticket=scope == "ticket",
+                        ):
                             from agent_run.change_delivery_fallback import prepare_ticket_ci_publication_authorization
                             if not prepare_ticket_ci_publication_authorization(self, state, job):
                                 raise ValueError("Ticket CI repair has no valid publication authority")
@@ -886,7 +1173,12 @@ class DevelopmentReview:
                             from agent_run.change_delivery_fallback import prepare_ticket_fallback
                             if not prepare_ticket_fallback(self, state, job):
                                 policy = self.review_budget_policy()
-                                self._checkpoint_budget(state, job, "modification_budget_exhausted" if policy.fallback else "review_budget_exhausted", "Review budget is exhausted and the current Candidate still needs modification")
+                                self._checkpoint_budget(
+                                    state,
+                                    job,
+                                    "modification_budget_exhausted" if policy.fallback else "review_budget_exhausted",
+                                    "Review budget is exhausted and the current Candidate still needs modification",
+                                )
                         else:
                             self._review(state, job, checkout)
                 elif phase == "escalating" and scope == "repair":
@@ -896,7 +1188,11 @@ class DevelopmentReview:
                     self.save(state)
                 return self._step_result(state, job)
             except AgentWorkRequired as work:
-                return DeliveryStep(DeliveryStepKind.WAITING if self.agent_work.capacity_wait else DeliveryStepKind.NEEDS_AGENT, str(job["phase"]), "work_capacity" if self.agent_work.capacity_wait else work.role)
+                return DeliveryStep(
+                    DeliveryStepKind.WAITING if self.agent_work.capacity_wait else DeliveryStepKind.NEEDS_AGENT,
+                    str(job["phase"]),
+                    "work_capacity" if self.agent_work.capacity_wait else work.role,
+                )
             except ChangeJobStopped:
                 return self._step_result(state, job, waiting=True)
             except InitialCredentialUnavailable as error:
@@ -905,7 +1201,12 @@ class DevelopmentReview:
             except GitHubReadError as error:
                 if not is_github_convergence_error(error.code):
                     raise
-                wait_for_github_convergence(state, code=error.code, message=str(error), waiting_for=self.contract.label)
+                wait_for_github_convergence(
+                    state,
+                    code=error.code,
+                    message=str(error),
+                    waiting_for=self.contract.label,
+                )
                 ensure_supervision_window(state)
                 self.save(state)
                 self.agent_work.defer()
@@ -945,10 +1246,20 @@ class DevelopmentReview:
         self.agent_work.require("reviewer")
         ordinal = review_ordinal(job)
         previous_attempt = pending_semantic_attempt(job, role="reviewer")
-        validation = (self.states.root / "worktrees" / str(state["run_id"]) / f"validation-run-{ordinal}" if run_scope else cast(Path, checkout).parent / f"validation-{self.contract.label}-{ordinal}")
+        if run_scope:
+            validation = (
+                self.states.root / "worktrees" / str(state["run_id"])
+                / f"validation-run-{ordinal}"
+            )
+        else:
+            assert checkout is not None
+            validation = checkout.parent / f"validation-{self.contract.label}-{ordinal}"
         semantic: dict[str, Any] | None = None
         if run_scope:
-            if isinstance(job.get("run_integration"), dict) and not run_integration_record_is_valid(self, state):
+            if isinstance(
+                job.get("run_integration"),
+                dict,
+            ) and not run_integration_record_is_valid(self, state):
                 raise ValueError("Run Acceptance requires the current integrated Run Branch")
             resume_initial_credential_wait(state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT)
         else:
@@ -961,15 +1272,34 @@ class DevelopmentReview:
             if run_scope:
                 run_head, default_head = self.git.resolve(str(state["run_branch"])), self._default_head(state)
                 try:
-                    self.git.prepare_expected_merge_checkout(default_head_sha=default_head, run_head_sha=run_head, checkout=validation)
+                    self.git.prepare_expected_merge_checkout(
+                        default_head_sha=default_head,
+                        run_head_sha=run_head,
+                        checkout=validation,
+                    )
                 except MergeConflictError as error:
-                    job.update(phase="repairing", repair_request={"repair_source": "merge_conflict", "merge_conflict_evidence": str(error)})
-                    state.update(status="run_acceptance_pending", terminal_kind="run_repair_pending", diagnostics=[])
+                    job.update(
+                        phase="repairing",
+                        repair_request={
+                            "repair_source": "merge_conflict",
+                            "merge_conflict_evidence": str(error),
+                        },
+                    )
+                    state.update(
+                        status="run_acceptance_pending",
+                        terminal_kind="run_repair_pending",
+                        diagnostics=[],
+                    )
                     self.save(state)
                     return True
                 expected = self.git.expected_merge_tree(default_head_sha=default_head, run_head_sha=run_head)
                 request = self._review_request(state, job, validation, run_head, default_head, expected)
-                boundary = run_currentness_boundary(state, reviewed_head_sha=run_head, reviewed_default_base_sha=default_head, expected_merge_tree=expected)
+                boundary = run_currentness_boundary(
+                    state,
+                    reviewed_head_sha=run_head,
+                    reviewed_default_base_sha=default_head,
+                    expected_merge_tree=expected,
+                )
                 semantic = self._allocate_review(state, job, boundary)
             else:
                 if self._scope == "repair":
@@ -978,7 +1308,10 @@ class DevelopmentReview:
                     assert self.github is not None
                     request = RunRepairRequests(self.git, self.github).review(state, job, validation)
                 else:
-                    self.git.prepare_validation_checkout(head_sha=str(job["candidate_sha"]), checkout=validation)
+                    self.git.prepare_validation_checkout(
+                        head_sha=str(job["candidate_sha"]),
+                        checkout=validation,
+                    )
                     request = self._change_review_request(state, job, validation)
                 boundary = self._invocation_boundary(job)
             assert semantic is not None
@@ -987,7 +1320,17 @@ class DevelopmentReview:
             job["phase"] = "reviewing"
             self._save_review(state)
             try:
-                execute_agent_work(state, job, request, semantic, agents=self.agents, save=self._save_review, phase="run_acceptance" if run_scope else "reviewing", boundary=boundary, is_current=lambda: self._review_is_current(state, job, request, boundary))
+                execute_agent_work(
+                    state,
+                    job,
+                    request,
+                    semantic,
+                    agents=self.agents,
+                    save=self._save_review,
+                    phase="run_acceptance" if run_scope else "reviewing",
+                    boundary=boundary,
+                    is_current=lambda: self._review_is_current(state, job, request, boundary),
+                )
             except InitialCredentialUnavailable as error:
                 if not run_scope:
                     raise
@@ -995,28 +1338,58 @@ class DevelopmentReview:
                 if previous_attempt is None:
                     job["validation_attempts"] = ordinal - 1
                     release_semantic_attempt(job)
-                wait_for_initial_credential(state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT, phase="run_acceptance", resume_status="run_acceptance_pending", http_status=error.http_status)
+                wait_for_initial_credential(
+                    state,
+                    work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT,
+                    phase="run_acceptance",
+                    resume_status="run_acceptance_pending",
+                    http_status=error.http_status,
+                )
                 self.save(state)
                 return False
             finally:
                 self.release_agent_work()
-            clear_initial_credential_wait(state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT if run_scope else self.contract.label)
-            self._retain_review_return(state, job)
+            if run_scope:
+                clear_initial_credential_wait(state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT)
+                self._retain_review_return(state, job)
         finally:
             self.git.remove_worktree(validation)
         if run_scope:
             return self._complete_run_review(state, job)
+        clear_initial_credential_wait(state, work_subject=self.contract.label)
+        self._retain_review_return(state, job)
         self._complete_change_review(state, job, cast(Path, checkout))
         return True
 
-    def _allocate_review(self, state: dict[str, Any], job: dict[str, Any], boundary: dict[str, Any]) -> dict[str, Any]:
+    def _allocate_review(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        boundary: dict[str, Any],
+    ) -> dict[str, Any]:
         owner = delivery_budget_owner(state, job)
         policy = self._run_budget_policy(state, job) if self._scope == "run" else self.review_budget_policy()
         budget = ensure_budget(owner, policy)
-        identity = (f"run-acceptance:{state['run_id']}", int(job["acceptance_generation"])) if self._scope == "run" else self._identity(state, job)
-        return begin_review(job, work_subject=identity[0], generation=identity[1], boundary=boundary, budget_owner=owner, budget_window=int(owner["ci_recovery"]["window"] if job.get("attempt_kind") == "ci_repair" else budget["window"]))
+        identity = (
+            f"run-acceptance:{state['run_id']}",
+            int(job["acceptance_generation"]),
+        ) if self._scope == "run" else self._identity(state, job)
+        return begin_review(
+            job,
+            work_subject=identity[0],
+            generation=identity[1],
+            boundary=boundary,
+            budget_owner=owner,
+            budget_window=int(owner["ci_recovery"]["window"] if job.get("attempt_kind") == "ci_repair" else budget["window"]),
+        )
 
-    def _review_budget_input(self, state: dict[str, Any], job: dict[str, Any], request: dict[str, Any], attempt: dict[str, Any]) -> None:
+    def _review_budget_input(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        request: dict[str, Any],
+        attempt: dict[str, Any],
+    ) -> None:
         owner = delivery_budget_owner(state, job)
         if job.get("attempt_kind") == "ci_repair" and self._scope != "run":
             recovery = owner.get("ci_recovery")
@@ -1024,14 +1397,30 @@ class DevelopmentReview:
             if isinstance(records, list) and records and isinstance(records[-1], dict):
                 request["previous_acceptance_artifact"] = records[-1].get("artifact")
                 request["previous_review_identity"] = records[-1].get("review_identity")
-            request.update(ci_evidence=deepcopy(job.get("ci_evidence")), ci_failure_context=deepcopy(job.get("required_checks_origin")), attempt_kind="ci_repair", work_source="ci")
+            request.update(
+                ci_evidence=deepcopy(job.get("ci_evidence")),
+                ci_failure_context=deepcopy(job.get("required_checks_origin")),
+                attempt_kind="ci_repair",
+                work_source="ci",
+            )
         if job.get("parent_integration_stage") is True and job.get("attempt_kind") != "ci_repair":
             request.pop("review_budget_context", None)
         elif job.get("attempt_kind") == "ci_repair":
-            request["review_budget_context"] = ci_reviewer_budget_context(owner, limit=ci_limit_for_job(job), is_ticket=self._scope == "ticket")
+            request["review_budget_context"] = ci_reviewer_budget_context(
+                owner,
+                limit=ci_limit_for_job(job),
+                is_ticket=self._scope == "ticket",
+            )
         else:
-            policy = self._run_budget_policy(state, job) if self._scope == "run" else self.review_budget_policy()
-            request["review_budget_context"] = reviewer_budget_context(owner, policy, current_attempt_consumed=attempt.get("budget_consumed") is True)
+            policy = self._run_budget_policy(
+                state,
+                job,
+            ) if self._scope == "run" else self.review_budget_policy()
+            request["review_budget_context"] = reviewer_budget_context(
+                owner,
+                policy,
+                current_attempt_consumed=attempt.get("budget_consumed") is True,
+            )
 
     def _save_review(self, state: dict[str, Any]) -> dict[str, Any]:
         job = self._current_job
@@ -1039,16 +1428,34 @@ class DevelopmentReview:
             active = state.get("active_agent_invocation")
             bound = active.get("semantic_attempt") if isinstance(active, dict) else None
             attempt = pending_semantic_attempt(job, role="reviewer")
-            if job.get("phase") in {"pending", "reviewing"} and isinstance(active, dict) and isinstance(bound, dict) and attempt is not None and bound.get("attempt_id") == attempt["attempt_id"]:
+            if job.get("phase") in {
+                "pending",
+                "reviewing",
+            } and isinstance(
+                active,
+                dict,
+            ) and isinstance(
+                bound,
+                dict,
+            ) and attempt is not None and bound.get("attempt_id") == attempt["attempt_id"]:
                 job["phase"] = "pending" if active["status"] == "resuming" else "reviewing"
         return self.save(state)
 
-    def _review_is_current(self, state: dict[str, Any], job: dict[str, Any], request: dict[str, Any], boundary: dict[str, Any]) -> bool:
+    def _review_is_current(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        request: dict[str, Any],
+        boundary: dict[str, Any],
+    ) -> bool:
         if self._scope != "run":
             return self._agent_is_current(state, job)
         from agent_run.run_parent_integration import run_integration_remote_is_current
         return (self._refresh_run_currentness(state)
-                and (not isinstance(job.get("run_integration"), dict) or run_integration_remote_is_current(self, state))
+                and (not isinstance(
+                    job.get("run_integration"),
+                    dict,
+                ) or run_integration_remote_is_current(self, state))
                 and self.git.resolve(str(state["run_branch"])) == boundary["reviewed_head_sha"]
                 and self._default_head(state) == boundary["reviewed_default_base_sha"]
                 and state["parent"]["revision"] == request["parent"]["revision"]
@@ -1066,26 +1473,64 @@ class DevelopmentReview:
             self._record_reviewer(state, job, review.thread_id)
         else:
             _record_reviewer(job, review.thread_id, new_thread=job.get("review_new_thread") is True)
-            for key in ("review_new_thread", "review_failure_resume", "review_resume_thread_id", "review_human_blocker_resume"):
+            for key in (
+                "review_new_thread",
+                "review_failure_resume",
+                "review_resume_thread_id",
+                "review_human_blocker_resume",
+            ):
                 job.pop(key, None)
         policy = self._run_budget_policy(state, job) if run_scope else self.review_budget_policy()
-        artifact = consume_review_result(job, policy, review.artifact, budget_owner=delivery_budget_owner(state, job))
-        job["pending_review_result"] = ({"record": run_acceptance_record(review_context_for_result(job), review.thread_id, artifact.raw), "human_blocker_resume": human_resume} if run_scope else {"reviewer_thread_id": review.thread_id, "artifact": artifact.raw, "human_blocker_resume": human_resume})
+        artifact = consume_review_result(
+            job,
+            policy,
+            review.artifact,
+            budget_owner=delivery_budget_owner(state, job),
+        )
+        job["pending_review_result"] = ({
+            "record": run_acceptance_record(review_context_for_result(job), review.thread_id, artifact.raw),
+            "human_blocker_resume": human_resume,
+        } if run_scope else {
+            "reviewer_thread_id": review.thread_id,
+            "artifact": artifact.raw,
+            "human_blocker_resume": human_resume,
+        })
         job["phase"] = "reviewing"
         self.save(state)
 
-    def _finish_applicable_review(self, state: dict[str, Any], job: dict[str, Any], artifact: AcceptanceArtifact, *, history_facts: dict[str, Any] | None = None) -> None:
+    def _finish_applicable_review(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        artifact: AcceptanceArtifact,
+        *,
+        history_facts: dict[str, Any] | None = None,
+    ) -> None:
         run_scope = self._scope == "run"
-        finish_review_result(state, job, artifact, resume_phase="pending" if run_scope else "candidate", blocked_phase="ready_for_human" if run_scope else "blocked", history_facts=history_facts)
+        finish_review_result(
+            state,
+            job,
+            artifact,
+            resume_phase="pending" if run_scope else "candidate",
+            blocked_phase="ready_for_human" if run_scope else "blocked",
+            history_facts=history_facts,
+        )
         policy = self._run_budget_policy(state, job) if run_scope else self.review_budget_policy()
         decision = after_review(job, policy, artifact, budget_owner=delivery_budget_owner(state, job))
         if decision == ReviewDecision.ACCEPT:
             job["phase"] = "accepted"
         elif decision == ReviewDecision.HUMAN:
             pass
-        elif run_scope and decision in {ReviewDecision.REVIEW_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
+        elif run_scope and decision in {
+            ReviewDecision.REVIEW_EXHAUSTED,
+            ReviewDecision.DEVELOPMENT_EXHAUSTED,
+        }:
             self.checkpoint_run(state, job, decision.value)
-        elif not run_scope and decision in {ReviewDecision.REVIEW_EXHAUSTED, ReviewDecision.CI_EXHAUSTED, ReviewDecision.DEVELOPMENT_EXHAUSTED}:
+        elif not run_scope and decision in {
+            ReviewDecision.REVIEW_EXHAUSTED,
+            ReviewDecision.CI_EXHAUSTED,
+            ReviewDecision.DEVELOPMENT_EXHAUSTED,
+        }:
             job.update(phase="escalating", escalation_code=decision.value)
             if decision == ReviewDecision.REVIEW_EXHAUSTED:
                 ensure_budget(delivery_budget_owner(state, job), policy)["checkpoint_reason"] = decision.value
@@ -1099,7 +1544,11 @@ class DevelopmentReview:
         self._scope, self._current_job = "run", job
         job.update(phase="ready_for_human", blocked_reason=code)
         ensure_budget(job, self._run_budget_policy(state, job))["checkpoint_reason"] = code
-        state.update(status="ready_for_human", terminal_kind="waiting_human", diagnostics=[{"code": code, "message": "Run Acceptance budget is exhausted; resume is required"}])
+        state.update(
+            status="ready_for_human",
+            terminal_kind="waiting_human",
+            diagnostics=[{"code": code, "message": "Run Acceptance budget is exhausted; resume is required"}],
+        )
         self.save(state)
 
     def _complete_change_review(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> None:
@@ -1155,18 +1604,33 @@ class DevelopmentReview:
         context = review_context_for_result(job)
         job["last_review_candidate_sha"] = str(context["binding"]["candidate_sha"])
         prior_acceptance = job.get("acceptance_record")
-        if isinstance(prior_acceptance, dict) and AcceptanceArtifact.parse(prior_acceptance.get("artifact")).is_accepted:
+        if isinstance(
+            prior_acceptance,
+            dict,
+        ) and AcceptanceArtifact.parse(prior_acceptance.get("artifact")).is_accepted:
             job["previous_parent_acceptance_record"] = deepcopy(prior_acceptance)
         if self._scope == "repair":
-            job["acceptance_record"] = self.candidate_acceptance.record(job, reviewer_thread_id, artifact.raw, review_context=context)
+            job["acceptance_record"] = self.candidate_acceptance.record(
+                job,
+                reviewer_thread_id,
+                artifact.raw,
+                review_context=context,
+            )
             if artifact.is_accepted:
                 job.pop("unresolved_acceptance_artifact", None)
             elif artifact.has_failures:
                 job["unresolved_acceptance_artifact"] = deepcopy(artifact.raw)
         else:
-            job["acceptance_record"] = {**context["facts"]["current_review_identity"], "reviewer_thread_id": reviewer_thread_id, "artifact": artifact.raw}
+            job["acceptance_record"] = {
+                **context["facts"]["current_review_identity"],
+                "reviewer_thread_id": reviewer_thread_id,
+                "artifact": artifact.raw,
+            }
             if self._scope == "ticket":
-                job["acceptance_record"].update(acceptance_scope="change_job", effective_revision=str(context["binding"]["effective_revision"]))
+                job["acceptance_record"].update(
+                    acceptance_scope="change_job",
+                    effective_revision=str(context["binding"]["effective_revision"]),
+                )
         if artifact.is_accepted and job.get("attempt_kind") == "ci_repair":
             job["publication_authority"] = "accepted"
             job.pop("fallback_publication_receipt", None)
@@ -1270,7 +1734,10 @@ class DevelopmentReview:
     ) -> dict[str, Any]:
         request = {
             "acceptance_scope": "run",
-            "parent_issue_url": str(_mapping(state, "parent").get("url") or f"https://github.com/{state['repository']}/issues/{state['parent']['number']}"),
+            "parent_issue_url": str(_mapping(
+                state,
+                "parent",
+            ).get("url") or f"https://github.com/{state['repository']}/issues/{state['parent']['number']}"),
             "run_id": state["run_id"],
             "repository": str(state["repository"]),
             "parent": dict(_mapping(state, "parent")),
@@ -1436,12 +1903,31 @@ def _reviewer_resume_thread(run: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else latest_reviewer_thread(run)
 
 
-def change_revision_changed(github: GitHubPublisher | None, state: dict[str, Any], job: dict[str, Any]) -> bool:
+def change_revision_changed(
+    github: GitHubPublisher | None,
+    state: dict[str, Any],
+    job: dict[str, Any],
+) -> bool:
     if isinstance(job.get("ticket_number"), int):
         assert github is not None
-        return github.current_effective_revision(parent_number=int(state["parent"]["number"]), ticket_number=int(job["ticket_number"]), expected_revision=str(job["effective_revision"])) != str(job["effective_revision"])
+        return github.current_effective_revision(
+            parent_number=int(state["parent"]["number"]),
+            ticket_number=int(job["ticket_number"]),
+            expected_revision=str(job["effective_revision"]),
+        ) != str(job["effective_revision"])
     return state["parent"].get("revision") != job.get("effective_revision")
 
 
 def parent_review_identity(git: GitRepository, state: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
-    return {"acceptance_scope": "parent_only", "parent_number": state["parent"]["number"], "effective_revision": job["effective_revision"], "reviewed_base_sha": job["base_sha"], "reviewed_candidate_sha": job["candidate_sha"], "reviewed_candidate_tree": git.resolve(f"{job['candidate_sha']}^{{tree}}"), "expected_merge_tree": git.expected_merge_tree(default_head_sha=str(job["base_sha"]), run_head_sha=str(job["candidate_sha"]))}
+    return {
+        "acceptance_scope": "parent_only",
+        "parent_number": state["parent"]["number"],
+        "effective_revision": job["effective_revision"],
+        "reviewed_base_sha": job["base_sha"],
+        "reviewed_candidate_sha": job["candidate_sha"],
+        "reviewed_candidate_tree": git.resolve(f"{job['candidate_sha']}^{{tree}}"),
+        "expected_merge_tree": git.expected_merge_tree(
+            default_head_sha=str(job["base_sha"]),
+            run_head_sha=str(job["candidate_sha"]),
+        ),
+    }
