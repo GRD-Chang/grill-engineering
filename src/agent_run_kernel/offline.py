@@ -275,6 +275,7 @@ class OfflinePort:
                     prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
                     if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
                         raise KernelError("remote_compare_and_swap")
+                    self._sync_mirror(git, effect.source_ref, effect.before_sha)
                     git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
                     self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
                 commit = git.commit(effect.after_sha)
@@ -303,13 +304,7 @@ class OfflinePort:
                     target = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.target_ref,)).fetchone()
                     if source != (effect.after_sha,) or target != (effect.before_sha,):
                         raise KernelError("merge_compare_and_swap")
-                    local = self.ref_commit(effect.target_ref)
-                    if local is None:
-                        raise KernelError("merge_mirror_missing")
-                    if local.sha != effect.before_sha:
-                        if not git.is_ancestor(local.sha, effect.before_sha):
-                            raise KernelError("merge_mirror_changed")
-                        git.compare_and_swap(effect.target_ref, local.sha, effect.before_sha)
+                    self._sync_mirror(git, effect.target_ref, effect.before_sha)
                     git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
                     self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
                     self._write_pr_in(db, effect.subject, pr)
@@ -437,6 +432,16 @@ class OfflinePort:
             rows = db.execute("SELECT operation,subject,intent,facts FROM writes ORDER BY position").fetchall()
         return [{"operation": operation, "subject": subject, "intent": intent, "facts": json.loads(facts)}
                 for operation, subject, intent, facts in rows]
+
+    def _sync_mirror(self, git: LocalGit, ref: str, remote_before: str) -> None:
+        """Advance a stale local mirror only to the intent's exact remote parent."""
+        local = self.ref_commit(ref)
+        if local is None:
+            raise KernelError("write_mirror_missing")
+        if local.sha != remote_before:
+            if not git.is_ancestor(local.sha, remote_before):
+                raise KernelError("write_mirror_changed")
+            git.compare_and_swap(ref, local.sha, remote_before)
 
     def external_append(self, ref: str, files: Mapping[str, str], token: str) -> Commit:
         """A separate fixture actor advances an exact ref; never used by the driver."""
