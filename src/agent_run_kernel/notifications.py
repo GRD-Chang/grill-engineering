@@ -24,6 +24,7 @@ from agent_run.notification_event_facts import event_copy, event_envelope
 from agent_run.notification_transport import send
 from agent_run.process_binding import _process_start_token
 
+from .notification_events import events as history_events
 from .query import notification_boundaries
 from .storage import Storage, Transaction
 
@@ -94,92 +95,12 @@ class NativeNotifications:
             run_id, binding, config, state = self._run(tx)
             if not self._same_binding(run_id, binding, config, state):
                 raise ValueError("notification Run or recipient binding changed")
-            history = tx.rows("SELECT position,subject,kind,identity,generation,created_at,material_id "
+            history = tx.rows("SELECT position,subject,kind,identity,generation,created_at,material_id,phase,purpose "
                               "FROM history WHERE position>? ORDER BY position LIMIT 16", (after,), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
-                event = self._event(tx, row, state)
-                if event is not None:
-                    events.append(event)
+                events.extend(history_events(tx, dict(row), state, self.config.get("mode", "concise")))
             return events, len(history) == 16, history[-1]["position"] if history else after
-
-    def _event(self, tx: Transaction, row: Any, state: dict[str, Any]) -> dict[str, Any] | None:
-        subject = tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],))
-        if row["kind"] == "acceptance_promoted":
-            promotion = json.loads(tx.get(row["material_id"], row["subject"]))
-            review = tx.one("SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND role='review'",
-                            (row["identity"], row["subject"], row["generation"]))
-            if (subject["kind"] == "ticket" or promotion["review_attempt"] != review["id"]
-                    or review["outcome"] != "pass" or review["result_id"] is None):
-                raise ValueError("formal acceptance notification has no original Review")
-            acceptance_key = [row["generation"], promotion["promoted_sha"], review["base_sha"],
-                              review["expected_tree"], review["revision"], review["graph_revision"]]
-            return event_envelope(state, "acceptance_passed", acceptance_key,
-                                  event_copy(state, "parent_acceptance_passed" if subject["kind"] == "parent_only"
-                                             else "acceptance_passed"), "green",
-                                  summary=event_copy(state, "acceptance_passed_summary"),
-                                  attempt_id=review["id"], round=review["ordinal"],
-                                  phase=event_copy(state, "role_review"), execution_timing_complete=False)
-        if row["kind"] == "effect_consumed" and self.config.get("mode") == "detailed":
-            original = tx.rows("SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? "
-                               "AND operation='pr_write' AND status='confirmed' AND receipt_id=?",
-                               (row["identity"], row["subject"], row["generation"], row["material_id"]))
-            if original:
-                intent = json.loads(tx.get(original[0]["payload_id"], row["subject"]))
-                # An edit or an absent prior field is not a creation fact.
-                if "prior" not in intent or intent["prior"] is not None:
-                    return None
-                receipt = json.loads(tx.get(row["material_id"], row["subject"]))
-                pr = receipt.get("pr")
-                if (receipt.get("disposition") != "target" or not isinstance(pr, dict)
-                        or pr.get("repository") != self.binding[0]
-                        or type(pr.get("number")) is not int or pr["number"] <= 0):
-                    return None
-                number = pr["number"]
-                return event_envelope(state, "pr_created", number,
-                                      event_copy(state, "pr_created", number=number), "green",
-                                      summary=event_copy(state, "pr_summary"),
-                                      url=f"https://github.com/{pr['repository']}/pull/{number}")
-        if row["kind"] == "worker_started":
-            first = tx.one("SELECT min(position) FROM history WHERE subject=? AND kind='worker_started'",
-                           (row["subject"],))[0]
-            if first != row["position"] or subject["kind"] not in {"ticket", "parent_only"}:
-                return None
-            attempt = tx.rows("SELECT a.id,a.role,o.started_at FROM invocations i "
-                              "JOIN attempts a ON a.id=i.attempt "
-                              "JOIN invocation_outputs o ON o.invocation=i.id "
-                              "WHERE i.id=? AND a.subject=? AND o.started_at IS NOT NULL "
-                              "ORDER BY o.ordinal", (row["identity"], row["subject"]))
-            if not attempt or attempt[0]["role"] != "development":
-                return None
-            kind = "ticket_started" if subject["kind"] == "ticket" else "parent_started"
-            title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                            (subject["issue"], subject["revision"]))
-            name = title[0][0] if title else f"#{subject['issue']}"
-            identity = (f"ticket:{subject['issue']}" if kind == "ticket_started"
-                        else f"parent-only:{self.run_id}")
-            facts = ({"task_number": subject["issue"], "task_title": name,
-                      "url": f"https://github.com/{self.binding[0]}/issues/{subject['issue']}"}
-                     if kind == "ticket_started" else {})
-            return event_envelope(state, kind, identity, event_copy(state, kind, title=name),
-                                  attempt_id=attempt[0]["id"],
-                                  started_at=datetime.fromtimestamp(attempt[0]["started_at"], UTC).isoformat(),
-                                  **facts)
-        if row["kind"] == "effect_consumed" and subject["kind"] == "ticket":
-            completed = tx.rows("SELECT generation FROM completions WHERE subject=? AND generation=? "
-                                "AND close_effect=?", (row["subject"], row["generation"], row["identity"]))
-            if not completed:
-                return None
-            title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                            (subject["issue"], subject["revision"]))
-            name = title[0][0] if title else f"#{subject['issue']}"
-            # The old ticket_jobs map keyed numbers as strings; preserve the
-            # card identity across a native continuation of that Ticket.
-            return event_envelope(state, "ticket_completed", [str(subject["issue"]), row["generation"]],
-                                  event_copy(state, "ticket_completed", title=name), "green",
-                                  task_number=subject["issue"], task_title=name,
-                                  url=f"https://github.com/{self.binding[0]}/issues/{subject['issue']}")
-        return None
 
     @staticmethod
     def _gate_slot(subject: str | None, generation: int | None, reason: str) -> str:
