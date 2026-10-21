@@ -109,7 +109,8 @@ def _runtime_directory(action_id: str, environment: Mapping[str, str]) -> Path:
 def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...],
            manager: SystemdHost, environment: Mapping[str, str], runner_lock: Path,
            subject: str | None = None, world: World | None = None,
-           message: str | None = None, new_thread: bool = False) -> dict[str, Any]:
+           message: str | None = None, new_thread: bool = False,
+           policy_overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Submit one explicit Action through the existing managed Host protocol.
 
     The caller supplies the exact command constructed by the selected native
@@ -124,7 +125,7 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
         carrier = directory / "environment.json"
         request = kernel.admit_host(action_id, kind=kind, command=command, environment_carrier=carrier,
                                     preflight=manager.preflight, subject=subject, world=world,
-                                    message=message, new_thread=new_thread)
+                                    message=message, new_thread=new_thread, policy_overrides=policy_overrides)
         handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
         observed = launch_handoff(kernel, action_id, manager, handoff)
         with kernel.storage.transaction(write=False) as tx:
@@ -242,8 +243,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     if parsed.command not in {"run", "resume", "approve"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
     _require_github_host()
-    if parsed.command != "run" and personal_settings._policy_values(parsed):
-        raise KernelError("resume_policy_not_connected", "Explicit checkpoint policy update requires Kernel admission")
+    policy_overrides = personal_settings._policy_values(parsed)
     environment = dict(os.environ)
     runner_lock = default_runner_lock_path(environment)
     with runner_usage_lease(runner_lock):
@@ -321,7 +321,8 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         if original is not None:
             request = kernel.host_request(original["action_id"])
             kernel.control_host(request, parsed.command, action_id, subject=subject, world=world,
-                message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False))
+                message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False),
+                policy_overrides=policy_overrides)
             with kernel.storage.transaction(write=False) as tx:
                 action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
             result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
@@ -330,7 +331,8 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
             result = submit(kernel, parsed.command, action_id=action_id,
                             command=command(database, action_id, runner_lock, environment), manager=manager,
                             environment=environment, runner_lock=runner_lock, subject=subject, world=world,
-                            message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False))
+                            message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False),
+                            policy_overrides=policy_overrides)
         result["language"] = run["language"]
         return result
 

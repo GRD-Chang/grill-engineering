@@ -555,7 +555,7 @@ def convert_completed_ticket_v6(
                                      f"refs/heads/{facts.run_branch}"),
                             Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN,
                                      facts.parent_number, facts.parent_revision,
-                                     Commit(facts.integrated_sha, facts.integrated_tree),
+                                     Commit(facts.base_sha, base_tree),
                                      f"refs/heads/{facts.run_branch}",
                                      f"refs/heads/{facts.base_branch}",
                                      checkout=str(final_checkout), owned_root=str(final_checkout.parent),

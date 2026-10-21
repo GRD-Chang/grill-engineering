@@ -1287,6 +1287,8 @@ class Kernel:
                     tx.execute("DELETE FROM gates WHERE subject=? AND code=?", (subject, code))
                 if new_thread and job["current_attempt"]:
                     tx.execute("UPDATE attempts SET new_thread=1 WHERE id=?", (job["current_attempt"],))
+                elif new_thread and job["phase"] == "development":
+                    tx.execute("UPDATE subjects SET development_thread=NULL WHERE id=?", (subject,))
                 if job["current_attempt"] and not self._gates(tx, subject):
                     tx.execute("UPDATE attempts SET resume_action=? WHERE id=?", (action_id, job["current_attempt"]))
                 if job["phase"] in {"development", "review", "publish"}:
@@ -2361,6 +2363,18 @@ class Kernel:
             tx.execute("UPDATE runs SET integration_holder=NULL WHERE integration_holder=?", (subject,))
             tx.execute("DELETE FROM integration_queue WHERE subject=?", (subject,))
 
+    def _integration_origin(self, tx: Transaction, job: sqlite3.Row) -> Commit:
+        if job["workspace_sha"] == job["candidate_sha"] and job["candidate_tree"]:
+            return Commit(job["candidate_sha"], job["candidate_tree"])
+        receipts = tx.rows("SELECT receipt_id FROM effects WHERE subject=? AND generation=? AND status='confirmed' AND operation IN ('candidate','integrate','publication_commit') ORDER BY rowid DESC LIMIT 1",
+                           (job["id"], job["generation"]))
+        if receipts:
+            result = json.loads(tx.get(receipts[0][0], job["id"]))
+            commit = result.get("commit")
+            if result["disposition"] == "target" and commit is not None and commit["sha"] == job["workspace_sha"]:
+                return Commit(commit["sha"], commit["tree"])
+        raise KernelError("integration_workspace_unproven")
+
     def _prepare_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, execution: Execution,
                         world: World, operation: str, *, before: str, after: str | None = None,
                         payload: dict[str, Any] | None = None) -> Step:
@@ -2393,6 +2407,10 @@ class Kernel:
             body["github_identity"] = inputs["runner_identity"]
         if operation == "validation_checkout":
             body["checkout"] = str(Path(job["checkout"]).parent / ("review-" + effect_id))
+        candidate_sha, candidate_tree = job["candidate_sha"], job["candidate_tree"]
+        if operation == "integrate":
+            origin = self._integration_origin(tx, job)
+            candidate_sha, candidate_tree = origin.sha, origin.tree
         payload_id = tx.put(subject, "effect_intent", wire_json(body))
         tx.execute("""INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,
             graph_revision,revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
@@ -2400,7 +2418,7 @@ class Kernel:
             VALUES (?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (effect_id, subject, operation, execution.owner, execution.epoch, run["parent_revision"],
                     run["graph_revision"], job["revision"], job["generation"], source_ref, target_ref,
-                    before, after, job["candidate_sha"], job["candidate_tree"], base.sha, base.tree,
+                    before, after, candidate_sha, candidate_tree, base.sha, base.tree,
                     job["pr_number"], actor, payload_id))
         self._event(tx, subject, "effect_prepared", effect_id, payload_id)
         row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
