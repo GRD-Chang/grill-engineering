@@ -1,46 +1,68 @@
-"""Recovery reads the original live close proof before reopening its Ticket."""
+"""Recovery uses committed Issue currentness and independent exact write receipts."""
 from dataclasses import asdict, replace
 import json
 
 import pytest
 
+from agent_run.github import GitHubReadError
 from agent_run_kernel import KernelError
-from test_kernel_remote_effects import _fixture
+from agent_run_kernel.effects import LocalGit
+from agent_run_kernel.model import Effect, Execution
+from agent_run_kernel.remote_effects import RemoteEffects
+from support.managed_abandon_transport import install_currentness
+from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment
 
 
-@pytest.mark.parametrize("mode", ["closed", "already_open", "foreign_close", "missing_event",
-                                  "missing_comment", "changed", "stopped"])
-def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(tmp_path, monkeypatch, mode):
-    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    comment = replace(push, effect_id="comment-original", operation="completion_comment", after_sha=None, pr_number=17,
-                      payload={"issue": 2, "merge_sha": push.after_sha, "kind": "ticket"})
+def _closed_ticket(git_repo, tmp_path, monkeypatch):
+    _environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    install_currentness(tmp_path, state)
+    port = RemoteEffects(git_repo, "example/project", runner_identity={"source": "host"})
+    base = LocalGit(git_repo).commit("HEAD")
+    comment = Effect("comment-original", "ticket:2", "completion_comment", "example/project",
+                     "refs/heads/ticket-2", "refs/heads/run", base.sha, None, None, base, 17, "publisher",
+                     {"issue": 2, "merge_sha": base.sha, "kind": "ticket"}, Execution("run-1", "worker", 1))
     comment_receipt = port.execute(comment, lambda: None)
     assert comment_receipt.disposition == "target"
     close = replace(comment, effect_id="close-original", operation="close",
                     payload={**comment.payload, "close_intent": comment_receipt.raw["close_intent"]})
     close_receipt = port.execute(close, lambda: None)
     assert close_receipt.disposition == "target"
-    original_close = close_receipt.raw["event"]
-    reopen = replace(close, effect_id="recover-original", operation="reopen_ticket", before_sha=push.after_sha,
+    reopen = replace(close, effect_id="recover-original", operation="reopen_ticket",
                      payload={"issue": 2, "control_action": "abandon-original",
-                              "completion": {"subject": push.subject, "generation": 1, "merge_sha": push.after_sha,
+                              "completion": {"subject": close.subject, "generation": 1, "merge_sha": base.sha,
                                              "close_effect": close.effect_id},
                               "close_intent": close.payload["close_intent"], "close_receipt": asdict(close_receipt)})
+    return port, reopen, state, tmp_path / "gh-calls.jsonl"
+
+
+def _foreign_transition(document, event, actor):
+    observed = {"id": len(document["events"]) + 1, "event": event, "actor": {"login": actor},
+                "created_at": "2026-10-21T11:00:00Z"}
+    document["events"].append(observed)
+    document["events_by_issue"]["2"].append(observed)
+    issue = document["source_graph"]["issues"]["2"]
+    issue.update(state="OPEN" if event == "reopened" else "CLOSED", updated_at=observed["created_at"])
+    return observed
+
+
+@pytest.mark.parametrize("mode", ["closed", "already_open", "foreign_close", "missing_event",
+                                  "missing_comment", "metadata", "missing_timestamp", "equivalent_timestamp", "changed", "stopped"])
+def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(git_repo, tmp_path, monkeypatch, mode):
+    port, reopen, state, calls = _closed_ticket(git_repo, tmp_path, monkeypatch)
+    original_close = reopen.payload["close_receipt"]["raw"]["event"]
     document = json.loads(state.read_text())
-    external_reopen = {"id": 2, "event": "reopened", "actor": {"login": "maintainer"},
-                       "created_at": "2026-10-21T10:02:00Z"}
-    foreign_close = {"id": 3, "event": "closed", "actor": {"login": "external"},
-                     "created_at": "2026-10-21T10:03:00Z"}
-    if mode in {"already_open", "changed", "stopped", "foreign_close"}:
-        document["events"].append(external_reopen)
-        document["issue_state"] = "open"
+    if mode in {"already_open", "foreign_close"}:
+        _foreign_transition(document, "reopened", "maintainer")
     if mode == "foreign_close":
-        document["events"].append(foreign_close)
-        document["issue_state"] = "closed"
+        _foreign_transition(document, "closed", "external")
     if mode == "missing_event":
-        document["events"] = []
+        document["events"] = document["events_by_issue"]["2"] = []
     if mode == "missing_comment":
-        document["comments"] = []
+        document["comments"] = document["comments_by_issue"]["2"] = []
+    if mode == "metadata":
+        document["source_graph"]["issues"]["2"]["updated_at"] = "2026-10-21T12:00:00Z"
+    if mode == "missing_timestamp":
+        document["source_graph"]["issues"]["2"]["updated_at"] = None
     if mode == "closed":
         document["lose_operation"] = "close"
     state.write_text(json.dumps(document))
@@ -48,40 +70,110 @@ def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(
 
     def authorize():
         authorizations.append(reopen.effect_id)
+        if mode == "equivalent_timestamp":
+            changed = json.loads(state.read_text())
+            issue = changed["source_graph"]["issues"]["2"]
+            issue["updated_at"] = issue["updated_at"].replace("Z", "+00:00")
+            state.write_text(json.dumps(changed))
         if mode == "stopped":
             raise KernelError("executor_fenced")
         if mode == "changed":
             changed = json.loads(state.read_text())
-            changed["events"].append(foreign_close)
-            changed["issue_state"] = "closed"
+            _foreign_transition(changed, "reopened", "maintainer")
+            _foreign_transition(changed, "closed", "external")
             state.write_text(json.dumps(changed))
 
     if mode in {"changed", "stopped"}:
         with pytest.raises(KernelError, match="ticket_recovery_boundary_changed" if mode == "changed" else "executor_fenced"):
             port.execute(reopen, authorize)
         assert authorizations == [reopen.effect_id]
+    elif mode in {"missing_event", "missing_comment", "metadata", "missing_timestamp"}:
+        with pytest.raises(GitHubReadError) as pending:
+            port.execute(reopen, authorize)
+        assert pending.value.code == "github_recovery_observation_pending"
+        assert authorizations == []
     else:
         result = port.execute(reopen, authorize)
-        if mode in {"closed", "already_open"}:
-            assert result.disposition == "target"
-            assert result.raw["issue"] == 2 and result.raw["state"] == "OPEN"
+        if mode in {"closed", "equivalent_timestamp"}:
+            assert result.disposition == "target" and result.raw["state"] == "OPEN"
             assert result.raw["prior_close"] == original_close
+            assert result.raw["write_returncode"] == (1 if mode == "closed" else 0)
+            assert result.raw["reopened_event"]["id"] > original_close["id"]
+            assert result.raw["reopened_event"]["actor"] == "publisher"
             assert authorizations == [reopen.effect_id]
-            if mode == "closed":
-                assert result.raw["write_returncode"] == 1
-                assert result.raw.get("already_open") is not True
-                assert result.raw["reopened_event"]["id"] > original_close["id"]
-                assert result.raw["reopened_event"]["actor"] == {"login": "publisher"}
-            else:
-                assert result.raw["already_open"] is True
             assert port.reconcile(reopen).disposition == "target"
         else:
-            assert result.disposition == ("third" if mode == "foreign_close" else "unknown")
+            assert result.disposition == "third" and result.raw["reason"] == "not_owned"
+            assert result.raw["issue"] == 2 and result.raw["prior_close"] == original_close
             assert authorizations == []
-            if mode == "foreign_close":
-                assert result.raw["issue"] == 2 and result.raw["state"] == "CLOSED"
-                assert result.raw["latest_close"] == foreign_close
     final = json.loads(state.read_text())
     assert len(final["comments"]) == (0 if mode == "missing_comment" else 1)
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert sum("PATCH" in call for call in actual) == (2 if mode == "closed" else 1)
+    assert sum("PATCH" in call for call in actual) == (2 if mode in {"closed", "equivalent_timestamp"} else 1)
+
+
+@pytest.mark.parametrize("mode", ["lost_ack", "equivalent_timestamp", "metadata", "foreign_reopen", "foreign_close", "changed", "stopped"])
+def test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority(git_repo, tmp_path, monkeypatch, mode):
+    port, reopen, state, calls = _closed_ticket(git_repo, tmp_path, monkeypatch)
+    reopened = port.execute(reopen, lambda: None)
+    assert reopened.disposition == "target"
+    effect = replace(reopen, effect_id="recovery-comment-original", operation="recovery_comment",
+                     payload={**reopen.payload, "reopen_effect": reopen.effect_id, "reopen_receipt": asdict(reopened),
+                              "comment_body": "Run run-1 abandoned before default delivery; Ticket #2, PR #17, commit " + reopen.before_sha})
+    document = json.loads(state.read_text())
+    if mode == "lost_ack":
+        document["lose_operation"] = "comment"
+    if mode == "equivalent_timestamp":
+        event = document["events_by_issue"]["2"][-1]
+        event["created_at"] = event["created_at"].replace("Z", "+00:00")
+        document["source_graph"]["issues"]["2"]["updated_at"] = event["created_at"]
+    if mode == "metadata":
+        document["source_graph"]["issues"]["2"]["updated_at"] = "2026-10-21T12:00:00Z"
+    if mode in {"foreign_reopen", "foreign_close"}:
+        if mode == "foreign_reopen":
+            _foreign_transition(document, "closed", "external")
+            _foreign_transition(document, "reopened", "maintainer")
+        else:
+            _foreign_transition(document, "closed", "external")
+    state.write_text(json.dumps(document))
+    authorizations = []
+
+    def authorize():
+        authorizations.append(effect.effect_id)
+        if mode == "stopped":
+            raise KernelError("executor_fenced")
+        if mode == "changed":
+            changed = json.loads(state.read_text())
+            changed["source_graph"]["issues"]["2"]["updated_at"] = "2026-10-21T12:00:00Z"
+            state.write_text(json.dumps(changed))
+
+    if mode in {"metadata", "changed"}:
+        with pytest.raises(GitHubReadError) as pending:
+            port.execute(effect, authorize)
+        assert pending.value.code == "github_recovery_observation_pending"
+        assert authorizations == ([effect.effect_id] if mode == "changed" else [])
+    elif mode == "stopped":
+        with pytest.raises(KernelError, match="executor_fenced"):
+            port.execute(effect, authorize)
+        assert authorizations == [effect.effect_id]
+    elif mode in {"foreign_reopen", "foreign_close"}:
+        result = port.execute(effect, authorize)
+        assert result.disposition == "third" and result.raw["reason"] == "not_owned"
+        assert authorizations == []
+    else:
+        result = port.execute(effect, authorize)
+        assert result.disposition == "target" and result.raw["write_returncode"] == (1 if mode == "lost_ack" else 0)
+        assert result.raw["reopened_event"] == reopened.raw["reopened_event"]
+        assert result.raw["comment"]["actor"] == "publisher"
+        assert result.raw["comment"]["body"] == port._marker(effect) + "\n" + effect.payload["comment_body"]
+        assert authorizations == [effect.effect_id]
+        changed = json.loads(state.read_text())
+        changed["source_graph"]["issues"]["2"]["updated_at"] = "2026-10-21T12:00:00Z"
+        state.write_text(json.dumps(changed))
+        assert port.reconcile(effect).raw == {key: value for key, value in result.raw.items() if not key.startswith("write_")}
+        assert port.execute(effect, lambda: pytest.fail("exact target cannot write again")).disposition == "target"
+    final = json.loads(state.read_text())
+    assert len(final["comments"]) == (2 if mode in {"lost_ack", "equivalent_timestamp"} else 1)
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("POST" in call for call in actual) == (2 if mode in {"lost_ack", "equivalent_timestamp"} else 1)
+    assert sum("PATCH" in call for call in actual) == 2

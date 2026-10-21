@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, TYPE_CHECKING
+from typing import Any, NoReturn, TYPE_CHECKING
 from urllib.parse import urlencode
 
 from agent_run.github import GhGitHubReader, GitHubReadError
@@ -84,6 +84,8 @@ class RemoteEffects:
             return self._retire_pr(effect, authorize)
         if effect.operation == "reopen_ticket":
             return self._reopen_ticket(effect, authorize)
+        if effect.operation == "recovery_comment":
+            return self._recovery_comment(effect, authorize)
         observed = self.reconcile(effect)
         prior = effect.payload.get("prior")
         if (effect.operation == "pr_write" and effect.pr_number is not None and isinstance(prior, Mapping)
@@ -161,6 +163,8 @@ class RemoteEffects:
                 return self._reconcile_retirement(effect)
             if effect.operation == "reopen_ticket":
                 return self._reconcile_ticket_recovery(effect)
+            if effect.operation == "recovery_comment":
+                return self._reconcile_recovery_comment(effect)
             if effect.operation in {"push", "run_branch"}:
                 head = self._remote_head(effect.source_ref)
                 if head is not None and head == effect.after_sha:
@@ -332,6 +336,7 @@ class RemoteEffects:
                    "issue": _number(effect.payload["issue"]), "merge_sha": effect.before_sha, "kind": "ticket"}
         if (receipt["disposition"] != "target" or completion["subject"] != effect.subject
                 or completion["merge_sha"] != effect.before_sha
+                or intent["actor"] != effect.actor or intent["pr_number"] != effect.pr_number
                 or any(intent.get(key) != value for key, value in binding.items())
                 or original["event"] != "closed" or self._event_actor(original) != _text(intent["actor"])
                 or type(intent["baseline_event_id"]) is not int or intent["baseline_event_id"] < 0
@@ -343,6 +348,24 @@ class RemoteEffects:
         _sha(effect.before_sha)
         return intent, original
 
+    @staticmethod
+    def _recovery_pending(message: str) -> NoReturn:
+        raise GitHubReadError("github_recovery_observation_pending", message)
+
+    def _recovery_time(self, value: Any) -> datetime:
+        try:
+            return _time(value)
+        except (TypeError, ValueError):
+            self._recovery_pending("Recovery observation timestamp is unavailable")
+
+    def _recovery_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._event_actor(event)
+        if actor is None:
+            self._recovery_pending("Recovery transition actor is unavailable")
+        self._recovery_time(event.get("created_at"))
+        return {"id": _number(event["id"]), "event": event["event"],
+                "actor": actor, "created_at": _text(event["created_at"])}
+
     def _reconcile_ticket_recovery(self, effect: Effect) -> EffectResult:
         intent, original = self._ticket_recovery_proof(effect)
         issue = self._issue(effect)
@@ -352,25 +375,104 @@ class RemoteEffects:
                     if comment["id"] == intent["comment_id"]]
         if (len(comments) != 1 or comments[0]["body"] != intent["comment_body"]
                 or _login(comments[0].get("user")) != intent["actor"]
-                or _time(comments[0]["created_at"]) != _time(intent["comment_created_at"])):
-            return EffectResult("unknown", raw={**raw, "diagnostic": "original close comment unproven"})
+                or self._recovery_time(comments[0].get("created_at")) != _time(intent["comment_created_at"])):
+            self._recovery_pending("Original close comment is unproven")
         events = self._events(effect)
         matches = [event for event in events if event["id"] == original["id"]]
         if (len(matches) != 1 or matches[0]["event"] != "closed"
                 or self._event_actor(matches[0]) != self._event_actor(original)
-                or _time(matches[0]["created_at"]) != _time(original["created_at"])):
-            return EffectResult("unknown", raw={**raw, "diagnostic": "original close event unproven"})
+                or self._recovery_time(matches[0].get("created_at")) != _time(original["created_at"])):
+            self._recovery_pending("Original close event is unproven")
         latest_close = next(event for event in reversed(events) if event["event"] == "closed")
+        if (issue["state"] == "open" and events[-1]["event"] == "reopened"
+                and events[-1]["id"] > original["id"]):
+            latest_reopen = self._recovery_event(events[-1])
+            if latest_reopen["actor"] != effect.actor:
+                return EffectResult("third", raw={**raw, "latest_reopen": latest_reopen, "reason": "not_owned"})
         if latest_close["id"] != original["id"]:
-            return EffectResult("third" if self._event_actor(latest_close) else "unknown",
-                                raw={**raw, "latest_close": latest_close})
+            return EffectResult("third", raw={**raw, "latest_close": self._recovery_event(latest_close),
+                                               "reason": "not_owned"})
         later = [event for event in events if event["id"] > original["id"]]
         if issue["state"] == "closed":
-            return EffectResult("unknown" if later else "prior", raw=raw)
-        if (later and later[-1]["event"] == "reopened" and self._event_actor(later[-1]) == effect.actor
-                and _time(later[-1]["created_at"]) >= _time(original["created_at"])):
-            return EffectResult("target", raw={**raw, "reopened_event": later[-1]})
-        return EffectResult("target", raw={**raw, "already_open": True})
+            if later:
+                self._recovery_pending("Issue state and recovery timeline have not converged")
+            transition = original
+            disposition = "prior"
+        else:
+            if not later or later[-1]["event"] != "reopened":
+                self._recovery_pending("Open Issue has no proven recovery transition")
+            transition = self._recovery_event(later[-1])
+            if transition["actor"] != effect.actor:
+                return EffectResult("third", raw={**raw, "latest_reopen": transition, "reason": "not_owned"})
+            if _time(transition["created_at"]) < _time(original["created_at"]):
+                self._recovery_pending("Recovery transition precedes the original close")
+            raw["reopened_event"] = transition
+            disposition = "target"
+        try:
+            current = _time(issue["updated_at"]) == _time(transition["created_at"])
+        except (KeyError, TypeError, ValueError):
+            current = False
+        if not current:
+            self._recovery_pending("Issue updated_at does not prove the original recovery transition")
+        return EffectResult(disposition, raw={**raw, "updated_at": issue["updated_at"]})
+
+    def _recovery_comment_proof(self, effect: Effect) -> dict[str, Any]:
+        _intent, original = self._ticket_recovery_proof(effect)
+        receipt = effect.payload["reopen_receipt"]
+        raw = receipt["raw"]
+        event = raw["reopened_event"]
+        if (receipt["disposition"] != "target" or raw["issue"] != effect.payload["issue"]
+                or raw["state"] != "OPEN" or raw["prior_close"] != original
+                or event["event"] != "reopened" or event["actor"] != effect.actor
+                or _number(event["id"]) <= _number(original["id"])
+                or _time(event["created_at"]) < _time(original["created_at"])):
+            raise ValueError("Foreign Ticket reopen proof")
+        return {"issue": effect.payload["issue"], "reopen_effect": _text(effect.payload["reopen_effect"]),
+                "prior_close": dict(original), "reopened_event": dict(event)}
+
+    @staticmethod
+    def _same_recovery_event(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        return (all(left[key] == right[key] for key in ("id", "event", "actor"))
+                and _time(left["created_at"]) == _time(right["created_at"]))
+
+    def _recovery_body(self, effect: Effect) -> str:
+        return self._marker(effect) + "\n" + _text(effect.payload["comment_body"])
+
+    def _reconcile_recovery_comment(self, effect: Effect) -> EffectResult:
+        raw = self._recovery_comment_proof(effect)
+        comments = [comment for comment in self._pages(self._issue_path(effect) + "/comments?per_page=100")
+                    if self._marker(effect) in comment["body"]]
+        if comments:
+            # An exact sent write remains a physical fact after later Issue edits.
+            if (len(comments) != 1 or comments[0]["body"] != self._recovery_body(effect)
+                    or _login(comments[0].get("user")) != effect.actor):
+                return EffectResult("third", raw={**raw, "diagnostic": "Recovery marker conflicts"})
+            comment = comments[0]
+            self._recovery_time(comment.get("created_at"))
+            return EffectResult("target", raw={**raw, "comment": {"id": _number(comment["id"]),
+                "body": comment["body"], "actor": effect.actor, "created_at": comment["created_at"]}})
+        reopened = self._reconcile_ticket_recovery(effect)
+        if reopened.disposition == "third":
+            return reopened
+        if reopened.disposition != "target" or not self._same_recovery_event(reopened.raw["reopened_event"], raw["reopened_event"]):
+            self._recovery_pending("Frozen own reopen has not converged")
+        return EffectResult("prior", raw=raw)
+
+    def _recovery_comment(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+        observed = self.reconcile(effect)
+        if observed.disposition != "prior":
+            return observed
+        if self.actor() != effect.actor:
+            raise KernelError("remote_actor_changed")
+
+        def guard() -> None:
+            authorize()
+            if self.reconcile(effect) != observed:
+                raise KernelError("ticket_recovery_boundary_changed")
+
+        response = self._write(self._issue_path(effect) + "/comments", "POST",
+                               {"body": self._recovery_body(effect)}, guard)
+        return self._readback(effect, response)
 
     def _reopen_ticket(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
         observed = self.reconcile(effect)
@@ -379,12 +481,14 @@ class RemoteEffects:
 
         def guard() -> None:
             authorize()
-            if self.reconcile(effect) != observed:
+            fresh = self.reconcile(effect)
+            if (fresh.disposition != observed.disposition
+                    or (fresh.disposition == "target" and not self._same_recovery_event(
+                        fresh.raw["reopened_event"], observed.raw["reopened_event"]))):
                 raise KernelError("ticket_recovery_boundary_changed")
 
         if observed.disposition == "target":
-            # A verified already-OPEN cleanup outcome still needs first-dispatch
-            # authority. Reconciliation remains a pure physical observation.
+            # First dispatch still needs authority; sent reconciliation is read-only.
             guard()
             return observed
         if self.actor() != effect.actor:
@@ -693,7 +797,8 @@ class RemoteEffects:
             _number(event["id"])
         return sorted(events, key=lambda e: e["id"])
 
-    def _marker(self, effect: Effect) -> str:
+    @staticmethod
+    def _marker(effect: Effect) -> str:
         return "<!-- agent-run-kernel:" + effect.effect_id + " -->"
 
     def _comment_intent(self, effect: Effect, baseline: int) -> dict[str, Any]:

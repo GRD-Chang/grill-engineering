@@ -40,8 +40,8 @@ def identity() -> str:
 
 class Kernel:
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
-    ABANDON_EFFECTS = ("inspect_resources", "retire_pr", "reopen_ticket", "abandon_worktree")
-    REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref", "retire_pr", "reopen_ticket")
+    ABANDON_EFFECTS = ("inspect_resources", "retire_pr", "reopen_ticket", "recovery_comment", "abandon_worktree")
+    REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref", "retire_pr", "reopen_ticket", "recovery_comment")
     def __init__(self, path: Path) -> None:
         self.storage = Storage(path)
         self.clock: Callable[[], float] = time.time
@@ -528,12 +528,37 @@ class Kernel:
                 item["subject"] == row["subject"] and item["generation"] == row["generation"] and item["prior_pr"] == payload.get("prior_pr")
                 for item in self._abandon_prs(tx, action)))
         completion = payload.get("completion")
-        return bool(row["operation"] == "reopen_ticket" and isinstance(completion, dict) and tx.rows(
-            "SELECT subject FROM completions WHERE subject=? AND generation=? AND close_effect=?",
-            (row["subject"], row["generation"], completion.get("close_effect"))))
+        if row["operation"] not in {"reopen_ticket", "recovery_comment"} or not isinstance(completion, dict):
+            return False
+        records = tx.rows("SELECT * FROM completions WHERE subject=? AND generation=? AND close_effect=?",
+                          (row["subject"], row["generation"], completion.get("close_effect")))
+        if not records or dict(records[0]) != completion:
+            return False
+        closed = tx.one("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND operation='close' AND status='confirmed'",
+                        (completion["close_effect"], row["subject"], row["generation"]))
+        close_payload = json.loads(tx.get(closed["payload_id"], row["subject"]))
+        if (payload.get("issue") != self._job(tx, row["subject"])["issue"]
+                or payload.get("close_receipt") != json.loads(tx.get(closed["receipt_id"], row["subject"]))
+                or payload.get("close_intent") != close_payload["close_intent"] or row["actor"] != closed["actor"]):
+            return False
+        if row["operation"] == "reopen_ticket":
+            return True
+        reopened = tx.rows("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND control_action=? "
+                           "AND operation='reopen_ticket' AND status='confirmed'",
+                           (payload.get("reopen_effect"), row["subject"], row["generation"], action["id"]))
+        if not reopened:
+            return False
+        prior = reopened[0]
+        receipt = json.loads(tx.get(prior["receipt_id"], row["subject"]))
+        return bool(prior["actor"] == row["actor"] and receipt["disposition"] == "target"
+                    and payload.get("reopen_receipt") == receipt
+                    and json.loads(tx.get(prior["payload_id"], row["subject"]))["completion"] == completion)
 
     def _abandon_control_authority(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> bool:
         if not self._abandon_control_scope(tx, action, row):
+            return False
+        if (tx.one("SELECT blocked FROM runs")[0] == "supervision_timeout"
+                or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, row["subject"]))):
             return False
         if row["operation"] != "inspect_resources":
             inspection = self._abandon_inspection(tx, action)
@@ -595,10 +620,16 @@ class Kernel:
         original = payload["close_receipt"].get("raw", {}).get("event")
         raw = result.get("raw", {})
         latest = raw.get("latest_close")
-        return bool(isinstance(original, dict) and isinstance(latest, dict)
-                    and raw.get("issue") == payload["issue"] and raw.get("state") == "CLOSED"
+        closed = bool(isinstance(original, dict) and isinstance(latest, dict)
+                    and raw.get("issue") == payload["issue"] and raw.get("state") in {"OPEN", "CLOSED"}
                     and type(latest.get("id")) is int and latest["id"] > original["id"]
                     and latest.get("event") == "closed" and self._event_actor(latest))
+        reopened = raw.get("latest_reopen")
+        return closed or bool(isinstance(original, dict) and isinstance(reopened, dict)
+                    and raw.get("issue") == payload["issue"] and raw.get("state") == "OPEN"
+                    and raw.get("prior_close") == original and type(reopened.get("id")) is int
+                    and reopened["id"] > original["id"] and reopened.get("event") == "reopened"
+                    and self._event_actor(reopened) not in {None, payload["close_intent"]["actor"]})
 
     def _prepare_abandon_effect(self, tx: Transaction, run: sqlite3.Row, action: sqlite3.Row, subject: str,
                                 generation: int, execution: Execution, world: World, operation: str, *, before: str,
@@ -653,7 +684,7 @@ class Kernel:
                         self._check_abandon_inspection(tx, action, row)
                     except KernelError as error:
                         return Step("paused", row["subject"], error.code)
-                elif result["disposition"] != "target" and not (row["operation"] == "reopen_ticket"
+                elif result["disposition"] != "target" and not (row["operation"] in {"reopen_ticket", "recovery_comment"}
                         and result["disposition"] == "third" and self._reopen_not_owned(payload, result)):
                     return Step("paused", row["subject"], "abandon_outcome_unproven")
                 tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
@@ -699,8 +730,23 @@ class Kernel:
                 continue
             for completion in tx.all("SELECT * FROM completions ORDER BY subject,generation"):
                 value = dict(completion)
-                if completed("reopen_ticket", "completion", value):
-                    continue
+                reopened = next((row for row in effects if row["operation"] == "reopen_ticket" and row["status"] == "confirmed"
+                                 and json.loads(tx.get(row["payload_id"], row["subject"]))["completion"] == value), None)
+                if reopened is not None:
+                    receipt = json.loads(tx.get(reopened["receipt_id"], completion["subject"]))
+                    if receipt["disposition"] != "target" or completed("recovery_comment", "completion", value):
+                        continue
+                    if world is None or subject != completion["subject"]:
+                        return Step("observe", completion["subject"])
+                    payload = json.loads(tx.get(reopened["payload_id"], completion["subject"]))
+                    issue = payload["issue"]
+                    body = (f"Delivery Run `{run['id']}` was abandoned before entering the default branch. "
+                            f"Reopened Ticket #{issue}; its prior completion was recorded by PR #{completion['pr_number']} "
+                            f"at Run Branch commit `{completion['merge_sha']}`.")
+                    return self._prepare_abandon_effect(tx, run, action, completion["subject"], completion["generation"], execution, world,
+                        "recovery_comment", before=completion["merge_sha"], payload={"issue": issue, "completion": value,
+                         "close_receipt": payload["close_receipt"], "close_intent": payload["close_intent"],
+                         "reopen_effect": reopened["id"], "reopen_receipt": receipt, "comment_body": body})
                 if world is None or subject != completion["subject"]:
                     return Step("observe", completion["subject"])
                 closed = tx.one("SELECT * FROM effects WHERE id=? AND operation='close' AND status='confirmed'", (completion["close_effect"],))
@@ -1146,6 +1192,23 @@ class Kernel:
                         elif effect["operation"] == "inspect_resources" and effect["status"] == "observed":
                             tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (effect["id"],))
                             self._event(tx, effect["subject"], "effect_consumed", effect["id"], effect["receipt_id"], generation=effect["generation"])
+                    for wait in tx.all("SELECT w.*,m.body FROM waits w JOIN material m ON m.id=w.scope_id"):
+                        scope = json.loads(wait["body"])
+                        if (scope.get("abandon_action") != continuation_of
+                                or scope != self._automatic_scope(tx, run, wait["subject"], scope["cleanup"])):
+                            continue
+                        if wait["subject"] is not None:
+                            for gate in self._gates(tx, wait["subject"]):
+                                if (gate["code"] == "supervision_timeout" and gate["evidence"] is not None
+                                        and json.loads(tx.get(gate["evidence"], wait["subject"])).get("scope_id") == wait["scope_id"]):
+                                    tx.execute("DELETE FROM gates WHERE subject=? AND code='supervision_timeout' AND evidence=?",
+                                               (wait["subject"], gate["evidence"]))
+                        elif run["blocked"] == "supervision_timeout":
+                            latest = tx.rows("SELECT m.body FROM history h JOIN material m ON m.id=h.material_id "
+                                             "WHERE h.kind='paused' AND h.identity='supervision_timeout' ORDER BY h.position DESC LIMIT 1")
+                            if latest and json.loads(latest[0][0]).get("scope_id") == wait["scope_id"]:
+                                tx.execute("UPDATE runs SET blocked=NULL")
+                        tx.execute("DELETE FROM waits WHERE scope_id=? AND kind=?", (wait["scope_id"], wait["kind"]))
                     self._event(tx, material_owner, "abandon_continued", continuation_of, receipt)
                 elif kind == "run":
                     if run["stopped"]:
@@ -1647,8 +1710,13 @@ class Kernel:
             self._automatic_owned(tx, run, execution)
             if scope != self._automatic_scope(tx, run, subject, scope["cleanup"]):
                 return Step("waiting", subject or "", "observation_superseded")
-            if run["stopped"] or run["blocked"] or (subject is not None and self._gates(tx, subject)):
-                return Step("paused", subject or "", run["blocked"] or "operator_gate")
+            gates = [] if subject is None else self._gates(tx, subject)
+            abandoned = self._abandon_action(tx)
+            timed_out = run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in gates)
+            if (timed_out
+                    or ((abandoned is None or abandoned["status"] != "pending")
+                        and (run["stopped"] or run["blocked"] or gates))):
+                return Step("paused", subject or "", "supervision_timeout" if timed_out else run["blocked"] or "operator_gate")
             owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
             evidence = tx.put(owner, "github_read_observation", wire_json({"code": code, "message": bounded_error(message)}))
             if code in {"ambiguous_run_pr", "invalid_fixture", "invalid_parent", "missing_parent", "stale_run_pr",
@@ -2561,11 +2629,19 @@ class Kernel:
                         disposition = "quiescent"
                 if disposition == "progress" and self._abandon_reconciliation_blocked(tx, abandoned):
                     disposition = "quiescent"
+                waits = [row for row in tx.all("SELECT w.*,m.body FROM waits w JOIN material m ON m.id=w.scope_id")
+                         if json.loads(row["body"]) == self._automatic_scope(tx, run, row["subject"], False)]
+                if disposition == "progress" and waits:
+                    if (run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout"
+                            for row in waits if row["subject"] is not None for gate in self._gates(tx, row["subject"]))):
+                        disposition = "quiescent"
+                    elif all(row["next_retry_at"] is not None and row["next_retry_at"] > self.clock() for row in waits):
+                        disposition = "waiting"
                 return {"concurrency": run["concurrency"], "integration_holder": None,
                         "active": [{key: row[key] for key in ("id", "subject", "invocation")} for row in active],
                         "work_fifo": [], "integration_fifo": [], "cancel_workers": True,
                         "disposition": disposition,
-                        "next_deadline_at": None}
+                        "next_deadline_at": min((row["next_retry_at"] or row["deadline"] for row in waits), default=None)
             now = self.clock()
             deadlines = [float(row["deadline_at"]) for row in active]
             progress = any(row["dispatch_state"] == "allocated" and row["deadline_at"] <= now for row in active)
@@ -3291,10 +3367,20 @@ class Kernel:
             if (raw.get("issue") != payload["issue"] or raw.get("state") != "OPEN"
                     or not isinstance(original, dict) or raw.get("prior_close") != original):
                 raise KernelError("foreign_ticket_recovery_receipt")
-            if raw.get("already_open") is not True:
-                if (not isinstance(event, dict) or type(event.get("id")) is not int or event["id"] <= original["id"]
-                        or event.get("event") != "reopened" or self._event_actor(event) != row["actor"]):
-                    raise KernelError("foreign_ticket_recovery_receipt")
+            if (not isinstance(event, dict) or type(event.get("id")) is not int or event["id"] <= original["id"]
+                    or event.get("event") != "reopened" or self._event_actor(event) != row["actor"]):
+                raise KernelError("foreign_ticket_recovery_receipt")
+        if operation == "recovery_comment":
+            raw = result["raw"]
+            reopened = payload["reopen_receipt"]["raw"]
+            comment = raw.get("comment")
+            if (raw.get("issue") != payload["issue"] or raw.get("reopen_effect") != payload["reopen_effect"]
+                    or raw.get("prior_close") != reopened["prior_close"] or raw.get("reopened_event") != reopened["reopened_event"]
+                    or not isinstance(comment, dict) or type(comment.get("id")) is not int or comment["id"] <= 0
+                    or comment.get("actor") != row["actor"] or not isinstance(comment.get("body"), str)
+                    or not comment["body"].endswith("\n" + payload["comment_body"])
+                    or not isinstance(comment.get("created_at"), str) or not comment["created_at"]):
+                raise KernelError("foreign_ticket_recovery_comment")
         if operation == "retire_pr":
             intent = payload.get("retirement_intent")
             receipt = result["raw"].get("close_intent")
@@ -3890,11 +3976,17 @@ class Kernel:
                 self._abandon_owned(tx, abandoned, execution)
                 if row["control_action"] == abandoned["id"]:
                     payload = json.loads(tx.get(row["payload_id"], effect.subject))
-                    if result.disposition == "third" and row["operation"] == "reopen_ticket" and self._reopen_not_owned(payload, asdict(result)):
+                    if result.disposition == "third" and row["operation"] in {"reopen_ticket", "recovery_comment"} and self._reopen_not_owned(payload, asdict(result)):
                         receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
                         tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
                         self._event(tx, effect.subject, "ticket_recovery_not_owned", effect.effect_id, receipt, generation=row["generation"])
                         return Step("progress", effect.subject)
+                    if row["operation"] in {"reopen_ticket", "recovery_comment"} and result.disposition in {"prior", "unknown"}:
+                        evidence = tx.put(effect.subject, "github_read_observation", wire_json({
+                            "code": "github_recovery_observation_pending", "effect": effect.effect_id, "result": asdict(result)}))
+                        run = tx.one("SELECT * FROM runs")
+                        return self._supervised_wait(tx, run, effect.subject,
+                            self._automatic_scope(tx, run, effect.subject, False), "github_convergence", 600, evidence)
                     if (result.disposition == "prior" and self._abandon_control_scope(tx, abandoned, row)
                             and row["attempts"] - row["retry_baseline"] < 3):
                         evidence = tx.put(effect.subject, "abandon_prior_observation", wire_json({"dispatch_serial": row["attempts"], "result": asdict(result)}))

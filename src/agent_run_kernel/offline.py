@@ -17,6 +17,7 @@ from agent_run.prompt_resources import resolve_resources
 
 from .effects import LocalGit
 from .local_effects import LocalEffects
+from .remote_effects import RemoteEffects
 from .kernel import Kernel
 from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult,
                     KernelError, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json)
@@ -247,11 +248,34 @@ class OfflinePort:
             if event is not None and event[1:4] == ("reopened", effect.actor, effect.effect_id):
                 return EffectResult("target", raw={"issue": issue, "state": state, "prior_close": original,
                     "reopened_event": {"id": event[0], "event": event[1], "actor": event[2], "created_at": event[4]}})
-            return EffectResult("target", raw={"issue": issue, "state": state, "prior_close": original, "already_open": True})
+            actual = None if event is None else {"id": event[0], "event": event[1], "actor": event[2], "created_at": event[4]}
+            return EffectResult("third", raw={"issue": issue, "state": state, "prior_close": original,
+                                               "latest_reopen": actual, "reason": "not_owned"})
         actual = None if event is None else {"id": event[0], "event": event[1], "actor": event[2], "created_at": event[4]}
         if actual != original:
-            return EffectResult("third", raw={"issue": issue, "state": state, "latest_close": actual})
+            return EffectResult("third", raw={"issue": issue, "state": state, "prior_close": original,
+                                               "latest_close": actual, "reason": "not_owned"})
         return EffectResult("prior", raw={"issue": issue, "state": state, "latest_close": actual})
+
+    def _inspect_recovery_comment(self, effect: Effect) -> EffectResult:
+        proof = effect.payload["reopen_receipt"]["raw"]
+        raw = {"issue": effect.payload["issue"], "reopen_effect": effect.payload["reopen_effect"],
+               "prior_close": proof["prior_close"], "reopened_event": proof["reopened_event"]}
+        body = (RemoteEffects._marker(effect) + "\n" + effect.payload["comment_body"]).encode()
+        with sqlite3.connect(self.database) as db:
+            comment = db.execute("SELECT rowid,issue,actor,body,created_at FROM comments WHERE intent=?",
+                                 (effect.effect_id,)).fetchone()
+        if comment is not None:
+            if comment[1:4] != (effect.payload["issue"], effect.actor, body):
+                return EffectResult("third", raw=raw)
+            return EffectResult("target", raw={**raw, "comment": {"id": comment[0], "body": body.decode(),
+                "actor": effect.actor, "created_at": comment[4]}})
+        reopened = self._inspect_reopen(replace(effect, effect_id=effect.payload["reopen_effect"]))
+        if reopened.disposition != "target":
+            return reopened
+        if reopened.raw["reopened_event"] != proof["reopened_event"]:
+            return EffectResult("unknown", raw=raw)
+        return EffectResult("prior", raw=raw)
 
     def prepare_retirement(self, effect: Effect) -> dict[str, Any]:
         prior = effect.payload["prior_pr"]
@@ -418,6 +442,19 @@ class OfflinePort:
                 db.execute("INSERT INTO issue_events(issue,event,actor,intent) VALUES (?,'reopened',?,?)",
                            (payload["issue"], effect.actor, effect.effect_id))
             outcome = self._inspect_reopen(effect)
+        elif operation == "recovery_comment":
+            outcome = self._inspect_recovery_comment(effect)
+            if outcome.disposition != "prior":
+                return outcome
+            if authorize is not None:
+                authorize()
+            if self._inspect_recovery_comment(effect) != outcome:
+                raise KernelError("ticket_recovery_boundary_changed")
+            body = (RemoteEffects._marker(effect) + "\n" + payload["comment_body"]).encode()
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT INTO comments(intent,issue,actor,body,baseline_event_id) VALUES (?,?,?,?,0)",
+                           (effect.effect_id, payload["issue"], effect.actor, body))
+            outcome = self._inspect_recovery_comment(effect)
         else:
             raise KernelError("unsupported_offline_verb", operation)
         result = outcome or EffectResult("target", commit, expected, pr, raw)
@@ -449,6 +486,8 @@ class OfflinePort:
             return self._inspect_retirement(effect)
         if operation == "reopen_ticket":
             return self._inspect_reopen(effect)
+        if operation == "recovery_comment":
+            return self._inspect_recovery_comment(effect)
         if operation == "issue_link":
             with sqlite3.connect(self.database) as db:
                 row = db.execute("SELECT ref,sha,intent FROM links WHERE issue=?", (effect.payload["issue"],)).fetchone()

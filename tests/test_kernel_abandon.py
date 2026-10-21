@@ -1,5 +1,6 @@
 """Managed abandonment retains exact recovery obligations and authority."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -278,5 +279,19 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
     assert not checkout.exists()
     assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
     assert len([write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]) == 1
+    writes = scenario.port.writes()
+    recovery = [write for write in writes if write["operation"] == "recovery_comment"]
+    assert len(recovery) == 1
+    assert [write["operation"] for write in writes].index("reopen_ticket") < [write["operation"] for write in writes].index("recovery_comment")
+    with kernel.storage.transaction(write=False) as tx:
+        recovered = tx.one("SELECT * FROM effects WHERE id=?", (recovery[0]["intent"],))
+        payload = json.loads(tx.get(recovered["payload_id"], recovered["subject"]))
+        reopened = tx.one("SELECT * FROM effects WHERE id=?", (payload["reopen_effect"],))
+        assert reopened["operation"] == "reopen_ticket" and reopened["status"] == "confirmed"
+        assert payload["completion"] == completed[0]
+        assert payload["reopen_receipt"] == json.loads(tx.get(reopened["receipt_id"], reopened["subject"]))
+        assert "<!--" not in payload["comment_body"]
+        assert all(value in payload["comment_body"] for value in (scenario.execution.run_id, "Ticket #3",
+                   f"PR #{completed[0]['pr_number']}", completed[0]["merge_sha"], "abandoned before entering the default branch"))
     with pytest.raises(KernelError, match="run_abandoned"):
         kernel.control_host(request, "resume", "never-resume-business")
