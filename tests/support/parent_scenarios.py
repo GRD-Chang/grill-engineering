@@ -7,14 +7,15 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.development_review import parent_review_identity
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.integration_resync_budget import (
     complete_integration_window,
     observe_integration_snapshot,
 )
-from agent_run.parent_delivery_loop import ParentDeliveryAdapter
 from agent_run.review_budget import new_budget
 from agent_run.state import StateStore
 from support.cli import stdout_json
@@ -132,15 +133,19 @@ def prepare_approval_ready_parent(repo: Path, fixture: Path) -> dict[str, Any]:
             "effective_revision": state["parent"]["revision"], "attempts": 0,
         },
     }
-    adapter = ParentDeliveryAdapter(git, github)
-    acceptance = adapter.acceptance_record(state, job, "parent-reviewer-1", artifact)
+    identity = parent_review_identity(git, state, job)
+    acceptance = {
+        **identity,
+        "reviewer_thread_id": "parent-reviewer-1",
+        "artifact": AcceptanceArtifact.parse(artifact).raw,
+    }
     job["acceptance_record"] = acceptance
     job["review_budget"] = new_budget(
         development_attempts=1, reviewer_invocations=1,
         review_artifacts=[{
             "reviewer_thread_id": "parent-reviewer-1",
             "candidate_sha": candidate, "reviewed_base_sha": base,
-            "review_identity": adapter.review_identity(state, job),
+            "review_identity": identity,
             "artifact": deepcopy(artifact),
         }],
     )

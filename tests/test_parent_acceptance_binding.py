@@ -11,11 +11,13 @@ from typing import Any
 
 import pytest
 
-from agent_run.git import GitRepository
 from agent_run.development_prompts import development_prompt
+from agent_run.development_review import DevelopmentReview, parent_review_identity
+from agent_run.git import GitRepository
 from agent_run.parent_delivery_loop import ParentDeliveryAdapter
 from agent_run.prompt_resources import builtin_resources
 from agent_run.reviewer_prompts import review_prompt
+from agent_run.state import StateStore
 from support.cli_payloads import passing_acceptance
 
 
@@ -27,9 +29,9 @@ def _subject() -> tuple[dict[str, Any], dict[str, Any]]:
     return (
         {"run_id": "run", "repository": "example/repo", "parent": {
             "number": 399, "revision": "revision",
-        }},
-        {"base_sha": "base", "candidate_sha": "candidate", "effective_revision": "revision",
-         "acceptance_artifact": _artifact()},
+        }, "base": {"branch": "main"}},
+        {"parent_branch": "parent-399", "base_sha": "base", "candidate_sha": "candidate",
+         "effective_revision": "revision", "acceptance_artifact": _artifact()},
     )
 
 
@@ -51,7 +53,11 @@ class SnapshotGit:
 def test_parent_reuse_rejects_each_changed_acceptance_fact(field: str, value: object) -> None:
     state, job = _subject()
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
-    record = adapter.acceptance_record(state, job, "review-thread", job["acceptance_artifact"])
+    record = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread",
+        "artifact": deepcopy(job["acceptance_artifact"]),
+    }
     assert adapter.acceptance_is_current(state, job, record)
     record[field] = value
     assert not adapter.acceptance_is_current(state, job, record)
@@ -65,14 +71,21 @@ def test_parent_reuse_requires_all_three_lanes_to_pass(status: str) -> None:
         status=status, findings=["missing requirement"] if status == "fail" else [],
     )
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
-    record = adapter.acceptance_record(state, job, "review-thread", artifact)
+    record = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread", "artifact": deepcopy(artifact),
+    }
     assert not adapter.acceptance_is_current(state, job, record)
 
 
 def test_parent_reuse_rejects_changed_requirement_and_mismatched_artifact() -> None:
     state, job = _subject()
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
-    record = adapter.acceptance_record(state, job, "review-thread", deepcopy(job["acceptance_artifact"]))
+    record = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread",
+        "artifact": deepcopy(job["acceptance_artifact"]),
+    }
     state["parent"]["revision"] = "new-revision"
     assert not adapter.acceptance_is_current(state, job, record)
     state["parent"]["revision"] = "revision"
@@ -84,10 +97,20 @@ def test_parent_reuse_rejects_changed_requirement_and_mismatched_artifact() -> N
 def test_parent_review_uses_compatible_full_baseline_for_changed_combination(tmp_path: Path, language: str) -> None:
     state, job = _subject()
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
-    previous = adapter.acceptance_record(state, job, "review-thread", job["acceptance_artifact"])
+    previous = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread",
+        "artifact": deepcopy(job["acceptance_artifact"]),
+    }
     job.update(previous_parent_acceptance_record=previous, base_sha="new-base", candidate_sha="new-candidate",
                parent_integration={"source_sha": "source", "target_sha": "new-base", "head_sha": "new-candidate"})
-    request = adapter.review_request(state, job, tmp_path)
+    work = DevelopmentReview(
+        git=adapter.git, states=StateStore(tmp_path / "state"),
+        github=adapter.github, agents=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    work._bind_change(state, job, "parent-only")
+    assert work._compatible_parent_baseline(state, job) == previous
+    request = work._change_review_request(state, job, tmp_path)
     assert request["previous_acceptance_artifact"] == previous["artifact"]
     assert request["previous_review_identity"]["expected_merge_tree"] == previous["expected_merge_tree"]
     assert request["current_review_identity"]["expected_merge_tree"] == "merge-new-base-new-candidate"
@@ -101,18 +124,32 @@ def test_parent_review_uses_compatible_full_baseline_for_changed_combination(tmp
             else "Previous results cannot prove that current code has passed") in prompt
     assert not adapter.acceptance_is_current(state, job, previous)
     previous["effective_revision"] = "old-revision"
-    request = adapter.review_request(state, job, tmp_path)
+    request = work._change_review_request(state, job, tmp_path)
     assert "previous_acceptance_artifact" not in request
 
 
-def test_parent_findings_remain_a_full_review_baseline() -> None:
+def test_parent_findings_remain_a_full_review_baseline(tmp_path: Path) -> None:
     state, job = _subject()
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
     artifact = job["acceptance_artifact"]
     artifact["checks"]["spec"].update(status="fail", findings=["missing requirement"])
-    record = adapter.acceptance_record(state, job, "review-thread", artifact)
+    record = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread", "artifact": deepcopy(artifact),
+    }
     job["acceptance_record"] = record
-    assert adapter.compatible_review_baseline(state, job) == record
+    work = DevelopmentReview(
+        git=adapter.git, states=StateStore(tmp_path / "state"),
+        github=adapter.github, agents=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    work._bind_change(state, job, "parent-only")
+    request = work._change_review_request(state, job, tmp_path)
+    assert work._compatible_parent_baseline(state, job) == record
+    assert request["previous_acceptance_artifact"] == record["artifact"]
+    assert request["previous_review_identity"] == {
+        key: record[key] for key in request["current_review_identity"]
+    }
+    assert "parent_acceptance_baseline" not in request
     assert not adapter.acceptance_is_current(state, job, record)
 
 
@@ -131,7 +168,12 @@ def test_parent_integration_findings_development_has_complete_evidence(
     )
     adapter = ParentDeliveryAdapter(SnapshotGit(), SimpleNamespace())  # type: ignore[arg-type]
     adapter.git.checkout_head = lambda _: "candidate"  # type: ignore[method-assign]
-    request = adapter.development_request(state, job, tmp_path)
+    work = DevelopmentReview(
+        git=adapter.git, states=StateStore(tmp_path / "state"),
+        github=adapter.github, agents=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    work._bind_change(state, job, "parent-only")
+    request = work._development_request(state, job, tmp_path)
     assert request["repair_source"] == request["work_source"] == "integration"
     assert "acceptance_artifact" not in request
     assert json.loads(request["integration_evidence"]) == {
@@ -157,7 +199,11 @@ def test_parent_integration_findings_repair_keeps_baseline_before_reintegration(
     state, job = _subject()
     job.update(base_sha=base, candidate_sha=head)
     adapter = ParentDeliveryAdapter(GitRepository(git_repo), SimpleNamespace())  # type: ignore[arg-type]
-    record = adapter.acceptance_record(state, job, "review-thread", job["acceptance_artifact"])
+    record = {
+        **parent_review_identity(adapter.git, state, job),
+        "reviewer_thread_id": "review-thread",
+        "artifact": deepcopy(job["acceptance_artifact"]),
+    }
     assert record["expected_merge_tree"] == tree
     job.update(parent_integration_stage=True, parent_integration={
         "candidate_sha": head, "candidate_tree": tree, "source_sha": base,

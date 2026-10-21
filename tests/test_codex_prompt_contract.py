@@ -14,7 +14,8 @@ from typing import Any
 import pytest
 
 from agent_run.codex import CodexCliBackend, CodexProcessError
-from agent_run.delivery_loop import TicketDeliveryAdapter
+from agent_run.development_review import DevelopmentReview
+from agent_run.state import StateStore
 
 
 def test_publication_prompts_keep_human_blocker_semantics(
@@ -663,18 +664,21 @@ def test_initial_development_still_requires_reading_issue_contracts(
 def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    adapter = TicketDeliveryAdapter(
+    work = DevelopmentReview(
         git=SimpleNamespace(checkout_head=lambda _checkout: "HEAD_SHA"),
-        github=SimpleNamespace(),
+        states=StateStore(tmp_path / "state"),
+        github=SimpleNamespace(), agents=SimpleNamespace(),
     )
     state = {
         "run_id": "run-1",
         "repository": "example/project",
+        "run_branch": "run-1",
         "parent": {"number": 1},
         "ticket_graph": {"tickets": {"3": {"number": 3}}},
     }
     shared_job = {
         "ticket_number": 3,
+        "ticket_branch": "ticket-3",
         "effective_revision": "revision-1",
         "base_sha": "BASE_SHA",
         "repair_source": "required_checks",
@@ -683,11 +687,9 @@ def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
     prompts: list[str] = []
 
     for attempt_kind in ("ordinary", "final_ci_fix"):
-        request = adapter.development_request(
-            state,
-            {**shared_job, "next_attempt_kind": attempt_kind},
-            tmp_path,
-        )
+        job = {**shared_job, "next_attempt_kind": attempt_kind}
+        work._bind_change(state, job, "ticket")
+        request = work._development_request(state, job, tmp_path)
         assert "next_attempt_kind" not in request
         prompts.append(
             _capture_public_prompt(
