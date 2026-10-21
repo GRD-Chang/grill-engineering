@@ -257,6 +257,7 @@ def execute(
             "observed_exit": process.returncode,
         })
         raise failure or ProcessExitUnknown("Worker binding commit is unknown")
+    raw_settlement_failed = False
     try:
         if failure is None and process.returncode == 0:
             # Actual exit is already proved. Raw settlement is independent
@@ -264,12 +265,16 @@ def execute(
             kernel.receive(call, raw)
     except BaseException as error:
         failure = error
+        # This is a Runner storage/response failure, not a failed Worker turn.
+        # Kernel alone can tell whether the raw transaction actually committed.
+        raw_settlement_failed = True
     finally:
         assert process.returncode is not None
         try:
             kernel.agent_exited(
                 call, identity, process.returncode,
                 failure=None if failure is None else type(failure).__name__,
+                failure_kind="fatal" if raw_settlement_failed else "ordinary",
             )
         except BaseException as exit_error:
             if failure is not None:

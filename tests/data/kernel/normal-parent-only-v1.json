@@ -1,0 +1,92 @@
+{
+  "schema": "kernel-neutral-ticket/1",
+  "id": "normal-parent-only-same-input-v1",
+  "repository": "example/project",
+  "default_branch": "main",
+  "git": {
+    "author_name": "Agent Run Tests",
+    "author_email": "agent-run-tests@example.invalid",
+    "date": "2001-01-01T00:00:00+00:00",
+    "initial_message": "initial",
+    "initial_files": {
+      "README.md": "# fixture\n",
+      "pyproject.toml": "[tool.agent-run.required-checks]\ncode-failure-steps = [\n  \"fixture-ci::fixture-required-check::Run tests\",\n  \"CI::quality::Run tests\",\n]\n"
+    }
+  },
+  "parent": {
+    "number": 1,
+    "title": "Parent spec",
+    "body": "Deliver the ticket set.",
+    "sub_issues": [],
+    "sub_issue_order_reliable": true
+  },
+  "policy": {
+    "ticket_review_rounds": 3,
+    "ticket_development_workers": 1,
+    "integration_resync_limit": 3,
+    "ticket_integration_development_limit": 3,
+    "ticket_ci_development_limit": 3,
+    "ticket_ci_review": false,
+    "parent_ci_development_limit": 3,
+    "parent_only_paired_rounds": 10,
+    "run_repair_rounds": 3,
+    "development_thread_policy": "reuse",
+    "invocation_deadlines": {
+      "development": 18000,
+      "review": 7200,
+      "publication": 3600
+    }
+  },
+  "agents": {
+    "development": [
+      {
+        "edits": {
+          "delivered.txt": "first attempt\n"
+        },
+        "wire": {
+          "result_kind": "development",
+          "summary": "Implemented and tested the active ticket.",
+          "human_blockers": null
+        }
+      }
+    ],
+    "review": [
+      {
+        "checks": {
+          "e2e": {
+            "status": "pass",
+            "evidence": "操作或命令：执行公开候选流程；退出码：0；结果：候选通过端到端复验。",
+            "findings": []
+          },
+          "standards": {
+            "status": "pass",
+            "evidence": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
+            "findings": []
+          },
+          "spec": {
+            "status": "pass",
+            "evidence": "已核对的验收标准：Ticket 的全部验收标准；覆盖结论：候选完整覆盖。",
+            "findings": []
+          }
+        }
+      }
+    ],
+    "publication": [
+      {
+        "result_kind": "publication",
+        "commit_message": "feat(delivery): complete one ticket autonomously",
+        "pr_title": "feat(delivery): complete one ticket autonomously",
+        "pr_body_markdown": "## What Problem This Solves\n\nThe ticket stopped before publication.\n\n## Why This Change Was Made\n\nThe delivery loop now owns the bounded workflow.\n\n## User Impact\n\nThe active ticket reaches the Run Branch automatically.\n\n## Evidence\n\nThe scripted end-to-end scenario passed.",
+        "human_blockers": null
+      }
+    ]
+  },
+  "external": {
+    "required_checks": [
+      "pass"
+    ],
+    "linked_branch_display_outcomes": "linked"
+  },
+  "cut": "completed after whole Parent Review, Parent-only PR checks, explicit approval, normal merge, Parent close and cleanup",
+  "delivery_kind": "parent_only"
+}

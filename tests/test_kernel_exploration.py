@@ -255,7 +255,8 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
 def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) -> None:
     original = ticket_spec()
     deliveries = tuple(replace(original.deliveries[0], key=f"ticket:{number}", issue=number) for number in (2, 3, 4))
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries))
+    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries,
+                           policy=replace(original.policy, concurrency=1)))
     token = kernel.claim_executor("executor")
     world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
     first = kernel.advance("ticket:2", token, world).call
@@ -298,7 +299,7 @@ def test_full_parent_resume_renews_only_exhausted_development_allowance(tmp_path
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))
 def test_ci_renewal_keeps_requirement_budget_and_cumulative_reviewer_count(tmp_path: Path, kind: DeliveryKind) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "fail", "none"), policy=Policy(ci_developments=1, ticket_ci_review=True))
+    scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "fail", "none"), policy=Policy(ticket_ci_developments=1, parent_ci_developments=1, ticket_ci_review=True))
     assert scenario.run().kind == "paused"
     before = scenario.kernel.status(scenario.delivery.key)["budgets"]
     assert before["ci"]["developments_used"] == 1

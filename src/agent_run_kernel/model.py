@@ -9,8 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
+import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 class KernelError(RuntimeError):
@@ -59,19 +60,31 @@ class Policy:
     parent_rounds: int = 10
     run_repairs: int = 3
     integration_developments: int = 3
-    ci_developments: int = 3
+    ticket_ci_developments: int = 3
+    parent_ci_developments: int = 3
+    resync_limit: int = 3
     ticket_ci_review: bool = False
-    concurrency: int = 1
+    concurrency: int = 3
     new_thread_per_development: bool = False
     development_profile: Profile = field(default_factory=Profile)
     review_profile: Profile = field(default_factory=Profile)
     publication_profile: Profile = field(default_factory=Profile)
+    development_deadline_seconds: float = 18000.0
+    review_deadline_seconds: float = 7200.0
+    publication_deadline_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
         for value in (self.ticket_rounds, self.parent_rounds, self.run_repairs,
-                      self.integration_developments, self.ci_developments, self.concurrency):
+                      self.integration_developments, self.ticket_ci_developments, self.parent_ci_developments, self.concurrency):
             if type(value) is not int or value < 1:
                 raise ValueError("policy limits must be positive integers")
+        if type(self.resync_limit) is not int or self.resync_limit < 0:
+            raise ValueError("resync_limit must be a nonnegative integer")
+        for field_name in ("development_deadline_seconds", "review_deadline_seconds", "publication_deadline_seconds"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError("invocation deadlines must be positive finite durations")
+            object.__setattr__(self, field_name, float(value))
 
 
 @dataclass(frozen=True)
@@ -91,6 +104,17 @@ class Delivery:
 
 
 @dataclass(frozen=True)
+class CreationInputs:
+    """Resolved non-secret inputs; personal files are never read on continuation."""
+    profiles: Mapping[str, Any]
+    prompt_resources: Mapping[str, str]
+    worker_identity: Mapping[str, Any]
+    runner_identity: Mapping[str, Any]
+    notifications: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class RunSpec:
     run_id: str
     repository: str
@@ -101,6 +125,7 @@ class RunSpec:
     policy: Policy = field(default_factory=Policy)
     language: str | None = None
     repository_root: str | None = None
+    inputs: CreationInputs | None = None
 
     def __post_init__(self) -> None:
         if self.language not in {None, "zh", "en"}:
@@ -216,6 +241,37 @@ class Execution:
 
 
 @dataclass(frozen=True)
+class HostLaunch:
+    run_id: str
+    epoch: int
+    owner: str
+    nonce: str
+    unit_name: str
+    command: tuple[str, ...]
+    environment_carrier: Path
+
+    @property
+    def description(self) -> str:
+        return "agent-run-kernel:" + json.dumps(
+            [self.run_id, self.epoch, self.owner, self.nonce], separators=(",", ":"), ensure_ascii=True,
+        )
+
+
+@dataclass(frozen=True)
+class HostObservation:
+    disposition: Literal["running", "exited", "unknown"]
+    unit_name: str
+    invocation_id: str | None = None
+    cgroup: str | None = None
+    boot_id: str | None = None
+    main_pid: int | None = None
+    start_token: str | None = None
+    exit_status: int | None = None
+    ended_at: float | None = None
+    evidence: str = ""
+
+
+@dataclass(frozen=True)
 class AgentCall:
     attempt_id: str
     invocation_id: str
@@ -227,8 +283,13 @@ class AgentCall:
     execution: Execution
     context: Mapping[str, Any]
     profile: Profile
+    deadline_seconds: float
+    deadline_at: float
     mode: str = "fresh"
     reported_thread: str | None = None
+    output_ordinal: int = 0
+    profile_revision: int = 1
+    profile_reference: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +308,7 @@ class Effect:
     actor: str
     payload: Mapping[str, Any]
     execution: Execution
+    dispatch_serial: int = 1
 
 
 @dataclass(frozen=True)

@@ -110,7 +110,8 @@ class OfflinePort:
         delivery = Delivery(key, kind, ticket_number if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
                             source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout),
                             owned_root=str(checkout.parent.resolve()), common_git_dir=str((self.git.root / ".git").resolve()))
-        spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy())
+        spec = RunSpec("offline-run", repository, 1, "parent-v1", "graph-v1", (delivery,), policy or Policy(),
+                       language="zh", repository_root=str(self.git.root.resolve()))
         return spec, delivery
 
     def pull_request(self, subject: str) -> PullRequest | None:
@@ -126,7 +127,7 @@ class OfflinePort:
                            self.remote_commit(pr.source_ref) or pr.head, self.remote_commit(pr.target_ref) or pr.base, pr.title, pr.body,
                            pr.state, pr.actor, pr.merged)
 
-    def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none") -> World:
+    def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none", *, witnesses: Sequence[str] = ()) -> World:
         pr = self.pull_request(delivery.key)
         checks = None
         if pr is not None:
@@ -140,7 +141,13 @@ class OfflinePort:
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
                      target, source, pr, checks,
                      delivery.completion_revision,
-                     ((target.sha, source.sha),) if source is not None and self.git.is_ancestor(target.sha, source.sha) else ())
+                     self.ancestry(source, target, witnesses))
+
+    def ancestry(self, source: Commit | None, target: Commit, witnesses: Sequence[str]) -> tuple[tuple[str, str], ...]:
+        before_heads = set(witnesses) | {target.sha}
+        after_heads = {target.sha} if source is None else {target.sha, source.sha}
+        return tuple((before, after) for before in sorted(before_heads) for after in sorted(after_heads)
+                     if before == after or self.git.is_ancestor(before, after))
 
     def ref_commit(self, ref: str) -> Commit | None:
         result = self.git.run("for-each-ref", "--format=%(refname)%09%(objectname)", ref)
@@ -269,6 +276,7 @@ class OfflinePort:
                     prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
                     if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
                         raise KernelError("remote_compare_and_swap")
+                    self._sync_mirror(git, effect.source_ref, effect.before_sha)
                     git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
                     self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
                 commit = git.commit(effect.after_sha)
@@ -297,13 +305,7 @@ class OfflinePort:
                     target = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.target_ref,)).fetchone()
                     if source != (effect.after_sha,) or target != (effect.before_sha,):
                         raise KernelError("merge_compare_and_swap")
-                    local = self.ref_commit(effect.target_ref)
-                    if local is None:
-                        raise KernelError("merge_mirror_missing")
-                    if local.sha != effect.before_sha:
-                        if not git.is_ancestor(local.sha, effect.before_sha):
-                            raise KernelError("merge_mirror_changed")
-                        git.compare_and_swap(effect.target_ref, local.sha, effect.before_sha)
+                    self._sync_mirror(git, effect.target_ref, effect.before_sha)
                     git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
                     self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
                     self._write_pr_in(db, effect.subject, pr)
@@ -432,6 +434,16 @@ class OfflinePort:
         return [{"operation": operation, "subject": subject, "intent": intent, "facts": json.loads(facts)}
                 for operation, subject, intent, facts in rows]
 
+    def _sync_mirror(self, git: LocalGit, ref: str, remote_before: str) -> None:
+        """Advance a stale local mirror only to the intent's exact remote parent."""
+        local = self.ref_commit(ref)
+        if local is None:
+            raise KernelError("write_mirror_missing")
+        if local.sha != remote_before:
+            if not git.is_ancestor(local.sha, remote_before):
+                raise KernelError("write_mirror_changed")
+            git.compare_and_swap(ref, local.sha, remote_before)
+
     def external_append(self, ref: str, files: Mapping[str, str], token: str) -> Commit:
         """A separate fixture actor advances an exact ref; never used by the driver."""
         before = self.git.commit(ref)
@@ -472,8 +484,12 @@ class Scenario:
             frozen = neutral_script["policy"]
             policy = Policy(ticket_rounds=frozen["ticket_review_rounds"], parent_rounds=frozen["parent_only_paired_rounds"],
                             run_repairs=frozen["run_repair_rounds"], integration_developments=frozen["ticket_integration_development_limit"],
-                            ci_developments=frozen["ticket_ci_development_limit"], ticket_ci_review=frozen["ticket_ci_review"],
-                            concurrency=frozen["ticket_development_workers"])
+                            ticket_ci_developments=frozen["ticket_ci_development_limit"], parent_ci_developments=frozen["parent_ci_development_limit"],
+                            resync_limit=frozen["integration_resync_limit"], ticket_ci_review=frozen["ticket_ci_review"],
+                            concurrency=frozen["ticket_development_workers"],
+                            development_deadline_seconds=frozen["invocation_deadlines"]["development"],
+                            review_deadline_seconds=frozen["invocation_deadlines"]["review"],
+                            publication_deadline_seconds=frozen["invocation_deadlines"]["publication"])
             checks = neutral_script["external"]["required_checks"]
         self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
         self.initial = self.port.git.commit("refs/heads/main")
@@ -501,7 +517,11 @@ class Scenario:
         if pr is not None and pr.head.sha not in self.heads:
             self.heads.append(pr.head.sha)
         index = max(0, len(self.heads) - 1)
-        return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)])
+        state = self.kernel.status(self.delivery.key)
+        witnesses = [state["source_sha"]]
+        if state["resync"]["target_sha"] is not None:
+            witnesses.append(state["resync"]["target_sha"])
+        return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)], witnesses=witnesses)
 
     def agent(self, call: AgentCall) -> bytes:
         self.role_calls.append({"role": call.role.value, "purpose": call.purpose.value,
@@ -553,8 +573,11 @@ class Scenario:
             if self.kernel.dispatch(effect, self.execution, self.world()):
                 try:
                     acknowledgement = self.port.execute(effect, lambda: self.kernel.guard_effect(effect, self.execution, self.world()))
-                except LostResponse:
-                    pass
+                except LostResponse as error:
+                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                except Exception as error:
+                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
+                    raise
                 else:
                     if effect.operation == "issue_link":
                         if acknowledgement is not None:
@@ -687,6 +710,12 @@ class Scenario:
                 mutations.append({"action": "delete_managed_branch", "branch": source_label})
         current = self.kernel.status(self.delivery.key)
         projected = self.observable(script["id"], Step("complete", self.delivery.key))
+        with self.kernel.storage.transaction(write=False) as tx:
+            publication = tx.one("SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='publication' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                 (self.delivery.key, current["generation"]))
+            publication_wire = json.loads(tx.get(publication[0], self.delivery.key))
+        approval = any(checkpoint["phase"] == "approval" for checkpoint in self.checkpoints)
+        historical = script.get("completed_ticket_precondition")
         display_attempts = [{"issue_number": issue, "branch": labels.get(ref, ref),
                              "head_sha": head_identity(head)} for issue, ref, head, _ in linked]
         context_paths = {"review": current["reviewed_checkout"], "publication": self.delivery.checkout}
@@ -712,7 +741,7 @@ class Scenario:
                 "roles": projected["role_calls"], "raw_backend_calls": {"development": self.development_count,
                     "review": self.review_count, "publication": self.publication_count},
                 "status": ("ticket_completed" if self.delivery.kind == DeliveryKind.TICKET else "completed") if current["phase"] == "complete" else current["phase"],
-                "approval_required": False, "budget": {"initial_development": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["developments_used"],
+                "approval_required": current["phase"] == "approval", "budget": {"initial_development": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["developments_used"],
                     "initial_review": current["budgets"]["integration" if self.delivery.kind == DeliveryKind.FINAL_RUN else "requirements"]["reviews_used"]},
                 "commits": {name: actual_commit(head) for name, head in heads.items()}, "local_refs": refs,
                 "published_refs": {labels.get(ref, ref): head_identity(head)
@@ -726,7 +755,14 @@ class Scenario:
                                                               "status": None if current["issue_link"] is None else current["issue_link"]["state"]}},
                 "post_close_worktrees": {"observed": True, "registrations": registered,
                                          "role_checkouts": {role: {"observed": True, "path": path, "exists": Path(path).exists(), "registered": f"worktree {path}" in registry} for role, path in context_paths.items()}},
-                "publication_wire": script["agents"]["publication"][0], "cross_architecture_compared": False,
+                "publication_wire": publication_wire, "cross_architecture_compared": False,
+                "delivery_kind": "full_parent" if self.delivery.kind == DeliveryKind.FINAL_RUN else self.delivery.kind.value,
+                "approval_boundary": ("run_approval_pending" if self.delivery.kind == DeliveryKind.FINAL_RUN else "parent_approval_pending") if approval else None,
+                "historical_input": None if historical is None else {
+                    "kind": "completed Ticket fixture, no backend called for this prefix",
+                    "budget": {key: historical["historical_budget"][key] for key in ("development_attempts", "reviewer_invocations")},
+                    "head": heads["candidate"]},
+                "source_ref_identity": self.delivery.source_ref.removeprefix("refs/heads/"),
                 "known_gaps": ["GitHub Issue branch linking uses a persistent synthetic remote, not the native online API"],
                 "raw_effects": self.port.writes()}
 
@@ -794,7 +830,7 @@ class GraphScenario(Scenario):
         checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
         return World(status["source_parent_revision"], self.kernel.source_status()["observed_graph_revision"], status["source_revision"],
                      target, source, pr, checks, status["completion_revision"],
-                     ((target.sha, source.sha),) if source is not None and self.port.git.is_ancestor(target.sha, source.sha) else ())
+                     self.port.ancestry(source, target, [status["source_sha"], *([status["resync"]["target_sha"]] if status["resync"]["target_sha"] is not None else [])]))
 
     def agent(self, call: AgentCall) -> bytes:
         raw = super().agent(call)
@@ -820,7 +856,7 @@ def main() -> None:
     parser.add_argument("--scenario", required=True, choices=("ticket-normal", "ticket-review-repair", "ticket-fallback",
                         "parent-only-normal", "full-parent-normal", "full-parent-review-repair"))
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--input", type=Path, help="Exact neutral Ticket script, shared with the unchanged baseline adapter")
+    parser.add_argument("--input", type=Path, help="Exact neutral delivery script, shared with the unchanged baseline adapter")
     args = parser.parse_args()
     configurations = {
         "ticket-normal": (DeliveryKind.TICKET, ("pass",), "complete"),
