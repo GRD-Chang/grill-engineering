@@ -185,6 +185,42 @@ class NativeNotifications:
     def _gate_slot(subject: str | None, generation: int | None, reason: str) -> str:
         return hashlib.sha256(json.dumps([subject, generation, reason]).encode()).hexdigest()
 
+    def _terminal_event(self, view: dict[str, Any]) -> dict[str, Any] | None:
+        """Describe a committed lifecycle result, without granting completion."""
+        if not view["is_terminal"]:
+            return None
+        if view["status"] == "abandoned":
+            action = view["abandonment"]
+            if action is None or action["status"] != "complete":
+                raise ValueError("abandoned notification has no completed original Action")
+            return event_envelope(self.state, "boundary", ["abandoned", action["action"]],
+                                  event_copy(self.state, "abandoned"), "yellow",
+                                  current=True, terminal=True, status_code="abandoned",
+                                  execution_timing_complete=False)
+        if view["status"] != "completed":
+            return None
+        closures = view["closures"]
+        if len(closures) != 1 or closures[0]["receipt"].get("disposition") != "target":
+            raise ValueError("completed notification has no unique original close receipt")
+        closed = closures[0]
+        number = closed["pr_number"]
+        if type(number) is not int or number <= 0:
+            raise ValueError("completed notification has no original Pull Request")
+        cleanup = view["delivery_cleanup"]
+        pending = cleanup is not None and cleanup["status"] == "cleanup_pending"
+        status = "completed_cleanup" if pending else "completed"
+        summary = event_copy(self.state, "separator").join((
+            event_copy(self.state, "merged", number=number), event_copy(self.state, "closed")))
+        if pending:
+            summary += event_copy(self.state, "cleanup_summary")
+        return event_envelope(self.state, "boundary", [status, closed["effect_id"], closed["receipt_id"]],
+                              event_copy(self.state, "cleanup" if pending else "completed"),
+                              "yellow" if pending else "green", current=True, terminal=True,
+                              status_code="completed", summary=summary,
+                              next_step=f"agent-run resume {self.run_id}" if pending else "",
+                              url=f"https://github.com/{self.binding[0]}/pull/{number}",
+                              execution_timing_complete=False)
+
     def _boundaries(self, document: dict[str, Any]) -> bool:
         """Track notification occurrences, not an alternate writable Run state.
 
@@ -212,6 +248,7 @@ class NativeNotifications:
             if not self._same_binding(*self._run(tx)):
                 raise ValueError("notification Run or recipient binding changed")
             view = notification_boundaries(tx, self.database)
+            terminal = self._terminal_event(view)
             highwater = view["highwater"]
             if cursor < highwater:
                 rows = tx.rows("SELECT position,subject,generation,phase,status FROM history "
@@ -250,6 +287,10 @@ class NativeNotifications:
         current = {key: value["sequence"] for key, value in slots.items()}
         for item in list(document["pending"]):
             event = item["event"]
+            if event.get("terminal"):
+                if terminal is None or event["id"] != terminal["id"]:
+                    outbox.cancel_item(document, item, "recorded lifecycle result changed")
+                continue
             if (event.get("kind") == "boundary" and event.get("current")
                     and (event.get("slot_id") not in actions or event.get("slot_id") not in current
                          or event.get("occurrence") != current[event["slot_id"]])):
@@ -279,6 +320,14 @@ class NativeNotifications:
                                    next_step=action["next_action"])
             outbox.enqueue(document, event, time.time())
             slots[key]["enqueued"] = True
+        if terminal is not None:
+            receipts = document.setdefault("native_terminal_receipts", [])
+            if not isinstance(receipts, list) or any(not isinstance(key, str) for key in receipts):
+                raise ValueError("invalid native terminal notification receipts")
+            if terminal["id"] not in receipts and len(document["pending"]) < outbox.MAX_PENDING:
+                outbox.enqueue(document, terminal, time.time())
+                receipts.append(terminal["id"])
+                del receipts[:-outbox.MAX_RECORDS]
         return False
 
     def observe_committed(self) -> None:
