@@ -265,6 +265,10 @@ def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], termi
         return "operator_stopped"
     if run["blocked"]:
         return str(run["blocked"])
+    unfinished = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
+    if (len(unfinished) > 1 and all(job["kind"] == "ticket" for job in unfinished)
+            and any(job["gates"] for job in unfinished) and any(not job["gates"] for job in unfinished)):
+        return "active"
     codes = {gate["code"] for job in subjects for gate in job["gates"]}
     for code in ("requeue_required", "execution_failed", "supervision_timeout"):
         if code in codes:
@@ -275,7 +279,7 @@ def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], termi
         if all(job["phase"] == "abandoned" for job in subjects):
             return "abandoned"
         return "ticket_completed" if all(job["kind"] == "ticket" for job in subjects) else "completed"
-    current = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
+    current = unfinished
     if not current and subjects and all(job["kind"] == "ticket" for job in subjects):
         return "ticket_completed"
     if any(job["phase"] == "checks" for job in current):

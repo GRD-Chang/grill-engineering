@@ -121,6 +121,30 @@ def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     assert _snapshot(tmp_path) == before
 
 
+def test_local_human_boundary_does_not_present_its_sibling_as_globally_paused(tmp_path: Path) -> None:
+    base = Commit("base", "base-tree")
+    deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
+        f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
+    kernel = _create(tmp_path, deliveries=deliveries)
+    _human(kernel, "Only Ticket 2 requires this decision")
+    execution = kernel.claim_executor("query-executor")
+    call = kernel.advance("ticket:3", execution,
+        World("parent-v1", "graph-v1", "ticket-v1", base)).call
+    assert call is not None
+    before = _snapshot(tmp_path)
+    document = query.read(kernel.storage.path, "status").data
+    assert document["status"] == "active"
+    assert len(document["operator_actions"]) == 1
+    action = document["operator_actions"][0]
+    assert action["scope"] == "local" and action["run_paused"] is False
+    assert action["action"]["ticket_number"] == 2
+    peer = next(job for job in document["multi_ticket"]["tickets"] if job["ticket_number"] == 3)
+    assert peer["has_work_slot"] is True
+    assert peer["invocation"]["id"] == call.invocation_id
+    assert peer["execution_activity"] == "unknown"
+    assert _snapshot(tmp_path) == before
+
+
 def test_parent_selector_rejects_multiple_runs_and_exact_id_remains_available(
     tmp_path: Path, capsys,
 ) -> None:
