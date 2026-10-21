@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ import pytest
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Profile, RunSpec, World
 from agent_run_kernel import query
 from agent_run_kernel.query_cli import main
+from agent_run_kernel.offline import Scenario
 
 
 def test_missing_exact_query_is_actionable_and_does_not_create_storage(
@@ -234,4 +236,47 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["run_id"] == "run-query"
     assert completed.stderr == ""
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("kind,completed_phase", [(DeliveryKind.TICKET, "ticket_completed"),
+    (DeliveryKind.PARENT_ONLY, "completed"), (DeliveryKind.FINAL_RUN, "merged")])
+def test_public_delivery_boundaries_match_observed_02_meanings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, completed_phase: str,
+) -> None:
+    # The old 013 actual observations retain all public status/history outputs.
+    # These candidate regression oracles preserve their concrete boundary
+    # meanings; a separate same-input capture must establish full equivalence.
+    original_create = Kernel.create
+
+    def configured_create(path, spec, **kwargs):
+        return original_create(path, replace(spec, language="en", repository_root=str(tmp_path.resolve())), **kwargs)
+
+    monkeypatch.setattr(Kernel, "create", staticmethod(configured_create))
+    scenario = Scenario(tmp_path / "scenario", kind)
+    if kind != DeliveryKind.TICKET:
+        assert scenario.run().kind == "approval"
+        before = _snapshot(tmp_path)
+        approval = query.read(scenario.kernel.storage.path, "status").data
+        assert approval["phase"] == "ready_for_approval"
+        assert approval["next_action"] == "agent-run approve 1 --repo example/repository"
+        assert approval["active_ticket"] is None
+        assert approval["review_budget"] is not None
+        assert _snapshot(tmp_path) == before
+    assert scenario.run(approve=True).kind == "complete"
+    before = _snapshot(tmp_path)
+    document = query.read(scenario.kernel.storage.path, "status").data
+    assert document["phase"] == completed_phase
+    assert document["active_ticket"] is None
+    assert (document["review_budget"] is not None) == (kind == DeliveryKind.FINAL_RUN)
+    assert document["next_action"] == ("agent-run run 1" if kind == DeliveryKind.TICKET else "无")
+    assert document["progress"]["status"] == document["status"]
+    assert document["progress"]["phase"] == completed_phase
+    history = query.read(scenario.kernel.storage.path, "history").data
+    prefix = {DeliveryKind.TICKET: "ticket", DeliveryKind.PARENT_ONLY: "parent", DeliveryKind.FINAL_RUN: "run"}[kind]
+    assert history["summary"]["rounds"][prefix + "_publication"] == 1
+    assert history["summary"]["rounds"][prefix + "_review"] == 1
+    assert history["events"] and history["events"][0]["at"]
+    assert history["scheduler"]["activity"] == "unknown"
+    assert history["execution_activity"] != "running"
     assert _snapshot(tmp_path) == before

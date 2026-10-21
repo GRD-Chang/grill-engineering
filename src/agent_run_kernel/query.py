@@ -197,7 +197,8 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]]) ->
 
 def _public_phase(phase: str) -> str:
     return {"development": "developing", "review": "reviewing", "publish": "publication_pending",
-            "checks": "waiting_checks", "merge": "merging", "close": "closing", "complete": "completed"}.get(phase, phase)
+            "checks": "waiting_checks", "approval": "ready_for_approval", "merge": "merging",
+            "close": "closing", "complete": "completed"}.get(phase, phase)
 
 
 def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], terminal: bool) -> str:
@@ -236,7 +237,8 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
     active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
     selected = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
     if selected is None:
-        selected = active[0] if len(active) == 1 else subjects[0] if len(subjects) == 1 else None
+        selected = active[0] if len(active) == 1 else next((job for job in subjects
+            if job["kind"] == "final_run" and job["phase"] == "complete"), None)
     invocation = None
     attempt = None if selected is None else selected["pending_attempt"]
     if attempt and attempt["invocations"]:
@@ -248,7 +250,8 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
                   "live_status": "unknown", "dispatch_state": invocation["dispatch_state"]}
     current = [] if selected is None else [budget for budget in selected["budgets"] if budget["current"]]
     ordinary = next((row for row in current if row["purpose"] == ("integration" if selected and selected["kind"] == "final_run" else "requirements")), None)
-    integration = next((row for row in current if row["purpose"] == "integration"), None)
+    integration = next((row for row in current if row["purpose"] == "integration"
+                        and row["developments_used"] > 0), None)
     ci = next((row for row in current if row["purpose"] == "ci"), None)
     review_budget = None if ordinary is None else {
         "window": ordinary["window"], "development_attempts": ordinary["developments_used"],
@@ -279,6 +282,67 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
                 "last_error": next((row["outcome"] for row in cleanups if row["outcome"]), None), "items": cleanup_items}}
 
 
+def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: str,
+                 cleanup: Mapping[str, Any] | None) -> str:
+    if actions:
+        action = actions[0]
+        if action["action"] in {"resume", "approve", "requeue"}:
+            command = f"agent-run {action['action']} {run['parent_issue']} --repo {run['repository']}"
+            if action["scope"] == "ticket" and action["action"] == "resume":
+                command += f" --ticket {action['issue']}"
+            return command
+        return "Inspect original facts and diagnostics"
+    if cleanup and cleanup["status"] == "cleanup_pending":
+        return f"agent-run resume {run['id']}"
+    if status == "ticket_completed":
+        return f"agent-run run {run['parent_issue']}"
+    if status in {"completed", "abandoned"}:
+        return "无"  # Stable machine copy; human rendering localizes it.
+    return f"agent-run status {run['parent_issue']} --repo {run['repository']}"
+
+
+def _progress(data: Mapping[str, Any]) -> dict[str, Any]:
+    subjects = data["subjects"]
+    current = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
+    job = current[0] if len(current) == 1 else None
+    current_object = (f"Ticket #{job['issue']}" if job and job["kind"] == "ticket" else
+                      f"Parent Issue #{job['issue']}" if job and job["kind"] == "parent_only" else
+                      "Final Run" if job else "Delivery Run")
+    tickets = [owner for owner in subjects if owner["kind"] == "ticket"]
+    return {"repository": data["repository"], "parent": {"number": data["parent"]["number"], "title": data["parent"]["title"]},
+            "status": data["status"], "phase": data["phase"], "current_object": current_object,
+            "current_agent": data["worker"], "execution_activity": "unknown",
+            "scheduler": {"activity": "unknown", "failure": None}, "elapsed_seconds": data["elapsed_seconds"],
+            "ticket_progress": {"completed": sum(owner["phase"] == "complete" for owner in tickets), "total": len(tickets)},
+            "round_progress": data["review_budget"], "integration_development": data["integration_development"],
+            "integration_resync": data["integration_resync"], "ci_recovery": data["ci_recovery"],
+            "run_repair": data["run_repair"], "next_action": data["next_action"],
+            "conclusion": None, "findings": [] if job is None or job["review"] is None else job["review"]["artifact"]}
+
+
+def _history_views(data: Mapping[str, Any], subjects: list[dict[str, Any]], events: list[dict[str, Any]],
+                   attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    owners = {job["subject"]: job for job in subjects}
+    rounds: dict[str, int] = {}
+    for attempt in attempts:
+        job = owners[attempt["subject"]]
+        prefix = {"ticket": "ticket", "parent_only": "parent", "final_run": "run"}[job["kind"]]
+        key = prefix + "_" + attempt["role"]
+        rounds[key] = rounds.get(key, 0) + 1
+    projected = []
+    for event in events:
+        job = owners[event["subject"]]
+        moment = event["created_at"]
+        projected.append({"at": datetime.fromtimestamp(moment, UTC).isoformat() if moment is not None else None,
+            "kind": event["kind"], "object": f"Ticket #{job['issue']}" if job["kind"] == "ticket" else f"Parent Issue #{job['issue']}" if job["kind"] == "parent_only" else "Final Run",
+            "subject": job["subject"], "generation": event["generation"], "identity": event["identity"],
+            "phase": None, "status": None, "role": None, "round": None,
+            "details": [] if event["evidence"] is None else [event["evidence"]]})
+    return {"events": projected, "execution_activity": "unknown",
+            "scheduler": {"activity": "unknown", "failure": None}, "multi_ticket": None,
+            "summary": {"rounds": rounds, "elapsed_seconds": data["elapsed_seconds"]}, "time_zone": "UTC"}
+
+
 def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limit: int = 128,
          expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
     if after < 0 or not 1 <= limit <= 128:
@@ -295,7 +359,7 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                 raise QueryError("recovery_materials_missing", "Run language is missing or invalid; personal defaults cannot replace it")
             subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
             actions = _operator_actions(run, subjects)
-            title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
+            title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
             complete = location["is_terminal"]
             status = _public_status(run, subjects, complete)
@@ -305,8 +369,10 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
             elapsed_end = end if complete else time.time()
             elapsed = elapsed_end - created if created is not None and elapsed_end is not None and elapsed_end >= created else None
             data: dict[str, Any] = {"run_id": run["id"], "repository": run["repository"],
-                "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None},
-                "status": status, "phase": _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else status,
+                "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None,
+                           "body": title[0][1] if title else None, "revision": run["parent_revision"]},
+                "status": status, "phase": _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
+                    "merged" if any(job["kind"] == "final_run" and job["phase"] == "complete" for job in subjects) else status,
                 "created_at": created, "elapsed_seconds": elapsed, "repository_root": location["repository_root"],
                 "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
                 "policy_snapshot": json.loads(run["policy"]),
@@ -318,6 +384,8 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                                "work_fifo": [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row[0] for row in tx.rows("SELECT subject FROM integration_queue ORDER BY ready")]}}
             data.update(_status_fields(run, subjects))
+            data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
+            data["progress"] = _progress(data)
             data["gate"] = "required_checks" if status == "waiting_checks" else None
             data["unavailable_facts"] = ["host_liveness", "notifications", "agent_execution_segments",
                                          "publication_failure_count", "output_attempt_history"]
@@ -346,6 +414,7 @@ def read(path: Path, kind: Literal["status", "history"], *, after: int = 0, limi
                              "output_attempts": None, "agent_resumes": None, "resume_audit": None,
                              "actions": _all(tx, "SELECT id,kind,subject,status FROM actions ORDER BY rowid"),
                              "history_page": {"after": after, "next_after": next_after, "has_more": has_more}})
+                data.update(_history_views(data, subjects, events, attempts))
             if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
                 raise QueryError("query_limit", "Public response exceeds its bounded limit")
             return QueryDocument(kind, language, data)
