@@ -93,6 +93,7 @@ class Kernel:
         for purpose, (development_limit, review_limit) in limits.items():
             tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,1,?,?)",
                        (delivery.key, purpose.value, development_limit, review_limit))
+        tx.execute("INSERT INTO resync_allowances(subject,generation,allowance) VALUES (?,1,?)", (delivery.key, policy.resync_limit))
 
     def _budget_limits(self, policy: Policy, kind: DeliveryKind) -> dict[Purpose, tuple[int, int | None]]:
         return {
@@ -371,6 +372,7 @@ class Kernel:
                 tx.execute("UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1", (subject, budget["purpose"]))
                 tx.execute("INSERT INTO budgets(subject,purpose,window,development_limit,review_limit) VALUES (?,?,?,?,?)",
                            (subject, budget["purpose"], budget["window"] + 1, *limits))
+            self._renew_resync(tx, job, require_exhaustion=False)
             tx.execute("DELETE FROM gates WHERE subject=?", (subject,))
             self._release_integration(tx, subject)
             tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
@@ -824,6 +826,8 @@ class Kernel:
                         code = gate["code"]
                         if code in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}:
                             self._renew(tx, run, job, gate["purpose"])
+                        elif code == "integration_resync_exhausted":
+                            self._renew_resync(tx, job)
                         elif code == "human_blocker":
                             if job["current_attempt"]:
                                 tx.execute("UPDATE attempts SET result_id=NULL,status='continuing' WHERE id=?", (job["current_attempt"],))
@@ -915,6 +919,8 @@ class Kernel:
                 "generation": job["generation"], "version": job["version"],
                 "revision": job["revision"], "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
                 "completion_revision": job["completion_revision"],
+                "source_sha": job["source_sha"], "integration_target": job["integration_target"],
+                "resync": self._resync_state(tx, subject),
                 "reviewed_checkout": reviewed_checkout,
                 "source_revision": (job["revision"] if job["phase"] == "complete" or not observed else observed[0][0]),
                 "source_parent_revision": run["observed_parent_revision"] or run["parent_revision"],
@@ -1264,6 +1270,7 @@ class Kernel:
                 tx.execute("UPDATE subjects SET workspace_sha=? WHERE id=?", (commit["sha"], job["id"]))
             elif operation in {"push", "run_branch"}:
                 tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], job["id"]))
+                self._record_source_write(tx, job["id"], row["source_ref"], row["after_sha"])
             elif operation == "publication_commit" and commit:
                 tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=? WHERE id=?", (commit["sha"], commit["tree"], job["id"]))
             elif operation == "pr_write" and result["pr"]:
@@ -1322,14 +1329,20 @@ class Kernel:
         if phase == "workspace":
             return self._prepare_effect(tx, run, job, execution, world, "workspace", before=job["source_sha"],
                                         payload={"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN})
-        if (phase in {"ready_publication", "publication_commit", "push", "pr", "checks", "approval", "merge"}
-                and job["integration_target"] and job["integration_target"] != world.target.sha):
+        integrated_phases = {"ready_publication", "publication_commit", "push", "pr", "checks", "approval", "merge"}
+        changed_source = world.source is not None and world.source.sha != job["source_sha"]
+        if phase in integrated_phases | {"integration"} and not self._observe_integration_snapshot(tx, run, job, world):
+            self._finish_final_failure(tx, run)
+            return Step("paused", subject, "integration_snapshot")
+        if (phase in integrated_phases and job["integration_target"]
+                and (job["integration_target"] != world.target.sha or changed_source)):
             self._update_boundary(tx, run, job)
             return Step("progress", subject, "updating")
         if phase == "candidate":
             return self._prepare_effect(tx, run, job, execution, world, "candidate", before=job["workspace_sha"],
                                         payload={"checkout": job["checkout"], "summary_attempt": self._last_attempt(tx, subject, Role.DEVELOPMENT)})
         if phase == "integration":
+            job = self._job(tx, subject)  # An admitted external source append is the next CAS parent.
             if not self._integration_seat(tx, run, job):
                 return Step("waiting", subject, "integration_seat")
             return self._prepare_effect(tx, run, job, execution, world, "integrate",
@@ -1670,10 +1683,14 @@ class Kernel:
                 raise KernelError("integration_receipt_incomplete")
             tx.execute("UPDATE subjects SET integrated_sha=?,integrated_tree=?,workspace_sha=?,expected_tree=?,integration_target=? WHERE id=?",
                        (commit["sha"], commit["tree"], commit["sha"], result["expected_tree"], row["base_sha"], subject))
-            if row["base_sha"] != world.target.sha:
+            payload = json.loads(tx.get(row["payload_id"], subject))
+            live_source = None if world.source is None else world.source.sha
+            if row["base_sha"] != world.target.sha or payload["source_sha"] != live_source:
+                self._observe_integration_snapshot(tx, run, job, world)
                 tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
                 tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',ci_failure=NULL,version=version+1 WHERE id=?", (subject,))
                 return Step("progress", subject, "integration_snapshot_changed")
+            tx.execute("UPDATE integration_snapshots SET open=0 WHERE subject=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)", (subject, subject))
             latest = self._job(tx, subject)
             if job["kind"] == DeliveryKind.TICKET:
                 phase = "ready_publication"
@@ -1684,6 +1701,7 @@ class Kernel:
                 tx.execute("UPDATE subjects SET purpose=? WHERE id=?", (Purpose.CI.value if job["purpose"] == Purpose.CI else Purpose.INTEGRATION.value, subject))
         elif operation == "run_branch":
             tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], subject))
+            self._record_source_write(tx, subject, row["source_ref"], row["after_sha"])
             phase = "publish"
         elif operation == "publication_commit":
             if commit["tree"] != job["integrated_tree"]:
@@ -1692,6 +1710,7 @@ class Kernel:
             phase = "push"
         elif operation == "push":
             tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], subject))
+            self._record_source_write(tx, subject, row["source_ref"], row["after_sha"])
             phase = "pr"
         elif operation == "pr_write":
             pr = result["pr"]
@@ -1735,6 +1754,67 @@ class Kernel:
             tx.execute("UPDATE actions SET status='updating' WHERE id=?", (run["final_action"],))
             tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
         self._event(tx, job["id"], "boundary_update", job["candidate_sha"] or job["id"])
+
+    def _resync_state(self, tx: Transaction, subject: str) -> dict[str, Any]:
+        allowance = tx.one("SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,))
+        snapshots = tx.rows("SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
+        snapshot = snapshots[0] if snapshots else None
+        return {"generation": allowance["generation"], "used": allowance["used"], "limit": allowance["allowance"],
+                "window": None if snapshot is None else snapshot["window"], "open": bool(snapshot and snapshot["open"]),
+                "source_sha": None if snapshot is None else snapshot["source_sha"],
+                "target_sha": None if snapshot is None else snapshot["target_sha"]}
+
+    def _record_source_write(self, tx: Transaction, subject: str, ref: str, head: str) -> None:
+        tx.execute("UPDATE integration_snapshots SET source_sha=? WHERE subject=? AND source_ref=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)",
+                   (head, subject, ref, subject))
+
+    def _renew_resync(self, tx: Transaction, job: sqlite3.Row, *, require_exhaustion: bool = True) -> None:
+        previous = self._resync_state(tx, job["id"])
+        if require_exhaustion and (previous["used"] < previous["limit"] or previous["open"]):
+            raise KernelError("resync_allowance_not_exhausted")
+        tx.execute("UPDATE resync_allowances SET current=0 WHERE subject=? AND current=1", (job["id"],))
+        tx.execute("INSERT INTO resync_allowances(subject,generation,allowance) VALUES (?,?,?)",
+                   (job["id"], previous["generation"] + 1, self._policy(tx.one("SELECT * FROM runs")).resync_limit))
+        self._event(tx, job["id"], "resync_renewed", str(previous["generation"] + 1))
+
+    def _observe_integration_snapshot(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
+        """Only an external change after a completed window spends allowance."""
+        subject = job["id"]
+        if world.source is None and job["pr_number"] is not None:
+            self._gate(tx, subject, "published_head_changed")
+            return False
+        source_sha = job["source_sha"] if world.source is None else world.source.sha
+        previous = tx.rows("SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
+        allowance = tx.one("SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,))
+        snapshot = previous[0] if previous else None
+        first = snapshot is None or snapshot["source_ref"] != job["source_ref"] or snapshot["target_ref"] != job["target_ref"]
+        source_changed = snapshot is not None and not first and snapshot["source_sha"] != source_sha
+        target_changed = snapshot is not None and not first and snapshot["target_sha"] != world.target.sha
+        if snapshot is not None and not first:
+            for changed, before, after in ((source_changed, snapshot["source_sha"], source_sha),
+                                           (target_changed, snapshot["target_sha"], world.target.sha)):
+                if changed and (before, after) not in world.ancestry:
+                    self._gate(tx, subject, "non_append_integration_history")
+                    return False
+        charged = bool(snapshot is not None and not first and (source_changed or target_changed) and not snapshot["open"])
+        if charged and allowance["used"] >= allowance["allowance"]:
+            self._gate(tx, subject, "integration_resync_exhausted")
+            return False
+        if first or charged:
+            window = 1 if snapshot is None else snapshot["window"] + 1
+            tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,1)",
+                       (subject, window, allowance["generation"], job["source_ref"], job["target_ref"], source_sha, world.target.sha))
+            if charged:
+                tx.execute("UPDATE resync_allowances SET used=used+1 WHERE subject=? AND current=1", (subject,))
+        elif snapshot is not None and (source_changed or target_changed):
+            tx.execute("UPDATE integration_snapshots SET source_sha=?,target_sha=? WHERE subject=? AND window=?",
+                       (source_sha, world.target.sha, subject, snapshot["window"]))
+        if world.source is not None and source_sha != job["source_sha"]:
+            tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (source_sha, subject))
+        if first or source_changed or target_changed:
+            evidence = tx.put(subject, "integration_snapshot", wire_json({"source_sha": source_sha, "target_sha": world.target.sha, "charged": charged}))
+            self._event(tx, subject, "integration_snapshot", str(allowance["generation"]), evidence)
+        return True
 
     def _review_current(self, tx: Transaction, job: sqlite3.Row, world: World) -> bool:
         if not job["review_attempt"]:

@@ -126,7 +126,7 @@ class OfflinePort:
                            self.remote_commit(pr.source_ref) or pr.head, self.remote_commit(pr.target_ref) or pr.base, pr.title, pr.body,
                            pr.state, pr.actor, pr.merged)
 
-    def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none") -> World:
+    def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none", *, witnesses: Sequence[str] = ()) -> World:
         pr = self.pull_request(delivery.key)
         checks = None
         if pr is not None:
@@ -140,7 +140,13 @@ class OfflinePort:
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
                      target, source, pr, checks,
                      delivery.completion_revision,
-                     ((target.sha, source.sha),) if source is not None and self.git.is_ancestor(target.sha, source.sha) else ())
+                     self.ancestry(source, target, witnesses))
+
+    def ancestry(self, source: Commit | None, target: Commit, witnesses: Sequence[str]) -> tuple[tuple[str, str], ...]:
+        before_heads = set(witnesses) | {target.sha}
+        after_heads = {target.sha} if source is None else {target.sha, source.sha}
+        return tuple((before, after) for before in sorted(before_heads) for after in sorted(after_heads)
+                     if before == after or self.git.is_ancestor(before, after))
 
     def ref_commit(self, ref: str) -> Commit | None:
         result = self.git.run("for-each-ref", "--format=%(refname)%09%(objectname)", ref)
@@ -505,7 +511,11 @@ class Scenario:
         if pr is not None and pr.head.sha not in self.heads:
             self.heads.append(pr.head.sha)
         index = max(0, len(self.heads) - 1)
-        return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)])
+        state = self.kernel.status(self.delivery.key)
+        witnesses = [state["source_sha"]]
+        if state["resync"]["target_sha"] is not None:
+            witnesses.append(state["resync"]["target_sha"])
+        return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)], witnesses=witnesses)
 
     def agent(self, call: AgentCall) -> bytes:
         self.role_calls.append({"role": call.role.value, "purpose": call.purpose.value,
@@ -811,7 +821,7 @@ class GraphScenario(Scenario):
         checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
         return World(status["source_parent_revision"], self.kernel.source_status()["observed_graph_revision"], status["source_revision"],
                      target, source, pr, checks, status["completion_revision"],
-                     ((target.sha, source.sha),) if source is not None and self.port.git.is_ancestor(target.sha, source.sha) else ())
+                     self.port.ancestry(source, target, [status["source_sha"], *([status["resync"]["target_sha"]] if status["resync"]["target_sha"] is not None else [])]))
 
     def agent(self, call: AgentCall) -> bytes:
         raw = super().agent(call)

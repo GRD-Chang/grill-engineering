@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v6-exploration"
+PROTOCOL = "independent-delivery-kernel-v7-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -113,6 +113,18 @@ CREATE TABLE budgets (
  PRIMARY KEY(subject,purpose,window)
 );
 CREATE UNIQUE INDEX current_budget ON budgets(subject,purpose) WHERE current=1;
+CREATE TABLE resync_allowances (
+ subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
+ used INTEGER NOT NULL DEFAULT 0, allowance INTEGER NOT NULL CHECK(allowance>=0),
+ current INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(subject,generation)
+);
+CREATE UNIQUE INDEX current_resync ON resync_allowances(subject) WHERE current=1;
+CREATE TABLE integration_snapshots (
+ subject TEXT NOT NULL REFERENCES subjects(id), window INTEGER NOT NULL,
+ allowance_generation INTEGER NOT NULL, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
+ source_sha TEXT NOT NULL, target_sha TEXT NOT NULL, open INTEGER NOT NULL,
+ PRIMARY KEY(subject,window), FOREIGN KEY(subject,allowance_generation) REFERENCES resync_allowances(subject,generation)
+);
 CREATE TABLE material (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
  digest TEXT NOT NULL, size INTEGER NOT NULL, body BLOB NOT NULL,
