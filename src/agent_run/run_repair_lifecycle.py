@@ -127,10 +127,22 @@ class RunRepairLifecycle:
                         if job.get("phase") == "candidate" and job.get("attempt_kind") != "ci_repair":
                             # Parent repair integrates the live source/target
                             # snapshot before reviewing the actual Candidate.
-                            with work.agent_work.step(job, allow_agent=True):
-                                prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
-                                    work, state, job, checkout,
+                            try:
+                                with work.agent_work.step(job, allow_agent=True):
+                                    prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
+                                        work, state, job, checkout,
+                                    )
+                            except GitHubReadError as error:
+                                if not is_github_convergence_error(error.code):
+                                    raise
+                                wait_for_github_convergence(
+                                    state, code=error.code, message=str(error),
+                                    waiting_for=f"run-repair-{job['repair_attempt']}",
                                 )
+                                ensure_supervision_window(state)
+                                self.owner._save(state)
+                                work.agent_work.defer()
+                                break
                             if not prepared:
                                 if job.get("phase") == "candidate":
                                     continue
@@ -171,16 +183,6 @@ class RunRepairLifecycle:
                         raise
                     preserve_checkout = True
                     continue
-                except GitHubReadError as error:
-                    if not is_github_convergence_error(error.code):
-                        raise
-                    wait_for_github_convergence(
-                        state, code=error.code, message=str(error),
-                        waiting_for=f"run-repair-{job['repair_attempt']}",
-                    )
-                    ensure_supervision_window(state)
-                    self.owner._save(state)
-                    work.agent_work.defer()
                 sync_repair_cycle_counters(run, job)
                 pause_human_blocked_repair_cycle(run, job)
                 self.owner._save(state)
