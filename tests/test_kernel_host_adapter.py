@@ -6,10 +6,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
 from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError
+from agent_run_kernel.model import RunSpec
 from agent_run_kernel.model import HostLaunch
 
 
@@ -144,6 +147,7 @@ def test_running_host_requires_real_main_process_start_and_cgroup(tmp_path: Path
         observed = host.observe(request)
         assert observed.disposition == "running" and observed.main_pid == process.pid
         assert observed.start_token and observed.boot_id and observed.ended_at is None
+        assert not observed.usage_ready and not observed.usage_released
         state["fields"]["ControlGroup"] = "/different-unit"
         response.write_text(json.dumps(state))
         assert host.observe(request).disposition == "unknown"
@@ -164,3 +168,64 @@ def test_real_systemctl_cannot_use_an_unavailable_user_bus(tmp_path: Path) -> No
     })
     with pytest.raises(HostUnavailable, match="user systemd"):
         host.preflight()
+
+
+def host_kernel(tmp_path: Path) -> Kernel:
+    base = Commit("base", "tree")
+    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "requirements", base, "source", "target")
+    return Kernel.create(tmp_path / "state" / "kernel.sqlite3", RunSpec(
+        "host-run", "example/repository", 1, "requirements", "graph", (delivery,),
+        language="en", repository_root=str(tmp_path / "repository"),
+    ))
+
+
+def test_real_unavailable_bus_rejects_kernel_admission_before_action(tmp_path: Path) -> None:
+    kernel = host_kernel(tmp_path)
+    systemctl, systemd_run = shutil.which("systemctl"), shutil.which("systemd-run")
+    assert systemctl is not None and systemd_run is not None
+    host = SystemdHost(systemctl=systemctl, systemd_run=systemd_run, environment={
+        "PATH": os.defpath, "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path / "absent-runtime"),
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(tmp_path / "absent-user-bus"),
+    })
+    with pytest.raises(HostUnavailable, match="user systemd"):
+        kernel.admit_host("start", kind="run", command=(sys.executable, "-c", "pass"),
+                          environment_carrier=tmp_path / "carrier", preflight=host.preflight)
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM actions")[0] == 0
+        assert tx.one("SELECT executor FROM runs")[0] is None
+
+
+def test_real_manager_boundary_reports_unknown_and_reconciles_original_kernel_grant(tmp_path: Path) -> None:
+    kernel = host_kernel(tmp_path)
+    host, original_fixture, response, calls = controlled_manager(tmp_path)
+    launch = kernel.admit_host("start", kind="run", command=original_fixture.command,
+                               environment_carrier=original_fixture.environment_carrier, preflight=host.preflight)
+    state = json.loads(response.read_text())
+    state["fields"].update(Id=launch.unit_name, Description=launch.description,
+                           ExecMainExitTimestamp=f"@{time.time()}")
+    state["launch_returncode"] = 1
+    response.write_text(json.dumps(state))
+    observed = host.launch(launch, dispatch=lambda: kernel.dispatch_host(launch))
+    assert observed is not None and observed.disposition == "unknown"
+    assert kernel.observe_host(launch, observed) == "unknown"
+    reopened = Kernel(kernel.storage.path)
+    before = calls.read_bytes()
+    assert host.launch(launch, dispatch=lambda: reopened.dispatch_host(launch)) is None
+    assert calls.read_bytes() == before
+    with reopened.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT executor FROM runs")[0] == launch.owner
+    ended = host.observe(launch)
+    assert ended.disposition == "exited" and ended.invocation_id == "1" * 32
+    assert ended.main_pid is None and ended.start_token is None
+    assert not ended.usage_ready and not ended.usage_released
+    assert reopened.observe_host(launch, ended) == "exited"
+    with reopened.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT executor FROM runs")[0] is None
+        assert tuple(tx.one("SELECT usage_ready,usage_released FROM hosts")) == (0, 0)
+    with pytest.raises(KernelError, match="executor_exit_unproven"):
+        reopened.admit_host("next-start", kind="run", command=launch.command,
+                            environment_carrier=launch.environment_carrier, preflight=host.preflight)
+    launches = [json.loads(line) for line in calls.read_text().splitlines() if json.loads(line)[0] == "systemd-run"]
+    assert len(launches) == 1
+    assert "--unit=" + launch.unit_name in launches[0]
+    assert "--description=" + launch.description in launches[0]

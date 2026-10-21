@@ -125,7 +125,7 @@ class OfflinePort:
         # GitHub's base/head are live remote facts, not frozen intent fields.
         return PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref,
                            self.remote_commit(pr.source_ref) or pr.head, self.remote_commit(pr.target_ref) or pr.base, pr.title, pr.body,
-                           pr.state, pr.actor, pr.merged)
+                           pr.state, pr.actor, pr.merged, pr.head_repository)
 
     def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none", *, witnesses: Sequence[str] = ()) -> World:
         pr = self.pull_request(delivery.key)
@@ -290,7 +290,7 @@ class OfflinePort:
                     number = prior.number if prior else db.execute("SELECT coalesce(max(number),0)+1 FROM prs").fetchone()[0]
                 pr = PullRequest(number, effect.repository, effect.source_ref, effect.target_ref,
                                  self.git.commit(str(self.remote_refs()[effect.source_ref])), self.git.commit(str(self.remote_refs()[effect.target_ref])),
-                                 payload["title"], payload["body"], actor=effect.actor)
+                                 payload["title"], payload["body"], actor=effect.actor, head_repository=effect.repository)
                 self._write_pr(effect.subject, pr)
             elif operation == "merge":
                 pr = self.pull_request(effect.subject)
@@ -298,7 +298,7 @@ class OfflinePort:
                     raise KernelError("merge_compare_and_swap")
                 commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
                 pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
-                                 pr.title, pr.body, "MERGED", effect.actor, commit)
+                                 pr.title, pr.body, "MERGED", effect.actor, commit, pr.head_repository)
                 with sqlite3.connect(self.database) as db:
                     db.execute("BEGIN IMMEDIATE")
                     source = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
@@ -810,13 +810,14 @@ class GraphScenario(Scenario):
         self.heads = []
 
     def refresh(self) -> dict[str, Any]:
-        with sqlite3.connect(self.port.database) as db:
-            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
-        source = replace(self.requirements, issues=tuple(
-            replace(issue, state="CLOSED" if issue.number in closed else issue.state,
-                    blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker for blocker in issue.blocked_by))
-            for issue in self.requirements.issues))
-        return self.kernel.refresh(source)
+        def read() -> Requirements:
+            with sqlite3.connect(self.port.database) as db:
+                closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
+            return replace(self.requirements, issues=tuple(
+                replace(issue, state="CLOSED" if issue.number in closed else issue.state,
+                        blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker for blocker in issue.blocked_by))
+                for issue in self.requirements.issues))
+        return self.kernel.refresh(read)
 
     def world(self) -> World:
         self.refresh()

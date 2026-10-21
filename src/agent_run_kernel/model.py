@@ -197,6 +197,7 @@ class PullRequest:
     state: str = "OPEN"
     actor: str = "offline-publisher"
     merged: Commit | None = None
+    head_repository: str | None = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +270,9 @@ class HostObservation:
     exit_status: int | None = None
     ended_at: float | None = None
     evidence: str = ""
+    usage_ready: bool = False
+    usage_released: bool = False
+    usage_pending: bool = False
 
 
 @dataclass(frozen=True)

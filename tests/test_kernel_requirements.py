@@ -34,7 +34,7 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
     closed = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 3 else
                                          replace(issue, blocked_by=tuple(replace(blocker, state="CLOSED") for blocker in issue.blocked_by))
                                          for issue in source.issues))
-    kernel.refresh(closed)
+    kernel.refresh(lambda: closed)
     state = Kernel(kernel.storage.path).source_status()
     assert state["frontier"] == []
     assert state["remaining"] == {"ticket:3": "ticket_closed", "ticket:4": "blocked_by_incomplete_tickets"}
@@ -118,7 +118,7 @@ def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(t
     kernel.receive(first, raw)
     before = kernel.status("ticket:3")
     changed = replace(source, issues=tuple(replace(issue, body=issue.body + "\nNew requirement") if issue.number == 4 else issue for issue in source.issues))
-    kernel.refresh(changed)
+    kernel.refresh(lambda: changed)
     assert kernel.source_status()["blocked"] == "requeue_required"
     assert kernel.advance("ticket:3", token, demand_world(kernel, "ticket:3")).kind == "paused"
     old = kernel.delivery("ticket:4")
@@ -144,7 +144,7 @@ def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_autho
     calls = [kernel.advance(subject, token, demand_world(kernel, subject)).call for subject in ("ticket:3", "ticket:4")]
     kernel.control("stop", "operator-stop")
     removed = replace(source, parent=replace(source.parent, sub_issue_numbers=(4,)), issues=(source.issues[1],))
-    kernel.refresh(removed)
+    kernel.refresh(lambda: removed)
     assert kernel.source_status()["blocked"] == "unsupported_scope_change"
     assert kernel.source_status()["stopped"] is True
     assert kernel.source_status()["frontier"] == []
@@ -154,7 +154,7 @@ def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_autho
         assert kernel.status(call.subject)["pending_return"] is True
         with pytest.raises(KernelError, match="executor_fenced"):
             kernel.advance(call.subject, token, demand_world(kernel, call.subject))
-    kernel.refresh(source)
+    kernel.refresh(lambda: source)
     assert kernel.source_status()["blocked"] is None
     assert kernel.source_status()["stopped"] is True
     kernel.confirm_executor_exit(token)

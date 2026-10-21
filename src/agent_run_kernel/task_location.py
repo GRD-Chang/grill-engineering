@@ -1,0 +1,65 @@
+"""One locked Task -> Run location; all replacement decisions stay in Kernel."""
+
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import tempfile
+from typing import Iterator
+
+from agent_run.paths import app_data_root
+from agent_run.task_identity import TaskKey
+
+from .model import KernelError, wire_json
+
+
+@contextmanager
+def locked_task(task: TaskKey) -> Iterator[Path]:
+    root = app_data_root() / "native-task-locations"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / (task.fingerprint + ".json")
+    descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield path
+
+
+def read_task(path: Path) -> tuple[str, Path] | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as source:
+        body = source.read(8193)
+    if len(body) > 8192:
+        raise KernelError("task_location_invalid")
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError) as error:
+        raise KernelError("task_location_invalid") from error
+    if (not isinstance(value, dict) or set(value) != {"run_id", "database"}
+            or not isinstance(value["run_id"], str) or not value["run_id"]
+            or not isinstance(value["database"], str) or not Path(value["database"]).is_absolute()):
+        raise KernelError("task_location_invalid")
+    return value["run_id"], Path(value["database"])
+
+
+def bind_task(path: Path, run_id: str, database: Path) -> None:
+    body = wire_json({"run_id": run_id, "database": str(database.resolve())})
+    if len(body) > 8192:
+        raise KernelError("task_location_invalid")
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as target:
+        temporary = Path(target.name)
+        try:
+            target.write(body)
+            target.flush()
+            os.fsync(target.fileno())
+            os.replace(temporary, path)
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)

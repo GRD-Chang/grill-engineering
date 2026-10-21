@@ -15,7 +15,7 @@ from typing import Any, Iterator, Sequence
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v9-exploration"
+PROTOCOL = "independent-delivery-kernel-v10-exploration"
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -190,6 +190,17 @@ CREATE TABLE retired_executors (
  run_id TEXT NOT NULL REFERENCES runs(id), owner TEXT NOT NULL, epoch INTEGER NOT NULL,
  status TEXT NOT NULL, PRIMARY KEY(run_id,owner,epoch)
 );
+CREATE TABLE hosts (
+ run_id TEXT NOT NULL REFERENCES runs(id), epoch INTEGER NOT NULL, owner TEXT NOT NULL,
+ nonce TEXT NOT NULL UNIQUE, action_id TEXT NOT NULL UNIQUE REFERENCES actions(id),
+ subject TEXT NOT NULL REFERENCES subjects(id), request_id TEXT NOT NULL REFERENCES material(id),
+ unit_name TEXT NOT NULL UNIQUE, allocated_at REAL NOT NULL, dispatched_at REAL,
+ status TEXT NOT NULL CHECK(status IN ('allocated','dispatched','running','unknown','exited')),
+ invocation_id TEXT, cgroup TEXT, boot_id TEXT, main_pid INTEGER, start_token TEXT,
+ exit_status INTEGER, ended_at REAL, observation_id TEXT REFERENCES material(id),
+ usage_ready INTEGER NOT NULL DEFAULT 0, usage_released INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(run_id,epoch), UNIQUE(run_id,owner)
+);
 CREATE TABLE waits (
  subject TEXT NOT NULL REFERENCES subjects(id), kind TEXT NOT NULL, deadline REAL NOT NULL,
  PRIMARY KEY(subject,kind)
@@ -200,13 +211,14 @@ CREATE TABLE gates (
 );
 CREATE TABLE effects (
  id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), operation TEXT NOT NULL,
- status TEXT NOT NULL, executor TEXT NOT NULL, epoch INTEGER NOT NULL,
+ status TEXT NOT NULL, executor TEXT, epoch INTEGER,
  parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, revision TEXT NOT NULL,
  generation INTEGER NOT NULL, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
  before_sha TEXT NOT NULL, after_sha TEXT, candidate_sha TEXT, candidate_tree TEXT,
  base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT NOT NULL,
  payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
- attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0
+ attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0,
+ CHECK((executor IS NOT NULL AND epoch IS NOT NULL) OR (status='confirmed' AND executor IS NULL AND epoch IS NULL))
 );
 CREATE TABLE effect_failures (
  effect TEXT NOT NULL REFERENCES effects(id), dispatch_serial INTEGER NOT NULL,

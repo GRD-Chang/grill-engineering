@@ -42,7 +42,7 @@ def _latest_maintainer_response(request: dict[str, Any]) -> str | None:
 def uses_short_role_prompt(
     request: dict[str, Any], *, reviewer: bool = False
 ) -> bool:
-    if request.get("_invocation_mode") == "new-thread":
+    if request.get("_invocation_mode") in {"new-thread", "new-attempt"}:
         return False
     thread_id = request.get("thread_id")
     if not isinstance(thread_id, str) or not thread_id.strip():

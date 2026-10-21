@@ -49,6 +49,15 @@ def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_p
         if len(checks) == 2:
             assert any(event["kind"] == "worker_started" and event["identity"] == call.invocation_id
                        for event in Kernel(path).history(call.subject))
+            with kernel.storage.transaction(write=False) as tx:
+                witness = tx.one("SELECT process_identity FROM invocation_outputs WHERE invocation=? AND ordinal=?",
+                                 (call.invocation_id, call.output_ordinal))[0]
+                identity = json.loads(tx.get(witness, call.subject))
+            assert identity["host_pid"] == os.getpid()
+            for pid_field, group_field in (("pid", "cgroup"), ("host_pid", "host_cgroup")):
+                memberships = Path(f"/proc/{identity[pid_field]}/cgroup").read_text().splitlines()
+                assert f"0::{identity[group_field]}" in memberships
+                assert identity[group_field].startswith("/")
 
     arguments = [sys.executable, "-I", "-c", (
         f"from pathlib import Path; import sys; "
@@ -60,6 +69,7 @@ def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_p
         environment={"PATH": os.defpath}, timeout=5, authorize_source=authorize_source,
     )
     assert result is not None and result.returncode == 0 and result.raw == RAW
+    assert result.identity["cgroup"] == result.identity["host_cgroup"]
     assert len(checks) == 2
     assert canary.read_text() == "ran\n"
 
@@ -304,7 +314,7 @@ def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) 
 
     def refresh_source() -> None:
         nonlocal reads
-        kernel.refresh(Requirements.from_wire(json.loads(source_path.read_text())))
+        kernel.refresh(lambda: Requirements.from_wire(json.loads(source_path.read_text())))
         reads += 1
         if reads == 1:
             source["parent"]["body"] = "Requirement changed while the bootstrap was blocked"

@@ -13,7 +13,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import select
 import selectors
 import signal
@@ -69,15 +69,30 @@ def _start_token(pid: int) -> str | None:
     return fields[19] if len(fields) > 19 else None
 
 
+def _cgroup(pid: int) -> str:
+    try:
+        memberships = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ProcessExitUnknown("Process cgroup is unavailable") from error
+    groups = [line[3:] for line in memberships if line.startswith("0::")]
+    if len(groups) != 1 or not groups[0].startswith("/") or ".." in PurePosixPath(groups[0]).parts:
+        raise ProcessExitUnknown("Process cgroup is ambiguous")
+    return groups[0]
+
+
 def _identity(pid: int) -> dict[str, int | str]:
     host = os.getpid()
     start, host_start = _start_token(pid), _start_token(host)
     if start is None or host_start is None or os.getpgid(pid) != pid:
         raise ProcessExitUnknown("Worker process identity is unavailable")
+    group, host_group = _cgroup(pid), _cgroup(host)
+    if _start_token(pid) != start or _start_token(host) != host_start:
+        raise ProcessExitUnknown("Process identity changed while reading cgroup")
     return {
         "schema": "linux-process-v1", "pid": pid, "start_token": start,
         "pgid": pid, "host_pid": host, "host_start_token": host_start,
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "cgroup": group, "host_cgroup": host_group,
     }
 
 
