@@ -2782,7 +2782,8 @@ class Kernel:
                           (job["id"], job["generation"]))[0]
         # The original selection observes the newly allocated role ordinal.
         if publication["reference"] == "development" and attempts + 1 < 4:
-            return job["development_thread"]
+            development_thread = job["development_thread"]
+            return str(development_thread) if development_thread is not None else None
         return None
 
     def configure_task_profiles(self, action_id: str, *, preset: str | None = None,

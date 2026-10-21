@@ -106,12 +106,18 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
     revision = scenario.kernel.configure_profiles("choose-profile", preset="economy", overrides={
         "development_model": "selected-development", "publication_from_development": True,
     })
+    development = None
     for _ in range(40):
         step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        if step.call is not None and step.call.role == "development":
+            development = step.call
         if step.call is not None and step.call.role == "publication":
             call = step.call
+            assert development is not None
+            assert call.thread_id == development.thread_id and call.reported_thread == "offline-" + development.thread_id
+            assert call.mode == "resume" and call.profile == development.profile
             assert call.profile.model == "selected-development" and call.profile_revision == revision
-            assert call.profile_reference == "development"
+            assert call.profile_reference == development.profile_reference is None
             assert call.context["language"] == "zh" and call.context["repository_root"] == str(scenario.port.git.root.resolve())
             break
         scenario.handle(step)
