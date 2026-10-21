@@ -62,9 +62,10 @@ class Kernel:
                         "unread" if issue is None else kernel._fingerprint({"title": issue.title, "body": issue.body}))
                     delivery = replace(delivery, revision=revision, dependencies=())
                 kernel._add_delivery(tx, spec.run_id, spec.policy, delivery)
-            for delivery in spec.deliveries:
-                for predecessor in delivery.dependencies:
-                    tx.execute("INSERT INTO dependencies VALUES (?,?)", (delivery.key, predecessor))
+            if requirements is None:
+                for delivery in spec.deliveries:
+                    for predecessor in delivery.dependencies:
+                        tx.execute("INSERT INTO dependencies VALUES (?,?)", (delivery.key, predecessor))
             if requirements is not None:
                 kernel._refresh(tx, requirements, initial=True)
         return kernel
@@ -76,13 +77,10 @@ class Kernel:
             base_sha,base_tree,source_sha,candidate_sha,candidate_tree,completion_revision,checkout,workspace_sha)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (delivery.key, run_id, delivery.kind.value, delivery.issue, delivery.revision,
-                    "workspace" if final else "development", Purpose.INTEGRATION.value if final else Purpose.REQUIREMENTS.value,
+                    "integration" if final else "development", Purpose.INTEGRATION.value if final else Purpose.REQUIREMENTS.value,
                     delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.tree,
                     delivery.base.sha, delivery.base.sha if final else None, delivery.base.tree if final else None,
                     delivery.completion_revision, delivery.checkout, delivery.base.sha))
-        # Seed-only Final fixtures already have their explicitly supplied checkout.
-        if final and Path(delivery.checkout).is_dir():
-            tx.execute("UPDATE subjects SET phase='integration' WHERE id=?", (delivery.key,))
         limits = {
             Purpose.REQUIREMENTS: (policy.ticket_rounds + 1, policy.ticket_rounds)
             if delivery.kind == DeliveryKind.TICKET else (policy.parent_rounds, policy.parent_rounds),
@@ -106,6 +104,142 @@ class Kernel:
                 self._fingerprint({"tickets": members, "dependencies": {
                     str(issue.number): sorted(blocker.number for blocker in issue.blocked_by)
                     for issue in requirements.issues if issue.number in members}}))
+
+    def refresh(self, requirements: Requirements) -> dict[str, Any]:
+        """Observe real source facts without reopening any operator control."""
+        with self.storage.transaction() as tx:
+            if tx.one("SELECT source_sequence FROM runs")[0] is None:
+                raise KernelError("source_not_configured")
+            self._refresh(tx, requirements)
+        return self.source_status()
+
+    def _refresh(self, tx: Transaction, source: Requirements, *, initial: bool = False) -> None:
+        run = tx.one("SELECT * FROM runs")
+        if source.parent.number != run["parent_issue"]:
+            raise KernelError("parent_identity")
+        parent_revision, graph_revision = self._source_revisions(source)
+        order = list(source.parent.sub_issue_numbers)
+        if not source.parent.sub_issue_order_reliable:
+            order.sort()
+        raw = wire_json({"parent": asdict(source.parent), "issues": [
+            {**asdict(issue), "labels": sorted(issue.labels)} for issue in source.issues]})
+        if len(raw) > 4 * 1024 * 1024:
+            raise KernelError("source_limit")
+        previous = tx.rows("SELECT sequence,body FROM source_observations ORDER BY sequence DESC LIMIT 1")
+        if previous and previous[0]["body"] == raw:
+            return
+        tx.execute("INSERT INTO source_observations(parent_revision,graph_revision,body) VALUES (?,?,?)", (parent_revision, graph_revision, raw))
+        sequence = tx.one("SELECT last_insert_rowid()")[0]
+        tx.execute("INSERT OR IGNORE INTO requirement_versions VALUES (?,?,?,?)",
+                   (source.parent.number, parent_revision, source.parent.title, source.parent.body))
+        tx.execute("DELETE FROM issue_facts")
+        tx.execute("DELETE FROM dependency_facts")
+        by_number = {issue.number: issue for issue in source.issues}
+        for issue in source.issues:
+            revision = self._fingerprint({"title": issue.title, "body": issue.body})
+            tx.execute("INSERT OR IGNORE INTO requirement_versions VALUES (?,?,?,?)", (issue.number, revision, issue.title, issue.body))
+            tx.execute("INSERT INTO issue_facts VALUES (?,?,?,?,?)", (issue.number, revision, issue.state.upper(), wire_json(sorted(issue.labels)), order.index(issue.number) if issue.number in order else -1))
+            for blocker in issue.blocked_by:
+                tx.execute("INSERT INTO dependency_facts VALUES (?,?,?)", (issue.number, blocker.number, blocker.state.upper()))
+        tx.execute("UPDATE runs SET source_sequence=?,observed_parent_revision=?,observed_graph_revision=?",
+                   (sequence, parent_revision, graph_revision))
+        if initial:
+            jobs = {row["issue"]: row["id"] for row in tx.rows("SELECT id,issue FROM subjects WHERE kind='ticket'")}
+            for issue in source.issues:
+                for blocker in issue.blocked_by:
+                    if issue.number in jobs and blocker.number in jobs:
+                        tx.execute("INSERT INTO dependencies VALUES (?,?)", (jobs[issue.number], jobs[blocker.number]))
+        graph_problem = "missing_ticket" if any(number not in by_number for number in order) else None
+        edges = {number: {blocker.number for blocker in by_number[number].blocked_by if blocker.number in order}
+                 for number in order if number in by_number}
+        remaining = set(edges)
+        while remaining:
+            ready = {number for number in remaining if not (edges[number] & remaining)}
+            if not ready:
+                graph_problem = "dependency_cycle"
+                break
+            remaining -= ready
+        jobs = tx.rows("SELECT * FROM subjects")
+        reopened = any(job["kind"] == DeliveryKind.TICKET and job["phase"] == "complete"
+                       and job["issue"] in by_number and by_number[job["issue"]].state.upper() != "CLOSED" for job in jobs)
+        if graph_revision != run["graph_revision"] or reopened:
+            blocked = "unsupported_scope_change"
+        else:
+            blocked = graph_problem
+            changed_parent = parent_revision != run["parent_revision"]
+            parent_in_use = False
+            for job in jobs:
+                if job["phase"] == "complete":
+                    continue
+                facts = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+                revision = parent_revision if job["kind"] != DeliveryKind.TICKET else (facts[0][0] if facts else job["revision"])
+                has_work = bool(tx.rows("SELECT id FROM attempts WHERE subject=? LIMIT 1", (job["id"],)))
+                if has_work and (revision != job["revision"] or changed_parent):
+                    self._gate(tx, job["id"], "requeue_required")
+                    parent_in_use = parent_in_use or changed_parent
+                elif not has_work:
+                    tx.execute("UPDATE subjects SET revision=? WHERE id=?", (revision, job["id"]))
+            if not parent_in_use:
+                tx.execute("UPDATE runs SET parent_revision=?", (parent_revision,))
+            if tx.rows("SELECT subject FROM gates WHERE code='requeue_required' LIMIT 1"):
+                blocked = "requeue_required"
+        managed = {None, "missing_ticket", "dependency_cycle", "unsupported_scope_change", "requeue_required"}
+        if run["blocked"] in managed:
+            tx.execute("UPDATE runs SET blocked=?", (blocked,))
+        owner = jobs[0]["id"]
+        self._event(tx, owner, "source_refreshed", str(sequence))
+
+    def _completion(self, tx: Transaction, job: sqlite3.Row) -> sqlite3.Row | None:
+        rows = tx.rows("SELECT * FROM completions WHERE subject=? AND generation=? AND revision=? AND graph_revision=(SELECT graph_revision FROM runs)",
+                       (job["id"], job["generation"], job["revision"]))
+        return rows[0] if rows and job["phase"] == "complete" else None
+
+    def _eligibility(self, tx: Transaction, job: sqlite3.Row) -> str | None:
+        if job["kind"] != DeliveryKind.TICKET or tx.one("SELECT source_sequence FROM runs")[0] is None:
+            return None
+        facts = tx.rows("SELECT * FROM issue_facts WHERE issue=?", (job["issue"],))
+        if not facts:
+            return "missing_ticket"
+        if job["phase"] == "complete" and self._completion(tx, job) is not None:
+            return "completed"
+        # Local dependency authority is Completion, never the live CLOSED flag.
+        for predecessor in tx.rows("SELECT s.* FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (job["id"],)):
+            if self._completion(tx, predecessor) is None:
+                return "blocked_by_incomplete_tickets"
+        if facts[0]["state"] != "OPEN":
+            return "ticket_closed"
+        if tx.rows("SELECT blocker FROM dependency_facts WHERE issue=? AND state!='CLOSED' AND blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket')", (job["issue"],)):
+            return "blocked_by_open_issues"
+        if not tx.rows("SELECT id FROM attempts WHERE subject=? LIMIT 1", (job["id"],)):
+            labels = set(json.loads(facts[0]["labels"]))
+            disqualifying = sorted(labels & {"needs-triage", "needs-info", "ready-for-human"})
+            if disqualifying:
+                return "disqualifying_label:" + disqualifying[0]
+            if "ready-for-agent" not in labels:
+                return "missing_ready_for_agent"
+        return None
+
+    def source_status(self) -> dict[str, Any]:
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            jobs = tx.rows("SELECT s.* FROM subjects s LEFT JOIN issue_facts i ON i.issue=s.issue ORDER BY i.position,s.issue")
+            frontier, remaining = [], {}
+            for job in jobs:
+                if job["kind"] != DeliveryKind.TICKET:
+                    continue
+                reason = self._eligibility(tx, job)
+                if reason == "completed":
+                    continue
+                if reason is not None:
+                    remaining[job["id"]] = reason
+                elif not run["blocked"] and not run["stopped"] and not self._gates(tx, job["id"]):
+                    frontier.append(job["id"])
+            final = next((job["id"] for job in jobs if job["kind"] == DeliveryKind.FINAL_RUN), None)
+            return {"frontier": frontier, "remaining": remaining, "blocked": run["blocked"], "stopped": bool(run["stopped"]),
+                    "parent_revision": run["parent_revision"], "observed_parent_revision": run["observed_parent_revision"],
+                    "graph_revision": run["graph_revision"], "observed_graph_revision": run["observed_graph_revision"],
+                    "observation": run["source_sequence"], "final_subject": final,
+                    "completions": [dict(row) for row in tx.rows("SELECT * FROM completions ORDER BY subject,generation")]}
 
     def claim_executor(self, owner: str) -> Execution:
         with self.storage.transaction() as tx:
@@ -167,6 +301,9 @@ class Kernel:
                                             payload={"checkout": job["validation_cleanup"]})
             if job["phase"] == "complete":
                 return Step("complete", subject)
+            eligibility = self._eligibility(tx, job)
+            if eligibility is not None:
+                return Step("waiting", subject, eligibility)
             dependencies = tx.rows("SELECT s.phase FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (subject,))
             if any(row[0] != "complete" for row in dependencies):
                 return Step("waiting", subject, "dependencies")
@@ -302,7 +439,7 @@ class Kernel:
             tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
             self._gate(tx, call.subject, "worker_unavailable", evidence=material)
 
-    def agent_exited(self, call: AgentCall, process_identity: dict[str, Any], returncode: int) -> None:
+    def agent_exited(self, call: AgentCall, process_identity: dict[str, Any], returncode: int, *, failure: str | None = None) -> None:
         with self.storage.transaction() as tx:
             invocation = self._invocation(tx, call)
             if invocation["process_identity"] is None or json.loads(tx.get(invocation["process_identity"], call.subject)) != process_identity:
@@ -312,6 +449,14 @@ class Kernel:
             tx.execute("UPDATE invocations SET dispatch_state='exited',exit_code=? WHERE id=?", (returncode, call.invocation_id))
             tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
             self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"])
+            if invocation["raw_id"] is None and (returncode != 0 or failure is not None):
+                material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure}))
+                tx.execute("UPDATE invocations SET status='interrupted',start_evidence=? WHERE id=?", (material, call.invocation_id))
+                run = tx.one("SELECT * FROM runs")
+                job = self._job(tx, call.subject)
+                if (not run["stopped"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
+                        and job["current_attempt"] == call.attempt_id and job["generation"] == invocation["generation"]):
+                    self._gate(tx, call.subject, "execution_failed", evidence=material)
 
     def guard_effect(self, effect: Effect, execution: Execution, world: World) -> None:
         """Read-only authority guard for each real successor mutation in an adapter."""
@@ -400,6 +545,8 @@ class Kernel:
                         elif code == "human_blocker":
                             if job["current_attempt"]:
                                 tx.execute("UPDATE attempts SET result_id=NULL,status='continuing' WHERE id=?", (job["current_attempt"],))
+                        elif code in {"worker_unavailable", "execution_failed"}:
+                            pass  # Explicitly continue the same charged Attempt.
                         elif code == "publication_retry_exhausted":
                             tx.execute("UPDATE effects SET attempts=0 WHERE subject=? AND status='sent'", (subject,))
                         elif code == "write_conflict":
@@ -472,6 +619,8 @@ class Kernel:
             return {
                 "subject": subject, "kind": job["kind"], "phase": job["phase"], "purpose": job["purpose"],
                 "generation": job["generation"], "version": job["version"],
+                "revision": job["revision"], "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
+                "completion_revision": job["completion_revision"],
                 "pending_attempt": job["current_attempt"], "pending_return": bool(pending and pending["result_id"]),
                 "candidate": job["candidate_sha"], "pr_number": job["pr_number"], "gate_mode": job["gate_mode"],
                 "gates": [row["code"] for row in self._gates(tx, subject)], "stopped": bool(run["stopped"]),
