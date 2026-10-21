@@ -76,10 +76,12 @@ class OfflinePort:
                 CREATE TABLE refs(ref TEXT PRIMARY KEY,sha TEXT NOT NULL);
                 CREATE TABLE links(issue INTEGER PRIMARY KEY,ref TEXT NOT NULL,sha TEXT NOT NULL,intent TEXT NOT NULL);
             """)
+            db.execute("INSERT INTO refs VALUES (?,?)", ("refs/heads/main", port.git.commit("HEAD").sha))
         return port
 
     def prepare(self, kind: DeliveryKind, *, policy: Policy | None = None,
-                ticket_number: int = 2, repository: str = "example/repository") -> tuple[RunSpec, Delivery]:
+                ticket_number: int = 2, repository: str = "example/repository",
+                completed_ticket: Mapping[str, Any] | None = None) -> tuple[RunSpec, Delivery]:
         base = self.git.commit("refs/heads/main")
         source = base
         key = {DeliveryKind.TICKET: f"ticket:{ticket_number}", DeliveryKind.PARENT_ONLY: "parent:1", DeliveryKind.FINAL_RUN: "final:1"}[kind]
@@ -87,16 +89,20 @@ class OfflinePort:
         target_ref = "refs/heads/run" if kind == DeliveryKind.TICKET else "refs/heads/main"
         if kind == DeliveryKind.FINAL_RUN:
             # This is copied/synthetic completed-Ticket input, not a new Agent result.
-            self.git.run("switch", "-c", "fixture-completed-ticket")
-            (self.git.root / "ticket.txt").write_text("Completed synthetic Ticket.\n")
-            self.git.run("add", "--all")
-            self.git.run("commit", "-m", "completed fixture ticket")
-            source = self.git.commit("HEAD")
-            self.git.run("switch", "main")
+            if completed_ticket is not None:
+                source = self.git.make_commit(base.tree, (base.sha,), completed_ticket["commit_message"])
+            else:
+                self.git.run("switch", "-c", "fixture-completed-ticket")
+                (self.git.root / "ticket.txt").write_text("Completed synthetic Ticket.\n")
+                self.git.run("add", "--all")
+                self.git.run("commit", "-m", "completed fixture ticket")
+                source = self.git.commit("HEAD")
+                self.git.run("switch", "main")
         self.git.run("update-ref", source_ref, source.sha)
         self.git.run("update-ref", target_ref, base.sha)
         with sqlite3.connect(self.database) as db:
-            db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (source_ref, source.sha))
+            if kind == DeliveryKind.FINAL_RUN:
+                db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (source_ref, source.sha))
             db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (target_ref, base.sha))
         checkout = self.root / "work" / key.replace(":", "-")
         checkout.parent.mkdir(exist_ok=True)
@@ -117,7 +123,7 @@ class OfflinePort:
             return pr
         # GitHub's base/head are live remote facts, not frozen intent fields.
         return PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref,
-                           self.git.commit(pr.source_ref), self.git.commit(pr.target_ref), pr.title, pr.body,
+                           self.remote_commit(pr.source_ref) or pr.head, self.remote_commit(pr.target_ref) or pr.base, pr.title, pr.body,
                            pr.state, pr.actor, pr.merged)
 
     def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none") -> World:
@@ -127,8 +133,10 @@ class OfflinePort:
             details = () if checks_result == "none" else (("required", checks_result),)
             checks = Checks(pr.number, pr.head.sha, checks_result, details,
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
-        source = self.ref_commit(delivery.source_ref)
-        target = self.git.commit(delivery.target_ref)
+        source = self.remote_commit(delivery.source_ref)
+        target = self.remote_commit(delivery.target_ref)
+        if target is None:
+            raise KernelError("remote_target_missing")
         return World(spec.parent_revision, spec.graph_revision, delivery.revision,
                      target, source, pr, checks,
                      delivery.completion_revision,
@@ -143,12 +151,19 @@ class OfflinePort:
         with sqlite3.connect(self.database) as db:
             return dict(db.execute("SELECT ref,sha FROM refs ORDER BY ref"))
 
+    def remote_commit(self, ref: str) -> Commit | None:
+        head = self.remote_refs().get(ref)
+        return None if head is None else self.git.commit(head)
+
     def _remote_cas(self, ref: str, before: str, after: str) -> None:
         with sqlite3.connect(self.database) as db:
-            row = db.execute("SELECT sha FROM refs WHERE ref=?", (ref,)).fetchone()
-            if row is not None and row[0] not in {before, after}:
-                raise KernelError("remote_compare_and_swap")
-            db.execute("INSERT INTO refs VALUES (?,?) ON CONFLICT(ref) DO UPDATE SET sha=excluded.sha", (ref, after))
+            self._remote_cas_in(db, ref, before, after)
+
+    def _remote_cas_in(self, db: sqlite3.Connection, ref: str, before: str, after: str) -> None:
+        row = db.execute("SELECT sha FROM refs WHERE ref=?", (ref,)).fetchone()
+        if row is not None and row[0] not in {before, after}:
+            raise KernelError("remote_compare_and_swap")
+        db.execute("INSERT INTO refs VALUES (?,?) ON CONFLICT(ref) DO UPDATE SET sha=excluded.sha", (ref, after))
 
     def _write_pr(self, subject: str, pr: PullRequest) -> None:
         with sqlite3.connect(self.database) as db:
@@ -245,8 +260,17 @@ class OfflinePort:
             elif operation in {"push", "run_branch"}:
                 if effect.after_sha is None:
                     raise KernelError("missing_write_target")
-                git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
-                self._remote_cas(effect.source_ref, effect.before_sha, effect.after_sha)
+                # One simulated remote request: independently stored remote
+                # facts commit atomically. Git objects/refs are its local mirror.
+                # A crash across those two storage systems remains unknown,
+                # never a receipt-only proof that the request succeeded.
+                with sqlite3.connect(self.database) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
+                    if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
+                        raise KernelError("remote_compare_and_swap")
+                    git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                    self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
                 commit = git.commit(effect.after_sha)
             elif operation == "pr_write":
                 if authorize is not None:
@@ -257,7 +281,7 @@ class OfflinePort:
                 with sqlite3.connect(self.database) as db:
                     number = prior.number if prior else db.execute("SELECT coalesce(max(number),0)+1 FROM prs").fetchone()[0]
                 pr = PullRequest(number, effect.repository, effect.source_ref, effect.target_ref,
-                                 self.git.commit(effect.source_ref), self.git.commit(effect.target_ref),
+                                 self.git.commit(str(self.remote_refs()[effect.source_ref])), self.git.commit(str(self.remote_refs()[effect.target_ref])),
                                  payload["title"], payload["body"], actor=effect.actor)
                 self._write_pr(effect.subject, pr)
             elif operation == "merge":
@@ -265,11 +289,24 @@ class OfflinePort:
                 if pr is None or pr.head.sha != effect.after_sha or pr.base.sha != effect.before_sha or pr.state != "OPEN":
                     raise KernelError("merge_compare_and_swap")
                 commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
-                git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
-                self._remote_cas(effect.target_ref, effect.before_sha, commit.sha)
                 pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
                                  pr.title, pr.body, "MERGED", effect.actor, commit)
-                self._write_pr(effect.subject, pr)
+                with sqlite3.connect(self.database) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    source = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
+                    target = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.target_ref,)).fetchone()
+                    if source != (effect.after_sha,) or target != (effect.before_sha,):
+                        raise KernelError("merge_compare_and_swap")
+                    local = self.ref_commit(effect.target_ref)
+                    if local is None:
+                        raise KernelError("merge_mirror_missing")
+                    if local.sha != effect.before_sha:
+                        if not git.is_ancestor(local.sha, effect.before_sha):
+                            raise KernelError("merge_mirror_changed")
+                        git.compare_and_swap(effect.target_ref, local.sha, effect.before_sha)
+                    git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
+                    self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
+                    self._write_pr_in(db, effect.subject, pr)
             elif operation == "completion_comment":
                 if authorize is not None:
                     authorize()
@@ -353,11 +390,20 @@ class OfflinePort:
             pr = self.pull_request(effect.subject)
             if pr is None:
                 return EffectResult("unknown")
+            if (pr.number != effect.pr_number or pr.repository != effect.repository or pr.source_ref != effect.source_ref
+                    or pr.target_ref != effect.target_ref or pr.head.sha != effect.after_sha or pr.actor != effect.actor):
+                return EffectResult("third", pr=pr)
             if pr.state == "MERGED" and pr.merged is not None and pr.head.sha == effect.after_sha and pr.actor == effect.actor:
-                if effect.before_sha not in self.git.parents(pr.merged.sha) or pr.merged.tree != pr.head.tree:
+                parents = list(self.git.parents(pr.merged.sha))
+                if parents != list(effect.payload["parents"]) or pr.merged.tree != pr.head.tree:
                     return EffectResult("third", pr=pr)
-                return EffectResult("target", commit=pr.merged, pr=pr)
-            return EffectResult("prior" if pr.state == "OPEN" and pr.head.sha == effect.after_sha and pr.base.sha == effect.before_sha else "third", pr=pr)
+                if self.remote_refs().get(effect.target_ref) != pr.merged.sha or self.git.commit(effect.target_ref) != pr.merged:
+                    return EffectResult("unknown", pr=pr)
+                return EffectResult("target", commit=pr.merged, pr=pr, raw={"parents": parents})
+            prior = (pr.state == "OPEN" and pr.head.sha == effect.after_sha and pr.base.sha == effect.before_sha
+                     and self.remote_refs().get(effect.target_ref) == effect.before_sha
+                     and self.git.commit(effect.target_ref).sha == effect.before_sha)
+            return EffectResult("prior" if prior else "unknown" if pr.state == "OPEN" else "third", pr=pr)
         with sqlite3.connect(self.database) as db:
             if operation == "close":
                 closed = db.execute("SELECT intent,actor,merge_sha FROM closed WHERE issue=?", (effect.payload["issue"],)).fetchone()
@@ -417,7 +463,8 @@ class Scenario:
                  edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None) -> None:
         self.script = neutral_script
         if neutral_script is not None:
-            if neutral_script["schema"] != "kernel-neutral-ticket/1" or kind != DeliveryKind.TICKET:
+            declared = {"ticket": DeliveryKind.TICKET, "parent_only": DeliveryKind.PARENT_ONLY, "full_parent": DeliveryKind.FINAL_RUN}[neutral_script.get("delivery_kind", "ticket")]
+            if neutral_script["schema"] != "kernel-neutral-ticket/1" or kind != declared:
                 raise KernelError("unsupported_neutral_script")
             frozen = neutral_script["policy"]
             policy = Policy(ticket_rounds=frozen["ticket_review_rounds"], parent_rounds=frozen["parent_only_paired_rounds"],
@@ -427,9 +474,12 @@ class Scenario:
             checks = neutral_script["external"]["required_checks"]
         self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
         self.spec, self.delivery = self.port.prepare(kind, policy=policy,
-            ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"],
-            repository="example/repository" if neutral_script is None else neutral_script["repository"])
-        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec)
+            ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"] if neutral_script.get("ticket") else 1,
+            repository="example/repository" if neutral_script is None else neutral_script["repository"],
+            completed_ticket=None if neutral_script is None else neutral_script.get("completed_ticket_precondition"))
+        evidence = None if neutral_script is None else {"parent": neutral_script["parent"], "ticket": neutral_script.get("ticket"),
+            "historical_completion": neutral_script.get("completed_ticket_precondition"), "source": "explicit immutable neutral fixture; not a live Completion import"}
+        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, fixture_evidence=evidence)
         self.execution = self.kernel.claim_executor("offline-executor")
         self.reviews = list(reviews)
         self.checks = list(checks)
@@ -674,6 +724,7 @@ class GraphScenario(Scenario):
         base = self.port.git.commit("refs/heads/main")
         run_ref = "refs/heads/run"
         self.port.git.run("update-ref", run_ref, base.sha)
+        self.port._remote_cas(run_ref, base.sha, base.sha)
         work = (root / "work").resolve()
         work.mkdir()
         deliveries = []
@@ -716,8 +767,10 @@ class GraphScenario(Scenario):
         self.refresh()
         self.delivery = self.kernel.delivery(self.delivery.key)
         status = self.kernel.status(self.delivery.key)
-        source = self.port.ref_commit(self.delivery.source_ref)
-        target = self.port.git.commit(self.delivery.target_ref)
+        source = self.port.remote_commit(self.delivery.source_ref)
+        target = self.port.remote_commit(self.delivery.target_ref)
+        if target is None:
+            raise KernelError("remote_target_missing")
         pr = self.port.pull_request(self.delivery.key)
         checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
         return World(status["source_parent_revision"], self.kernel.source_status()["observed_graph_revision"], status["source_revision"],
@@ -732,8 +785,10 @@ class GraphScenario(Scenario):
 
     def activate_final(self) -> str:
         self.refresh()
-        head = self.port.git.commit("refs/heads/run")
-        default = self.port.git.commit("refs/heads/main")
+        head = self.port.remote_commit("refs/heads/run")
+        default = self.port.remote_commit("refs/heads/main")
+        if head is None or default is None:
+            raise KernelError("final_source_missing")
         records = self.kernel.source_status()["completions"]
         ancestry = tuple((record["merge_sha"], head.sha) for record in records if self.port.git.is_ancestor(record["merge_sha"], head.sha))
         return self.kernel.activate_final(self.execution, head, default, ancestry=ancestry)

@@ -104,6 +104,56 @@ def test_stopped_epoch_can_settle_its_exact_late_process_return_without_advancin
         reopened.advance(call.subject, call.execution, world)
 
 
+@pytest.mark.parametrize("committed", [False, True], ids=["precommit", "committed_reply_loss"])
+def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path, committed: bool) -> None:
+    path, _, call, world = allocated(tmp_path)
+    starts = tmp_path / "actual-agent-pids"
+    persistence_error = OSError("The raw persistence operation did not return successfully")
+
+    class FailedRawPersistence(Kernel):
+        def receive(self, exact_call: AgentCall, raw: bytes) -> None:
+            if committed:
+                super().receive(exact_call, raw)
+            raise persistence_error
+
+    arguments = [sys.executable, "-I", "-c", (
+        f"from pathlib import Path; import os, sys; "
+        f"Path({str(starts)!r}).open('a').write(str(os.getpid()) + '\\n'); "
+        f"sys.stdout.buffer.write({RAW!r})"
+    )]
+    with pytest.raises(OSError) as caught:
+        execute(FailedRawPersistence(path), call, arguments=arguments, cwd=tmp_path, prompt="",
+                environment={"PATH": os.defpath}, timeout=5)
+    assert caught.value is persistence_error
+    first_start = starts.read_text()
+    with pytest.raises(ChildProcessError):
+        os.waitpid(int(first_start), os.WNOHANG)
+    reopened = Kernel(path)
+    assert reopened.scheduling()["active"] == []
+    assert any(event["kind"] == "worker_exited" and event["identity"] == call.invocation_id
+               for event in reopened.history(call.subject))
+    status = reopened.status(call.subject)
+    assert status["pending_attempt"] == call.attempt_id and status["phase"] == "development"
+    assert status["pending_return"] is committed
+    assert status["gates"] == ([] if committed else ["execution_failed"])
+    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert execute(reopened, call, arguments=arguments, cwd=tmp_path, prompt="",
+                   environment={"PATH": os.defpath}, timeout=5) is None
+    assert starts.read_text() == first_start
+    if committed:
+        assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
+    else:
+        reopened.control("resume", "resume-after-raw-save-failure", subject=call.subject)
+        resumed = reopened.advance(call.subject, call.execution, world).call
+        assert resumed is not None and resumed.attempt_id == call.attempt_id
+        assert resumed.thread_id == call.thread_id and resumed.invocation_id != call.invocation_id
+        result = execute(reopened, resumed, arguments=arguments, cwd=tmp_path, prompt="",
+                         environment={"PATH": os.defpath}, timeout=5)
+        assert result is not None and result.returncode == 0 and result.raw == RAW
+        assert len(starts.read_text().splitlines()) == 2
+    assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
 def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tmp_path: Path) -> None:
     path, kernel, call, world = allocated(tmp_path)
     credential = tmp_path / "selected-worker-credential"

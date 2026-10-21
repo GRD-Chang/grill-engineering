@@ -8,6 +8,7 @@ import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Requirements, RunSpec, World
 from agent_run_kernel.offline import GraphScenario
+from agent_run_kernel.model import EffectResult
 
 
 def native_input() -> dict:
@@ -162,3 +163,94 @@ def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_autho
     for subject in ("ticket:3", "ticket:4"):
         assert kernel.advance(subject, replacement, demand_world(kernel, subject), allow_agent=False).kind == "progress"
         assert kernel.status(subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.parametrize("dirty_repair", [False, True])
+def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_refund(tmp_path: Path, dirty_repair: bool) -> None:
+    original = Requirements.from_wire(native_input()["initial_requirements"])
+    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
+    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "fail", "pass") if dirty_repair else ("pass",))
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    if dirty_repair:
+        for _ in range(100):
+            step = scenario.step()
+            if step.call is not None and step.call.role.value == "development":
+                break
+        else:
+            raise AssertionError("Final Findings never reached the real Repair checkout")
+    else:
+        assert scenario.run(cut="publication_pending").kind == "publication_pending"
+    before = scenario.kernel.status(scenario.delivery.key)
+    run_head = scenario.port.git.commit("refs/heads/run")
+    old_checkout = Path(scenario.delivery.checkout)
+    old_contents = {path.name: path.read_bytes() for path in old_checkout.iterdir() if path.is_file()}
+    scenario.requirements = replace(source, parent=replace(source.parent, body="Updated Parent requirements after whole-Run work."))
+    scenario.refresh()
+    refreshed = scenario.kernel.status(scenario.delivery.key)
+    assert refreshed["phase"] == "refresh_final"
+    assert refreshed["budgets"] == before["budgets"]
+    assert scenario.run(cut="publication_pending").kind == "publication_pending"
+    after = scenario.kernel.status(scenario.delivery.key)
+    assert after["generation"] == before["generation"] + 1
+    assert scenario.kernel.delivery(scenario.delivery.key).source_ref == "refs/heads/run"
+    assert Path(scenario.kernel.delivery(scenario.delivery.key).checkout) != old_checkout
+    assert old_contents == {path.name: path.read_bytes() for path in old_checkout.iterdir() if path.is_file()}
+    assert scenario.port.git.commit("refs/heads/run") == run_head
+    assert after["budgets"]["integration"]["developments_used"] == int(dirty_repair)
+    assert after["budgets"]["integration"]["reviews_used"] == before["budgets"]["integration"]["reviews_used"] + 1
+    final_calls = [call for call in scenario.role_calls if call["subject"] == scenario.delivery.key]
+    assert [call["role"] for call in final_calls] == (["review", "development", "review"] if dirty_repair else ["review", "review"])
+    assert final_calls[-1]["context"]["requirements"][0]["body"] == scenario.requirements.parent.body
+    assert "previous_review" not in final_calls[-1]["context"]
+
+
+@pytest.mark.parametrize("outcome", ["target", "prior", "third", "foreign_receipt"])
+def test_original_final_approval_reconciles_before_parent_requirement_refresh(tmp_path: Path, outcome: str) -> None:
+    original = Requirements.from_wire(native_input()["initial_requirements"])
+    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
+    scenario = GraphScenario(tmp_path / "graph", source)
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    assert scenario.run().kind == "approval"
+    final = scenario.delivery.key
+    scenario.kernel.control("approve", "original-final-approval", subject=final, world=scenario.world())
+    for _ in range(20):
+        step = scenario.kernel.advance(final, scenario.execution, scenario.world())
+        if step.effect is not None and step.effect.operation == "merge":
+            effect = step.effect
+            break
+        scenario.handle(step)
+    else:
+        raise AssertionError("Final approval did not prepare its exact merge")
+    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+    if outcome in {"target", "foreign_receipt"}:
+        scenario.port.execute(effect, lambda: scenario.kernel.guard_effect(effect, scenario.execution, scenario.world()))
+    elif outcome == "third":
+        third = scenario.port.external_remote_append(effect.source_ref, {"third.txt": "Another actor's work\n"}, "approved-third")
+    scenario.requirements = replace(source, parent=replace(source.parent, body="Changed after the original approval was dispatched."))
+    scenario.refresh()
+    observed = scenario.port.reconcile(effect)
+    if outcome == "foreign_receipt":
+        assert observed.pr is not None
+        observed = replace(observed, pr=replace(observed.pr, actor="foreign-publisher"))
+    scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world())
+    if outcome == "foreign_receipt":
+        with pytest.raises(KernelError, match="foreign_merge_receipt"):
+            scenario.kernel.advance(final, scenario.execution, scenario.world())
+        assert scenario.kernel.status(final)["generation"] == 1
+    elif outcome == "target":
+        assert scenario.run().kind == "complete"
+        assert scenario.kernel.status(final)["generation"] == 1
+        assert [call["role"] for call in scenario.role_calls if call["subject"] == final] == ["review", "publication"]
+        assert len([write for write in scenario.port.writes() if write["subject"] == final and write["operation"] == "merge"]) == 1
+    elif outcome == "prior":
+        assert scenario.run().kind == "approval"
+        assert scenario.kernel.status(final)["generation"] == 2
+        assert scenario.kernel.status(final)["budgets"]["integration"]["reviews_used"] == 2
+    else:
+        assert scenario.kernel.advance(final, scenario.execution, scenario.world()).kind == "reconcile"
+        assert scenario.kernel.status(final)["pending_write"]["id"] == effect.effect_id
+        assert scenario.port.remote_commit(effect.source_ref) == third
+    if outcome != "target":
+        assert not [write for write in scenario.port.writes() if write["subject"] == final and write["operation"] == "close"]

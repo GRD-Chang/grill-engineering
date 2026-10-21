@@ -257,15 +257,24 @@ def execute(
             "observed_exit": process.returncode,
         })
         raise failure or ProcessExitUnknown("Worker binding commit is unknown")
-    if failure is None and process.returncode == 0:
-        # Actual process exit was observed above. Recording raw is permitted
-        # even if Stop/epoch retirement happens before this separate commit.
-        kernel.receive(call, raw)
-    assert process.returncode is not None
-    kernel.agent_exited(
-        call, identity, process.returncode,
-        failure=None if failure is None else type(failure).__name__,
-    )
+    try:
+        if failure is None and process.returncode == 0:
+            # Actual exit is already proved. Raw settlement is independent
+            # of Stop and of the separate exit-fact transaction below.
+            kernel.receive(call, raw)
+    except BaseException as error:
+        failure = error
+    finally:
+        assert process.returncode is not None
+        try:
+            kernel.agent_exited(
+                call, identity, process.returncode,
+                failure=None if failure is None else type(failure).__name__,
+            )
+        except BaseException as exit_error:
+            if failure is not None:
+                raise failure from exit_error
+            raise
     if failure is not None:
         raise failure
     return ProcessExit(MappingProxyType(identity), process.returncode, raw, stderr)

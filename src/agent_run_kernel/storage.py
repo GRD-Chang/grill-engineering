@@ -45,7 +45,8 @@ CREATE TABLE subjects (
  checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
  development_thread TEXT, ci_failure TEXT, last_failure TEXT
  ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT,
- validation_checkout TEXT, validation_cleanup TEXT, owned_root TEXT NOT NULL DEFAULT '', common_git_dir TEXT NOT NULL DEFAULT ''
+ validation_checkout TEXT, validation_cleanup TEXT, owned_root TEXT NOT NULL DEFAULT '', common_git_dir TEXT NOT NULL DEFAULT '',
+ refresh_revision TEXT
 );
 CREATE TABLE dependencies (
  subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
