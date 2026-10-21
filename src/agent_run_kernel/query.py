@@ -608,6 +608,19 @@ def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
             "unavailable_facts": [key for key in ("worker_identity", "runner_identity", "notifications", "prompt_resources", "provenance")
                                   if inputs.get(key) is None]}
 
+def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
+    """Project recorded operator gates in the observer's existing read snapshot.
+
+    This is the same display classification as status, never command admission.
+    No journal, transport, Host probe or business mutation belongs to this read.
+    """
+    run = dict(tx.one("SELECT * FROM runs"))
+    subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
+    return {"actions": _operator_actions(run, subjects),
+            "generations": {job["subject"]: job["generation"] for job in subjects},
+            "highwater": tx.one("SELECT coalesce(max(position),0) FROM history")[0]}
+
+
 def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
          expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
     if after < 0 or (limit is not None and not 1 <= limit <= 128):

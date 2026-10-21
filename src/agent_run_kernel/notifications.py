@@ -24,6 +24,7 @@ from agent_run.notification_event_facts import event_copy, event_envelope
 from agent_run.notification_transport import send
 from agent_run.process_binding import _process_start_token
 
+from .query import notification_boundaries
 from .storage import Storage, Transaction
 
 
@@ -178,6 +179,106 @@ class NativeNotifications:
                                   url=f"https://github.com/{self.binding[0]}/issues/{subject['issue']}")
         return None
 
+    @staticmethod
+    def _gate_slot(subject: str | None, generation: int | None, reason: str) -> str:
+        return hashlib.sha256(json.dumps([subject, generation, reason]).encode()).hexdigest()
+
+    def _boundaries(self, document: dict[str, Any]) -> bool:
+        """Track notification occurrences, not an alternate writable Run state.
+
+        Replaying original committed gate snapshots detects leave/reentry even
+        between observer polls. Only gates still current in this same snapshot
+        receive cards; old pending occurrences retain their original budgets.
+        """
+        slots = document.setdefault("native_boundary_slots", {})
+        cursor = document.get("native_boundary_cursor", 0)
+        if not isinstance(slots, dict) or type(cursor) is not int or cursor < 0:
+            raise ValueError("invalid native boundary receipt")
+
+        def replace_scope(subject: str | None, generation: int | None, reasons: list[str]) -> None:
+            desired = {self._gate_slot(subject, generation, reason) for reason in reasons}
+            for key, value in list(slots.items()):
+                if value["subject"] == subject and key not in desired:
+                    del slots[key]
+            for key in desired:
+                if key not in slots:
+                    document["sequence"] += 1
+                    slots[key] = {"subject": subject, "generation": generation,
+                                  "sequence": document["sequence"]}
+
+        with self.storage.transaction(write=False) as tx:
+            if not self._same_binding(*self._run(tx)):
+                raise ValueError("notification Run or recipient binding changed")
+            view = notification_boundaries(tx, self.database)
+            highwater = view["highwater"]
+            if cursor < highwater:
+                rows = tx.rows("SELECT position,subject,generation,phase,status FROM history "
+                               "WHERE position>? AND position<=? ORDER BY position LIMIT 128",
+                               (cursor, highwater), limit=128)
+                if not rows:
+                    raise ValueError("notification history cursor has no committed continuation")
+                for row in rows:
+                    if row["status"] is None:
+                        continue
+                    status = json.loads(row["status"])
+                    global_reason = "operator_stopped" if status["stopped"] else status["blocked"]
+                    replace_scope(None, None, [global_reason] if global_reason else [])
+                    if view["generations"].get(row["subject"]) == row["generation"]:
+                        reasons = list(status["gates"])
+                        if row["phase"] == "approval":
+                            reasons.append("final_approval")
+                        replace_scope(row["subject"], row["generation"], reasons)
+                cursor = rows[-1]["position"]
+            actions = {self._gate_slot(item["subject"], item.get("generation"), item["reason"]): item
+                       for item in view["actions"]}
+            caught_up = cursor == highwater
+            # Never send an intermediate historical gate as a current card.
+            # Each call reads at most 128 snapshots, then persists its cursor.
+            if caught_up:
+                for key in list(slots):
+                    if key not in actions:
+                        del slots[key]
+                for key, action in actions.items():
+                    if key not in slots:
+                        document["sequence"] += 1
+                        slots[key] = {"subject": action["subject"], "generation": action.get("generation"),
+                                      "sequence": document["sequence"]}
+            document["native_boundary_cursor"] = cursor
+            document["native_boundary_catching_up"] = not caught_up
+        current = {key: value["sequence"] for key, value in slots.items()}
+        for item in list(document["pending"]):
+            event = item["event"]
+            if (event.get("kind") == "boundary" and event.get("current")
+                    and (event.get("slot_id") not in actions or event.get("slot_id") not in current
+                         or event.get("occurrence") != current[event["slot_id"]])):
+                outbox.cancel_item(document, item, "recorded operator gate changed")
+        document["active"] = list(actions)
+        if not caught_up:
+            return True
+        for key, action in actions.items():
+            occurrence = current[key]
+            if slots[key].get("enqueued") or len(document["pending"]) >= outbox.MAX_PENDING:
+                continue
+            reason = action["reason"]
+            title_key = ("stopped" if reason == "operator_stopped" else "approval"
+                         if reason == "final_approval" else "human_title"
+                         if reason == "human_blocker" else "execution_failed"
+                         if reason == "execution_failed" else "budget" if "budget" in reason else "timeout"
+                         if reason == "supervision_timeout" else "requeue" if reason == "requeue_required"
+                         else "human_title")
+            event = event_envelope(self.state, "boundary", [key, occurrence],
+                                   event_copy(self.state, title_key),
+                                   "red" if reason in {"execution_failed", "supervision_timeout"} else "yellow",
+                                   current=True,
+                                   slot_id=key, occurrence=occurrence, work_subject=action["subject"],
+                                   generation=action.get("generation"), object=action["object"],
+                                   scope=action["scope"],
+                                   summary="; ".join(str(value) for value in action["reasons"]),
+                                   next_step=action["next_action"])
+            outbox.enqueue(document, event, time.time())
+            slots[key]["enqueued"] = True
+        return False
+
     def observe_committed(self) -> None:
         """Read only committed facts; claim no transport while a kernel lock is held."""
         if not self.enabled or self.closed or self.cancel.is_set():
@@ -186,9 +287,6 @@ class NativeNotifications:
             for _ in range(64):
                 with outbox.transaction(self.state_root, self.run_id) as document:
                     outbox.settle(document, time.time())
-                    if len(document["pending"]) > outbox.MAX_PENDING - 17:
-                        self._more = True
-                        return
                     if not document.get("native_run_start"):
                         journal = outbox.notification_path(self.state_root, self.run_id)
                         if journal.exists() or journal.is_symlink():
@@ -198,17 +296,19 @@ class NativeNotifications:
                                                event_copy(self.state, "run_start"), started_at=started)
                         outbox.enqueue(document, event, time.time())
                         document["native_run_start"] = True
+                    boundary_more = self._boundaries(document)
+                    full = len(document["pending"]) > outbox.MAX_PENDING - 17
                     cursor = document.get("native_cursor", 0)
                     if type(cursor) is not int or cursor < 0:
                         raise ValueError("invalid native notification cursor")
-                    events, more, position = self._page(cursor)
+                    events, more, position = (([], True, cursor) if full or boundary_more else self._page(cursor))
                     for event in events:
                         outbox.enqueue(document, event, time.time())
                     document["native_cursor"] = position
                 with self.condition:
                     self.condition.notify_all()
                 self._more = more
-                if not more:
+                if not more or full or boundary_more:
                     return
         except Exception as error:
             self.failure_reason = bounded_error(str(error))
@@ -221,8 +321,9 @@ class NativeNotifications:
         active_event_id: str | None = None
         while not self.cancel.is_set():
             try:
-                if self._more:
-                    self.observe_committed()
+                # Each claim/retry rereads committed facts. A business commit
+                # can outlive its callback (for example, after a Host crash).
+                self.observe_committed()
                 if self.cancel.is_set():
                     return
                 with self.condition:
@@ -231,6 +332,9 @@ class NativeNotifications:
                         pending = document["pending"]
                         inflight = any(item["outcome"] == "sending" for item in pending)
                         item = None if inflight else next((item for item in pending if not item.get("cancelled")
+                                                            and not (document.get("native_boundary_catching_up")
+                                                                     and item["event"].get("current")
+                                                                     and item["event"].get("kind") == "boundary")
                                                             and item["next_attempt_at"] <= time.time()), None)
                         if item is not None:
                             item.update(owner=self.owner, outcome="sending")

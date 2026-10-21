@@ -22,14 +22,16 @@ from agent_run_kernel.notifications import NativeNotifications
 from agent_run_kernel.offline import OfflinePort, Scenario
 
 
-def _kernel(root: Path) -> Kernel:
+def _kernel(root: Path, count: int = 1) -> Kernel:
     defaults = UserDefaultsStore(root / "defaults.json")
     defaults.configure(language="en", notifications={"enabled": False, "mode": "detailed"})
     base = Commit("base", "tree")
     delivery = Delivery("native-ticket", DeliveryKind.TICKET, 2, "ticket-v1", base,
                         "refs/heads/source", "refs/heads/target")
+    deliveries = ((delivery,) if count == 1 else tuple(
+        replace(delivery, key=f"native-ticket-{index}", issue=index + 2) for index in range(count)))
     spec = freeze_creation(RunSpec("run-native", "example/project", 1, "parent-v1", "graph-v1",
-                                   (delivery,), repository_root=str(root)), defaults,
+                                   deliveries, repository_root=str(root)), defaults,
                            prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
     assert spec.inputs is not None
     inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
@@ -337,3 +339,188 @@ def test_fatal_close_cancels_real_local_send_child_without_drain(tmp_path: Path)
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=5)
+
+
+def test_native_gate_leave_reentry_between_observations_is_a_new_occurrence(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path)
+    gate_colors: list[str] = []
+
+    def transport(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if rendered["header"]["title"]["content"] == "Task paused":
+            gate_colors.append(rendered["header"]["template"])
+        return {"outcome": "success", "reason": None}
+
+    def boundaries() -> list[dict[str, Any]]:
+        observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+        observer.close()
+        assert observer.failure_reason is None
+        return [row for row in outbox.read_notifications(tmp_path, "run-native")["records"]
+                if row["kind"] == "boundary"]
+
+    kernel.control("stop", "first-stop", subject="native-ticket")
+    first = boundaries()
+    assert len(first) == 1 and first[0]["outcome"] == "success"
+    # Both transitions happen while there is no observer. Comparing only the
+    # latest gate snapshot would mistake this for the first occurrence.
+    kernel.control("resume", "between-observations", subject="native-ticket")
+    kernel.control("stop", "second-stop", subject="native-ticket")
+    second = boundaries()
+    assert len(second) == 2
+    assert second[0]["id"] != second[1]["id"]
+    assert second[0]["slot_id"] == second[1]["slot_id"]
+    assert [row["attempts"] for row in second] == [1, 1]
+    assert boundaries() == second
+    assert gate_colors == ["yellow", "yellow"]
+
+
+def test_leaving_a_gate_cancels_its_unsent_card_without_claiming_delivery(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path)
+    started, release = Event(), Event()
+    delivered: list[str] = []
+
+    def transport(_config: Any, _card: Any, identity: str, cancel: Event,
+                  **_kwargs: Any) -> dict[str, Any]:
+        started.set()
+        assert release.wait(5)
+        delivered.append(identity)
+        return {"outcome": "success", "reason": None}
+
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    try:
+        assert started.wait(3)
+        kernel.control("stop", "first-stop", subject="native-ticket")
+        observer.observe_committed()
+        pending = outbox.read_notifications(tmp_path, "run-native")["pending"]
+        gate = [item for item in pending if item["event"]["kind"] == "boundary"]
+        assert len(gate) == 1 and gate[0]["attempts"] == 0
+        deadline = gate[0]["deadline_at"]
+        kernel.control("resume", "leave-before-send", subject="native-ticket")
+        observer.observe_committed()
+        document = outbox.read_notifications(tmp_path, "run-native")
+        cancelled = [item for item in document["records"] if item["kind"] == "boundary"]
+        assert len(cancelled) == 1
+        assert cancelled[0]["outcome"] == "cancelled" and cancelled[0]["attempts"] == 0
+        assert cancelled[0]["deadline_at"] == deadline
+        assert cancelled[0]["id"] not in delivered
+    finally:
+        release.set()
+        observer.close()
+
+
+def test_gate_batch_wakes_a_parked_sender_without_close(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path, count=16)
+    started, boundary = Event(), Event()
+
+    def transport(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if rendered["header"]["title"]["content"] == "Task paused":
+            boundary.set()
+        started.set()
+        return {"outcome": "success", "reason": None}
+
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    try:
+        assert started.wait(3)
+        deadline = time.monotonic() + 3
+        while outbox.read_notifications(tmp_path, "run-native")["pending"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        for index in range(16):
+            kernel.control("stop", f"batch-{index}", subject=f"native-ticket-{index}")
+        observer.observe_committed()
+        assert boundary.wait(3), "durable current cards did not wake the idle sender"
+        assert observer.failure_reason is None
+    finally:
+        observer.close(drain=False)
+
+
+def test_accumulated_gate_history_continues_within_each_read_budget(tmp_path: Path, monkeypatch) -> None:
+    from agent_run_kernel import storage
+
+    kernel = _kernel(tmp_path)
+    for index in range(200):
+        kernel.control("stop", f"old-stop-{index}", subject="native-ticket")
+        kernel.control("resume", f"old-resume-{index}", subject="native-ticket")
+    # A constrained but valid read budget exposes cumulative unpaged reads
+    # without creating a huge Run or weakening production capacity limits.
+    monkeypatch.setattr(storage, "QUERY_LIMIT", 32 * 1024)
+    sent: list[str] = []
+
+    def transport(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        sent.append(rendered["header"]["title"]["content"])
+        return {"outcome": "success", "reason": None}
+
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer.close()
+    assert observer.failure_reason is None
+    document = outbox.read_notifications(tmp_path, "run-native")
+    assert document["native_boundary_cursor"] == document["native_cursor"]
+    assert len(sent) == 1  # Historical, already-cleared gates are not current cards.
+
+
+def test_gate_reentry_during_paged_catchup_never_claims_the_old_card(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path)
+    started, release = Event(), Event()
+    delivered: list[str] = []
+
+    def transport(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        started.set()
+        assert release.wait(15)
+        delivered.append(rendered["header"]["title"]["content"])
+        return {"outcome": "success", "reason": None}
+
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    try:
+        assert started.wait(3)
+        kernel.control("stop", "original-stop", subject="native-ticket")
+        observer.observe_committed()
+        old = next(item["event"]["id"] for item in outbox.read_notifications(tmp_path, "run-native")["pending"]
+                   if item["event"]["kind"] == "boundary")
+        # Keep the same gate for more than two replay pages before leaving it.
+        # The sender must catch up before claiming any old current boundary.
+        for index in range(300):
+            kernel.control("stop", f"still-stopped-{index}", subject="native-ticket")
+        kernel.control("resume", "leave-old", subject="native-ticket")
+        kernel.control("stop", "new-occurrence", subject="native-ticket")
+        observer.observe_committed()
+        release.set()
+        observer.close()
+        assert observer.failure_reason is None
+        records = [row for row in outbox.read_notifications(tmp_path, "run-native")["records"]
+                   if row["kind"] == "boundary"]
+        previous = next(row for row in records if row["id"] == old)
+        assert previous["outcome"] == "cancelled" and previous["attempts"] == 0
+        assert len([row for row in records if row["outcome"] == "success"]) == 1
+        assert delivered.count("Task paused") == 1
+    finally:
+        release.set()
+        observer.close(drain=False)
+
+
+def test_gate_retry_rereads_committed_subject_without_a_callback(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path)
+    kernel.control("stop", "original-gate", subject="native-ticket")
+    attempted = Event()
+    gate_calls: list[str] = []
+
+    def transport(_config: Any, rendered: Any, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if rendered["header"]["title"]["content"] == "Task paused":
+            gate_calls.append("attempt")
+            # The business commit survives even if its observer callback did
+            # not run. A delivery retry cannot use an old gate as authority.
+            kernel.control("resume", "resume-without-observer", subject="native-ticket")
+            attempted.set()
+            return {"outcome": "failed", "reason": "definitive rejected send"}
+        return {"outcome": "success", "reason": None}
+
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    try:
+        assert attempted.wait(3)
+        observer.close()
+        assert observer.failure_reason is None
+        records = [row for row in outbox.read_notifications(tmp_path, "run-native")["records"]
+                   if row["kind"] == "boundary"]
+        assert len(records) == 1 and records[0]["cancelled"] is True
+        assert records[0]["attempts"] == 1 and records[0]["outcome"] == "failed"
+        assert gate_calls == ["attempt"]
+    finally:
+        observer.close(drain=False)
