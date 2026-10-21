@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel.offline import Scenario
 
 
 @pytest.mark.parametrize(("kind", "expected"), [(DeliveryKind.TICKET, 1), (DeliveryKind.PARENT_ONLY, 2), (DeliveryKind.FINAL_RUN, 2)])
@@ -34,3 +35,33 @@ def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: 
     with pytest.raises(KernelError, match="invocation_deadline_exceeded"):
         kernel.guard_agent(call)
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
+    assert scenario.run().kind == "approval"
+    initial = scenario.kernel.status(scenario.delivery.key)
+    for ordinal in range(1, limit + 2):
+        scenario.port.external_remote_append(scenario.delivery.target_ref, {f"external-{ordinal}.txt": "Retained external work\n"}, f"resync-{ordinal}")
+        boundary = scenario.run()
+        if ordinal <= limit:
+            assert boundary.kind == "approval"
+            current = scenario.kernel.status(scenario.delivery.key)
+            assert current["budgets"]["requirements"] == initial["budgets"]["requirements"]
+            assert current["budgets"]["ci"] == initial["budgets"]["ci"]
+        else:
+            assert boundary.kind == "paused" and "integration_resync_exhausted" in scenario.kernel.status(scenario.delivery.key)["gates"]
+    before = scenario.kernel.status(scenario.delivery.key)
+    assert initial["resync"]["used"] == 0 and initial["resync"]["open"] is False
+    assert before["resync"]["used"] == limit
+    assert before["resync"]["window"] == limit + 1
+    assert scenario.development_count == 1
+    if limit:
+        scenario.kernel.control("resume", "renew-resync-only", subject=scenario.delivery.key)
+        renewed = scenario.kernel.status(scenario.delivery.key)
+        assert renewed["resync"]["generation"] == 2 and renewed["resync"]["used"] == 0
+        assert renewed["budgets"] == before["budgets"]
+        assert scenario.run().kind == "approval"
+        assert scenario.kernel.status(scenario.delivery.key)["resync"]["used"] == 1
+        assert scenario.port.pull_request(scenario.delivery.key).number == initial["pr_number"]
