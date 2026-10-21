@@ -75,52 +75,56 @@ def prepare_repair_integration(
     assert github is not None
     if not needs_repair_integration(github, state, job):
         return True
-    try:
-        result = prepare_repair_snapshot(
-            git=owner.git, github=github, state_store=state_store,
-            state=state, job=job, checkout=checkout,
-        )
-    except ParentHistoryRewritten as error:
-        job["run_repair_integration_history_rewrite"] = {
-            "branch": error.branch_kind, "previous_sha": error.previous, "observed_sha": error.observed,
-        }
-        _pause(state_store, state, job, "integration_history_rewritten", str(error))
-        return False
-    except ResyncBudgetExhausted:
-        _pause(state_store, state, job, "integration_resync_exhausted", "Run Repair integration resync allowance is exhausted")
-        return False
-    except GitError as error:
-        _pause(state_store, state, job, "integration_failed", str(error))
-        return False
-    while result.status == "conflict":
-        step = owner.work.develop_integration(state, job, checkout, scope="repair", allow_agent=True)
-        if step.kind is not DeliveryStepKind.CONTINUE:
-            return False
+    while True:
         try:
-            result = finish_repair_snapshot(
+            result = prepare_repair_snapshot(
                 git=owner.git, github=github, state_store=state_store,
                 state=state, job=job, checkout=checkout,
             )
+        except ParentHistoryRewritten as error:
+            job["run_repair_integration_history_rewrite"] = {
+                "branch": error.branch_kind, "previous_sha": error.previous, "observed_sha": error.observed,
+            }
+            _pause(state_store, state, job, "integration_history_rewritten", str(error))
+            return False
+        except ResyncBudgetExhausted:
+            _pause(state_store, state, job, "integration_resync_exhausted", "Run Repair integration resync allowance is exhausted")
+            return False
         except GitError as error:
             _pause(state_store, state, job, "integration_failed", str(error))
             return False
-    record = result.record
-    if record is None:
-        raise ValueError("Run Repair integration returned no record")
-    if record["head_sha"] != job["candidate_sha"] or record["target_sha"] != job["base_sha"]:
-        job["previous_run_repair_acceptance_record"] = job.get("acceptance_record")
-        local_run_head = owner.git.resolve(str(state["run_branch"]))
-        if local_run_head == job["base_sha"]:
-            job.setdefault("run_branch_local_sha", local_run_head)
-        job["base_sha"] = record["target_sha"]
-        job["repair_base_run_head_sha"] = record["target_sha"]
-        job["candidate_sha"] = record["head_sha"]
-        job["phase"] = "candidate"
-        job.pop("acceptance_record", None)
-        job.pop("approval_grant", None)
-        save_change_job(state_store, state, job, label=f"run-repair-{job['repair_attempt']}", development_only=True)
-        return False
-    return reconcile_repair_integration(github, state_store, state, job)
+        if result.status == "conflict":
+            step = owner.work.develop_integration(state, job, checkout, scope="repair", allow_agent=True)
+            if step.kind is not DeliveryStepKind.CONTINUE:
+                return False
+            try:
+                result = finish_repair_snapshot(
+                    git=owner.git, github=github, state_store=state_store,
+                    state=state, job=job, checkout=checkout,
+                )
+            except GitError as error:
+                _pause(state_store, state, job, "integration_failed", str(error))
+                return False
+            if result.status == "conflict":
+                # The next Repair unit first observes the live snapshot.
+                continue
+        record = result.record
+        if record is None:
+            raise ValueError("Run Repair integration returned no record")
+        if record["head_sha"] != job["candidate_sha"] or record["target_sha"] != job["base_sha"]:
+            job["previous_run_repair_acceptance_record"] = job.get("acceptance_record")
+            local_run_head = owner.git.resolve(str(state["run_branch"]))
+            if local_run_head == job["base_sha"]:
+                job.setdefault("run_branch_local_sha", local_run_head)
+            job["base_sha"] = record["target_sha"]
+            job["repair_base_run_head_sha"] = record["target_sha"]
+            job["candidate_sha"] = record["head_sha"]
+            job["phase"] = "candidate"
+            job.pop("acceptance_record", None)
+            job.pop("approval_grant", None)
+            save_change_job(state_store, state, job, label=f"run-repair-{job['repair_attempt']}", development_only=True)
+            return False
+        return reconcile_repair_integration(github, state_store, state, job)
 
 
 def _pause(

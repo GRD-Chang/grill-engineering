@@ -119,59 +119,63 @@ def prepare_parent_integration(
     engine: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], checkout: Path,
 ) -> bool:
     """Require a current complete Parent review of the prepared combination."""
-    try:
-        result = prepare_parent_snapshot(
-            git=engine.git, github=engine.github, state_store=engine.state_store,
-            state=state, job=job, checkout=checkout,
-        )
-    except ParentHistoryRewritten as error:
-        job["parent_integration_history_rewrite"] = {
-            "branch": error.branch_kind, "previous_sha": error.previous, "observed_sha": error.observed,
-        }
-        _pause(engine, state, job, "integration_history_rewritten", str(error))
-        return False
-    except ResyncBudgetExhausted:
-        _pause(engine, state, job, "integration_resync_exhausted",
-               "Parent integration resync allowance is exhausted; resume explicitly")
-        return False
-    except GitError as error:
-        _pause(engine, state, job, "integration_failed", str(error))
-        return False
-    while result.status == "conflict":
-        step = engine.work.develop_integration(state, job, checkout, scope="parent-only", allow_agent=True)
-        if step.kind is not DeliveryStepKind.CONTINUE:
-            return False
+    while True:
         try:
-            result = finish_parent_snapshot(
+            result = prepare_parent_snapshot(
                 git=engine.git, github=engine.github, state_store=engine.state_store,
                 state=state, job=job, checkout=checkout,
             )
-        except GitError as error:
-            _pause(engine, state, job, "integration_record_invalid", str(error))
+        except ParentHistoryRewritten as error:
+            job["parent_integration_history_rewrite"] = {
+                "branch": error.branch_kind, "previous_sha": error.previous, "observed_sha": error.observed,
+            }
+            _pause(engine, state, job, "integration_history_rewritten", str(error))
             return False
-    record = result.record
-    if record is None:
-        raise ValueError("Parent integration returned no record")
-    changed = record["head_sha"] != job["candidate_sha"] or record["target_sha"] != job["base_sha"]
-    acceptance = job.get("acceptance_record")
-    if changed and isinstance(acceptance, dict):
-        job["previous_parent_acceptance_record"] = acceptance
-    job["base_sha"] = record["target_sha"]
-    job["candidate_sha"] = record["head_sha"]
-    current = isinstance(acceptance, dict) and engine.adapter.acceptance_is_current(state, job, acceptance)
-    if changed or not current:
-        awaiting_review = job.get("phase") == "candidate"
-        job["parent_integration_stage"] = True
-        job["phase"] = "candidate"
-        for key in (
-            "acceptance_record", "approval_grant", "publication", "publication_sha",
-            "pending_publication_result", "publication_parent_sha", "merge_intent",
-            "publication_commit_intent",
-        ):
-            job.pop(key, None)
-        engine.save(state)
-        return awaiting_review and not changed
-    return reconcile_parent_integration(engine, state, job)
+        except ResyncBudgetExhausted:
+            _pause(engine, state, job, "integration_resync_exhausted",
+                   "Parent integration resync allowance is exhausted; resume explicitly")
+            return False
+        except GitError as error:
+            _pause(engine, state, job, "integration_failed", str(error))
+            return False
+        if result.status == "conflict":
+            while result.status == "conflict":
+                step = engine.work.develop_integration(state, job, checkout, scope="parent-only", allow_agent=True)
+                if step.kind is not DeliveryStepKind.CONTINUE:
+                    return False
+                try:
+                    result = finish_parent_snapshot(
+                        git=engine.git, github=engine.github, state_store=engine.state_store,
+                        state=state, job=job, checkout=checkout,
+                    )
+                except GitError as error:
+                    _pause(engine, state, job, "integration_record_invalid", str(error))
+                    return False
+            # Preserve the original observation after conflict closeout.
+            continue
+        record = result.record
+        if record is None:
+            raise ValueError("Parent integration returned no record")
+        changed = record["head_sha"] != job["candidate_sha"] or record["target_sha"] != job["base_sha"]
+        acceptance = job.get("acceptance_record")
+        if changed and isinstance(acceptance, dict):
+            job["previous_parent_acceptance_record"] = acceptance
+        job["base_sha"] = record["target_sha"]
+        job["candidate_sha"] = record["head_sha"]
+        current = isinstance(acceptance, dict) and engine.adapter.acceptance_is_current(state, job, acceptance)
+        if changed or not current:
+            awaiting_review = job.get("phase") == "candidate"
+            job["parent_integration_stage"] = True
+            job["phase"] = "candidate"
+            for key in (
+                "acceptance_record", "approval_grant", "publication", "publication_sha",
+                "pending_publication_result", "publication_parent_sha", "merge_intent",
+                "publication_commit_intent",
+            ):
+                job.pop(key, None)
+            engine.save(state)
+            return awaiting_review and not changed
+        return reconcile_parent_integration(engine, state, job)
 
 
 def _pause(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:
