@@ -49,10 +49,10 @@ class Kernel:
                          "reference": None, "provenance": {"source": "explicit_policy"}} for role in Role}}
                     if spec.inputs is None else dict(spec.inputs.profiles))
         if spec.inputs is not None:
-            validate_profile_options(preset=profiles.get("preset"))
-            checked = resolve_profiles(current=profiles)
-            if any(field not in profiles["profiles"][role.value]
-                   or profiles["profiles"][role.value][field] != checked["profiles"][role.value][field]
+            validate_profile_options(preset=spec.inputs.profiles.get("preset"))
+            checked = resolve_profiles(current=spec.inputs.profiles)
+            if any(field not in spec.inputs.profiles["profiles"][role.value]
+                   or spec.inputs.profiles["profiles"][role.value][field] != checked["profiles"][role.value][field]
                    for role in Role for field in ("model", "reasoning_effort", "reference")):
                 raise KernelError("creation_profile_binding_changed")
             if spec.language is None:
