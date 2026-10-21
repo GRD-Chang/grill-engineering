@@ -361,9 +361,9 @@ def test_accepted_repair_second_integration_unit_fails_in_public_executor(
 
     # Keep the actual CLI admission, Driver and Executor broad failure handler.
     # There is deliberately no helper catching AgentWorkRequired and retrying.
-    result = invoke_cli_inprocess(repo, fixture, "run", "1", "--json")
+    with pytest.raises(AgentWorkRequired, match="integration_conflict"):
+        invoke_cli_inprocess(repo, fixture, "run", "1", "--json")
 
-    assert result.returncode == 2, result.stdout + result.stderr
     failed = StateStore(states.root).load_current_run(run_id)
     assert failed is not None
     assert failed["status"] == "execution_failed"
