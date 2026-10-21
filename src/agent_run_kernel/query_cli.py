@@ -12,6 +12,15 @@ from typing import Any, Literal, NoReturn, Sequence
 
 from agent_run.cli_messages import personal_language as _personal_language
 from agent_run.messages import error_detail
+from agent_run.git_errors import GitError
+from agent_run.github import GitHubReadError
+from agent_run.runner_lease import RunnerLeaseError
+from agent_run.managed_workspace import normalize_repository
+from agent_run.paths import app_data_root
+
+from .model import KernelError
+from .host_adapter import HostUnavailable
+from .native_host import HandoffError
 
 from . import personal_settings
 from .query import QueryDocument, QueryError, discover, read
@@ -56,13 +65,16 @@ def _parser(language: str) -> argparse.ArgumentParser:
         help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
     doctor.add_argument("--json", action="store_true", dest="as_json")
     personal_settings.add_parsers(commands, language)
+    from .lifecycle_cli import add_parsers
+    add_parsers(commands, language)
     return parser
 
 
 def _repository(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", value):
-        raise QueryError("run_locator_invalid", "Repository must be OWNER/NAME")
-    return value.lower()
+    try:
+        return normalize_repository(value)
+    except GitError as error:
+        raise QueryError("run_locator_invalid", "Repository must be OWNER/NAME") from error
 
 
 def _cwd_repository() -> str | None:
@@ -80,13 +92,62 @@ def _cwd_repository() -> str | None:
         return None
 
 
+def _managed_state_roots(repository: str | None) -> list[Path]:
+    """Locate durable state without walking clones, worktrees or installations."""
+    base = app_data_root() / "repositories"
+
+    def directory(path: Path) -> bool:
+        if path.is_symlink():
+            raise QueryError("run_locator_invalid", f"Symbolic managed state path: {path}")
+        if not path.exists():
+            return False
+        if not path.is_dir():
+            raise QueryError("run_locator_invalid", f"Managed state path is not a directory: {path}")
+        return True
+
+    if not directory(base):
+        return []
+    if repository is not None:
+        owner_name, repository_name = repository.split("/")
+        paths = (base / owner_name, base / owner_name / repository_name,
+                 base / owner_name / repository_name / "state")
+        return [paths[-1]] if all(directory(path) for path in paths) else []
+    roots = []
+    visited = 0
+    for owner in base.iterdir():
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", owner.name):
+            continue
+        if not directory(owner):
+            continue
+        for checkout in owner.iterdir():
+            visited += 1
+            if visited > 4096:
+                raise QueryError("query_limit", "Too many managed repositories; provide --repo or --state-dir")
+            try:
+                _repository(owner.name + "/" + checkout.name)
+            except QueryError:
+                continue
+            if directory(checkout) and directory(checkout / "state"):
+                roots.append(checkout / "state")
+    return roots
+
+
 def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
-    default_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "agent-run"
-    roots = [parsed.state_dir] if parsed.state_dir is not None else [getattr(parsed, "data_root", None) or default_root]
+    if parsed.state_dir is not None:
+        roots = [parsed.state_dir]
+    elif getattr(parsed, "data_root", None) is not None:
+        roots = [parsed.data_root]
+    else:
+        repository = _repository(parsed.repo) if parsed.repo else None
+        if repository is None and not getattr(parsed, "run_id", None):
+            repository = _cwd_repository()
+        roots = _managed_state_roots(repository)
     result: dict[str, dict[str, Any]] = {}
     for root in roots:
         for candidate in discover(root):
             result[str(Path(candidate["database"]).resolve())] = candidate
+            if len(result) > 256:
+                raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
     return list(result.values())
 
 
@@ -123,6 +184,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
+        if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
+            from .lifecycle_cli import execute
+            output = execute(parsed)
+            language = output.pop("language", language)
+            if parsed.as_json:
+                print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            else:
+                if output["result"] == "attached":
+                    label = "已附着原请求；本次操作未应用" if language == "zh" else "Attached to original request; new action not applied"
+                else:
+                    label = "请求已受理" if language == "zh" else "Request accepted"
+                host_label = "宿主" if language == "zh" else "Host"
+                print(safe_text(f"{label}: {output['run_id']} {output['status']} [{output['action_id']}] {host_label}: {output['host']}"))
+            return 0
         if parsed.command == "doctor":
             from agent_run.doctor import run as diagnose
             return diagnose(as_json=parsed.as_json)
@@ -155,8 +230,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 and sys.stdout.isatty()) else "plain"
         render(document, style=style, details=getattr(parsed, "details", False), stream=sys.stdout)
         return 0
-    except (ValueError, OSError) as error:
-        diagnostic_code = error.code if isinstance(error, QueryError) else "command_failed"
+    except (ValueError, OSError, GitError, GitHubReadError, RunnerLeaseError, KernelError, HostUnavailable, HandoffError) as error:
+        language = getattr(parsed, "_run_language", language)
+        diagnostic_code = "execution_readiness" if isinstance(error, HostUnavailable) else str(getattr(error, "code", "command_failed"))
         error_candidates = error.candidates if isinstance(error, QueryError) else []
         error_output: dict[str, Any] = {"result": "error", "status": "command_failed",
                   "diagnostics": [{"code": diagnostic_code, "message": str(error)}]}

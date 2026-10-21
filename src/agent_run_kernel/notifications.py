@@ -78,22 +78,29 @@ class NativeNotifications:
                  "language": run["language"], "created_at": run["created_at"]}
         return run["id"], (run["repository"], run["parent_issue"]), config, state
 
+    def _same_binding(self, run_id: str, binding: tuple[str, int],
+                      config: dict[str, Any], state: dict[str, Any]) -> bool:
+        # A refreshed Parent title is current card copy, not a recipient or
+        # Run identity change. The frozen notification inputs remain exact.
+        return ((run_id, binding, config, state["language"], state["created_at"])
+                == (self.run_id, self.binding, self.config,
+                    self.state["language"], self.state["created_at"]))
+
     def _page(self, after: int) -> tuple[list[dict[str, Any]], bool, int]:
         with self.storage.transaction(write=False) as tx:
             run_id, binding, config, state = self._run(tx)
-            if (run_id, binding, config, state) != (self.run_id, self.binding, self.config, self.state):
+            if not self._same_binding(run_id, binding, config, state):
                 raise ValueError("notification Run or recipient binding changed")
             history = tx.rows("SELECT position,subject,kind,identity,generation,created_at "
                               "FROM history WHERE position>? ORDER BY position LIMIT 16", (after,), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
-                event = self._event(tx, row)
+                event = self._event(tx, row, state)
                 if event is not None:
                     events.append(event)
             return events, len(history) == 16, history[-1]["position"] if history else after
 
-    def _event(self, tx: Transaction, row: Any) -> dict[str, Any] | None:
-        state = self.state
+    def _event(self, tx: Transaction, row: Any, state: dict[str, Any]) -> dict[str, Any] | None:
         subject = tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],))
         if row["kind"] == "worker_started":
             first = tx.one("SELECT min(position) FROM history WHERE subject=? AND kind='worker_started'",
@@ -213,7 +220,7 @@ class NativeNotifications:
                 result: Mapping[str, Any]
                 try:
                     with self.storage.transaction(write=False) as tx:
-                        if self._run(tx) != (self.run_id, self.binding, self.config, self.state):
+                        if not self._same_binding(*self._run(tx)):
                             raise ValueError("notification Run or recipient binding changed")
                 except Exception as error:
                     result = {"outcome": "failed", "reason": bounded_error(str(error))}

@@ -13,10 +13,11 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from agent_run.messages import error_message
-from agent_run.git import GitRepository
+if TYPE_CHECKING:
+    from agent_run.git import GitRepository
 from agent_run.git_errors import GitError
 from agent_run.git_output import git_environment, run_git
 from agent_run.paths import app_data_root
@@ -61,7 +62,12 @@ class ManagedWorkspace:
         return self.root / "state"
 
     def open(self) -> GitRepository:
-        """Validate an existing workspace without creating or updating anything."""
+        """Legacy object entry; native callers use the same pure path validation."""
+        from agent_run.git import GitRepository
+        return GitRepository(self.open_path())
+
+    def open_path(self) -> Path:
+        """Validate an existing workspace without loading the legacy runtime."""
         validate_data_root()
         document = self._owned_document()
         git_directory = self.repository_root / ".git"
@@ -77,7 +83,7 @@ class ManagedWorkspace:
             or origin != document["remote_url"]
         ):
             raise ManagedWorkspaceError(error_message("workspace.error.git_replaced"))
-        return GitRepository(self.repository_root)
+        return self.repository_root
 
     def _owned_document(self) -> dict[str, str]:
         _check_owned_path(self.root)
@@ -108,10 +114,18 @@ class ManagedWorkspace:
         self, remote_url: str | None = None, *, identity: dict[str, str] | None = None,
         runner_identity: Mapping[str, Any] | None = None,
     ) -> GitRepository:
+        """Legacy object entry over the same clone/path implementation."""
+        from agent_run.git import GitRepository
+        return GitRepository(self.ensure_path(remote_url, identity=identity, runner_identity=runner_identity))
+
+    def ensure_path(
+        self, remote_url: str | None = None, *, identity: dict[str, str] | None = None,
+        runner_identity: Mapping[str, Any] | None = None,
+    ) -> Path:
         """Create once; never reset, fetch or modify an existing checkout."""
         _check_owned_path(self.root)
         if self.root.exists():
-            return self.open()
+            return self.open_path()
         validate_data_root()
         _make_owned_directory(self.root.parent)
         lock = app_data_root() / "repositories" / ".locks" / (self.repository + ".lock")
@@ -124,7 +138,7 @@ class ManagedWorkspace:
                 raise ManagedWorkspaceError(error_message("workspace.error.creating")) from error
             _check_owned_path(self.root)
             if self.root.exists():
-                return self.open()
+                return self.open_path()
             staging = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-", dir=self.root.parent))
             try:
                 checkout = staging / "repository"
@@ -153,7 +167,7 @@ class ManagedWorkspace:
             finally:
                 if staging.exists():
                     shutil.rmtree(staging)
-        return self.open()
+        return self.open_path()
 
 
 def workspace_state_root(repository_root: Path) -> Path:

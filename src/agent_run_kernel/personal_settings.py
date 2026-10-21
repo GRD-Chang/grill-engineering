@@ -54,12 +54,13 @@ def _duration(value: str) -> str:
     return value  # The existing policy leaf validates units, finiteness and positivity.
 
 
-def _policy_options(parser: argparse.ArgumentParser, language: str) -> None:
+def _policy_options(parser: argparse.ArgumentParser, language: str, *, allow_thread_policy: bool = True) -> None:
     for key, alias, message in _POSITIVE_POLICY:
         options = ("--" + key.replace("_", "-"),) + ((alias,) if alias else ())
         parser.add_argument(*options, dest=key, type=_positive, help=text("cli." + message, language=language))
-    parser.add_argument("--development-thread-policy", choices=("reuse", "new-per-attempt"),
-                        help=text("cli.thread_policy_help", language=language))
+    if allow_thread_policy:
+        parser.add_argument("--development-thread-policy", choices=("reuse", "new-per-attempt"),
+                            help=text("cli.thread_policy_help", language=language))
     parser.add_argument("--integration-resync-limit", type=_nonnegative,
                         help=text("cli.integration_resync_limit_help", language=language))
     parser.add_argument("--ticket-ci-review", action=argparse.BooleanOptionalAction, default=None,
@@ -67,6 +68,20 @@ def _policy_options(parser: argparse.ArgumentParser, language: str) -> None:
     for role, label in (("development", "Development"), ("review", "Review"), ("publication", "Publication")):
         parser.add_argument(f"--{role}-deadline", f"--{role}-duration", f"--{role}-timeout", dest=f"{role}_deadline",
                             type=_duration, help=text("cli.deadline_help", language=language, role=label))
+
+
+
+def _profile_options(parser: argparse.ArgumentParser, language: str) -> None:
+    parser.add_argument("--preset", "--profile-preset", dest="profile_preset", help=text("cli.preset_help", language=language))
+    parser.add_argument("--development-model", "--dev-model", dest="development_model", help=text("cli.dev_model_help", language=language))
+    parser.add_argument("--development-effort", "--development-reasoning-effort", "--dev-effort", dest="development_effort", help=text("cli.dev_effort_help", language=language))
+    parser.add_argument("--review-model", help=text("cli.review_model_help", language=language))
+    parser.add_argument("--review-effort", "--review-reasoning-effort", dest="review_effort", help=text("cli.review_effort_help", language=language))
+    parser.add_argument("--publication-model", help=text("cli.publication_model_help", language=language))
+    parser.add_argument("--publication-effort", "--publication-reasoning-effort", dest="publication_effort", help=text("cli.publication_effort_help", language=language))
+    parser.add_argument("--publication-from-development", "--publication-reference-development", "--publication-use-development",
+                           action="store_true", default=None, dest="publication_from_development", help=text("cli.publication_reference_help", language=language))
+    parser.add_argument("--publication-reference", choices=("development",), help=argparse.SUPPRESS)
 
 
 def add_parsers(commands: Any, language: str) -> None:
@@ -83,16 +98,7 @@ def add_parsers(commands: Any, language: str) -> None:
     add_identity_options(configure, language)
     configure.add_argument("--migrate-github-app", action="store_true", help=text("identity.migrate_help", language=language))
     _policy_options(configure, language)
-    configure.add_argument("--preset", "--profile-preset", dest="profile_preset", help=text("cli.preset_help", language=language))
-    configure.add_argument("--development-model", "--dev-model", dest="development_model", help=text("cli.dev_model_help", language=language))
-    configure.add_argument("--development-effort", "--development-reasoning-effort", "--dev-effort", dest="development_effort", help=text("cli.dev_effort_help", language=language))
-    configure.add_argument("--review-model", help=text("cli.review_model_help", language=language))
-    configure.add_argument("--review-effort", "--review-reasoning-effort", dest="review_effort", help=text("cli.review_effort_help", language=language))
-    configure.add_argument("--publication-model", help=text("cli.publication_model_help", language=language))
-    configure.add_argument("--publication-effort", "--publication-reasoning-effort", dest="publication_effort", help=text("cli.publication_effort_help", language=language))
-    configure.add_argument("--publication-from-development", "--publication-reference-development", "--publication-use-development",
-                           action="store_true", default=None, dest="publication_from_development", help=text("cli.publication_reference_help", language=language))
-    configure.add_argument("--publication-reference", choices=("development",), help=argparse.SUPPRESS)
+    _profile_options(configure, language)
     toggle = configure.add_mutually_exclusive_group()
     toggle.add_argument("--notifications", dest="notifications_enabled", action="store_true", default=None, help=text("settings.notifications_help", language=language))
     toggle.add_argument("--no-notifications", dest="notifications_enabled", action="store_false", help=text("settings.no_notifications_help", language=language))

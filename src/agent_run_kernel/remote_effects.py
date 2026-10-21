@@ -175,17 +175,18 @@ class RemoteEffects:
             revision = issues[0]["revision"]
         source_sha, target_sha = read_remote_heads(self.root, job["source_ref"], job["target_ref"],
                                                   runner_identity=self.identity, remote=self.remote)
-        target = self._commit(target_sha)[0]
+        target = None if target_sha is None else self._commit(target_sha)[0]
         source = None if source_sha is None else self._commit(source_sha)[0]
         raw_pr = self._find_pr(job["source_ref"], job["target_ref"], job["pr_number"])
         pr = None if raw_pr is None else self._pr(raw_pr)
         checks = None
         if pr is not None and pr.state == "OPEN":
-            if source is None or pr.head.sha != source.sha or pr.base.sha != target.sha:
+            if source is None or target is None or pr.head.sha != source.sha or pr.base.sha != target.sha:
                 raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
             checks = normalize_required_checks(read_required_check_facts(reader, pr.number, expected_head_sha=source.sha))
-        anchors.add(target.sha)
-        after = {target.sha, *(sha for sha in (source_sha, job["candidate_sha"], job["integrated_sha"]) if sha is not None)}
+        if target is not None:
+            anchors.add(target.sha)
+        after = {sha for sha in (target_sha, source_sha, job["candidate_sha"], job["integrated_sha"]) if sha is not None}
         ancestry = tuple((before, head) for before in sorted(anchors) for head in sorted(after)
                          if self._ancestor(_sha(before), _sha(head)))
         return World(_text(receipt["observed_parent_revision"]), _text(receipt["observed_graph_revision"]),
@@ -209,6 +210,8 @@ class RemoteEffects:
                                                  runner_identity=self.identity, remote=self.remote)
         if run_sha is None:
             raise GitHubReadError("final_source_missing", "The original remote Run ref is absent")
+        if default_sha is None:
+            raise GitHubReadError("missing_target_branch", "The exact remote default ref is absent")
         run_head, default_head = self._commit(run_sha)[0], self._commit(default_sha)[0]
         generations = {row["subject"]: row["generation"] for row in receipt["completion_revisions"]}
         anchors = {row["merge_sha"] for row in receipt["completions"]

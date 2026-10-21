@@ -42,11 +42,12 @@ def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirement
 
 
 def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
-                      runner_identity: Mapping[str, Any], remote: str = "origin") -> tuple[str | None, str]:
+                      runner_identity: Mapping[str, Any], remote: str = "origin") -> tuple[str | None, str | None]:
     """Read exact remote refs in one response; never use local tracking refs.
 
-    Runner identity must be the explicit frozen reference. An absent source is
-    normal before first publication; absent target and unknown observations fail.
+    Runner identity must be the explicit frozen reference. A successful empty
+    ref read is None; Kernel decides whether that absence permits any operation.
+    Unknown observations fail rather than being converted into an absent ref.
     This neither fetches objects nor modifies local refs or Git configuration.
     """
     if source_ref == target_ref or not remote or "\0" in remote:
@@ -66,10 +67,7 @@ def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
         if not separator or ref not in heads or heads[ref] is not None or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
             raise GitHubReadError("github_invalid_response", "Remote returned an invalid or unexpected ref")
         heads[ref] = sha
-    target = heads[target_ref]
-    if target is None:
-        raise GitHubReadError("missing_target_branch", "The exact remote target ref is missing")
-    return heads[source_ref], target
+    return heads[source_ref], heads[target_ref]
 
 
 def _object(value: Any) -> dict[str, Any]:

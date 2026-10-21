@@ -156,9 +156,13 @@ def test_remote_heads_are_independent_of_local_refs_and_missing_is_not_read_fail
     assert git.run('show-ref').stdout == before
     absent, target = read_remote_heads(root, 'refs/heads/not-created', 'refs/heads/main', runner_identity={'source': 'host'})
     assert absent is None and target == base.sha
+    assert read_remote_heads(root, 'refs/heads/source', 'refs/heads/not-created',
+                             runner_identity={'source': 'host'}) == (later.sha, None)
     with pytest.raises(GitHubReadError) as failure:
-        read_remote_heads(root, 'refs/heads/source', 'refs/heads/not-created', runner_identity={'source': 'host'})
-    assert failure.value.code == 'missing_target_branch'
+        read_remote_heads(root, 'refs/heads/source', 'refs/heads/main',
+                          runner_identity={'source': 'host'}, remote=str(tmp_path / 'missing-remote.git'))
+    assert failure.value.code == 'github_read_failed'
+    assert git.run('show-ref').stdout == before
 
 
 def test_pr_observation_preserves_foreign_head_repository_and_original_actor_text(tmp_path: Path, monkeypatch) -> None:

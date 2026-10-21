@@ -232,7 +232,7 @@ class World:
     parent_revision: str
     graph_revision: str
     revision: str
-    target: Commit
+    target: Commit | None
     source: Commit | None = None
     pr: PullRequest | None = None
     checks: Checks | None = None
