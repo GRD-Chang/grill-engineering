@@ -68,6 +68,70 @@ def _journal(kernel: Kernel, run_id: str = "notification-query") -> None:
                 outbox.retire(document, item)
 
 
+def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_original_final_close(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from agent_run_kernel import Issue, ParentIssue, Requirements
+    from agent_run_kernel.offline import GraphScenario
+    from agent_run_kernel import query
+
+    scenario = GraphScenario(tmp_path / "delivery", Requirements(
+        ParentIssue(1, "Full Parent", "Original requirements", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
+    assert scenario.run().kind == "complete"
+    assert query.read(scenario.kernel.storage.path, "status").data["status"] == "run_acceptance_pending"
+    monkeypatch.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        ticket_only = query.notification_boundaries(tx, scenario.kernel.storage.path)
+    assert ticket_only["is_terminal"] is False
+    assert ticket_only["status"] == "run_acceptance_pending"
+    assert ticket_only["closures"] == []
+    final = scenario.activate_final()
+    scenario.select(final)
+    assert scenario.run().kind == "approval"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        approval = query.notification_boundaries(tx, scenario.kernel.storage.path)
+    assert approval["is_terminal"] is False and approval["closures"] == []
+    assert scenario.run(approve=True).kind == "complete"
+    before = _snapshot(tmp_path)
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        completed = query.notification_boundaries(tx, scenario.kernel.storage.path)
+        effect = tx.one("SELECT id,receipt_id,pr_number FROM effects WHERE subject=? AND operation='close' AND status='confirmed'", (final,))
+        receipt = json.loads(tx.get(effect["receipt_id"], final))
+    assert completed["status"] == "completed" and completed["is_terminal"] is True
+    assert completed["abandonment"] is None
+    assert completed["delivery_cleanup"]["status"] == "completed"
+    assert completed["closures"] == [{"subject": final, "generation": scenario.kernel.status(final)["generation"],
+        "effect_id": effect["id"], "receipt_id": effect["receipt_id"], "receipt": receipt, "pr_number": effect["pr_number"]}]
+    assert _snapshot(tmp_path) == before
+
+
+def test_notification_boundary_reader_returns_the_original_abandon_action_until_terminal_cleanup(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from agent_run_kernel import query
+    from agent_run_kernel.local_effects import LocalEffects
+    from agent_run_kernel.offline import Scenario
+
+    scenario = Scenario(tmp_path / "abandon", DeliveryKind.PARENT_ONLY)
+    inspections = LocalEffects(scenario.port.git).inspect_resources(scenario.kernel.generation_resources())
+    assert scenario.kernel.control("abandon", "original-abandon", resource_inspections=inspections) == "pending"
+    monkeypatch.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        pending = query.notification_boundaries(tx, scenario.kernel.storage.path)
+    assert pending["status"] == "abandonment_pending" and pending["is_terminal"] is False
+    assert pending["abandonment"] == {"action": "original-abandon", "status": "pending"}
+    assert pending["actions"] == [] and pending["closures"] == []
+    assert scenario.run().kind == "complete"
+    before = _snapshot(tmp_path)
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        completed = query.notification_boundaries(tx, scenario.kernel.storage.path)
+    assert completed["status"] == "abandoned" and completed["is_terminal"] is True
+    assert completed["abandonment"] == {"action": "original-abandon", "status": "complete"}
+    assert completed["closures"] == []
+    assert _snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize("command", ["status", "history"])
 def test_public_notification_query_keeps_pending_retry_and_delivery_facts_without_mutation(
     tmp_path: Path, monkeypatch, capsys, command: str,

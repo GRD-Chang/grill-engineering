@@ -104,7 +104,8 @@ def _header(tx: Transaction, path: Path) -> dict[str, Any]:
         terminal = abandonment["status"] == "complete"
     return {"run_id": run["id"], "repository": run["repository"], "parent": run["parent_issue"],
             "repository_root": root, "language": run.get("language"), "created_at": _timestamp(run.get("created_at")),
-            "phases": phases, "is_terminal": terminal, "stopped": bool(run["stopped"]), "blocked": run["blocked"],
+            "phases": phases, "is_terminal": terminal, "abandonment": abandonment,
+            "stopped": bool(run["stopped"]), "blocked": run["blocked"],
             "state_dir": str(path.parent), "database": str(path)}
 
 
@@ -392,7 +393,7 @@ def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], termi
         return "ticket_completed" if all(job["kind"] == "ticket" for job in subjects) else "completed"
     current = unfinished
     if not current and subjects and all(job["kind"] == "ticket" for job in subjects):
-        return "ticket_completed"
+        return "run_acceptance_pending"
     if any(job["phase"] == "checks" for job in current):
         return "waiting_checks"
     if len(current) == 1:
@@ -634,8 +635,18 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
     """
     run = dict(tx.one("SELECT * FROM runs"))
     subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
-    return {"actions": _operator_actions(run, subjects, abandonment=_abandonment(tx)),
+    location = _header(tx, path)
+    abandonment = location["abandonment"]
+    closures = _all(tx, "SELECT e.subject,e.generation,e.id AS effect_id,e.receipt_id,e.pr_number "
+        "FROM effects e JOIN subjects s ON s.id=e.subject AND s.generation=e.generation "
+        "WHERE s.kind!='ticket' AND e.operation='close' AND e.status='confirmed' ORDER BY e.rowid")
+    for closure in closures:
+        closure["receipt"] = _material(tx, closure["receipt_id"], closure["subject"])
+    return {"actions": _operator_actions(run, subjects, abandonment=abandonment),
             "generations": {job["subject"]: job["generation"] for job in subjects},
+            "status": _public_status(run, subjects, location["is_terminal"], abandonment=abandonment),
+            "is_terminal": location["is_terminal"], "abandonment": abandonment,
+            "delivery_cleanup": _status_fields(run, subjects)["delivery_cleanup"], "closures": closures,
             "highwater": tx.one("SELECT coalesce(max(position),0) FROM history")[0]}
 
 
@@ -659,7 +670,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     raise QueryError("query_limit", "Public response exceeds its bounded limit")
                 return QueryDocument("settings", language, settings)
             subjects = [_subject(tx, job) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
-            abandonment = _abandonment(tx)
+            abandonment = location["abandonment"]
             actions = _operator_actions(run, subjects, abandonment=abandonment)
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
