@@ -168,6 +168,15 @@ class DevelopmentReview:
         with self.agent_work.step(job, allow_agent=True):
             return resolve_integration_work(self, state, job, checkout)
 
+    def wait_for_change_credential(
+        self, state: dict[str, Any], job: dict[str, Any], *,
+        scope: ChangeScope, http_status: int | None,
+    ) -> None:
+        self._bind_change(state, job, scope)
+        self._refund_unstarted_credential_invocation(state, job)
+        self._wait_for_initial_credential(state, job, http_status=http_status)
+        self.agent_work.defer()
+
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         if self._scope == "run":
             self.states.save_run(str(state["run_id"]), state)
@@ -895,9 +904,7 @@ class DevelopmentReview:
             except ChangeJobStopped:
                 return self._step_result(state, job, waiting=True)
             except InitialCredentialUnavailable as error:
-                self._refund_unstarted_credential_invocation(state, job)
-                self._wait_for_initial_credential(state, job, http_status=error.http_status)
-                self.agent_work.defer()
+                self.wait_for_change_credential(state, job, scope=scope, http_status=error.http_status)
                 return self._step_result(state, job, waiting=True)
             except GitHubReadError as error:
                 if not is_github_convergence_error(error.code):

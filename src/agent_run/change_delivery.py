@@ -288,9 +288,11 @@ class ChangeDeliveryEngine:
             self.agent_work.defer()
             return self._step_result(state, job, waiting=True)
         except InitialCredentialUnavailable as error:
-            self.work._refund_unstarted_credential_invocation(state, job)
-            self.work._wait_for_initial_credential(state, job, http_status=error.http_status)
-            self.agent_work.defer()
+            self.work.wait_for_change_credential(
+                state, job,
+                scope="ticket" if self.contract.label.startswith("ticket-") else "parent-only",
+                http_status=error.http_status,
+            )
             return self._step_result(state, job, waiting=True)
 
     def reconcile_pending_pr_write(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
