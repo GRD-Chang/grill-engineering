@@ -360,6 +360,9 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                     or invocation["status"] != "completed" or invocation["ended_at"] is None
                     or bound["status"] != "pending" or bound["returned_result_evidence_id"] is not None
                     or invocation["attempt_version_id"] == current["version_id"]
+                    or (role == Role.REVIEW
+                        and (bound["review_context_evidence_id"] is None
+                             or bound["review_context_evidence_id"] != version["review_context_evidence_id"]))
                     or invocation["error"] is not None or invocation["execution_interrupted"] != 0
                     or invocation["recovery_waiting"] != 0 or invocation["return_code"] is not None
                     or invocation["execution_segments_null"] != 0

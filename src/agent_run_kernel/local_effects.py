@@ -74,8 +74,17 @@ class LocalEffects:
         )
 
     def _cleanup(self, effect: Effect) -> Effect:
-        if effect.payload.get("owned_root") != str(self.owned_root):
+        if (effect.payload.get("owned_root") != str(self.owned_root)
+                or not self.owned_root.is_absolute() or self.owned_root.resolve() != self.owned_root):
             raise KernelError("foreign_local_checkout")
+        if effect.operation == "cleanup_local_ref":
+            common = effect.payload.get("common_git_dir")
+            if (not isinstance(common, str) or not common or "\0" in common
+                    or not Path(common).is_absolute() or Path(common).resolve() != Path(common)):
+                raise KernelError("foreign_local_checkout")
+            actual = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+            if Path(actual).resolve() != Path(common):
+                raise KernelError("foreign_local_checkout")
         if effect.operation != "validation_cleanup":
             return effect
         return replace(effect, payload={**effect.payload,
@@ -187,7 +196,7 @@ class LocalEffects:
         """Observe original physical facts without using response receipts as proof."""
         try:
             if effect.operation == "cleanup_local_ref":
-                return inspect_local_ref(self.git, effect)
+                return inspect_local_ref(self.git, self._cleanup(effect))
             if effect.operation in {"validation_cleanup", "cleanup_worktree"}:
                 return inspect_worktree(self.git, self._cleanup(effect))
             checkout, head = self._checkout(effect)
@@ -218,10 +227,19 @@ class LocalEffects:
 
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
         observed = self.reconcile(effect)
-        if (effect.operation == "integrate" and observed.disposition == "target"
-                and effect.candidate is not None and observed.commit == effect.candidate):
-            # An exact candidate can already contain both integration inputs.
-            # Even without a Git write, consuming it needs current dispatch authority.
+        no_write = (
+            effect.operation == "integrate" and effect.candidate is not None and observed.commit == effect.candidate
+            or effect.operation == "candidate" and observed.raw.get("no_change") is True
+            and observed.commit is not None and observed.commit.sha == effect.before_sha
+            or effect.operation == "publication_commit" and bool(effect.payload.get("reuse_sha"))
+            and observed.commit is not None and observed.commit.sha == effect.payload["reuse_sha"]
+            or effect.operation in {"validation_cleanup", "cleanup_worktree"}
+            and observed.raw.get("reason") == "worktree_absent"
+            or effect.operation == "cleanup_local_ref" and observed.raw.get("reason") == "ref_absent"
+        )
+        if observed.disposition == "target" and no_write:
+            # Only explicit, verified no-write outcomes may acquire first-dispatch
+            # authority here; an arbitrary pre-existing target remains read-only.
             authorize()
             fresh = self.reconcile(effect)
             if fresh != observed:

@@ -177,6 +177,83 @@ def test_returned_development_refuses_unknown_external_write_without_consuming_r
     assert {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()} == original_hashes
 
 
+def test_returned_review_refuses_current_context_drift_from_bound_input(tmp_path: Path) -> None:
+    oracle = Path(__file__).resolve().parents[3] / "results" / "kernel-returned-reviewer-bound-observation"
+    paths = {suffix: oracle / ("kernel-returned-reviewer" + suffix) for suffix in
+             (".sqlite3", ".json", "-profile.json", "-github.json", ".bundle", "-checkout.tar")}
+    assert hashlib.sha256(paths[".sqlite3"].read_bytes()).hexdigest() == "0fc6daa20c4147a4fda55d8edd8eb69eb71bb98a40369adb3c618b68dca57ee3"
+    hashes = {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()}
+    observed = json.loads(paths[".json"].read_text(encoding="utf-8"))
+    external = json.loads(paths["-github.json"].read_text(encoding="utf-8"))
+    root = tmp_path / "continued"
+    port, checkout = _restore_returned_checkout(root, paths, observed, external)
+    source = tmp_path / "synthetic.sqlite3"
+    source.write_bytes(paths[".sqlite3"].read_bytes())
+    # Append a later CURRENT context using the frozen v6 content identities.
+    # The completed Invocation, its startup BOUND version and raw stay intact.
+    with closing(sqlite3.connect(source)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        invocation = dict(db.execute("SELECT * FROM work_invocations WHERE role='fresh_acceptance'").fetchone())
+        attempt_id = invocation["attempt_id"]
+        current = dict(db.execute("SELECT v.* FROM work_attempt_current c JOIN work_attempt_versions v "
+                                 "USING(run_id,attempt_id,version_id) WHERE c.attempt_id=?",
+                                 (attempt_id,)).fetchone())
+        bound = dict(db.execute("SELECT * FROM work_attempt_versions WHERE attempt_id=? AND version_id=?",
+                               (attempt_id, invocation["attempt_version_id"])).fetchone())
+        evidence = dict(db.execute("SELECT * FROM work_evidence WHERE evidence_id=?",
+                                  (current["review_context_evidence_id"],)).fetchone())
+        old_body = db.execute("SELECT body FROM work_evidence_materials WHERE material_id=?",
+                              (evidence["material_id"],)).fetchone()[0]
+        context = json.loads(old_body)
+        context["facts"]["human_response_history"] = [{"message": "Later operator clarification."}]
+        body = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        evidence_id = hashlib.sha256(json.dumps(
+            (evidence["owner_id"], "review_context", digest, None, None),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        db.execute("INSERT INTO work_evidence_materials VALUES (?,?,?)", (digest, body, len(body.encode())))
+        db.execute("INSERT INTO work_evidence VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (evidence["run_id"], evidence_id, evidence["owner_id"], "review_context",
+                    evidence["version"] + 1, digest, len(body.encode()), digest, None, None))
+        current["review_context_evidence_id"] = evidence_id
+        current["logical_bytes"] += len(body.encode()) - len(old_body.encode())
+        evidence_fields = ("budget_snapshot", "review_context", "history_facts", "review_identity",
+                           "development_summary", "publication", "publication_operation_retry",
+                           "publication_commit_observation", "returned_result")
+        identity = (attempt_id, current["presence"].hex(),
+                    tuple(current[key] for key in ("status", "outcome", "budget_consumed")),
+                    tuple(current[key + "_evidence_id"] for key in evidence_fields))
+        current["version_id"] = hashlib.sha256(json.dumps(
+            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        db.execute("INSERT INTO work_attempt_versions (" + ",".join(current) + ") VALUES (" +
+                   ",".join("?" for _ in current) + ")", tuple(current.values()))
+        db.execute("UPDATE work_attempt_current SET version_id=? WHERE attempt_id=?",
+                   (current["version_id"], attempt_id))
+        db.commit()
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert dict(db.execute("SELECT * FROM work_invocations WHERE role='fresh_acceptance'").fetchone()) == invocation
+        assert dict(db.execute("SELECT * FROM work_attempt_versions WHERE attempt_id=? AND version_id=?",
+                               (attempt_id, invocation["attempt_version_id"])).fetchone()) == bound
+    snapshot = capture_v6(source, tmp_path / "captured.sqlite3")
+    observed["source_sha256"] = snapshot.sha256
+    observed["pending_attempt"]["review_context"] = context
+    observation = tmp_path / "synthetic-observation.json"
+    observation.write_text(json.dumps(observed), encoding="utf-8")
+    destination = root / "kernel.sqlite3"
+    with pytest.raises(MigrationRefused):
+        convert_returned_role_v6(
+            snapshot, destination, repository_root=port.git.root,
+            checkout=checkout, final_checkout=root / "work" / "final",
+            profile_snapshot=paths["-profile.json"], github_snapshot=paths["-github.json"],
+            observation_snapshot=observation, remote_source_sha=external["default_head_sha"],
+            remote_target_sha=external["default_head_sha"], checkout_archive=paths["-checkout.tar"])
+    assert not destination.exists()
+    assert port.writes() == []
+    assert source.read_bytes() == snapshot.path.read_bytes()
+    assert {suffix: hashlib.sha256(path.read_bytes()).hexdigest() for suffix, path in paths.items()} == hashes
+
+
 def test_fixed_4aba_v6_copy_converts_and_new_runtime_completes_ticket(tmp_path: Path) -> None:
     oracle = Path(__file__).resolve().parents[3] / "results" / "kernel-initial-observation"
     source = oracle / "kernel-initial-v6.sqlite3"
