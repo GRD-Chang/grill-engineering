@@ -1,10 +1,11 @@
-"""A narrow v6 returned-role import from a copied, stopped source.
+"""Bounded v6 returned-role conversion for copied or canonical offline sources.
 
-This imports completed synchronous old calls as historical evidence.  It never
-invents a native executor, process lease, or Invocation for old calls.
+Old calls remain historical evidence. Only the normalized current result enters
+native consumption; no old executor, lease or Invocation is fabricated.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, replace
 import hashlib
 import io
@@ -16,10 +17,15 @@ import tempfile
 import tarfile
 from typing import Any, Mapping
 
+from agent_run.managed_workspace import ManagedWorkspace
+
+from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
                         _require_no_v6_notification_journal, capture_v6)
 from .migration_conversion import _git, _one, _policy
+from .migration_quiescence import CONTROL_TABLES, read_v6_host_exit
+from .migration_records import _preserve_copy
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
                     KernelError, ParentIssue, Policy, Profile, Requirements, Role,
                     RunSpec, artifact, wire_json)
@@ -38,7 +44,7 @@ _ACTIVE_TABLES = frozenset({
     "run_graph_members", "run_graph_snapshots", "run_graph_scope_order",
     "run_graph_ticket_slots", "run_frontier", "run_condition_base", "run_query_roots",
     "run_timeline_events", "run_timeline_slots", "run_resume_roots",
-})
+}) | CONTROL_TABLES
 
 # These are durable publication intents, write outcomes or remote identities,
 # not proof that the current role return is the only unconsumed work.  Their
@@ -164,6 +170,7 @@ def _verify_checkout_archive(path: Path, checkout: Path, expected_sha: str) -> N
     if hashlib.sha256(body).hexdigest() != expected_sha:
         raise MigrationRefused("source_checkout_archive")
     expected: dict[Path, bytes] = {}
+    modes: dict[Path, int] = {}
     try:
         with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as archive:
             for member in archive:
@@ -176,6 +183,7 @@ def _verify_checkout_archive(path: Path, checkout: Path, expected_sha: str) -> N
                 if stream is None:
                     raise MigrationRefused("source_checkout_archive")
                 expected[relative] = stream.read()
+                modes[relative] = member.mode & 0o777
     except (OSError, tarfile.TarError, ValueError) as error:
         raise MigrationRefused("source_checkout_archive") from error
     paths = [path for path in checkout.rglob("*") if ".git" not in path.relative_to(checkout).parts]
@@ -185,27 +193,40 @@ def _verify_checkout_archive(path: Path, checkout: Path, expected_sha: str) -> N
     if set(actual) != set(expected):
         raise MigrationRefused("source_checkout_archive")
     for relative, file in actual.items():
-        if file.is_symlink() or file.stat().st_nlink != 1 or file.read_bytes() != expected[relative]:
+        if (file.is_symlink() or file.stat().st_nlink != 1 or file.read_bytes() != expected[relative]
+                or file.stat().st_mode & 0o777 != modes[relative]):
             raise MigrationRefused("source_checkout_archive")
 
 
 def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
-                 source_sha: str) -> _Active:
+                 source_sha: str, *, original: bool = False) -> _Active:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA query_only=ON")
         counts = {name: db.execute('SELECT count(*) FROM "' + name.replace('"', '""') + '"').fetchone()[0]
                   for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-        if any(count and name not in _ACTIVE_TABLES for name, count in counts.items()):
+        if not original and any(count and name not in _ACTIVE_TABLES for name, count in counts.items()):
             raise MigrationRefused("unsupported_source_relations")
         run = _one(db, "SELECT * FROM runs")
         run_id = run["run_id"]
+        read_v6_host_exit(db, run_id, required=original)
         root = _one(db, "SELECT * FROM run_root WHERE run_id=?", (run_id,))
         layout = _one(db, "SELECT * FROM work_job_layout WHERE run_id=?", (run_id,))
         job = _one(db, "SELECT * FROM work_jobs WHERE run_id=? AND job_id=?",
                    (run_id, layout["active_job_id"]))
         ticket = job["value_ticket_number"]
+        if original:
+            # Current obligations need their own mapping; unrelated historical
+            # rows, timing segments and diagnostics remain read-only records.
+            for table in ('work_job_publication_commit_intent', 'work_job_ticket_write_intent',
+                          'work_job_write_intent', 'work_job_run_branch_write_intent',
+                          'work_job_integration_publication_intent', 'work_job_merge_intent',
+                          'work_job_parent_close_intent', 'work_job_ticket_close_intent'):
+                if counts.get(table, 0) and db.execute(
+                        f'SELECT 1 FROM "{table}" WHERE run_id=? AND job_id=? LIMIT 1',
+                        (run_id, job['job_id'])).fetchone():
+                    raise MigrationRefused('unsupported_source_write_authority')
         pending_role = {"developing": Role.DEVELOPMENT, "reviewing": Role.REVIEW,
                         "accepted": Role.PUBLICATION}.get(job["stage"])
         if pending_role is None:
@@ -388,18 +409,25 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 raise MigrationRefused("source_profile_bindings")
             raw = _evidence(db, run_id, returned["evidence_id"],
                             owner=f"attempt:{attempt_id}", kind="returned_result")
-            if not isinstance(raw, dict) or raw.get("thread_id") != thread_id:
+            wire_publication = (original and role == Role.PUBLICATION and isinstance(raw, dict)
+                                and raw.get("kind") == "publication_wire" and set(raw) == {"kind", "artifact"})
+            # Original publication_wire deliberately has no top-level Thread.
+            # The completed Invocation and its requested/reported binding above
+            # remain the authority; preserve the envelope without adding fields.
+            if not isinstance(raw, dict) or not wire_publication and raw.get("thread_id") != thread_id:
                 raise MigrationRefused("source_returned_result")
             if role == Role.DEVELOPMENT:
                 if raw.get("kind") != "development" or not isinstance(raw.get("summary"), str):
                     raise MigrationRefused("source_returned_result")
                 value: Any = {"result_kind": "development", "summary": raw["summary"], "human_blockers": None}
             else:
-                if raw.get("kind") != ("review" if role == Role.REVIEW else "publication"):
+                if not wire_publication and raw.get("kind") != ("review" if role == Role.REVIEW else "publication"):
                     raise MigrationRefused("source_returned_result")
                 value = raw.get("artifact")
             try:
                 normalized = artifact(role, wire_json(value))
+                if wire_publication and normalized.get("result_kind") != "publication":
+                    raise MigrationRefused("unsupported_source_artifact")
             except (KernelError, TypeError, ValueError) as error:
                 raise MigrationRefused("unsupported_source_artifact") from error
             calls.append(_Call(attempt_id, role, attempt["ordinal"], thread_id,
@@ -408,7 +436,7 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
         if (count == 3 and (calls[2].invocation["requested_thread_id"] != calls[0].thread_id
                 or calls[2].thread_id != calls[0].thread_id)):
             raise MigrationRefused("source_publication_thread")
-        if counts.get("work_invocation_segments", 0) or counts.get("work_invocation_wait_intervals", 0):
+        if not original and (counts.get("work_invocation_segments", 0) or counts.get("work_invocation_wait_intervals", 0)):
             raise MigrationRefused("unsupported_source_process")
         budget = _one(db, "SELECT * FROM work_job_review_budget WHERE run_id=? AND job_id=?",
                       (run_id, job["job_id"]))
@@ -416,6 +444,11 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                 or budget["value_reviewer_invocations"] != int(count == 3)
                 or budget["value_final_ci_fix_used"] != 0):
             raise MigrationRefused("unsupported_source_budget")
+        ci = _one(db, "SELECT * FROM work_job_ci_recovery WHERE run_id=? AND job_id=?", (run_id, job['job_id']))
+        if (ci['value_window'] != 1 or any(ci[field] != 0 for field in (
+                'value_developments_used','value_repair_pending','value_review_required','value_reviewer_invocations'))
+                or ci['value_failure_head'] is not None or ci['value_previous_publication_authorization'] is not None):
+            raise MigrationRefused('unsupported_source_ci_history')
         candidate_intent: dict[str, Any] | None = None
         if count == 1:
             intent = _one(db, "SELECT * FROM work_job_candidate_commit_intent WHERE run_id=? AND job_id=?",
@@ -478,20 +511,20 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
                     or not isinstance(identity.get("reviewed_candidate_tree"), str)):
                 raise MigrationRefused("source_review_identity")
             candidate_tree = identity["reviewed_candidate_tree"]
-        evidence = tuple({"evidence_id": row["evidence_id"], "owner_id": row["owner_id"],
+        evidence = () if original else tuple({"evidence_id": row["evidence_id"], "owner_id": row["owner_id"],
                           "kind": row["kind"], "version": row["version"],
                           "source_evidence_id": row["source_evidence_id"],
                           "source_member": row["source_member"],
                           "value": _evidence(db, run_id, row["evidence_id"],
                                              owner=row["owner_id"], kind=row["kind"])}
                          for row in db.execute("SELECT * FROM work_evidence WHERE run_id=? ORDER BY evidence_id", (run_id,)))
-        if len(evidence) != counts["work_evidence"]:
+        if not original and len(evidence) != counts["work_evidence"]:
             raise MigrationRefused("source_evidence")
-        timeline = tuple(dict(row) for row in db.execute(
+        timeline = () if original else tuple(dict(row) for row in db.execute(
             "SELECT e.* FROM run_timeline_slots s JOIN run_timeline_events e "
             "ON e.run_id=s.run_id AND e.event_id=s.event_id "
             "WHERE s.run_id=? AND s.stream='timeline' ORDER BY s.position", (run_id,)))
-        if len(timeline) != counts["run_timeline_events"]:
+        if not original and len(timeline) != counts["run_timeline_events"]:
             raise MigrationRefused("source_timeline")
         return _Active(run_id, run["repository"], run["parent_number"], parent_revision,
                        graph_revision, _created_at_epoch(run["created_at"]), root["value_language"],
@@ -504,6 +537,138 @@ def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
         raise MigrationRefused("source_corrupt") from error
     finally:
         db.close()
+
+
+def _build_returned_candidate(
+    snapshot: SourceSnapshot, facts: _Active, candidate: Path, *, repository_root: Path,
+    checkout: Path, final_checkout: Path, profile_sha: str, remote_source_sha: str,
+    remote_target_sha: str, archive_ref: str | None, original_mode: bool = False,
+) -> Kernel:
+    """Map proved role facts; only Kernel later consumes the returned artifact."""
+    subject = f"ticket:{facts.ticket}"
+    common = repository_root / ".git"
+    spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
+                   facts.graph_revision,
+                   (Delivery(subject, DeliveryKind.TICKET, facts.ticket, "source-verified",
+                             Commit(facts.base_sha, _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
+                             facts.source_ref, f"refs/heads/{facts.run_branch}",
+                             checkout=str(checkout), owned_root=str(checkout.parent),
+                             common_git_dir=str(common)),
+                    Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN, facts.parent_number,
+                             facts.parent_revision, Commit(facts.base_sha,
+                             _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
+                             f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}",
+                             checkout=str(final_checkout), owned_root=str(final_checkout.parent),
+                             common_git_dir=str(common))), facts.policy, facts.language,
+                   str(repository_root), facts.inputs)
+    kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
+    phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review",
+             Role.PUBLICATION: "publish"}[facts.pending_role]
+    with kernel.storage.transaction() as tx:
+        native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
+        tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
+        tx.execute("UPDATE subjects SET phase=?,current_attempt=?,review_attempt=?,"
+                   "development_thread=?,candidate_sha=?,candidate_tree=?,workspace_sha=?,"
+                   "expected_tree=?,integrated_sha=?,integrated_tree=?,integration_target=?,gate_mode=? "
+                   "WHERE id=?", (phase, facts.calls[-1].attempt_id,
+                                  facts.calls[1].attempt_id if facts.pending_role == Role.PUBLICATION else None,
+                                  facts.calls[0].thread_id, facts.candidate_sha, facts.candidate_tree,
+                                  facts.candidate_sha or facts.base_sha, facts.candidate_tree,
+                                  facts.candidate_sha if facts.pending_role == Role.PUBLICATION else None,
+                                  facts.candidate_tree if facts.pending_role == Role.PUBLICATION else None,
+                                  facts.integration_target,
+                                  "review" if facts.pending_role == Role.PUBLICATION else None, subject))
+        tx.execute("UPDATE budgets SET developments_used=1,reviews_used=? "
+                   "WHERE subject=? AND purpose='requirements' AND window=1",
+                   (int(facts.pending_role == Role.PUBLICATION), subject))
+        if facts.pending_role == Role.PUBLICATION:
+            tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
+                       (subject, facts.resync_window, 1, facts.source_ref,
+                        f"refs/heads/{facts.run_branch}", facts.base_sha, facts.integration_target))
+        tx.execute("DELETE FROM history")
+        for event in facts.timeline:
+            at = _created_at_epoch(event["value_at"])
+            payload = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
+                       "values": {key: value for key, value in event.items()
+                                  if key.startswith("value_") and value is not None}}
+            material = tx.put(subject, "v6_timeline_event", wire_json(payload))
+            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
+                       "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}",
+                                               event["event_id"], material, at))
+        for entry in facts.evidence:
+            tx.put(subject, "v6_evidence", wire_json(entry))
+        if facts.candidate_intent is not None:
+            tx.put(subject, "v6_candidate_commit_intent", wire_json(facts.candidate_intent))
+        for binding in facts.bindings:
+            tx.execute("INSERT INTO threads(id,subject,role,profile_revision,backend_id) VALUES (?,?,?,1,?)",
+                       (binding["thread_id"], subject, binding["role"], binding["thread_id"]))
+            tx.put(subject, "v6_thread_binding", wire_json(binding))
+        for index, call in enumerate(facts.calls, start=1):
+            context_witness: dict[str, Any] = {
+                "old_attempt": call.attempt_id,
+                "old_role_ordinal": call.old_ordinal,
+                "input_fingerprint": call.invocation["input_fingerprint"],
+                "bound_version": _wire_row(call.bound_version),
+                "native_authority": {
+                    "kind": "continuation-boundary",
+                    "parent_revision": facts.parent_revision,
+                    "graph_revision": facts.graph_revision,
+                    "revision": native["revision"],
+                    "completion_revision": native["completion_revision"],
+                    "base_sha": facts.base_sha,
+                    "candidate_sha": facts.candidate_sha,
+                    "candidate_tree": facts.candidate_tree,
+                },
+            }
+            if call.role == Role.REVIEW:
+                # The old review_context evidence binds the exact candidate
+                # but contains no reviewer checkout path.  Preserve that
+                # absence instead of claiming the Ticket checkout was it.
+                # Successor Publication consumes the native review identity;
+                # these revisions identify the verified continuation boundary,
+                # while the original bound input remains above unchanged.
+                context_witness.update(
+                    checkout=None, base_sha=facts.base_sha,
+                    reviewed_commit=facts.candidate_sha, reviewed_tree=facts.candidate_tree,
+                    revision=native["revision"], parent_revision=facts.parent_revision,
+                    graph_revision=facts.graph_revision,
+                    completion_revision=native["completion_revision"],
+                )
+            context = tx.put(subject, "v6_attempt_input_witness", wire_json(context_witness))
+            result = tx.put(subject, "v6_normalized_artifact", wire_json(call.native_artifact))
+            tx.execute("""INSERT INTO attempts(
+                id,subject,generation,ordinal,role,purpose,window,parent_revision,graph_revision,
+                revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,
+                context_id,current_invocation,result_id,status,accounted,outcome)
+                VALUES (?,?,1,?,?,'requirements',1,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)""",
+                       (call.attempt_id, subject, index, call.role.value, facts.parent_revision,
+                        facts.graph_revision, native["revision"],
+                        facts.base_sha, facts.candidate_sha, facts.candidate_tree, facts.candidate_tree,
+                        native["completion_revision"], context, result,
+                        "returned" if index == len(facts.calls) else "consumed",
+                        1 if index == 2 and facts.pending_role == Role.PUBLICATION else 0,
+                        None if index == len(facts.calls) else "pass" if index == 2 else "development"))
+            original = {"attempt_id": call.attempt_id, "old_role_ordinal": call.old_ordinal,
+                        "thread_id": call.thread_id, "raw_evidence_id": call.raw_evidence_id,
+                        "returned": call.returned, "invocation": _wire_row(call.invocation),
+                        "bound_version": _wire_row(call.bound_version),
+                        "current_version": _wire_row(call.current_version)}
+            material = tx.put(subject, "v6_imported_invocation", wire_json(original))
+            original_identity = ":".join((facts.run_id, subject, call.invocation["started_at"]))
+            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
+                       "VALUES (?,?,?,?,1,?)", (subject, "imported_invocation", original_identity,
+                                               material, _created_at_epoch(call.invocation["ended_at"])))
+        tx.put(subject, "v6_import_identity", wire_json({
+            "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
+            "source_ref": facts.source_ref, "candidate_sha": facts.candidate_sha,
+            "candidate_tree": facts.candidate_tree, "remote_source_sha": remote_source_sha,
+            "remote_target_sha": remote_target_sha,
+            "archive_ref": archive_ref if facts.candidate_sha is not None else None,
+            "checkout": str(checkout),
+            "mirror_conversion": "candidate-to-remote-base" if facts.candidate_sha is not None and not original_mode else "none",
+            "source_backend": "original-reaped-local" if original_mode else "completed-synchronous-oracle",
+        }))
+    return kernel
 
 
 def convert_returned_role_v6(
@@ -625,128 +790,12 @@ def convert_returned_role_v6(
         if facts.candidate_sha is not None and _git(repository_root, "for-each-ref", "--format=%(refname)", archive_ref):
             raise MigrationRefused("migration_archive_exists")
         subject = f"ticket:{facts.ticket}"
-        spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
-                       facts.graph_revision,
-                       (Delivery(subject, DeliveryKind.TICKET, facts.ticket, "source-verified",
-                                 Commit(facts.base_sha, _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
-                                 facts.source_ref, f"refs/heads/{facts.run_branch}",
-                                 checkout=str(checkout), owned_root=str(checkout.parent),
-                                 common_git_dir=str(common)),
-                        Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN, facts.parent_number,
-                                 facts.parent_revision, Commit(facts.base_sha,
-                                 _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
-                                 f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}",
-                                 checkout=str(final_checkout), owned_root=str(final_checkout.parent),
-                                 common_git_dir=str(common))), facts.policy, facts.language,
-                       str(repository_root), facts.inputs)
         candidate = Path(directory) / "kernel.sqlite3"
-        kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
-        phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review",
-                 Role.PUBLICATION: "publish"}[facts.pending_role]
-        with kernel.storage.transaction() as tx:
-            native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
-            tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
-            tx.execute("UPDATE subjects SET phase=?,current_attempt=?,review_attempt=?,"
-                       "development_thread=?,candidate_sha=?,candidate_tree=?,workspace_sha=?,"
-                       "expected_tree=?,integrated_sha=?,integrated_tree=?,integration_target=?,gate_mode=? "
-                       "WHERE id=?", (phase, facts.calls[-1].attempt_id,
-                                      facts.calls[1].attempt_id if facts.pending_role == Role.PUBLICATION else None,
-                                      facts.calls[0].thread_id, facts.candidate_sha, facts.candidate_tree,
-                                      facts.candidate_sha or facts.base_sha, facts.candidate_tree,
-                                      facts.candidate_sha if facts.pending_role == Role.PUBLICATION else None,
-                                      facts.candidate_tree if facts.pending_role == Role.PUBLICATION else None,
-                                      facts.integration_target,
-                                      "review" if facts.pending_role == Role.PUBLICATION else None, subject))
-            tx.execute("UPDATE budgets SET developments_used=1,reviews_used=? "
-                       "WHERE subject=? AND purpose='requirements' AND window=1",
-                       (int(facts.pending_role == Role.PUBLICATION), subject))
-            if facts.pending_role == Role.PUBLICATION:
-                tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
-                           (subject, facts.resync_window, 1, facts.source_ref,
-                            f"refs/heads/{facts.run_branch}", facts.base_sha, facts.integration_target))
-            tx.execute("DELETE FROM history")
-            for event in facts.timeline:
-                at = _created_at_epoch(event["value_at"])
-                payload = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
-                           "values": {key: value for key, value in event.items()
-                                      if key.startswith("value_") and value is not None}}
-                material = tx.put(subject, "v6_timeline_event", wire_json(payload))
-                tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                           "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}",
-                                                   event["event_id"], material, at))
-            for entry in facts.evidence:
-                tx.put(subject, "v6_evidence", wire_json(entry))
-            if facts.candidate_intent is not None:
-                tx.put(subject, "v6_candidate_commit_intent", wire_json(facts.candidate_intent))
-            for binding in facts.bindings:
-                tx.execute("INSERT INTO threads(id,subject,role,profile_revision,backend_id) VALUES (?,?,?,1,?)",
-                           (binding["thread_id"], subject, binding["role"], binding["thread_id"]))
-                tx.put(subject, "v6_thread_binding", wire_json(binding))
-            for index, call in enumerate(facts.calls, start=1):
-                context_witness: dict[str, Any] = {
-                    "old_attempt": call.attempt_id,
-                    "old_role_ordinal": call.old_ordinal,
-                    "input_fingerprint": call.invocation["input_fingerprint"],
-                    "bound_version": _wire_row(call.bound_version),
-                    "native_authority": {
-                        "kind": "continuation-boundary",
-                        "parent_revision": facts.parent_revision,
-                        "graph_revision": facts.graph_revision,
-                        "revision": native["revision"],
-                        "completion_revision": native["completion_revision"],
-                        "base_sha": facts.base_sha,
-                        "candidate_sha": facts.candidate_sha,
-                        "candidate_tree": facts.candidate_tree,
-                    },
-                }
-                if call.role == Role.REVIEW:
-                    # The old review_context evidence binds the exact candidate
-                    # but contains no reviewer checkout path.  Preserve that
-                    # absence instead of claiming the Ticket checkout was it.
-                    # Successor Publication consumes the native review identity;
-                    # these revisions identify the verified continuation boundary,
-                    # while the original bound input remains above unchanged.
-                    context_witness.update(
-                        checkout=None, base_sha=facts.base_sha,
-                        reviewed_commit=facts.candidate_sha, reviewed_tree=facts.candidate_tree,
-                        revision=native["revision"], parent_revision=facts.parent_revision,
-                        graph_revision=facts.graph_revision,
-                        completion_revision=native["completion_revision"],
-                    )
-                context = tx.put(subject, "v6_attempt_input_witness", wire_json(context_witness))
-                result = tx.put(subject, "v6_normalized_artifact", wire_json(call.native_artifact))
-                tx.execute("""INSERT INTO attempts(
-                    id,subject,generation,ordinal,role,purpose,window,parent_revision,graph_revision,
-                    revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,
-                    context_id,current_invocation,result_id,status,accounted,outcome)
-                    VALUES (?,?,1,?,?,'requirements',1,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)""",
-                           (call.attempt_id, subject, index, call.role.value, facts.parent_revision,
-                            facts.graph_revision, native["revision"],
-                            facts.base_sha, facts.candidate_sha, facts.candidate_tree, facts.candidate_tree,
-                            native["completion_revision"], context, result,
-                            "returned" if index == len(facts.calls) else "consumed",
-                            1 if index == 2 and facts.pending_role == Role.PUBLICATION else 0,
-                            None if index == len(facts.calls) else "pass" if index == 2 else "development"))
-                original = {"attempt_id": call.attempt_id, "old_role_ordinal": call.old_ordinal,
-                            "thread_id": call.thread_id, "raw_evidence_id": call.raw_evidence_id,
-                            "returned": call.returned, "invocation": _wire_row(call.invocation),
-                            "bound_version": _wire_row(call.bound_version),
-                            "current_version": _wire_row(call.current_version)}
-                material = tx.put(subject, "v6_imported_invocation", wire_json(original))
-                original_identity = ":".join((facts.run_id, subject, call.invocation["started_at"]))
-                tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                           "VALUES (?,?,?,?,1,?)", (subject, "imported_invocation", original_identity,
-                                                   material, _created_at_epoch(call.invocation["ended_at"])))
-            tx.put(subject, "v6_import_identity", wire_json({
-                "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
-                "source_ref": facts.source_ref, "candidate_sha": facts.candidate_sha,
-                "candidate_tree": facts.candidate_tree, "remote_source_sha": remote_source_sha,
-                "remote_target_sha": remote_target_sha,
-                "archive_ref": archive_ref if facts.candidate_sha is not None else None,
-                "checkout": str(checkout),
-                "mirror_conversion": "candidate-to-remote-base" if facts.candidate_sha is not None else "none",
-                "source_backend": "completed-synchronous-oracle",
-            }))
+        kernel = _build_returned_candidate(
+            snapshot, facts, candidate, repository_root=repository_root, checkout=checkout,
+            final_checkout=final_checkout, profile_sha=profile_sha, remote_source_sha=remote_source_sha,
+            remote_target_sha=remote_target_sha, archive_ref=archive_ref)
+        phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review", Role.PUBLICATION: "publish"}[facts.pending_role]
         if (kernel.status(subject)["pending_attempt"] != facts.calls[-1].attempt_id
                 or kernel.status(subject)["phase"] != phase):
             raise MigrationRefused("converted_state")
@@ -804,3 +853,204 @@ def convert_returned_role_v6(
                 raise MigrationRefused("copied_mirror_recovery_required") from error
             raise
     return Kernel(destination)
+
+
+def _returned_external(facts: _Active, proof: Mapping[str, Any], source_sha: str) -> None:
+    """Match actual requirements and exact remote refs; no pending write is inferred."""
+    expected = {
+        'parent': {'number': facts.requirements.parent.number, 'title': facts.requirements.parent.title,
+                   'body': facts.requirements.parent.body,
+                   'sub_issue_numbers': list(facts.requirements.parent.sub_issue_numbers),
+                   'sub_issue_order_reliable': facts.requirements.parent.sub_issue_order_reliable},
+        'issues': [{'number': issue.number, 'title': issue.title, 'body': issue.body,
+                    'state': issue.state, 'labels': sorted(issue.labels),
+                    'blocked_by': [{'number': edge.number, 'state': edge.state} for edge in issue.blocked_by]}
+                   for issue in facts.requirements.issues],
+    }
+    if (proof.get('source_kind') != 'returned_role' or proof.get('source_sha256') != source_sha
+            or proof.get('runner_identity') != facts.inputs.runner_identity
+            or proof.get('requirements') != expected
+            or proof.get('remote_heads') != {facts.source_ref: facts.base_sha,
+                'refs/heads/' + facts.run_branch: facts.base_sha,
+                'refs/heads/' + facts.base_branch: facts.base_sha}):
+        raise MigrationRefused('source_returned_external')
+
+
+def _returned_layout(facts: _Active, origin: Mapping[str, str], archive_sha: str) -> dict[str, Any]:
+    managed = ManagedWorkspace.for_repository(facts.repository)
+    checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
+    return {'version': 1, 'nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
+            'source_uuid': origin['source_uuid'], 'repository_root': str(managed.repository_root),
+            'checkout': str(checkout), 'owned_root': str(checkout.parent),
+            'common_git_dir': str(managed.repository_root / '.git'), 'source_ref': facts.source_ref,
+            'expected_oid': facts.candidate_sha or facts.base_sha,
+            'before_head': 'ref: ' + facts.source_ref + '\n', 'checkout_archive_sha256': archive_sha}
+
+
+def _existing_returned_git(snapshot: SourceSnapshot, facts: _Active, destination: Path,
+                           archive: Path, archive_sha: str, index_sha: str, *, detached: bool = False) -> None:
+    """Keep the original clone, refs, dirty content and exact checkout identity."""
+    managed = ManagedWorkspace.for_repository(facts.repository)
+    root = managed.repository_root
+    checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
+    if (managed.open_path() != root or snapshot.source != managed.state_root / 'state.sqlite3'
+            or destination != managed.state_root / facts.run_id / 'kernel.sqlite3'
+            or destination.parent.resolve() != destination.parent
+            or root.is_symlink() or checkout.is_symlink() or checkout.resolve() != checkout):
+        raise MigrationRefused('source_existing_resources')
+    with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        task = read_v6_host_exit(db, facts.run_id, required=True)
+        uuid = _one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?', (facts.run_id,))[0]
+        control = _one(db, 'SELECT run_state_dir FROM control_tasks')
+        if task is None or task.workspace != root or control[0] != str(managed.state_root):
+            raise MigrationRefused('source_existing_identity')
+    marker = root / '.git' / 'agent-run-checkout-id'
+    if (not isinstance(uuid, str) or marker.is_symlink() or not marker.is_file()
+            or marker.stat().st_nlink != 1 or marker.read_bytes() != (uuid + '\n').encode('ascii')):
+        raise MigrationRefused('source_existing_identity')
+    git = LocalGit(root)
+    for ref, oid in ((facts.source_ref, facts.candidate_sha or facts.base_sha),
+                     ('refs/heads/' + facts.run_branch, facts.base_sha),
+                     ('refs/heads/' + facts.base_branch, facts.base_sha)):
+        if (git.run('symbolic-ref', '-q', ref, check=False).returncode != 1
+                or _git(root, 'rev-parse', '--verify', ref) != oid):
+            raise MigrationRefused('source_existing_ref')
+    expected_head = facts.candidate_sha or facts.base_sha
+    shape = git.run('symbolic-ref', '-q', 'HEAD', cwd=checkout, check=False)
+    if (not checkout.is_dir() or _git(root, 'rev-parse', 'HEAD') != facts.base_sha
+            or _git(root, 'status', '--porcelain')
+            or _git(checkout, 'diff', '--cached', '--name-only')
+            or _git(checkout, 'rev-parse', 'HEAD') != expected_head
+            or _git(checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir') != str(root / '.git')
+            or (shape.returncode == 0 and shape.stdout.strip() != facts.source_ref)
+            or shape.returncode not in ({0, 1} if detached else {0})):
+        raise MigrationRefused('source_existing_checkout')
+    worktrees = _git(root, 'worktree', 'list', '--porcelain').strip().split('\n\n')
+    if (len(worktrees) != 2 or {block.splitlines()[0] for block in worktrees}
+            != {'worktree ' + str(root), 'worktree ' + str(checkout)}):
+        raise MigrationRefused('source_existing_worktrees')
+    if facts.candidate_sha is not None and (
+            _git(root, 'rev-parse', facts.candidate_sha + '^{tree}') != facts.candidate_tree
+            or _git(root, 'show', '-s', '--format=%P', facts.candidate_sha) != facts.base_sha):
+        raise MigrationRefused('source_git_ancestry')
+    _verify_checkout_archive(archive, checkout, archive_sha)
+    sealed_index = archive.parent / 'checkout-index'
+    index = Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+    if (index.is_symlink() or index.resolve() != index or not index.is_relative_to(root / '.git' / 'worktrees')
+            or not index.is_file() or index.stat().st_nlink != 1 or index.stat().st_size > 32 * 1024 * 1024
+            or sealed_index.is_symlink() or not sealed_index.is_file() or sealed_index.stat().st_nlink != 1
+            or sealed_index.stat().st_size > 32 * 1024 * 1024
+            or hashlib.sha256(sealed_index.read_bytes()).hexdigest() != index_sha
+            or index.read_bytes() != sealed_index.read_bytes()):
+        raise MigrationRefused('source_checkout_index')
+
+
+def convert_original_returned_v6(snapshot: SourceSnapshot, destination: Path, *,
+                                  profile_snapshot: Path, external_snapshot: Path,
+                                  checkout_archive: Path, source_origin: Mapping[str, str]) -> Kernel:
+    """Prepare original pending raw facts; no source ref, layout or authority is changed."""
+    from .migration_completed import _read_document
+    from .legacy_admission import read_source_fence, source_fence
+    from .migration_layout import verify_layout
+    origin = read_source_fence(source_fence(dict(source_origin)))
+    profile, profile_sha = _read_profile(profile_snapshot)
+    proof, proof_sha = _read_document(external_snapshot)
+    facts = _read_active(snapshot.path, profile, profile_sha, snapshot.sha256, original=True)
+    _require_no_v6_notification_journal(snapshot, facts.run_id)
+    _returned_external(facts, proof, snapshot.sha256)
+    archive_sha = proof.get('checkout_archive_sha256')
+    index_sha = proof.get('checkout_index_sha256')
+    if not isinstance(archive_sha, str) or not isinstance(index_sha, str):
+        raise MigrationRefused('source_checkout_archive')
+    managed = ManagedWorkspace.for_repository(facts.repository)
+    layout = _returned_layout(facts, origin, archive_sha)
+    _existing_returned_git(snapshot, facts, destination, checkout_archive, archive_sha, index_sha)
+    verify_layout(layout, state='attached')
+    if (destination.exists() or destination.is_symlink() or origin['source_db'] != str(snapshot.source)
+            or origin['source_sha256'] != snapshot.sha256 or origin['run_id'] != facts.run_id
+            or origin['target_db'] != str(destination)):
+        raise MigrationRefused('source_original_identity')
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.v6-returned-original-') as directory:
+        candidate = Path(directory) / 'kernel.sqlite3'
+        kernel = _build_returned_candidate(snapshot, facts, candidate,
+            repository_root=managed.repository_root, checkout=Path(layout['checkout']),
+            final_checkout=managed.root / 'worktrees' / facts.run_id / 'run-publication',
+            profile_sha=profile_sha, remote_source_sha=facts.base_sha,
+            remote_target_sha=facts.base_sha, archive_ref=None, original_mode=True)
+        subject = f'ticket:{facts.ticket}'
+        _preserve_copy(snapshot, kernel, run_id=facts.run_id, subject=subject,
+                       profile_document=profile_snapshot.read_bytes(), whole_source=True)
+        with kernel.storage.transaction() as tx:
+            body = {'source_sha256': snapshot.sha256, 'profile_sha256': profile_sha,
+                    'external_readproof_sha256': proof_sha, 'resource_mode': 'existing-verified',
+                    'original_layout': layout, 'checkout_index_sha256': index_sha,
+                    'source_record': {'table': 'work_jobs', 'key': [facts.run_id, f'ticket:{facts.ticket}:generation:1']},
+                    'run_ref': 'refs/heads/' + facts.run_branch,
+                    'run_ref_ownership': {'source_ref': 'refs/heads/' + facts.run_branch, 'expected_oid': facts.base_sha,
+                                          'source_record': {'table': 'run_root', 'key': [facts.run_id]}}}
+            for kind, identity, payload in (
+                    ('v6_returned_import', snapshot.sha256, body),
+                    ('v6_original_cutover', origin['nonce'], origin),
+                    ('v6_original_layout', origin['nonce'], layout),
+                    ('v6_external_readproof', proof_sha, proof)):
+                material = tx.put(subject, kind, wire_json(payload))
+                tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
+                           'VALUES (?,?,?,?,1,?)', (subject, kind, identity, material, kernel.clock()))
+        _existing_returned_git(snapshot, facts, destination, checkout_archive, archive_sha, index_sha)
+        if _read_profile(profile_snapshot)[1] != profile_sha or _read_document(external_snapshot)[1] != proof_sha:
+            raise MigrationRefused('source_documents_changed')
+        descriptor = os.open(candidate, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.link(candidate, destination)
+        descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return Kernel(destination)
+
+
+def _seal_returned_checkout(facts: _Active, archive: Path) -> tuple[str, str]:
+    """Seal file bytes of the original stopped checkout, including dirty work."""
+    managed = ManagedWorkspace.for_repository(facts.repository)
+    checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
+    paths = sorted(path for path in checkout.rglob('*') if '.git' not in path.relative_to(checkout).parts)
+    if any(path.is_symlink() or not (path.is_file() or path.is_dir()) for path in paths):
+        raise MigrationRefused('source_checkout_archive')
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode='w:') as bundle:
+        for path in paths:
+            if path.is_file():
+                physical = path.stat()
+                if physical.st_nlink != 1 or physical.st_size > 16 * 1024 * 1024:
+                    raise MigrationRefused('source_checkout_archive')
+                body = path.read_bytes()
+                item = tarfile.TarInfo(path.relative_to(checkout).as_posix())
+                item.size, item.mode = len(body), physical.st_mode & 0o777
+                bundle.addfile(item, io.BytesIO(body))
+                if output.tell() > 32 * 1024 * 1024:
+                    raise MigrationRefused('source_checkout_archive')
+    body = output.getvalue()
+    digest = hashlib.sha256(body).hexdigest()
+    with archive.open('xb') as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    _verify_checkout_archive(archive, checkout, digest)
+    index = Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+    if (index.is_symlink() or index.resolve() != index
+            or not index.is_relative_to(managed.repository_root / '.git' / 'worktrees')
+            or not index.is_file() or index.stat().st_nlink != 1 or index.stat().st_size > 32 * 1024 * 1024):
+        raise MigrationRefused('source_checkout_index')
+    body = index.read_bytes()
+    with (archive.parent / 'checkout-index').open('xb') as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if index.read_bytes() != body:
+        raise MigrationRefused('source_checkout_index')
+    return digest, hashlib.sha256(body).hexdigest()

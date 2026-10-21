@@ -33,7 +33,8 @@ from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _offline_source, _source_blocks,
                         restore_v6, capture_v6, source_identity)
 from .legacy_admission import legacy_task_lock, read_source_fence, source_fence
-from .migration_active import _read_profile
+from .migration_active import (_Active, _read_active, _read_profile, _returned_external,
+                               _returned_layout, _existing_returned_git, convert_original_returned_v6)
 from .migration_completed import (_Completed, convert_completed_ticket_v6, _existing_completed_git,
                                   _read_completed, _read_document)
 from .migration_quiescence import read_v6_host_exit
@@ -458,9 +459,88 @@ def _original_protocol(source: Path) -> str:
     return str(rows[0][1])
 
 
+def _read_original_facts(path: Path, profile: dict[str, Any], profile_sha: str,
+                         source_sha: str, readproof: dict[str, Any] | None) -> _Completed | _Active:
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        active = db.execute('SELECT status FROM runs').fetchone()[0] == 'active'
+    if active:
+        facts = _read_active(path, profile, profile_sha, source_sha, original=True)
+        if readproof is not None:
+            _returned_external(facts, readproof, source_sha)
+        return facts
+    return _read_completed(path, profile, profile_sha, source_sha, readproof)
+
+
+def _original_refs(facts: _Completed | _Active) -> dict[str, str]:
+    if isinstance(facts, _Active):
+        return {'refs/heads/' + facts.run_branch: facts.base_sha,
+                'refs/heads/' + facts.base_branch: facts.base_sha,
+                facts.source_ref: facts.candidate_sha or facts.base_sha}
+    return {'refs/heads/' + facts.run_branch: facts.integrated_sha,
+            'refs/heads/' + facts.base_branch: facts.base_sha,
+            'refs/heads/' + facts.ticket_branch: facts.publication_sha if facts.pending_resources else '0' * len(facts.base_sha)}
+
+
+def _original_returned_prepared(native: Kernel, receipt: dict[str, str], task: TaskKey,
+                                facts: _Active, readproof: dict[str, Any] | None) -> dict[str, Any]:
+    if (readproof is None or not isinstance(readproof.get('checkout_archive_sha256'), str)
+            or not isinstance(readproof.get('checkout_index_sha256'), str)):
+        raise MigrationRefused('source_checkout_archive')
+    expected_layout = _returned_layout(facts, receipt, readproof['checkout_archive_sha256'])
+    with native.storage.transaction(write=False) as tx:
+        run = tx.one('SELECT id,repository,parent_issue,repository_root,executor,stopped FROM runs')
+        if (run['id'] != receipt['run_id'] or run['repository_root'] != str(task.workspace)
+                or run['repository'] != task.repository or run['parent_issue'] != task.parent_number
+                or native.storage.path.resolve() != Path(receipt['target_db'])):
+            raise MigrationRefused('native_original_cutover_provenance')
+        if (run['executor'] is not None or run['stopped'] or any(tx.one(f'SELECT count(*) FROM {table}')[0]
+                for table in ('actions','hosts','invocations','leases','retired_executors','worker_activity','effects','resource_cleanup'))):
+            raise MigrationRefused('native_original_cutover_advanced')
+        imported = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_returned_import'")
+        body = json.loads(tx.get(imported['material_id'], imported['subject']))
+        origin = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_original_cutover' AND identity=?", (receipt['nonce'],))
+        observed = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_external_readproof'")
+        layout = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_original_layout' AND identity=?", (receipt['nonce'],))
+        if (tx.get(origin['material_id'], origin['subject']) != wire_json(receipt)
+                or body.get('source_sha256') != receipt['source_sha256']
+                or body.get('profile_sha256') != facts.inputs.provenance['profile_sha256']
+                or body.get('resource_mode') != 'existing-verified'
+                or body.get('original_layout') != expected_layout
+                or body.get('checkout_index_sha256') != readproof['checkout_index_sha256']
+                or tx.get(layout['material_id'], layout['subject']) != wire_json(expected_layout)
+                or tx.get(observed['material_id'], observed['subject']) != wire_json(readproof)):
+            raise MigrationRefused('native_original_cutover_provenance')
+        subject = tx.one('SELECT id,generation,phase,current_attempt,candidate_sha,candidate_tree,workspace_sha FROM subjects')
+        phase = {'development':'development','review':'review','publication':'publish'}[facts.pending_role.value]
+        if (subject['id'] != f'ticket:{facts.ticket}' or subject['generation'] != 1 or subject['phase'] != phase
+                or subject['current_attempt'] != facts.calls[-1].attempt_id
+                or subject['candidate_sha'] != facts.candidate_sha or subject['candidate_tree'] != facts.candidate_tree
+                or subject['workspace_sha'] != (facts.candidate_sha or facts.base_sha)
+                or tx.rows('SELECT subject FROM completions')
+                or tx.rows('SELECT subject FROM final_barriers') or tx.rows('SELECT subject FROM retired_generations')):
+            raise MigrationRefused('native_original_cutover_advanced')
+        attempts = tx.rows('SELECT id,role,status,current_invocation,result_id,accounted FROM attempts ORDER BY ordinal')
+        if len(attempts) != len(facts.calls):
+            raise MigrationRefused('native_original_cutover_advanced')
+        for index, (attempt, call) in enumerate(zip(attempts, facts.calls, strict=True)):
+            if (attempt['id'] != call.attempt_id or attempt['role'] != call.role.value
+                    or attempt['status'] != ('returned' if index == len(facts.calls)-1 else 'consumed')
+                    or attempt['current_invocation'] is not None
+                    or attempt['accounted'] != int(index == 1 and len(facts.calls) == 3)
+                    or tx.get(attempt['result_id'], subject['id']) != wire_json(call.native_artifact)):
+                raise MigrationRefused('native_original_cutover_advanced')
+        if tuple(tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject=? AND purpose='requirements' AND window=1",
+                        (subject['id'],))) != (1, int(len(facts.calls) == 3)):
+            raise MigrationRefused('native_original_cutover_advanced')
+    return expected_layout
+
+
 def _original_prepared(native: Kernel, receipt: dict[str, str], task: TaskKey,
-                       facts: _Completed) -> None:
+                       facts: _Completed | _Active, readproof: dict[str, Any] | None = None) -> None:
     """Require this unpublished, unexecuted candidate and all three source proofs."""
+    if isinstance(facts, _Active):
+        _original_returned_prepared(native, receipt, task, facts, readproof)
+        return
     with native.storage.transaction(write=False) as tx:
         run = tx.one('SELECT id,repository,parent_issue,repository_root,executor,stopped FROM runs')
         if (run['id'] != receipt['run_id'] or run['executor'] is not None or run['stopped']
@@ -604,7 +684,7 @@ def migrate_completed_original_v6(
     observation_snapshot: Path | None = None, original_report: Path | None = None,
     external_snapshot: Path | None = None,
 ) -> Kernel:
-    """Transfer one settled original Task to the same managed clone's native DB.
+    """Transfer one authenticated original Task unit to its managed clone's native DB.
 
     All source evidence remains preserved. A crash after source retirement is
     recovered only with the original receipt/nonce and still-unexecuted target;
@@ -634,7 +714,7 @@ def migrate_completed_original_v6(
                 run_id, uuid = db.execute('SELECT run_id,value_checkout_identity FROM run_root').fetchone()
             profile, profile_sha = _read_profile(profile_snapshot)
             readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
-            facts = _read_completed(checked.path, profile, profile_sha, snapshot.sha256, readproof)
+            facts = _read_original_facts(checked.path, profile, profile_sha, snapshot.sha256, readproof)
             if (facts.run_id != run_id or facts.repository != task.repository
                     or facts.parent_number != task.parent_number):
                 raise MigrationRefused('source_original_identity')
@@ -659,22 +739,42 @@ def migrate_completed_original_v6(
                 if retired:
                     raise MigrationRefused('native_original_cutover_missing')
                 destination.parent.mkdir(mode=0o700, exist_ok=True)
-                native = convert_completed_ticket_v6(
-                    accepted, destination, git_store=managed.repository_root / '.git',
-                    repository_root=managed.repository_root, final_checkout=final,
-                    profile_snapshot=profile_snapshot, github_snapshot=github_snapshot,
-                    observation_snapshot=observation_snapshot, original_report=original_report,
-                    existing_verified=True, source_origin=receipt, external_snapshot=external_snapshot)
-            _original_prepared(native, receipt, task, facts)
+                if isinstance(facts, _Active):
+                    if external_snapshot is None:
+                        raise MigrationRefused('source_external_readback_required')
+                    native = convert_original_returned_v6(accepted, destination,
+                        profile_snapshot=profile_snapshot, external_snapshot=external_snapshot,
+                        checkout_archive=external_snapshot.parent / 'checkout.tar', source_origin=receipt)
+                else:
+                    native = convert_completed_ticket_v6(
+                        accepted, destination, git_store=managed.repository_root / '.git',
+                        repository_root=managed.repository_root, final_checkout=final,
+                        profile_snapshot=profile_snapshot, github_snapshot=github_snapshot,
+                        observation_snapshot=observation_snapshot, original_report=original_report,
+                        existing_verified=True, source_origin=receipt, external_snapshot=external_snapshot)
+            _original_prepared(native, receipt, task, facts, readproof)
             reader = LocalGit(managed.repository_root)
             with ExitStack() as refs:
-                for ref, sha in sorted({f'refs/heads/{facts.run_branch}': facts.integrated_sha,
-                                        f'refs/heads/{facts.base_branch}': facts.base_sha,
-                                        f'refs/heads/{facts.ticket_branch}': facts.publication_sha if facts.pending_resources else '0' * len(facts.base_sha)}.items()):
+                for ref, sha in sorted(_original_refs(facts).items()):
                     refs.enter_context(_hold_ref(reader, managed.repository_root, ref, sha))
-                _existing_completed_git(accepted, checked.path, facts, destination,
-                                        managed.repository_root, final, managed.repository_root / '.git')
+                layout = None
+                if isinstance(facts, _Active):
+                    from .migration_layout import verify_layout, detach_layout
+                    layout = _original_returned_prepared(native, receipt, task, facts, readproof)
+                    assert external_snapshot is not None and readproof is not None
+                    _existing_returned_git(accepted, facts, destination, external_snapshot.parent / 'checkout.tar',
+                                           layout['checkout_archive_sha256'], readproof['checkout_index_sha256'], detached=True)
+                    verify_layout(layout)
+                else:
+                    _existing_completed_git(accepted, checked.path, facts, destination,
+                                            managed.repository_root, final, managed.repository_root / '.git')
                 _retire_original(source, checked.path, receipt, retired=retired)
+                if layout is not None:
+                    detach_layout(layout)
+                    assert isinstance(facts, _Active) and external_snapshot is not None and readproof is not None
+                    _existing_returned_git(accepted, facts, destination, external_snapshot.parent / 'checkout.tar',
+                                           layout['checkout_archive_sha256'], readproof['checkout_index_sha256'], detached=True)
+                    verify_layout(layout, state='detached')
                 if read_task(location) != prior:
                     raise MigrationRefused('native_task_binding_changed')
                 bind_task(location, run_id, destination)
@@ -722,7 +822,7 @@ def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
                 run_id, uuid = db.execute('SELECT run_id,value_checkout_identity FROM run_root').fetchone()
             profile, profile_sha = _read_profile(managed.state_root / 'profiles' / (run_id + '.json'))
             readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
-            facts = _read_completed(checked.path, profile, profile_sha, snapshot.sha256, readproof)
+            facts = _read_original_facts(checked.path, profile, profile_sha, snapshot.sha256, readproof)
             if facts.repository != task.repository or facts.parent_number != task.parent_number:
                 raise MigrationRefused('source_original_identity')
             destination = managed.state_root / run_id / 'kernel.sqlite3'
@@ -733,9 +833,10 @@ def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
                 'nonce': nonce, 'source_db': str(source), 'source_sha256': snapshot.sha256,
                 'run_id': run_id, 'task_fingerprint': task.fingerprint,
                 'source_uuid': uuid, 'target_db': str(destination)}))
-            _original_prepared(native, receipt, task, facts)
+            _original_prepared(native, receipt, task, facts, readproof)
             with native.storage.transaction(write=False) as tx:
-                imported = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_completed_import'")
+                import_kind = "v6_returned_import" if isinstance(facts, _Active) else "v6_completed_import"
+                imported = tx.one("SELECT subject,material_id FROM history WHERE kind=?", (import_kind,))
                 body = json.loads(tx.get(imported['material_id'], imported['subject']))
                 if body['profile_sha256'] != profile_sha:
                     raise MigrationRefused('source_profile_changed')
@@ -751,16 +852,23 @@ def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
                 raise MigrationRefused('source_original_fence_changed')
             reader = LocalGit(managed.repository_root)
             with ExitStack() as refs:
-                for ref, sha in sorted({f'refs/heads/{facts.run_branch}': facts.integrated_sha,
-                                        f'refs/heads/{facts.base_branch}': facts.base_sha,
-                                        f'refs/heads/{facts.ticket_branch}': facts.publication_sha if facts.pending_resources else '0' * len(facts.base_sha)}.items()):
+                for ref, sha in sorted(_original_refs(facts).items()):
                     refs.enter_context(_hold_ref(reader, managed.repository_root, ref, sha))
                 accepted = SourceSnapshot(source, checked.path, checked.sha256, checked.source_protocol,
                                           checked.schema_sha256, checked.table_rows)
-                _existing_completed_git(accepted, checked.path, facts, destination,
-                                        managed.repository_root,
-                                        managed.root / 'worktrees' / run_id / 'run-publication',
-                                        managed.repository_root / '.git')
+                layout = None
+                if isinstance(facts, _Active):
+                    from .migration_layout import verify_layout, restore_layout
+                    layout = _original_returned_prepared(native, receipt, task, facts, readproof)
+                    assert external_snapshot is not None and readproof is not None
+                    _existing_returned_git(accepted, facts, destination, external_snapshot.parent / 'checkout.tar',
+                                           layout['checkout_archive_sha256'], readproof['checkout_index_sha256'], detached=True)
+                    verify_layout(layout)
+                else:
+                    _existing_completed_git(accepted, checked.path, facts, destination,
+                                            managed.repository_root,
+                                            managed.root / 'worktrees' / run_id / 'run-publication',
+                                            managed.repository_root / '.git')
                 # Prove source quiescence/rows before withdrawing its successor.
                 # The same locks remain held through both durable boundaries.
                 _retire_original(source, checked.path, receipt, retired=protocol != _OLD_PROTOCOL,
@@ -771,6 +879,12 @@ def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
                         tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
                                    'VALUES (?,?,?,?,1,?)', (imported['subject'], 'v6_original_rollback_started',
                                                            nonce, material, native.clock()))
+                if layout is not None:
+                    restore_layout(layout)
+                    assert isinstance(facts, _Active) and external_snapshot is not None and readproof is not None
+                    _existing_returned_git(accepted, facts, destination, external_snapshot.parent / 'checkout.tar',
+                                           layout['checkout_archive_sha256'], readproof['checkout_index_sha256'])
+                    verify_layout(layout, state='attached')
                 _withdraw_original_pointer(location, run_id, destination)
                 _retire_original(source, checked.path, receipt, retired=protocol != _OLD_PROTOCOL,
                                  release=True)

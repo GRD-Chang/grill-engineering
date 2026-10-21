@@ -109,6 +109,7 @@ def test_offline_recovery_requires_its_original_operation_before_any_mutation(
 
 def test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
     tmp_path: Path, git_repo: Path, *, current_pr_base: bool = False,
+    default_observation: str = 'original',
 ) -> None:
     # The unchanged GhGitHubPublisher must produce the ID through its real
     # command adapter. No SQL field or old returned ownership is rewritten.
@@ -130,6 +131,19 @@ def test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
         # Keep original SQL, Review base and managed Git untouched.
         service['pr_base_sha'] = json.loads(paths['report'].read_text())['integrated_sha']
         (tmp_path / 'close-service.json').write_text(json.dumps(service))
+    if default_observation != 'original':
+        external = json.loads(paths['github'].read_text())
+        original_default = external['default_head_sha']
+        tree = subprocess.run(['git', '-C', str(managed.repository_root), 'rev-parse',
+                               original_default + '^{tree}'], check=True, capture_output=True, text=True).stdout.strip()
+        commit = ['git', '-C', str(managed.repository_root), 'commit-tree', tree]
+        if default_observation == 'append':
+            commit.extend(['-p', original_default])
+        observed_default = ('f' * 40 if default_observation == 'missing' else subprocess.run(
+            commit, input='External default change\n', check=True,
+            capture_output=True, text=True).stdout.strip())
+        service['remote_default_sha'] = observed_default
+        (tmp_path / 'close-service.json').write_text(json.dumps(service))
     assert 'publisher-close-intent:' in service['comments'][0]['body']
     commands = [json.loads(line) for line in (tmp_path / 'close-service-calls.jsonl').read_text().splitlines()]
     assert sum(arguments[:3] == ['issue', 'close', '2'] for arguments in commands) == 1
@@ -145,6 +159,17 @@ def test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
         sys.executable, '-m', 'agent_run_kernel.migration_cutover',
         '--repo', 'example/project', '--parent', '1', '--evidence-dir', str(destination),
     ], env=environment, text=True, capture_output=True, timeout=20)
+    if default_observation in {'rewrite', 'missing'}:
+        assert observed.returncode == 1, observed.stdout + observed.stderr
+        failure = json.loads(observed.stdout)
+        expected = ('source_external_default_object' if default_observation == 'missing'
+                    else 'source_external_default_ancestry')
+        assert failure['status'] == 'refused' and failure['code'] == expected
+        assert paths['database'].read_bytes() == source_bytes
+        assert _git_bytes(managed.repository_root) == before_git
+        assert not (managed.state_root / run_id / 'kernel.sqlite3').exists()
+        assert read_task(task_path(TaskKey(managed.repository_root, 'example/project', 1))) is None
+        return
     assert observed.returncode == 0, observed.stdout + observed.stderr
     result = json.loads(observed.stdout)
     assert result['status'] == 'migrated' and result['source']['run_id'] == run_id
@@ -176,6 +201,11 @@ def test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
         with closing(sqlite3.connect(destination / 'source.sqlite3')) as captured:
             historical_base = captured.execute('SELECT value_sha FROM run_condition_base').fetchone()[0]
         assert historical_base != service['pr_base_sha']
+        if default_observation != 'original':
+            assert proof['remote_heads']['refs/heads/main'] == observed_default
+            assert observed_default != historical_base
+            assert subprocess.run(['git', '-C', str(managed.repository_root), 'rev-parse', 'refs/heads/main'],
+                                  check=True, capture_output=True, text=True).stdout.strip() == historical_base
         with kernel.storage.transaction(write=False) as tx:
             assert {row['base_sha'] for row in tx.rows(
                 "SELECT base_sha FROM attempts WHERE role='review'")} == {historical_base}
@@ -188,6 +218,21 @@ def test_offline_apply_accepts_proved_merge_as_current_pr_base_without_rewriting
 ) -> None:
     test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
         tmp_path, git_repo, current_pr_base=True)
+
+
+def test_offline_default_remote_append_preserves_historical_local_ownership(
+    tmp_path: Path, git_repo: Path,
+) -> None:
+    test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
+        tmp_path, git_repo, current_pr_base=True, default_observation='append')
+
+
+@pytest.mark.parametrize('observation', ['rewrite', 'missing'])
+def test_offline_default_remote_requires_available_descendant_commit(
+    tmp_path: Path, git_repo: Path, observation: str,
+) -> None:
+    test_offline_apply_reconciles_real_old_dispatched_close_without_replay(
+        tmp_path, git_repo, current_pr_base=True, default_observation=observation)
 
 
 def test_offline_cli_resumes_then_returns_unadvanced_original_authority(

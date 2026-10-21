@@ -11,19 +11,21 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import base64
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 from agent_run.managed_workspace import ManagedWorkspace, ManagedWorkspaceError, normalize_repository
 from agent_run.paths import app_data_root
 from agent_run.task_identity import TaskKey
 
 from .migration import SOURCE_PROTOCOL, SOURCE_TABLES, source_identity
+from .migration_quiescence import read_v6_host_exit
 from .model import KernelError, wire_json
-from .storage import Storage
+from .storage import Storage, Transaction
 from .task_location import locked_task, read_task, task_path
 
 
@@ -126,6 +128,69 @@ def origin_reference(database: Path, task: TaskKey, run_id: str) -> dict[str, st
         return {"origin_db": value["origin_db"], "nonce": value["nonce"]}
 
 
+def _returned_transfer_identity(tx: Transaction, imported: sqlite3.Row, body: dict[str, Any],
+                                receipt: dict[str, str], managed: ManagedWorkspace,
+                                db: sqlite3.Connection) -> None:
+    """Authenticate immutable conversion facts, without reauthorizing a live checkout."""
+    run_id = receipt["run_id"]
+    jobs = db.execute("SELECT j.job_id,j.value_ticket_number,j.value_ticket_branch,j.value_candidate_sha,j.value_base_sha "
+                      "FROM work_jobs j JOIN work_job_layout l ON l.run_id=j.run_id AND l.active_job_id=j.job_id "
+                      "WHERE j.run_id=?", (run_id,)).fetchall()
+    roots = db.execute("SELECT r.value_run_branch,b.value_sha FROM run_root r "
+                       "JOIN run_condition_base b ON b.run_id=r.run_id WHERE r.run_id=?", (run_id,)).fetchall()
+    if len(jobs) != 1 or len(roots) != 1:
+        raise _refuse()
+    factory = db.row_factory
+    try:
+        db.row_factory = sqlite3.Row
+        read_v6_host_exit(db, run_id, required=True)
+    finally:
+        db.row_factory = factory
+    job, root = jobs[0], roots[0]
+    ticket, source_ref = job[1], "refs/heads/" + job[2]
+    if (type(ticket) is not int or ticket < 1 or job[0] != f"ticket:{ticket}:generation:1"
+            or imported["subject"] != f"ticket:{ticket}" or imported["generation"] != 1
+            or imported["identity"] != receipt["source_sha256"] or imported["purpose"] != "v6_returned_import"
+            or body.get("source_record") != {"table": "work_jobs", "key": [run_id, job[0]]}):
+        raise _refuse()
+    for key in ("profile_sha256", "external_readproof_sha256", "checkout_index_sha256"):
+        value = body.get(key)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise _refuse()
+    layout = body.get("original_layout")
+    if not isinstance(layout, dict):
+        raise _refuse()
+    archive = layout.get("checkout_archive_sha256")
+    if not isinstance(archive, str) or len(archive) != 64 or any(c not in "0123456789abcdef" for c in archive):
+        raise _refuse()
+    checkout = managed.state_root / "worktrees" / run_id / f"ticket-{ticket}"
+    expected = {"version": 1, "nonce": receipt["nonce"], "source_sha256": receipt["source_sha256"],
+                "source_uuid": receipt["source_uuid"], "repository_root": str(managed.repository_root),
+                "checkout": str(checkout), "owned_root": str(checkout.parent),
+                "common_git_dir": str(managed.repository_root / ".git"), "source_ref": source_ref,
+                "expected_oid": job[3] or job[4], "before_head": "ref: " + source_ref + "\n",
+                "checkout_archive_sha256": archive}
+    saved_layout = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
+                          "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_original_layout'")
+    observed = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
+                      "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_external_readproof'")
+    proof_bytes = tx.get(observed["material_id"], observed["subject"])
+    proof = json.loads(proof_bytes)
+    if (layout != expected or body.get("run_ref") != "refs/heads/" + root[0]
+            or body.get("run_ref_ownership") != {"source_ref": "refs/heads/" + root[0], "expected_oid": root[1],
+                                                 "source_record": {"table": "run_root", "key": [run_id]}}
+            or saved_layout["subject"] != imported["subject"] or saved_layout["identity"] != receipt["nonce"]
+            or saved_layout["purpose"] != "v6_original_layout"
+            or tx.get(saved_layout["material_id"], saved_layout["subject"]) != wire_json(expected)
+            or observed["subject"] != imported["subject"] or observed["purpose"] != "v6_external_readproof"
+            or observed["identity"] != body["external_readproof_sha256"]
+            or hashlib.sha256(proof_bytes).hexdigest() != observed["identity"]
+            or proof.get("source_kind") != "returned_role" or proof.get("source_sha256") != receipt["source_sha256"]
+            or proof.get("checkout_archive_sha256") != archive
+            or proof.get("checkout_index_sha256") != body["checkout_index_sha256"]):
+        raise _refuse()
+
+
 def _original_transfer(task: TaskKey, source: _Source, path: Path,
                        db: sqlite3.Connection, protocol: str) -> dict[str, str] | None:
     """Verify the retired source and its initial native proof; never interpret old work."""
@@ -156,19 +221,30 @@ def _original_transfer(task: TaskKey, source: _Source, path: Path,
         raise _refuse()
     with Storage(origin).transaction(write=False) as tx:
         proof = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_original_cutover'")
-        imported = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h JOIN material m ON m.id=h.material_id WHERE h.kind='v6_completed_import'")
+        imports = tx.rows("SELECT h.subject,h.kind,h.identity,h.material_id,h.generation,m.purpose FROM history h "
+                          "JOIN material m ON m.id=h.material_id WHERE h.kind IN ('v6_completed_import','v6_returned_import')", limit=2)
+        if len(imports) != 1 or tx.rows("SELECT identity FROM history WHERE kind='v6_original_rollback_started' LIMIT 1"):
+            raise _refuse()
+        imported = imports[0]
         records = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h JOIN material m ON m.id=h.material_id WHERE h.kind='v6_record_import'")
         imported_body = json.loads(tx.get(imported["material_id"], imported["subject"]))
         record_body = json.loads(tx.get(records["material_id"], records["subject"]))
         if (tx.get(proof["material_id"], proof["subject"]) != wire_json(receipt)
-                or imported["identity"] != receipt["run_id"] or imported["purpose"] != "v6_completed_import_identity"
                 or imported_body.get("source_sha256") != receipt["source_sha256"]
                 or imported_body.get("resource_mode") != "existing-verified"
-                or imported_body.get("copied_repository_root") != str(transferred.workspace)
                 or records["identity"] != receipt["run_id"] or records["purpose"] != "v6_record_manifest"
                 or record_body.get("source", {}).get("sha256") != receipt["source_sha256"]
                 or record_body.get("source", {}).get("run_id") != receipt["run_id"]):
             raise _refuse()
+        if imported["kind"] == "v6_completed_import":
+            if (imported["identity"] != receipt["run_id"] or imported["purpose"] != "v6_completed_import_identity"
+                    or imported_body.get("copied_repository_root") != str(transferred.workspace)):
+                raise _refuse()
+        else:
+            if (proof["subject"] != imported["subject"] or records["subject"] != imported["subject"]
+                    or imported_body.get("profile_sha256") != record_body.get("documents", {}).get("profile", {}).get("sha256")):
+                raise _refuse()
+            _returned_transfer_identity(tx, imported, imported_body, receipt, managed, db)
     if transferred != task:
         return None  # The sole retired old Task cannot authorize or block another Parent.
     current = read_task(task_path(task))

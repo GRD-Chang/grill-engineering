@@ -26,7 +26,7 @@ if args[:2]==['repo','view']:
     print(json.dumps({'nameWithOwner':external['repository'],
                       'defaultBranchRef':{'name':external['default_branch']}}))
 elif args[:2]==['api','repos/example/project/commits/main']:
-    print(json.dumps({'sha':external['default_head_sha']}))
+    print(json.dumps({'sha':data.get('remote_default_sha',external['default_head_sha'])}))
 elif args[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for index,value in enumerate(args)
                 if index and args[index-1] in ('-F','-f'))
@@ -100,7 +100,8 @@ args=sys.argv[1:]
 if args[:1]==['ls-remote']:
     root=Path(os.environ['V6_CLOSE_SERVICE']).parent
     data=json.loads((root/'source/github.json').read_text())
-    branches={**data['delivery']['published_branches'],data['default_branch']:data['default_head_sha']}
+    service=json.loads((root/'close-service.json').read_text())
+    branches={**data['delivery']['published_branches'],data['default_branch']:service.get('remote_default_sha',data['default_head_sha'])}
     for ref in args[args.index('--')+2:]:
         if ref.startswith('refs/heads/') and ref[11:] in branches:
             print(branches[ref[11:]]+'\\t'+ref)

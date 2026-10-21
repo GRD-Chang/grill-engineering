@@ -68,7 +68,9 @@ def _sync_directory(path: Path) -> None:
 
 def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path, *,
                          external: bool = False) -> tuple[dict[str, Any], SourceSnapshot]:
-    """Collect one settled original completion without changing its authority."""
+    """Collect one supported original unit without changing its authority."""
+    from .migration_active import _Active, _existing_returned_git, _seal_returned_checkout
+    from .migration_cutover import _read_original_facts
     managed = ManagedWorkspace.for_repository(repository)
     task = TaskKey(managed.repository_root, managed.repository, parent_number)
     destination = evidence_dir.absolute()
@@ -86,76 +88,86 @@ def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path
         destination.mkdir(mode=0o700)
         snapshot = capture_v6(managed.state_root / 'state.sqlite3', destination / 'source.sqlite3')
         with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
-            runs = db.execute('SELECT run_id,repository,parent_number FROM runs').fetchmany(2)
-        if (len(runs) != 1 or runs[0][1:] != (task.repository, task.parent_number)
-                or not isinstance(runs[0][0], str)
-                or re.fullmatch(r'run-[1-9][0-9]*-[0-9a-f]{16}', runs[0][0]) is None):
-            raise MigrationRefused('source_original_identity')
-        run_id = runs[0][0]
+            db.row_factory = sqlite3.Row
+            runs = db.execute('SELECT run_id,repository,parent_number,status FROM runs').fetchmany(2)
+            if (len(runs) != 1 or tuple(runs[0])[1:3] != (task.repository, task.parent_number)
+                    or not isinstance(runs[0][0], str)
+                    or re.fullmatch(r'run-[1-9][0-9]*-[0-9a-f]{16}', runs[0][0]) is None):
+                raise MigrationRefused('source_original_identity')
+            run_id = runs[0][0]
+            root = db.execute('SELECT * FROM run_root WHERE run_id=?', (run_id,)).fetchone()
+            job = db.execute('SELECT j.* FROM work_jobs j JOIN work_job_layout l ON l.run_id=j.run_id AND l.active_job_id=j.job_id WHERE j.run_id=?', (run_id,)).fetchone()
+            base = db.execute('SELECT value_branch FROM run_condition_base WHERE run_id=?', (run_id,)).fetchone()
+            if root is None or job is None or base is None:
+                raise MigrationRefused('source_original_identity')
+            returned = runs[0]['status'] == 'active'
+            ticket, pr_number = job['value_ticket_number'], job['value_pr_number']
+            if type(ticket) is not int or ticket < 1 or (not returned and (type(pr_number) is not int or pr_number < 1)):
+                raise MigrationRefused('source_original_identity')
+            runner = _completed_evidence(db, run_id, root['value_runner_github_identity'],
+                                         owner='run:' + run_id, kind='runner_github_identity')
+            run_ref, ticket_ref = 'refs/heads/' + root['value_run_branch'], 'refs/heads/' + job['value_ticket_branch']
+            base_ref = 'refs/heads/' + base['value_branch']
+            clone_uuid = root['value_checkout_identity']
         profile_path = managed.state_root / 'profiles' / (run_id + '.json')
         profile, profile_sha = _read_profile(profile_path)
-        readproof = None
+        readproof: dict[str, Any] | None = None
         if external:
-            with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
-                db.row_factory = sqlite3.Row
-                root = db.execute('SELECT * FROM run_root WHERE run_id=?', (run_id,)).fetchone()
-                job = db.execute('SELECT j.* FROM work_jobs j JOIN work_job_layout l ON l.run_id=j.run_id AND l.active_job_id=j.job_id WHERE j.run_id=?', (run_id,)).fetchone()
-                base = db.execute('SELECT value_branch FROM run_condition_base WHERE run_id=?', (run_id,)).fetchone()
-                if root is None or job is None or base is None:
-                    raise MigrationRefused('source_original_identity')
-                ticket, pr_number = job['value_ticket_number'], job['value_pr_number']
-                if type(ticket) is not int or ticket < 1 or type(pr_number) is not int or pr_number < 1:
-                    raise MigrationRefused('source_original_identity')
-                runner = _completed_evidence(db, run_id, root['value_runner_github_identity'],
-                                             owner='run:' + run_id, kind='runner_github_identity')
-                run_ref = 'refs/heads/' + root['value_run_branch']
-                ticket_ref = 'refs/heads/' + job['value_ticket_branch']
-                base_ref = 'refs/heads/' + base['value_branch']
             reader = GhGitHubReader(repository, working_directory=managed.repository_root, runner_identity=runner)
             requirements = read_requirements(reader, parent_number)
-            before = read_pull_request_facts(reader, pr_number)
-            close = read_issue_close_facts(reader, ticket)
+            before = None if returned else read_pull_request_facts(reader, pr_number)
+            close = None if returned else read_issue_close_facts(reader, ticket)
             run_head, base_head = read_remote_heads(managed.repository_root, run_ref, base_ref, runner_identity=runner)
             ticket_head, repeated_base = read_remote_heads(managed.repository_root, ticket_ref, base_ref, runner_identity=runner)
             if base_head != repeated_base:
                 raise MigrationRefused('source_external_refs')
-            after = read_pull_request_facts(reader, pr_number)
+            after = None if returned else read_pull_request_facts(reader, pr_number)
             readproof = {'source_sha256': snapshot.sha256, 'runner_identity': runner,
-                         'close': close, 'pr_before': before, 'pr_after': after,
                          'requirements': {'parent': asdict(requirements.parent), 'issues': [
                              {**asdict(issue), 'labels': sorted(issue.labels)} for issue in requirements.issues]},
                          'remote_heads': {run_ref: run_head, ticket_ref: ticket_head, base_ref: base_head}}
+            if returned:
+                readproof['source_kind'] = 'returned_role'
+            else:
+                readproof.update(close=close, pr_before=before, pr_after=after)
             readproof = json.loads(wire_json(readproof))
-            _write(destination / 'external-readproof.json', wire_json(readproof))
-        facts = _read_completed(snapshot.path, profile, profile_sha, snapshot.sha256, readproof)
+        facts = _read_original_facts(snapshot.path, profile, profile_sha, snapshot.sha256, readproof)
         target = managed.state_root / run_id / 'kernel.sqlite3'
         if target.exists() or target.is_symlink():
             raise MigrationRefused('native_original_candidate_exists')
-        final = managed.root / 'worktrees' / run_id / 'run-publication'
-        _existing_completed_git(snapshot, snapshot.path, facts, target,
-                                managed.repository_root, final, managed.repository_root / '.git')
+        if isinstance(facts, _Active):
+            archive_sha, index_sha = _seal_returned_checkout(facts, destination / 'checkout.tar')
+            _existing_returned_git(snapshot, facts, target, destination / 'checkout.tar', archive_sha, index_sha)
+            if readproof is not None:
+                readproof.update(checkout_archive_sha256=archive_sha, checkout_index_sha256=index_sha)
+            run_oid = facts.base_sha
+        else:
+            _existing_completed_git(snapshot, snapshot.path, facts, target, managed.repository_root,
+                managed.root / 'worktrees' / run_id / 'run-publication', managed.repository_root / '.git')
+            run_oid = facts.integrated_sha
+        if readproof is not None:
+            _write(destination / 'external-readproof.json', wire_json(readproof))
         profile_body = profile_path.read_bytes()
         if hashlib.sha256(profile_body).hexdigest() != profile_sha:
             raise MigrationRefused('source_profile_changed')
         _write(destination / 'profile.json', profile_body)
-        with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
-            clone_uuid = db.execute('SELECT value_checkout_identity FROM run_root WHERE run_id=?',
-                                    (run_id,)).fetchone()[0]
-        result = {
+        result: dict[str, Any] = {
             'status': 'inspection_only', 'external_status': 'verified' if external else 'not_read',
             'source': {'path': str(snapshot.source), 'run_id': run_id,
                        'sha256': snapshot.sha256, 'task_fingerprint': task.fingerprint},
             'profile': {'source_path': str(profile_path), 'sha256': profile_sha},
             'git': {'repository_root': str(managed.repository_root), 'clone_uuid': clone_uuid,
                     'common_git_dir': str(managed.repository_root / '.git'),
-                    'run_ref': 'refs/heads/' + facts.run_branch, 'run_head': facts.integrated_sha,
-                    'default_ref': 'refs/heads/' + facts.base_branch, 'default_head': facts.base_sha},
+                    'run_ref': run_ref, 'run_head': run_oid,
+                    'default_ref': base_ref, 'default_head': facts.base_sha},
             'supported_source': {'ticket': facts.ticket, 'generation': 1, 'review_window': 1,
-                                 'physical_scope': 'reaped-local',
-                                 'developments_used': facts.developments_used,
-                                 'reviews_used': facts.reviews_used},
+                                 'physical_scope': 'reaped-local'},
             'evidence_dir': str(destination),
         }
+        if isinstance(facts, _Active):
+            result['supported_source'].update(kind='returned_role', role=facts.pending_role.value)
+        else:
+            result['supported_source'].update(developments_used=facts.developments_used, reviews_used=facts.reviews_used)
         _write(destination / 'inspection.json', wire_json(result))
         _sync_directory(destination)
         return result, snapshot

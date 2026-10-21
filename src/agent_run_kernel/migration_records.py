@@ -52,16 +52,21 @@ def _name(value: str) -> str:
     return '"' + value + '"'
 
 
-def _scope(table: str, columns: Sequence[str], run_id: str) -> tuple[str, tuple[str, ...]]:
+def _scope(table: str, columns: Sequence[str], run_id: str, *, whole_source: bool = False) -> tuple[str, tuple[str, ...]]:
     if table == 'schema_meta':
         return '', ()
     if table == 'work_evidence_materials':
+        if whole_source:
+            return '', ()
         return (' WHERE material_id IN (SELECT material_id FROM work_evidence '
                 'WHERE run_id=? AND material_id IS NOT NULL)', (run_id,))
-    if table in CONTROL_TABLES:
+    if table in CONTROL_TABLES or 'task_id' in columns:
         return (' WHERE task_id IN (SELECT task_id FROM control_tasks WHERE run_id=?)', (run_id,))
     if 'run_id' in columns:
         return ' WHERE run_id=?', (run_id,)
+    if whole_source:
+        # Global metadata in this one-Run source is data, never authority.
+        return '', ()
     raise MigrationRefused('source_record_scope')
 
 
@@ -79,8 +84,13 @@ def preserve_v6_records(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str
 
 
 def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, subject: str,
-                   profile_document: bytes | None = None) -> None:
-    """The mapper passes its already captured, privately owned source copy."""
+                   profile_document: bytes | None = None, whole_source: bool = False) -> None:
+    """Copy records from an already captured source, without execution authority.
+
+    whole_source requires every source row in the one-Run database. The public
+    reader retains its scoped Run/material-reference export. Admission and
+    source retirement are decided separately by the canonical Task cutover.
+    """
     with kernel.storage.transaction(write=False) as tx:
         if (tx.one('SELECT id,executor FROM runs')['id'] != run_id
                 or tx.one('SELECT executor FROM runs')[0] is not None
@@ -112,7 +122,8 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
     with closing(sqlite3.connect(snapshot.path.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
         db.row_factory = sqlite3.Row
         parameters: tuple[str, ...]
-        if db.execute('SELECT count(*) FROM runs WHERE run_id=?', (run_id,)).fetchone()[0] != 1:
+        if ((whole_source and db.execute('SELECT count(*) FROM runs').fetchone()[0] != 1)
+                or db.execute('SELECT count(*) FROM runs WHERE run_id=?', (run_id,)).fetchone()[0] != 1):
             raise MigrationRefused('source_record_identity')
         if profile_document is not None:
             if len(profile_document) > 4 * 1024 * 1024:
@@ -126,15 +137,16 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
         for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
             info = [dict(row) for row in db.execute(f'PRAGMA table_info({_name(table)})')]
             names = [entry['name'] for entry in info]
-            if table not in RECORD_TABLES:
-                where, parameters = (' WHERE run_id=?', (run_id,)) if 'run_id' in names else ('', ())
-                if db.execute(f'SELECT 1 FROM {_name(table)}{where} LIMIT 1', parameters).fetchone():
-                    raise MigrationRefused('unsupported_source_relations')
-                continue
+            if whole_source and 'run_id' in names and db.execute(
+                    f'SELECT 1 FROM {_name(table)} WHERE run_id IS NOT ? LIMIT 1', (run_id,)).fetchone():
+                raise MigrationRefused('source_record_scope')
             primary = [entry['name'] for entry in sorted(info, key=lambda entry: entry['pk']) if entry['pk']]
             if not primary or len(names) > 256:
                 raise MigrationRefused('source_record_schema')
-            where, parameters = _scope(table, names, run_id)
+            where, parameters = _scope(table, names, run_id, whole_source=whole_source)
+            if (whole_source and db.execute(f'SELECT count(*) FROM {_name(table)}{where}', parameters).fetchone()[0]
+                    != db.execute(f'SELECT count(*) FROM {_name(table)}').fetchone()[0]):
+                raise MigrationRefused('source_record_scope')
             sizes = '+'.join(f'CASE WHEN typeof({_name(name)}) IN (\'text\',\'blob\') '
                              f'THEN length(CAST({_name(name)} AS BLOB)) ELSE 16 END' for name in names)
             largest = db.execute(f'SELECT coalesce(max({sizes}),0) FROM {_name(table)}{where}', parameters).fetchone()[0]

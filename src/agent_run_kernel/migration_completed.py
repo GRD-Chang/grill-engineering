@@ -67,6 +67,7 @@ class _Completed:
     physical_invocations: int
     close_readproof: dict[str, Any] | None = None
     pending_resources: bool = False
+    observed_default_sha: str | None = None
 
 
 def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, repository: str,
@@ -144,7 +145,8 @@ def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, reposito
         heads = readproof['remote_heads']
         if (set(heads) != {'refs/heads/' + branch for branch in (run_branch, ticket_branch, base_branch)}
                 or heads['refs/heads/' + run_branch] != integrated_sha
-                or heads['refs/heads/' + base_branch] != base_sha
+                or not isinstance(heads['refs/heads/' + base_branch], str)
+                or re.fullmatch(r'[0-9a-f]{40}', heads['refs/heads/' + base_branch]) is None
                 or heads['refs/heads/' + ticket_branch] not in {publication_sha, None}):
             raise MigrationRefused('source_external_refs')
         return {'event': after[0], 'comment': matching[0],
@@ -635,7 +637,8 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
                           timeline, _wire_row(dict(close_intent)),
                           _wire_row(dict(close_owner)), budget["value_development_attempts"],
                           budget["value_reviewer_invocations"], physical_invocations,
-                          close_readproof, pending_resources)
+                          close_readproof, pending_resources,
+                          None if readproof is None else readproof['remote_heads']['refs/heads/' + base['value_branch']])
     except sqlite3.Error as error:
         raise MigrationRefused("source_corrupt") from error
     finally:
@@ -736,6 +739,16 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
             or marker.stat().st_size != 33 or marker.read_bytes() != uuid.encode('ascii') + b'\n'):
         raise MigrationRefused('source_existing_identity')
     reader = LocalGit(root)
+    # The live default observation grants no ownership of a changed local ref.
+    # Prove append-only ancestry from existing immutable objects; never fetch or
+    # move the historical checkout to make an observation acceptable.
+    if facts.observed_default_sha is not None and facts.observed_default_sha != facts.base_sha:
+        observed = reader.run('cat-file', '-t', facts.observed_default_sha, check=False)
+        if observed.returncode != 0 or observed.stdout.strip() != 'commit':
+            raise MigrationRefused('source_external_default_object')
+        if reader.run('merge-base', '--is-ancestor', facts.base_sha,
+                      facts.observed_default_sha, check=False).returncode != 0:
+            raise MigrationRefused('source_external_default_ancestry')
     for ref, sha in ((f'refs/heads/{facts.run_branch}', facts.integrated_sha),
                      (f'refs/heads/{facts.base_branch}', facts.base_sha)):
         if (reader.run('symbolic-ref', '-q', ref, check=False).returncode != 1
@@ -1111,7 +1124,7 @@ def convert_completed_ticket_v6(
             if hashlib.sha256(profile_body).hexdigest() != profile_sha:
                 raise MigrationRefused("source_document_changed")
             _preserve_copy(copied, kernel, run_id=facts.run_id, subject=subject,
-                           profile_document=profile_body)
+                           profile_document=profile_body, whole_source=origin is not None)
             if origin is not None:
                 reader = V6RecordReader(kernel)
                 original_root = reader.row('run_root', [facts.run_id])
