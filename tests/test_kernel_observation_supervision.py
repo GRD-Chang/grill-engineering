@@ -34,18 +34,26 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
     step = driver.advance("parent:1")
 
     assert step.kind == "waiting" and step.call is None and step.effect is None
-    assert kernel.scheduling()["next_deadline_at"] == now + 600
+    assert step.retry_at == now + 5
+    assert kernel.scheduling()["next_deadline_at"] == step.retry_at
     assert kernel.status("parent:1")["gates"] == []
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM attempts")
         assert not tx.rows("SELECT id FROM effects")
+        window = tx.one("SELECT started_at,deadline,next_retry_at FROM waits WHERE subject=? AND kind=?",
+                        ("parent:1", "github_convergence"))
+        assert window["started_at"] == now and window["deadline"] == now + 600
+        assert window["next_retry_at"] == step.retry_at
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()][previous_calls:]
     assert observed_calls and not any("--method" in call for call in observed_calls)
     first_wait_calls = calls.read_text()
     repeated = driver.advance("parent:1")
     assert repeated.kind == "waiting" and repeated.retry_at == step.retry_at
     assert calls.read_text() == first_wait_calls
-    assert kernel.scheduling()["next_deadline_at"] == now + 600
+    assert kernel.scheduling()["next_deadline_at"] == step.retry_at
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT deadline FROM waits WHERE subject=? AND kind=?",
+                      ("parent:1", "github_convergence"))[0] == now + 600
     # A later read can converge without changing the original PR or dispatching
     # anything. The ordinary loop, rather than an execute retry, owns that read.
     document["prs"][0]["head"]["sha"] = published.head.sha
