@@ -374,7 +374,7 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
     before = _snapshot(tmp_path)
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
-    completed = subprocess.run([sys.executable, "-m", "agent_run_kernel.query_cli", *_arguments(kernel, "status", "--json")],
+    completed = subprocess.run([sys.executable, "-m", "agent_run_kernel", *_arguments(kernel, "status", "--json")],
                                text=True, capture_output=True, env=env, timeout=15, check=False)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["run_id"] == "run-query"

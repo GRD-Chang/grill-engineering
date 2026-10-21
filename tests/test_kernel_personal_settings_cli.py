@@ -7,14 +7,39 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
-from agent_run.cli import main as old_main
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel.query_cli import main
+
+
+def old_main(arguments: list[str]) -> int:
+    """Execute the unchanged oracle in another process, never native dead code."""
+    configured = os.environ.get("AGENT_RUN_SETTINGS_ORACLE_SRC")
+    if not configured:
+        pytest.fail("Set AGENT_RUN_SETTINGS_ORACLE_SRC to the immutable unchanged-02 CLI source; no oracle is skipped")
+    source = Path(configured)
+    expected = {
+        "cli.py": "bb705bec1cb40b890876f5ac4c7c2389af6f9419405e9e7ad2c7b5be24efda7c",
+        "agent_profiles.py": "e4c2adb94ae5c348a6f1c54012f0d712831fd4d0bf410590cfe48eccffd486be",
+        "delivery_policy.py": "f5da6897e2095066214105f1dc219d3eae2c8ff1540c4d3904f06768fc0a1027",
+        "user_defaults.py": "069233d34f2cbc1fe30d87144a4eb7caa85987f0c3831c08a3af2b5241cf72c6",
+    }
+    for name, digest in expected.items():
+        assert hashlib.sha256((source / "agent_run" / name).read_bytes()).hexdigest() == digest
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source)
+    result = subprocess.run([sys.executable, "-m", "agent_run.cli", *arguments],
+        env=environment, text=True, capture_output=True, timeout=20, check=False)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 @pytest.fixture
@@ -178,10 +203,10 @@ def test_personal_plain_output_uses_real_language_and_does_not_send_or_open_runs
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Personal settings attempted Run/online work")
 
-    monkeypatch.setattr("agent_run_kernel.query_cli._candidates", forbidden)
-    monkeypatch.setattr("subprocess.run", forbidden)
     assert old_main(["settings", "show"]) == 0
     old = capsys.readouterr().out
+    monkeypatch.setattr("agent_run_kernel.query_cli._candidates", forbidden)
+    monkeypatch.setattr("subprocess.run", forbidden)
     assert main(["settings", "show"]) == 0
     assert capsys.readouterr().out == old
     assert "User text / 用户原文" in old
