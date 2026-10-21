@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import base64
 import json
 import math
@@ -56,6 +57,10 @@ def _timestamp(value: Any) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise QueryError("incompatible_run_state", "Invalid recorded timestamp")
+    try:
+        datetime.fromtimestamp(value, UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise QueryError("incompatible_run_state", "Recorded timestamp is outside the supported calendar range") from error
     return float(value)
 
 
@@ -96,7 +101,10 @@ def discover(root: Path) -> list[dict[str, Any]]:
         raise QueryError("run_locator_invalid", "State directory is a symbolic link")
     paths: list[Path] = [root] if root.is_file() else []
     if root.is_dir():
-        for visited, (directory, _children, files) in enumerate(os.walk(root, followlinks=False)):
+        def unreadable(error: OSError) -> None:
+            raise QueryError("run_locator_invalid", f"Cannot read state directory: {error}") from error
+
+        for visited, (directory, _children, files) in enumerate(os.walk(root, followlinks=False, onerror=unreadable)):
             if visited >= 4096:
                 raise QueryError("query_limit", "Discovery directory limit; provide --state-dir")
             if "kernel.sqlite3" in files:

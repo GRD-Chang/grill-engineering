@@ -35,6 +35,51 @@ _COPY = {
            "global": "Whole Delivery Run", "unknown_live": "Executor liveness is unconfirmed; querying does not resume or stop work"},
 }
 
+_TERMS = {
+    "zh": {"development": "开发", "developing": "开发", "review": "验收", "reviewing": "验收", "publish": "准备发布文案",
+           "publication_pending": "准备发布文案", "candidate": "保存候选", "integration": "集成检查", "workspace": "准备工作区",
+           "ready_publication": "准备发布", "publication_commit": "保存发布提交", "push": "推送发布成果", "pr_write": "创建或更新 PR",
+           "checks": "等待必需检查", "waiting_checks": "等待必需检查", "approval": "等待最终批准", "merge": "合并", "merging": "合并",
+           "completion_comment": "记录完成说明", "close": "Issue 收尾", "closing": "Issue 收尾", "complete": "业务已完成", "completed": "业务已完成",
+           "parallel": "多个对象并行", "requirements": "需求实现", "ci": "CI 修复", "abandoned": "已放弃",
+           "ticket_completed": "子任务已完成", "ready_for_human": "等待人工处理", "parent_approval_pending": "完整需求待批准",
+           "run_approval_pending": "最终 Run 待批准", "run_acceptance_pending": "整体修复或验收", "run_publication_pending": "最终 Run 发布",
+           "parent_delivery_pending": "完整需求交付", "human_blocker": "需要人工答复", "operator_stopped": "已主动停止",
+           "execution_failed": "执行失败", "supervision_timeout": "监督等待超时", "requeue_required": "需求已变，需重新排队",
+           "review_budget_exhausted": "验收额度耗尽", "modification_budget_exhausted": "开发额度耗尽",
+           "ci_development_budget_exhausted": "CI 修复额度耗尽", "worker_unavailable": "Worker 不可用",
+           "write_result_unknown": "原写入结果未确认", "write_conflict": "发现第三方写入", "final_approval": "需要最终批准",
+           "source_refreshed": "需求观察已记录", "agent_allocated": "调用已分配，尚无启动证明", "agent_dispatched": "调用已派发",
+           "worker_started": "执行进程绑定已记录", "worker_exited": "准确进程退出已记录", "raw_returned": "原始返回已耐久保存",
+           "role_consumed": "本轮结果已处理", "paused": "遇到人工边界", "human_response": "人工答复", "control_applied": "控制请求已应用",
+           "checks_observed": "必需检查观察", "ci_failed": "必需检查未通过", "effect_prepared": "操作意图已保存",
+           "effect_dispatched": "外部操作已派发", "effect_observed": "操作结果已读回", "effect_consumed": "操作结果已处理",
+           "generation_requeued": "已建立新工作代次", "final_activated": "进入整体交付", "budget_renewed": "额度窗口已显式续期",
+           "resource_retired": "资源清理已确认", "cleanup_pending": "交付后仍有资源待清理", "boundary_update": "适用工作边界已更新",
+           "issue_link_acknowledged": "可选 Issue 分支关联已确认"},
+    "en": {"development": "Development", "developing": "Development", "review": "Review", "reviewing": "Review", "publish": "Publication narrative",
+           "publication_pending": "Publication narrative", "candidate": "Saving candidate", "integration": "Integration checks", "workspace": "Preparing checkout",
+           "ready_publication": "Preparing publication", "publication_commit": "Saving publication commit", "push": "Publishing branch", "pr_write": "Creating or updating PR",
+           "checks": "Waiting for required checks", "waiting_checks": "Waiting for required checks", "approval": "Waiting for final approval", "merge": "Merging", "merging": "Merging",
+           "completion_comment": "Recording completion", "close": "Closing Issue", "closing": "Closing Issue", "complete": "Business completed", "completed": "Business completed",
+           "parallel": "Concurrent work subjects", "requirements": "Requirements", "ci": "CI repair", "abandoned": "Abandoned",
+           "ticket_completed": "Ticket completed", "ready_for_human": "Waiting for human action", "parent_approval_pending": "Parent awaiting approval",
+           "run_approval_pending": "Final Run awaiting approval", "run_acceptance_pending": "Whole-Run repair or review", "run_publication_pending": "Final Run publication",
+           "parent_delivery_pending": "Parent delivery", "human_blocker": "Human response required", "operator_stopped": "Operator stopped",
+           "execution_failed": "Execution failed", "supervision_timeout": "Supervision timed out", "requeue_required": "Requirements changed; requeue required",
+           "review_budget_exhausted": "Review allowance exhausted", "modification_budget_exhausted": "Development allowance exhausted",
+           "ci_development_budget_exhausted": "CI repair allowance exhausted", "worker_unavailable": "Worker unavailable",
+           "write_result_unknown": "Original write outcome unconfirmed", "write_conflict": "Third-party write observed", "final_approval": "Final approval required",
+           "source_refreshed": "Requirements observation recorded", "agent_allocated": "Call allocated, without start evidence", "agent_dispatched": "Call dispatched",
+           "worker_started": "Execution process binding recorded", "worker_exited": "Exact process exit recorded", "raw_returned": "Original return durably stored",
+           "role_consumed": "Round result consumed", "paused": "Operator boundary", "human_response": "Human response", "control_applied": "Control request applied",
+           "checks_observed": "Required checks observed", "ci_failed": "Required checks failed", "effect_prepared": "Operation intent stored",
+           "effect_dispatched": "External operation dispatched", "effect_observed": "Operation result read back", "effect_consumed": "Operation result consumed",
+           "generation_requeued": "New work generation created", "final_activated": "Whole-Run delivery activated", "budget_renewed": "Allowance explicitly renewed",
+           "resource_retired": "Resource retirement confirmed", "cleanup_pending": "Business completed with resource cleanup pending", "boundary_update": "Applicable work boundary updated",
+           "issue_link_acknowledged": "Optional Issue branch link acknowledged"},
+}
+
 
 def _safe(value: object) -> str:
     content = str(value)
@@ -47,7 +92,10 @@ def _safe(value: object) -> str:
 def _time(value: float | None) -> tuple[str | None, str]:
     if value is None:
         return None, "UTC"
-    stamp = datetime.fromtimestamp(value, UTC)
+    try:
+        stamp = datetime.fromtimestamp(value, UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise QueryError("incompatible_run_state", "Recorded timestamp is outside the supported calendar range") from error
     try:
         local = stamp.astimezone()
         return local.isoformat(timespec="seconds"), str(local.tzinfo)
@@ -64,7 +112,10 @@ def _findings(value: Any) -> Iterator[str]:
         return
     if value.get("human_blockers"):
         yield _body(value["human_blockers"])
-    for lane in value.get("checks", {}).values():
+    checks = value.get("checks")
+    if not isinstance(checks, Mapping):
+        return
+    for lane in checks.values():
         if isinstance(lane, Mapping) and lane.get("status") in {"fail", "blocked"}:
             for finding in lane.get("findings", []):
                 yield _body(finding)
@@ -72,6 +123,7 @@ def _findings(value: Any) -> Iterator[str]:
 
 def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     copy = _COPY[document.language]
+    terms = _TERMS[document.language]
     data = document.data
     if document.kind == "runs":
         if not data["runs"]:
@@ -84,14 +136,14 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{copy['run']}: {data['repository']} Parent #{data['parent']['number']}"
     if data["parent"]["title"]:
         yield data["parent"]["title"]
-    yield f"{copy['status']}: {copy.get(data['status'], data['status'])} | {copy['phase']}: {data['phase']}"
+    yield f"{copy['status']}: {terms.get(data['status'], copy.get(data['status'], data['status']))} | {copy['phase']}: {terms.get(data['phase'], data['phase'])}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
     # Put actionable current boundaries before long Findings/evidence.
     for action in data["operator_actions"]:
         scope = copy["local"] if action["scope"] == "ticket" else copy["global"]
         target = f"#{action['issue']}" if action.get("issue") else data["repository"]
-        yield f"{copy['gates']}: {target} — {action['reason']} ({copy['scope']}: {scope})"
+        yield f"{copy['gates']}: {target} — {terms.get(action['reason'], action['reason'])} ({copy['scope']}: {scope})"
         command = f"agent-run {action['action']} {data['parent']['number']} --repo {data['repository']}"
         if action["scope"] == "ticket" and action["action"] == "resume":
             command += f" --ticket {action['issue']}"
@@ -101,10 +153,11 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     if not data["operator_actions"]:
         yield f"{copy['next']}: {copy.get(data['next_action'], data['next_action']) or copy['complete']}"
     for job in data["subjects"]:
-        yield f"{copy['subject']}: #{job['issue']} {job['title'] or ''} — {job['phase']} ({job['purpose']})"
+        yield f"{copy['subject']}: #{job['issue']} {job['title'] or ''} — {terms.get(job['phase'], job['phase'])} ({terms.get(job['purpose'], job['purpose'])})"
         pending = job["pending_attempt"]
         if pending:
-            yield f"{copy['agent']}: {copy.get(pending['role'], pending['role'])} #{pending['ordinal']}"
+            label = ("触发待办的 Agent" if document.language == "zh" else "Agent that triggered this boundary") if job["gates"] else copy["agent"]
+            yield f"{label}: {copy.get(pending['role'], pending['role'])} #{pending['ordinal']}"
             for invocation in pending["invocations"]:
                 yield f"  {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
                 if invocation["started_at"] is not None:
@@ -112,7 +165,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
         for budget in job["budgets"]:
             review_limit = budget["review_limit"] if budget["review_limit"] is not None else copy["unknown"]
-            yield (f"  {copy['budget']}: {budget['purpose']} W{budget['window']} "
+            yield (f"  {copy['budget']}: {terms.get(budget['purpose'], budget['purpose'])} W{budget['window']} "
                    f"D {budget['developments_used']}/{budget['development_limit']} R {budget['reviews_used']}/{review_limit}")
         if job["delivery_cleanup"]:
             cleanup = job["delivery_cleanup"]
@@ -123,20 +176,38 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 yield f"{copy['findings']}: {finding}"
     if document.kind == "history":
         yield copy["history"]
+        attempts = {row["id"]: row for row in data["semantic_agent_attempts"]}
+        invocations = {row["id"]: row for row in data["agent_invocations"]}
+        shown: set[str] = set()
+        milestones = {"source_refreshed", "final_activated", "role_consumed", "paused", "human_response", "control_applied",
+                      "checks_observed", "ci_failed", "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending"}
         for event in data["timeline"]:
+            if not details and event["kind"] not in milestones:
+                continue
+            invocation = invocations.get(event["identity"])
+            attempt = attempts.get(event["identity"]) or (attempts.get(invocation["attempt"]) if invocation else None)
+            if attempt and attempt["id"] not in shown:
+                shown.add(attempt["id"])
+                yield f"{attempt['subject']} {copy.get(attempt['role'], attempt['role'])} #{attempt['ordinal']} ({terms.get(attempt['purpose'], attempt['purpose'])})"
             stamp, zone = _time(event["created_at"])
-            yield f"{stamp or copy['unknown']} [{zone}] {event['subject']} {event['kind']}"
+            yield f"{stamp or copy['unknown']} [{zone}] {event['subject']} {terms.get(event['kind'], event['kind'])}"
             evidence = event["evidence"]
             if event["kind"] in {"human_response", "paused"} and evidence is not None:
                 content = _body(evidence)
                 yield content if details or len(content) <= 1000 else content[:1000] + " [truncated; --details]"
             elif details and evidence is not None:
                 yield f"  {copy['evidence']}: {_body(evidence)}"
+            if event["kind"] == "role_consumed":
+                for finding in _findings(evidence):
+                    yield f"{copy['findings']}: {finding if details or len(finding) <= 1000 else finding[:1000] + ' [truncated; --details]'}"
         if details:
             for attempt in data["semantic_agent_attempts"]:
                 yield f"{attempt['subject']} {copy.get(attempt['role'], attempt['role'])} #{attempt['ordinal']}: {attempt['status']}"
                 if attempt["artifact"] is not None:
                     yield _body(attempt["artifact"])
+            for invocation in data["agent_invocations"]:
+                yield f"{invocation['attempt']} — {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
+                yield f"  {copy['duration']}: {copy['incomplete']}"
         if data["history_page"]["has_more"]:
             yield f"{copy['more']}: --after {data['history_page']['next_after']}"
 

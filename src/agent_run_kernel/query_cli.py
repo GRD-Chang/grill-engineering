@@ -70,9 +70,7 @@ def _cwd_repository() -> str | None:
 
 def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
     default_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "agent-run"
-    roots = [parsed.data_root or default_root]
-    if parsed.state_dir is not None:
-        roots.append(parsed.state_dir)
+    roots = [parsed.state_dir] if parsed.state_dir is not None else [parsed.data_root or default_root]
     result: dict[str, dict[str, Any]] = {}
     for root in roots:
         for candidate in discover(root):
@@ -128,12 +126,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         render(document, style=style, details=getattr(parsed, "details", False), stream=sys.stdout)
         return 0
     except QueryError as error:
-        output: dict[str, Any] = {"result": "error", "status": "command_failed",
+        error_output: dict[str, Any] = {"result": "error", "status": "command_failed",
                   "diagnostics": [{"code": error.code, "message": str(error)}]}
         if error.candidates:
-            output["candidates"] = error.candidates
+            error_output["candidates"] = error.candidates
         if parsed.as_json:
-            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(error_output, ensure_ascii=False, sort_keys=True))
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
             print(f"{prefix}: {error.code}\n{str(error)}")

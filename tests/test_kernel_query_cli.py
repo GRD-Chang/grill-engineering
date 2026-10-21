@@ -115,6 +115,31 @@ def test_runs_filters_repository_and_parent_without_creating_an_index(tmp_path: 
     assert _snapshot(tmp_path) == before
 
 
+def test_explicit_state_directory_selects_its_clone_without_scanning_other_roots(tmp_path: Path, capsys) -> None:
+    catalog = tmp_path / "catalog"
+    first = _create(catalog / "first")
+    second = _create(catalog / "second")
+    _human(first, "First clone decision")
+    _human(second, "Explicit clone decision")
+    before = _snapshot(tmp_path)
+    assert main(["status", "run-query", "--data-root", str(catalog), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_conflict"
+    assert main(_arguments(second, "status", "--data-root", str(catalog), "--json")) == 0
+    selected = json.loads(capsys.readouterr().out)
+    assert selected["subjects"][0]["pending_attempt"]["result"]["human_blockers"] == ["Explicit clone decision"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_unrepresentable_recorded_time_returns_diagnostic_without_modifying_storage(tmp_path: Path, capsys) -> None:
+    kernel = _create(tmp_path)
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE runs SET created_at=?", (1e300,))
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--plain")) == 2
+    assert "incompatible_run_state" in capsys.readouterr().out
+    assert _snapshot(tmp_path) == before
+
+
 def test_missing_run_language_is_rejected_without_using_personal_defaults(tmp_path: Path, capsys) -> None:
     kernel = _create(tmp_path, language=None)
     before = _snapshot(tmp_path)
