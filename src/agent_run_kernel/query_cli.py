@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from .query import QueryDocument, QueryError, discover, read
 from .query_render import render
@@ -97,8 +97,7 @@ def _select(parsed: argparse.Namespace, candidates: list[dict[str, Any]]) -> lis
     if parsed.command == "runs":
         return sorted(matches, key=lambda item: (item["repository"], item["parent"], item["run_id"]))
     if not exact and parsed.parent is None:
-        matches = [item for item in matches if item["stopped"] or item["blocked"] or
-                   any(phase not in {"complete", "abandoned"} for phase in item["phases"])]
+        matches = [item for item in matches if not item["is_terminal"]]
     if not matches:
         raise QueryError("run_locator_missing", "No matching Run; use runs to inspect candidates")
     if len(matches) != 1:
@@ -119,17 +118,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             document = QueryDocument("runs", language, {"result": "runs", "runs": selected})
         else:
             candidate = selected[0]
-            kind = "history" if parsed.command == "history" else "status"
+            kind: Literal["history", "status"] = "history" if parsed.command == "history" else "status"
             document = read(Path(candidate["database"]), kind,
                             after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", 128),
                             expected_run=candidate["run_id"], expected_repository=candidate["repository"].lower())
-        style = "json" if parsed.as_json else "rich" if (not getattr(parsed, "plain", False)
+        style: Literal["json", "rich", "plain"] = "json" if parsed.as_json else "rich" if (not getattr(parsed, "plain", False)
                 and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"
                 and sys.stdout.isatty()) else "plain"
         render(document, style=style, details=getattr(parsed, "details", False), stream=sys.stdout)
         return 0
     except QueryError as error:
-        output = {"result": "error", "status": "command_failed",
+        output: dict[str, Any] = {"result": "error", "status": "command_failed",
                   "diagnostics": [{"code": error.code, "message": str(error)}]}
         if error.candidates:
             output["candidates"] = error.candidates

@@ -189,6 +189,7 @@ def test_plain_and_tty_preserve_text_without_executing_terminal_controls(
     monkeypatch.setattr(sys.stdout, "isatty", lambda: terminal)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLUMNS", "200")
     assert main(_arguments(kernel, "status")) == 0
     output = capsys.readouterr().out
     assert "Need the original decision" in output and "保留原文" in output
