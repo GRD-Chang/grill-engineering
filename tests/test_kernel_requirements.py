@@ -8,7 +8,7 @@ import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Requirements, RunSpec, World
 from agent_run_kernel.offline import GraphScenario
-from agent_run_kernel.model import EffectResult
+from agent_run_kernel.model import Effect, EffectResult
 
 
 def native_input() -> dict:
@@ -254,3 +254,71 @@ def test_original_final_approval_reconciles_before_parent_requirement_refresh(tm
         assert scenario.port.remote_commit(effect.source_ref) == third
     if outcome != "target":
         assert not [write for write in scenario.port.writes() if write["subject"] == final and write["operation"] == "close"]
+
+
+def final_merge_in_flight(path: Path) -> tuple[GraphScenario, Effect]:
+    """Real Ticket Completion, full Review and human approval precede the fault."""
+    original = Requirements.from_wire(native_input()["initial_requirements"])
+    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
+    scenario = GraphScenario(path, source)
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    assert scenario.run().kind == "approval"
+    final = scenario.delivery.key
+    scenario.kernel.control("approve", "original-final-approval", subject=final, world=scenario.world())
+    for _ in range(20):
+        step = scenario.kernel.advance(final, scenario.execution, scenario.world())
+        if step.effect is not None and step.effect.operation == "merge":
+            effect = step.effect
+            assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+            scenario.port.execute(effect, lambda: scenario.kernel.guard_effect(effect, scenario.execution, scenario.world()))
+            return scenario, effect
+        scenario.handle(step)
+    raise AssertionError("Final approval did not send its exact merge")
+
+
+def test_original_final_merge_settles_after_remote_target_appends(tmp_path: Path) -> None:
+    # Old test_run_publication_reconciliation preserves the original grant
+    # after our merge and a later external default-branch advance.
+    scenario, effect = final_merge_in_flight(tmp_path / "graph")
+    pr = scenario.port.pull_request(effect.subject)
+    assert pr is not None and pr.merged is not None
+    merged = pr.merged
+    before = scenario.kernel.status(effect.subject)
+    advanced = scenario.port.external_remote_append(effect.target_ref, {"later.txt": "Later independent work\n"}, "after-merge")
+    assert scenario.port.git.commit(effect.target_ref) == merged
+    assert scenario.port.remote_commit(effect.target_ref) == advanced
+    observed = scenario.port.reconcile(effect)
+    assert observed.disposition == "target"
+    assert observed.commit == merged
+    scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world())
+    assert scenario.run().kind == "complete"
+    assert scenario.port.remote_commit(effect.target_ref) == advanced
+    assert scenario.kernel.status(effect.subject)["budgets"] == before["budgets"]
+    assert len([write for write in scenario.port.writes() if write["subject"] == effect.subject and write["operation"] == "merge"]) == 1
+
+
+@pytest.mark.parametrize("first_read", ["unknown", "third"])
+def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_drift(tmp_path: Path, first_read: str) -> None:
+    scenario, effect = final_merge_in_flight(tmp_path / "graph")
+    before = scenario.kernel.status(effect.subject)
+    scenario.port.force_read["merge"] = first_read
+    observed = scenario.port.reconcile(effect)
+    assert scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world()).kind == "paused"
+    assert not [write for write in scenario.port.writes() if write["subject"] == effect.subject and write["operation"] == "close"]
+    scenario.port.force_read.clear()
+    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.requirements = replace(scenario.requirements, parent=replace(scenario.requirements.parent, body="Changed after uncertain original merge readback."))
+    scenario.refresh()
+    step = scenario.kernel.advance(effect.subject, scenario.execution, scenario.world())
+    assert step.kind == "reconcile" and step.effect is not None and step.effect.effect_id == effect.effect_id
+    scenario.handle(step)  # The exact original target is now actually observable.
+    scenario.kernel.control("resume", "resume-original-closeout", subject=effect.subject)
+    assert scenario.run().kind == "complete"
+    after = scenario.kernel.status(effect.subject)
+    assert after["generation"] == before["generation"]
+    assert after["budgets"] == before["budgets"]
+    assert [call["role"] for call in scenario.role_calls if call["subject"] == effect.subject] == ["review", "publication"]
+    writes = [write for write in scenario.port.writes() if write["subject"] == effect.subject]
+    assert len([write for write in writes if write["operation"] == "merge"]) == 1
+    assert len([write for write in writes if write["operation"] == "close"]) == 1
