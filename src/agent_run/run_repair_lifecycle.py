@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
+from agent_run.change_delivery_state import ChangeDeliveryStateStore
+from agent_run.run_repair_integration import prepare_repair_integration
 from agent_run.delivery_step import AgentWorkRequired, DeliveryStepKind
 from agent_run.external_supervision import (
     ensure_supervision_window,
@@ -60,6 +62,7 @@ class RunRepairLifecycle:
         if self.owner.github is None:
             raise ValueError("Run Repair requires the Publisher")
         checkout = self.owner._repair_checkout(state)
+        state_store = ChangeDeliveryStateStore(self.owner.states, str(state["run_id"]))
         job: dict[str, Any] | None = None
         preserve_checkout = False
         try:
@@ -124,7 +127,8 @@ class RunRepairLifecycle:
                             # Parent repair integrates the live source/target
                             # snapshot before reviewing the actual Candidate.
                             try:
-                                prepared = work.integrate_repair_candidate(state, job, checkout)
+                                with work.agent_work.step(job, allow_agent=True):
+                                    prepared = prepare_repair_integration(self.owner, state_store, state, job, checkout)
                             except InitialCredentialUnavailable as error:
                                 work.wait_for_change_credential(
                                     state, job, scope="repair", http_status=error.http_status,
@@ -162,7 +166,8 @@ class RunRepairLifecycle:
                         if job.get("attempt_kind") == "ci_repair":
                             job["attempt_kind"] = "ordinary"
                             self.owner._save(state)
-                        prepared = work.integrate_repair_candidate(state, job, checkout)
+                        with work.agent_work.step(job, allow_agent=True):
+                            prepared = prepare_repair_integration(self.owner, state_store, state, job, checkout)
                         if not prepared:
                             if job.get("phase") == "candidate":
                                 continue

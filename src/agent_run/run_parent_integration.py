@@ -2,33 +2,25 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_run.git import GitError, GitRepository
+from agent_run.delivery_protocol import GitHubPublisher
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.integration_resync_budget import (
     ResyncBudgetExhausted,
     observe_integration_snapshot,
 )
 from agent_run.parent_integration import (
     ParentHistoryRewritten,
-    finish_parent_snapshot_conflict,
-    prepare_parent_snapshot,
-    record_parent_integration_failure,
+    _own_run_ref_write, _published_run_head,
+    finish_run_snapshot, prepare_run_snapshot,
 )
 from agent_run.run_currentness import invalidate_run_acceptance
-from agent_run.semantic_attempt import (
-    close_semantic_attempt,
-    pending_semantic_attempt,
-)
-
-from agent_run.run_integration_development import resolve_run_integration_work
 from agent_run.resume_materials import require_change_checkout
-from agent_run.work_projection import materialize_history
 
 if TYPE_CHECKING:
-    from agent_run.development_review import DevelopmentReview
     from agent_run.run_acceptance import RunAcceptanceEngine
 
 
@@ -56,51 +48,19 @@ def prepare_run_parent_integration(
             branch=str(state["run_branch"]), checkout=checkout
         )
         for _ in range(5):
-            candidate = owner.git.resolve(str(state["run_branch"]))
-            result = prepare_parent_snapshot(
-                git=owner.git,
-                github=github,
-                subject=run,
-                checkout=checkout,
-                source_branch=str(state["run_branch"]),
-                target_branch=str(state["base"]["branch"]),
-                candidate_sha=candidate,
-                policy_snapshot=run.get("policy_snapshot") or state["policy_snapshot"],
-                record_key="run_integration",
-                save=lambda: owner._save(state),
-                own_source_write=candidate if _own_run_ref_write(state, candidate) else False,
-                confirmed_source_sha=_published_run_head(state, owner.git),
-                handoff_git_failures=True,
+            result = prepare_run_snapshot(
+                git=owner.git, github=github, states=owner.states,
+                state=state, run=run, checkout=checkout,
             )
             while result.status == "conflict":
                 keep_checkout = True
-                conflict = result.conflict
-                if not resolve_run_integration_work(owner, state, run, checkout, conflict):
+                step = owner.work.develop_integration(state, run, checkout, scope="run", allow_agent=True)
+                if step.kind is not DeliveryStepKind.CONTINUE:
                     return False
-                work_evidence = deepcopy(conflict)
-                try:
-                    result = finish_parent_snapshot_conflict(
-                        git=owner.git, subject=run, checkout=checkout,
-                        record_key="run_integration", save=lambda: owner._save(state),
-                    )
-                except GitError as error:
-                    semantic = pending_semantic_attempt(run, role="development")
-                    if semantic is not None:
-                        close_semantic_attempt(run, semantic, outcome="integration_git_check_failed",
-                                               result={"development_summary": (work_evidence or {}).get("development_summary")})
-                    assert isinstance(conflict, dict)
-                    if not record_parent_integration_failure(run, conflict, error):
-                        _pause(owner, state, run, "run_integration_failed", str(error))
-                        return False
-                    owner._save(state)
-                    continue
-                semantic = pending_semantic_attempt(run, role="development")
-                if semantic is not None:
-                    close_semantic_attempt(run, semantic, outcome="integration_conflict_resolved",
-                                           result={"development_summary": (work_evidence or {}).get("development_summary")})
-                    owner._save(state)
-                run.setdefault("integration_work_history", []).append(work_evidence)
-                owner._save(state)
+                result = finish_run_snapshot(
+                    git=owner.git, github=github, states=owner.states,
+                    state=state, run=run, checkout=checkout,
+                )
             record = result.record
             if not isinstance(record, dict):
                 raise ValueError("Run integration did not produce a record")
@@ -149,7 +109,7 @@ def prepare_run_parent_integration(
 
 
 def run_integration_record_is_valid(
-    owner: RunAcceptanceEngine | DevelopmentReview, state: dict[str, Any],
+    git: GitRepository, state: dict[str, Any],
 ) -> bool:
     run = state.get("run_acceptance")
     if not isinstance(run, dict):
@@ -159,35 +119,35 @@ def run_integration_record_is_valid(
         return False
     try:
         return (
-            record["head_sha"] == owner.git.resolve(str(state["run_branch"]))
-            and record["head_tree"] == owner.git.resolve(f"{record['head_sha']}^{{tree}}")
-            and record["candidate_tree"] == owner.git.resolve(f"{record['candidate_sha']}^{{tree}}")
-            and owner.git.is_ancestor(str(record["candidate_sha"]), str(record["head_sha"]))
-            and owner.git.is_ancestor(str(record["source_sha"]), str(record["head_sha"]))
-            and owner.git.is_ancestor(str(record["target_sha"]), str(record["head_sha"]))
+            record["head_sha"] == git.resolve(str(state["run_branch"]))
+            and record["head_tree"] == git.resolve(f"{record['head_sha']}^{{tree}}")
+            and record["candidate_tree"] == git.resolve(f"{record['candidate_sha']}^{{tree}}")
+            and git.is_ancestor(str(record["candidate_sha"]), str(record["head_sha"]))
+            and git.is_ancestor(str(record["source_sha"]), str(record["head_sha"]))
+            and git.is_ancestor(str(record["target_sha"]), str(record["head_sha"]))
         )
     except (GitError, KeyError, TypeError, ValueError):
         return False
 
 
 def run_integration_remote_is_current(
-    owner: RunAcceptanceEngine | DevelopmentReview, state: dict[str, Any],
+    git: GitRepository, github: GitHubPublisher | None, state: dict[str, Any],
 ) -> bool:
-    if owner.github is None:
+    if github is None:
         return True
     run = state.get("run_acceptance")
     record = run.get("run_integration") if isinstance(run, dict) else None
     if not isinstance(record, dict):
         return False
-    source, target = owner.github.live_branch_heads(
+    source, target = github.live_branch_heads(
         str(state["run_branch"]), str(state["base"]["branch"])
     )
-    published = _published_run_head(state, owner.git)
+    published = _published_run_head(state, git)
     if published is not None:
         if source is None:
             return False
-        owner.git.fetch_remote_commit(str(state["run_branch"]), source)
-        if not owner.git.is_ancestor(published, source):
+        git.fetch_remote_commit(str(state["run_branch"]), source)
+        if not git.is_ancestor(published, source):
             return False
     return (
         target == record["target_sha"]
@@ -196,36 +156,6 @@ def run_integration_remote_is_current(
             or (source == record["head_sha"] and _own_run_ref_write(state, str(source)))
         )
     )
-
-
-def _own_run_ref_write(state: dict[str, Any], candidate: str) -> bool:
-    publication = state.get("run_publication")
-    if isinstance(publication, dict) and publication.get("published_head_sha") == candidate:
-        return True
-    run = state.get("run_acceptance")
-    if isinstance(run, dict) and run.get("published_integration_head_sha") == candidate:
-        return True
-    completed = materialize_history(run, "completed_repair_jobs") if isinstance(run, dict) else None
-    return isinstance(completed, list) and any(
-        isinstance(job, dict)
-        and job.get("phase") == "completed"
-        and job.get("acceptance_state") == "promoted"
-        and job.get("integrated_sha") == candidate
-        for job in completed
-    )
-
-
-def _published_run_head(state: dict[str, Any], git: GitRepository) -> str | None:
-    publication = state.get("run_publication")
-    run = state.get("run_acceptance")
-    integrated = run.get("published_integration_head_sha") if isinstance(run, dict) else None
-    head = publication.get("published_head_sha") if isinstance(publication, dict) else None
-    if isinstance(integrated, str) and isinstance(head, str):
-        if git.is_ancestor(integrated, head):
-            return head
-        if not git.is_ancestor(head, integrated):
-            raise GitError("Published Run authorities have divergent histories")
-    return integrated if isinstance(integrated, str) else head if isinstance(head, str) else None
 
 
 def ensure_run_repair_base(owner: RunAcceptanceEngine, state: dict[str, Any], run: dict[str, Any]) -> None:
@@ -240,7 +170,7 @@ def ensure_run_repair_base(owner: RunAcceptanceEngine, state: dict[str, Any], ru
     head = str(record["head_sha"])
     if owner.git.resolve(str(state["run_branch"])) != head:
         return  # A later Repair already owns a newer Run head.
-    if not run_integration_record_is_valid(owner, state):
+    if not run_integration_record_is_valid(owner.git, state):
         raise GitError("Run Repair base lacks a valid integration record")
     github = owner.github
     assert github is not None

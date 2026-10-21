@@ -51,6 +51,35 @@ def block_change_job(
     return False
 
 
+def invalidate_ticket_publication(
+    store: ChangeDeliveryStateStore, state: dict[str, Any], job: dict[str, Any],
+) -> None:
+    """Retire this publication while retaining the fixed demand acceptance."""
+    from agent_run.required_checks_observation import clear_required_checks_observation
+    from agent_run.semantic_attempt import (
+        close_semantic_attempt, detach_active_invocation, pending_semantic_attempt,
+    )
+
+    pending = pending_semantic_attempt(job, role="publication")
+    if pending is not None:
+        close_semantic_attempt(job, pending, outcome="currentness_invalidated")
+        detach_active_invocation(state, pending)
+    job["phase"] = "accepted"
+    for key in (
+        "publication", "publication_sha", "publication_parent_sha", "publication_prior_published_sha",
+        "pending_publication_result", "merge_intent", "deterministic_integration_record",
+        "ticket_write_intent", "publication_commit_intent",
+    ):
+        job.pop(key, None)
+    clear_required_checks_observation(job)
+    ci_receipt = job.get("ci_repair_publication_receipt")
+    if isinstance(ci_receipt, dict):
+        ci_receipt.pop("publication_sha", None)
+    state["status"] = "ticket_delivery_pending"
+    state["diagnostics"] = []
+    save_change_job(store, state, job, label=f"ticket-{job['ticket_number']}", development_only=False)
+
+
 def require_mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key)
     if not isinstance(value, dict):

@@ -19,7 +19,7 @@ from agent_run.change_delivery_contracts import (
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
 from agent_run.change_delivery_stage import ChangeDeliveryStage
-from agent_run.change_delivery_state import require_mapping as _mapping
+from agent_run.change_delivery_state import ChangeDeliveryStateStore, require_mapping as _mapping
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
@@ -56,6 +56,7 @@ class PublishedHeadStage(ChangeDeliveryStage, Protocol):
     contract: ChangeJobContract
     adapter: ChangeDeliveryAdapter
     publisher: ChangeDeliveryPublisher
+    state_store: ChangeDeliveryStateStore
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -113,13 +114,13 @@ def _reconcile_delivery_snapshot(
 ) -> bool:
     label = stage.contract.label
     if label.startswith("ticket-"):
-        return reconcile_ticket_integration(stage, state, job)
+        return reconcile_ticket_integration(stage, state, job, state_store=stage.state_store)
     if label == "parent-only":
         return reconcile_parent_integration(stage, state, job, live=live)
     if label.startswith("run-repair-"):
         if isinstance(job.get("integrated_sha"), str):
             return True
-        return reconcile_repair_integration(stage, state, job)
+        return reconcile_repair_integration(stage.github, stage.state_store, state, job)
     return True
 
 def publish_and_merge(

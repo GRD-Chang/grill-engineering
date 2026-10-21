@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_run.ticket_integration import prepare_ticket_integration
+from agent_run.parent_only_integration import prepare_parent_integration
 from agent_run.ticket_queue import acquire as acquire_ticket_slot
 
 if TYPE_CHECKING:
@@ -42,5 +43,5 @@ def prepare_delivery_integration(
             engine.save(state)
         if before_review and (job.get("attempt_kind") == "ci_repair" or not isinstance(job.get("parent_integration"), dict)):
             return True
-        return engine.work.integrate_parent_candidate(state, job, checkout)
+        return prepare_parent_integration(engine, state, job, checkout)
     return True
