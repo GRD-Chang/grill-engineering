@@ -2641,7 +2641,7 @@ class Kernel:
                         "active": [{key: row[key] for key in ("id", "subject", "invocation")} for row in active],
                         "work_fifo": [], "integration_fifo": [], "cancel_workers": True,
                         "disposition": disposition,
-                        "next_deadline_at": min((row["next_retry_at"] or row["deadline"] for row in waits), default=None)
+                        "next_deadline_at": min((row["next_retry_at"] or row["deadline"] for row in waits), default=None)}
             now = self.clock()
             deadlines = [float(row["deadline_at"]) for row in active]
             progress = any(row["dispatch_state"] == "allocated" and row["deadline_at"] <= now for row in active)
