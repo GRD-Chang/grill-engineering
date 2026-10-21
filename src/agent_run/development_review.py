@@ -1916,7 +1916,7 @@ def change_revision_changed(
             ticket_number=int(job["ticket_number"]),
             expected_revision=str(job["effective_revision"]),
         ) != str(job["effective_revision"])
-    return state["parent"].get("revision") != job.get("effective_revision")
+    return bool(state["parent"].get("revision") != job.get("effective_revision"))
 
 
 def parent_review_identity(git: GitRepository, state: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:

@@ -72,13 +72,6 @@ class ChangeDeliveryStage(Protocol):
 
     def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]: ...
 
-    def _wait_for_initial_credential(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        *,
-        http_status: int | None,
-    ) -> None: ...
 
     def _wait_for_human(
         self,

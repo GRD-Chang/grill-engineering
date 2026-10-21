@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Ticket delivery integration after fixed-base Development and Review."""
 
+from agent_run.change_delivery_stage import ChangeDeliveryStage
+
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -21,7 +23,7 @@ from agent_run.semantic_attempt import (
 from agent_run.required_checks_observation import clear_required_checks_observation
 
 
-def _pause(stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:
+def _pause(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any], code: str, message: str) -> None:
     stage._block(state, job, code, message)
     state["terminal_kind"] = "waiting_human"
     stage.save(state)
@@ -96,7 +98,7 @@ def _own_source_write(job: dict[str, Any], source: str) -> bool:
     )
 
 
-def reconcile_ticket_integration(stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any]) -> bool:
+def reconcile_ticket_integration(stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]) -> bool:
     """Invalidate a published candidate when a new external snapshot is observed."""
 
     record = job.get("ticket_integration")
@@ -124,7 +126,7 @@ def reconcile_ticket_integration(stage: ChangeDeliveryEngine, state: dict[str, A
 
 
 def _invalidate_ticket_publication(
-    stage: ChangeDeliveryEngine, state: dict[str, Any], job: dict[str, Any]
+    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
 ) -> None:
     pending = pending_semantic_attempt(job, role="publication")
     if pending is not None:
@@ -146,7 +148,7 @@ def _invalidate_ticket_publication(
     stage.save(state)
 
 
-def _observe(stage: ChangeDeliveryEngine, job: dict[str, Any]) -> tuple[str, str]:
+def _observe(stage: ChangeDeliveryStage, job: dict[str, Any]) -> tuple[str, str]:
     source, target = stage.github.live_branch_heads(
         stage.contract.branch, stage.contract.base_branch
     )
