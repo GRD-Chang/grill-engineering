@@ -341,8 +341,8 @@ class DevelopmentReview:
             return self.candidate_acceptance.is_current(state, job, acceptance) and self._agent_is_current(state, job)
         if change_revision_changed(self.github, state, job):
             return False
-        identity = ({"acceptance_scope": "change_job", **candidate_review_identity(job, self.git), "effective_revision": job.get("effective_revision")} if self._scope == "ticket" else parent_review_identity(self.git, state, job))
         try:
+            identity = ({"acceptance_scope": "change_job", **candidate_review_identity(job, self.git), "effective_revision": job.get("effective_revision")} if self._scope == "ticket" else parent_review_identity(self.git, state, job))
             return accepted_review_matches(acceptance, identity, job.get("acceptance_artifact"))
         except (GitError, ValueError, KeyError):
             return False
@@ -614,23 +614,18 @@ class DevelopmentReview:
             job, result.thread_id, requested_thread=request.get("thread_id")
         )
         clear_initial_credential_wait(state, work_subject=self.contract.label)
+        if not self._thread_allowed(state, result.thread_id):
+            raise ValueError("Change Job Development Thread is not independent")
+        _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+        job.pop("development_new_thread", None)
+        job.pop("development_failure_resume", None)
         if isinstance(result, HumanBlockerResult):
-            if not self._thread_allowed(state, result.thread_id):
-                raise ValueError("Change Job Development Thread is not independent")
-            _record_development_thread(job, result.thread_id, result.replaced_thread_id)
-            job.pop("development_new_thread", None)
-            job.pop("development_failure_resume", None)
             self._wait_for_human(
                 state, job, phase=str(job["phase"]), blockers=result.human_blockers
             )
             return
         if not result.thread_id.strip() or not result.summary.strip():
             raise ValueError("Development result is incomplete")
-        if not self._thread_allowed(state, result.thread_id):
-            raise ValueError("Change Job Development Thread is not independent")
-        _record_development_thread(job, result.thread_id, result.replaced_thread_id)
-        job.pop("development_new_thread", None)
-        job.pop("development_failure_resume", None)
         job["development_summary"] = result.summary
         clear_current_human_blocker(job)
         job["phase"] = "committing_candidate"
