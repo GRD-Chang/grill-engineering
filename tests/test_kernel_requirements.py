@@ -322,3 +322,33 @@ def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_dri
     writes = [write for write in scenario.port.writes() if write["subject"] == effect.subject]
     assert len([write for write in writes if write["operation"] == "merge"]) == 1
     assert len([write for write in writes if write["operation"] == "close"]) == 1
+
+
+def test_final_requirement_refresh_never_reuses_old_generation_human_response(tmp_path: Path) -> None:
+    original = Requirements.from_wire(native_input()["initial_requirements"])
+    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
+    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"))
+    assert scenario.run().kind == "complete"
+    scenario.select(scenario.activate_final())
+    assert scenario.run().reason == "human_blocker"
+    final = scenario.delivery.key
+    scenario.kernel.control("resume", "answer-old-generation", subject=final, message="Decision for original Parent requirements only.")
+    scenario.requirements = replace(source, parent=replace(source.parent, body="New Parent requirements retire the old response."))
+    scenario.refresh()
+    for _ in range(50):
+        step = scenario.kernel.advance(final, scenario.execution, scenario.world())
+        if step.call is not None:
+            call = step.call
+            break
+        scenario.handle(step)
+    else:
+        raise AssertionError("Fresh Final generation did not reach Review")
+    assert call.context["generation"] == 2
+    assert not call.context.get("human_responses")
+    assert scenario.kernel.dispatch_agent(call)
+    scenario.kernel.agent_unavailable(call, "worker_credentials_unavailable", "Synthetic prelaunch credential absence")
+    scenario.kernel.control("resume", "continue-current-generation", subject=final)
+    continuation = scenario.kernel.advance(final, scenario.execution, scenario.world()).call
+    assert continuation is not None and continuation.attempt_id == call.attempt_id
+    assert continuation.context["generation"] == 2
+    assert not continuation.context.get("human_responses")
