@@ -207,12 +207,13 @@ class DevelopmentReview:
         if self._scope != "repair":
             return not change_revision_changed(self.github, state, job)
         from agent_run.run_repair_integration import repair_run_branch_is_current
+        if not repair_run_branch_is_current(self.git, job, self.git.resolve(str(state["run_branch"]))):
+            return False
         if not self._refresh_run_currentness(state):
             return False
         default = self._default_head(state)
         assert self.repair_currentness is not None
-        return (repair_run_branch_is_current(self.git, job, self.git.resolve(str(state["run_branch"])))
-                and default == job.get("default_base_sha")
+        return (default == job.get("default_base_sha")
                 and not self.repair_currentness.non_default_revision_changed(state, job, default_head_sha=default))
 
     def _reject_stale(self, state: dict[str, Any], job: dict[str, Any], checkout: Path, message: str) -> None:
