@@ -7,6 +7,10 @@ import sys
 import pytest
 
 from agent_run_kernel import executor
+from agent_run_kernel import codex_execution
+from agent_run_kernel.kernel import Kernel
+from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec
+from agent_run_kernel.offline import Scenario
 
 
 def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secrets(
@@ -38,3 +42,46 @@ def test_unmanaged_executor_entry_refuses_before_accessing_a_database(
     assert executor.main(["--database", str(database), "--action", "unadmitted", "--runner-lock", str(lock)]) == 1
     assert "managed_host_required" in capsys.readouterr().err
     assert not database.exists() and not lock.exists()
+
+
+def test_native_executor_enumerates_more_than_one_query_page(tmp_path: Path) -> None:
+    keys = [f"ticket:{number}" for number in range(2, 132)]
+    deliveries = tuple(Delivery(key, DeliveryKind.TICKET, number, "revision", Commit("base", "tree"),
+                                f"refs/heads/{key}", "refs/heads/run")
+                       for number, key in enumerate(keys, 2))
+    kernel = Kernel.create(tmp_path / "wide.sqlite", RunSpec("wide", "example/project", 1, "parent", "graph", deliveries))
+    driver = object.__new__(executor._Executor)
+    driver.kernel = kernel
+    ordered = driver.subjects({"work_fifo": [keys[-1]], "integration_fifo": [keys[0]]})
+    assert ordered == [keys[-1], *keys[:-1]]
+    assert len(ordered) == 130
+
+
+def test_prompt_preparation_failure_durably_releases_only_its_original_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    call = scenario.step().call
+    assert call is not None
+    driver = object.__new__(executor._Executor)
+    driver.kernel = scenario.kernel
+    assert scenario.spec.inputs is not None
+    driver.worker_identity = scenario.spec.inputs.worker_identity
+    driver.environment = {}
+    driver.hidden_paths = ()
+    driver.hidden_environment = ()
+
+    def invalid_prompt(call: object) -> str:
+        raise KernelError("prompt_resources_unavailable")
+
+    def unexpected_worker(*arguments: object, **keywords: object) -> None:
+        raise AssertionError("No process may start after prompt preparation failed")
+
+    monkeypatch.setattr(codex_execution, "execute_selected_codex", unexpected_worker, raising=False)
+    monkeypatch.setattr(executor, "render_role_prompt", invalid_prompt)
+    driver.agent(call)
+    status = scenario.kernel.status(call.subject)
+    assert status["pending_attempt"] == call.attempt_id
+    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert "worker_unavailable" in status["gates"]
+    assert scenario.kernel.scheduling()["active"] == []
