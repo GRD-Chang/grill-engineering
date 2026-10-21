@@ -299,8 +299,9 @@ def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> di
     active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
     selected = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
     if selected is None:
-        selected = active[0] if len(active) == 1 else next((job for job in subjects
+        completed_final = next((job for job in subjects
             if job["kind"] == "final_run" and job["phase"] == "complete"), None)
+        selected = active[0] if len(active) == 1 else completed_final
     invocation = None
     attempt = None if selected is None else selected["pending_attempt"]
     if attempt and attempt["invocations"]:

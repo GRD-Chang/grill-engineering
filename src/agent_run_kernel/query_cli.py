@@ -42,12 +42,11 @@ class _Parser(argparse.ArgumentParser):
 
 def _parser(language: str) -> argparse.ArgumentParser:
     parser = _Parser(language=language, prog="agent-run", description="只读交付查询" if language == "zh" else "Read-only delivery queries")
-    commands = parser.add_subparsers(dest="command", required=True,
-        parser_class=lambda **kwargs: _Parser(language=language, **kwargs))
+    commands = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
     for command in ("status", "history", "runs"):
         help_text = {"status": "当前交付状态", "history": "语义轮次与原始审计", "runs": "发现本地交付运行"}[command] if language == "zh" else {
             "status": "Current delivery status", "history": "Semantic rounds and original audit", "runs": "Discover local delivery Runs"}[command]
-        child = commands.add_parser(command, help=help_text, description=help_text)
+        child = commands.add_parser(command, language=language, help=help_text, description=help_text)
         if command != "runs":
             child.add_argument("run_id", nargs="?")
         child.add_argument("--repo")
