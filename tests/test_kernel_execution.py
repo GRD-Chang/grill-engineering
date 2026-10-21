@@ -233,7 +233,8 @@ def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(
 
 def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) -> None:
     source_path = tmp_path / "requirements.json"
-    source = {"parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issue_numbers": []}, "issues": []}
+    source = {"parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issues": [],
+                         "sub_issue_order_reliable": True}, "issues": []}
     source_path.write_text(json.dumps(source))
     requirements = Requirements.from_wire(json.loads(source_path.read_text()))
     base = Commit("base", "base-tree")

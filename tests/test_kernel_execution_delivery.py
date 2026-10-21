@@ -47,8 +47,12 @@ sys.stdout.write(json.dumps(result))
 """
 
 
-@pytest.mark.parametrize("kind", list(DeliveryKind))
-def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: DeliveryKind) -> None:
+@pytest.mark.parametrize(("kind", "header"), [
+    (DeliveryKind.TICKET, "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n"),
+    (DeliveryKind.PARENT_ONLY, "Parent Issue: #1\nDelivery Type: Parent-only\n\n"),
+    (DeliveryKind.FINAL_RUN, "Parent Issue: #1\nDelivery Type: Final Run\n\n"),
+])
+def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: DeliveryKind, header: str) -> None:
     scenario = Scenario(tmp_path / "scenario", kind)
     processes = tmp_path / "role-processes"
     for _ in range(100):
@@ -88,5 +92,5 @@ def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: Del
     assert "validation.tmp" not in scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.splitlines()
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.state == "MERGED"
-    assert pr.title == "feat: deliver the child implementation" and pr.body == _BODY
+    assert pr.title == "feat: deliver the child implementation" and pr.body == header + _BODY
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
