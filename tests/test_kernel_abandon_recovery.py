@@ -8,6 +8,7 @@ import pytest
 
 from agent_run_kernel import KernelError
 from agent_run_kernel.model import Effect, EffectResult, Execution, HostObservation
+from agent_run_kernel.query import read
 from test_kernel_abandon import managed_abandon_scenario
 
 
@@ -102,14 +103,19 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
     assert scenario.run().kind == "complete"
     kernel = scenario.kernel
     before_abandon = kernel.begin_automatic_step(scenario.execution, scenario.delivery.key)
-    kernel.control_host(request, "abandon", "original-abandon",
-                        resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
+    kernel.control("stop", "retain-subject-stop", subject=scenario.delivery.key)
+    assert kernel.control_host(request, "abandon", "original-abandon",
+        resource_inspections=scenario.port.inspect_resources(kernel.generation_resources())) == "pending"
     assert kernel.wait_for_read(before_abandon, scenario.execution,
         "github_recovery_observation_pending", "Previous business scope").reason == "observation_superseded"
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
     token = kernel.begin_automatic_step(scenario.execution, scenario.delivery.key)
-    assert kernel.source_status()["stopped"] is True
+    assert kernel.source_status()["abandonment"] == {"action": "original-abandon", "status": "pending"}
+    assert kernel.status(scenario.delivery.key)["gates"] == ["operator_stopped"]
+    assert read(kernel.storage.path, "status").data["status"] == "abandonment_pending"
+    with pytest.raises(KernelError, match="run_abandoned"):
+        kernel.control_host(request, "resume", "cannot-resume-business")
     waiting = kernel.wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Timeline is not current")
     assert waiting.kind == "waiting" and waiting.retry_at is not None
     assert kernel.guard_automatic_step(token, scenario.execution).kind == "waiting"
