@@ -30,10 +30,6 @@ from agent_run.run_repair_currentness import (
     RunRepairObservationPending,
     RunRepairWorkStale,
 )
-from agent_run.run_repair_integration import (
-    needs_repair_integration,
-    prepare_repair_integration,
-)
 from agent_run.run_repair_write import update_run_branch
 from agent_run.run_parent_integration import ensure_run_repair_base
 from agent_run.run_thread_identity import prior_thread_identities
@@ -123,15 +119,11 @@ class RunRepairLifecycle:
                 work = self.owner.work
                 try:
                     while True:
-                        work._bind_change(state, job, "repair")
                         if job.get("phase") == "candidate" and job.get("attempt_kind") != "ci_repair":
                             # Parent repair integrates the live source/target
                             # snapshot before reviewing the actual Candidate.
                             try:
-                                with work.agent_work.step(job, allow_agent=True):
-                                    prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
-                                        work, state, job, checkout,
-                                    )
+                                prepared = work.integrate_repair_candidate(state, job, checkout)
                             except GitHubReadError as error:
                                 if not is_github_convergence_error(error.code):
                                     raise
@@ -141,7 +133,6 @@ class RunRepairLifecycle:
                                 )
                                 ensure_supervision_window(state)
                                 self.owner._save(state)
-                                work.agent_work.defer()
                                 break
                             if not prepared:
                                 if job.get("phase") == "candidate":
@@ -158,14 +149,10 @@ class RunRepairLifecycle:
                         }:
                             break
                     if job.get("phase") == "accepted":
-                        work._bind_change(state, job, "repair")
                         if job.get("attempt_kind") == "ci_repair":
                             job["attempt_kind"] = "ordinary"
                             self.owner._save(state)
-                        with work.agent_work.step(job, allow_agent=True):
-                            prepared = not needs_repair_integration(work, job) or prepare_repair_integration(
-                                work, state, job, checkout,
-                            )
+                        prepared = work.integrate_repair_candidate(state, job, checkout)
                         if not prepared:
                             if job.get("phase") == "candidate":
                                 continue
