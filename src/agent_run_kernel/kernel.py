@@ -561,7 +561,9 @@ class Kernel:
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (attempt["id"], subject))
             if outcome == "fail":
                 tx.execute("UPDATE subjects SET last_failure=? WHERE id=?", (attempt["result_id"], subject))
-                tx.execute("UPDATE subjects SET repair_source=? WHERE id=?", ("required_checks" if job["purpose"] == Purpose.CI else "acceptance", subject))
+                source = ("required_checks" if job["purpose"] == Purpose.CI else "integration"
+                          if job["purpose"] == Purpose.INTEGRATION and job["repair_source"] == "integration" else "acceptance")
+                tx.execute("UPDATE subjects SET repair_source=? WHERE id=?", (source, subject))
                 phase = "development"
                 self._release_integration(tx, subject)
             else:
@@ -894,7 +896,7 @@ class Kernel:
                        (commit["sha"], commit["tree"], commit["sha"], result["expected_tree"], row["base_sha"], subject))
             if row["base_sha"] != world.target.sha:
                 tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
-                tx.execute("UPDATE subjects SET phase='integration',version=version+1 WHERE id=?", (subject,))
+                tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',ci_failure=NULL,version=version+1 WHERE id=?", (subject,))
                 return Step("progress", subject, "integration_snapshot_changed")
             latest = self._job(tx, subject)
             if job["kind"] == DeliveryKind.TICKET:
@@ -948,7 +950,7 @@ class Kernel:
         return Step("progress", subject)
 
     def _update_boundary(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> None:
-        tx.execute("UPDATE subjects SET phase='integration',purpose='integration',integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,version=version+1 WHERE id=?", (job["id"],))
+        tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',ci_failure=NULL,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,version=version+1 WHERE id=?", (job["id"],))
         if run["final_action"]:
             tx.execute("UPDATE actions SET status='updating' WHERE id=?", (run["final_action"],))
             tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))

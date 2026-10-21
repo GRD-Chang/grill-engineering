@@ -351,3 +351,36 @@ def test_failed_approval_rolls_back_action_material_grant_and_business_facts(tmp
     assert scenario.port.writes() == writes
     assert scenario.kernel.control("approve", "atomic-approval", subject=scenario.delivery.key, world=world) == "pending"
 
+
+def test_parent_ci_target_append_changes_current_work_to_integration_and_retains_ci_accounting(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
+                        reviews=("pass", "pass", "fail", "pass"), checks=("fail", "none"))
+    for _ in range(100):
+        status = scenario.kernel.status(scenario.delivery.key)
+        if scenario.development_count == 1 and scenario.review_count == 2 and status["phase"] == "ready_publication":
+            break
+        scenario.step()
+    else:
+        raise AssertionError("CI repair review did not reach publication boundary")
+    original_ci = scenario.kernel.status(scenario.delivery.key)["budgets"]["ci"]
+    assert (original_ci["developments_used"], original_ci["reviews_used"]) == (1, 1)
+    original_ci_events = [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"]
+    assert len(original_ci_events) == 1
+    scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Default branch advanced\n"}, "ci-then-append")
+    for _ in range(80):
+        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        if step.call is not None and step.call.role.value == "development" and step.call.purpose.value == "integration":
+            call = step.call
+            break
+        scenario.handle(step)
+        assert step.kind not in {"paused", "complete", "approval", "waiting"}
+    else:
+        raise AssertionError("new integration Findings did not return to Development")
+    assert call.context["purpose"] == "integration"
+    assert call.context["repair_source"] == "integration"
+    assert "ci_failure" not in call.context
+    budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
+    assert budgets["ci"] == original_ci
+    assert budgets["integration"]["developments_used"] == 1
+    assert [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"] == original_ci_events
+
