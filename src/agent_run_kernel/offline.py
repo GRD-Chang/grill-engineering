@@ -16,7 +16,7 @@ from agent_run.agent_profiles import resolve_profiles
 from agent_run.prompt_resources import resolve_resources
 
 from .effects import LocalGit
-from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_worktree
+from .local_effects import LocalEffects
 from .kernel import Kernel
 from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult,
                     KernelError, Policy, PullRequest, Requirements, Role, RunSpec, Step, World, wire_json)
@@ -30,7 +30,8 @@ def fixture_inputs() -> CreationInputs:
     """Explicit fixture configuration; never an implicit production fallback."""
     return CreationInputs(resolve_profiles(preset="economy"), resolve_resources("zh"),
                           {"source": "host"}, {"source": "host"}, {"enabled": False},
-                          {"source": "explicit-synthetic-fixture", "profile_preset": "economy"})
+                          {"source": "explicit-synthetic-fixture", "profile_preset": "economy"},
+                          repository_remote="offline-remote")
 
 
 def review_result(outcome: str) -> dict[str, Any]:
@@ -51,6 +52,9 @@ class OfflinePort:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.git = LocalGit(self.root / "authority")
+        self.git.env.update({"GIT_AUTHOR_NAME": "Offline Publisher", "GIT_AUTHOR_EMAIL": "offline@example.invalid",
+                             "GIT_COMMITTER_NAME": "Offline Publisher", "GIT_COMMITTER_EMAIL": "offline@example.invalid",
+                             "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00"})
         self.database = self.root / "remote.sqlite3"
         self.lose_response: set[str] = set()
         self.force_read: dict[str, str] = {}
@@ -79,7 +83,6 @@ class OfflinePort:
         with sqlite3.connect(port.database) as db:
             db.executescript("""
                 CREATE TABLE prs(number INTEGER PRIMARY KEY,subject TEXT UNIQUE,body BLOB NOT NULL);
-                CREATE TABLE receipts(id TEXT PRIMARY KEY,body BLOB NOT NULL);
                 CREATE TABLE writes(position INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT,subject TEXT,intent TEXT,facts BLOB);
                 CREATE TABLE closed(issue INTEGER PRIMARY KEY,intent TEXT,actor TEXT,merge_sha TEXT);
                 CREATE TABLE comments(intent TEXT PRIMARY KEY,issue INTEGER,actor TEXT,body BLOB,
@@ -193,9 +196,9 @@ class OfflinePort:
         db.execute("INSERT INTO prs VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET body=excluded.body",
                    (pr.number, subject, wire_json(asdict(pr))))
 
-    def _receipt(self, effect: Effect, result: EffectResult) -> None:
-        with sqlite3.connect(self.database) as db:
-            db.execute("INSERT OR REPLACE INTO receipts VALUES (?,?)", (effect.effect_id, wire_json(asdict(result))))
+    @property
+    def local(self) -> LocalEffects:
+        return LocalEffects(self.git, owned_root=self.root / "work")
 
     def execute(self, effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
         operation = effect.operation
@@ -207,151 +210,89 @@ class OfflinePort:
         expected: str | None = None
         raw: dict[str, Any] = {}
         outcome: EffectResult | None = None
-        try:
-            if operation == "cleanup_worktree":
-                outcome = cleanup_worktree(git, effect)
-            elif operation == "cleanup_local_ref":
-                outcome = cleanup_local_ref(git, effect)
-            elif operation == "cleanup_remote_ref":
+        if operation in LocalEffects.OPERATIONS:
+            outcome = self.local.execute(effect, authorize or (lambda: None))
+        elif operation == "cleanup_remote_ref":
+            outcome = self._inspect_remote_cleanup(effect)
+            if outcome.disposition == "prior":
+                if authorize is not None:
+                    authorize()
+                with sqlite3.connect(self.database) as db:
+                    db.execute("DELETE FROM refs WHERE ref=? AND sha=?", (payload["branch_ref"], payload["expected_head"]))
                 outcome = self._inspect_remote_cleanup(effect)
-                if outcome.disposition == "prior":
-                    if authorize is not None:
-                        authorize()
-                    with sqlite3.connect(self.database) as db:
-                        db.execute("DELETE FROM refs WHERE ref=? AND sha=?", (payload["branch_ref"], payload["expected_head"]))
-                    outcome = self._inspect_remote_cleanup(effect)
-            elif operation == "issue_link":
-                if authorize is not None:
-                    authorize()
-                with sqlite3.connect(self.database) as db:
-                    db.execute("INSERT OR IGNORE INTO links VALUES (?,?,?,?)", (payload["issue"], payload["ref"], payload["source_head"], effect.effect_id))
-                outcome = EffectResult("target", raw={"acknowledged_status": "linked"})
-            elif operation == "workspace":
-                checkout = Path(payload["checkout"])
-                if payload["create_ref"]:
-                    existing = self.ref_commit(effect.source_ref)
-                    if existing is None:
-                        git.run("update-ref", effect.source_ref, effect.before_sha, "0" * len(effect.before_sha))
-                    elif existing.sha != effect.before_sha:
-                        raise KernelError("workspace_ref_changed")
-                if not checkout.exists():
-                    git.run("worktree", "add", "--detach", str(checkout), effect.before_sha)
-                common = git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()
-                commit = git.commit(git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip())
-                if Path(common).resolve() != (git.root / ".git").resolve() or commit.sha != effect.before_sha:
-                    raise KernelError("foreign_workspace")
-            elif operation == "validation_checkout":
-                checkout = Path(payload["checkout"])
-                if not checkout.exists():
-                    git.run("worktree", "add", "--detach", str(checkout), payload["reviewed_commit"])
-                self._validation_identity(git, checkout, payload["reviewed_commit"])
-                commit = git.commit(payload["reviewed_commit"])
-            elif operation == "validation_cleanup":
-                checkout = Path(payload["checkout"])
-                if checkout.exists():
-                    self._validation_identity(git, checkout)
-                    git.run("worktree", "remove", "--force", str(checkout))
-            elif operation == "candidate":
-                commit, no_change = git.candidate(Path(payload["checkout"]), effect.before_sha, effect.effect_id)
-                raw = {"parents": git.parents(commit.sha), "no_change": no_change}
-            elif operation == "integrate":
-                if effect.candidate is None:
-                    raise KernelError("missing_candidate")
-                commit = effect.candidate
-                for suffix, target in (("source", payload["source_sha"]), ("target", effect.base.sha)):
-                    if target:
-                        try:
-                            commit = git.combine(commit.sha, target, effect.effect_id + "-" + suffix)
-                        except KernelError as error:
-                            if error.code != "integration_failed":
-                                raise
-                            raw = git.conflict_checkout(Path(payload["checkout"]), target)
-                            self._receipt(effect, EffectResult("failure", commit=self.git.commit(str(raw["head"])), raw=raw))
-                            return None
-                        git.install_checkout(Path(payload["checkout"]), commit.sha)
-                expected = commit.tree
-                raw = {"parents": git.parents(commit.sha)}
-            elif operation == "publication_commit":
-                if payload["reuse_sha"]:
-                    commit = git.commit(payload["reuse_sha"])
-                else:
-                    commit = git.make_commit(payload["integrated_tree"], payload["parents"], payload["commit_message"])
-                raw = {"parents": git.parents(commit.sha)}
-            elif operation in {"push", "run_branch"}:
-                if effect.after_sha is None:
-                    raise KernelError("missing_write_target")
-                # One simulated remote request: independently stored remote
-                # facts commit atomically. Git objects/refs are its local mirror.
-                # A crash across those two storage systems remains unknown,
-                # never a receipt-only proof that the request succeeded.
-                with sqlite3.connect(self.database) as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
-                    if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
-                        raise KernelError("remote_compare_and_swap")
-                    self._sync_mirror(git, effect.source_ref, effect.before_sha)
-                    git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
-                    self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
-                commit = git.commit(effect.after_sha)
-            elif operation == "pr_write":
-                if authorize is not None:
-                    authorize()
-                prior = self.pull_request(effect.subject)
-                if prior is not None and prior.state != "OPEN":
-                    raise KernelError("closed_pull_request")
-                with sqlite3.connect(self.database) as db:
-                    number = prior.number if prior else db.execute("SELECT coalesce(max(number),0)+1 FROM prs").fetchone()[0]
-                pr = PullRequest(number, effect.repository, effect.source_ref, effect.target_ref,
-                                 self.git.commit(str(self.remote_refs()[effect.source_ref])), self.git.commit(str(self.remote_refs()[effect.target_ref])),
-                                 payload["title"], payload["body"], actor=effect.actor, head_repository=effect.repository)
-                self._write_pr(effect.subject, pr)
-            elif operation == "merge":
-                pr = self.pull_request(effect.subject)
-                if pr is None or pr.head.sha != effect.after_sha or pr.base.sha != effect.before_sha or pr.state != "OPEN":
+        elif operation == "issue_link":
+            if authorize is not None:
+                authorize()
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT OR IGNORE INTO links VALUES (?,?,?,?)", (payload["issue"], payload["ref"], payload["source_head"], effect.effect_id))
+            outcome = EffectResult("target", raw={"acknowledged_status": "linked"})
+        elif operation in {"push", "run_branch"}:
+            if effect.after_sha is None:
+                raise KernelError("missing_write_target")
+            # One simulated remote request: independently stored remote
+            # facts commit atomically. Git objects/refs are its local mirror.
+            # A crash across those two storage systems remains unknown,
+            # never a receipt-only proof that the request succeeded.
+            with sqlite3.connect(self.database) as db:
+                db.execute("BEGIN IMMEDIATE")
+                prior = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
+                if prior is not None and prior[0] not in {effect.before_sha, effect.after_sha}:
+                    raise KernelError("remote_compare_and_swap")
+                self._sync_mirror(git, effect.source_ref, effect.before_sha)
+                git.compare_and_swap(effect.source_ref, effect.before_sha, effect.after_sha)
+                self._remote_cas_in(db, effect.source_ref, effect.before_sha, effect.after_sha)
+            commit = git.commit(effect.after_sha)
+        elif operation == "pr_write":
+            if authorize is not None:
+                authorize()
+            prior = self.pull_request(effect.subject)
+            if prior is not None and prior.state != "OPEN":
+                raise KernelError("closed_pull_request")
+            with sqlite3.connect(self.database) as db:
+                number = prior.number if prior else db.execute("SELECT coalesce(max(number),0)+1 FROM prs").fetchone()[0]
+            pr = PullRequest(number, effect.repository, effect.source_ref, effect.target_ref,
+                             self.git.commit(str(self.remote_refs()[effect.source_ref])), self.git.commit(str(self.remote_refs()[effect.target_ref])),
+                             payload["title"], payload["body"], actor=effect.actor, head_repository=effect.repository)
+            self._write_pr(effect.subject, pr)
+        elif operation == "merge":
+            pr = self.pull_request(effect.subject)
+            if pr is None or pr.head.sha != effect.after_sha or pr.base.sha != effect.before_sha or pr.state != "OPEN":
+                raise KernelError("merge_compare_and_swap")
+            commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
+            pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
+                             pr.title, pr.body, "MERGED", effect.actor, commit, pr.head_repository)
+            with sqlite3.connect(self.database) as db:
+                db.execute("BEGIN IMMEDIATE")
+                source = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
+                target = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.target_ref,)).fetchone()
+                if source != (effect.after_sha,) or target != (effect.before_sha,):
                     raise KernelError("merge_compare_and_swap")
-                commit = git.make_commit(pr.head.tree, payload["parents"], payload["commit_message"])
-                pr = PullRequest(pr.number, pr.repository, pr.source_ref, pr.target_ref, pr.head, pr.base,
-                                 pr.title, pr.body, "MERGED", effect.actor, commit, pr.head_repository)
-                with sqlite3.connect(self.database) as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    source = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.source_ref,)).fetchone()
-                    target = db.execute("SELECT sha FROM refs WHERE ref=?", (effect.target_ref,)).fetchone()
-                    if source != (effect.after_sha,) or target != (effect.before_sha,):
-                        raise KernelError("merge_compare_and_swap")
-                    self._sync_mirror(git, effect.target_ref, effect.before_sha)
-                    git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
-                    self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
-                    self._write_pr_in(db, effect.subject, pr)
-            elif operation == "completion_comment":
-                with sqlite3.connect(self.database) as db:
-                    closed = db.execute("SELECT rowid FROM closed WHERE issue=?", (payload["issue"],)).fetchone()
-                if closed is not None:
-                    return EffectResult("third")
-                if authorize is not None:
-                    authorize()
-                with sqlite3.connect(self.database) as db:
-                    db.execute("INSERT OR IGNORE INTO comments(intent,issue,actor,body,baseline_event_id) VALUES (?,?,?,?,0)",
-                               (effect.effect_id, payload["issue"], effect.actor, wire_json(dict(payload))))
-            elif operation == "close":
-                observed = self.reconcile(effect)
-                if observed.disposition != "prior":
-                    return observed
-                if authorize is not None:
-                    authorize()
-                with sqlite3.connect(self.database) as db:
-                    db.execute("INSERT OR IGNORE INTO closed VALUES (?,?,?,?)",
-                               (payload["issue"], effect.effect_id, effect.actor, payload["merge_sha"]))
-            else:
-                raise KernelError("unsupported_offline_verb", operation)
-        except KernelError as error:
-            if error.code in {"operation_cancelled", "operation_boundary_changed", "executor_fenced"}:
-                raise
-            if operation not in {"candidate", "integrate"}:
-                raise
-            self._receipt(effect, EffectResult("failure", raw={"code": error.code, "evidence": str(error)}))
-            return None
+                self._sync_mirror(git, effect.target_ref, effect.before_sha)
+                git.compare_and_swap(effect.target_ref, effect.before_sha, commit.sha)
+                self._remote_cas_in(db, effect.target_ref, effect.before_sha, commit.sha)
+                self._write_pr_in(db, effect.subject, pr)
+        elif operation == "completion_comment":
+            with sqlite3.connect(self.database) as db:
+                closed = db.execute("SELECT rowid FROM closed WHERE issue=?", (payload["issue"],)).fetchone()
+            if closed is not None:
+                return EffectResult("third")
+            if authorize is not None:
+                authorize()
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT OR IGNORE INTO comments(intent,issue,actor,body,baseline_event_id) VALUES (?,?,?,?,0)",
+                           (effect.effect_id, payload["issue"], effect.actor, wire_json(dict(payload))))
+        elif operation == "close":
+            observed = self.reconcile(effect)
+            if observed.disposition != "prior":
+                return observed
+            if authorize is not None:
+                authorize()
+            with sqlite3.connect(self.database) as db:
+                db.execute("INSERT OR IGNORE INTO closed VALUES (?,?,?,?)",
+                           (payload["issue"], effect.effect_id, effect.actor, payload["merge_sha"]))
+        else:
+            raise KernelError("unsupported_offline_verb", operation)
         result = outcome or EffectResult("target", commit, expected, pr, raw)
-        self._receipt(effect, result)
         with sqlite3.connect(self.database) as db:
             db.execute("INSERT INTO writes(operation,subject,intent,facts) VALUES (?,?,?,?)",
                        (operation, effect.subject, effect.effect_id, wire_json({"before": effect.before_sha, "after": effect.after_sha})))
@@ -368,22 +309,12 @@ class OfflinePort:
         return EffectResult("target" if row is None else "prior" if row[0] == effect.payload["expected_head"] else "third",
                             raw={"observed_head": None if row is None else row[0]})
 
-    def _validation_identity(self, git: LocalGit, checkout: Path, expected: str | None = None) -> None:
-        if checkout.parent != self.root / "work" or not checkout.name.startswith("review-"):
-            raise KernelError("foreign_validation_checkout")
-        common = Path(git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()).resolve()
-        head = git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip()
-        if common != (git.root / ".git").resolve() or (expected is not None and head != expected):
-            raise KernelError("foreign_validation_checkout")
-
     def reconcile(self, effect: Effect) -> EffectResult:
         if effect.operation in self.force_read:
             return EffectResult(self.force_read[effect.operation])
         operation = effect.operation
-        if operation == "cleanup_worktree":
-            return inspect_worktree(self.git, effect)
-        if operation == "cleanup_local_ref":
-            return inspect_local_ref(self.git, effect)
+        if operation in LocalEffects.OPERATIONS:
+            return self.local.reconcile(effect)
         if operation == "cleanup_remote_ref":
             return self._inspect_remote_cleanup(effect)
         if operation == "issue_link":
@@ -446,15 +377,7 @@ class OfflinePort:
                           "pr_number": effect.pr_number, "kind": effect.payload["kind"], "comment_id": comment[2],
                           "baseline_event_id": comment[3], "comment_created_at": comment[4], "comment_body": comment[1].decode()}
                 return EffectResult("target", raw={"close_intent": intent})
-            receipt = db.execute("SELECT body FROM receipts WHERE id=?", (effect.effect_id,)).fetchone()
-        if receipt is None:
-            return EffectResult("prior")
-        data = json.loads(receipt[0])
-        commit = None if data["commit"] is None else Commit(**data["commit"])
-        if commit is not None and self.git.commit(commit.sha) != commit:
-            return EffectResult("third")
-        return EffectResult(data["disposition"], commit, data["expected_tree"],
-                            None if data["pr"] is None else _pr(data["pr"]), data["raw"])
+        return EffectResult("unknown")
 
     def writes(self) -> list[dict[str, Any]]:
         with sqlite3.connect(self.database) as db:
@@ -481,7 +404,7 @@ class OfflinePort:
             path = checkout / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
-        candidate, _ = self.git.candidate(checkout, before.sha, token)
+        candidate, _ = self.git.candidate(checkout, before.sha, token, (before.sha,))
         if candidate.sha == before.sha:
             candidate = self.git.make_commit(before.tree, (before.sha,), "external append " + token)
         self.git.compare_and_swap(ref, before.sha, candidate.sha)
@@ -598,6 +521,9 @@ class Scenario:
             self.kernel.receive(step.call, self.agent(step.call))
         elif step.kind == "effect" and step.effect is not None:
             effect = step.effect
+            if effect.operation == "publication_commit" and not effect.payload.get("reuse_sha"):
+                witness = self.port.local.prepare_publication(effect)
+                effect = self.kernel.attach_publication_commit(effect, witness, self.execution, self.world())
             dispatched = effect.operation != "close" and self.kernel.dispatch(effect, self.execution, self.world())
 
             def authorize() -> None:

@@ -98,8 +98,9 @@ class Kernel:
             owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
             kernel._store_profiles(tx, owner, profiles, {"operation": "create"})
             if spec.inputs is not None:
-                values = {name: dict(getattr(spec.inputs, name)) for name in (
+                values: dict[str, Any] = {name: dict(getattr(spec.inputs, name)) for name in (
                     "prompt_resources", "worker_identity", "runner_identity", "notifications", "provenance")}
+                values["repository_remote"] = spec.inputs.repository_remote
                 material = tx.put(owner, "creation_inputs", wire_json(values))
                 tx.execute("INSERT INTO run_inputs VALUES (?,?,?)", (spec.run_id, owner, material))
             if requirements is None:
@@ -472,6 +473,27 @@ class Kernel:
                 and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1")
                 and not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1"))
 
+    @classmethod
+    def open_task(cls, task: TaskKey) -> Kernel | None:
+        """Find unfinished work under the original Task admission lock."""
+        with locked_task(task) as location:
+            prior = read_task(location)
+            if prior is None:
+                return None
+            kernel = cls(prior[1])
+            return None if kernel._replaceable(task, prior[0]) else kernel
+
+    def active_host_action(self) -> str | None:
+        """Read the original Action until its Host and usage are both retired."""
+        with self.storage.transaction(write=False) as tx:
+            rows = tx.rows("SELECT action_id FROM hosts WHERE status!='exited' OR usage_released=0", limit=1)
+            return None if not rows else str(rows[0][0])
+
+    def host_dispatched(self, action_id: str) -> bool:
+        """Read the durable launch claim, never infer it from process absence."""
+        with self.storage.transaction(write=False) as tx:
+            return tx.one("SELECT dispatched_at FROM hosts WHERE action_id=?", (action_id,))[0] is not None
+
     def admit_host(self, action_id: str, *, kind: str, command: tuple[str, ...], environment_carrier: Path,
                    preflight: Callable[[], None], subject: str | None = None, world: World | None = None,
                    message: str | None = None, new_thread: bool = False) -> HostLaunch:
@@ -688,7 +710,7 @@ class Kernel:
             tx.execute("UPDATE runs SET executor=NULL WHERE id=? AND executor=? AND epoch>?",
                        (execution.run_id, execution.owner, execution.epoch))
 
-    def advance(self, subject: str, execution: Execution, world: World, *, allow_agent: bool = True) -> Step:
+    def advance(self, subject: str, execution: Execution, world: World | None = None, *, allow_agent: bool = True) -> Step:
         with self.storage.transaction() as tx:
             run, job = self._owned(tx, subject, execution)
             pending = self._pending_effect(tx, subject)
@@ -703,6 +725,8 @@ class Kernel:
                     return Step("progress", subject, "stale_intent_retired")
                 if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                     return Step("paused", subject, self._pause_reason(tx, subject, run))
+                if world is None:
+                    return Step("observe", subject)
                 if not self._current(tx, job, run, world):
                     return Step("paused", subject, "currentness")
                 if pending["status"] == "observed":
@@ -710,19 +734,32 @@ class Kernel:
                 return Step("effect", subject, effect=self._effect(tx, pending, execution))
             if (job["refresh_revision"] is not None and not run["stopped"] and run["blocked"] == "final_refresh"
                     and not any(gate["code"] == "operator_stopped" for gate in self._gates(tx, subject))):
+                if world is None:
+                    return Step("observe", subject)
                 return self._refresh_final(tx, run, job, world)
             if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                 return Step("paused", subject, self._pause_reason(tx, subject, run))
             optional = tx.rows("SELECT e.* FROM effects e JOIN issue_links l ON l.effect_id=e.id WHERE l.subject=? AND l.state='pending' AND e.status='prepared'", (subject,))
             if optional:
+                if world is None:
+                    return Step("observe", subject)
                 if not self._current(tx, job, run, world):
                     return Step("paused", subject, "currentness")
                 return Step("effect", subject, effect=self._effect(tx, optional[0], execution))
             if job["validation_cleanup"]:
+                if world is None:
+                    return Step("observe", subject)
                 if not self._current(tx, job, run, world):
                     return Step("paused", subject, "currentness")
-                return self._prepare_effect(tx, run, job, execution, world, "validation_cleanup", before=job["workspace_sha"],
-                                            payload={"checkout": job["validation_cleanup"]})
+                originals = [json.loads(tx.get(row[0], subject)) for row in tx.all(
+                    "SELECT payload_id FROM effects WHERE subject=? AND operation='validation_checkout' AND status='confirmed'",
+                    (subject,))]
+                originals = [value for value in originals if value["checkout"] == job["validation_cleanup"]]
+                if len(originals) != 1:
+                    raise KernelError("validation_origin_unproven")
+                original = originals[0]
+                return self._prepare_effect(tx, run, job, execution, world, "validation_cleanup", before=original["reviewed_commit"],
+                                            payload={key: original[key] for key in ("checkout", "owned_root", "common_git_dir", "reviewed_commit")})
             if job["phase"] == "complete":
                 return Step("complete", subject)
             eligibility = self._eligibility(tx, job)
@@ -731,6 +768,8 @@ class Kernel:
             dependencies = tx.all("SELECT s.phase FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (subject,))
             if any(row[0] != "complete" for row in dependencies):
                 return Step("waiting", subject, "dependencies")
+            if world is None:
+                return Step("observe", subject)
             if job["current_attempt"]:
                 attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
                 if attempt["result_id"]:
@@ -762,7 +801,7 @@ class Kernel:
                 return self._allocate(tx, run, job, execution, world, allow_agent)
             return self._mechanical(tx, run, job, execution, world)
 
-    def advance_cleanup(self, subject: str, execution: Execution, world: World) -> Step:
+    def advance_cleanup(self, subject: str, execution: Execution, world: World | None = None) -> Step:
         """Bounded program work; cleanup never owns an Agent or integration seat."""
         with self.storage.transaction() as tx:
             run, job = self._owned(tx, subject, execution)
@@ -789,14 +828,18 @@ class Kernel:
                     return Step("progress", subject)
                 if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                     return Step("paused", subject, "cleanup_authority")
+                if world is None:
+                    return Step("observe", subject)
                 return Step("effect", subject, effect=self._effect(tx, pending, execution))
             if run["stopped"] or run["blocked"] or self._gates(tx, subject):
                 return Step("paused", subject, "cleanup_authority")
+            if world is None:
+                return Step("observe", subject)
             operation = self.CLEANUP[cleanup["stage"]]
             head = cleanup["workspace_sha"] if operation == "cleanup_worktree" else cleanup["source_sha"]
             payload = {"checkout": cleanup["checkout"], "owned_root": cleanup["owned_root"],
                        "common_git_dir": cleanup["common_git_dir"], "branch_ref": cleanup["source_ref"], "expected_head": head,
-                       "remote": "offline-remote"}
+                       "remote": self._inputs(tx, run)["repository_remote"]}
             step = self._prepare_effect(tx, run, job, execution, world, operation, before=head, payload=payload)
             assert step.effect is not None
             tx.execute("UPDATE resource_cleanup SET effect_id=? WHERE subject=? AND generation=?", (step.effect.effect_id, subject, job["generation"]))
@@ -1264,11 +1307,69 @@ class Kernel:
 
     def scheduling(self) -> dict[str, Any]:
         with self.storage.transaction(write=False) as tx:
-            run = tx.one("SELECT concurrency,integration_holder FROM runs")
+            run = tx.one("SELECT * FROM runs")
+            jobs = tx.all("SELECT * FROM subjects ORDER BY id")
+            active = tx.all("SELECT l.*,i.deadline_at,o.dispatch_state FROM leases l JOIN invocations i ON i.id=l.invocation JOIN invocation_outputs o ON o.invocation=i.id AND o.lease=l.id ORDER BY l.subject")
+            now = self.clock()
+            deadlines = [float(row["deadline_at"]) for row in active]
+            progress = any(row["dispatch_state"] == "allocated" and row["deadline_at"] <= now for row in active)
+            leased = {row["subject"] for row in active}
+            for job in jobs:
+                subject = job["id"]
+                gates = {row["code"] for row in self._gates(tx, subject)}
+                pending = self._pending_effect(tx, subject)
+                if pending is not None:
+                    if pending["status"] == "sent":
+                        progress |= not bool(gates & {"write_result_unknown", "write_conflict", "publication_retry_exhausted"})
+                    elif self._effect_stale(tx, run, job, pending):
+                        progress = True
+                refreshing = (job["refresh_revision"] is not None and run["blocked"] == "final_refresh"
+                              and "operator_stopped" not in gates)
+                if run["stopped"] or (run["blocked"] and not refreshing) or (gates and not refreshing):
+                    continue
+                if pending is not None:
+                    progress |= pending["status"] != "sent"
+                    continue
+                if refreshing or job["validation_cleanup"] or tx.rows("SELECT subject FROM issue_links WHERE subject=? AND state='pending'", (subject,)):
+                    progress = True
+                    continue
+                cleanup = tx.rows("SELECT c.*,e.status AS effect_status FROM resource_cleanup c LEFT JOIN effects e ON e.id=c.effect_id WHERE c.subject=? AND c.generation=? AND c.state!='complete'",
+                                  (subject, job["generation"]))
+                if cleanup:
+                    progress |= (cleanup[0]["effect_status"] in {"prepared", "observed", "cancelled"}
+                                 or cleanup[0]["outcome"] is None)
+                if job["phase"] in {"complete", "approval"} or subject in leased or self._eligibility(tx, job) is not None:
+                    continue
+                if tx.rows("SELECT s.id FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' LIMIT 1", (subject,)):
+                    continue
+                waits = (tx.rows("SELECT deadline FROM waits WHERE subject=?", (subject,))
+                         if job["phase"] in {"checks", "merge"} else [])
+                if waits:
+                    deadlines.extend(float(row[0]) for row in waits)
+                    progress |= any(row[0] <= now for row in waits)
+                    continue
+                if job["current_attempt"]:
+                    recovery = tx.rows("SELECT o.failure_kind,o.recovery_ready_at FROM attempts a JOIN invocation_outputs o ON o.invocation=a.current_invocation WHERE a.id=? ORDER BY o.ordinal DESC LIMIT 1",
+                                       (job["current_attempt"],))
+                    if recovery and recovery[0]["failure_kind"] == "capacity" and recovery[0]["recovery_ready_at"] > now:
+                        deadlines.append(float(recovery[0]["recovery_ready_at"]))
+                        continue
+                if job["phase"] == "integration" and job["kind"] == DeliveryKind.TICKET and run["integration_holder"] not in {None, subject}:
+                    continue
+                progress = True
+            final_pending = bool(tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run')"))
+            if final_pending and not run["stopped"] and not run["blocked"]:
+                tickets = [job for job in jobs if job["kind"] == DeliveryKind.TICKET]
+                progress |= bool(tickets) and all(self._completion(tx, job) is not None for job in tickets)
+            complete = (all(job["phase"] == "complete" for job in jobs) and not final_pending
+                        and not active and not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1")
+                        and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1"))
+            disposition = "progress" if progress else "waiting" if deadlines else "complete" if complete else "quiescent"
             return {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
-                    "active": [dict(row) for row in tx.all("SELECT id,subject,invocation FROM leases ORDER BY subject")],
+                    "active": [{key: row[key] for key in ("id", "subject", "invocation")} for row in active],
                     "work_fifo": [row[0] for row in tx.all("SELECT subject FROM work_queue ORDER BY ready")],
-                    "integration_fifo": [row[0] for row in tx.all("SELECT subject FROM integration_queue ORDER BY ready")]}
+                    "integration_fifo": [row[0] for row in tx.all("SELECT subject FROM integration_queue ORDER BY ready")],
+                    "disposition": disposition, "next_deadline_at": min(deadlines) if deadlines else None}
 
     def history(self, subject: str, *, after: int = 0, limit: int = 128) -> list[dict[str, Any]]:
         if not 1 <= limit <= 128:
@@ -1803,8 +1904,10 @@ class Kernel:
             raise KernelError("effect_receipt_incomplete", operation)
         if operation in {"push", "run_branch"} and commit["sha"] != row["after_sha"]:
             raise KernelError("write_target_changed")
-        if operation == "publication_commit" and commit["tree"] != payload["integrated_tree"]:
-            raise KernelError("publication_tree_changed")
+        if operation == "publication_commit":
+            expected = payload.get("reuse_sha") or payload.get("publication_commit_intent", {}).get("expected_sha")
+            if not expected or commit["sha"] != expected or commit["tree"] != payload["integrated_tree"]:
+                raise KernelError("publication_object_changed")
         if operation == "validation_checkout" and commit["sha"] != payload["reviewed_commit"]:
             raise KernelError("validation_commit_changed")
         if operation == "completion_comment":
@@ -1838,7 +1941,8 @@ class Kernel:
                 tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], job["id"]))
                 self._record_source_write(tx, job["id"], row["source_ref"], row["after_sha"])
             elif operation == "publication_commit" and commit:
-                tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=? WHERE id=?", (commit["sha"], commit["tree"], job["id"]))
+                tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
+                           (commit["sha"], commit["tree"], commit["sha"], job["id"]))
             elif operation == "pr_write" and result["pr"]:
                 tx.execute("UPDATE subjects SET pr_number=? WHERE id=?", (result["pr"]["number"], job["id"]))
             elif operation == "merge" and commit:
@@ -1906,8 +2010,19 @@ class Kernel:
             self._update_boundary(tx, run, job)
             return Step("progress", subject, "updating")
         if phase == "candidate":
+            development = self._last_attempt(tx, subject, Role.DEVELOPMENT)
+            context_id = tx.one("SELECT context_id FROM attempts WHERE id=?", (development,))[0]
+            context = json.loads(tx.get(context_id, subject))
+            parents = [job["workspace_sha"]]
+            failure = context.get("integration_evidence")
+            raw = failure.get("raw") if isinstance(failure, dict) else None
+            if isinstance(raw, dict) and raw.get("merge_head"):
+                if raw.get("head") != job["workspace_sha"] or not isinstance(raw["merge_head"], str):
+                    raise KernelError("candidate_parent_unproven")
+                if raw["merge_head"] not in parents:
+                    parents.append(raw["merge_head"])
             return self._prepare_effect(tx, run, job, execution, world, "candidate", before=job["workspace_sha"],
-                                        payload={"checkout": job["checkout"], "summary_attempt": self._last_attempt(tx, subject, Role.DEVELOPMENT)})
+                                        payload={"checkout": job["checkout"], "summary_attempt": development, "parents": parents})
         if phase == "integration":
             job = self._job(tx, subject)  # An admitted external source append is the next CAS parent.
             if not self._integration_seat(tx, run, job):
@@ -2080,6 +2195,11 @@ class Kernel:
         body["integrated_sha"] = job["integrated_sha"]
         body["integrated_tree"] = job["integrated_tree"]
         body["kind"] = job["kind"]
+        if operation in {"workspace", "validation_checkout", "validation_cleanup", "candidate", "integrate", "publication_commit"}:
+            for key in ("checkout", "owned_root", "common_git_dir"):
+                body.setdefault(key, job[key])
+        if operation in {"push", "run_branch"}:
+            body["expected_remote_sha"] = None if world.source is None else world.source.sha
         inputs = self._inputs(tx, run)
         if inputs:
             body["github_identity"] = inputs["runner_identity"]
@@ -2115,6 +2235,39 @@ class Kernel:
         if effect["operation"] in self.REMOTE and self._publisher_actor(tx, run, world) != effect["actor"]:
             raise KernelError("publisher_identity_changed")
 
+    def attach_publication_commit(self, effect: Effect, witness: Mapping[str, Any],
+                                  execution: Execution, world: World) -> Effect:
+        """Persist the original Git object bytes before the first physical write."""
+        with self.storage.transaction() as tx:
+            run, job = self._owned(tx, effect.subject, execution)
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            stored = self._effect(tx, row, execution)
+            payload = dict(stored.payload)
+            prior = payload.pop("publication_commit_intent", None)
+            original = replace(stored, payload=payload)
+            if (row["operation"] != "publication_commit" or row["status"] != "prepared" or row["attempts"] != 0
+                    or effect not in (stored, original) or payload.get("reuse_sha")):
+                raise KernelError("effect_binding")
+            if prior is not None:
+                if prior != witness:
+                    raise KernelError("publication_commit_intent_changed")
+                return stored
+            if (run["stopped"] or run["blocked"] or self._gates(tx, effect.subject)
+                    or row["generation"] != job["generation"] or not self._current(tx, job, run, world)
+                    or row["base_sha"] != world.target.sha):
+                raise KernelError("operation_cancelled")
+            if (set(witness) != {"tree_sha", "parents", "message", "raw_commit", "expected_sha"}
+                    or witness["tree_sha"] != payload["integrated_tree"] or witness["parents"] != payload["parents"]
+                    or witness["message"] != payload["commit_message"]
+                    or not isinstance(witness["raw_commit"], str) or not witness["raw_commit"]
+                    or not isinstance(witness["expected_sha"], str) or not witness["expected_sha"]):
+                raise KernelError("publication_commit_intent_changed")
+            payload["publication_commit_intent"] = dict(witness)
+            material = tx.put(effect.subject, "effect_intent", wire_json(payload))
+            tx.execute("UPDATE effects SET payload_id=? WHERE id=?", (material, effect.effect_id))
+            self._event(tx, effect.subject, "publication_commit_prepared", effect.effect_id, material)
+            return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
+
     def dispatch(self, effect: Effect, execution: Execution, world: World) -> bool:
         """Recheck authority immediately before the single external operation."""
         with self.storage.transaction() as tx:
@@ -2124,6 +2277,9 @@ class Kernel:
                 return False
             if self._effect(tx, row, execution) != effect:
                 raise KernelError("effect_binding")
+            if (effect.operation == "publication_commit" and not effect.payload.get("reuse_sha")
+                    and not effect.payload.get("publication_commit_intent")):
+                raise KernelError("publication_commit_intent_required")
             self._guard_publisher(tx, run, row, world)
             if run["stopped"] or run["blocked"] or self._gates(tx, effect.subject):
                 return False
@@ -2157,7 +2313,7 @@ class Kernel:
             self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
             return True
 
-    def reconcile(self, effect: Effect, result: EffectResult, execution: Execution, world: World) -> Step:
+    def reconcile(self, effect: Effect, result: EffectResult, execution: Execution, world: World | None = None) -> Step:
         """Record target/prior/third/unknown without treating absence as read failure.
 
         Exact target settlement does not need live mutation authority. A prior
@@ -2187,6 +2343,8 @@ class Kernel:
                 # acknowledgement was durably received. Never replay it.
                 return Step("progress", effect.subject, "optional_display_indeterminate")
             if effect.operation in self.CLEANUP and result.disposition != "target":
+                if result.disposition == "prior" and world is None:
+                    return Step("observe", effect.subject)
                 evidence = tx.put(effect.subject, "cleanup_observation", wire_json(asdict(result)))
                 tx.execute("UPDATE resource_cleanup SET outcome=? WHERE effect_id=?", (result.disposition, effect.effect_id))
                 self._event(tx, effect.subject, "cleanup_pending", effect.effect_id, evidence)
@@ -2204,6 +2362,8 @@ class Kernel:
                 return Step("progress", effect.subject)
             run, job = self._owned(tx, effect.subject, execution)
             if result.disposition == "prior":
+                if world is None:
+                    return Step("observe", effect.subject)
                 if self._effect_stale(tx, run, job, row):
                     tx.execute("UPDATE effects SET status='retired' WHERE id=?", (row["id"],))
                     if job["kind"] == DeliveryKind.FINAL_RUN and run["observed_graph_revision"] == run["graph_revision"]:
@@ -2332,7 +2492,8 @@ class Kernel:
         elif operation == "publication_commit":
             if commit["tree"] != job["integrated_tree"]:
                 raise KernelError("publication_tree_changed")
-            tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=? WHERE id=?", (commit["sha"], commit["tree"], subject))
+            tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
+                       (commit["sha"], commit["tree"], commit["sha"], subject))
             phase = "push"
         elif operation == "push":
             tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], subject))

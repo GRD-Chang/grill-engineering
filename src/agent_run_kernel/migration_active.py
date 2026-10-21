@@ -15,7 +15,8 @@ import tempfile
 from typing import Any, Mapping
 
 from .kernel import Kernel
-from .migration import MigrationRefused, SourceSnapshot, _created_at_epoch, capture_v6
+from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
+                        _require_no_v6_notification_journal, capture_v6)
 from .migration_conversion import _git, _one, _policy
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
                     KernelError, ParentIssue, Policy, Profile, Requirements, Role,
@@ -449,6 +450,7 @@ def convert_returned_publication_v6(
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _read_active(copied.path, profile, profile_sha, snapshot.sha256)
+        _require_no_v6_notification_journal(snapshot, facts.run_id)
         completed = observed.get("completed_invocation")
         pending = observed.get("pending_attempt")
         if (observed.get("run_id") != facts.run_id or not isinstance(completed, dict)

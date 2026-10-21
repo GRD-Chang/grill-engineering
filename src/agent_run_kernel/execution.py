@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from agent_run.error_safety import bounded_error
+from agent_run.process_binding import _process_start_token as _start_token
 
 from .model import AgentCall
 from .storage import MATERIAL_LIMIT
@@ -57,16 +58,6 @@ class ProcessExit:
 
 class ProcessExitUnknown(RuntimeError):
     """No lease may be released on this unproven process observation."""
-
-
-def _start_token(pid: int) -> str | None:
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-    except (OSError, UnicodeError):
-        return None
-    closing = raw.rfind(")")
-    fields = raw[closing + 2:].split() if closing >= 0 else []
-    return fields[19] if len(fields) > 19 else None
 
 
 def _cgroup(pid: int) -> str:
@@ -145,6 +136,8 @@ def _drain(
         while selector.get_map() or process.poll() is None:
             if process.poll() is None:
                 kernel.guard_agent(call)
+                if capture is not None:
+                    capture.guard()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Worker process exceeded its execution deadline")
             else:
@@ -264,6 +257,8 @@ def _run_dispatched(
         if authorize_source is not None:
             authorize_source()
         kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired during preparation")
     except BaseException as error:
@@ -299,6 +294,8 @@ def _run_dispatched(
         if authorize_source is not None:
             authorize_source()
         kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired before process release")
         os.write(gate_write, b"1")

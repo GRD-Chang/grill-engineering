@@ -17,7 +17,7 @@ from typing import Any, Mapping, cast
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _evidence_value, capture_v6)
+                        _evidence_value, _require_no_v6_notification_journal, capture_v6)
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue, ParentIssue,
                     KernelError, Policy, Profile, Requirements, RunSpec, wire_json)
 
@@ -298,6 +298,7 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _initial_facts(captured.path)
+        _require_no_v6_notification_journal(snapshot, facts.run_id)
         additional = additional_workspaces or {}
         expected_additional = set(facts.requirements.parent.sub_issue_numbers) - {facts.ticket_number}
         if set(additional) != expected_additional:

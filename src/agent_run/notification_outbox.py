@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.error_safety import bounded_error
-from agent_run.executor_host import _process_binding_status
+from agent_run.process_binding import _process_binding_status
 
 MAX_PENDING = 32
 MAX_RECORDS = 256

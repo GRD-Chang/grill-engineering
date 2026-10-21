@@ -66,6 +66,7 @@ class _Executor:
         self.remote = RemoteEffects(root, row["repository"], runner_identity=inputs["runner_identity"], remote=remote)
         self.worker_identity = inputs["worker_identity"]
         self.source_lock = threading.Lock()
+        self.cancelled = threading.Event()
         self.hidden_paths = (kernel.storage.path.parent,)
         self.hidden_environment: tuple[str, ...] = ()
         protected = list(self.hidden_paths)
@@ -105,7 +106,7 @@ class _Executor:
             self.kernel, call, identity=self.worker_identity, environment=self.environment,
             prompt=prompt, hidden_paths=self.hidden_paths,
             hidden_environment=self.hidden_environment,
-            authorize_source=authorize_source,
+            authorize_source=authorize_source, cancelled=self.cancelled,
         )
 
     def effect(self, step: Step) -> Step:
@@ -141,13 +142,9 @@ class _Executor:
                 dispatched = True
             self.kernel.guard_effect(effect, self.execution, world)
 
-        try:
-            result = port.execute(effect, authorize)
-        except Exception as error:
-            if dispatched:
-                self.kernel.observe_effect_failure(effect, {"type": type(error).__name__,
-                                                          "message": bounded_error(str(error))})
-            raise
+        # Authorization cancellation is not a failed external command. Only
+        # the adapter's actual command result below can create that audit fact.
+        result = port.execute(effect, authorize)
         if dispatched and result.raw.get("write_returncode") not in (None, 0):
             self.kernel.observe_effect_failure(effect, {
                 "returncode": result.raw["write_returncode"],
@@ -175,6 +172,19 @@ class _Executor:
             ids = [row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid")]
         return list(dict.fromkeys([*scheduling["work_fifo"], *scheduling["integration_fifo"], *ids]))
 
+    def worker_finished(self, call: AgentCall) -> bool:
+        """Read exact durable physical facts before forgetting a failed future."""
+        with self.kernel.storage.transaction(write=False) as tx:
+            row = tx.one("SELECT dispatch_state,exit_code,process_identity,start_evidence "
+                         "FROM invocation_outputs WHERE invocation=? AND ordinal=?",
+                         (call.invocation_id, call.output_ordinal))
+            leased = tx.rows("SELECT id FROM leases WHERE id=?", (call.lease_id,))
+        return not leased and (
+            row["dispatch_state"] == "exited" and row["exit_code"] is not None
+            or row["dispatch_state"] == "unavailable" and row["process_identity"] is None
+            and row["start_evidence"] is not None
+        )
+
     def activate_final(self) -> bool:
         with self.kernel.storage.transaction(write=False) as tx:
             if not tx.rows("SELECT id FROM final_target") or tx.rows("SELECT id FROM subjects WHERE kind='final_run'"):
@@ -192,52 +202,68 @@ class _Executor:
 
 def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) -> int:
     """Supervise allocated calls while other subjects' program work advances."""
+    from .notifications import NativeNotifications
+
     driver = _Executor(kernel, execution, environment)
     scheduling = kernel.scheduling()
-    workers: dict[str, Future[None]] = {}
-    with ThreadPoolExecutor(max_workers=scheduling["concurrency"], thread_name_prefix="agent-run") as pool:
-        while True:
-            for subject, future in list(workers.items()):
-                if future.done():
-                    # Process transport has already durably settled raw/exit or
-                    # exact start-unknown facts. It never authorizes a retry.
-                    try:
-                        future.result()
-                    except ProcessExitUnknown:
-                        # Only the actual managed Host/cgroup exit can settle
-                        # this remaining physical uncertainty.
-                        raise
-                    except Exception as error:
-                        # The one process adapter has recorded unavailable,
-                        # raw/exit or fatal facts. Kernel decides recovery from
-                        # those facts; an exception is not a second policy.
-                        print(bounded_error(str(error)), file=sys.stderr)
-                    del workers[subject]
-            progress = False
-            for subject in driver.subjects(scheduling):
-                if subject in workers:
-                    continue
-                step = driver.advance(subject)
-                if step.kind == "agent" and step.call is not None:
-                    workers[subject] = pool.submit(driver.agent, step.call)
-                    progress = True
-                elif step.kind == "complete":
-                    retired = driver.advance(subject, cleanup=True)
-                    progress = progress or retired.kind == "progress"
-                else:
-                    progress = progress or step.kind == "progress"
-            scheduling = kernel.scheduling()
-            if not workers and not progress and scheduling["disposition"] in {"quiescent", "complete"}:
-                return 0
-            if not progress and not workers:
-                progress = driver.activate_final()
-            if not progress:
-                deadline = scheduling["next_deadline_at"]
-                delay = 1.0 if deadline is None else min(1.0, max(0.01, deadline - kernel.clock()))
-                if workers:
-                    wait(workers.values(), timeout=delay)
-                else:
-                    time.sleep(delay)
+    workers: dict[str, tuple[AgentCall, Future[None]]] = {}
+    notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent)
+    drain_notifications = False
+    try:
+        with ThreadPoolExecutor(max_workers=scheduling["concurrency"], thread_name_prefix="agent-run") as pool:
+            try:
+                while True:
+                    # Also picks up Worker-thread commits during long calls.
+                    # Observation is lock-free; the I/O loop's bounded calls
+                    # can delay this tick, so no one-second delivery is promised.
+                    notifications.observe_committed()
+                    for subject, (call, future) in list(workers.items()):
+                        if future.done():
+                            try:
+                                future.result()
+                            except ProcessExitUnknown:
+                                raise
+                            except Exception as error:
+                                if not driver.worker_finished(call):
+                                    raise ProcessExitUnknown("Worker outcome was not durably settled") from error
+                                # Kernel alone chooses recovery from the exact
+                                # unavailable/exit facts, never this exception.
+                                print(bounded_error(str(error)), file=sys.stderr)
+                            del workers[subject]
+                    progress = False
+                    for subject in driver.subjects(scheduling):
+                        if subject in workers:
+                            continue
+                        step = driver.advance(subject)
+                        if step.kind == "agent" and step.call is not None:
+                            workers[subject] = (step.call, pool.submit(driver.agent, step.call))
+                            progress = True
+                        elif step.kind == "complete":
+                            retired = driver.advance(subject, cleanup=True)
+                            progress = progress or retired.kind == "progress"
+                        else:
+                            progress = progress or step.kind == "progress"
+                    notifications.observe_committed()
+                    scheduling = kernel.scheduling()
+                    if not workers and not progress and scheduling["disposition"] in {"quiescent", "complete"}:
+                        drain_notifications = True
+                        return 0
+                    if not progress and not workers:
+                        progress = driver.activate_final()
+                    if not progress:
+                        deadline = scheduling["next_deadline_at"]
+                        delay = 1.0 if deadline is None else min(1.0, max(0.01, deadline - kernel.clock()))
+                        if workers:
+                            wait((future for _, future in workers.values()), timeout=delay)
+                        else:
+                            time.sleep(delay)
+            finally:
+                # Set before ThreadPoolExecutor.__exit__ waits. Every known
+                # process follows its original terminate/pidfd/raw-finally path;
+                # the actual managed Host exit must prove any unknown survivor.
+                driver.cancelled.set()
+    finally:
+        notifications.close(drain=drain_notifications)
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -257,6 +283,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             kernel, parsed.action, manager, runner_lock=parsed.runner_lock,
             credential=Path(credential_directory) / "agent-run-environment", notify_socket=notify_socket,
         ) as inherited:
+            # Runner/PAT/App helpers consume process environment. Restore the
+            # exact admitted terminal values once, before starting any threads;
+            # the user-manager's environment is not an identity fallback.
+            os.environ.clear()
+            os.environ.update(inherited.environment)
             execution = Execution(request.run_id, request.owner, request.epoch)
             return run(kernel, execution, inherited.environment)
     except (OSError, ValueError, RuntimeError) as error:

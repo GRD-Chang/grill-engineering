@@ -13,6 +13,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Sequence
 
+from agent_run.sqlite_runtime import require_wal_runtime
+
 from .model import KernelError
 
 PROTOCOL = "independent-delivery-kernel-v11-exploration"
@@ -326,6 +328,7 @@ class Transaction:
 
 class Storage:
     def __init__(self, path: Path) -> None:
+        require_wal_runtime()
         self.path = path
         if not path.is_file():
             raise KernelError("missing_database", str(path))
@@ -334,6 +337,7 @@ class Storage:
 
     @classmethod
     def create(cls, path: Path) -> Storage:
+        require_wal_runtime()
         path.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive creation refuses to adopt or upgrade any existing database.
         with path.open("xb"):
@@ -355,6 +359,7 @@ class Storage:
 
     @contextmanager
     def transaction(self, *, write: bool = True) -> Iterator[Transaction]:
+        require_wal_runtime()
         uri = self.path.resolve().as_uri() + ("?mode=rw" if write else "?mode=ro")
         connection = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1.0)
         connection.row_factory = sqlite3.Row

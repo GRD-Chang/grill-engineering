@@ -17,8 +17,8 @@ import stat
 import subprocess
 
 from agent_run.bounded_command import CommandCapture, capture_command
+from agent_run.process_binding import _process_start_token as _start_token
 
-from .execution import _start_token
 from .model import HostLaunch, HostObservation
 
 

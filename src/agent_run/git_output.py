@@ -30,7 +30,7 @@ def _git_executable(search_path: str) -> str:
     return shutil.which("git", path=search_path) or "git"
 
 
-def git_environment() -> dict[str, str]:
+def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
     """Keep authentication, but prevent inherited repository redirection."""
     locations = {
         "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
@@ -39,7 +39,7 @@ def git_environment() -> dict[str, str]:
         "GIT_CONFIG_PARAMETERS",
     }
     return {
-        key: value for key, value in os.environ.items()
+        key: value for key, value in (os.environ if environment is None else environment).items()
         if key not in locations
         and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
     } | {"GIT_OPTIONAL_LOCKS": "0"}
@@ -57,7 +57,10 @@ def run_git(
     data = input.encode() if input is not None else b""
     if len(data) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
-    remote = environment is None and bool(arguments[1:2] and arguments[1] in {"clone", "fetch", "push", "pull", "ls-remote"})
+    command = arguments[1:]
+    while command[:1] in (["-C"], ["-c"]):
+        command = command[2:]
+    remote = bool(command and command[0] in {"clone", "fetch", "push", "pull", "ls-remote"})
     if environment is not None:
         if runner_identity is not None:
             raise GitError("Explicit Git environment cannot override a selected Runner identity")
@@ -67,6 +70,14 @@ def run_git(
         environment = runner_git_environment(runner_identity, cwd=cwd)
     else:
         environment = git_environment()
+    selected_environment = environment
+
+    def safe_output(value: str) -> str:
+        if remote:
+            from agent_run.runner_transport import redact_transport_output
+            return redact_transport_output(value, selected_environment)
+        return value
+
     executable = _git_executable(environment.get("PATH", os.defpath))
     process = subprocess.Popen(
         [executable, *arguments[1:]], cwd=cwd,
@@ -97,8 +108,8 @@ def run_git(
                         f"Git command timed out after {timeout:g} seconds",
                         evidence={
                             "command": arguments, "returncode": None,
-                            "stdout": stdout.decode("utf-8", errors="replace"),
-                            "stderr": stderr.decode("utf-8", errors="replace"),
+                            "stdout": safe_output(stdout.decode("utf-8", errors="replace")),
+                            "stderr": safe_output(stderr.decode("utf-8", errors="replace")),
                             "timeout_seconds": timeout,
                         },
                     )
@@ -133,8 +144,8 @@ def run_git(
                 raise GitError(
                     f"Git command timed out after {timeout:g} seconds",
                     evidence={"command": arguments, "returncode": None,
-                              "stdout": stdout.decode("utf-8", errors="replace"),
-                              "stderr": stderr.decode("utf-8", errors="replace"),
+                              "stdout": safe_output(stdout.decode("utf-8", errors="replace")),
+                              "stderr": safe_output(stderr.decode("utf-8", errors="replace")),
                               "timeout_seconds": timeout},
                 ) from timeout_error
     finally:
@@ -143,10 +154,7 @@ def run_git(
         for opened_stream in streams:
             if opened_stream is not None:
                 opened_stream.close()
-    error = stderr.decode("utf-8", errors="replace")
-    if remote:
-        from agent_run.runner_transport import redact_transport_output
-        error = redact_transport_output(error, environment)
+    error = safe_output(stderr.decode("utf-8", errors="replace"))
     # Replacement decoding may expand invalid bytes; the diagnostic is byte bounded too.
     encoded = error.encode()
     if overflow["stderr"] or len(encoded) > MAX_GIT_ERROR_BYTES:
@@ -159,9 +167,7 @@ def run_git(
             + error[-(MAX_GIT_ERROR_BYTES // 4):]
         )
     try:
-        output = stdout.decode("utf-8")
-        if remote:
-            output = redact_transport_output(output, environment)
+        output = safe_output(stdout.decode("utf-8"))
     except UnicodeDecodeError as invalid_output:
         raise GitError("Git stdout is not valid UTF-8; complete result unavailable") from invalid_output
     return subprocess.CompletedProcess(arguments, returncode, output, error)

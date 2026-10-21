@@ -233,6 +233,30 @@ def validate_snapshot(snapshot: SourceSnapshot) -> SourceSnapshot:
     return snapshot
 
 
+def _require_no_v6_notification_journal(snapshot: SourceSnapshot, run_id: str) -> None:
+    """A copied database alone cannot preserve the old sender's delivery budget."""
+    try:
+        if not stat.S_ISREG(snapshot.source.lstat().st_mode):
+            raise MigrationRefused("source_notification_journal_unproved")
+        root = snapshot.source.resolve(strict=True).parent
+        directory = root / "notifications"
+        try:
+            directory_mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(directory_mode):
+            raise MigrationRefused("source_notification_journal_unproved")
+        name = hashlib.sha256(run_id.encode()).hexdigest()[:32] + ".json"
+        journal = directory / name
+        try:
+            journal.lstat()
+        except FileNotFoundError:
+            return
+        raise MigrationRefused("unsupported_source_notification_journal")
+    except OSError as error:
+        raise MigrationRefused("source_notification_journal_unproved") from error
+
+
 def restore_v6(snapshot: SourceSnapshot, destination: Path) -> SourceSnapshot:
     """Restore exact v6 bytes to a new path as an unchanged-old physical copy.
 

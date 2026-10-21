@@ -112,6 +112,12 @@ class CreationInputs:
     runner_identity: Mapping[str, Any]
     notifications: Mapping[str, Any]
     provenance: Mapping[str, Any]
+    repository_remote: str = "origin"
+
+    def __post_init__(self) -> None:
+        if (not self.repository_remote or self.repository_remote.startswith("-")
+                or any(not (character.isalnum() or character in "-_.") for character in self.repository_remote)):
+            raise ValueError("repository_remote must be a named Git remote")
 
 
 @dataclass(frozen=True)

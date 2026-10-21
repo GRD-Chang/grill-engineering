@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
@@ -22,7 +23,7 @@ from agent_run.agent_schemas import (
     acceptance_schema, development_or_human_blocker_schema, publication_or_human_blocker_schema,
 )
 from agent_run.error_safety import bounded_error
-from agent_run.worker_sandbox import _BoundedJsonlStream, bubblewrap_command, native_worker_environment
+from agent_run.worker_sandbox import _BoundedJsonlStream, WorkerSandboxError, bubblewrap_command, native_worker_environment
 
 from .execution import ProcessExit, _execute
 from .model import AgentCall, Role
@@ -93,12 +94,16 @@ class _CodexCapture:
 
     def __init__(
         self, kernel: Kernel, call: AgentCall, *, executable: str,
-        environment: Mapping[str, str], credential_file: Path,
+        environment: Mapping[str, str], credential_file: Path | None,
         hidden_paths: Sequence[Path], hidden_environment: Sequence[str],
+        identity: Mapping[str, Any] | None = None, cancelled: threading.Event | None = None,
     ) -> None:
         self.kernel, self.call, self.executable = kernel, call, executable
         self.source_environment = dict(environment)
         self.credential_file = credential_file
+        self.identity, self.cancelled = identity, cancelled
+        self.credential_exhausted = threading.Event()
+        self.inherit_host_auth = False
         self.hidden_paths, self.hidden_environment = tuple(hidden_paths), tuple(hidden_environment)
         self.cwd = Path(call.context["checkout"])
         self.arguments: list[str] = []
@@ -121,20 +126,10 @@ class _CodexCapture:
             temporary.chmod(0o700)
             self.directory = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             self.resources.callback(os.close, self.directory)
-            source = os.open(self.credential_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            try:
-                credential = _read_regular(source, _MAX_CREDENTIAL_BYTES)
-            finally:
-                os.close(source)
-            if not credential.strip():
-                raise ValueError("Selected Worker credential file is empty")
+            self.guard()
             gh = temporary / "gh"
-            gh.mkdir(mode=0o700)
-            gh_descriptor = os.open(gh, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                _write_member(gh_descriptor, "hosts.yml", credential)
-            finally:
-                os.close(gh_descriptor)
+            self.environment = self._credential_environment(gh)
+            self.guard()
             schemas = {
                 Role.DEVELOPMENT: development_or_human_blocker_schema,
                 Role.REVIEW: acceptance_schema,
@@ -145,25 +140,99 @@ class _CodexCapture:
                 raise ValueError("Worker output schema exceeds its file limit")
             _write_member(self.directory, "schema.json", schema)
             _write_member(self.directory, "last-message.txt", b"")
-            self.environment = native_worker_environment(self.source_environment, gh, host=False)
-            for variable in (*_GITHUB_TOKEN_VARIABLES, *self.hidden_environment):
+            for variable in self.hidden_environment:
                 self.environment.pop(variable, None)
             self.environment["GH_PROMPT_DISABLED"] = "1"
             self.environment["GIT_TERMINAL_PROMPT"] = "0"
             readonly = self.call.context["readonly"]
             if type(readonly) is not bool:
                 raise ValueError("Allocated checkout access must be explicit")
-            if self.call.mode == "output-repair" and not readonly:
+            if self.call.output_ordinal > 0 and not readonly:
                 raise ValueError("Output repair requires an allocated read-only checkout")
             command = self._command(temporary)
             self.arguments = bubblewrap_command(
                 command, checkout=self.cwd, temporary=temporary, writable_checkout=not readonly,
-                environment=self.environment, hidden_paths=self._protected_paths(), inherit_host_auth=False,
+                environment=self.environment, hidden_paths=self._protected_paths(), inherit_host_auth=self.inherit_host_auth,
             )
             return self
         except BaseException:
             self.resources.close()
             raise
+
+    def _credential_environment(self, gh: Path) -> dict[str, str]:
+        if self.credential_file is not None:
+            source = os.open(self.credential_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                credential = _read_regular(source, _MAX_CREDENTIAL_BYTES)
+            finally:
+                os.close(source)
+            if not credential.strip():
+                raise ValueError("Selected Worker credential file is empty")
+            gh.mkdir(mode=0o700)
+            descriptor = os.open(gh, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                _write_member(descriptor, "hosts.yml", credential)
+            finally:
+                os.close(descriptor)
+            environment = native_worker_environment(self.source_environment, gh, host=False)
+        else:
+            from agent_run.github_identity import native_github_environment, validate_identity_snapshot, validate_worker_auth
+
+            self.identity = identity = validate_identity_snapshot(self.identity)
+            repository = self.call.context["repository"]
+            if not isinstance(repository, str) or not repository:
+                raise ValueError("Allocated repository identity is unavailable")
+            if identity["source"] == "app":
+                host = self.source_environment.get("GH_HOST", "").strip()
+                if host and host.casefold() != "github.com":
+                    raise WorkerSandboxError("Worker GitHub read host is not authorized")
+                from agent_run.git_output import git_environment
+                from agent_run.github_auth import _GitHubAppCredentialProvider
+                from agent_run.github_auth_profile import GitHubAppProfile
+                from agent_run.worker_credentials import NativeCredentialDelivery
+
+                app = identity["app_profile"]
+                provider = _GitHubAppCredentialProvider(
+                    GitHubAppProfile(app["app_id"], app["installation_id"], Path(app["private_key_path"])),
+                    read_only=identity["app_read_only"],
+                    repository=repository if identity["app_current_repository_only"] else None,
+                )
+                delivery = self.resources.enter_context(NativeCredentialDelivery(
+                    provider, gh, on_exhausted=lambda _message: self.credential_exhausted.set(),
+                ))
+                delivery.start()
+                environment = native_worker_environment(git_environment(self.source_environment), gh, host=False)
+                environment.pop("GH_HOST", None)
+                environment.update({
+                    "XDG_CONFIG_HOME": str(gh.parent), "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false",
+                    "GIT_SSH_COMMAND": "ssh -o BatchMode=yes", "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
+                })
+            else:
+                validate_worker_auth(identity, self.source_environment)
+                self.inherit_host_auth = identity["source"] == "host"
+                environment = native_worker_environment(
+                    native_github_environment(identity, self.source_environment), gh, host=self.inherit_host_auth,
+                )
+            environment["GH_REPO"] = repository
+        if self.credential_file is not None or self.identity is not None and self.identity["source"] == "app":
+            for variable in _GITHUB_TOKEN_VARIABLES:
+                environment.pop(variable, None)
+        return environment
+
+    def guard(self) -> None:
+        """Physical Host/credential cancellation does not grant a retry."""
+        if self.cancelled is not None and self.cancelled.is_set():
+            self.failure_kind = "fatal"
+            self.diagnostic = {"source": "host-cancellation", "error_type": "InterruptedError"}
+            raise InterruptedError("Host execution cancelled")
+        if self.credential_exhausted.is_set():
+            from agent_run.credential_lifecycle import WorkerCredentialError
+
+            self.failure_kind = "fatal"
+            self.diagnostic = {"source": "worker-credentials", "error_type": "CredentialExhausted"}
+            raise WorkerCredentialError("Selected Worker credential renewal exhausted")
 
     def __exit__(
         self, exception_type: type[BaseException] | None, exception: BaseException | None,
@@ -195,10 +264,19 @@ class _CodexCapture:
         if state.parent == self.cwd.resolve():
             raise ValueError("Kernel state needs a directory separate from the Worker checkout")
         paths = [state.parent, state, Path(str(state) + "-wal"), Path(str(state) + "-shm"),
-                 self.credential_file, *self.hidden_paths]
+                 *self.hidden_paths]
+        if self.credential_file is not None:
+            paths.append(self.credential_file)
+        if self.identity is not None:
+            if self.identity["source"] == "app":
+                paths.append(Path(self.identity["app_profile"]["private_key_path"]))
+            elif self.identity["source"] == "pat" and "file" in self.identity["pat"]:
+                paths.append(Path(self.identity["pat"]["file"]))
         environment = self.source_environment
         home = Path(environment.get("HOME", str(Path.home())))
-        paths.extend((home / ".config" / "gh", home / ".ssh", home / ".git-credentials"))
+        if not self.inherit_host_auth:
+            paths.extend((home / ".config" / "gh", home / ".ssh", home / ".git-credentials"))
+            paths.extend(Path(environment[key]) for key in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME") if environment.get(key))
         paths.extend((Path(environment.get("XDG_DATA_HOME", str(home / ".local" / "share"))) / "agent-run",
                       Path(environment.get("XDG_CONFIG_HOME", str(home / ".config"))) / "agent-run"))
         runtime = Path(environment.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}"))
@@ -232,7 +310,7 @@ class _CodexCapture:
                 observed_at=self.kernel.clock(),
                 evidence={"source": "codex-jsonl", "type": event_type, "sequence": self.sequence},
             )
-        if event_type in {"turn.failed", "task_complete"}:
+        if event_type in {"turn.failed", "task_complete"} and self.failure_kind != "fatal":
             error = event.get("error")
             machine_present = isinstance(error, dict) and "codex_error_info" in error
             machine = error.get("codex_error_info") if isinstance(error, dict) else None
@@ -304,6 +382,22 @@ def execute_codex(
     capture = _CodexCapture(kernel, call, executable=executable, environment=environment,
                             credential_file=credential_file, hidden_paths=hidden_paths,
                             hidden_environment=hidden_environment)
+    return _execute(
+        kernel, call, arguments=(), cwd=capture.cwd, prompt=prompt,
+        environment=environment, timeout=timeout, authorize_source=authorize_source, capture=capture,
+    )
+
+
+def execute_selected_codex(
+    kernel: Kernel, call: AgentCall, *, identity: Mapping[str, Any],
+    environment: Mapping[str, str], prompt: str, hidden_paths: Sequence[Path],
+    authorize_source: Callable[[], None], executable: str = "codex", timeout: float | None = None,
+    hidden_environment: Sequence[str] = (), cancelled: threading.Event | None = None,
+) -> ProcessExit | None:
+    """Consume the frozen native identity within this single owned invocation."""
+    capture = _CodexCapture(kernel, call, executable=executable, environment=environment,
+                            credential_file=None, identity=identity, cancelled=cancelled,
+                            hidden_paths=hidden_paths, hidden_environment=hidden_environment)
     return _execute(
         kernel, call, arguments=(), cwd=capture.cwd, prompt=prompt,
         environment=environment, timeout=timeout, authorize_source=authorize_source, capture=capture,

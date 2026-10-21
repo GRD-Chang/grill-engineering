@@ -1,0 +1,265 @@
+"""Post-commit native notification observer using the existing durable outbox.
+
+This observer reads committed kernel facts. It neither calls Kernel nor infers a
+new business state from a displayed Status document.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from agent_run import notification_outbox as outbox
+from agent_run.error_safety import bounded_error
+from agent_run.notification_cards import card
+from agent_run.notification_event_facts import event_copy, event_envelope
+from agent_run.notification_transport import send
+from agent_run.process_binding import _process_start_token
+
+from .storage import Storage, Transaction
+
+
+CLOSE_TIMEOUT_SECONDS = 60.0
+Send = Callable[..., Mapping[str, Any]]
+
+
+class NativeNotifications:
+    """Deliver only committed native events for one exact Run and owned directory."""
+
+    def __init__(self, database: Path, state_root: Path, *, transport: Send = send) -> None:
+        if (database.is_symlink() or state_root.is_symlink()
+                or not database.is_file() or not state_root.is_dir()
+                or database.parent.resolve() != state_root.resolve()):
+            raise ValueError("notification state root does not own this database")
+        self.database = database
+        self.state_root = state_root
+        self.transport = transport
+        self.storage = Storage(database)
+        with self.storage.transaction(write=False) as tx:
+            self.run_id, self.binding, self.config, self.state = self._run(tx)
+        self.enabled = self.config.get("enabled") is True
+        self.condition = threading.Condition()
+        self.cancel = threading.Event()
+        self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid()),
+                      "sender": uuid.uuid4().hex}
+        self.closing = False
+        self.closed = False
+        self.failure_reason: str | None = None
+        self.thread: threading.Thread | None = None
+        self._more = False
+        if self.enabled:
+            self.observe_committed()
+            if self.failure_reason is None:
+                self.thread = threading.Thread(target=self._work, name="kernel-notifications", daemon=True)
+                self.thread.start()
+
+    @staticmethod
+    def _run(tx: Transaction) -> tuple[str, tuple[str, int], dict[str, Any], dict[str, Any]]:
+        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
+        inputs = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (run["id"],))
+        value = json.loads(tx.get(inputs["material_id"], inputs["subject"]))
+        if not isinstance(value, dict) or not isinstance(value.get("notifications"), dict):
+            raise ValueError("notification configuration is not a frozen Run input")
+        config = value["notifications"]
+        if config.get("enabled") is True and run["language"] not in {"zh", "en"}:
+            raise ValueError("enabled notification requires a known Run language")
+        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
+                        (run["parent_issue"], run["parent_revision"]))
+        state = {"run_id": run["id"], "repository": run["repository"],
+                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
+                 "language": run["language"], "created_at": run["created_at"]}
+        return run["id"], (run["repository"], run["parent_issue"]), config, state
+
+    def _page(self, after: int) -> tuple[list[dict[str, Any]], bool, int]:
+        with self.storage.transaction(write=False) as tx:
+            run_id, binding, config, state = self._run(tx)
+            if (run_id, binding, config, state) != (self.run_id, self.binding, self.config, self.state):
+                raise ValueError("notification Run or recipient binding changed")
+            history = tx.rows("SELECT position,subject,kind,identity,generation,created_at "
+                              "FROM history WHERE position>? ORDER BY position LIMIT 16", (after,), limit=16)
+            events: list[dict[str, Any]] = []
+            for row in history:
+                event = self._event(tx, row)
+                if event is not None:
+                    events.append(event)
+            return events, len(history) == 16, history[-1]["position"] if history else after
+
+    def _event(self, tx: Transaction, row: Any) -> dict[str, Any] | None:
+        state = self.state
+        subject = tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],))
+        if row["kind"] == "worker_started":
+            first = tx.one("SELECT min(position) FROM history WHERE subject=? AND kind='worker_started'",
+                           (row["subject"],))[0]
+            if first != row["position"] or subject["kind"] not in {"ticket", "parent_only"}:
+                return None
+            attempt = tx.rows("SELECT a.id,a.role,o.started_at FROM invocations i "
+                              "JOIN attempts a ON a.id=i.attempt "
+                              "JOIN invocation_outputs o ON o.invocation=i.id "
+                              "WHERE i.id=? AND a.subject=? AND o.started_at IS NOT NULL "
+                              "ORDER BY o.ordinal", (row["identity"], row["subject"]))
+            if not attempt or attempt[0]["role"] != "development":
+                return None
+            kind = "ticket_started" if subject["kind"] == "ticket" else "parent_started"
+            title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
+                            (subject["issue"], subject["revision"]))
+            name = title[0][0] if title else f"#{subject['issue']}"
+            identity = (f"ticket:{subject['issue']}" if kind == "ticket_started"
+                        else f"parent-only:{self.run_id}")
+            facts = ({"task_number": subject["issue"], "task_title": name,
+                      "url": f"https://github.com/{self.binding[0]}/issues/{subject['issue']}"}
+                     if kind == "ticket_started" else {})
+            return event_envelope(state, kind, identity, event_copy(state, kind, title=name),
+                                  attempt_id=attempt[0]["id"],
+                                  started_at=datetime.fromtimestamp(attempt[0]["started_at"], UTC).isoformat(),
+                                  **facts)
+        if row["kind"] == "effect_consumed" and subject["kind"] == "ticket":
+            completed = tx.rows("SELECT generation FROM completions WHERE subject=? AND generation=? "
+                                "AND close_effect=?", (row["subject"], row["generation"], row["identity"]))
+            if not completed:
+                return None
+            title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
+                            (subject["issue"], subject["revision"]))
+            name = title[0][0] if title else f"#{subject['issue']}"
+            # The old ticket_jobs map keyed numbers as strings; preserve the
+            # card identity across a native continuation of that Ticket.
+            return event_envelope(state, "ticket_completed", [str(subject["issue"]), row["generation"]],
+                                  event_copy(state, "ticket_completed", title=name), "green",
+                                  task_number=subject["issue"], task_title=name,
+                                  url=f"https://github.com/{self.binding[0]}/issues/{subject['issue']}")
+        return None
+
+    def observe_committed(self) -> None:
+        """Read only committed facts; claim no transport while a kernel lock is held."""
+        if not self.enabled or self.closed or self.cancel.is_set():
+            return
+        try:
+            for _ in range(64):
+                with outbox.transaction(self.state_root, self.run_id) as document:
+                    outbox.settle(document, time.time())
+                    if len(document["pending"]) > outbox.MAX_PENDING - 17:
+                        self._more = True
+                        return
+                    if not document.get("native_run_start"):
+                        journal = outbox.notification_path(self.state_root, self.run_id)
+                        if journal.exists() or journal.is_symlink():
+                            raise ValueError("existing notification journal has no native receipt")
+                        started = datetime.fromtimestamp(self.state["created_at"], UTC).isoformat()
+                        event = event_envelope(self.state, "run_start", self.run_id,
+                                               event_copy(self.state, "run_start"), started_at=started)
+                        outbox.enqueue(document, event, time.time())
+                        document["native_run_start"] = True
+                    cursor = document.get("native_cursor", 0)
+                    if type(cursor) is not int or cursor < 0:
+                        raise ValueError("invalid native notification cursor")
+                    events, more, position = self._page(cursor)
+                    for event in events:
+                        outbox.enqueue(document, event, time.time())
+                    document["native_cursor"] = position
+                with self.condition:
+                    self.condition.notify_all()
+                self._more = more
+                if not more:
+                    return
+        except Exception as error:
+            self.failure_reason = bounded_error(str(error))
+            self.cancel.set()
+            print(f"飞书通知不可用（开发继续）：{self.failure_reason}", file=sys.stderr)
+            with self.condition:
+                self.condition.notify_all()
+
+    def _work(self) -> None:
+        active_event_id: str | None = None
+        while not self.cancel.is_set():
+            try:
+                if self._more:
+                    self.observe_committed()
+                if self.cancel.is_set():
+                    return
+                with self.condition:
+                    with outbox.transaction(self.state_root, self.run_id) as document:
+                        outbox.settle(document, time.time())
+                        pending = document["pending"]
+                        inflight = any(item["outcome"] == "sending" for item in pending)
+                        item = None if inflight else next((item for item in pending if not item.get("cancelled")
+                                                            and item["next_attempt_at"] <= time.time()), None)
+                        if item is not None:
+                            item.update(owner=self.owner, outcome="sending")
+                            item["attempts"] += 1
+                            item["attempt_history"].append({"number": item["attempts"],
+                                                            "started_at": time.time(), "outcome": "sending"})
+                            event = dict(item["event"])
+                            active_event_id = event["id"]
+                            deadline_at = float(item["deadline_at"])
+                        else:
+                            event = None
+                            deadline_at = 0.0
+                            wait = min((max(0.0, min(entry["next_attempt_at"], entry["deadline_at"]) - time.time())
+                                        for entry in pending), default=0.1)
+                    if event is None:
+                        if self.closing and not pending and not self._more:
+                            return
+                        self.condition.wait(timeout=(max(0.01, min(wait, 0.1))
+                                                     if pending or self._more else None))
+                        continue
+                identity = hashlib.sha256(event["id"].encode()).hexdigest()[:32]
+                result: Mapping[str, Any]
+                try:
+                    with self.storage.transaction(write=False) as tx:
+                        if self._run(tx) != (self.run_id, self.binding, self.config, self.state):
+                            raise ValueError("notification Run or recipient binding changed")
+                except Exception as error:
+                    result = {"outcome": "failed", "reason": bounded_error(str(error))}
+                else:
+                    try:
+                        result = self.transport(self.config, card(event), identity, self.cancel,
+                                                timeout_seconds=max(0.0, deadline_at - time.time()))
+                    except Exception as error:
+                        result = {"outcome": "unknown", "reason": bounded_error(str(error))}
+                with outbox.transaction(self.state_root, self.run_id) as document:
+                    claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event["id"]
+                                  and entry.get("owner") == self.owner), None)
+                    if claim is not None:
+                        outbox.finish_attempt(claim, dict(result), time.time())
+                        outbox.settle(document, time.time())
+                active_event_id = None
+            except Exception as error:
+                self.failure_reason = bounded_error(str(error))
+                print(f"飞书通知不可用（开发继续）：{self.failure_reason}", file=sys.stderr)
+                if active_event_id is not None:
+                    try:
+                        with outbox.transaction(self.state_root, self.run_id) as document:
+                            claim = next((entry for entry in document["pending"]
+                                          if entry["event"]["id"] == active_event_id
+                                          and entry.get("owner") == self.owner), None)
+                            if claim is not None:
+                                outbox.finish_attempt(claim, {"outcome": "unknown",
+                                                                   "reason": self.failure_reason}, time.time())
+                                outbox.settle(document, time.time())
+                    except Exception:
+                        pass
+                return
+
+    def close(self, *, drain: bool = True) -> None:
+        if not self.enabled or self.closed:
+            return
+        with self.condition:
+            self.closing = True
+            if not drain:
+                self.cancel.set()
+            self.condition.notify_all()
+        if self.thread is not None and drain:
+            self.thread.join(timeout=CLOSE_TIMEOUT_SECONDS)
+        self.cancel.set()
+        with self.condition:
+            self.condition.notify_all()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.closed = True

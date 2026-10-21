@@ -32,7 +32,7 @@ def render_role_prompt(call: AgentCall) -> str:
         raise KernelError("prompt_thread_binding")
     request: dict[str, Any] = dict(context)
     request["thread_id"] = call.reported_thread
-    if call.mode == "output-repair":
+    if call.output_ordinal > 0:
         error = context.get("contract_error")
         if context.get("readonly") is not True or not isinstance(error, str) or not error:
             raise KernelError("output_repair_prompt_unavailable")

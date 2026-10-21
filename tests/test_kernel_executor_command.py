@@ -8,6 +8,7 @@ import pytest
 
 from agent_run_kernel import executor
 from agent_run_kernel import codex_execution
+from agent_run_kernel import local_effects
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec, World
 
@@ -86,3 +87,41 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert "worker_unavailable" in status["gates"]
     assert kernel.scheduling()["active"] == []
+
+
+def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket:2", DeliveryKind.TICKET, 2, "revision", base, "refs/heads/ticket", "refs/heads/run")
+    kernel = Kernel.create(tmp_path / "run.sqlite", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
+    execution = kernel.claim_executor("executor")
+    world = World("parent", "graph", "revision", base)
+    call = kernel.advance(delivery.key, execution, world).call
+    assert call is not None
+    kernel.receive(call, b'{"result_kind":"development","summary":"changed","human_blockers":null}')
+    assert kernel.advance(delivery.key, execution, world, allow_agent=False).kind == "progress"
+    step = kernel.advance(delivery.key, execution, world)
+    assert step.effect is not None and step.effect.operation == "candidate"
+    writes: list[str] = []
+
+    class Local:
+        def __init__(self, *arguments: object, **keywords: object) -> None:
+            pass
+
+        def execute(self, effect: object, authorize: object) -> None:
+            assert callable(authorize)
+            authorize()
+            kernel.control("stop", "operator-stop")
+            authorize()
+            writes.append("unexpected")
+
+    monkeypatch.setattr(local_effects, "LocalEffects", Local)
+    driver = object.__new__(executor._Executor)
+    driver.kernel, driver.execution = kernel, execution
+    driver.remote = type("Remote", (), {"git": object()})()
+    driver.observe = lambda subject: world
+    with pytest.raises(KernelError, match="executor_fenced"):
+        driver.effect(step)
+    assert writes == []
+    assert not any(event["kind"] == "effect_failed" for event in kernel.history(delivery.key))

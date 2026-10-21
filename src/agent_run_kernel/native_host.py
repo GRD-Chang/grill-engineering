@@ -19,9 +19,10 @@ import sys
 import time
 from typing import Any, TYPE_CHECKING
 
+from agent_run.process_binding import _process_start_token as _start_token
 from agent_run.runner_lease import RunnerLease, retain_lease_for_systemd_exit, runner_usage_lease
 
-from .execution import _cgroup, _start_token
+from .execution import _cgroup
 from .model import HostLaunch, HostObservation
 
 if TYPE_CHECKING:
@@ -314,6 +315,7 @@ def managed_host_environment(
         original = kernel.host_usage(action_id)
         if original is None or original.evidence != _encode(inherited.receipt).decode():
             raise HandoffError("Original guardian receipt is unavailable")
+        manager.environment = {**inherited.environment, "LC_ALL": "C", "SYSTEMD_PAGER": "cat"}
         observation = manager.observe(request)
         if (observation.disposition != "running" or observation.main_pid != os.getpid()
                 or observation.start_token != _start_token(os.getpid())

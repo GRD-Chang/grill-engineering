@@ -19,7 +19,8 @@ import tempfile
 from typing import Any, Mapping
 
 from .kernel import Kernel
-from .migration import MigrationRefused, SourceSnapshot, _created_at_epoch, capture_v6
+from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
+                        _require_no_v6_notification_journal, capture_v6)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
@@ -464,6 +465,7 @@ def convert_completed_ticket_v6(
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _read_completed(copied.path, profile, profile_sha, snapshot.sha256)
+        _require_no_v6_notification_journal(snapshot, facts.run_id)
         if (observed.get("run_id") != facts.run_id
                 or observed.get("candidate_sha") != facts.candidate_sha
                 or observed.get("integrated_sha") != facts.integrated_sha
