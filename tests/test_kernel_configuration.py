@@ -79,7 +79,9 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
 
 def test_publication_call_retains_its_actual_development_reference_revision(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    revision = scenario.kernel.configure_profiles("choose-profile", preset="economy", overrides={"development_model": "selected-development"})
+    revision = scenario.kernel.configure_profiles("choose-profile", preset="economy", overrides={
+        "development_model": "selected-development", "publication_from_development": True,
+    })
     for _ in range(40):
         step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
         if step.call is not None and step.call.role == "publication":

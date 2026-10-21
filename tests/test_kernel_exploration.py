@@ -255,7 +255,8 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
 def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) -> None:
     original = ticket_spec()
     deliveries = tuple(replace(original.deliveries[0], key=f"ticket:{number}", issue=number) for number in (2, 3, 4))
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries))
+    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries,
+                           policy=replace(original.policy, concurrency=1)))
     token = kernel.claim_executor("executor")
     world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
     first = kernel.advance("ticket:2", token, world).call
