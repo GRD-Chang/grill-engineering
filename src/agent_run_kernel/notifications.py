@@ -179,7 +179,7 @@ class NativeNotifications:
                 closure = view["closures"][0]
                 original = tx.one("SELECT * FROM history WHERE kind='effect_consumed' AND identity=? AND material_id=?",
                                   (closure["effect_id"], closure["receipt_id"]))
-                timing = execution_facts(tx, original, whole_run=True)
+                timing = execution_facts(tx, dict(original), whole_run=True)
                 total = timing.pop("execution_seconds", None)
                 terminal.update(timing, total_seconds=total)
             highwater = view["highwater"]
@@ -207,13 +207,13 @@ class NativeNotifications:
             for key, action in actions.items():
                 if action["subject"] is None:
                     continue
-                original = tx.rows("SELECT h.* FROM history h JOIN gates g ON g.subject=h.subject "
+                gate_history = tx.rows("SELECT h.* FROM history h JOIN gates g ON g.subject=h.subject "
                                    "AND g.code=h.identity AND g.evidence IS h.material_id "
                                    "WHERE h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? "
                                    "ORDER BY h.position DESC LIMIT 1",
                                    (action["subject"], action.get("generation"), action["reason"]))
-                if original:
-                    resumes[key] = resume_facts(tx, original[0])
+                if gate_history:
+                    resumes[key] = resume_facts(tx, dict(gate_history[0]))
             caught_up = cursor == highwater
             # Never send an intermediate historical gate as a current card.
             # Each call reads at most 128 snapshots, then persists its cursor.
