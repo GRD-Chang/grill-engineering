@@ -4,11 +4,8 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-from agent_run.agent_work import AgentWorkScope
-from agent_run.change_delivery_contracts import ChangeJobContract
-from agent_run.change_delivery_review import ChangeReview
+from agent_run.development_review import DevelopmentReview
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github import GitHubReadError
 from agent_run.review_attempt import begin_review, consume_review_result
 from agent_run.review_budget import TICKET_POLICY, new_budget
@@ -20,7 +17,8 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     job = {
         "base_sha": "base", "candidate_sha": "candidate", "phase": "reviewing",
         "pr_number": 11, "review_budget": new_budget(), "review_budget_history": [],
-        "ticket_number": 3,
+        "ticket_number": 3, "ticket_branch": "ticket/3",
+        "effective_revision": "revision",
     }
     attempt = begin_review(
         job, work_subject="ticket-3", generation=1,
@@ -34,29 +32,31 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     )
     artifact = consume_review_result(job, TICKET_POLICY, _passing_artifact())
     job["pending_review_result"] = {"reviewer_thread_id": "reviewer", "artifact": artifact.raw}
-    state = {"active_ticket_job": job, "ticket_integration_queue": [], "ticket_integration_holder": None}
+    state = {"run_id": "review-run", "run_branch": "run", "parent": {"number": 1},
+             "active_ticket_job": job, "ticket_integration_queue": [], "ticket_integration_holder": None}
 
-    def status_read_failure(*_args, **_kwargs):
+    status_reads: list[int] = []
+
+    def status_read_failure(number, *_args, **_kwargs):
+        status_reads.append(number)
         raise GitHubReadError("github_read_failed", "status readback unavailable")
 
-    github = SimpleNamespace(record_agent_run_status=status_read_failure)
+    github = SimpleNamespace(
+        record_agent_run_status=status_read_failure,
+        current_effective_revision=lambda **_kwargs: "revision",
+    )
 
-    def review_work(current):
-        return ChangeReview(
-            state=current, job=current["active_ticket_job"], checkout=tmp_path,
-            contract=ChangeJobContract(label="ticket-3", branch="ticket/3", base_branch="run",
-                                       review_budget_policy=TICKET_POLICY),
+    def review_work():
+        return DevelopmentReview(
             git=SimpleNamespace(resolve=lambda _ref: "tree"), github=github, agents=None,
-            adapter=SimpleNamespace(
-                acceptance_record=lambda *_args, **_kwargs: {"artifact": artifact.raw},
-                revision_changed=lambda *_args: False,
-            ),
-            publisher=SimpleNamespace(), state_store=SimpleNamespace(save=lambda value: value),
-            agent_work=AgentWorkScope(), development_only=False,
+            states=SimpleNamespace(save_run=lambda *_args: None,
+                                   ticket_pause_requested=lambda *_args: False),
         )
 
-    with pytest.raises(GitHubReadError, match="status readback unavailable"):
-        review_work(state).complete()
+    step = review_work().advance_change(state, job, tmp_path, scope="ticket")
+    assert step.kind == DeliveryStepKind.WAITING
+    assert status_reads == [11]
+    assert state["external_wait"]["code"] == "github_read_failed"
     # Failure recording may persist the mutated in-memory state. That snapshot
     # must retain the answer and its Attempt until remote readback succeeds.
     reloaded = deepcopy(state)
@@ -65,7 +65,7 @@ def test_candidate_status_read_failure_keeps_the_returned_reviewer(tmp_path: Pat
     assert pending["pending_review_result"]["artifact"] == artifact.raw
     assert pending["pending_semantic_attempt"]["attempt_id"] == attempt["attempt_id"]
     github.record_agent_run_status = lambda *_args, **_kwargs: None
-    review_work(reloaded).complete()
+    review_work().advance_change(reloaded, pending, tmp_path, scope="ticket")
     assert pending["phase"] == "accepted"
     assert "pending_review_result" not in pending
     assert "pending_semantic_attempt" not in pending

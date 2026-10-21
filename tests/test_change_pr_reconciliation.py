@@ -114,6 +114,7 @@ def test_creation_recovery_lookup_includes_closed_and_ambiguous_objects(
 
 def test_run_repair_checks_pending_write_before_source_observation(monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_run.run_repair_lifecycle import RunRepairLifecycle
+    from agent_run.development_review import DevelopmentReview
 
     intent = {"branch": "run", "base_sha": "base", "candidate_sha": "candidate", "default_base_sha": "default"}
     state: dict[str, Any] = {"run_id": "run-1"}
@@ -132,7 +133,7 @@ def test_run_repair_checks_pending_write_before_source_observation(monkeypatch: 
 
     monkeypatch.setattr("agent_run.run_repair_lifecycle.update_run_branch", reconcile)
     monkeypatch.setattr("agent_run.run_repair_lifecycle.require_change_checkout", forbidden)
-    monkeypatch.setattr("agent_run.run_repair_lifecycle.prepare_delivery_integration", forbidden)
+    monkeypatch.setattr(DevelopmentReview, "integrate_repair_candidate", forbidden)
     assert lifecycle._repair(state, {}) == "blocked"
     assert job["run_branch_write_intent"] == intent
 

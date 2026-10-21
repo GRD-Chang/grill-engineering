@@ -16,6 +16,7 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
 from agent_run.controller import Controller
+from agent_run.development_review import DevelopmentReview
 from agent_run.object_state import current_projection_facts
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -1110,20 +1111,21 @@ def test_returned_run_review_survives_currentness_read_failure(
             event("thread_started", reported_thread_id="run-reviewer-1", attempt_count=1)
             result = super().review(request)
             if during_call_drift:
-                engine.default_head_sha = git.resolve(str(state["run_branch"]))
+                engine.work.default_head_sha = git.resolve(str(state["run_branch"]))
             event("completed", reported_thread_id=result.thread_id, attempt_count=1)
             return result
 
     agents = ReturningReviewer()
     agents._reviews = [_passing_artifact()]
 
-    class FailingReadEngine(RunAcceptanceEngine):
+    class FailingReadWork(DevelopmentReview):
         def _refresh_run_currentness(self, current: dict[str, Any]) -> bool:
             if agents.review_requests:
                 raise GitHubReadError("github_api_unavailable", "readback unavailable")
             return super()._refresh_run_currentness(current)
 
-    engine = FailingReadEngine(git=git, states=states, agents=agents)
+    engine = RunAcceptanceEngine(git=git, states=states, agents=agents)
+    engine.work = FailingReadWork(git=git, states=engine.states, agents=agents)
     with pytest.raises(GitHubReadError, match="readback unavailable"):
         engine.accept(state["run_id"])
     saved = states.load_current_run(state["run_id"])
@@ -1217,14 +1219,16 @@ def test_returned_review_finishes_before_new_integration_work(
     agents = Agents()
     agents._reviews = [_passing_artifact()]
 
-    class ReadFailure(RunAcceptanceEngine):
+    class ReadFailure(DevelopmentReview):
         def _refresh_run_currentness(self, current: dict[str, Any]) -> bool:
             if agents.review_requests:
                 raise GitHubReadError("github_api_unavailable", "readback unavailable")
             return super()._refresh_run_currentness(current)
 
+    engine = RunAcceptanceEngine(git=git, states=states, agents=agents, github=publisher)
+    engine.work = ReadFailure(git=git, states=engine.states, agents=agents, github=publisher)
     with pytest.raises(GitHubReadError):
-        ReadFailure(git=git, states=states, agents=agents, github=publisher).accept(run_id)
+        engine.accept(run_id)
     saved = states.load_current_run(run_id)
     attempt = saved["run_acceptance"]["pending_semantic_attempt"]["attempt_id"]
     assert saved["run_acceptance"]["pending_review_result"]["record"]["reviewed_default_base_sha"] == target

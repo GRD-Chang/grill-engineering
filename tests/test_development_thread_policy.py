@@ -9,25 +9,31 @@ import pytest
 
 from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.change_delivery_threads import require_development_thread
-from agent_run.change_delivery_development import develop
+from agent_run.development_review import DevelopmentReview
 from agent_run.agents import DevelopmentResult
-from agent_run.review_budget import TICKET_POLICY, new_budget, mark_development, reset_budget
+from agent_run.review_budget import TICKET_POLICY, new_budget, reset_budget
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.prompt_resources import resolve_resources
 
 
 @pytest.mark.parametrize("source", ["acceptance", "required_checks", "git_integrity", "human_revision", "merge_conflict", "final_ci_fix", "new_budget_window"])
-def test_shared_development_allocates_once_and_preserves_pending_work(source: str, tmp_path: Path) -> None:
+def test_shared_development_allocates_once_and_preserves_pending_work(
+    source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     frozen_resources = resolve_resources()
     frozen_resources["methods/repair"] = "Run 创建时固定的修复方法"
     state: dict[str, Any] = {
+        "run_id": "thread-policy", "run_branch": "run", "parent": {"number": 1},
+        "ticket_integration_queue": [], "ticket_integration_holder": None,
         "policy_snapshot": DeliveryPolicy(development_thread_policy="new-per-attempt").snapshot(),
         "prompt_resources": deepcopy(frozen_resources),
     }
     used = 4 if source == "final_ci_fix" else 1
     repair_source = {"final_ci_fix": "required_checks", "new_budget_window": "acceptance"}.get(source, source)
     job: dict[str, Any] = {
+        "ticket_number": 1, "ticket_branch": "ticket/1",
+        "base_sha": "base", "effective_revision": "revision",
         "development_thread_id": "old", "development_thread_history": [], "reviewer_thread_ids": [],
         "repair_source": repair_source, "candidate_sha": "candidate", "pr_number": 12,
         "modification_attempts": used, "validation_attempts": 0, "phase": "repairing", "review_budget": new_budget(development_attempts=used),
@@ -48,24 +54,22 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
         assert (tmp_path / "uncommitted.txt").read_text() == "existing work"
         return DevelopmentResult(thread_id="new", summary="Work retained")
 
-    stage = SimpleNamespace(
-        git=SimpleNamespace(checkout_head=lambda checkout: "current-head"),
-        adapter=SimpleNamespace(
-            invocation_identity=lambda state, job: ("ticket:1", 1),
-            development_request=lambda state, job, checkout: {
-                "thread_id": job.get("development_thread_id"), "repair_source": job["repair_source"],
-                "checkout": str(checkout),
-            },
-            development_thread_is_allowed=lambda state, thread: True,
-        ),
-        agents=SimpleNamespace(develop=worker), contract=SimpleNamespace(label="ticket:1"),
-        mark_development_attempt=lambda state, job, *, attempt_kind: mark_development(job, TICKET_POLICY, attempt_kind=attempt_kind),
-        review_budget_policy=lambda: TICKET_POLICY,
-        _reject_stale=lambda *args: None, _invocation_boundary=lambda job: {"base_sha": "base"},
-        _agent_is_current=lambda *args: True, save=lambda state: saved.append(deepcopy(job)),
-        release_agent_work=lambda: None,
+    work = DevelopmentReview(
+        git=SimpleNamespace(checkout_head=lambda checkout: "current-head",
+                            resolve=lambda _ref: "candidate-tree"),
+        github=SimpleNamespace(current_effective_revision=lambda **_kwargs: "revision"),
+        agents=SimpleNamespace(develop=worker),
+        states=SimpleNamespace(save_run=lambda *_args: saved.append(deepcopy(job))),
     )
-    develop(stage, state, job, tmp_path)
+    work._bind_change(state, job, "ticket")
+    # This unit isolates allocation/Thread/raw replay from request projection,
+    # as the original test's finite request adapter did. Real role execution,
+    # allowance arithmetic, semantic allocation and result consumption run.
+    monkeypatch.setattr(work, "_development_request", lambda _state, current, checkout: {
+        "thread_id": current.get("development_thread_id"),
+        "repair_source": current["repair_source"], "checkout": str(checkout),
+    })
+    work._develop_work(state, job, tmp_path)
     first_attempt = deepcopy(job["pending_semantic_attempt"])
     first_budget = deepcopy(job["review_budget"])
     assert requests[0]["thread_id"] is None
@@ -78,7 +82,7 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
     # Re-entry after a returned result continues closeout without new Agent work.
     job.update(deepcopy(saved[-1]))
     job["phase"] = "repairing"
-    develop(stage, state, job, tmp_path)
+    work._develop_work(state, job, tmp_path)
     assert len(requests) == 1
     assert job["development_thread_id"] == "new"
     assert job["development_summary"] == "Work retained"

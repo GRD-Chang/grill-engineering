@@ -10,7 +10,7 @@ import pytest
 from support.workspace import managed_state
 
 from agent_run.cli_presentation import _publication_operation_retries
-from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.development_review import DevelopmentReview
 from agent_run.publication_operation_retry import (
     begin_publication_operation_attempt,
     record_publication_operation_failure,
@@ -109,7 +109,7 @@ def test_unstarted_publication_credential_wait_releases_its_retry_owner() -> Non
     owner["last_publication_error"] = "context offline"
     engine = SimpleNamespace(review_budget_policy=lambda: TICKET_POLICY)
 
-    ChangeDeliveryEngine._refund_unstarted_credential_invocation(
+    DevelopmentReview._refund_unstarted_credential_invocation(
         engine, {}, owner
     )
 

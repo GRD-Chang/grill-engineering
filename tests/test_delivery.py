@@ -52,8 +52,9 @@ from agent_run.requeue import requeue_change_job
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.ticket_state import TicketState
 from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
-from agent_run.run_repair_delivery import RunRepairAdapter
 from agent_run.review_budget import TICKET_POLICY
+from agent_run.development_review import DevelopmentReview
+from agent_run.change_delivery_fallback import prepare_ticket_fallback
 
 from support.seeding import write_fixture
 from support.ticket_scenarios import published_ticket
@@ -77,33 +78,15 @@ def test_change_delivery_seams_keep_facts_and_semantics_separate() -> None:
         contract.label = "mutated"  # type: ignore[misc]
 
     assert not hasattr(ChangeDeliveryAdapter, "__dataclass_fields__")
+    # Development/Review requests now belong to concrete Work. Only the
+    # retained publication contract remains on these delivery adapters.
     assert {
-        "development_request",
         "publication_request",
-        "review_request",
-        "acceptance_record",
         "acceptance_is_current",
     } <= set(vars(ChangeDeliveryAdapter))
-    assert set(signature(ChangeDeliveryEngine.__init__).parameters) == {
-        "self",
-        "git",
-        "github",
-        "agents",
-        "contract",
-        "adapter",
-        "publisher",
-        "state_store",
-        "development_only",
-    }
-    for concrete in (
-        TicketDeliveryAdapter,
-        ParentDeliveryAdapter,
-        RunRepairAdapter,
-    ):
+    for concrete in (TicketDeliveryAdapter, ParentDeliveryAdapter):
         assert "owner" not in signature(concrete.__init__).parameters
-        assert concrete.development_request is not ChangeDeliveryAdapter.development_request
         assert concrete.publication_request is not ChangeDeliveryAdapter.publication_request
-        assert concrete.review_request is not ChangeDeliveryAdapter.review_request
 
 
 def test_fallback_publication_context_is_a_minimal_non_null_projection() -> None:
@@ -1974,7 +1957,7 @@ def test_fallback_observation_commit_resumes_without_duplicate_work(
 
 
 def test_ci_sourced_fallback_receipt_preserves_failure_source_and_authority() -> None:
-    engine = object.__new__(ChangeDeliveryEngine)
+    engine = SimpleNamespace()
     engine.review_budget_policy = lambda: TICKET_POLICY
     engine.save = lambda state: state
     engine.git = SimpleNamespace(
@@ -2028,7 +2011,7 @@ def test_ci_sourced_fallback_receipt_preserves_failure_source_and_authority() ->
         "review_budget_history": [],
     }
 
-    assert engine._prepare_ticket_fallback({}, job)
+    assert prepare_ticket_fallback(engine, {}, job)
 
     receipt = job["fallback_publication_receipt"]
     assert receipt["failure_evidence"] == ci_evidence
@@ -2041,7 +2024,7 @@ def test_ci_sourced_fallback_receipt_preserves_failure_source_and_authority() ->
 
 
 def test_fallback_after_final_ci_fix_reuses_prior_acceptance_artifact() -> None:
-    engine = object.__new__(ChangeDeliveryEngine)
+    engine = SimpleNamespace()
     engine.review_budget_policy = lambda: TICKET_POLICY
     engine.save = lambda state: state
     engine.git = SimpleNamespace(
@@ -2077,7 +2060,7 @@ def test_fallback_after_final_ci_fix_reuses_prior_acceptance_artifact() -> None:
         "review_budget_history": [],
     }
 
-    assert engine._prepare_ticket_fallback({}, job)
+    assert prepare_ticket_fallback(engine, {}, job)
 
     receipt = job["fallback_publication_receipt"]
     assert receipt["last_acceptance_artifact"] == prior_artifact
@@ -2086,7 +2069,7 @@ def test_fallback_after_final_ci_fix_reuses_prior_acceptance_artifact() -> None:
 
 
 def test_acceptance_repair_supersedes_stale_ci_fallback_evidence() -> None:
-    engine = object.__new__(ChangeDeliveryEngine)
+    engine = SimpleNamespace()
     engine.review_budget_policy = lambda: TICKET_POLICY
     engine.save = lambda state: state
     engine.git = SimpleNamespace(
@@ -2122,7 +2105,7 @@ def test_acceptance_repair_supersedes_stale_ci_fallback_evidence() -> None:
         "review_budget_history": [],
     }
 
-    assert engine._prepare_ticket_fallback({}, job)
+    assert prepare_ticket_fallback(engine, {}, job)
 
     receipt = job["fallback_publication_receipt"]
     assert receipt["failure_evidence_source"] == "acceptance"
@@ -3253,7 +3236,7 @@ def test_ticket_unknown_category_required_check_failure_reaches_development(
     git_repo: Path, checks: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        ChangeDeliveryEngine,
+        DevelopmentReview,
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )
@@ -3291,7 +3274,7 @@ def test_ticket_mixed_pending_required_checks_are_supervised(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        ChangeDeliveryEngine,
+        DevelopmentReview,
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )
@@ -3358,7 +3341,7 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
     value: object,
 ) -> None:
     monkeypatch.setattr(
-        ChangeDeliveryEngine,
+        DevelopmentReview,
         "review_budget_policy",
         lambda self: replace(TICKET_POLICY, development_limit=1),
     )

@@ -330,12 +330,12 @@ def test_run_update_reviews_latest_target_after_another_append(
 def test_run_update_resume_reuses_returned_reviewer_after_readback_failure(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agent_run.run_acceptance import RunAcceptanceEngine
+    from agent_run.development_review import DevelopmentReview
 
     fixture, before = prepare_published_run(git_repo)
     target = append_remote(git_repo, fixture, "main", "target.txt", "new target\n")
     agents = update_agents(git_repo)
-    refresh = RunAcceptanceEngine._refresh_run_currentness
+    refresh = DevelopmentReview._refresh_run_currentness
 
     def fail_readback(self: Any, state: dict[str, Any]) -> bool:
         if state["run_acceptance"].get("pending_review_result"):
@@ -343,7 +343,7 @@ def test_run_update_resume_reuses_returned_reviewer_after_readback_failure(
         return refresh(self, state)
 
     with monkeypatch.context() as patch:
-        patch.setattr(RunAcceptanceEngine, "_refresh_run_currentness", fail_readback)
+        patch.setattr(DevelopmentReview, "_refresh_run_currentness", fail_readback)
         failed = invoke_cli_inprocess(
             git_repo, fixture, "approve", before["run_id"], "--agent-fixture", str(agents), "--json",
         )

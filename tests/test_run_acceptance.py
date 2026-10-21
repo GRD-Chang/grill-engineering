@@ -17,10 +17,11 @@ from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller, _resume_review_budget_window
 from agent_run.delivery_policy import DeliveryPolicy
+from agent_run.delivery_step import DeliveryStepKind
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.git import MergeConflictError
 from agent_run.run_acceptance import RunAcceptanceEngine
-from agent_run.run_repair_delivery import RunRepairPublisher
+from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_repair_promotion import RunRepairPromotion
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_currentness import (
@@ -352,7 +353,7 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
     assert state is not None
     state.update(engine.states.load_delivery_evidence(str(state["run_id"])))
     run = state["run_acceptance"]
-    assert engine._review(state, run)
+    assert engine.work.advance_run(state, run).kind == DeliveryStepKind.CONTINUE
 
     assert run["phase"] == "repairing"
     assert run["validation_attempts"] == 2
@@ -383,7 +384,7 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
     assert state is not None
     state.update(engine.states.load_delivery_evidence(str(state["run_id"])))
     run = state["run_acceptance"]
-    assert engine._review(state, run)
+    assert engine.work.advance_run(state, run).kind == DeliveryStepKind.CONTINUE
     assert run["validation_attempts"] == 3
     assert run["review_budget"]["reviewer_invocations"] == 1
     assert [attempt["ordinal"] for attempt in run["semantic_attempt_history"]] == [3]
@@ -975,8 +976,7 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
     try:
         git.seed_managed_checkout(checkout, expected_head=candidate)
         assert git.checkout_head(checkout) == candidate
-        assert engine.repair_requests is not None
-        request = engine.repair_requests.development(state, job, checkout)
+        request = RunRepairRequests(git, engine.github).development(state, job, checkout)
         assert request["thread_id"] == thread_id
         assert request["head_sha"] == candidate
         assert request["repair_source"] == "acceptance"
@@ -1783,7 +1783,7 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     }
     run["repair_job"] = job
 
-    RunRepairPublisher(engine, RunRepairPromotion(engine)).invalidate_stale(
+    RunRepairPromotion(engine).invalidate_stale(
         state, job, git_repo / "unused-checkout"
     )
 

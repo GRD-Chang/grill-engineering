@@ -611,7 +611,7 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
         "candidate_acceptance_history": [],
     }
 
-    engine.candidate_acceptance.record(job, "candidate-reviewer", artifact)
+    engine.work.candidate_acceptance.record(job, "candidate-reviewer", artifact)
 
     assert job["candidate_acceptance_history"][-1]["outcome"] == expected_outcome
     state["run_acceptance"] = {

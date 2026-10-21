@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine, ChangeJobContract
-from agent_run.change_delivery_review import ChangeReview
+from agent_run.development_review import DevelopmentReview, parent_review_identity
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
@@ -306,6 +306,7 @@ def test_parent_ci_candidate_reviews_before_rejoining_integration(
     policy = DeliveryPolicy().snapshot()
     job = {
         "base_sha": base, "candidate_sha": candidate, "phase": "accepted",
+        "parent_branch": "parent",
         "policy_snapshot": policy,
         "acceptance_record": {"reviewed_candidate_sha": candidate},
         # Demand acceptance may use more reviews than the integration window.
@@ -313,18 +314,26 @@ def test_parent_ci_candidate_reviews_before_rejoining_integration(
         "review_budget_history": [],
         "modification_attempts": 6, "validation_attempts": 6,
     }
-    state = {"policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
+    state = {"run_id": "parent-run", "base": {"branch": "main"},
+             "policy_snapshot": policy, "parent": {"number": 1, "revision": "revision"}}
     job["effective_revision"] = "revision"
+    work = DevelopmentReview(
+        git=git, github=github, agents=None,
+        states=SimpleNamespace(save_run=lambda *_args: None),
+    )
     engine = ChangeDeliveryEngine(
         git=git, github=github, agents=None,
         contract=ChangeJobContract(label="parent-only", branch="parent", base_branch="main"),
         adapter=ParentDeliveryAdapter(git, github), publisher=None,
-        state_store=SimpleNamespace(save=lambda value: value),
+        state_store=SimpleNamespace(save=lambda value: value), work=work,
     )
 
     job["acceptance_artifact"] = {key: value for key, value in passing_acceptance("demand-reviewer", "demand passed").items() if key != "thread_id"}
-    job["acceptance_record"] = engine.adapter.acceptance_record(state, job, "demand-reviewer", job["acceptance_artifact"])
-    assert prepare_parent_integration(engine, state, job, git_repo) is True
+    job["acceptance_record"] = {
+        **parent_review_identity(git, state, job),
+        "reviewer_thread_id": "demand-reviewer", "artifact": job["acceptance_artifact"],
+    }
+    assert work.integrate_parent_candidate(state, job, git_repo) is True
     assert "parent_integration_stage" not in job
     assert job["review_budget"]["window"] == 1
 
@@ -341,12 +350,14 @@ def test_parent_ci_candidate_reviews_before_rejoining_integration(
                               repair_pending=True, review_required=True)
     reviewed: list[tuple[str, str]] = []
 
-    def capture_review(work: ChangeReview) -> None:
-        current = work.job
+    def capture_review(
+        work: DevelopmentReview, current_state: dict, current: dict, checkout: Path,
+    ) -> bool:
         reviewed.append((current["base_sha"], current["candidate_sha"]))
         current["phase"] = "blocked"
+        return True
 
-    monkeypatch.setattr(ChangeReview, "review", capture_review)
+    monkeypatch.setattr(DevelopmentReview, "_review", capture_review)
     engine.run(state, job, git_repo)
 
     assert reviewed == [(base, repaired_candidate)]
