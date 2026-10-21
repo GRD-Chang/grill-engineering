@@ -118,7 +118,7 @@ def test_run_repair_checks_pending_write_before_source_observation(monkeypatch: 
     intent = {"branch": "run", "base_sha": "base", "candidate_sha": "candidate", "default_base_sha": "default"}
     state: dict[str, Any] = {"run_id": "run-1"}
     job: dict[str, Any] = {"phase": "accepted", "run_branch_write_intent": dict(intent)}
-    owner = SimpleNamespace(github=object(), _repair_checkout=lambda _state: Path("unused"))
+    owner = SimpleNamespace(github=object(), states=object(), _repair_checkout=lambda _state: Path("unused"))
     lifecycle = RunRepairLifecycle(owner, SimpleNamespace())
     monkeypatch.setattr(lifecycle, "_repair_job", lambda _state, _run: job)
 

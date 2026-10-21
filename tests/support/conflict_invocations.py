@@ -15,6 +15,8 @@ from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.git import GitRepository
 from agent_run.delivery_step import DeliveryStepKind
+from agent_run.delivery_budget import repair_integration_budget_owner
+from agent_run.integration_resync_budget import observe_integration_snapshot
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.parent_integration import (
     finish_ticket_snapshot, finish_parent_snapshot, finish_repair_snapshot,
@@ -119,6 +121,13 @@ def prepared_conflict(git_repo: Path, kind: str, phase: str = "accepted", *, sta
     job[key] = dict(source_sha=base, target_sha=base, candidate_sha=base,
                     stage="source", head_sha=base, merge_head_sha=base, paths=["README.md"], attempts=0,
                     resolved_stages=[], conflict_paths=["README.md"])
+    # This fixture starts after snapshot preparation. Open that exact pair's
+    # original free window on the actual object/generation owner before work.
+    observe_integration_snapshot(
+        repair_integration_budget_owner(state, job),
+        source_sha=job[key]["source_sha"], target_sha=job[key]["target_sha"],
+        policy_snapshot=job["policy_snapshot"],
+    )
     persist_run_fixture(store, str(state["run_id"]), state)
     scoped = object_store(store, parent_scope=kind != "ticket")
     assert scoped.load_current_run(str(state["run_id"])) is not None
