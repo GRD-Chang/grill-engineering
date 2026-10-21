@@ -9,8 +9,7 @@ import pytest
 from agent_run_kernel import executor
 from agent_run_kernel import codex_execution
 from agent_run_kernel.kernel import Kernel
-from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec
-from agent_run_kernel.offline import Scenario
+from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec, World
 
 
 def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secrets(
@@ -60,13 +59,15 @@ def test_native_executor_enumerates_more_than_one_query_page(tmp_path: Path) -> 
 def test_prompt_preparation_failure_durably_releases_only_its_original_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    call = scenario.step().call
+    base = Commit("base", "tree")
+    delivery = Delivery("ticket:2", DeliveryKind.TICKET, 2, "revision", base, "refs/heads/ticket", "refs/heads/run")
+    kernel = Kernel.create(tmp_path / "run.sqlite", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
+    execution = kernel.claim_executor("executor")
+    call = kernel.advance(delivery.key, execution, World("parent", "graph", "revision", base)).call
     assert call is not None
     driver = object.__new__(executor._Executor)
-    driver.kernel = scenario.kernel
-    assert scenario.spec.inputs is not None
-    driver.worker_identity = scenario.spec.inputs.worker_identity
+    driver.kernel = kernel
+    driver.worker_identity = {"source": "host"}
     driver.environment = {}
     driver.hidden_paths = ()
     driver.hidden_environment = ()
@@ -80,8 +81,8 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     monkeypatch.setattr(codex_execution, "execute_selected_codex", unexpected_worker, raising=False)
     monkeypatch.setattr(executor, "render_role_prompt", invalid_prompt)
     driver.agent(call)
-    status = scenario.kernel.status(call.subject)
+    status = kernel.status(call.subject)
     assert status["pending_attempt"] == call.attempt_id
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert "worker_unavailable" in status["gates"]
-    assert scenario.kernel.scheduling()["active"] == []
+    assert kernel.scheduling()["active"] == []
