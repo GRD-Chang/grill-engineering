@@ -580,7 +580,6 @@
     },
     "host_loop_regression": {
       "module": "tests/test_kernel_operation_review_host.py",
-      "sha256": "3538e9c50afe4dcd3834b07b361f835d57f4a6301f114c12b4b97e2cd9919296",
       "command": "python -m pytest -q tests/test_kernel_operation_review_host.py",
       "original_edbbeb62_results": {
         "top_level_nodes": 1,
@@ -610,7 +609,63 @@
           }
         ]
       },
-      "contract": "executor.run exits at unknown push without polling or writing despite now-readable target; explicit subject resume uses original readback, preserves one push and Attempt count, and reaches approval. No Agent is allowed to start in the Host runs. NativeNotifications is replaced by a no-I/O observer; this tests the real Host loop, not an actual systemd service or worker namespace."
+      "contract": "executor.run exits at unknown push without polling or writing despite now-readable target; explicit subject resume uses original readback, preserves one push and Attempt count, and reaches approval. No Agent is allowed to start in the Host runs. NativeNotifications is replaced by a no-I/O observer; this tests the real Host loop, not an actual systemd service or worker namespace.",
+      "module_sha256_at_initial_measurement": "3538e9c50afe4dcd3834b07b361f835d57f4a6301f114c12b4b97e2cd9919296",
+      "current_module_sha256": "b868ffd248ef1f522ea246583d3837e27f1321aa3b786c0aa8753dd3ac7b965f"
     }
+  },
+  "third_host_recovery_review": {
+    "nodeid": "tests/test_kernel_operation_review_host.py::test_public_run_reads_a_restored_third_push_before_conflict_resume",
+    "module_sha256": "b868ffd248ef1f522ea246583d3837e27f1321aa3b786c0aa8753dd3ac7b965f",
+    "scope": "Only physical I/O adapters differ for historical/current interfaces. Every recovery operation uses public control/admit_host/dispatch_host/observe_host/control_host and actual executor.run. No direct runner.run_once, Kernel.advance/reconcile, SQL mutation, fabricated Action, or arbitrary Execution is used as a recovery shortcut. The Execution fields come exclusively from the actual Kernel-issued HostLaunch.",
+    "physical_fixture": "OfflinePort actually writes the push once; a supported scripted physical read reports third, then is cleared to expose the exact original target. This is a synthetic external observation, not a claim of an online foreign-ref rollback.",
+    "formal_route_static_check": "lifecycle_cli._run -> submit -> Kernel.admit_host(kind=run) -> issued HostLaunch -> Host entry executor.run. CLI resume reaches _control through submit/control_host; it refreshes requirements but does not reconcile the pending effect first.",
+    "old_formal_source_revision": "2078a0901b930790c0c3b2c52b9ee44985b30d29",
+    "old_source_identical_to_259acd4": {
+      "executor_blob": "ae97367c56aca0cf6aef257ab43860ad0d4f6b9c",
+      "kernel_blob": "cfa07b98c5f581dce3267e651b4775577f59314b"
+    },
+    "old_result": {
+      "nodes": 1,
+      "failures": 0,
+      "skipped": 0,
+      "seconds": 1.998
+    },
+    "unified_before_c649_revision": "3cde81be26c436a87f50af06baba232a3713b2c9",
+    "unified_before_c649_result": {
+      "nodes": 1,
+      "failures": 1,
+      "skipped": 0,
+      "seconds": 2.404
+    },
+    "unified_with_c649_verification_head": "247a21fb9cbedc438622a67130f6394bfa55de50",
+    "unified_with_c649_result": {
+      "nodes": 1,
+      "failures": 1,
+      "skipped": 0,
+      "seconds": 2.636
+    },
+    "old_verified_path": [
+      "Normal Scenario steps perform one original push and persist third/write_conflict with the effect sent.",
+      "Expose the exact original target; direct public Resume correctly rejects unresolved_write_conflict and creates no Action.",
+      "Public Stop -> confirm_executor_exit -> whole-Run Resume retires only fixture ownership; the independent write_conflict remains.",
+      "Public kind=run admission creates a real Action and HostLaunch. Dispatch and controlled physical Host observation bind its exact owner/epoch; no identity is manufactured.",
+      "Actual old executor.run polls the original intent before its quiescent exit: sent -> observed, one push, same Attempt count, conflict gate retained.",
+      "Public control_host(resume) now accepts the observed original; actual executor.run continues it to confirmed/approval without another push or Agent."
+    ],
+    "new_verified_obstruction": {
+      "executor_run_returncode": 0,
+      "physical_readbacks": 0,
+      "effect_status": "sent",
+      "dispatches": 1,
+      "resume_error": "unresolved_write_conflict",
+      "refused_resume_action_created": false,
+      "additional_agent_attempts": 0,
+      "additional_writes": 0
+    },
+    "cause": "The unified Host introduced by affb1ab checks quiescent and returns before scheduling run_once. The old Host performed a subject readback pass before deciding to exit. c649 makes an explicit direct run_once poll available, but normal CLI run still reaches the unchanged early-exit Host. The Resume guard itself already existed in 259/2078.",
+    "expected": "An explicitly requested normal run must be able to settle one original late target readback to observed while preserving write_conflict. Only the separate public Resume may then authorize further work. No new state framework or write-conflict relaxation is proposed.",
+    "limits": "The native public Host protocol and real executor.run are exercised with a controlled manager receipt. Literal CLI process selection/environment handoff and live systemd/bwrap are not revalidated; their routing is inspected in source. This is not a new c649-introduced defect.",
+    "original_nine_regressions_unchanged": true
   }
 }
