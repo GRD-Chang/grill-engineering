@@ -252,7 +252,12 @@ def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_pa
 
 @pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
 def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, operation: str) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    from agent_run_kernel.offline import GraphScenario
+    from test_kernel_requirements import independent_source
+
+    # Native workspace effects establish ownership; a pre-created fixture ref
+    # is not sufficient authority for deleting even an already absent marker.
+    scenario = GraphScenario(tmp_path / "scenario", independent_source())
     if operation == "validation_cleanup":
         effect = advance_to_effect(scenario, operation)
     else:

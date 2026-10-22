@@ -1602,7 +1602,17 @@ class Kernel:
                 "generation", "revision", "phase", "purpose", "source_ref", "target_ref", "base_sha",
                 "source_sha", "candidate_sha", "integrated_sha", "publication_sha", "pr_number",
                 "current_attempt", "completion_revision")}
+            requeue = self._pending_requeue(tx, subject)
+            if requeue is not None:
+                scope["requeue_action"] = requeue["id"]
         return scope
+
+    def _automatic_requeue_read(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> bool:
+        # This permits an observation only. Retirement still checks the exact
+        # accepted versions, PR identity and publisher before any external write.
+        return bool(subject is not None and not cleanup and not run["stopped"] and not run["final_action"]
+                    and run["blocked"] == "requeue_required" and self._pending_requeue(tx, subject) is not None
+                    and all(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)))
 
     def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> str:
         # No sequence counters, diagnostics, history, clocks, polling attempts
@@ -1662,7 +1672,8 @@ class Kernel:
                 row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (readback.effect_id, scope["subject"]))
                 if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
                     raise KernelError("effect_binding")
-            if (readback is None and self._abandon_action(tx) is None and
+            if (readback is None and self._abandon_action(tx) is None
+                    and not self._automatic_requeue_read(tx, run, scope["subject"], scope["cleanup"]) and
                     (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
                 raise KernelError("automatic_step_paused")
             if not after_read:
@@ -1716,9 +1727,10 @@ class Kernel:
                 return Step("waiting", subject or "", "observation_superseded")
             gates = [] if subject is None else self._gates(tx, subject)
             abandoned = self._abandon_action(tx)
+            requeue = self._automatic_requeue_read(tx, run, subject, scope["cleanup"])
             timed_out = run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in gates)
             if (timed_out
-                    or ((abandoned is None or abandoned["status"] != "pending")
+                    or ((abandoned is None or abandoned["status"] != "pending") and not requeue
                         and (run["stopped"] or run["blocked"] or gates))):
                 return Step("paused", subject or "", "supervision_timeout" if timed_out else run["blocked"] or "operator_gate")
             owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
@@ -1731,7 +1743,7 @@ class Kernel:
                 else:
                     self._gate(tx, subject, "deterministic_contradiction", evidence=evidence)
                 return Step("paused", subject or "", code)
-            kind = "required_checks" if subject is not None and self._job(tx, subject)["phase"] == "checks" else "github_convergence"
+            kind = "required_checks" if not requeue and subject is not None and self._job(tx, subject)["phase"] == "checks" else "github_convergence"
             seconds = 2700 if kind == "required_checks" else 600
             return self._supervised_wait(tx, run, subject, scope, kind, seconds, evidence)
 
