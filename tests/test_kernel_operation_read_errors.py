@@ -52,3 +52,34 @@ def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
     assert expired.value.step.reason == "supervision_timeout"
     assert runner.state().active == (call.lease_id,)
     assert not runner.worker_settled(call)
+
+
+def test_source_read_window_survives_stop_and_a_proven_executor_handoff(tmp_path):
+    from agent_run_kernel.operation_runner import ReadUnavailable
+
+    s, ports, runner = setup(tmp_path)
+    now = [100.25]
+    s.kernel.clock = lambda: now[0]
+
+    def unavailable(parent):
+        raise ReadUnavailable("github_read_failed", "Same source outage")
+
+    ports.source = unavailable
+    assert runner.run_once().retry_at == 105.25
+    now[0] = 200.25
+    s.kernel.control("stop", "stop-original-reader")
+    s.kernel.confirm_executor_exit(s.execution)
+    s.kernel.control("resume", "resume-same-read")
+    s.execution = s.kernel.claim_executor("replacement-reader")
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    assert runner.run_once().kind == "waiting"
+    with s.kernel.storage.transaction(write=False) as tx:
+        wait = tx.one("SELECT started_at,deadline,retry_count FROM waits")
+        assert tuple(wait) == (100.25, 700.25, 2)
+        assert not tx.rows("SELECT id FROM attempts")
+        assert not tx.rows("SELECT id FROM leases")
+    now[0] = 700.25
+    assert runner.run_once().reason == "supervision_timeout"
+    with s.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
+        assert not tx.rows("SELECT id FROM attempts")

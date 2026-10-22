@@ -89,7 +89,8 @@ class Kernel:
         run = tx.one("SELECT * FROM runs")
         return wire_json({"scope": self._automatic_scope(tx, run, subject, cleanup),
                           "progress": self._automatic_progress(tx, run, subject, cleanup),
-                          "source_sequence": run["source_sequence"]}).decode()
+                          "source_sequence": run["source_sequence"],
+                          "control_version": [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]}).decode()
 
     def _check_operation(self, tx: Transaction, token: str, execution: Execution | None) -> None:
         value, run = self._automatic_token(token), tx.one("SELECT * FROM runs")
@@ -97,7 +98,8 @@ class Kernel:
             self._automatic_owned(tx, run, execution)
         scope = value["scope"]
         if (scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"])
-                or value["source_sequence"] != run["source_sequence"]):
+                or value["source_sequence"] != run["source_sequence"]
+                or execution is None and value["control_version"] != [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]):
             raise KernelError("automatic_step_superseded")
 
     def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
@@ -1801,9 +1803,7 @@ class Kernel:
             self._abandon_owned(tx, abandoned, execution)
 
     def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> dict[str, Any]:
-        scope: dict[str, Any] = {"run": run["id"], "executor": run["executor"], "epoch": run["epoch"],
-                                 "stopped": run["stopped"], "blocked": run["blocked"], "final_action": run["final_action"],
-                                 "parent_revision": run["parent_revision"],
+        scope: dict[str, Any] = {"run": run["id"], "parent_revision": run["parent_revision"],
                                  "graph_revision": run["graph_revision"], "subject": subject, "cleanup": cleanup}
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
@@ -1863,7 +1863,7 @@ class Kernel:
             if len(token.encode()) > CURRENT_LIMIT:
                 raise ValueError("oversize token")
             value = json.loads(token)
-            if not isinstance(value, dict) or set(value) != {"scope", "progress", "source_sequence"} or not isinstance(value["scope"], dict):
+            if not isinstance(value, dict) or set(value) != {"scope", "progress", "source_sequence", "control_version"} or not isinstance(value["scope"], dict):
                 raise ValueError("invalid token")
             return value
         except (TypeError, ValueError, UnicodeError) as error:
