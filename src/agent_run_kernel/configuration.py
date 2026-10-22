@@ -14,28 +14,9 @@ from .model import CreationInputs, Policy, Profile, RunSpec
 
 def checkpoint_policy(current: Policy, overrides: Mapping[str, Any]) -> Policy:
     """Resolve an explicit new window against this owner's frozen policy."""
-    policy = resolve_delivery_policy(user_defaults={
-        "ticket_review_rounds": current.ticket_rounds,
-        "parent_only_paired_rounds": current.parent_rounds,
-        "run_repair_rounds": current.run_repairs,
-        "ticket_integration_development_limit": current.integration_developments,
-        "ticket_ci_development_limit": current.ticket_ci_developments,
-        "parent_ci_development_limit": current.parent_ci_developments,
-        "integration_resync_limit": current.resync_limit,
-        "ticket_ci_review": current.ticket_ci_review,
-        "ticket_development_workers": current.concurrency,
-        "development_thread_policy": "new-per-attempt" if current.new_thread_per_development else "reuse",
-        "invocation_deadlines": {"development": current.development_deadline_seconds,
-                                 "review": current.review_deadline_seconds, "publication": current.publication_deadline_seconds},
-    }, command_overrides=overrides)
-    return replace(current,
-        ticket_rounds=policy.ticket_review_rounds, parent_rounds=policy.parent_only_paired_rounds,
-        run_repairs=policy.run_repair_rounds, integration_developments=policy.ticket_integration_development_limit,
-        ticket_ci_developments=policy.ticket_ci_development_limit, parent_ci_developments=policy.parent_ci_development_limit,
-        resync_limit=policy.integration_resync_limit, ticket_ci_review=policy.ticket_ci_review,
-        concurrency=policy.ticket_development_workers, new_thread_per_development=policy.development_thread_policy == "new-per-attempt",
-        development_deadline_seconds=policy.development_deadline_seconds,
-        review_deadline_seconds=policy.review_deadline_seconds, publication_deadline_seconds=policy.publication_deadline_seconds)
+    policy = resolve_delivery_policy(user_defaults=current, command_overrides=overrides)
+    return replace(policy, development_profile=current.development_profile,
+                   review_profile=current.review_profile, publication_profile=current.publication_profile)
 
 
 def freeze_creation(spec: RunSpec, defaults: UserDefaultsStore, *, preset: str | None = None,
@@ -64,15 +45,8 @@ def freeze_creation(spec: RunSpec, defaults: UserDefaultsStore, *, preset: str |
          "disable_notifications": disable_notifications, "notification_mode": notification_mode},
     )
     roles = profiles["profiles"]
-    return replace(spec, language=language, inputs=inputs, policy=Policy(
-        ticket_rounds=policy.ticket_review_rounds, parent_rounds=policy.parent_only_paired_rounds,
-        run_repairs=policy.run_repair_rounds, integration_developments=policy.ticket_integration_development_limit,
-        ticket_ci_developments=policy.ticket_ci_development_limit, parent_ci_developments=policy.parent_ci_development_limit,
-        resync_limit=policy.integration_resync_limit, ticket_ci_review=policy.ticket_ci_review,
-        concurrency=policy.ticket_development_workers, new_thread_per_development=policy.development_thread_policy == "new-per-attempt",
+    return replace(spec, language=language, inputs=inputs, policy=replace(policy,
         development_profile=Profile(roles["development"]["model"], roles["development"]["reasoning_effort"]),
         review_profile=Profile(roles["review"]["model"], roles["review"]["reasoning_effort"]),
         publication_profile=Profile(roles["publication"]["model"], roles["publication"]["reasoning_effort"]),
-        development_deadline_seconds=policy.development_deadline_seconds,
-        review_deadline_seconds=policy.review_deadline_seconds, publication_deadline_seconds=policy.publication_deadline_seconds,
     ))

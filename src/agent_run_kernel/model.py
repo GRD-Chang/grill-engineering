@@ -9,9 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
-import math
 from pathlib import Path
 from typing import Any, Literal, Mapping
+
+from agent_run.delivery_policy import (
+    DeliveryPolicyError, _POLICY_VALUE_FIELDS, _canonical_number, _nonnegative_integer,
+    _positive_duration, _positive_integer,
+)
 
 from .artifact_contract import ArtifactContractError, parse_artifact
 
@@ -58,6 +62,12 @@ class Profile:
 
 @dataclass(frozen=True)
 class Policy:
+    """The validated frozen values used by both configuration and delivery.
+
+    Profiles remain creation hints; the Run stores its actual Thread bindings
+    separately, so they are omitted from the public policy snapshot.
+    """
+
     ticket_rounds: int = 3
     parent_rounds: int = 10
     run_repairs: int = 3
@@ -76,17 +86,35 @@ class Policy:
     publication_deadline_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
-        for value in (self.ticket_rounds, self.parent_rounds, self.run_repairs,
-                      self.integration_developments, self.ticket_ci_developments, self.parent_ci_developments, self.concurrency):
-            if type(value) is not int or value < 1:
-                raise ValueError("policy limits must be positive integers")
-        if type(self.resync_limit) is not int or self.resync_limit < 0:
-            raise ValueError("resync_limit must be a nonnegative integer")
-        for field_name in ("development_deadline_seconds", "review_deadline_seconds", "publication_deadline_seconds"):
+        for key, field_name in _POLICY_VALUE_FIELDS.items():
             value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                raise ValueError("invocation deadlines must be positive finite durations")
-            object.__setattr__(self, field_name, float(value))
+            if key == "ticket_ci_review":
+                if type(value) is not bool:
+                    raise DeliveryPolicyError("ticket_ci_review must be boolean")
+            else:
+                validate = _nonnegative_integer if key == "integration_resync_limit" else _positive_integer
+                object.__setattr__(self, field_name, validate(value, key))
+        if type(self.new_thread_per_development) is not bool:
+            raise DeliveryPolicyError("new_thread_per_development must be boolean")
+        for role in ("development", "review", "publication"):
+            field_name = role + "_deadline_seconds"
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise DeliveryPolicyError("invocation deadlines must be positive finite durations")
+            object.__setattr__(self, field_name, _positive_duration(value, role + " deadline"))
+
+    @property
+    def invocation_deadlines(self) -> dict[str, float]:
+        return {"development": self.development_deadline_seconds,
+                "review": self.review_deadline_seconds, "publication": self.publication_deadline_seconds}
+
+    def snapshot(self) -> dict[str, Any]:
+        """Encode complete public policy values; never resolve future defaults."""
+        return {
+            **{key: getattr(self, field_name) for key, field_name in _POLICY_VALUE_FIELDS.items()},
+            "development_thread_policy": "new-per-attempt" if self.new_thread_per_development else "reuse",
+            "invocation_deadlines": {role: _canonical_number(value) for role, value in self.invocation_deadlines.items()},
+        }
 
 
 @dataclass(frozen=True)

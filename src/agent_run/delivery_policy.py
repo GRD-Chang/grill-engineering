@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
 from functools import lru_cache
 
 from agent_run.messages import error_message
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent_run_kernel.model import Policy
 
 
 DELIVERY_POLICY_PROTOCOL = 9
@@ -49,109 +51,40 @@ class DeliveryPolicyError(ValueError):
     """The Delivery Policy is missing, malformed, or outside its contract."""
 
 
-@dataclass(frozen=True)
-class DeliveryPolicy:
-    """Complete policy values captured by one Delivery Run/window."""
-
-    ticket_review_rounds: int = 3
-    ticket_development_workers: int = 3
-    integration_resync_limit: int = 3
-    ticket_integration_development_limit: int = 3
-    ticket_ci_development_limit: int = 3
-    ticket_ci_review: bool = False
-    parent_ci_development_limit: int = 3
-    parent_only_paired_rounds: int = 10
-    run_repair_rounds: int = 3
-    development_deadline_seconds: float = 5 * 60 * 60
-    review_deadline_seconds: float = 2 * 60 * 60
-    publication_deadline_seconds: float = 60 * 60
-    development_thread_policy: str = "reuse"
-
-    def __post_init__(self) -> None:
-        if self.development_thread_policy not in ("reuse", "new-per-attempt"):
-            raise DeliveryPolicyError(error_message('policy.error.thread_policy', audit="development_thread_policy must be reuse or new-per-attempt"))
-        object.__setattr__(
-            self,
-            "ticket_review_rounds",
-            _positive_integer(self.ticket_review_rounds, "ticket_review_rounds"),
-        )
-        object.__setattr__(
-            self,
-            "ticket_development_workers",
-            _positive_integer(self.ticket_development_workers, "ticket_development_workers"),
-        )
-        object.__setattr__(
-            self,
-            "integration_resync_limit",
-            _nonnegative_integer(self.integration_resync_limit, "integration_resync_limit"),
-        )
-        if type(self.ticket_ci_review) is not bool:
-            raise DeliveryPolicyError("ticket_ci_review must be boolean")
-        for field in ("parent_ci_development_limit", "ticket_integration_development_limit", "ticket_ci_development_limit"):
-            object.__setattr__(self, field, _positive_integer(getattr(self, field), field))
-        object.__setattr__(
-            self,
-            "parent_only_paired_rounds",
-            _positive_integer(
-                self.parent_only_paired_rounds, "parent_only_paired_rounds"
-            ),
-        )
-        object.__setattr__(
-            self,
-            "run_repair_rounds",
-            _positive_integer(self.run_repair_rounds, "run_repair_rounds"),
-        )
-        for field, label in (
-            ("development_deadline_seconds", "development deadline"),
-            ("review_deadline_seconds", "review deadline"),
-            ("publication_deadline_seconds", "publication deadline"),
-        ):
-            object.__setattr__(
-                self,
-                field,
-                _positive_duration(getattr(self, field), label),
-            )
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "parent_only_paired_rounds": self.parent_only_paired_rounds,
-            "run_repair_rounds": self.run_repair_rounds,
-            "ticket_review_rounds": self.ticket_review_rounds,
-            "ticket_development_workers": self.ticket_development_workers,
-            "integration_resync_limit": self.integration_resync_limit,
-            "ticket_integration_development_limit": self.ticket_integration_development_limit,
-            "ticket_ci_development_limit": self.ticket_ci_development_limit,
-            "ticket_ci_review": self.ticket_ci_review,
-            "parent_ci_development_limit": self.parent_ci_development_limit,
-            "development_thread_policy": self.development_thread_policy,
-            "invocation_deadlines": {
-                "development": _canonical_number(self.development_deadline_seconds),
-                "review": _canonical_number(self.review_deadline_seconds),
-                "publication": _canonical_number(self.publication_deadline_seconds),
-            },
-        }
-
-    @property
-    def invocation_deadlines(self) -> dict[str, float]:
-        return {
-            "development": self.development_deadline_seconds,
-            "review": self.review_deadline_seconds,
-            "publication": self.publication_deadline_seconds,
-        }
+# Canonical wire keys map once to the native frozen value's stable fields.
+# This is a fixed contract, not a configurable field/schema interpreter.
+_POLICY_VALUE_FIELDS = {
+    "parent_only_paired_rounds": "parent_rounds",
+    "run_repair_rounds": "run_repairs",
+    "ticket_review_rounds": "ticket_rounds",
+    "ticket_development_workers": "concurrency",
+    "integration_resync_limit": "resync_limit",
+    "ticket_integration_development_limit": "integration_developments",
+    "ticket_ci_development_limit": "ticket_ci_developments",
+    "ticket_ci_review": "ticket_ci_review",
+    "parent_ci_development_limit": "parent_ci_developments",
+}
 
 
-def default_delivery_policy() -> DeliveryPolicy:
-    return DeliveryPolicy()
+def default_delivery_policy() -> Policy:
+    from agent_run_kernel.model import Policy
+    return Policy()
 
 
 def resolve_delivery_policy(
     *,
-    user_defaults: Mapping[str, Any] | DeliveryPolicy | None = None,
+    user_defaults: Mapping[str, Any] | Policy | None = None,
     command_overrides: Mapping[str, Any] | None = None,
-) -> DeliveryPolicy:
+) -> Policy:
     """Resolve builtin values, user defaults, then one-shot overrides."""
 
-    values: dict[str, Any] = default_delivery_policy().snapshot()
+    from agent_run_kernel.model import Policy
+
+    if isinstance(user_defaults, Policy):
+        values = user_defaults.snapshot()
+        user_defaults = None  # A complete frozen owner is the baseline, not sparse defaults.
+    else:
+        values = default_delivery_policy().snapshot()
     values["invocation_deadlines"] = dict(values["invocation_deadlines"])
     for source, raw, ignore_none in (
         ("user defaults", user_defaults, False),
@@ -159,11 +92,7 @@ def resolve_delivery_policy(
     ):
         if raw is None:
             continue
-        normalized = (
-            raw.snapshot()
-            if isinstance(raw, DeliveryPolicy)
-            else normalize_policy_overrides(raw, ignore_none=ignore_none)
-        )
+        normalized = normalize_policy_overrides(raw, ignore_none=ignore_none)
         _merge_policy_values(values, normalized, source)
     return _policy_from_values(values)
 
@@ -250,7 +179,7 @@ def normalize_policy_overrides(
     return normalized
 
 
-def parse_policy_snapshot(value: object) -> DeliveryPolicy:
+def parse_policy_snapshot(value: object) -> Policy:
     """Parse the complete canonical state snapshot without applying defaults."""
 
     if not isinstance(value, Mapping) or set(value) not in (
@@ -300,7 +229,7 @@ def _policy_cache_key(
 
 
 @lru_cache(maxsize=128)
-def _cached_policy(key: _PolicyCacheKey) -> DeliveryPolicy:
+def _cached_policy(key: _PolicyCacheKey) -> Policy:
     scalar_count = len(_POLICY_SCALAR_FIELDS)
     values = dict(zip(_POLICY_SCALAR_FIELDS, (scalar for _, scalar in key[:scalar_count])))
     deadlines = dict(zip(_DEADLINE_FIELDS, (scalar for _, scalar in key[scalar_count:])))
@@ -323,7 +252,7 @@ def _merge_policy_values(
             target[key] = value
 
 
-def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
+def _policy_from_values(values: Mapping[str, Any]) -> Policy:
     deadlines = values.get("invocation_deadlines")
     if not isinstance(deadlines, Mapping):
         raise DeliveryPolicyError(error_message('policy.error.invocation_object', audit="invocation_deadlines must be an object"))
@@ -339,24 +268,20 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
 
 def _policy_with_deadlines(
     values: Mapping[str, Any], deadlines: Mapping[str, Any],
-) -> DeliveryPolicy:
+) -> Policy:
     """Construct after the caller has checked its required deadline fields."""
-    return DeliveryPolicy(
-        development_thread_policy=values.get("development_thread_policy", "reuse"),
-        # The immutable policy's constructor validates and normalizes these
-        # exact values. Do not repeat every check before __post_init__.
-        parent_only_paired_rounds=cast(int, values.get("parent_only_paired_rounds")),
-        run_repair_rounds=cast(int, values.get("run_repair_rounds")),
-        ticket_review_rounds=cast(int, values.get("ticket_review_rounds")),
-        ticket_development_workers=cast(int, values.get("ticket_development_workers")),
-        ticket_integration_development_limit=cast(int, values.get("ticket_integration_development_limit")),
-        integration_resync_limit=cast(int, values.get("integration_resync_limit")),
-        ticket_ci_development_limit=cast(int, values.get("ticket_ci_development_limit")),
-        ticket_ci_review=cast(bool, values.get("ticket_ci_review")),
-        parent_ci_development_limit=cast(int, values.get("parent_ci_development_limit")),
-        development_deadline_seconds=deadlines["development"],
-        review_deadline_seconds=deadlines["review"],
-        publication_deadline_seconds=deadlines["publication"],
+    from agent_run_kernel.model import Policy
+
+    thread_policy = values.get("development_thread_policy", "reuse")
+    if thread_policy not in ("reuse", "new-per-attempt"):
+        raise DeliveryPolicyError(error_message('policy.error.thread_policy', audit="development_thread_policy must be reuse or new-per-attempt"))
+    native_values: dict[str, Any] = {field: values.get(key) for key, field in _POLICY_VALUE_FIELDS.items()}
+    return Policy(
+        **native_values,
+        new_thread_per_development=thread_policy == "new-per-attempt",
+        development_deadline_seconds=_positive_duration(deadlines["development"], "development deadline"),
+        review_deadline_seconds=_positive_duration(deadlines["review"], "review deadline"),
+        publication_deadline_seconds=_positive_duration(deadlines["publication"], "publication deadline"),
     )
 
 
