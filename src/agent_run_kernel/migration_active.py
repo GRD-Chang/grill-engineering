@@ -1054,10 +1054,9 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
         root, common = managed.repository_root, managed.repository_root / '.git'
         checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
         final_checkout = managed.root / 'worktrees' / run_id / 'run-publication'
-        _verify_returned_git(snapshot, managed.state_root / run_id / 'kernel.sqlite3',
-            checkout_archive, archive_sha, index_sha, repository=repository, run_id=run_id, ticket=ticket,
-            source_ref=source_ref, candidate_sha=candidate_sha, candidate_tree=candidate_tree,
-            base_sha=base_sha, run_branch=run_branch, base_branch=base_branch)
+        # This descriptor is the sealed source claim. The unique cutover
+        # authenticates current resources after strict prepared validation;
+        # advanced/cleaned native resources must not redefine this baseline.
         base = Commit(base_sha, _git(root, 'rev-parse', base_sha + '^{tree}'))
         subject = f'ticket:{ticket}'
         spec = RunSpec(run_id, repository, parent_number, parent_revision, graph_revision,
@@ -1106,7 +1105,9 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
         workspace = ImportedResource(owner=owner, kind='ticket-workspace', disposition='existing',
             source_ref=source_ref, expected_oid=candidate_sha or base_sha, checkout=checkout,
             workspace_oid=candidate_sha or base_sha, owned_root=checkout.parent, common_git_dir=common,
-            before_head=Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'HEAD')).read_bytes(),
+            # The sealed source owner/branch is the original attached HEAD
+            # witness. Current HEAD may already be detached by this transfer.
+            before_head=('ref: ' + source_ref + '\n').encode('ascii'),
             checkout_archive_sha256=archive_sha, checkout_index_sha256=index_sha, head_evidence=(owner,), cleanup_pending=False)
         integration = None if job['value_ticket_integration'] is None else _one(db,
             'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m ON m.material_id=e.material_id '

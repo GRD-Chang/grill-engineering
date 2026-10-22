@@ -319,12 +319,10 @@ def read_original_run_import(snapshot: SourceSnapshot, profile_snapshot: Path, *
                 if (hashlib.sha256((folder / 'checkout.tar').read_bytes()).hexdigest() != archive_sha
                         or hashlib.sha256((folder / 'checkout-index').read_bytes()).hexdigest() != index_sha):
                     raise MigrationRefused('source_checkout_archive')
-                workspace_oid = _git(checkout, 'rev-parse', 'HEAD')
-                before_head = Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'HEAD')).read_bytes()
-                if workspace_oid != expected_oid:
-                    raise MigrationRefused('source_existing_checkout')
-            elif checkout.exists() or checkout.is_symlink() or _git(root, 'for-each-ref', '--format=%(refname)', source_ref):
-                raise MigrationRefused('source_resource_absence')
+                workspace_oid = expected_oid
+                # Original attachment is a fixed claim from the sealed owner
+                # witness; current native HEAD/workspace may be gone or changed.
+                before_head = ('ref: ' + source_ref + '\n').encode('ascii')
             return ImportedResource(owner=SourceRecord(key.table, key.key), kind='ticket-workspace',
                 disposition='existing' if existing else 'absent', source_ref=source_ref,
                 expected_oid=expected_oid if existing else None, checkout=checkout if existing else None,

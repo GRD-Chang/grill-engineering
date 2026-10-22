@@ -418,3 +418,52 @@ def test_settled_completed_oracle_decodes_and_matches_existing_normal_conversion
     assert paths['database'].read_bytes() == before[0]
     if copied:
         assert _git_bytes(managed.repository_root) == before[1]
+
+
+@pytest.mark.parametrize('scope', ['returned', 'whole'])
+def test_original_decoder_preserves_sealed_resource_baseline_after_formal_transfer(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
+) -> None:
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from agent_run_kernel.migration_active import read_original_returned_import
+    from agent_run_kernel.migration_run import read_original_run_import
+    from agent_run_kernel.migration_cli import _collect_original_v6
+    from support.v6_returned_source import returned_managed_source
+    from test_kernel_migration_original_source import _git_bytes
+
+    managed, paths = (returned_managed_source(tmp_path, git_repo, 'development') if scope == 'returned'
+                      else whole_run_managed_source(tmp_path, git_repo))
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'inspection'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+
+    def decode():
+        if scope == 'returned':
+            return read_original_returned_import(snapshot, profile_snapshot=evidence / 'profile.json',
+                external_snapshot=evidence / 'external-readproof.json', checkout_archive=evidence / 'checkout.tar')
+        return read_original_run_import(snapshot, evidence / 'profile.json',
+            external_snapshot=evidence / 'external-readproof.json', checkouts_snapshot=evidence / 'checkouts.json')
+
+    initial = decode()
+    applied = subprocess.run([sys.executable, '-m', 'agent_run_kernel.migration_cutover',
+        '--repo', 'example/project', '--parent', '1', '--evidence-dir', str(tmp_path / 'formal')],
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
+             'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')},
+        capture_output=True, text=True, timeout=30)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    target = Path(json.loads(applied.stdout)['target']['database'])
+    before = paths['database'].read_bytes(), target.read_bytes(), _git_bytes(managed.repository_root)
+    assert decode() == initial  # Current detached HEAD cannot replace original source evidence.
+    for subject in initial.subjects:
+        for resource in subject.resources:
+            if resource.disposition == 'existing':
+                assert LocalGit(resource.checkout).run('symbolic-ref', '-q', 'HEAD', check=False).returncode == 1
+                assert resource.before_head == ('ref: ' + resource.source_ref + '\n').encode('ascii')
+    assert before == (paths['database'].read_bytes(), target.read_bytes(), _git_bytes(managed.repository_root))

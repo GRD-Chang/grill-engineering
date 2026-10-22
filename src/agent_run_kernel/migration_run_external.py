@@ -66,7 +66,7 @@ def prove_run_head(facts: OriginalRunFacts, repository_root: Path, run_head: str
 
 
 def verify_run_readback_header(header: RunHeader, source_sha: str, proof: Mapping[str, Any],
-        repository_root: Path, *, worked_refs: set[str], completed_subjects: set[str], completed_heads: set[str]) -> str:
+        repository_root: Path, *, worked_refs: set[str], completed_subjects: set[str], completed_heads: set[str], verify_current: bool = True) -> str:
     """Shared exact external scope/ref check; no legacy writer facts required."""
     run_ref, default_ref = 'refs/heads/' + header.run_branch, 'refs/heads/' + header.default_branch
     heads, subjects = proof.get('remote_heads'), proof.get('subjects')
@@ -82,8 +82,8 @@ def verify_run_readback_header(header: RunHeader, source_sha: str, proof: Mappin
     if (not isinstance(run_head, str) or run_head not in {header.default_sha, *completed_heads}
             or not isinstance(default_head, str)
             or reader.run('merge-base', '--is-ancestor', header.default_sha, default_head, check=False).returncode != 0
-            or reader.run('symbolic-ref', '-q', run_ref, check=False).returncode != 1
-            or _git(repository_root, 'rev-parse', '--verify', run_ref) != run_head):
+            or (verify_current and (reader.run('symbolic-ref', '-q', run_ref, check=False).returncode != 1
+                or _git(repository_root, 'rev-parse', '--verify', run_ref) != run_head))):
         raise MigrationRefused('source_external_refs')
     _prove_run_head(header.default_sha, completed_heads, repository_root, run_head)
     return run_head
@@ -141,7 +141,8 @@ def verify_imported_run_external(header: RunHeader, source_sha: str, subjects: t
     run_head = verify_run_readback_header(header, source_sha, proof, repository_root,
         worked_refs={subject.resources[0].source_ref for subject in worked},
         completed_subjects={subject.subject for subject in completed},
-        completed_heads={subject.completion.integrated.sha for subject in completed if subject.completion is not None})
+        completed_heads={subject.completion.integrated.sha for subject in completed if subject.completion is not None},
+        verify_current=False)
     heads = proof['remote_heads']
     run_ref, default_ref = 'refs/heads/' + header.run_branch, 'refs/heads/' + header.default_branch
     result: dict[str, Mapping[str, Any]] = {}
