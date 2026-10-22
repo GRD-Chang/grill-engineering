@@ -425,7 +425,10 @@ def test_original_final_approval_reconciles_before_parent_requirement_refresh(tm
     elif outcome == "prior":
         assert scenario.kernel.source_status()["blocked"] == "final_refresh"
         assert operations.once().reason == "automatic_step_paused"
-        assert scenario.kernel.control("requeue", "accept-new-parent-after-unapplied-merge", subject=final, world=fresh) == "applied"
+        # The still-pending approval cannot be cancelled by a new operator action.
+        # Its own program continuation must settle the proved unapplied intent.
+        with pytest.raises(KernelError, match="final_approval_noncancellable"):
+            scenario.kernel.control("requeue", "accept-new-parent-after-unapplied-merge", subject=final, world=fresh)
         assert scenario.run().kind == "approval"
         assert scenario.kernel.status(final)["generation"] == 2
         assert scenario.kernel.status(final)["budgets"]["integration"]["reviews_used"] == 2
