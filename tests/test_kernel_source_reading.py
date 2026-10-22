@@ -104,6 +104,15 @@ def test_paginated_source_preserves_native_order_text_and_external_blockers(tmp_
     assert any('cursor=blocker-next' in args for args in calls)
 
 
+def test_public_graph_returns_the_canonical_requirement_values(tmp_path: Path, monkeypatch) -> None:
+    from agent_run_kernel.model import Blocker, Issue, ParentIssue
+    reader, _log = _reader(tmp_path, monkeypatch)
+    graph = reader.delivery_graph(1)
+    assert isinstance(graph.parent, ParentIssue)
+    assert all(isinstance(issue, Issue) for issue in graph.issues.values())
+    assert all(isinstance(blocker, Blocker) for issue in graph.issues.values() for blocker in issue.blocked_by)
+
+
 def test_closed_local_dependency_is_still_decided_by_native_completion_not_reader(tmp_path: Path, monkeypatch) -> None:
     reader, _log = _reader(tmp_path, monkeypatch)
     source = read_requirements(reader, 1)

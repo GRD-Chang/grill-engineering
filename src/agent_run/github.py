@@ -10,7 +10,8 @@ from urllib.parse import urlparse
 from agent_run.runner_transport import runner_options
 from agent_run.github_retry import run_read_command
 from agent_run.git_output import git_environment
-from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
+from agent_run.models import DeliveryGraph, Repository
+from agent_run_kernel.model import Blocker, Issue, ParentIssue
 
 
 class GitHubReadError(RuntimeError):

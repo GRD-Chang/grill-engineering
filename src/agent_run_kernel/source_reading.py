@@ -18,7 +18,7 @@ from .storage import MATERIAL_LIMIT
 from .effects import LocalGit
 from agent_run.github_identity import validate_identity_snapshot
 
-from .model import Blocker, Checks, Issue, ParentIssue, Requirements
+from .model import Checks, Requirements
 
 
 def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirements:
@@ -31,14 +31,7 @@ def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirement
         raise ValueError('Parent Issue number must be a positive integer')
     validate_identity_snapshot(reader.runner_identity)
     graph = reader.delivery_graph(parent_number)
-    parent = graph.parent
-    return Requirements(
-        ParentIssue(parent.number, parent.title, parent.body, parent.sub_issue_numbers,
-                    parent.sub_issue_order_reliable),
-        tuple(Issue(issue.number, issue.title, issue.body, issue.state, issue.labels,
-                    tuple(Blocker(blocker.number, blocker.state) for blocker in issue.blocked_by))
-              for issue in graph.issues.values()),
-    )
+    return Requirements(graph.parent, tuple(graph.issues.values()))
 
 
 def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
