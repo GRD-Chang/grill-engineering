@@ -178,7 +178,11 @@ class Evidence:
             if (record['material_id'] is not None or parent_record['source_evidence_id'] is not None
                     or parent_record['kind'] != ('human_response_history' if member == 'response' else 'returned_result')):
                 raise ValueError('source_evidence')
-            parent = self.get(record['source_evidence_id'])['value']
+            # Attempt members belong to that same Attempt's raw return, even
+            # when first reached without an owner constraint or through cache.
+            # Job projections may legitimately reference another role's Attempt.
+            parent_owner = record['owner_id'] if record['owner_id'].startswith('attempt:') else None
+            parent = self.get(record['source_evidence_id'], owner=parent_owner)['value']
             if not isinstance(parent, dict):
                 raise ValueError('source_evidence')
             if member == 'response' and isinstance(parent.get('response'), str) and parent['response'].strip():
@@ -387,7 +391,8 @@ def locator_entries(path: Path, *, run_id: str | None = None, repository: str | 
             raise ValueError('Invalid original Run locator entry')
         # Only a valid route discriminator proves this entry unrelated. Paths
         # and other payload fields are validated after that scope decision.
-        if run_id is not None and isinstance(entry.get('run_id'), str) and entry['run_id'] != run_id:
+        if (run_id is not None and isinstance(entry.get('run_id'), str)
+                and entry['run_id'] and entry['run_id'] != run_id):
             continue
         try:
             routed_repository = normalize_repository(entry['repository']) if isinstance(entry.get('repository'), str) else None

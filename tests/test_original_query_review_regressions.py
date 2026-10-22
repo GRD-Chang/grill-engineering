@@ -98,7 +98,8 @@ def test_raw_closure_is_page_scoped_and_requested_damage_is_not_hidden(
     assert _bytes(tmp_path) == before
 
 
-@pytest.mark.parametrize('scope', ['other-run', 'other-repository', 'other-parent', 'matching', 'unknown'])
+@pytest.mark.parametrize('scope', ['other-run', 'other-repository', 'other-parent', 'matching', 'unknown',
+                                 'empty-run-other-repository', 'empty-run-other-parent'])
 def test_locator_scope_precedes_payload_validation_but_matching_errors_stay_strict(tmp_path, capsys, scope):
     _published(ManagedWorkspace.for_repository('example/project').state_root, run_id='native-exact')
     route = {'run_id': 'native-exact', 'repository_root': str(tmp_path / 'old'),
@@ -107,15 +108,17 @@ def test_locator_scope_precedes_payload_validation_but_matching_errors_stay_stri
     selector = ['native-exact']
     if scope == 'other-run':
         route['run_id'] = 'another-run'
-    elif scope == 'other-repository':
+    elif scope in {'other-repository', 'empty-run-other-repository'}:
         route['repository'] = 'example/other'
-    elif scope == 'other-parent':
+    elif scope in {'other-parent', 'empty-run-other-parent'}:
         selector = ['--parent', '1']
         route['parent_number'] = 2
     elif scope == 'unknown':
         route.pop('repository')
         route.pop('parent_number')
         route['run_id'] = None
+    if scope.startswith('empty-run-'):
+        route['run_id'] = ''
     locator = app_data_root() / 'run-locator.json'
     locator.write_text(json.dumps({'entries': [route]}))
     before = _snapshot(tmp_path)
