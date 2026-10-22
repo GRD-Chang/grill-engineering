@@ -5,12 +5,12 @@ import json
 
 import pytest
 
-from agent_run.github import GitHubReadError
-from agent_run_kernel import Kernel, RunSpec
+from agent_run_kernel import Kernel, KernelError, RunSpec
 from agent_run_kernel.lifecycle_cli import creation_resources
 from agent_run_kernel.source_reading import read_requirements
 from agent_run.github import GhGitHubReader
-from tests.test_kernel_remote_effects import _fixture, _source_kernel, _publish_pr
+from test_kernel_remote_effects import _fixture, _source_kernel, _publish_pr
+from support.core_operations import CoreOperations
 
 
 def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tmp_path: Path, monkeypatch) -> None:
@@ -31,30 +31,47 @@ def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tm
                    language="en", repository_root=str(port.root.resolve()), inputs=inputs)
     kernel = Kernel.create(tmp_path / "new-run/kernel.sqlite3", spec, requirements=source)
     execution = kernel.claim_executor("creator")
-    world = port.observe(kernel, "ticket:2")
+    operations = CoreOperations(kernel, execution, lambda binding: port)
+    world = operations.runner.observe("ticket:2")
     assert world.target is None and world.source is None and world.pr is None and world.checks is None
     assert not Path(resources[0].checkout).exists()
-    step = kernel.advance("ticket:2", execution, world)
-    assert step.effect is not None and step.effect.operation == "run_branch" and step.call is None
-    effect = step.effect
+    execute = port.execute
+    sent, authorized = [], []
+
+    def lost_response(effect, authorize):
+        assert effect.operation == "run_branch"
+        sent.append(effect)
+
+        def original_authority():
+            authorize()
+            authorized.append(effect.effect_id)
+
+        actual = execute(effect, original_authority)
+        assert actual.disposition == "target" and actual.commit == seed.base
+        raise OSError("Original Run-ref CAS completed but its reply was lost")
+
+    monkeypatch.setattr(port, "execute", lost_response)
+    interrupted = operations.once()
+    assert interrupted.call is None and interrupted.reason == "original_write_readback_required"
+    effect, = sent
     assert effect.source_ref == resources[-1].source_ref and effect.target_ref == "refs/heads/main"
     assert effect.payload["expected_remote_sha"] is None and effect.after_sha == seed.base.sha
-    authorized = []
-
-    def authorize() -> None:
-        assert kernel.dispatch(effect, execution, port.observe(kernel, "ticket:2"))
-        kernel.guard_effect(effect, execution, port.observe(kernel, "ticket:2"))
-        authorized.append(effect.effect_id)
-
-    actual = port.execute(effect, authorize)
-    assert actual.disposition == "target" and actual.commit == seed.base
     assert authorized == [effect.effect_id]
     assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == seed.base.sha
     reopened = Kernel(kernel.storage.path)
-    assert reopened.advance("ticket:2", execution).effect == effect
-    readback = port.execute(effect, lambda: pytest.fail("lost reply must settle without a second write"))
-    assert reopened.reconcile(effect, readback, execution).kind == "progress"
-    assert port.observe(reopened, "ticket:2").target == seed.base
+    original_read = port.reconcile
+    readbacks = []
+
+    def exact_readback(original):
+        readbacks.append(original)
+        return original_read(original)
+
+    monkeypatch.setattr(port, "execute", lambda *args: pytest.fail("lost reply must settle without a second write"))
+    monkeypatch.setattr(port, "reconcile", exact_readback)
+    restarted = CoreOperations(reopened, execution, lambda binding: port)
+    assert restarted.once().kind == "progress"
+    assert readbacks == [effect]
+    assert restarted.runner.observe("ticket:2").target == seed.base
     assert not Path(resources[0].checkout).exists()
     with reopened.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM invocations")[0] == 0
@@ -72,8 +89,8 @@ def test_existing_pr_with_missing_remote_target_remains_an_inconsistent_observat
     kernel = _source_kernel(tmp_path, port, seed)
     git.run("push", "origin", ":" + run_ref)
     before = len(calls.read_text().splitlines())
-    with pytest.raises(GitHubReadError) as error:
-        port.observe(kernel, "parent:1")
+    with pytest.raises(KernelError) as error:
+        kernel.observe_control("parent:1", lambda binding: port)
     assert error.value.code == "github_observation_pending"
     observations = [json.loads(line) for line in calls.read_text().splitlines()][before:]
     assert not any("--method" in call for call in observations)

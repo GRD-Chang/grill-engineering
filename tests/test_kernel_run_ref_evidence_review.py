@@ -1,4 +1,9 @@
-"""Consumer regressions from the independent Run-ref ownership review."""
+"""Internal archive/cleanup consumer regressions from the Run-ref review.
+
+The imported_cleanup fixture models already imported records without live Source,
+Git or Task admission. These unit tests call the consumer transition explicitly;
+they do not claim public OperationRunner or end-to-end migration coverage.
+"""
 import json
 from contextlib import closing
 from pathlib import Path
@@ -8,6 +13,11 @@ import pytest
 
 from agent_run_kernel.model import wire_json
 from test_kernel_whole_resource_proof import imported_cleanup
+
+
+def _cleanup_consumer(kernel, execution, world):
+    token = kernel._begin_automatic_step(execution, "final:1", cleanup=True)
+    return kernel._advance_cleanup("final:1", execution, world, token=token)
 
 
 @pytest.mark.parametrize("head_evidence", [
@@ -22,7 +32,7 @@ def test_final_cleanup_rejects_unproven_run_ref(tmp_path: Path, head_evidence: o
         manifest["run_ref_ownership"]["head_evidence"] = head_evidence
         updated = tx.put(row["subject"], "v6_run_import", wire_json(manifest))
         tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (updated,))
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = _cleanup_consumer(kernel, execution, world)
     assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
 
 
@@ -51,7 +61,7 @@ def test_final_ref_is_bound_to_the_original_archive_not_only_native_material(tmp
             tx.execute("UPDATE effects SET source_ref='refs/heads/foreign' WHERE subject='final:1'")
         material = tx.put(row["subject"], "v6_run_import", wire_json(manifest))
         tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (material,))
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = _cleanup_consumer(kernel, execution, world)
     assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
     assert kernel.status("final:1")["resource_cleanup"]["effect_id"] is None
 
@@ -60,9 +70,10 @@ def test_final_ref_is_bound_to_the_original_archive_not_only_native_material(tmp
 def test_exact_archived_head_can_dispatch_without_inventing_a_new_authority(tmp_path: Path, source: str) -> None:
     kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1", head_source=source)
     head = "e" * 40 if source == "work_jobs" else "a" * 40
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = _cleanup_consumer(kernel, execution, world)
     assert step.effect is not None and step.effect.before_sha == head
-    assert kernel.dispatch(step.effect, execution, world)
+    token = kernel._begin_automatic_step(execution, "final:1", cleanup=True)
+    assert kernel._dispatch(step.effect, execution, world, token=token)
 
 
 def test_historical_base_does_not_override_an_original_completed_head(tmp_path: Path) -> None:
@@ -75,7 +86,7 @@ def test_historical_base_does_not_override_an_original_completed_head(tmp_path: 
         manifest["run_ref_ownership"]["expected_oid"] = "a" * 40
         material = tx.put(row["subject"], "v6_run_import", wire_json(manifest))
         tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (material,))
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = _cleanup_consumer(kernel, execution, world)
     assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
     assert kernel.status("final:1")["resource_cleanup"]["effect_id"] is None
 
@@ -94,7 +105,7 @@ def test_native_archive_claims_do_not_replace_the_retired_source_fence(tmp_path:
             receipt["nonce"] = "00" * 16
             protocol = "sqlite-work-records-v6" if change == "unfenced" else source_fence(receipt)
             db.execute("UPDATE schema_meta SET value=?", (protocol,))
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = _cleanup_consumer(kernel, execution, world)
     assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
     assert kernel.status("final:1")["resource_cleanup"]["effect_id"] is None
 
