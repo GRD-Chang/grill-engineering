@@ -12,6 +12,7 @@ from agent_run_kernel.model import KernelError
 from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.operation_runner import DeliveryFacts
 from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run_kernel.query import read
 from test_kernel_requirements import independent_source, native_input
 
 
@@ -312,3 +313,30 @@ def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
     runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
     second = drive_until(s, runner, lambda step: step.call is not None)
     assert second.call.subject == "ticket:4"
+
+
+def test_explicit_approval_poll_observes_target_append_without_background_polling(tmp_path):
+    source = Requirements(ParentIssue(1, "Parent", "Original Parent requirement", ()), ())
+    s = GraphScenario(tmp_path / "parent", source, policy=Policy(resync_limit=0))
+    ports = Ports(s)
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    drive_until(s, runner, lambda step: s.kernel.status("parent:1")["phase"] == "approval")
+    assert runner.state().disposition == "quiescent"
+    unchanged = runner.run_once()
+    assert unchanged.kind == "approval"
+    assert runner.state().disposition == "quiescent"
+    budgets = s.kernel.status("parent:1")["budgets"]
+    s.port.external_remote_append(s.delivery.target_ref, {"external.txt": "Original external work"}, "append")
+    assert runner.run_once().kind == "paused"
+    data = read(s.kernel.storage.path, "status").data
+    assert data["integration_resync"]["limit"] == 0 and data["integration_resync"]["used"] == 0
+    assert data["integration_resync"]["window"] == 1 and data["integration_resync"]["open"] is False
+    action = next(item for item in data["operator_actions"] if item["reason"] == "integration_resync_exhausted")
+    assert action["operation"] == "resume" and action["action"]["command"] == "resume"
+    assert s.kernel.status("parent:1")["budgets"] == budgets
+    s.kernel.control("resume", "explicit-zero-resync-resume", subject="parent:1")
+    assert runner.run_once().kind == "paused"
+    resumed = read(s.kernel.storage.path, "status").data["integration_resync"]
+    assert resumed["limit"] == 0 and resumed["used"] == 0
+    assert resumed["window"] == 1 and resumed["open"] is False
+    assert s.kernel.status("parent:1")["budgets"] == budgets

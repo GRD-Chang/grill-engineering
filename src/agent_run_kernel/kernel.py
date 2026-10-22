@@ -140,14 +140,13 @@ class Kernel:
             return Step("waiting", subject, eligibility)
         if tx.rows("SELECT s.id FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' LIMIT 1", (subject,)):
             return Step("waiting", subject, "dependencies")
-        if job["phase"] == "approval":
-            return Step("waiting", subject, "approval")
         if continuation is not None:
             return continuation
 
         return None
 
-    def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1) -> tuple[str | None, bool] | None:
+    def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
+                          poll_approval: bool = False) -> tuple[str | None, bool] | None:
         agent_capacity = min(agent_capacity, max(0, run["concurrency"] - tx.one("SELECT count(*) FROM leases")[0]))
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
@@ -156,6 +155,7 @@ class Kernel:
             return tx.one("SELECT id FROM subjects ORDER BY rowid LIMIT 1")[0], False
         order = [row[0] for table in ("work_queue", "integration_queue") for row in tx.all(f"SELECT subject FROM {table} ORDER BY ready")]
         order.extend(row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid"))
+        approval = None
         for subject in dict.fromkeys(order):
             job = self._job(tx, subject)
             waiting = self._subject_wait(tx, run, job)
@@ -166,6 +166,13 @@ class Kernel:
             elif waiting is not None:
                 continue
             if self._operation_wait(tx, run, subject, cleanup) is not None:
+                continue
+            if (job["phase"] == "approval" and not job["validation_cleanup"] and job["refresh_revision"] is None
+                    and not self._pending_effect(tx, subject) and self._pending_requeue(tx, subject) is None):
+                # An explicit operation call may poll the manual boundary once.
+                # Passive supervision must not advertise perpetual background work.
+                if poll_approval and approval is None:
+                    approval = (subject, False)
                 continue
             if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not self._pending_effect(tx, subject):
                 # A ready return may still perform program work without a slot.
@@ -180,7 +187,7 @@ class Kernel:
                 and all(self._completion(tx, job) is not None for job in tickets)
                 and self._operation_wait(tx, run, None, False) is None):
             return None, False
-        return None
+        return approval
 
     def _operation_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> float | None:
         scope = wire_json(self._automatic_scope(tx, run, subject, cleanup))
