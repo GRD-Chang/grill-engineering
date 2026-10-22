@@ -10,6 +10,7 @@ from agent_run_kernel.model import Execution, HostObservation
 from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.task_location import bind_task, locked_task
 from test_kernel_requirements import independent_source
+from support.core_operations import CoreOperations
 
 
 @pytest.mark.parametrize("host_state", ["unlaunched", "unknown", "rebound"])
@@ -19,7 +20,7 @@ def test_task_abandon_fences_the_exact_task_without_reclaiming_its_host(tmp_path
     scenario.kernel = kernel
     task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
     request = None
-    active_before = []
+    active_before = ()
     usage_before = None
     if host_state == "unknown":
         request = kernel.admit_host("original-launch", kind="run", command=("native-host",),
@@ -28,15 +29,15 @@ def test_task_abandon_fences_the_exact_task_without_reclaiming_its_host(tmp_path
         assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
                                                            42, "start", usage_ready=True)) == "running"
         scenario.execution = Execution(request.run_id, request.owner, request.epoch)
+        operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
         for _ in range(20):
-            step = kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+            step = operations.once()
             if step.call is not None:
                 assert kernel.dispatch_agent(step.call)
                 break
-            scenario.handle(step)
         else:
             raise AssertionError("The original Host never allocated its Worker lease")
-        active_before = kernel.scheduling()["active"]
+        active_before = kernel.operation_state().active
         assert len(active_before) == 1
         usage_before = kernel.host_usage("original-launch")
         assert usage_before is not None and not usage_before.usage_released
@@ -57,8 +58,8 @@ def test_task_abandon_fences_the_exact_task_without_reclaiming_its_host(tmp_path
     assert kernel.source_status()["abandonment"] == {"action": "abandon-original-task", "status": "pending"}
     assert scenario.port.remote_refs() == before_refs and scenario.port.writes() == before_writes
     assert kernel.active_host_action() == (None if request is None else "original-launch")
-    assert kernel.scheduling()["active"] == active_before
-    assert kernel.scheduling()["cancel_workers"] is True
+    assert kernel.operation_state().active == active_before
+    assert kernel.operation_state().cancel == active_before
     if request is not None:
         assert kernel.host_usage("original-launch") == usage_before
         with pytest.raises(KernelError, match="executor_fenced"):
