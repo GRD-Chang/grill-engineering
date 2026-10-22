@@ -30,18 +30,29 @@ def test_terminal_notification_keeps_close_cleanup_and_completed_as_distinct_fac
         return [record for record in outbox.read_notifications(tmp_path, scenario.spec.run_id)['records']
                 if record['kind'] == 'boundary']
 
+    closed = []
+    original_execute = scenario.port.execute
+
+    def execute(effect, authorize=None):
+        result = original_execute(effect, authorize)
+        if effect.subject == scenario.delivery.key and effect.operation == 'close':
+            # Observe the real physical return before the runner consumes it.
+            assert observe() == []
+            closed.append(effect)
+        return result
+
+    monkeypatch.setattr(scenario.port, 'execute', execute)
     for _ in range(100):
         step = scenario.step()
         if step.kind == 'approval':
             scenario.kernel.control('approve', 'original-approval', subject=scenario.delivery.key, world=scenario.world())
             continue
-        if step.effect is not None and step.effect.operation == 'close':
+        if closed:
             break
         assert step.kind not in {'paused', 'waiting', 'complete'}
     else:
         pytest.fail('Original close operation not reached')
     # An acknowledged remote close still needs its original committed consume.
-    assert observe() == []
     assert scenario.step().kind == 'progress'
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT state FROM resource_cleanup WHERE subject=?', (scenario.delivery.key,))[0] != 'complete'
