@@ -4229,6 +4229,16 @@ class Kernel:
                         raise KernelError("effect_binding")
                     return self._recheck_retirement(tx, run, job, requeue, row, result)
                 return Step("progress", effect.subject)
+            # A foreign cleanup resource is a known observation, not a write.
+            # Persist the refusal without inventing first-dispatch authority.
+            if row["status"] == "prepared" and effect.operation in self.CLEANUP and result.disposition == "third":
+                self._owned(tx, effect.subject, execution)
+                if self._effect(tx, row, execution) != effect:
+                    raise KernelError("effect_binding")
+                evidence = tx.put(effect.subject, "cleanup_observation", wire_json(asdict(result)))
+                tx.execute("UPDATE resource_cleanup SET outcome='third' WHERE effect_id=?", (effect.effect_id,))
+                self._event(tx, effect.subject, "cleanup_pending", effect.effect_id, evidence)
+                return Step("paused", effect.subject, "cleanup_pending")
             original_target = row["status"] == "prepared" and row["attempts"] > 0 and result.disposition == "target"
             if row["status"] == "prepared" and not original_target:
                 run, _ = self._owned(tx, effect.subject, execution)
