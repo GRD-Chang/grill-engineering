@@ -297,6 +297,10 @@ class OperationRunner:
                     raise
                 kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": bounded_error(str(error))})
                 return Step("waiting", effect.subject, "original_write_readback_required")
+            returncode = result.raw.get("write_returncode")
+            if type(returncode) is int and returncode != 0:
+                kernel.observe_effect_failure(effect, {"returncode": returncode,
+                    "message": bounded_error(str(result.raw.get("write_diagnostic", "")))})
             if effect.operation == "issue_link":
                 kernel.acknowledge_link(effect, result)
                 return Step("progress", effect.subject)
