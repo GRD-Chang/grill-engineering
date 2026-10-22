@@ -340,3 +340,52 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
     assert resumed["limit"] == 0 and resumed["used"] == 0
     assert resumed["window"] == 1 and resumed["open"] is False
     assert s.kernel.status("parent:1")["budgets"] == budgets
+
+
+@pytest.mark.parametrize("uncertain", ["unknown", "third"])
+def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_path, uncertain):
+    from agent_run_kernel.model import EffectResult
+
+    source = Requirements(ParentIssue(1, "Parent", "One exact ticket", (2,)),
+                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
+    s = GraphScenario(tmp_path / "graph", source)
+    ports = Ports(s)
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    execute, reconcile = ports.execute, ports.reconcile
+    sent = []
+
+    def lost(effect, authorize):
+        result = execute(effect, authorize)
+        if effect.operation == "merge":
+            sent.append(effect)
+            raise OSError("Original merge response lost after the physical write")
+        return result
+
+    ports.execute = lost
+    for _ in range(100):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        if sent:
+            break
+    else:
+        raise AssertionError("Core never sent the original merge")
+    effect, = sent
+    assert step.reason == "original_write_readback_required"
+    ports.reconcile = lambda selected: EffectResult(uncertain) if selected == effect else reconcile(selected)
+    assert runner.run_once().kind == "paused"
+    with s.kernel.storage.transaction(write=False) as tx:
+        attempts = tx.one("SELECT count(*) FROM attempts")[0]
+        original = tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (effect.effect_id,)))
+    assert original == ("sent", 1)
+    writes = s.port.writes()
+    # A known manual gate does not turn Host supervision into a busy poll.
+    assert runner.state().disposition == "quiescent"
+    ports.reconcile = reconcile
+    assert runner.run_once().kind == "progress"
+    with s.kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM attempts")[0] == attempts
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (effect.effect_id,))) == ("observed", 1)
+    assert s.port.writes() == writes
+    assert sum(write["operation"] == "merge" for write in writes) == 1
+    assert ("write_result_unknown" if uncertain == "unknown" else "write_conflict") in s.kernel.status(effect.subject)["gates"]
