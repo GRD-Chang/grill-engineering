@@ -21,6 +21,7 @@ from agent_run_kernel.migration import capture_v6
 from agent_run_kernel.migration_records import V6RecordReader
 from support.v6_returned_source import returned_managed_source, continue_original_returned
 from support.returned_remote import ReturnedRemote
+from support.migration_operations import configure_source, admit_final
 from test_kernel_migration_completed_history import _assert_original_records
 from test_kernel_migration_original_source import _git_bytes
 
@@ -173,6 +174,7 @@ def test_original_returned_role_transfers_exact_pending_work_without_replay(
     scenario.reviews, scenario.checks = ['pass'], ['none']
     scenario.review_count = scenario.development_count = scenario.publication_count = 0
     scenario.heads, scenario.role_calls, scenario.checkpoints, scenario.reviewed_heads = [], [], [], []
+    configure_source(scenario, external)
     scenario.edits = [{'history-feature.txt': 'implemented round 2\n'}] if review_findings else None
     cleanup_effects = []
     original_execute = port.execute
@@ -189,7 +191,12 @@ def test_original_returned_role_transfers_exact_pending_work_without_replay(
                 port.git.run('update-ref', effect.source_ref, foreign_oid, expected_oid)
         return original_execute(effect, authorize)
     port.execute = execute
-    assert scenario.run().kind == 'complete'
+    boundary = scenario.run()
+    # Business completion survives a refused cleanup of a foreign ref. The
+    # runner reports the remaining cleanup separately instead of claiming it
+    # succeeded; the original ownership assertions below remain unchanged.
+    assert kernel.status('ticket:2')['phase'] == 'complete'
+    assert boundary.kind == ('paused' if foreign_ref else 'complete'), boundary
     assert len(cleanup_effects) == 1
     if foreign_ref:
         assert foreign_oid is not None
@@ -216,7 +223,7 @@ def test_original_returned_role_transfers_exact_pending_work_without_replay(
     assert run_head is not None and default is not None
     original_run_oid = port.git.commit(run_ref).sha
     assert original_run_oid == default.sha and run_head.sha != original_run_oid
-    final = kernel.activate_final(scenario.execution, run_head, default, ancestry=((default.sha, run_head.sha),))
+    final = admit_final(scenario)
     port.local_root = managed.root / 'worktrees' / run_id
     final_scenario = Scenario.__new__(Scenario)
     final_scenario.script, final_scenario.kernel, final_scenario.port = None, kernel, port
@@ -226,6 +233,7 @@ def test_original_returned_role_transfers_exact_pending_work_without_replay(
     final_scenario.reviews, final_scenario.checks = ['pass'], ['none']
     final_scenario.review_count = final_scenario.development_count = final_scenario.publication_count = 0
     final_scenario.heads, final_scenario.role_calls, final_scenario.checkpoints, final_scenario.reviewed_heads = [], [], [], []
+    configure_source(final_scenario, external)
     final_scenario.edits = None
     final_ref_cleanup = []
     def execute_final(effect, authorize=None):

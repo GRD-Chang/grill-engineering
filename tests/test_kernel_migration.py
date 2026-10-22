@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import datetime
 import json
 import os
@@ -17,7 +18,9 @@ import pytest
 from agent_run_kernel.migration import MigrationRefused, capture_v6, restore_v6, validate_snapshot
 from agent_run_kernel.migration_conversion import convert_initial_v6
 from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.model import Commit, EffectResult, Policy, Profile, RunSpec, World
+from agent_run_kernel.model import Effect, EffectResult, Policy, Profile, RunSpec, Requirements
+from agent_run_kernel.operation_runner import DeliveryFacts
+from support.core_operations import CoreOperations, ReadOnlyPorts
 from agent_run_kernel.offline import OfflinePort, Scenario
 from support.frozen_v6_runtime import old_v6_runtime
 
@@ -106,18 +109,29 @@ def test_selected_idle_v6_ticket_converts_and_new_kernel_can_continue(
     restore_v6(snapshot, old_copy / "state.sqlite3")
     assert original_v6("load", root=old_copy, run_id=state["run_id"]) == original_old
     execution = kernel.claim_executor("migration-test-owner")
-    tree = subprocess.run(["git", "rev-parse", f"{base_sha}^{{tree}}"], cwd=git_repo,
-                          check=True, capture_output=True, text=True).stdout.strip()
-    world = World(current["parent_revision"], current["graph_revision"], current["revision"],
-                  Commit(base_sha, tree), completion_revision=current["completion_revision"])
-    workspace = kernel.advance("ticket:2", execution, world)
-    assert workspace.kind == "effect" and workspace.effect is not None
-    assert workspace.effect.operation == "workspace"
-    assert kernel.dispatch(workspace.effect, execution, world)
-    LocalGit(git_repo).run("update-ref", workspace.effect.source_ref, base_sha, "0" * len(base_sha))
-    kernel.reconcile(workspace.effect, EffectResult("target", commit=Commit(base_sha, tree)), execution, world)
-    assert kernel.advance("ticket:2", execution, world).kind == "progress"
-    step = kernel.advance("ticket:2", execution, world)
+    # An actual local workspace is the first bounded operation. The read-only
+    # fixture supplies only the exact old external requirement/base facts.
+    delivery = kernel.delivery("ticket:2")
+    from agent_run_kernel.local_effects import LocalEffects
+    local = LocalEffects(LocalGit(git_repo), owned_root=work_root)
+    class Ports(ReadOnlyPorts):
+        def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+            assert effect.operation == "workspace"
+            return local.execute(effect, authorize)
+        def reconcile(self, effect: Effect) -> EffectResult:
+            return local.reconcile(effect)
+    ports = Ports(Requirements.from_wire(json.loads(fixture.read_text())),
+                  delivery.source_ref, delivery.target_ref, DeliveryFacts(delivery.base, None))
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    workspace = operations.once(agent_capacity=0)
+    assert workspace.kind == "progress"
+    assert operations.once(agent_capacity=0).kind == "progress"
+    with kernel.storage.transaction(write=False) as tx:
+        effect = tx.one("SELECT operation,status FROM effects")
+        assert (effect["operation"], effect["status"]) == ("workspace", "confirmed")
+    assert LocalGit(git_repo).commit(delivery.source_ref).sha == base_sha
+    assert Path(delivery.checkout).is_dir()
+    step = operations.until(lambda step: step.call is not None)
     assert step.kind == "agent"
     assert step.call is not None and step.call.subject == "ticket:2"
     assert kernel.status("ticket:2")["pending_attempt"] == step.call.attempt_id

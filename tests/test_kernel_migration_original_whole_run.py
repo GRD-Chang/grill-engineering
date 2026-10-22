@@ -294,8 +294,8 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
         assert restored == original
         return
     class WholeRemote(ReturnedRemote):
-        def world(self, *arguments, **options):
-            return replace(super().world(*arguments, **options), publisher_actor='fixture-publisher')
+        def delivery(self, *arguments, **options):
+            return replace(super().delivery(*arguments, **options), publisher_actor='fixture-publisher')
     port = WholeRemote.create(tmp_path / 'native-whole-remote')
     port.git = LocalGit(managed.repository_root)
     port.local_root = managed.state_root / 'worktrees' / run_id
@@ -345,7 +345,8 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
             kernel.bind_thread(call, call.reported_thread or 'fixture-run-publication')
             self.publication_count += 1
             return wire_json({'result_kind': 'publication', **(final_run_publication() if subject.startswith('final:') else publication()), 'human_blockers': None})
-    def scenario(subject):
+    from support.migration_operations import configure_source, admit_final
+    def scenario(subject: str) -> WholeScenario:
         item = WholeScenario.__new__(WholeScenario)
         item.script, item.kernel, item.port = None, kernel, port
         item.delivery, item.execution = kernel.delivery(subject), execution
@@ -358,6 +359,7 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
         item.review_count = item.development_count = item.publication_count = 0
         item.heads, item.role_calls, item.checkpoints, item.reviewed_heads = [], [], [], []
         item.edits = None
+        configure_source(item, external)
         return item
     assert scenario('ticket:3').run().kind == 'complete'
     b_cleanup = kernel.status('ticket:3')['resource_cleanup']
@@ -375,8 +377,8 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
             'ON s.id=c.subject AND s.generation=c.generation ORDER BY c.subject'))
     # Match the production Final observer: every current Completion must be
     # proved into the observed Run head by the real local Git object graph.
-    final = kernel.activate_final(execution, run_head, default,
-                                  ancestry=port.ancestry(run_head, default, completion_heads))
+    assert all(port.git.is_ancestor(head, run_head.sha) for head in completion_heads)
+    final = admit_final(scenario('ticket:4'))
     port.local_root = managed.root / 'worktrees' / run_id
     assert scenario(final).run(approve=True).kind == 'complete'
     assert role_calls == original['calls']

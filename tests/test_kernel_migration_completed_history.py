@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -11,7 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,9 +20,11 @@ from agent_run_kernel.migration import MigrationRefused, SourceSnapshot, capture
 from agent_run_kernel.migration_completed import convert_completed_ticket_v6
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.migration_records import V6RecordReader, preserve_v6_records
-from agent_run_kernel.model import CreationInputs, DeliveryKind, Policy, PullRequest, RunSpec, World, wire_json
+from agent_run_kernel.model import CreationInputs, DeliveryKind, Policy, PullRequest, RunSpec, wire_json
 from agent_run_kernel.offline import OfflinePort, Scenario
+from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead
 from support.frozen_v6_runtime import BASELINE, old_v6_runtime
+from support.migration_operations import configure_source, admit_final
 
 
 _COMPLETE = r'''
@@ -278,14 +281,16 @@ def _assert_original_records(snapshot: SourceSnapshot, reader: V6RecordReader) -
         assert actual_history == expected_history  # Every original event identity/body and stream slot.
 
 
-class _HistoricalPublisherScenario(Scenario):
+class _HistoricalPublisherPort(OfflinePort):
     original_actor: str
 
-    def world(self) -> World:
-        return replace(super().world(), publisher_actor=self.original_actor)
+    def delivery(self, request: DeliveryRead, checks_script: Sequence[str], heads: list[str], *,
+                 publisher_identity: Mapping[str, Any] | None = None) -> DeliveryFacts:
+        return replace(super().delivery(request, checks_script, heads, publisher_identity=publisher_identity),
+                       publisher_actor=self.original_actor)
 
 
-def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -> None:
+def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[str, Path]) -> None:
     """Reuse the existing native driver, with copied old Git/external facts."""
     report = json.loads(paths['report'].read_text())
     run_id = report['source_identity']['run_id']
@@ -316,12 +321,10 @@ def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -
         profiles = json.loads(tx.get(profile['material_id'], profile['subject']))
         old_effects = [tuple(row) for row in tx.rows("SELECT id,status,payload_id,receipt_id FROM effects WHERE id LIKE 'v6-import:%' ORDER BY id")]
     execution = kernel.claim_executor('completed-history-native-executor')
-    final = kernel.activate_final(execution, run_head, default,
-                                  ancestry=((default.sha, run_head.sha),))
-    scenario = _HistoricalPublisherScenario.__new__(_HistoricalPublisherScenario)
-    scenario.original_actor = close['value_actor']
+    port.original_actor = close['value_actor']
+    scenario = Scenario.__new__(Scenario)
     scenario.script, scenario.kernel, scenario.port, scenario.execution = None, kernel, port, execution
-    scenario.delivery = kernel.delivery(final)
+    scenario.delivery = kernel.delivery('ticket:2')
     scenario.spec = RunSpec(run_id, 'example/project', 1, state['parent_revision'], state['graph_revision'],
                             (scenario.delivery,), Policy(), inputs=CreationInputs(
                                 profiles, inputs['prompt_resources'], inputs['worker_identity'],
@@ -331,6 +334,9 @@ def _continue_final(kernel: Kernel, port: OfflinePort, paths: dict[str, Path]) -
     scenario.review_count = scenario.development_count = scenario.publication_count = 0
     scenario.heads, scenario.role_calls, scenario.checkpoints, scenario.reviewed_heads = [], [], [], []
     scenario.edits = None
+    configure_source(scenario, json.loads(paths['github'].read_text()))
+    final = admit_final(scenario)
+    scenario.delivery = kernel.delivery(final)
     assert scenario.run(approve=True).kind == 'complete'
     assert kernel.status(final)['phase'] == 'complete'
     assert [call['role'] for call in scenario.role_calls] == ['review', 'publication']
@@ -473,7 +479,7 @@ def _import_history_and_continue(tmp_path: Path, paths: dict[str, Path], rounds:
         assert db.execute('SELECT count(*) FROM control_workers').fetchone()[0] == 0
         assert db.execute('SELECT count(*) FROM control_executors').fetchone()[0] == 0
     target = tmp_path / 'native'
-    port = OfflinePort.create(target)
+    port = cast(_HistoricalPublisherPort, _HistoricalPublisherPort.create(target))
     shutil.rmtree(port.git.root)  # Only this helper's newly created synthetic seed.
     kernel = convert_completed_ticket_v6(
         snapshot, target / 'kernel.sqlite3', git_store=paths['git'], repository_root=port.git.root,
