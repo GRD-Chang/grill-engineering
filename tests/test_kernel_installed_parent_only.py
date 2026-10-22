@@ -12,6 +12,7 @@ from agent_run.runner_lease import default_runner_lock_path, runner_management_l
 from agent_run_kernel import Kernel, lifecycle_cli
 from tests.test_kernel_managed_entry_end_to_end import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
+    _hold_host_operation_return,
 )
 
 
@@ -27,6 +28,7 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
             return tx.rows("SELECT id FROM subjects WHERE kind='parent_only' AND phase='approval'")
 
     with _approval_read_barrier(boundary=awaiting_parent_approval) as (address, databases, reached, release):
+        _hold_host_operation_return(tmp_path, monkeypatch)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=())
         original = _git(git_repo, "rev-parse", "HEAD")
