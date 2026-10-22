@@ -19,23 +19,24 @@ import pytest
 from agent_run_kernel import DeliveryKind, Effect, EffectResult, Kernel
 from agent_run_kernel.offline import GraphScenario, OfflinePort, Scenario
 from test_kernel_requirements import independent_source
+from support.core_operations import CoreOperations, final_scenario
 
 
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
 
 
 def _native_scenario(root: Path, kind: DeliveryKind) -> GraphScenario:
+    if kind == DeliveryKind.FINAL_RUN:
+        return final_scenario(root)
     source = independent_source()
     if kind == DeliveryKind.PARENT_ONLY:
         source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
-    elif kind == DeliveryKind.FINAL_RUN:
+    else:
+        # Isolate one delivery's cleanup. A global runner may otherwise start
+        # the independent sibling when the completed subject's cleanup blocks.
         first = source.issues[0]
         source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
-    scenario = GraphScenario(root, source)
-    if kind == DeliveryKind.FINAL_RUN:
-        assert scenario.run().kind == "complete"
-        scenario.select(scenario.activate_final())
-    return scenario
+    return GraphScenario(root, source)
 
 
 def _local_head(scenario: Scenario, ref: str) -> str | None:
@@ -133,6 +134,8 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
 
     def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
         if effect.operation == "cleanup_remote_ref":
+            assert authorize is not None
+            authorize()  # Preserve the original race after durable dispatch.
             assert not attempts
             attempts.append(effect)
             assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
@@ -149,7 +152,8 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    assert scenario.run().kind == "complete"
+    boundary = scenario.run()
+    assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == len(foreign_heads) == 1
     original = attempts[0]
     durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
@@ -167,7 +171,11 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
     scenario.port = OfflinePort(scenario.port.root)
     assert scenario.port.remote_refs()[original.source_ref] == foreign_heads[0]
-    assert scenario.run().kind == "complete"
+    # Re-entry may admit Final, but must neither replay the original cleanup
+    # nor run another Agent. Its completed business and pending cleanup persist.
+    reentry = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
+    assert reentry.call is None and reentry.reason == "final_activated"
+    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     assert scenario.port.remote_refs()[original.source_ref] == foreign_heads[0]
     assert _local_head(scenario, original.source_ref) is None
     assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"] == cleanup
@@ -187,6 +195,8 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
 
     def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
         if effect.operation in CLEANUP_OPERATIONS:
+            assert authorize is not None
+            authorize()  # The original completed-delivery cut is already sent.
             attempts.append(effect)
             assert effect.operation == "cleanup_worktree"
             assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
@@ -194,7 +204,8 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    assert scenario.run().kind == "complete"
+    boundary = scenario.run()
+    assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == 1
     durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
     assert durable["phase"] == "complete"
@@ -211,7 +222,9 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
     scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
     scenario.port = OfflinePort(scenario.port.root)
-    assert scenario.run().kind == "complete"
+    reentry = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
+    assert reentry.call is None and reentry.reason == "final_activated"
+    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"] == cleanup
     assert scenario.kernel.status(scenario.delivery.key)["budgets"] == durable["budgets"]
     assert (checkout / "unsaved.txt").read_text() == "retain work after delivery\n"
@@ -233,14 +246,26 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
         if effect.operation == "issue_link":
             attempts.append(effect)
-            before = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
-            assert before["issue_link"]["state"] == "indeterminate"
             assert effect.payload["issue"] == scenario.delivery.issue
             assert effect.payload["ref"] == scenario.delivery.source_ref
+            original_authorize = authorize
+
+            def dispatched() -> None:
+                assert original_authorize is not None
+                original_authorize()
+                before = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+                assert before["issue_link"]["state"] == "indeterminate"
+
+            authorize = dispatched
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    assert scenario.run().kind == "complete"
+    interrupted = scenario.run()
+    assert interrupted.reason == "original_write_readback_required"
+    # A separate operation continues business after the optional response loss;
+    # the original indeterminate display mutation must never be replayed.
+    boundary = scenario.run()
+    assert boundary.kind == "complete", boundary
     assert len(attempts) == 1
     original = attempts[0]
     durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
@@ -254,7 +279,8 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     # Real durable external link exists; observing it cannot manufacture the
     # missing original acknowledgement or authorize a second optional mutation.
     assert scenario.port.reconcile(original).disposition == "target"
-    assert scenario.run().kind == "complete"
+    boundary = scenario.run()
+    assert boundary.kind == "complete", boundary
     assert scenario.kernel.status(scenario.delivery.key)["issue_link"] == durable["issue_link"]
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     assert scenario.kernel.status(scenario.delivery.key)["budgets"] == durable["budgets"]

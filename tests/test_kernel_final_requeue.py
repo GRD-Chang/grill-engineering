@@ -2,16 +2,31 @@
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from test_kernel_abandon import managed_abandon_scenario
+from support.core_operations import CoreOperations, scripted_return
 
 
-def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budget_refund(tmp_path: Path) -> None:
+def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budget_refund(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scenario, request = managed_abandon_scenario(tmp_path)
+    calls = []
+    agent = scenario.agent
+
+    def recorded_agent(call):
+        calls.append(call)
+        return agent(call)
+
+    monkeypatch.setattr(scenario, "agent", recorded_agent)
     scenario.reviews[:] = ["pass", "pass", "fail", "pass"]
     assert scenario.run().kind == "complete"
     scenario.select("ticket:4")
     assert scenario.run().kind == "complete"
-    scenario.select(scenario.activate_final())
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations.until(lambda step: scenario.kernel.source_status()["final_subject"] is not None)
+    scenario.select(scenario.kernel.source_status()["final_subject"])
     kernel, subject = scenario.kernel, scenario.delivery.key
     for _ in range(50):
         scenario.step()
@@ -21,7 +36,7 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
         raise AssertionError("The original whole-Run Review did not request repair")
     before = kernel.status(subject)
     assert before["generation"] == 1
-    assert not kernel.scheduling()["active"]
+    assert not kernel.operation_state().active
     completions = kernel.source_status()["completions"]
     original = scenario.delivery
     preserved = Path(original.checkout) / "old-repair-note.txt"
@@ -44,20 +59,19 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
     assert delivery.source_ref == original.source_ref and delivery.target_ref == original.target_ref
     assert delivery.checkout != original.checkout and delivery.base == current
     for _ in range(50):
-        step = kernel.advance(subject, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is not None:
             fresh = step.call
             break
-        scenario.handle(step)
     else:
         raise AssertionError("Explicit Final requeue never reached fresh whole-Run Review")
     assert fresh.role.value == "review" and fresh.context["generation"] == 2
     assert fresh.context["reviewed_commit"] == current.sha
     assert fresh.context["full_scope"] == "final_run"
     assert any("Clarified current whole-Run acceptance." in item["body"] for item in fresh.context["requirements"])
-    kernel.receive(fresh, scenario.agent(fresh))
+    scripted_return(kernel, operations.runner, fresh, scenario.agent)
     assert scenario.run().kind == "approval"
-    assert [call["role"] for call in scenario.role_calls if call["subject"] == subject] == ["review", "review", "publication"]
+    assert [call.role.value for call in calls if call.subject == subject] == ["review", "review", "publication"]
     assert kernel.status(subject)["budgets"]["integration"]["reviews_used"] == before["budgets"]["integration"]["reviews_used"] + 1
     final_prs = [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "pr_write"]
     assert len(final_prs) == 1
