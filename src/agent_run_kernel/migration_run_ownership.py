@@ -88,6 +88,9 @@ def authenticate_run_ownership(tx: Transaction, body: Mapping[str, Any], receipt
                      (run_id, root['value_graph_snapshot_id']))
         members = {row['ticket_number'] for row in _rows(db,
             'SELECT ticket_number FROM run_graph_members WHERE run_id=? AND version_id=?', (run_id, graph['version_id']))}
+        scope = body.get('source_scope', 'whole-run')
+        if scope not in {'whole-run', 'single-ticket'} or scope == 'single-ticket' and len(members) != 1:
+            raise ValueError('original_owner_scope')
         entries = body['subjects']
         if (not isinstance(entries, list) or len(entries) != len(members)
                 or {entry['subject'] for entry in entries} != {f'ticket:{number}' for number in members}):
@@ -106,6 +109,21 @@ def authenticate_run_ownership(tx: Transaction, body: Mapping[str, Any], receipt
         current: set[str] = set()
         completed = {}
         seen: set[int] = set()
+
+        def authenticate_worked_owner(job: Mapping[str, Any], number: int) -> None:
+            proof = proofs[f'ticket:{number}']
+            if (job['job_id'] != f'ticket:{number}:generation:1'
+                    or job['owner_kind'] != 'ticket' or job['owner_key'] != str(number)
+                    or job['value_ticket_number'] != number
+                    or type(job['value_ticket_branch_generation']) is not int or job['value_ticket_branch_generation'] != 1
+                    or records.row('work_jobs', [run_id, job['job_id']]) != job
+                    or proof['source_record'] != {'table': 'work_jobs', 'key': [run_id, job['job_id']]}
+                    or proof['kind'] != ('completed' if job['stage'] == 'completed' else 'returned')):
+                raise ValueError('original_owner_generation')
+            current.add(job['job_id'])
+            if job['stage'] == 'completed':
+                completed[job['job_id']] = job['value_integrated_sha']
+
         for slot in slots:
             job = jobs[slot['job_id']]
             number = job['value_ticket_number']
@@ -118,18 +136,18 @@ def authenticate_run_ownership(tx: Transaction, body: Mapping[str, Any], receipt
             seen.add(number)
             proof = proofs[f'ticket:{number}']
             if job['job_id'].endswith(':selection'):
-                if job['stage'] is not None or proof['kind'] != 'unallocated':
+                if job['stage'] is not None or scope == 'whole-run' and proof['kind'] != 'unallocated':
                     raise ValueError('original_owner_generation')
                 continue
-            current.add(job['job_id'])
-            if (type(job['value_ticket_branch_generation']) is not int or job['value_ticket_branch_generation'] != 1
-                    or proof['source_record'] != {'table': 'work_jobs', 'key': [run_id, job['job_id']]}
-                    or proof['kind'] != ('completed' if job['stage'] == 'completed' else 'returned')):
+            authenticate_worked_owner(job, number)
+        if scope == 'single-ticket':
+            active = _one(db, 'SELECT active_job_id FROM work_job_layout WHERE run_id=?', (run_id,))
+            number = next(iter(members))
+            if active['active_job_id'] not in jobs or proofs[f'ticket:{number}']['kind'] != 'returned':
                 raise ValueError('original_owner_generation')
-            if job['stage'] == 'completed':
-                completed[job['job_id']] = job['value_integrated_sha']
+            authenticate_worked_owner(jobs[active['active_job_id']], number)
         if (current != {key for key, job in jobs.items() if job['stage'] is not None}
-                or any(proofs[f'ticket:{number}']['kind'] != 'unallocated' for number in members - seen)):
+                or scope == 'whole-run' and any(proofs[f'ticket:{number}']['kind'] != 'unallocated' for number in members - seen)):
             raise ValueError('original_owner_scope')
 
         external = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
@@ -140,7 +158,8 @@ def authenticate_run_ownership(tx: Transaction, body: Mapping[str, Any], receipt
         head = evidence.get('remote_heads', {}).get(ref)
         if (external['purpose'] != 'v6_external_readproof' or external['identity'] != body['external_readproof_sha256']
                 or hashlib.sha256(raw).hexdigest() != external['identity']
-                or evidence.get('source_sha256') != receipt['source_sha256'] or evidence.get('source_kind') != 'original_run'
+                or evidence.get('source_sha256') != receipt['source_sha256']
+                or evidence.get('source_kind') != ('returned_role' if scope == 'single-ticket' else 'original_run')
                 or not isinstance(head, str) or re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', head) is None
                 or head not in {base['value_sha'], *completed.values()}):
             raise ValueError('original_owner_head')

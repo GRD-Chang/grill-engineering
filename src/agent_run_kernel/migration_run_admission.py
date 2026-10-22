@@ -1,4 +1,4 @@
-"""Authenticate immutable whole-Run conversion facts at existing Task admission."""
+"""Authenticate immutable original-source facts at existing Task admission."""
 from __future__ import annotations
 
 import json
@@ -30,7 +30,11 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
         db.row_factory = factory
     keys = {'origin_nonce', 'source_sha256', 'profile_sha256', 'external_readproof_sha256',
             'resource_mode', 'run_record', 'run_ref_ownership', 'subjects'}
-    if (set(body) != keys or imported['purpose'] != 'v6_run_import' or imported['identity'] != receipt['nonce']
+    # Historical untagged manifests retain their exact WholeRun semantics.
+    # A Single label only selects the source SQL owner path, never authority.
+    scope = body.get('source_scope', 'whole-run')
+    if (scope not in {'single-ticket', 'whole-run'} or set(body) not in (keys, keys | {'source_scope'})
+            or imported['purpose'] != 'v6_run_import' or imported['identity'] != receipt['nonce']
             or imported['generation'] != 1 or body['origin_nonce'] != receipt['nonce']
             or body['source_sha256'] != receipt['source_sha256'] or body['resource_mode'] != 'existing-verified'
             or body['run_record'] != {'table': 'run_root', 'key': [run_id]}):
@@ -55,7 +59,7 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
     if any(row[0] != 'ticket_jobs' or row[1] not in {str(number) for number in members} for row in slots):
         raise _refuse()
     active = db.execute('SELECT active_job_id FROM work_job_layout WHERE run_id=?', (run_id,)).fetchone()
-    if active is None:
+    if active is None or scope == 'single-ticket' and len(members) != 1:
         raise _refuse()
     current_jobs: set[str] = set()
     seen_refs = {'refs/heads/' + root[0]}
@@ -77,8 +81,11 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
         selected = [row for row in slots if row[1] == str(number)]
         if len(selected) > 1:
             raise _refuse()
-        aliases = [{'table': 'work_job_slots', 'key': [run_id, row[0], row[1]]} for row in selected]
-        job_id = selected[0][2] if selected else None
+        # Single selection slots can still name the inert selection job while
+        # work_job_layout names the real generation owner. Do not invent a slot.
+        job_id = active[0] if scope == 'single-ticket' else selected[0][2] if selected else None
+        aliases = [{'table': 'work_job_slots', 'key': [run_id, row[0], row[1]]}
+            for row in selected if row[2] == job_id]
         jobs = [] if job_id is None else db.execute('SELECT stage,value_ticket_number,value_base_sha,value_ticket_branch,'
             'value_candidate_sha,budget_owner_id FROM work_jobs WHERE run_id=? AND job_id=?', (run_id, job_id)).fetchall()
         if job_id is not None and (len(jobs) != 1 or jobs[0][1] != number):

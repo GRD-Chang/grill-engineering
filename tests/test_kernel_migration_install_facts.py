@@ -23,12 +23,14 @@ from agent_run_kernel.migration_records import V6RecordReader
 from agent_run_kernel.migration_run_install import install_imported_facts
 from agent_run_kernel.migration_run_projection import verify_imported_installation
 from agent_run_kernel.model import Purpose, Role, wire_json
+from agent_run_kernel.model import KernelError
+from agent_run_kernel.migration_run_admission import authenticate_run_transfer
 from agent_run_kernel.offline import fixture_inputs
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.migration_conversion import read_initial_import
 from agent_run_kernel.model import Profile, World
 from support.frozen_v6_runtime import old_v6_runtime
-from support.v6_returned_source import returned_managed_source
+from support.v6_returned_source import returned_managed_source, continue_original_returned
 from agent_run_kernel.migration_active import read_original_returned_import
 from agent_run_kernel.migration_cli import _collect_original_v6
 from test_kernel_migration_original_source import _git_bytes
@@ -302,8 +304,9 @@ def test_original_returned_decoder_reaches_canonical_prepared_without_retiring_s
 
 
 @pytest.mark.parametrize('role', ['development', 'review', 'publication'])
+@pytest.mark.parametrize('enter_native', [False, True], ids=['inverse', 'native'])
 def test_canonical_original_executor_transfers_reenters_and_restores_real_returned_source(
-    tmp_path, git_repo, monkeypatch, role,
+    tmp_path, git_repo, monkeypatch, role, enter_native,
 ):
     import os
     import shutil
@@ -339,6 +342,44 @@ def test_canonical_original_executor_transfers_reenters_and_restores_real_return
     again = _execute_original_import(decoded, nonce=nonce, evidence=evidence)
     assert isinstance(again, Kernel) and again.storage.path == native.storage.path
     assert (native.storage.path.read_bytes(), _git_bytes(managed.repository_root)) == before
+    if enter_native:
+        state = native.status('ticket:2')
+        # Exercise rejected proof inputs in memory, without rewriting either
+        # database or its immutable materials/source rows.
+        checked_bytes = snapshot.source.read_bytes(), native.storage.path.read_bytes()
+        with native.storage.transaction(write=False) as tx, closing(sqlite3.connect(
+                snapshot.source.as_uri() + '?mode=ro', uri=True)) as source:
+            imported = tx.one("SELECT h.subject,h.kind,h.identity,h.material_id,h.generation,m.purpose "
+                "FROM history h JOIN material m ON m.id=h.material_id WHERE h.kind='v6_run_import'")
+            body = json.loads(tx.get(imported['material_id'], imported['subject']))
+            origin = _import_origin(decoded, managed, nonce)
+            for field, value in (('source_scope', 'whole-run'), ('source_scope', 'unknown'),
+                    ('origin_nonce', '00' * 16), ('source_sha256', '00' * 32),
+                    ('profile_sha256', False), ('run_record', {'table': 'run_root', 'key': ['other-run']})):
+                with pytest.raises(KernelError, match='legacy_requires_offline_migration'):
+                    authenticate_run_transfer(tx, imported, {**body, field: value}, origin, managed, source)
+            for field, value in (('expected_oid', '0' * 40),
+                    ('head_evidence', [{'table': 'work_jobs', 'key': [decoded.spec.run_id, 'other-owner']}] )):
+                with pytest.raises(KernelError, match='legacy_requires_offline_migration'):
+                    authenticate_run_transfer(tx, imported,
+                        {**body, 'run_ref_ownership': {**body['run_ref_ownership'], field: value}}, origin, managed, source)
+            authenticate_run_transfer(tx, imported, body, origin, managed, source)
+        assert (snapshot.source.read_bytes(), native.storage.path.read_bytes()) == checked_bytes
+        execution = native.claim_executor('canonical-returned-native')
+        delivery = native.delivery('ticket:2')
+        world = World(state['parent_revision'], state['graph_revision'], state['revision'],
+            decoded.spec.deliveries[0].base, git.commit(resource.source_ref),
+            completion_revision=state['completion_revision'])
+        step = native.advance(delivery.key, execution, world)
+        assert step.kind == 'progress'
+        with native.storage.transaction(write=False) as tx:
+            pending = decoded.subjects[0].attempts[-1].record.key[-1]
+            assert tx.one('SELECT status FROM attempts WHERE id=?', (pending,))[0] == 'consumed'
+            assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        expected_budgets = json.loads(json.dumps(state['budgets']))
+        expected_budgets['requirements']['reviews_used'] = int(role != 'development')
+        assert native.status('ticket:2')['budgets'] == expected_budgets
+        return
 
     result = _execute_original_import(decoded, nonce=nonce, evidence=evidence, inverse=True)
     assert isinstance(result, dict) and result['status'] == 'rolled_back'
@@ -355,8 +396,15 @@ def test_canonical_original_executor_transfers_reenters_and_restores_real_return
     with native.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM history WHERE kind='v6_original_rollback_started'")[0] == 1
         assert tx.one("SELECT count(*) FROM history WHERE kind='v6_original_rollback_complete'")[0] == 1
-    # Admission/native execution is a separate gate; this test only proves the
-    # fixed transfer/inverse executor on real producer layouts and local refs.
+    with pytest.raises(KernelError, match='legacy_requires_offline_migration'):
+        native.claim_executor('stale-native-after-canonical-inverse')
+    resumed = continue_original_returned(managed, paths, role)
+    assert resumed['calls'] == {'development': ['review', 'publication'],
+        'review': ['publication'], 'publication': []}[role]
+    assert resumed['budget'] == [1, 1] and resumed['state'] == 'CLOSED'
+    candidate = decoded.subjects[0].candidate
+    if candidate is not None:
+        assert resumed['candidate_tree'] == candidate.tree
 
 
 @pytest.mark.parametrize('profile_backend', [False, True])
