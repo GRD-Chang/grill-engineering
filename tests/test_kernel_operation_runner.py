@@ -389,3 +389,110 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
     assert s.port.writes() == writes
     assert sum(write["operation"] == "merge" for write in writes) == 1
     assert ("write_result_unknown" if uncertain == "unknown" else "write_conflict") in s.kernel.status(effect.subject)["gates"]
+
+
+def test_original_approved_prior_merge_continues_new_review_without_a_new_control(tmp_path):
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)),
+                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
+    s = GraphScenario(tmp_path / "graph", source)
+    ports = Ports(s)
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    for _ in range(120):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        if s.kernel.source_status()["final_subject"] is not None and s.kernel.status("final:1")["phase"] == "approval":
+            break
+    else:
+        raise AssertionError("Final did not reach its real first approval")
+    s.kernel.control("approve", "original-final-approval", subject="final:1", world=runner.observe("final:1"))
+    execute = ports.execute
+    sent = []
+
+    def interrupted(effect, authorize):
+        if effect.subject == "final:1" and effect.operation == "merge":
+            authorize()
+            sent.append(effect)
+            raise OSError("Original merge was interrupted before remote application")
+        return execute(effect, authorize)
+
+    ports.execute = interrupted
+    for _ in range(10):
+        runner.run_once()
+        if sent:
+            break
+    effect, = sent
+    assert ports.reconcile(effect).disposition == "prior"
+    s.requirements = replace(source, parent=replace(source.parent, body="Changed after the original approval"))
+    runner.observe("final:1")
+    ports.execute = execute
+    assert runner.run_once().kind == "progress"
+    assert s.kernel.source_status()["blocked"] == "final_refresh"
+    with pytest.raises(KernelError, match="final_approval_noncancellable"):
+        s.kernel.control("requeue", "cannot-replace-approval", subject="final:1", world=s.kernel.observe_control("final:1", lambda binding: ports))
+    assert runner.state().disposition == "ready"
+    for _ in range(80):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        status = s.kernel.status("final:1")
+        if status["phase"] == "approval":
+            break
+    else:
+        raise AssertionError("The original proved-unapplied approval never continued")
+    assert status["generation"] == 2
+    assert status["budgets"]["integration"]["reviews_used"] == 2
+    assert not [write for write in s.port.writes() if write["subject"] == "final:1" and write["operation"] == "merge"]
+
+
+@pytest.mark.parametrize("external_change", ["foreign", "absent"])
+def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_path, external_change):
+    source = Requirements(ParentIssue(1, "Parent", "One ticket", (2,)),
+                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
+    s = GraphScenario(tmp_path / "graph", source)
+    ports = Ports(s)
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    execute = ports.execute
+    inspected = []
+    foreign = []
+
+    def changed(effect, authorize):
+        if effect.operation != "cleanup_local_ref":
+            return execute(effect, authorize)
+        inspected.append(effect)
+        expected = effect.payload["expected_head"]
+        if external_change == "foreign":
+            prior = s.port.git.commit(expected)
+            other = s.port.git.make_commit(prior.tree, (prior.sha,), "Independent foreign ref")
+            foreign.append(other)
+            s.port.git.run("update-ref", effect.source_ref, other.sha, expected)
+        else:
+            s.port.git.run("update-ref", "-d", effect.source_ref, expected)
+        guard = authorize if external_change == "absent" else lambda: pytest.fail("A foreign observation cannot authorize a write")
+        return s.port.local.execute(effect, guard)
+
+    ports.execute = changed
+    for _ in range(100):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        if inspected:
+            break
+    effect, = inspected
+    assert s.kernel.status(effect.subject)["phase"] == "complete"
+    with s.kernel.storage.transaction(write=False) as tx:
+        row = tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (effect.effect_id,))
+        assert row["attempts"] == (0 if external_change == "foreign" else 1)
+        dispatched = tx.rows("SELECT position FROM history WHERE kind='effect_dispatched' AND identity=?", (effect.effect_id,))
+        assert len(dispatched) == (0 if external_change == "foreign" else 1)
+        cleanup = tx.one("SELECT stage,state,outcome FROM resource_cleanup WHERE effect_id=?", (effect.effect_id,))
+        assert cleanup["stage"] == 1 and cleanup["state"] == "pending"
+        if external_change == "foreign":
+            assert step.kind == "paused" and row["status"] == "prepared" and row["receipt_id"] is None
+            assert cleanup["outcome"] == "third"
+            assert s.port.git.commit(effect.source_ref) == foreign[0]
+        else:
+            assert step.kind == "progress" and row["status"] == "observed" and row["receipt_id"]
+    if external_change == "absent":
+        assert runner.run_once().kind == "progress"
+        assert s.kernel.status(effect.subject)["resource_cleanup"]["stage"] == 2

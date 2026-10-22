@@ -26,6 +26,10 @@ class KernelError(RuntimeError):
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
+class ObservationSuperseded(KernelError):
+    """A physical read lost to a committed authority/version change."""
+
+
 class DeliveryKind(StrEnum):
     TICKET = "ticket"
     PARENT_ONLY = "parent_only"
