@@ -150,6 +150,8 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     with monkeypatch.context() as patch:
         patch.setattr(OfflinePort, "prepare", prepare)
         scenario = Scenario(tmp_path, DeliveryKind.TICKET, checks=("fail", "none"))
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
     issued = []
     execute = scenario.port.execute
@@ -184,6 +186,13 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None  # External write succeeded, but its ACK was lost.
     assert not any(record["kind"] == "pr_created" for record in observe())
+    assert step.kind == "waiting" and step.retry_at is not None
+    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert pending["id"] == issued[0].effect_id and pending["status"] == "sent"
+    assert len(issued) == 1
+    # Advance to Core's actual bounded readback wake, without polling or renewing
+    # its deadline. The same original write must be observed before consumption.
+    now[0] = step.retry_at
 
     step = scenario.step()
     assert step.kind == "progress"
