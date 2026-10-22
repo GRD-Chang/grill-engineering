@@ -173,3 +173,60 @@ def test_whole_owner_decoder_keeps_historical_base_versions_and_source_outcomes(
     assert report['default_base'] != report['a_integrated']
     assert paths['database'].read_bytes() == original == snapshot.path.read_bytes()
     assert managed.open_path() == managed.repository_root
+
+
+@pytest.mark.parametrize('role', ['development', 'review', 'publication'])
+def test_original_returned_decoder_preserves_exact_source_and_owned_resources(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, role: str,
+) -> None:
+    import os
+    import shutil
+    from agent_run_kernel.migration_active import read_original_returned_import
+    from agent_run_kernel.migration_cli import _collect_original_v6
+    from support.v6_returned_source import returned_managed_source
+    from test_kernel_migration_original_source import _git_bytes
+
+    managed, paths = returned_managed_source(tmp_path, git_repo, role)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    # Supported inspection writes only evidence. All external reads use the
+    # existing synthetic service; no real gh, Agent or source retirement.
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    report = json.loads(paths['report'].read_bytes())
+    facts = read_original_returned_import(snapshot, profile_snapshot=evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json', checkout_archive=evidence / 'checkout.tar')
+    assert facts.source.mode == 'original' and facts.source.scope == 'single-ticket'
+    assert facts.source.profile_document == paths['profile'].read_bytes()
+    assert facts.source.external_readproof == (evidence / 'external-readproof.json').read_bytes()
+    assert facts.source.task is not None and facts.source.task.workspace == managed.repository_root
+    assert len(facts.subjects) == 1
+    subject = facts.subjects[0]
+    assert subject.subject == 'ticket:2' and subject.kind == 'returned'
+    assert subject.record == SourceRecord('work_jobs', (report['run_id'], 'ticket:2:generation:1'))
+    assert subject.completion is None and subject.historical_base is not None
+    assert subject.budgets[0].developments_used == 1
+    assert subject.budgets[0].reviews_used == int(role == 'publication')
+    assert subject.attempts[-1].role.value == role and subject.attempts[-1].pending
+    assert all(not attempt.pending for attempt in subject.attempts[:-1])
+    assert all(attempt.execution is not None and attempt.continuation_basis is None for attempt in subject.attempts)
+    assert len(subject.attempts) == {'development': 1, 'review': 2, 'publication': 3}[role]
+    assert subject.resources[0].disposition == 'existing'
+    assert subject.resources[0].checkout_archive_sha256 == hashlib.sha256((evidence / 'checkout.tar').read_bytes()).hexdigest()
+    assert subject.resources[0].checkout_index_sha256 == hashlib.sha256((evidence / 'checkout-index').read_bytes()).hexdigest()
+    assert subject.resources[0].before_head == ('ref: refs/heads/' + report['ticket_branch'] + '\n').encode()
+    assert facts.run_resource.head_evidence == (SourceRecord('run_condition_base', (report['run_id'],)),)
+    documents = dict(facts.source.oracle_documents)
+    if role == 'development':
+        intent = json.loads(documents['source:work_job_candidate_commit_intent'])
+        assert intent['run_id'] == report['run_id'] and intent['job_id'] == 'ticket:2:generation:1'
+        assert intent['value_kind'] == 'candidate_commit' and intent['value_attempt'] == 1
+        assert intent['value_expected_head'] == subject.historical_base.sha
+    else:
+        assert 'source:work_job_candidate_commit_intent' not in documents
+    assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
+    assert not (managed.state_root / report['run_id'] / 'kernel.sqlite3').exists()
