@@ -48,7 +48,7 @@ def test_original_whole_run_producer_retains_completed_returned_and_unallocated_
 
 
 def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proofs(
-    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, *, canonical_drift: str | None = None,
 ) -> None:
     from agent_run_kernel import Kernel
     from agent_run_kernel.migration import capture_v6
@@ -126,8 +126,25 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
     assert kernel.source_status()['remaining']['ticket:4'] == 'blocked_by_incomplete_tickets'
     proof_sha = hashlib.sha256(wire_json(proof)).hexdigest()
     prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+    if canonical_drift is not None:
+        with kernel.storage.transaction() as tx:
+            if canonical_drift == 'dependencies':
+                tx.execute("DELETE FROM dependencies WHERE subject='ticket:4' AND predecessor='ticket:3'")
+            else:
+                revision = tx.one('SELECT subject,material_id FROM profile_revisions WHERE id=1')
+                document = json.loads(tx.get(revision['material_id'], revision['subject']))
+                document['profiles']['review']['model'] = 'gpt-6-sol'
+                replacement = tx.put(revision['subject'], 'profile_revision', wire_json(document))
+                tx.execute('UPDATE profile_revisions SET material_id=? WHERE id=1', (replacement,))
+        candidate_bytes = destination.read_bytes()
+        with pytest.raises(MigrationRefused) as refused:
+            prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+        assert refused.value.code == 'native_original_cutover_advanced'
+        assert destination.read_bytes() == candidate_bytes
+        return
     with kernel.storage.transaction(write=False) as tx:
         other_context = tx.one("SELECT context_id FROM attempts WHERE subject='ticket:3' AND role='development'")[0]
+        review_thread = tx.one("SELECT id FROM threads WHERE subject='ticket:3' AND role='review'")[0]
     # A prepared Run is an exact conversion, including the other owners and
     # historical Attempt authority. Read-only validation must catch drift
     # before either source retirement or inverse can use it.
@@ -139,6 +156,14 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
         ('attempts', 'outcome', 'id=?', report['b_pending_attempt'], 'pass'),
         ('budgets', 'development_limit', "subject=? AND purpose='requirements' AND window=1", 'ticket:4', 99),
         ('resync_allowances', 'used', 'subject=? AND generation=1', 'ticket:3', 1),
+        ('runs', 'source_sequence', 'id=?', report['run_id'], 2),
+        ('issue_facts', 'state', 'issue=?', 4, 'CLOSED'),
+        ('dependency_facts', 'state', 'issue=? AND blocker=3', 4, 'CLOSED'),
+        ('requirement_versions', 'title', 'issue=?', 4, 'Changed requirement'),
+        ('source_observations', 'body', 'sequence=?', 1, wire_json({'foreign': 'requirements'})),
+        ('final_target', 'target_ref', 'id=?', 'final:' + report['run_id'], 'refs/heads/foreign'),
+        ('threads', 'backend_id', 'id=?', review_thread, 'foreign-review-thread'),
+        ('effects', 'actor', 'id=?', f"v6-import:{report['run_id']}:2:close", 'foreign-actor'),
     ):
         with kernel.storage.transaction() as tx:
             original = tx.one(f'SELECT {column} FROM {table} WHERE {predicate}', (identity,))[0]
@@ -153,7 +178,25 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
             with kernel.storage.transaction() as tx:
                 tx.execute(f'UPDATE {table} SET {column}=? WHERE {predicate}', (original, identity))
         prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+    # These audit values do not authorize execution. No broad timestamp or
+    # material exclusion is used: only declared mechanical clocks and valid,
+    # unreferenced immutable material may vary.
+    with kernel.storage.transaction() as tx:
+        tx.execute('UPDATE profile_revisions SET created_at=created_at+0.5')
+        tx.execute("UPDATE history SET created_at=created_at+0.5 WHERE kind IN ('source_refreshed','v6_original_cutover','v6_record_import')")
+        tx.put('ticket:3', 'inspection_note', b'Unreferenced read-only diagnostic')
+    candidate_bytes = destination.read_bytes()
+    prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+    assert destination.read_bytes() == candidate_bytes
     assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
+
+
+@pytest.mark.parametrize('drift', ['dependencies', 'profile'])
+def test_prepared_whole_run_refuses_changed_canonical_installation(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, drift: str,
+) -> None:
+    test_original_whole_run_private_install_uses_one_core_and_exact_subject_proofs(
+        tmp_path, git_repo, monkeypatch, canonical_drift=drift)
 
 
 def test_original_whole_run_formal_cutover_continues_c_and_final_against_original(

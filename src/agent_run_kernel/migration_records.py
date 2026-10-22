@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .kernel import Kernel
 from .migration import MigrationRefused, SourceSnapshot, capture_v6
@@ -97,13 +97,28 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
                 or tx.rows("SELECT position FROM history WHERE kind='v6_record_import'")):
             raise MigrationRefused('record_import_identity')
         tx.one('SELECT id FROM subjects WHERE id=?', (subject,))
-    source = {'run_id': run_id, 'protocol': snapshot.source_protocol,
-              'sha256': snapshot.sha256, 'schema_sha256': snapshot.schema_sha256}
-    manifest: dict[str, Any] = {'format': _FORMAT, 'source': source, 'tables': {}, 'documents': {}}
-
     def put(purpose: str, body: bytes) -> str:
         with kernel.storage.transaction() as tx:
             return tx.put(subject, purpose, body)
+
+    manifest = record_manifest(snapshot, run_id=run_id, profile_document=profile_document,
+                               whole_source=whole_source, put=put)
+    with kernel.storage.transaction() as tx:
+        material = tx.put(subject, 'v6_record_manifest', wire_json(manifest))
+        tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
+                   (subject, 'v6_record_import', run_id, material, 1, kernel.clock()))
+
+
+def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: bytes | None,
+                    whole_source: bool, put: Callable[[str, bytes], str]) -> dict[str, Any]:
+    """Encode authenticated source rows once for writing or an ephemeral expectation.
+
+    The callback supplies material identities; this function never opens a
+    native candidate, creates a Run, or derives an expectation from native rows.
+    """
+    source = {'run_id': run_id, 'protocol': snapshot.source_protocol,
+              'sha256': snapshot.sha256, 'schema_sha256': snapshot.schema_sha256}
+    manifest: dict[str, Any] = {'format': _FORMAT, 'source': source, 'tables': {}, 'documents': {}}
 
     def cell(value: Any) -> dict[str, Any]:
         kind = {type(None): 'null', int: 'integer', float: 'real', str: 'text', bytes: 'blob'}.get(type(value))
@@ -180,10 +195,7 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
                 body_size += encoded_size
             flush()
             manifest['tables'][table] = {'columns': info, 'primary_key': primary, 'count': count, 'pages': pages}
-    with kernel.storage.transaction() as tx:
-        material = tx.put(subject, 'v6_record_manifest', wire_json(manifest))
-        tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
-                   (subject, 'v6_record_import', run_id, material, 1, kernel.clock()))
+    return manifest
 
 
 class V6RecordReader:

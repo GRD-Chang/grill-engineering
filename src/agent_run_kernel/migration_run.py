@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import sqlite3
 from typing import Any, Literal, Mapping
@@ -52,6 +53,8 @@ class OriginalRunFacts:
     profile_sha256: str
     profile: Mapping[str, Any]
     tickets: tuple[UnallocatedTicket | WorkedTicket, ...]
+    snapshot: SourceSnapshot
+    profile_document: bytes
 
 
 def _read_acceptance(db: sqlite3.Connection, header: RunHeader, job: sqlite3.Row,
@@ -225,6 +228,9 @@ def _read_worked_ticket(db: sqlite3.Connection, header: RunHeader, owner: Ticket
 
 def read_original_run(snapshot: SourceSnapshot, profile_snapshot: Path) -> OriginalRunFacts:
     profile, profile_sha = _read_profile(profile_snapshot)
+    profile_document = profile_snapshot.read_bytes()
+    if hashlib.sha256(profile_document).hexdigest() != profile_sha:
+        raise MigrationRefused('source_profile_changed')
     with closing(sqlite3.connect(snapshot.path.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA query_only=ON')
@@ -250,4 +256,4 @@ def read_original_run(snapshot: SourceSnapshot, profile_snapshot: Path) -> Origi
         used_bindings = {call.invocation['binding_id'] for ticket in tickets if isinstance(ticket, WorkedTicket) for call in ticket.calls}
         if used_bindings != {entry['binding_id'] for entry in profile['bindings']}:
             raise MigrationRefused('unsupported_source_profile_bindings')
-        return OriginalRunFacts(header, snapshot.sha256, profile_sha, profile, tickets)
+        return OriginalRunFacts(header, snapshot.sha256, profile_sha, profile, tickets, snapshot, profile_document)

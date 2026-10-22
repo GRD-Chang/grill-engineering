@@ -49,6 +49,22 @@ class SubjectProof:
         }
 
 
+def run_import_document(*, origin: Mapping[str, Any], profile_sha256: str,
+        external_readproof_sha256: str, run_ref: str, run_head: str,
+        head_evidence: tuple[SourceKey, ...], entries: list[dict[str, Any]]) -> dict[str, Any]:
+    run_id = origin['run_id']
+    return {
+        'origin_nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
+        'profile_sha256': profile_sha256, 'external_readproof_sha256': external_readproof_sha256,
+        'resource_mode': 'existing-verified',
+        'run_record': SourceKey('run_root', (run_id,)).document(),
+        'run_ref_ownership': {'source_ref': run_ref, 'expected_oid': run_head,
+            'source_record': SourceKey('run_root', (run_id,)).document(),
+            'head_evidence': [key.document() for key in head_evidence]},
+        'subjects': entries,
+    }
+
+
 def install_run_proofs(tx: Transaction, *, origin: Mapping[str, Any], anchor: str,
                        profile_sha256: str, external_readproof_sha256: str,
                        run_ref: str, run_head: str, head_evidence: tuple[SourceKey, ...],
@@ -96,16 +112,9 @@ def install_run_proofs(tx: Transaction, *, origin: Mapping[str, Any], anchor: st
                    'VALUES (?,?,?,?,?,?)', (row['id'], 'v6_subject_import', origin['nonce'],
                                           material, row['generation'], created_at))
         entries.append({'subject': row['id'], 'generation': row['generation'], 'proof_id': material})
-    body = {
-        'origin_nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
-        'profile_sha256': profile_sha256, 'external_readproof_sha256': external_readproof_sha256,
-        'resource_mode': 'existing-verified',
-        'run_record': SourceKey('run_root', (run_id,)).document(),
-        'run_ref_ownership': {'source_ref': run_ref, 'expected_oid': run_head,
-            'source_record': SourceKey('run_root', (run_id,)).document(),
-            'head_evidence': [key.document() for key in head_evidence]},
-        'subjects': entries,
-    }
+    body = run_import_document(origin=origin, profile_sha256=profile_sha256,
+        external_readproof_sha256=external_readproof_sha256, run_ref=run_ref, run_head=run_head,
+        head_evidence=head_evidence, entries=entries)
     material = tx.put(anchor, 'v6_run_import', wire_json(body))
     tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
                'VALUES (?,?,?,?,1,?)', (anchor, 'v6_run_import', origin['nonce'], material, created_at))
