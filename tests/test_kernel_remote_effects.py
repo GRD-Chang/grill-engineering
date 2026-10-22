@@ -1,4 +1,5 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 import os
@@ -15,7 +16,38 @@ from agent_run_kernel.remote_effects import RemoteEffects
 from agent_run_kernel.operation_runner import ReadUnavailable
 
 
-def _fixture(tmp_path, monkeypatch):
+class EffectBoundary(Exception):
+    """A test barrier at the selected physical write, never a Core selector."""
+
+    def __init__(self, effect, authorize):
+        self.effect, self.authorize = effect, authorize
+        super().__init__(effect.operation)
+
+
+@contextmanager
+def effect_boundary(scenario, monkeypatch, operation, *, sent=False):
+    make_ports = scenario.make_ports
+
+    def intercepted(binding):
+        ports = make_ports(binding)
+        execute = ports.execute
+
+        def hold(effect, authorize):
+            if effect.operation == operation:
+                if sent:
+                    authorize()
+                raise EffectBoundary(effect, authorize)
+            return execute(effect, authorize)
+
+        ports.execute = hold
+        return ports
+
+    with monkeypatch.context() as boundary_patch:
+        boundary_patch.setattr(scenario, "make_ports", intercepted)
+        yield
+
+
+def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
     repo = tmp_path / "repo"
     repo.mkdir()
     git = LocalGit(repo)
@@ -42,7 +74,8 @@ def _fixture(tmp_path, monkeypatch):
     binary = tmp_path / "bin"
     binary.mkdir()
     fake = binary / "gh"
-    fake.write_text("#!" + sys.executable + "\n" + FAKE_GH)
+    fake.write_text("#!" + sys.executable + "\n" +
+                    FAKE_GH.replace("example/project", repository).replace("publisher", actor))
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("REMOTE_TEST_STATE", str(state))
@@ -50,9 +83,9 @@ def _fixture(tmp_path, monkeypatch):
     monkeypatch.setenv("REMOTE_TEST_BARE", str(remote))
     for name in ("GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(name, raising=False)
-    port = RemoteEffects(repo, "example/project", runner_identity={"source": "host"})
-    effect = Effect("push-1", "ticket:2", "push", "example/project", "refs/heads/delivery", "refs/heads/main",
-        base.sha, published.sha, published, base, None, "publisher", {}, Execution("run-1", "worker", 1))
+    port = RemoteEffects(repo, repository, runner_identity={"source": "host"})
+    effect = Effect("push-1", "ticket:2", "push", repository, "refs/heads/delivery", "refs/heads/main",
+        base.sha, published.sha, published, base, None, actor, {}, Execution("run-1", "worker", 1))
     return port, git, effect, state, calls
 
 

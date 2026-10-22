@@ -44,16 +44,10 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
                           checkout=str(Path(original.checkout).with_name("replacement-g2")))
     assert kernel.control_host(request, "requeue", "replace-original", subject=subject,
                                world=world, replacement=replacement) == "pending"
-    step = kernel.advance(subject, scenario.execution, scenario.world())
-    assert step.effect is not None and step.effect.operation == "retire_pr"
-    effect = step.effect
-    control_action = effect.payload["control_action"]
-
     transport_root = tmp_path / "transport"
     transport_root.mkdir()
-    _fixture_port, _git, _push, state, calls = _fixture(transport_root, monkeypatch)
-    fake = transport_root / "bin" / "gh"
-    fake.write_text(fake.read_text().replace("example/project", prior.repository).replace("publisher", prior.actor))
+    _fixture_port, _git, _push, state, calls = _fixture(transport_root, monkeypatch,
+        repository=prior.repository, actor=prior.actor)
     bare = transport_root / "origin.git"
     scenario.port.git.run("remote", "add", "native-test", str(bare))
     scenario.port.git.run("push", "--force", "native-test", prior.head.sha + ":" + prior.source_ref,
@@ -69,32 +63,49 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
     remote = RemoteEffects(scenario.port.git.root, prior.repository,
                            runner_identity={"source": "host"}, remote="native-test")
 
-    def current_world():
-        return replace(scenario.world(), pr=remote.pull_request(prior.number))
-
-    witness = remote.prepare_retirement(effect)
-    effect = kernel.attach_retirement(effect, witness, scenario.execution, current_world())
-    assert effect.payload["retirement_intent"]["control_action"] == control_action
-    dispatched = False
+    make_ports = scenario.make_ports
+    effects, results = [], []
     authorizations: list[int] = []
 
-    def authorize() -> None:
-        nonlocal dispatched
-        observed = current_world()
-        if not dispatched:
-            assert kernel.dispatch(effect, scenario.execution, observed)
-            dispatched = True
-        kernel.guard_effect(effect, scenario.execution, observed)
-        observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
-        authorizations.append(sum("--method" in call for call in observed_calls))
+    def transport_ports(binding):
+        ports = make_ports(binding)
+        delivery, execute = ports.delivery, ports.execute
 
-    result = remote.execute(effect, authorize)
+        def read(request):
+            facts = delivery(request)
+            return replace(facts, pr=remote.pull_request(prior.number))
+
+        def write(effect, authorize):
+            if effect.operation != "retire_pr":
+                return execute(effect, authorize)
+            effects.append(effect)
+            assert effect.payload["retirement_intent"]["control_action"] == effect.payload["control_action"]
+
+            def guarded():
+                authorize()
+                observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
+                authorizations.append(sum("--method" in call for call in observed_calls))
+
+            result = remote.execute(effect, guarded)
+            results.append(result)
+            return result
+
+        ports.delivery, ports.execute = read, write
+        ports.prepare_retirement = remote.prepare_retirement
+        return ports
+
+    monkeypatch.setattr(scenario, "make_ports", transport_ports)
+    runner = scenario.runner()
+    assert runner.run_once().kind == "progress"
+    assert len(effects) == len(results) == 1
+    effect, result = effects[0], results[0]
+    control_action = effect.payload["control_action"]
+    assert control_action == "replace-original"
     assert result.disposition == "target" and result.pr is not None and result.pr.state == "CLOSED"
     assert result.raw["write_returncode"] == 1
     assert authorizations == [0, 1]
     assert kernel.status(subject)["generation"] == 1
-    assert kernel.reconcile(effect, result, scenario.execution).kind == "progress"
-    assert kernel.advance(subject, scenario.execution, current_world()).kind == "progress"
+    assert runner.run_once().kind == "progress"
     assert kernel.status(subject)["generation"] == 2
     again = remote.execute(effect, lambda: pytest.fail("The original closed receipt must remain read-only"))
     assert again.disposition == "target" and again.pr == result.pr
