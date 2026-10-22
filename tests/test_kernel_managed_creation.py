@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_run_kernel.executor import _make_ports
+from support.core_operations import CoreOperations
+
 from agent_run.managed_workspace import ManagedWorkspace, read_git_identity
 
 
@@ -301,7 +304,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     import json
     import os
     from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, RunSpec, World
+    from agent_run_kernel import Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, RunSpec
     from agent_run_kernel.configuration import freeze_creation
     from tests.test_kernel_remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
@@ -338,11 +341,12 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement", tickets), tuple(
             Issue(number, f"Ticket {number}", "Frozen Ticket requirement", "OPEN", labels=frozenset({"ready-for-agent"}))
             for number in tickets)))
-    receipt = kernel.source_status()
-    world = World(receipt["observed_parent_revision"], receipt["observed_graph_revision"],
-                  kernel.delivery(deliveries[0].key).revision, base)
+    if tickets:
+        # An explicit external run-ref precondition, observed through the real
+        # native port rather than represented by a test-constructed World.
+        git(git_repo, "update-ref", "refs/heads/run", base.sha)
     with _ready_public_host(kernel, tmp_path, monkeypatch, admit=admit) as (request, execution, calls):
-        yield kernel, request, execution, world, calls
+        yield kernel, request, execution, base, calls
 
 
 @contextmanager
@@ -390,18 +394,23 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
     import json
     from agent_run_kernel.model import EffectResult
     from agent_run_kernel.query_cli import main
-    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, calls):
-        original = kernel.advance("parent:1", execution, world).call
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
+        operations = CoreOperations(kernel, execution, _make_ports)
+        original = operations.until(lambda step: step.call is not None).call
         assert original is not None and original.deadline_seconds == 7.0
         kernel.bind_thread(original, "original-thread")
         kernel.receive(original, b'{"result_kind":"development","summary":"Candidate investigation","human_blockers":null}')
-        assert kernel.advance("parent:1", execution, world).kind == "progress"
-        effect = kernel.advance("parent:1", execution, world).effect
-        assert effect is not None and effect.operation == "candidate" and kernel.dispatch(effect, execution, world)
-        kernel.reconcile(effect, EffectResult("failure", world.target,
-            raw={"head": world.target.sha, "reason": "candidate_integrity"}), execution)
-        assert kernel.advance("parent:1", execution, world).kind == "progress"
-        assert kernel.advance("parent:1", execution, world).kind == "paused"
+        assert operations.once().kind == "progress"
+        execute = operations.runner.ports.execute
+        def failed_candidate(effect, authorize):
+            if effect.operation != "candidate":
+                return execute(effect, authorize)
+            authorize()  # Core dispatches and guards this exact fixture failure.
+            return EffectResult("failure", base, raw={"head": base.sha, "reason": "candidate_integrity"})
+        monkeypatch.setattr(operations.runner.ports, "execute", failed_candidate)
+        assert operations.once().kind == "progress"
+        assert operations.once().kind == "progress"
+        assert operations.once().kind == "paused"
         assert "modification_budget_exhausted" in kernel.status("parent:1")["gates"]
         with kernel.storage.transaction(write=False) as tx:
             previous_calls = [dict(row) for row in tx.all("SELECT * FROM invocations")]
@@ -419,7 +428,7 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
             assert tx.one("SELECT count(*) FROM hosts")[0] == 1
         budget = kernel.status("parent:1")["budgets"]["requirements"]
         assert (budget["window"], budget["development_limit"], budget["review_limit"]) == (2, 2, 2)
-        continued = kernel.advance("parent:1", execution, world).call
+        continued = operations.until(lambda step: step.call is not None).call
         assert continued is not None and continued.deadline_seconds == 13.0
         assert continued.thread_id != original.thread_id and continued.context["human_responses"] == [message]
         assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
@@ -430,8 +439,9 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
 ) -> None:
     import json
     from agent_run_kernel.query_cli import main
-    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, calls):
-        original = kernel.advance("parent:1", execution, world).call
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
+        operations = CoreOperations(kernel, execution, _make_ports)
+        original = operations.until(lambda step: step.call is not None).call
         assert original is not None and kernel.dispatch_agent(original)
         kernel.agent_unavailable(original, "preparation_failed", "No Worker was started")
         before = kernel.status("parent:1")
@@ -443,7 +453,7 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
             assert tx.one("SELECT count(*) FROM actions")[0] == 1
         assert main(["resume", "1", "--repo", "example/project", "--message", "Worker setup fixed", "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["host"] == "running"
-        continued = kernel.advance("parent:1", execution, world).call
+        continued = operations.until(lambda step: step.call is not None).call
         assert continued is not None and continued.attempt_id == original.attempt_id
         assert continued.deadline_seconds == 7.0 and kernel.host_request("original") == request
         assert all(json.loads(line)[0] != "systemd-run" for line in calls.read_text().splitlines())
@@ -458,12 +468,13 @@ def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_origin
     from agent_run_kernel.query_cli import main
     from agent_run_kernel.source_reading import read_requirements
 
-    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, calls):
-        original = kernel.advance("parent:1", execution, world).call
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
+        operations = CoreOperations(kernel, execution, _make_ports)
+        original = operations.until(lambda step: step.call is not None).call
         assert original is not None
         kernel.bind_thread(original, "original-parent-thread")
         kernel.receive(original, b'{"result_kind":"development","summary":"Original investigation","human_blockers":null}')
-        assert kernel.advance("parent:1", execution, world).kind == "progress"
+        assert operations.once().kind == "progress"
         previous = kernel.delivery("parent:1")
         state = tmp_path / "github.json"
         changed = json.loads(state.read_text())
@@ -484,7 +495,7 @@ def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_origin
         current = kernel.delivery("parent:1")
         assert current.key == previous.key and current.kind == previous.kind and current.issue == previous.issue
         assert current.source_ref != previous.source_ref and current.checkout != previous.checkout
-        assert current.target_ref == previous.target_ref and current.base == world.target
+        assert current.target_ref == previous.target_ref and current.base == base
         assert current.owned_root == str(root.parent / "worktrees" / request.run_id)
         assert current.common_git_dir == str(root / ".git")
         assert not Path(current.checkout).exists()
@@ -525,14 +536,15 @@ def test_public_requeue_with_multiple_stale_tickets_requires_an_exact_current_ch
     import json
     from agent_run_kernel.query_cli import main
 
-    with _running_public_parent(git_repo, tmp_path, monkeypatch, tickets=(2, 3)) as (kernel, request, execution, world, _calls):
+    with _running_public_parent(git_repo, tmp_path, monkeypatch, tickets=(2, 3)) as (kernel, request, execution, base, _calls):
+        operations = CoreOperations(kernel, execution, _make_ports)
         for number in (2, 3):
             subject = f"ticket:{number}"
-            call = kernel.advance(subject, execution, replace(world, revision=kernel.delivery(subject).revision)).call
-            assert call is not None
+            call = operations.until(lambda step: step.call is not None).call
+            assert call is not None and call.subject == subject
             kernel.bind_thread(call, f"original-ticket-{number}")
             kernel.receive(call, b'{"result_kind":"development","summary":"Original Ticket investigation","human_blockers":null}')
-            assert kernel.advance(subject, execution, replace(world, revision=kernel.delivery(subject).revision)).kind == "progress"
+            assert operations.once(agent_capacity=0).kind == "progress"
         state = tmp_path / "github.json"
         changed = json.loads(state.read_text())
         for issue in changed["source_graph"]["issues"].values():
@@ -555,13 +567,14 @@ def test_public_idle_requeue_binds_the_exact_replacement_to_the_original_host_in
     from agent_run_kernel import lifecycle_cli
     from agent_run_kernel.query_cli import main
 
-    with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, world, _calls):
+    with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, base, _calls):
         execution = kernel.claim_executor("isolated-preparation")
-        call = kernel.advance("parent:1", execution, world).call
+        operations = CoreOperations(kernel, execution, _make_ports)
+        call = operations.until(lambda step: step.call is not None).call
         assert call is not None
         kernel.bind_thread(call, "original-parent-thread")
         kernel.receive(call, b'{"result_kind":"development","summary":"Original investigation","human_blockers":null}')
-        assert kernel.advance("parent:1", execution, world).kind == "progress"
+        assert operations.once().kind == "progress"
         kernel.stop_task("retire-isolated-preparation")
         kernel.confirm_executor_exit(execution)
         kernel.control("resume", "prepare-managed-requeue")
@@ -602,7 +615,8 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
     from agent_run_kernel.model import HostObservation, KernelError
     from agent_run_kernel.query_cli import main
 
-    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, world, _calls):
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, _calls):
+        operations = CoreOperations(kernel, execution, _make_ports)
         assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
             evidence="The manager cannot currently prove this original Host's lifetime.")) == "unknown"
         with kernel.storage.transaction(write=False) as tx:
@@ -629,8 +643,8 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
             assert tx.one("SELECT epoch FROM runs")[0] == original_epoch + 1
             assert tx.one("SELECT count(*) FROM actions WHERE kind='abandon'")[0] == 1
             assert tx.one("SELECT count(*) FROM effects WHERE control_action IS NOT NULL")[0] == 0
-        with pytest.raises(KernelError, match="executor_fenced"):
-            kernel.advance("parent:1", execution, world)
+        fenced = operations.once()
+        assert fenced.kind == "paused" and fenced.reason == "executor_fenced", fenced
 
 
 def test_public_queries_show_the_recorded_pending_abandonment_instead_of_new_business_actions(

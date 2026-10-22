@@ -69,18 +69,14 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
 ) -> None:
     import threading
     from agent_run_kernel.offline import GraphScenario
-    from test_kernel_operation_runner import Ports
+    from support.core_operations import CoreOperations
     from test_kernel_requirements import independent_source
     scenario = GraphScenario(tmp_path / "preparation", independent_source())
     kernel = scenario.kernel
-    runner = kernel.operation_runner(scenario.execution, lambda binding: Ports(scenario))
-    for _ in range(30):
-        step = runner.run_once()
-        if step.call is not None:
-            call = step.call
-            break
-    else:
-        raise AssertionError("Core did not allocate the normal Development call")
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    runner = operations.runner
+    call = operations.until(lambda step: step.call is not None).call
+    assert call is not None
     driver = executor._Executor(kernel, runner, {})
 
     def invalid_prompt(call: object) -> str:
@@ -104,11 +100,12 @@ def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_run_kernel.offline import GraphScenario
-    from test_kernel_operation_runner import Ports, settle_agent
+    from support.core_operations import CoreOperations, scripted_return
     from test_kernel_requirements import independent_source
     scenario = GraphScenario(tmp_path / "stop", independent_source())
     kernel = scenario.kernel
-    ports = Ports(scenario)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    ports = operations.runner.ports
     original = ports.execute
     writes: list[str] = []
     selected = []
@@ -119,17 +116,23 @@ def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
         selected.append(effect)
         authorize()
         kernel.control("stop", "operator-stop")
-        authorize()
+        try:
+            authorize()
+        except KernelError as denied:
+            assert denied.code == "executor_fenced"
+            raise
         writes.append("unexpected")
         raise AssertionError("Stop must reject the second write guard")
 
     monkeypatch.setattr(ports, "execute", execute)
-    runner = kernel.operation_runner(scenario.execution, lambda binding: ports)
-    with pytest.raises(KernelError, match="executor_fenced"):
-        for _ in range(30):
-            step = runner.run_once()
-            if step.call is not None:
-                settle_agent(scenario, runner, step.call)
+    for _ in range(30):
+        step = operations.once()
+        if step.call is not None:
+            scripted_return(kernel, operations.runner, step.call, scenario.agent)
+        if step.kind == "paused":
+            assert step.reason == "executor_fenced"
+            break
+    else:
         raise AssertionError("The normal candidate boundary was not reached")
     assert len(selected) == 1 and writes == []
     assert not any(event["kind"] == "effect_failed" for event in kernel.history(selected[0].subject))
