@@ -817,6 +817,99 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
         candidate_sha=facts.candidate_sha, candidate_tree=facts.candidate_tree, integrated_tree=facts.integrated_tree)
 
 
+
+_COMPLETED_ORACLE_FIELDS = ('run_id', 'developments_used', 'reviews_used', 'physical_invocations', 'candidate_sha', 'integrated_sha', 'repository', 'parent_number', 'requirements', 'ticket', 'pr_number', 'ticket_branch', 'run_branch', 'base_branch', 'publication_sha', 'base_sha', 'close_ownership')
+
+
+def _verify_completed_oracle(source: Mapping[str, Any], observed: Mapping[str, Any],
+        report: Mapping[str, Any], github: Mapping[str, Any], git_store: Path, *, existing_verified: bool) -> list[Any]:
+    if (observed.get("run_id") != source['run_id']
+            or report.get("raw_backend_calls") != {"development": source['developments_used'],
+                                                    "review": source['reviews_used'], "publication": 1}
+            or (source['physical_invocations'] and observed.get("old_runtime_exit") != {"returncode": 0, "reaped": True})
+            or observed.get("candidate_sha") != source['candidate_sha']
+            or observed.get("integrated_sha") != source['integrated_sha']
+            or report.get("source_identity", {}).get("run_id") != source['run_id']
+            or report.get("source_identity", {}).get("pull_request") != observed.get("pull_request")):
+        raise MigrationRefused("source_observation")
+    delivery = github.get("delivery")
+    issues = github.get("issues")
+    if (github.get("repository") != source['repository'] or not isinstance(delivery, dict)
+            or not isinstance(issues, dict) or not isinstance(issues.get(str(source['ticket'])), dict)
+            or github.get("parent") != {"number": source['parent_number'],
+                                        "title": source['requirements'].parent.title,
+                                        "body": source['requirements'].parent.body,
+                                        "sub_issues": [source['ticket']],
+                                        "sub_issue_order_reliable": True}
+            or delivery.get("closed_issues") != [source['ticket']]
+            or issues[str(source['ticket'])].get("state") != "CLOSED"
+            or delivery.get("pull_requests") != [observed["pull_request"]]
+            or delivery.get("published_branches", {}).get(source['run_branch']) != source['integrated_sha']):
+        raise MigrationRefused("source_external")
+    original = source['requirements'].issues[0]
+    latest = issues[str(source['ticket'])]
+    if (latest.get("number") != source['ticket'] or latest.get("title") != original.title
+            or latest.get("body") != original.body or set(latest.get("labels", [])) != original.labels
+            or latest.get("blocked_by") != [] or original.state != "OPEN"):
+        raise MigrationRefused("source_external_issue")
+    pr = observed.get("pull_request")
+    if (not isinstance(pr, dict)
+            or pr.get("number") != source['pr_number'] or pr.get("state") != "MERGED"
+            or pr.get("branch") != source['ticket_branch'] or pr.get("base_branch") != source['run_branch']
+            or pr.get("head_sha") != source['publication_sha']
+            or pr.get("integrated_sha") != source['integrated_sha']
+            or pr.get("base_sha") != source['base_sha']):
+        raise MigrationRefused("source_external_pr")
+    source_mutations = delivery.get("mutations")
+    expected = {"run_id": source['run_id'], "ticket_number": source['ticket'],
+                "pr_number": source['pr_number'], "integrated_sha": source['integrated_sha']}
+    if (not isinstance(source_mutations, list) or len(source_mutations) != 3
+            or source_mutations[:2] != [{"action": action, **expected}
+                                 for action in ("completion_comment", "close_issue")]
+            or source_mutations[2] != {"action": "delete_managed_branch", "branch": source['ticket_branch']}
+            or delivery.get("ticket_close_ownership", {}).get(str(source['ticket']), {}).get("event_id")
+               != source['close_ownership']["value_event_id"]
+            or delivery["ticket_close_ownership"][str(source['ticket'])].get("intent_binding")
+               != source['close_ownership']["value_intent_binding"]
+            or delivery["ticket_close_ownership"][str(source['ticket'])].get("actor")
+               != source['close_ownership']["value_actor"]):
+        raise MigrationRefused("source_external_effects")
+
+    observed_refs = observed.get("git_refs")
+    if observed_refs != sorted([f"refs/heads/{source['run_branch']}\t{source['integrated_sha']}",
+                                f"refs/heads/{source['base_branch']}\t{source['base_sha']}"]):
+        raise MigrationRefused("source_git_refs")
+    source_run_ref = git_store / "refs" / "heads" / source['run_branch']
+    source_base_ref = git_store / "refs" / "heads" / source['base_branch']
+    try:
+        source_refs_valid = (not any(path.is_symlink() or not path.is_file()
+                                     or not path.resolve().is_relative_to(git_store.resolve())
+                                     for path in (source_run_ref, source_base_ref))
+                             and source_run_ref.read_text(encoding="ascii").strip() == source['integrated_sha']
+                             and source_base_ref.read_text(encoding="ascii").strip() == source['base_sha']
+                             and not (git_store / "refs" / "heads" / source['ticket_branch']).exists()
+                             and not (git_store / "packed-refs").exists())
+    except (OSError, UnicodeError):
+        source_refs_valid = False
+    if not source_refs_valid and not existing_verified:
+        raise MigrationRefused("source_git_refs")
+    return source_mutations
+
+
+def _verify_completed_oracle_documents(source_sha: str, profile_sha: str,
+        observed: Mapping[str, Any], report: Mapping[str, Any], github_sha: str, report_sha: str) -> None:
+    if (not isinstance(observed.get("backend"), str)
+            or observed.get("copied_database_sha256") != source_sha
+            or observed.get("source_database_sha256") != source_sha
+            or observed.get("profile_present") is not True
+            or observed.get("profile_sha256") != profile_sha
+            or observed.get("github_sha256") != github_sha
+            or observed.get("original_report_sha256") != report_sha
+            or report.get("status") != "ticket_completed"
+            or observed.get("external_effects") != report.get("mutations")):
+        raise MigrationRefused("source_observation")
+
+
 def convert_completed_ticket_v6(
     snapshot: SourceSnapshot, destination: Path, *, git_store: Path,
     repository_root: Path, final_checkout: Path, profile_snapshot: Path,
@@ -869,16 +962,7 @@ def convert_completed_ticket_v6(
         observed, observation_sha = _read_document(observation_snapshot)
         report, report_sha = _read_document(original_report)
         github, github_sha = _read_document(github_snapshot)
-        if (not isinstance(observed.get("backend"), str)
-                or observed.get("copied_database_sha256") != snapshot.sha256
-                or observed.get("source_database_sha256") != snapshot.sha256
-                or observed.get("profile_present") is not True
-                or observed.get("profile_sha256") != profile_sha
-                or observed.get("github_sha256") != github_sha
-                or observed.get("original_report_sha256") != report_sha
-                or report.get("status") != "ticket_completed"
-                or observed.get("external_effects") != report.get("mutations")):
-            raise MigrationRefused("source_observation")
+        _verify_completed_oracle_documents(snapshot.sha256, profile_sha, observed, report, github_sha, report_sha)
         registrations = report.get("post_close_worktrees", {}).get("registrations")
         original_roots = ([Path(row["path"]) for row in registrations
                            if isinstance(row, dict) and row.get("repository") is True
@@ -897,76 +981,8 @@ def convert_completed_ticket_v6(
         _require_no_v6_notification_journal(snapshot, facts.run_id)
         mutations: list[Any] = []
         if readproof is None:
-            if (observed.get("run_id") != facts.run_id
-                    or report.get("raw_backend_calls") != {"development": facts.developments_used,
-                                                            "review": facts.reviews_used, "publication": 1}
-                    or (facts.physical_invocations and observed.get("old_runtime_exit") != {"returncode": 0, "reaped": True})
-                    or observed.get("candidate_sha") != facts.candidate_sha
-                    or observed.get("integrated_sha") != facts.integrated_sha
-                    or report.get("source_identity", {}).get("run_id") != facts.run_id
-                    or report.get("source_identity", {}).get("pull_request") != observed.get("pull_request")):
-                raise MigrationRefused("source_observation")
-            delivery = github.get("delivery")
-            issues = github.get("issues")
-            if (github.get("repository") != facts.repository or not isinstance(delivery, dict)
-                    or not isinstance(issues, dict) or not isinstance(issues.get(str(facts.ticket)), dict)
-                    or github.get("parent") != {"number": facts.parent_number,
-                                                "title": facts.requirements.parent.title,
-                                                "body": facts.requirements.parent.body,
-                                                "sub_issues": [facts.ticket],
-                                                "sub_issue_order_reliable": True}
-                    or delivery.get("closed_issues") != [facts.ticket]
-                    or issues[str(facts.ticket)].get("state") != "CLOSED"
-                    or delivery.get("pull_requests") != [observed["pull_request"]]
-                    or delivery.get("published_branches", {}).get(facts.run_branch) != facts.integrated_sha):
-                raise MigrationRefused("source_external")
-            original = facts.requirements.issues[0]
-            latest = issues[str(facts.ticket)]
-            if (latest.get("number") != facts.ticket or latest.get("title") != original.title
-                    or latest.get("body") != original.body or set(latest.get("labels", [])) != original.labels
-                    or latest.get("blocked_by") != [] or original.state != "OPEN"):
-                raise MigrationRefused("source_external_issue")
-            pr = observed.get("pull_request")
-            if (not isinstance(pr, dict)
-                    or pr.get("number") != facts.pr_number or pr.get("state") != "MERGED"
-                    or pr.get("branch") != facts.ticket_branch or pr.get("base_branch") != facts.run_branch
-                    or pr.get("head_sha") != facts.publication_sha
-                    or pr.get("integrated_sha") != facts.integrated_sha
-                    or pr.get("base_sha") != facts.base_sha):
-                raise MigrationRefused("source_external_pr")
-            source_mutations = delivery.get("mutations")
-            expected = {"run_id": facts.run_id, "ticket_number": facts.ticket,
-                        "pr_number": facts.pr_number, "integrated_sha": facts.integrated_sha}
-            if (not isinstance(source_mutations, list) or len(source_mutations) != 3
-                    or source_mutations[:2] != [{"action": action, **expected}
-                                         for action in ("completion_comment", "close_issue")]
-                    or source_mutations[2] != {"action": "delete_managed_branch", "branch": facts.ticket_branch}
-                    or delivery.get("ticket_close_ownership", {}).get(str(facts.ticket), {}).get("event_id")
-                       != facts.close_ownership["value_event_id"]
-                    or delivery["ticket_close_ownership"][str(facts.ticket)].get("intent_binding")
-                       != facts.close_ownership["value_intent_binding"]
-                    or delivery["ticket_close_ownership"][str(facts.ticket)].get("actor")
-                       != facts.close_ownership["value_actor"]):
-                raise MigrationRefused("source_external_effects")
-            mutations = source_mutations
-            observed_refs = observed.get("git_refs")
-            if observed_refs != sorted([f"refs/heads/{facts.run_branch}\t{facts.integrated_sha}",
-                                        f"refs/heads/{facts.base_branch}\t{facts.base_sha}"]):
-                raise MigrationRefused("source_git_refs")
-            source_run_ref = git_store / "refs" / "heads" / facts.run_branch
-            source_base_ref = git_store / "refs" / "heads" / facts.base_branch
-            try:
-                source_refs_valid = (not any(path.is_symlink() or not path.is_file()
-                                             or not path.resolve().is_relative_to(git_store.resolve())
-                                             for path in (source_run_ref, source_base_ref))
-                                     and source_run_ref.read_text(encoding="ascii").strip() == facts.integrated_sha
-                                     and source_base_ref.read_text(encoding="ascii").strip() == facts.base_sha
-                                     and not (git_store / "refs" / "heads" / facts.ticket_branch).exists()
-                                     and not (git_store / "packed-refs").exists())
-            except (OSError, UnicodeError):
-                source_refs_valid = False
-            if not source_refs_valid and not existing_verified:
-                raise MigrationRefused("source_git_refs")
+            mutations = _verify_completed_oracle({name: getattr(facts, name) for name in _COMPLETED_ORACLE_FIELDS},
+                observed, report, github, git_store, existing_verified=existing_verified)
         subject = f"ticket:{facts.ticket}"
         owned_repository = False
         try:
@@ -1235,20 +1251,71 @@ def convert_completed_ticket_v6(
 
 
 def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
-        external_snapshot: Path) -> ImportedRunFacts:
-    """Decode existing original Completion/cleanup facts with external close proof.
+        external_snapshot: Path | None = None, github_snapshot: Path | None = None,
+        observation_snapshot: Path | None = None, original_report: Path | None = None) -> ImportedRunFacts:
+    return _read_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=external_snapshot,
+        github_snapshot=github_snapshot, observation_snapshot=observation_snapshot, original_report=original_report,
+        copy_layout=None)
+
+
+def read_copied_completed_import(snapshot: SourceSnapshot, destination: Path, *, git_store: Path,
+        repository_root: Path, final_checkout: Path, profile_snapshot: Path, github_snapshot: Path,
+        observation_snapshot: Path, original_report: Path) -> ImportedRunFacts:
+    """Decode a settled private-copy input without creating its target clone.
+
+    The Run ref witness belongs to git_store; RunSpec declares the separate
+    future target. This grants no original-clone ownership. Installation must
+    retain the existing bounded copy operation and its destination guards.
+    """
+    return _read_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=None,
+        github_snapshot=github_snapshot, observation_snapshot=observation_snapshot, original_report=original_report,
+        copy_layout=(destination.absolute(), repository_root.absolute(), final_checkout.absolute(), git_store))
+
+
+def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
+        external_snapshot: Path | None, github_snapshot: Path | None, observation_snapshot: Path | None,
+        original_report: Path | None, copy_layout: tuple[Path, Path, Path, Path] | None) -> ImportedRunFacts:
+    """Decode the existing external-proof or offline-oracle Completion input.
 
     The old writer DTO is not an intermediate. Historical Invocation absence
     remains absence; neither the returned raw nor the reaped Host proves an
     unknown worker exited. No native Invocation, Thread or Opening is created.
+    Oracle-only inputs preserve the old conversion contract; they do not gain
+    the public CLI's external-proof transfer admission merely by decoding.
     """
     validate_snapshot(snapshot)
     profile, profile_sha = _read_profile(profile_snapshot)
-    proof, proof_sha = _read_document(external_snapshot)
-    profile_document, external_document = profile_snapshot.read_bytes(), external_snapshot.read_bytes()
-    if (hashlib.sha256(profile_document).hexdigest() != profile_sha
-            or hashlib.sha256(external_document).hexdigest() != proof_sha):
+    profile_document = profile_snapshot.read_bytes()
+    if hashlib.sha256(profile_document).hexdigest() != profile_sha:
         raise MigrationRefused('source_documents_changed')
+    proof = None
+    external_document = None
+    proof_sha = None
+    oracle_documents: tuple[tuple[str, bytes], ...] = ()
+    documents: dict[str, tuple[Path, str]] = {}
+    observed: dict[str, Any] = {}
+    report: dict[str, Any] = {}
+    github: dict[str, Any] = {}
+    if external_snapshot is not None:
+        if copy_layout is not None or any(path is not None for path in (github_snapshot, observation_snapshot, original_report)):
+            raise MigrationRefused('source_readproof_resources')
+        proof, proof_sha = _read_document(external_snapshot)
+        external_document = external_snapshot.read_bytes()
+        if hashlib.sha256(external_document).hexdigest() != proof_sha:
+            raise MigrationRefused('source_documents_changed')
+        documents['external'] = external_snapshot, proof_sha
+    else:
+        if github_snapshot is None or observation_snapshot is None or original_report is None:
+            raise MigrationRefused('source_documents_required')
+        github, github_sha = _read_document(github_snapshot)
+        observed, observation_sha = _read_document(observation_snapshot)
+        report, report_sha = _read_document(original_report)
+        _verify_completed_oracle_documents(snapshot.sha256, profile_sha, observed, report, github_sha, report_sha)
+        documents = {'oracle:github': (github_snapshot, github_sha),
+            'oracle:observation': (observation_snapshot, observation_sha), 'oracle:report': (original_report, report_sha)}
+        oracle_documents = tuple((key, path.read_bytes()) for key, (path, _) in documents.items())
+        if any(hashlib.sha256(body).hexdigest() != documents[key][1] for key, body in oracle_documents):
+            raise MigrationRefused('source_documents_changed')
 
     def decode(db: sqlite3.Connection, run_id: str, repository: str, parent_number: int,
             parent_revision: str, graph_revision: str, created_at: float, language: str,
@@ -1262,16 +1329,55 @@ def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot
             pending_resources: bool, observed_default_sha: str | None) -> ImportedRunFacts:
         _require_no_v6_notification_journal(snapshot, run_id)
         managed = ManagedWorkspace.for_repository(repository)
-        root, common = managed.repository_root, managed.repository_root / '.git'
-        final = managed.root / 'worktrees' / run_id / 'run-publication'
-        _verify_completed_git(snapshot, snapshot.path, managed.state_root / run_id / 'kernel.sqlite3', root, final, common,
-            repository=repository, run_id=run_id, observed_default_sha=observed_default_sha,
-            base_sha=base_sha, run_branch=run_branch, integrated_sha=integrated_sha,
-            base_branch=base_branch, ticket_branch=ticket_branch, ticket=ticket, pending_resources=pending_resources,
-            publication_sha=publication_sha, candidate_sha=candidate_sha, candidate_tree=candidate_tree,
-            integrated_tree=integrated_tree)
-        checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
-        base = Commit(base_sha, _git(root, 'rev-parse', base_sha + '^{tree}'))
+        if copy_layout is None:
+            root, common = managed.repository_root, managed.repository_root / '.git'
+            final = managed.root / 'worktrees' / run_id / 'run-publication'
+            _verify_completed_git(snapshot, snapshot.path, managed.state_root / run_id / 'kernel.sqlite3', root, final, common,
+                repository=repository, run_id=run_id, observed_default_sha=observed_default_sha,
+                base_sha=base_sha, run_branch=run_branch, integrated_sha=integrated_sha,
+                base_branch=base_branch, ticket_branch=ticket_branch, ticket=ticket, pending_resources=pending_resources,
+                publication_sha=publication_sha, candidate_sha=candidate_sha, candidate_tree=candidate_tree,
+                integrated_tree=integrated_tree)
+            checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
+            base = Commit(base_sha, _git(root, 'rev-parse', base_sha + '^{tree}'))
+            object_root = root
+            object_prefix: tuple[str, ...] = ()
+            store = common
+        else:
+            destination, root, final, store = copy_layout
+            if (destination.exists() or destination.is_symlink() or root.exists() or root.is_symlink()
+                    or not root.parent.resolve().is_relative_to(destination.parent.resolve())
+                    or not root.is_relative_to(destination.parent)
+                    or snapshot.source.resolve().is_relative_to(destination.parent.resolve())
+                    or snapshot.path.resolve().is_relative_to(destination.parent.resolve())
+                    or store.is_symlink() or store.resolve().is_relative_to(destination.parent.resolve())
+                    or final in {root, destination} or final.exists() or not final.is_relative_to(destination.parent)
+                    or not final.parent.resolve().is_relative_to(destination.parent.resolve())):
+                raise MigrationRefused('private_destination_required')
+            common = root / '.git'
+            checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
+            object_root, object_prefix = store, ('--git-dir', str(store.resolve()))
+            base = Commit(base_sha, _git(object_root, *object_prefix, 'rev-parse', base_sha + '^{tree}'))
+        if proof is None:
+            registrations = report.get('post_close_worktrees', {}).get('registrations')
+            original_roots = [Path(row['path']) for row in registrations
+                if isinstance(row, dict) and row.get('repository') is True and isinstance(row.get('path'), str)] if isinstance(registrations, list) else []
+            if (len(original_roots) != 1 or not original_roots[0].is_absolute()
+                    or (copy_layout is None and original_roots[0] != root)
+                    or (copy_layout is not None and copy_layout[0].parent.resolve().is_relative_to(original_roots[0].resolve()))):
+                raise MigrationRefused('old_repository_alias')
+            _verify_completed_oracle(dict(run_id=run_id, developments_used=developments_used, reviews_used=reviews_used,
+                physical_invocations=physical_invocations, candidate_sha=candidate_sha, integrated_sha=integrated_sha,
+                repository=repository, parent_number=parent_number, requirements=requirements, ticket=ticket,
+                pr_number=pr_number, ticket_branch=ticket_branch, run_branch=run_branch, base_branch=base_branch,
+                publication_sha=publication_sha, base_sha=base_sha, close_ownership=close_ownership),
+                observed, report, github, store, existing_verified=copy_layout is None)
+            for oid, tree in ((candidate_sha, candidate_tree), (publication_sha, integrated_tree), (integrated_sha, integrated_tree)):
+                if _git(object_root, *object_prefix, 'rev-parse', oid + '^{tree}') != tree:
+                    raise MigrationRefused('source_git_object')
+            if any(_git(object_root, *object_prefix, 'show', '-s', '--format=%P', oid) != base_sha
+                   for oid in (publication_sha, integrated_sha)):
+                raise MigrationRefused('source_git_ancestry')
         subject, source_ref = f'ticket:{ticket}', 'refs/heads/' + ticket_branch
         spec = RunSpec(run_id, repository, parent_number, parent_revision, graph_revision,
             (Delivery(subject, DeliveryKind.TICKET, ticket, 'source-verified', base, source_ref,
@@ -1341,16 +1447,16 @@ def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot
             kind='completed', historical_base=base, budgets=budgets, attempts=tuple(attempts),
             candidate=Commit(candidate_sha, candidate_tree), integration=integration.encode('utf-8'),
             accepted_review=calls[1]['attempt_id'], completion=completion, resources=(workspace,))
-        source = ImportSource(snapshot=snapshot, mode='original', scope='single-ticket',
-            task=read_v6_host_exit(db, run_id, required=True),
+        source = ImportSource(snapshot=snapshot, mode='original' if copy_layout is None else 'copied', scope='single-ticket',
+            task=read_v6_host_exit(db, run_id, required=copy_layout is None),
             checkout_uuid=_one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?', (run_id,))[0],
             profile_document=profile_document, external_readproof=external_document,
             oracle_documents=tuple((row[0], row[1].encode('utf-8')) for row in db.execute(
                 'SELECT e.evidence_id,m.body FROM work_evidence e JOIN work_evidence_materials m '
-                'ON m.material_id=e.material_id WHERE e.run_id=? ORDER BY e.evidence_id', (run_id,))))
+                'ON m.material_id=e.material_id WHERE e.run_id=? ORDER BY e.evidence_id', (run_id,))) + oracle_documents)
         run_resource = ImportedResource(owner=SourceRecord('runs', (run_id,)), kind='run-ref', disposition='existing',
             source_ref='refs/heads/' + run_branch, expected_oid=integrated_sha, checkout=None, workspace_oid=None,
-            owned_root=None, common_git_dir=common, before_head=None, checkout_archive_sha256=None,
+            owned_root=None, common_git_dir=store, before_head=None, checkout_archive_sha256=None,
             checkout_index_sha256=None, head_evidence=(owner,), cleanup_pending=False)
         history = tuple(ImportedHistoryEvent(record=SourceRecord('run_timeline_events', (run_id, event['event_id'])),
             subject=subject, generation=1, kind=f"v6_{event['value_kind']}", identity=event['event_id'],
@@ -1359,14 +1465,18 @@ def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot
                     if key.startswith('value_') and value is not None}})) for event in timeline)
         # The validated live readback closes the selected Issue. Keep it
         # distinct from the frozen graph's earlier OPEN observation.
-        observed = proof['requirements']
-        observed_requirements = Requirements.from_wire({**observed,
-            'parent': {**observed['parent'], 'sub_issues': observed['parent']['sub_issue_numbers']}})
+        if proof is not None:
+            readback = proof['requirements']
+            observed_requirements = Requirements.from_wire({**readback,
+                'parent': {**readback['parent'], 'sub_issues': readback['parent']['sub_issue_numbers']}})
+        else:
+            observed_requirements = Requirements.from_wire(github)
         return ImportedRunFacts(source=source, spec=spec, requirements=requirements, observed_requirements=observed_requirements,
             created_at=created_at, subjects=(imported,), run_resource=run_resource, history=history)
 
     result = _read_completed_source(snapshot.path, profile, profile_sha, snapshot.sha256, decode, proof)
     validate_snapshot(snapshot)
-    if (_read_profile(profile_snapshot)[1] != profile_sha or _read_document(external_snapshot)[1] != proof_sha):
+    if (_read_profile(profile_snapshot)[1] != profile_sha
+            or any(_read_document(path)[1] != digest for path, digest in documents.values())):
         raise MigrationRefused('source_documents_changed')
     return result

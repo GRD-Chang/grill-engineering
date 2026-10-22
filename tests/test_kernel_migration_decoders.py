@@ -362,3 +362,59 @@ def test_whole_top_decoder_keeps_one_source_scope_and_each_owners_historical_bas
     assert len(facts.spec.deliveries) == 4 and len(facts.subjects) == 3  # Final is only a target definition.
     assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
     assert not (managed.state_root / report['run_id'] / 'kernel.sqlite3').exists()
+
+
+@pytest.mark.parametrize('copied', [False, True])
+def test_settled_completed_oracle_decodes_and_matches_existing_normal_conversion(
+    tmp_path: Path, git_repo: Path, copied: bool,
+) -> None:
+    from agent_run_kernel.migration_completed import (
+        convert_completed_ticket_v6, read_copied_completed_import, read_original_completed_import,
+    )
+    from test_kernel_migration_original_source import _managed_source, _git_bytes
+
+    managed, paths = _managed_source(tmp_path, git_repo)
+    snapshot = capture_v6(paths['database'], tmp_path / 'source.sqlite3')
+    profile = json.loads(paths['profile'].read_bytes())
+    run_id = profile['run_id']
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    inputs = dict(profile_snapshot=paths['profile'], github_snapshot=paths['github'],
+        observation_snapshot=paths['observation'], original_report=paths['report'])
+    if copied:
+        private = tmp_path / 'private'
+        private.mkdir()
+        target, root, final, store = private / 'kernel.sqlite3', private / 'repository', private / 'work' / 'final', paths['git']
+        facts = read_copied_completed_import(snapshot, target, git_store=store,
+            repository_root=root, final_checkout=final, **inputs)
+        assert not root.exists()
+    else:
+        target = managed.state_root / run_id / 'kernel.sqlite3'
+        root, final, store = managed.repository_root, managed.root / 'worktrees' / run_id / 'run-publication', managed.repository_root / '.git'
+        facts = read_original_completed_import(snapshot, **inputs)
+    subject = facts.subjects[0]
+    assert facts.source.mode == ('copied' if copied else 'original')
+    assert facts.source.external_readproof is None
+    documents = dict(facts.source.oracle_documents)
+    assert documents['oracle:github'] == paths['github'].read_bytes()
+    assert documents['oracle:observation'] == paths['observation'].read_bytes()
+    assert documents['oracle:report'] == paths['report'].read_bytes()
+    assert subject.kind == 'completed' and subject.completion is not None
+    assert subject.completion.close_readproof is None and subject.completion.close_ownership is not None
+    assert subject.resources[0].disposition == 'absent' and not subject.resources[0].cleanup_pending
+    assert subject.resources[0].checkout is None and subject.resources[0].checkout_archive_sha256 is None
+    assert (subject.budgets[0].developments_used, subject.budgets[0].reviews_used) == (2, 2)
+    assert len(subject.attempts) == 3
+    assert facts.requirements.issues[0].state == 'OPEN' and facts.observed_requirements.issues[0].state == 'CLOSED'
+    assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
+    assert not target.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    kernel = convert_completed_ticket_v6(snapshot, target, git_store=store, repository_root=root,
+        final_checkout=final, existing_verified=not copied, **inputs)
+    assert kernel.status('ticket:2')['phase'] == 'complete'
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM attempts')[0] == 3
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        assert tx.one('SELECT count(*) FROM resource_cleanup')[0] == 0
+    assert paths['database'].read_bytes() == before[0]
+    if copied:
+        assert _git_bytes(managed.repository_root) == before[1]
