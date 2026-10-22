@@ -138,14 +138,21 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
 @pytest.mark.parametrize('has_raw', [False, True])
 def test_opening_with_unproven_exit_cannot_consume_or_dispatch(tmp_path: Path, has_raw: bool) -> None:
     raw = wire_json({'result_kind': 'development', 'summary': 'Durable before exit.', 'human_blockers': None}) if has_raw else None
-    kernel, execution, operations, _ = _canonical_boundary(tmp_path, exit_proven=False, return_body=raw)
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, exit_proven=False, return_body=raw)
     step = operations.once()
-    assert (step.kind, step.reason, step.call, step.effect) == ('waiting', 'previous_invocation_exit', None, None)
+    # The shared selector already sees the Opening exit barrier; it need not
+    # enter a private subject transition to rediscover the same waiting reason.
+    assert (step.kind, step.call, step.effect) == ('waiting', None, None)
+    state = operations.runner.state()
+    assert (state.disposition, state.active, state.wake_at) == ('waiting', (), None)
     assert kernel.status('ticket:2')['phase'] == 'development'
     assert kernel.status('ticket:2')['pending_return'] is has_raw
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        prior = load_continuation(tx, attempt_id).prior
+        assert prior is not None and prior.dispatch_state == 'unknown'
+        assert (prior.raw_id is not None) is has_raw
 
 
 def test_first_native_explicit_continuation_does_not_refund_opening_recovery(tmp_path: Path) -> None:
@@ -165,7 +172,9 @@ def test_first_native_explicit_continuation_does_not_refund_opening_recovery(tmp
 def test_first_native_capacity_continuation_preserves_existing_not_before(tmp_path: Path) -> None:
     kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, failure_kind='capacity')
     kernel.clock = lambda: 129.0
-    assert operations.once().reason == 'capacity_recovery_wait'
+    waiting = operations.once()
+    assert (waiting.kind, waiting.retry_at, waiting.call, waiting.effect) == ('waiting', 130.0, None, None)
+    assert operations.runner.state().wake_at == 130.0
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
     kernel.clock = lambda: 130.0
@@ -268,7 +277,9 @@ def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_
         assert tx.one('SELECT count(*) FROM leases')[0] == 1
     kernel.control('stop', 'stop-new-native')
     kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Durable late result.', 'human_blockers': None}))
-    with pytest.raises(KernelError, match='executor_fenced'):
-        operations.once()
+    before = kernel.status('ticket:2')
+    stopped = operations.once()
+    assert (stopped.kind, stopped.reason, stopped.call, stopped.effect) == ('paused', 'executor_fenced', None, None)
+    assert kernel.status('ticket:2') == before
     assert kernel.status('ticket:2')['pending_return'] is True
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
