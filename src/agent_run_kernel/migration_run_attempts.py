@@ -4,14 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import sqlite3
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar
 
 from .migration import MigrationRefused, _created_at_epoch
-from .migration_active import _evidence
+from .migration_active import _evidence, _wire_row
 from .migration_conversion import _one
+from .migration_facts import HistoricalExecution, ImportedAttempt, SourceRecord
 from .migration_run_facts import BudgetFacts, RunHeader, TicketOwner
 from .kernel import Kernel
-from .model import KernelError, Role, artifact, wire_json
+from .model import KernelError, Purpose, Role, artifact, wire_json
 
 
 @dataclass(frozen=True)
@@ -57,10 +58,14 @@ def _normalized(role: Role, raw: Any, thread: str) -> dict[str, Any]:
     return result
 
 
-def read_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: TicketOwner,
+_DecodedAttempt = TypeVar('_DecodedAttempt')
+
+
+def _read_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: TicketOwner,
                         budget: BudgetFacts, profile: Mapping[str, Any],
+                        emit: Callable[..., _DecodedAttempt],
                         *, historical_base: str, effective_revision: str,
-                        completed: bool) -> tuple[AttemptFacts, ...]:
+                        completed: bool) -> tuple[_DecodedAttempt, ...]:
     """Select history.version for history and current.version only for pending.
 
     Startup versions remain Invocation evidence even if their status is pending.
@@ -192,7 +197,7 @@ def read_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: Ticket
                                  Role.PUBLICATION: {'publication_artifact'}}[role]
             if version['outcome'] not in expected_outcomes:
                 raise MigrationRefused('unsupported_source_attempt_outcome')
-        calls.append(AttemptFacts(attempt_id, role, attempt['ordinal'], pending, thread, binding,
+        calls.append(emit(attempt_id, role, attempt['ordinal'], pending, thread, binding,
             dict(invocation), dict(bound), dict(version), dict(global_current), returned['evidence_id'],
             raw, normalized, boundary))
     if (developments != budget.developments_used or charged_reviews != budget.reviews_used
@@ -200,3 +205,55 @@ def read_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: Ticket
                                         (run_id, owner.subject)).fetchone()[0]):
         raise MigrationRefused('source_budget_accounting')
     return tuple(calls)
+
+
+def read_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: TicketOwner,
+                        budget: BudgetFacts, profile: Mapping[str, Any],
+                        *, historical_base: str, effective_revision: str,
+                        completed: bool) -> tuple[AttemptFacts, ...]:
+    """Temporary old writer consumer; canonical decoding does not construct it."""
+    return _read_owner_attempts(db, header, owner, budget, profile, AttemptFacts,
+        historical_base=historical_base, effective_revision=effective_revision, completed=completed)
+
+
+def read_imported_owner_attempts(db: sqlite3.Connection, header: RunHeader, owner: TicketOwner,
+                        budget: BudgetFacts, profile: Mapping[str, Any],
+                        *, historical_base: str, effective_revision: str,
+                        completed: bool) -> tuple[ImportedAttempt, ...]:
+    """Emit canonical facts at the authenticated SQL boundary, without a DTO hop.
+
+    outcome is the selected source version's literal outcome, not a fabricated
+    native consumption result. Historical execution is preserved evidence;
+    it certifies neither process exit nor a native continuation Opening.
+    """
+    def decode(*values: Any) -> ImportedAttempt:
+        return _imported_attempt(db, header.run_id, *values)
+
+    return _read_owner_attempts(db, header, owner, budget, profile, decode,
+        historical_base=historical_base, effective_revision=effective_revision, completed=completed)
+
+
+def _imported_attempt(db: sqlite3.Connection, run_id: str, attempt_id: str, role: Role, ordinal: int, pending: bool, thread: str,
+           binding: Mapping[str, Any], invocation: Mapping[str, Any],
+           bound: Mapping[str, Any], selected: Mapping[str, Any], current: Mapping[str, Any],
+           raw_id: str, raw: Mapping[str, Any], normalized: Mapping[str, Any],
+           boundary: Mapping[str, Any]) -> ImportedAttempt:
+    attempt = _one(db, 'SELECT * FROM work_attempts WHERE run_id=? AND attempt_id=?',
+                   (run_id, attempt_id))
+    return ImportedAttempt(
+        record=SourceRecord('work_attempts', (run_id, attempt_id)), role=role,
+        role_ordinal=ordinal, generation=attempt['generation'], purpose=Purpose.REQUIREMENTS,
+        window=attempt['budget_window'], pending=pending,
+        accounted=role == Role.REVIEW and selected['budget_consumed'] == 1,
+        outcome=selected['outcome'], raw_record=SourceRecord('work_evidence', (run_id, raw_id)),
+        raw_result=_one(db, 'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m '
+            'ON m.material_id=e.material_id WHERE e.run_id=? AND e.evidence_id=?',
+            (run_id, raw_id))[0].encode('utf-8'),
+        normalized_artifact=wire_json(dict(normalized)), bound_version=wire_json(_wire_row(bound)),
+        selected_version=wire_json(_wire_row(selected)), current_version=wire_json(_wire_row(current)),
+        allocation_boundary=wire_json(dict(boundary)), execution=HistoricalExecution(
+            record=SourceRecord('work_invocations',
+                (run_id, invocation['work_subject'], invocation['started_at'])),
+            binding_id=invocation['binding_id'], thread_id=thread,
+            binding=wire_json(dict(binding)), invocation=wire_json(_wire_row(invocation))),
+        continuation_basis=None)

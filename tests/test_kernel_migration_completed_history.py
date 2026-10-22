@@ -80,7 +80,27 @@ class Agents(FixtureAgentBackend):
         calls.append('review'); return super().review(request)
     def publication(self, request):
         calls.append('publication'); return super().publication(request)
-backend = ProfiledAgentBackend(Agents(agents_file), profiles, run_id=run_id)
+backend = (ProfiledAgentBackend(Agents(agents_file), profiles, run_id=run_id)
+           if request.get('profile_backend', True) else Agents(agents_file))
+if not request.get('profile_backend', True):
+    # A supported synchronous AgentBackend may return ordinary results without
+    # reporting optional lifecycle events. Keep real fixture work/results and
+    # let the unchanged Controller/Engine persist the resulting source facts.
+    delegate = backend
+    class SynchronousBackend:
+        def develop(self, request):
+            return delegate.develop({key:value for key,value in request.items() if key != '_invocation_event'})
+        def review(self, request):
+            return delegate.review({key:value for key,value in request.items() if key != '_invocation_event'})
+        def publication(self, request):
+            from agent_run.agents import PublicationResult
+            artifact = delegate.publication({key:value for key,value in request.items() if key != '_invocation_event'})
+            # The supported typed return reports the backend fixture's actual
+            # configured Thread. A threadless wire without an Invocation is
+            # not enough for the existing completed-source admission contract.
+            thread = json.loads(agents_file.read_text())['publications'][0]['thread_id']
+            return PublicationResult(thread, artifact)
+    backend = SynchronousBackend()
 publisher = FixtureGitHubPublisher(fixture, git)
 if request.get('actual_github_close'):
     from agent_run.github_publish import GhGitHubPublisher
@@ -168,7 +188,7 @@ print(json.dumps({'run_id': run_id, 'status': after['status']}))
 
 def _completed_source(tmp_path: Path, git_repo: Path, rounds: int, *,
                       state_root: Path | None = None, controlled: bool = False,
-                      actual_github_close: bool = False) -> dict[str, Path]:
+                      actual_github_close: bool = False, profile_backend: bool = True) -> dict[str, Path]:
     frozen, source = tmp_path / 'unchanged-02', tmp_path / 'source'
     old_v6_runtime(frozen)  # Only materializes verified, unchanged source files.
     source.mkdir()
@@ -182,6 +202,7 @@ def _completed_source(tmp_path: Path, git_repo: Path, rounds: int, *,
                                               'output': str(source), 'rounds': rounds,
                                               'state_root': str(state_root) if state_root else None,
                                               'controlled': controlled,
+                                              'profile_backend': profile_backend,
                                               'actual_github_close': actual_github_close}),
                             text=True, capture_output=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -210,7 +231,8 @@ def _completed_source(tmp_path: Path, git_repo: Path, rounds: int, *,
                           capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
     paths['observation'].write_text(json.dumps({
         'source_runtime_revision': BASELINE,
-        'backend': 'unchanged 02 FixtureAgentBackend with ProfiledAgentBackend, terminated runtime child',
+        'backend': ('unchanged 02 FixtureAgentBackend with ProfiledAgentBackend, terminated runtime child'
+                    if profile_backend else 'unchanged 02 FixtureAgentBackend through synchronous AgentBackend adapter without lifecycle reporting'),
         'run_id': run_id, 'source_database_sha256': digest(paths['database']),
         'copied_database_sha256': digest(paths['database']),
         'original_report_sha256': digest(paths['report']), 'profile_present': True,

@@ -2173,6 +2173,19 @@ class Kernel:
         if manifests:
             if len(manifests) != 1 or manifests[0]["subject"] != anchor["subject"]:
                 raise KernelError("cleanup_marker_unproven")
+            from .migration_run_ownership import authenticate_completed_cleanup
+
+            imported = tx.one("SELECT h.subject,h.identity,h.generation,m.purpose FROM history h "
+                "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_run_import'")
+            proof = json.loads(tx.get(manifests[0]["material_id"], manifests[0]["subject"]))
+            if not isinstance(proof, dict):
+                raise KernelError("cleanup_marker_unproven")
+            try:
+                clean_head = authenticate_completed_cleanup(tx, imported, proof, origin, job, cleanup)
+            except (KernelError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as error:
+                raise KernelError("cleanup_marker_unproven") from error
+            if clean_head is not None:
+                return clean_head, origin["source_uuid"]
             return self._whole_imported_local_resources(tx, run, job, cleanup, origin, manifests[0])
         returned = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
                            "WHERE h.kind='v6_returned_import' LIMIT 2")

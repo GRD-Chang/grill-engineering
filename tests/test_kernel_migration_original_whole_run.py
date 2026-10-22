@@ -57,8 +57,9 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
     from agent_run_kernel.migration_run import read_original_run, WorkedTicket
     from agent_run_kernel.migration_run_external import collect_run_external, verify_run_external
     from agent_run_kernel.migration_run_facts import SourceKey
-    from agent_run_kernel.migration_run_install import build_original_run_candidate
-    from agent_run_kernel.migration_run_cutover import prepared_original_run
+    from agent_run_kernel.migration_run import read_original_run_import
+    from agent_run_kernel.migration_run_install import install_imported_facts
+    from agent_run_kernel.migration_run_projection import verify_imported_installation
     from agent_run_kernel.migration import MigrationRefused
     from agent_run_kernel.migration_run_resources import seal_run_checkouts, authenticate_run_resources
     from agent_run_kernel.model import wire_json
@@ -97,12 +98,11 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
     assert {subject: len(entries) for subject, entries in resources.items()} == {'ticket:2': 0, 'ticket:3': 1, 'ticket:4': 0}
     destination = tmp_path / 'private-whole.sqlite3'
     private_origin = {**origin, 'target_db': str(destination)}
-    kernel = build_original_run_candidate(snapshot, facts, destination,
-        repository_root=managed.repository_root, state_root=managed.state_root, origin=private_origin,
-        resources=resources, run_head=run_head,
-        head_evidence=(SourceKey('work_jobs', (report['run_id'], 'ticket:2:generation:1')),),
-        external_readproof=proof, external_readproof_sha256=hashlib.sha256(wire_json(proof)).hexdigest(),
-        close_readproofs=closes, profile_document=paths['profile'].read_bytes())
+    (evidence / 'external-readproof.json').write_bytes(wire_json(proof))
+    (evidence / 'checkouts.json').write_bytes(wire_json(sealed))
+    canonical = read_original_run_import(snapshot, paths['profile'],
+        external_snapshot=evidence / 'external-readproof.json', checkouts_snapshot=evidence / 'checkouts.json')
+    kernel = install_imported_facts(canonical, destination, origin=private_origin)
     with kernel.storage.transaction(write=False) as tx:
         assert [tuple(row) for row in tx.rows('SELECT id,phase,base_sha FROM subjects ORDER BY id')] == [
             ('ticket:2', 'complete', report['default_base']), ('ticket:3', 'review', report['b_base']),
@@ -126,7 +126,7 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
     assert kernel.source_status()['frontier'] == ['ticket:3']
     assert kernel.source_status()['remaining']['ticket:4'] == 'blocked_by_incomplete_tickets'
     proof_sha = hashlib.sha256(wire_json(proof)).hexdigest()
-    prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+    verify_imported_installation(kernel, canonical, origin=private_origin)
     if canonical_drift is not None:
         with kernel.storage.transaction() as tx:
             if canonical_drift == 'dependencies':
@@ -139,7 +139,7 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
                 tx.execute('UPDATE profile_revisions SET material_id=? WHERE id=1', (replacement,))
         candidate_bytes = destination.read_bytes()
         with pytest.raises(MigrationRefused) as refused:
-            prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+            verify_imported_installation(kernel, canonical, origin=private_origin)
         assert refused.value.code == 'native_original_cutover_advanced'
         assert destination.read_bytes() == candidate_bytes
         return
@@ -172,13 +172,13 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
         candidate_bytes = destination.read_bytes()
         try:
             with pytest.raises(MigrationRefused) as refused:
-                prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+                verify_imported_installation(kernel, canonical, origin=private_origin)
             assert refused.value.code == 'native_original_cutover_advanced'
             assert destination.read_bytes() == candidate_bytes
         finally:
             with kernel.storage.transaction() as tx:
                 tx.execute(f'UPDATE {table} SET {column}=? WHERE {predicate}', (original, identity))
-        prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+        verify_imported_installation(kernel, canonical, origin=private_origin)
     # These audit values do not authorize execution. No broad timestamp or
     # material exclusion is used: only declared mechanical clocks and valid,
     # unreferenced immutable material may vary.
@@ -187,7 +187,7 @@ def test_original_whole_run_private_install_uses_one_core_and_exact_subject_proo
         tx.execute("UPDATE history SET created_at=created_at+0.5 WHERE kind IN ('source_refreshed','v6_original_cutover','v6_record_import')")
         tx.put('ticket:3', 'inspection_note', b'Unreferenced read-only diagnostic')
     candidate_bytes = destination.read_bytes()
-    prepared_original_run(kernel, facts, private_origin, proof, proof_sha, resources, run_head)
+    verify_imported_installation(kernel, canonical, origin=private_origin)
     assert destination.read_bytes() == candidate_bytes
     assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
 
@@ -445,7 +445,7 @@ def test_original_whole_run_two_layout_exit_reentry_has_one_authority_and_set_in
     command = [sys.executable, '-m', 'agent_run_kernel.migration_cutover', *arguments]
     crash = r'''
 import os,sys
-from agent_run_kernel import migration_run_cutover as unit
+from agent_run_kernel import migration_layout as unit
 from agent_run_kernel.migration_cli import main
 operation=sys.argv[1]; original=getattr(unit,operation); count=0
 def exit_after_first(layout):

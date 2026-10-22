@@ -12,12 +12,14 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-from typing import Any, Mapping, cast
+from typing import Any, Callable, Mapping, TypeVar, cast
 
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _evidence_value, _require_no_v6_notification_journal, capture_v6)
+                        _evidence_value, _require_no_v6_notification_journal, capture_v6, validate_snapshot)
+from .migration_facts import (ImportSource, ImportedHistoryEvent, ImportedResource,
+                              ImportedRunFacts, ImportedSubject, SourceRecord)
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue, ParentIssue,
                     KernelError, Policy, Profile, Requirements, RunSpec, wire_json)
 
@@ -96,7 +98,10 @@ def _policy(value: object) -> Policy:
         raise MigrationRefused("source_policy") from error
 
 
-def _initial_facts(path: Path) -> _InitialFacts:
+_Decoded = TypeVar("_Decoded")
+
+
+def _read_initial(path: Path, emit: Callable[..., _Decoded]) -> _Decoded:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     db.row_factory = sqlite3.Row
     try:
@@ -251,7 +256,7 @@ def _initial_facts(path: Path) -> _InitialFacts:
                 or events[0]["value_status"] != "starting" or events[1]["value_phase"] != "pending"
                 or events[1]["value_ticket"] != ticket):
             raise MigrationRefused("unsupported_source_history")
-        return _InitialFacts(run["run_id"], run["repository"], run["parent_number"], parent_revision,
+        return emit(db, run["run_id"], run["repository"], run["parent_number"], parent_revision,
                              graph_revision, _created_at_epoch(run["created_at"]), root["value_language"],
                              root["value_run_branch"], base["value_branch"], base["value_sha"], ticket, requirements,
                              _policy(frozen["policy_snapshot"]), frozen, frozen_ids,
@@ -260,6 +265,14 @@ def _initial_facts(path: Path) -> _InitialFacts:
         raise MigrationRefused("source_corrupt") from error
     finally:
         db.close()
+
+
+def _initial_facts(path: Path) -> _InitialFacts:
+    # Temporary consumer of the same checked SQL until the unique installer is
+    # wired. The canonical decoder never constructs this legacy writer DTO.
+    def legacy(db: sqlite3.Connection, *values: Any) -> _InitialFacts:
+        return _InitialFacts(*values)
+    return _read_initial(path, legacy)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -298,74 +311,14 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _initial_facts(captured.path)
-        _require_no_v6_notification_journal(snapshot, facts.run_id)
-        additional = additional_workspaces or {}
-        expected_additional = set(facts.requirements.parent.sub_issue_numbers) - {facts.ticket_number}
-        if set(additional) != expected_additional:
-            raise MigrationRefused("new_ticket_workspaces")
-        workspaces = {facts.ticket_number: (source_ref, checkout), **{
-            number: (ref, path.resolve()) for number, (ref, path) in additional.items()}}
-        if (len({ref for ref, _ in workspaces.values()}) != len(workspaces)
-                or len({path for _, path in workspaces.values()}) != len(workspaces)):
-            raise MigrationRefused("new_ticket_workspaces")
-        if _git(repository_root, "rev-parse", "--show-toplevel") != str(repository_root):
-            raise MigrationRefused("source_git")
-        for ref in (*[value[0] for value in workspaces.values()],
-                    f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}"):
-            _git(repository_root, "check-ref-format", ref)
-        if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{facts.run_branch}^{{commit}}") != facts.base_sha:
-            raise MigrationRefused("source_git")
-        if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{facts.base_branch}^{{commit}}") != facts.base_sha:
-            raise MigrationRefused("source_git")
-        tree = _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")
-        if not tree:
-            raise MigrationRefused("source_git")
-        common = (repository_root / ".git").resolve()
-        for ref, path in workspaces.values():
-            if not ref.startswith("refs/heads/") or ref == "refs/heads/":
-                raise MigrationRefused("new_source_ref")
-            if _git(repository_root, "for-each-ref", "--format=%(refname)", ref):
-                raise MigrationRefused("new_source_ref_exists")
-            if (not path.is_dir() or path == repository_root
-                    or _git(path, "rev-parse", "--show-toplevel") != str(path)
-                    or _git(path, "rev-parse", "HEAD") != facts.base_sha):
-                raise MigrationRefused("new_checkout")
-            if _git(path, "status", "--porcelain"):
-                raise MigrationRefused("new_checkout_dirty")
-            common_value = Path(_git(path, "rev-parse", "--git-common-dir") or "")
-            found_common = (common_value if common_value.is_absolute() else path / common_value).resolve()
-            if found_common != common:
-                raise MigrationRefused("new_checkout")
-        if final_checkout == repository_root or final_checkout in {path for _, path in workspaces.values()} or final_checkout.exists():
-            raise MigrationRefused("new_final_checkout")
+        decoded = read_initial_import(replace(captured, source=snapshot.source), repository_root=repository_root,
+            source_ref=source_ref, checkout=checkout, final_checkout=final_checkout,
+            development_profile=development_profile, review_profile=review_profile,
+            publication_profile=publication_profile, additional_workspaces=additional_workspaces)
+        spec = decoded.spec
         subject = f"ticket:{facts.ticket_number}"
-        profile_document = {"preset": None, "profiles": {
-            role: {"model": profile.model, "reasoning_effort": profile.effort,
-                   "reference": None, "provenance": {"source": "explicit-migration-input"}}
-            for role, profile in profiles.items()}}
-        inputs = CreationInputs(
-            profile_document, facts.frozen["prompt_resources"], facts.frozen["github_identity"],
-            facts.frozen["runner_github_identity"], facts.notifications,
-            {"source": "v6-offline-conversion", "source_sha256": snapshot.sha256,
-             "frozen_evidence_ids": facts.frozen_ids,
-             "profiles": "explicit-migration-input",
-             "notifications": "old-not-configured"},
-        )
-        spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
-                       facts.graph_revision,
-                       (*tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "source-verified",
-                                        Commit(facts.base_sha, tree or ""), workspaces[number][0],
-                                        f"refs/heads/{facts.run_branch}", checkout=str(workspaces[number][1]),
-                                        owned_root=str(workspaces[number][1].parent), common_git_dir=str(common))
-                               for number in facts.requirements.parent.sub_issue_numbers),
-                        Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN, facts.parent_number,
-                                 facts.parent_revision, Commit(facts.base_sha, tree or ""),
-                                 f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}",
-                                 checkout=str(final_checkout), owned_root=str(final_checkout.parent),
-                                 common_git_dir=str(common))),
-                       replace(facts.policy, development_profile=profiles["development"],
-                               review_profile=profiles["review"], publication_profile=profiles["publication"]),
-                       facts.language, str(repository_root), inputs)
+        workspaces = {delivery.issue: (delivery.source_ref, Path(delivery.checkout))
+                      for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
         candidate = Path(directory) / "kernel.sqlite3"
         kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
         with kernel.storage.transaction() as tx:
@@ -424,3 +377,150 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
         finally:
             os.close(parent_fd)
     return Kernel(destination)
+
+
+def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,
+                        source_ref: str, checkout: Path, final_checkout: Path,
+                        development_profile: Profile, review_profile: Profile,
+                        publication_profile: Profile,
+                        additional_workspaces: Mapping[int, tuple[str, Path]] | None = None) -> ImportedRunFacts:
+    """Decode a sealed idle source directly, observing only explicit new layouts.
+
+    The legacy converter still has its writer until unique installation is
+    connected. Its DTO is not an intermediate on this decoder path. SQL stage,
+    graph, policy, notification and evidence checks are shared, not weakened.
+    """
+    validate_snapshot(snapshot)
+    repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.resolve(),
+                                                 final_checkout.resolve())
+    if not source_ref.startswith("refs/heads/") or source_ref == "refs/heads/":
+        raise MigrationRefused("new_source_ref")
+    profiles = {"development": development_profile, "review": review_profile,
+                "publication": publication_profile}
+    if any(not profile.model or not profile.effort or profile.model == "configured-model"
+           or profile.effort == "configured-effort" for profile in profiles.values()):
+        raise MigrationRefused("new_profile_source")
+
+    def decode(db: sqlite3.Connection, run_id: str, repository: str, parent_number: int,
+               parent_revision: str, graph_revision: str, created_at: float, language: str,
+               run_branch: str, base_branch: str, base_sha: str, ticket_number: int,
+               requirements: Requirements, policy: Policy, frozen: dict[str, Any],
+               frozen_ids: dict[str, str], notifications: dict[str, Any],
+               source_evidence: tuple[dict[str, Any], ...],
+               timeline: tuple[dict[str, Any], ...]) -> ImportedRunFacts:
+        _require_no_v6_notification_journal(snapshot, run_id)
+        additional = additional_workspaces or {}
+        expected_additional = set(requirements.parent.sub_issue_numbers) - {ticket_number}
+        if set(additional) != expected_additional:
+            raise MigrationRefused("new_ticket_workspaces")
+        workspaces = {ticket_number: (source_ref, checkout), **{
+            number: (ref, path.resolve()) for number, (ref, path) in additional.items()}}
+        if (len({ref for ref, _ in workspaces.values()}) != len(workspaces)
+                or len({path for _, path in workspaces.values()}) != len(workspaces)):
+            raise MigrationRefused("new_ticket_workspaces")
+        if _git(repository_root, "rev-parse", "--show-toplevel") != str(repository_root):
+            raise MigrationRefused("source_git")
+        for ref in (*[value[0] for value in workspaces.values()],
+                    f"refs/heads/{run_branch}", f"refs/heads/{base_branch}"):
+            _git(repository_root, "check-ref-format", ref)
+        if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{run_branch}^{{commit}}") != base_sha:
+            raise MigrationRefused("source_git")
+        if _git(repository_root, "rev-parse", "--verify", f"refs/heads/{base_branch}^{{commit}}") != base_sha:
+            raise MigrationRefused("source_git")
+        tree = _git(repository_root, "rev-parse", f"{base_sha}^{{tree}}")
+        if not tree:
+            raise MigrationRefused("source_git")
+        common = (repository_root / ".git").resolve()
+        for ref, path in workspaces.values():
+            if not ref.startswith("refs/heads/") or ref == "refs/heads/":
+                raise MigrationRefused("new_source_ref")
+            if _git(repository_root, "for-each-ref", "--format=%(refname)", ref):
+                raise MigrationRefused("new_source_ref_exists")
+            if (not path.is_dir() or path == repository_root
+                    or _git(path, "rev-parse", "--show-toplevel") != str(path)
+                    or _git(path, "rev-parse", "HEAD") != base_sha):
+                raise MigrationRefused("new_checkout")
+            if _git(path, "status", "--porcelain"):
+                raise MigrationRefused("new_checkout_dirty")
+            common_value = Path(_git(path, "rev-parse", "--git-common-dir") or "")
+            found_common = (common_value if common_value.is_absolute() else path / common_value).resolve()
+            if found_common != common:
+                raise MigrationRefused("new_checkout")
+        if final_checkout == repository_root or final_checkout in {path for _, path in workspaces.values()} or final_checkout.exists():
+            raise MigrationRefused("new_final_checkout")
+        profile_document = {"preset": None, "profiles": {
+            role: {"model": profile.model, "reasoning_effort": profile.effort,
+                   "reference": None, "provenance": {"source": "explicit-migration-input"}}
+            for role, profile in profiles.items()}}
+        inputs = CreationInputs(
+            profile_document, frozen["prompt_resources"], frozen["github_identity"],
+            frozen["runner_github_identity"], notifications,
+            {"source": "v6-offline-conversion", "source_sha256": snapshot.sha256,
+             "frozen_evidence_ids": frozen_ids,
+             "profiles": "explicit-migration-input",
+             "notifications": "old-not-configured"},
+        )
+        spec = RunSpec(run_id, repository, parent_number, parent_revision,
+                       graph_revision,
+                       (*tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "source-verified",
+                                        Commit(base_sha, tree or ""), workspaces[number][0],
+                                        f"refs/heads/{run_branch}", checkout=str(workspaces[number][1]),
+                                        owned_root=str(workspaces[number][1].parent), common_git_dir=str(common))
+                               for number in requirements.parent.sub_issue_numbers),
+                        Delivery(f"final:{run_id}", DeliveryKind.FINAL_RUN, parent_number,
+                                 parent_revision, Commit(base_sha, tree or ""),
+                                 f"refs/heads/{run_branch}", f"refs/heads/{base_branch}",
+                                 checkout=str(final_checkout), owned_root=str(final_checkout.parent),
+                                 common_git_dir=str(common))),
+                       replace(policy, development_profile=profiles["development"],
+                               review_profile=profiles["review"], publication_profile=profiles["publication"]),
+                       language, str(repository_root), inputs)
+        run_key = SourceRecord("runs", (run_id,))
+        graph = _one(db, "SELECT s.version_id FROM run_graph_snapshots s JOIN run_root r "
+                     "ON r.run_id=s.run_id AND r.value_graph_snapshot_id=s.snapshot_id WHERE s.run_id=?", (run_id,))
+        selected = _one(db, "SELECT * FROM work_job_slots WHERE run_id=?", (run_id,))
+        subjects = []
+        for number in requirements.parent.sub_issue_numbers:
+            key = SourceRecord("run_graph_members", (run_id, graph["version_id"], number))
+            aliases = () if number != ticket_number else (
+                SourceRecord("work_jobs", (run_id, selected["job_id"])),
+                SourceRecord("work_job_slots", (run_id, selected["container"], selected["slot"])),
+                SourceRecord("work_job_layout", (run_id,)))
+            resource = ImportedResource(owner=key, kind="ticket-workspace", disposition="new-unused",
+                source_ref=workspaces[number][0], expected_oid=None, checkout=workspaces[number][1],
+                workspace_oid=base_sha, owned_root=workspaces[number][1].parent, common_git_dir=common,
+                before_head=Path(_git(workspaces[number][1], "rev-parse", "--path-format=absolute",
+                                      "--git-path", "HEAD")).read_bytes(),
+                checkout_archive_sha256=None, checkout_index_sha256=None,
+                head_evidence=(), cleanup_pending=False)
+            subjects.append(ImportedSubject(subject=f"ticket:{number}", issue=number, generation=1,
+                record=key, aliases=aliases, kind="unallocated", historical_base=None, budgets=(), attempts=(),
+                candidate=None, integration=None, accepted_review=None, completion=None, resources=(resource,)))
+        history = tuple(ImportedHistoryEvent(
+            record=SourceRecord("run_timeline_events", (run_id, event["event_id"])),
+            subject=f"ticket:{ticket_number}", generation=1, kind=f"v6_{event['value_kind']}",
+            identity=event["event_id"], created_at=_created_at_epoch(event["value_at"]),
+            body=wire_json({"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
+                "values": {key: value for key, value in event.items()
+                           if key.startswith("value_") and value is not None}})) for event in timeline)
+        # Exact authenticated source text; the evidence ID is its identity,
+        # never a material purpose or permission to consume an unknown fact.
+        documents = tuple((row["evidence_id"], row["body"].encode("utf-8")) for row in db.execute(
+            "SELECT e.evidence_id,m.body FROM work_evidence e JOIN work_evidence_materials m "
+            "ON m.material_id=e.material_id WHERE e.run_id=? ORDER BY e.evidence_id", (run_id,)))
+        source = ImportSource(snapshot=snapshot, mode="copied",
+            scope="single-ticket" if len(subjects) == 1 else "selected-graph", task=None,
+            checkout_uuid=_one(db, "SELECT value_checkout_identity FROM run_root WHERE run_id=?", (run_id,))[0],
+            profile_document=None, external_readproof=None, oracle_documents=documents)
+        run_resource = ImportedResource(owner=run_key, kind="run-ref", disposition="existing",
+            source_ref="refs/heads/" + run_branch, expected_oid=base_sha, checkout=None, workspace_oid=None,
+            owned_root=None, common_git_dir=common, before_head=None, checkout_archive_sha256=None,
+            checkout_index_sha256=None, head_evidence=(SourceRecord("run_condition_base", (run_id,)),),
+            cleanup_pending=False)
+        return ImportedRunFacts(source=source, spec=spec, requirements=requirements,
+            observed_requirements=requirements, created_at=created_at, subjects=tuple(subjects),
+            run_resource=run_resource, history=history)
+
+    decoded = _read_initial(snapshot.path, decode)
+    validate_snapshot(snapshot)
+    return decoded
