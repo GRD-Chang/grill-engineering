@@ -34,7 +34,7 @@ from .attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, 
 from .configuration import checkpoint_policy
 from .task_location import bind_task, read_task
 from .legacy_admission import locked_admission, origin_reference, read_source_fence, source_fence
-from .operation_runner import OperationBinding, OperationPorts, OperationRunner, OperationState
+from .operation_runner import OperationBinding, OperationPorts, OperationRunner, OperationState, ReadUnavailable, observe_operation
 
 
 def identity() -> str:
@@ -53,11 +53,20 @@ class Kernel:
     def operation_runner(self, execution: Execution, make_ports: Callable[[OperationBinding], OperationPorts]) -> OperationRunner:
         return OperationRunner(self, execution, make_ports)
 
-    def _operation_binding(self, execution: Execution) -> OperationBinding:
+    def observe_control(self, subject: str, make_ports: Callable[[OperationBinding], OperationPorts]) -> World:
+        """Refresh control facts without claiming, borrowing or advancing an Executor."""
+        binding = self._operation_binding()
+        try:
+            return observe_operation(self, binding, make_ports(binding), subject)[0]
+        except ReadUnavailable as error:
+            raise KernelError(error.code, error.message) from error
+
+    def _operation_binding(self, execution: Execution | None = None) -> OperationBinding:
         """Frozen physical configuration; no source refresh or work admission."""
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
-            self._automatic_owned(tx, run, execution)
+            if execution is not None:
+                self._automatic_owned(tx, run, execution)
             if run["source_sequence"] is None:
                 raise KernelError("source_not_configured")
             inputs = CreationInputs(profiles=self._profile_document(tx, 1), **self._inputs(tx, run))
@@ -82,9 +91,10 @@ class Kernel:
                           "progress": self._automatic_progress(tx, run, subject, cleanup),
                           "source_sequence": run["source_sequence"]}).decode()
 
-    def _check_operation(self, tx: Transaction, token: str, execution: Execution) -> None:
+    def _check_operation(self, tx: Transaction, token: str, execution: Execution | None) -> None:
         value, run = self._automatic_token(token), tx.one("SELECT * FROM runs")
-        self._automatic_owned(tx, run, execution)
+        if execution is not None:
+            self._automatic_owned(tx, run, execution)
         scope = value["scope"]
         if (scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"])
                 or value["source_sequence"] != run["source_sequence"]):
@@ -1791,7 +1801,9 @@ class Kernel:
             self._abandon_owned(tx, abandoned, execution)
 
     def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> dict[str, Any]:
-        scope: dict[str, Any] = {"run": run["id"], "parent_revision": run["parent_revision"],
+        scope: dict[str, Any] = {"run": run["id"], "executor": run["executor"], "epoch": run["epoch"],
+                                 "stopped": run["stopped"], "blocked": run["blocked"], "final_action": run["final_action"],
+                                 "parent_revision": run["parent_revision"],
                                  "graph_revision": run["graph_revision"], "subject": subject, "cleanup": cleanup}
         abandoned = self._abandon_action(tx)
         if abandoned is not None:

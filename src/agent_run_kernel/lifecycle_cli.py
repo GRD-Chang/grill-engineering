@@ -382,9 +382,9 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
             remote = inputs.get("repository_remote")
             if not isinstance(remote, str) or not remote:
                 raise KernelError("creation_repository_remote_required")
-            port = RemoteEffects(workspace.repository_root, workspace.repository,
-                                 runner_identity=inputs["runner_identity"], remote=remote)
-            world = port.observe(kernel, subject)
+            world = kernel.observe_control(subject, lambda binding: RemoteEffects(
+                binding.repository_root, binding.repository,
+                runner_identity=binding.inputs.runner_identity, remote=remote))
             if parsed.command == "requeue":
                 original_delivery = kernel.delivery(subject)
                 if original_delivery.kind != DeliveryKind.FINAL_RUN:

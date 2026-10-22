@@ -88,6 +88,64 @@ class OperationPorts(Protocol):
     def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]: ...
 
 
+def observe_operation(kernel: Kernel, binding: OperationBinding, ports: OperationPorts,
+                      subject: str | None, *, execution: Execution | None = None,
+                      cleanup: bool = False) -> tuple[World, str]:
+    """One fact assembly for automatic work and manual controls.
+
+    Manual observation owns no Executor or lease. It still rejects a source,
+    delivery or Executor epoch changed while physical reads were in flight.
+    """
+    if execution is None:
+        with kernel.storage.transaction(write=False) as tx:
+            token = kernel._operation_token(tx, subject, cleanup)
+    else:
+        token = kernel._begin_automatic_step(execution, subject, cleanup=cleanup)
+        waiting = kernel._guard_automatic_step(token, execution)
+        if waiting is not None:
+            raise ReadWait(waiting)
+    source = ports.source(binding.parent_number)
+    with kernel.storage.transaction() as tx:
+        kernel._check_operation(tx, token, execution)
+        kernel._refresh(tx, source)
+        token = kernel._operation_token(tx, subject, cleanup)
+        run = tx.one("SELECT * FROM runs")
+        if subject is None:
+            job = tx.one("SELECT * FROM final_target")
+            records = tx.all("SELECT c.* FROM completions c JOIN subjects s ON s.id=c.subject AND s.generation=c.generation WHERE s.phase='complete' ORDER BY s.issue")
+            anchors = {row["merge_sha"] for row in records}
+        else:
+            job = kernel._job(tx, subject)
+            anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
+            for row in tx.rows("SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,)):
+                anchors.update(value for value in row if value is not None)
+            if job["review_attempt"] is not None:
+                review = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))
+                context = json.loads(tx.get(review[0], subject))
+                if "review_context" in context:
+                    anchors.add(context["review_context"]["full_range"]["candidate_sha"])
+        request = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if subject is not None else None,
+                               tuple(sorted(anchors)), job["source_sha"] if subject is not None and job["phase"] == "checks" else None,
+                               subject is not None)
+    facts = ports.delivery(request)
+    with kernel.storage.transaction(write=False) as tx:
+        kernel._check_operation(tx, token, execution)
+        run = tx.one("SELECT * FROM runs")
+        revision, completion = run["observed_parent_revision"], "no-tickets"
+        if subject is not None:
+            job = kernel._job(tx, subject)
+            if job["kind"] == "ticket":
+                revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
+            completion = job["completion_revision"]
+        if facts.pr is not None and facts.pr.state == "OPEN" and (
+                facts.source != facts.pr.head or facts.target != facts.pr.base
+                or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
+            raise ReadUnavailable("github_observation_pending", "PR, refs and checks have not converged")
+        return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
+                     facts.source, facts.pr, facts.checks, completion, facts.ancestry,
+                     facts.publisher_actor, facts.publisher_identity), token
+
+
 class OperationRunner:
     """Factory: kernel.operation_runner(execution, make_ports).
 
@@ -119,51 +177,8 @@ class OperationRunner:
         return self._observe(subject)[0]
 
     def _observe(self, subject: str | None, *, cleanup: bool = False) -> tuple[World, str]:
-        kernel, execution = self.kernel, self.execution
-        token = kernel._begin_automatic_step(execution, subject, cleanup=cleanup)
-        waiting = kernel._guard_automatic_step(token, execution)
-        if waiting is not None:
-            raise ReadWait(waiting)
-        source = self.ports.source(self.binding.parent_number)
-        with kernel.storage.transaction() as tx:
-            kernel._check_operation(tx, token, execution)
-            kernel._refresh(tx, source)
-            token = kernel._operation_token(tx, subject, cleanup)
-            run = tx.one("SELECT * FROM runs")
-            if subject is None:
-                job = tx.one("SELECT * FROM final_target")
-                records = tx.all("SELECT c.* FROM completions c JOIN subjects s ON s.id=c.subject AND s.generation=c.generation WHERE s.phase='complete' ORDER BY s.issue")
-                anchors = {row["merge_sha"] for row in records}
-            else:
-                job = kernel._job(tx, subject)
-                anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
-                for row in tx.rows("SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,)):
-                    anchors.update(value for value in row if value is not None)
-                if job["review_attempt"] is not None:
-                    review = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))
-                    context = json.loads(tx.get(review[0], subject))
-                    if "review_context" in context:
-                        anchors.add(context["review_context"]["full_range"]["candidate_sha"])
-            request = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if subject is not None else None,
-                                   tuple(sorted(anchors)), job["source_sha"] if subject is not None and job["phase"] == "checks" else None,
-                                   subject is not None)
-        facts = self.ports.delivery(request)
-        with kernel.storage.transaction(write=False) as tx:
-            kernel._check_operation(tx, token, execution)
-            run = tx.one("SELECT * FROM runs")
-            revision, completion = run["observed_parent_revision"], "no-tickets"
-            if subject is not None:
-                job = kernel._job(tx, subject)
-                if job["kind"] == "ticket":
-                    revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
-                completion = job["completion_revision"]
-            if facts.pr is not None and facts.pr.state == "OPEN" and (
-                    facts.source != facts.pr.head or facts.target != facts.pr.base
-                    or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
-                raise ReadUnavailable("github_observation_pending", "PR, refs and checks have not converged")
-            return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
-                         facts.source, facts.pr, facts.checks, completion, facts.ancestry,
-                         facts.publisher_actor, facts.publisher_identity), token
+        return observe_operation(self.kernel, self.binding, self.ports, subject,
+                                 execution=self.execution, cleanup=cleanup)
 
     def authorize_agent(self, call: AgentCall) -> None:
         if call.execution != self.execution:
