@@ -1159,7 +1159,7 @@ class Kernel:
         tx.execute("UPDATE actions SET status='superseded' WHERE id=?", (action["id"],))
         self._gate(tx, job["id"], "requeue_retirement_changed", evidence=material)
         self._event(tx, job["id"], "requeue_superseded", action["id"], material)
-        return Step("paused", job["id"], "requeue_retirement_changed")
+        return Step("progress", job["id"], "requeue_retirement_changed")
 
     def _requeue_versions_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                                   action: sqlite3.Row, world: World | None) -> bool:
@@ -1882,6 +1882,12 @@ class Kernel:
                      "integration_seat": run["integration_holder"] == subject,
                      "cleanup": [dict(row) for row in tx.rows("SELECT generation,stage,state,effect_id,outcome FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))],
                      "link": [dict(row) for row in tx.rows("SELECT generation,state,effect_id FROM issue_links WHERE subject=?", (subject,))]}
+            requeue = self._pending_requeue(tx, subject)
+            # This exact current-Action witness is consumed by _advance_requeue
+            # before generation replacement; unrelated audit events never count.
+            facts["requeue_readback"] = None if requeue is None else [dict(row) for row in tx.rows(
+                "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1",
+                (requeue["id"],))]
         return self._fingerprint(facts)
 
     @staticmethod
