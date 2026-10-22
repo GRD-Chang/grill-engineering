@@ -16,10 +16,8 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol
 from dataclasses import asdict
 import json
 
-from agent_run.github import GitHubReadError
 from agent_run.error_safety import bounded_error
 
-from .remote_effects import EffectReadError
 
 from .model import (AgentCall, Checks, Commit, CreationInputs, Effect, EffectResult,
                     Execution, KernelError, PullRequest, ReadWait, Requirements, ResourceInspection,
@@ -27,6 +25,15 @@ from .model import (AgentCall, Checks, Commit, CreationInputs, Effect, EffectRes
 
 if TYPE_CHECKING:
     from .kernel import Kernel
+
+
+class ReadUnavailable(RuntimeError):
+    """Port read failure; optional fields are an actual write response only."""
+    def __init__(self, code: str, message: str, *, write_returncode: int | None = None,
+                 write_diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.code, self.message = code, message
+        self.write_returncode, self.write_diagnostic = write_returncode, write_diagnostic
 
 
 @dataclass(frozen=True)
@@ -153,7 +160,7 @@ class OperationRunner:
             if facts.pr is not None and facts.pr.state == "OPEN" and (
                     facts.source != facts.pr.head or facts.target != facts.pr.base
                     or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
-                raise GitHubReadError("github_observation_pending", "PR, refs and checks have not converged")
+                raise ReadUnavailable("github_observation_pending", "PR, refs and checks have not converged")
             return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
                          facts.source, facts.pr, facts.checks, completion, facts.ancestry,
                          facts.publisher_actor, facts.publisher_identity), token
@@ -161,7 +168,13 @@ class OperationRunner:
     def authorize_agent(self, call: AgentCall) -> None:
         if call.execution != self.execution:
             raise KernelError("invocation_binding")
-        world, token = self._observe(call.subject)
+        with self.kernel.storage.transaction(write=False) as tx:
+            self.kernel._agent_authority(tx, call)
+            original = self.kernel._operation_token(tx, call.subject)
+        try:
+            world, token = self._observe(call.subject)
+        except ReadUnavailable as error:
+            raise ReadWait(self.kernel._wait_for_read(original, self.execution, error.code, error.message)) from error
         with self.kernel.storage.transaction() as tx:
             self.kernel._check_operation(tx, token, self.execution)
             run, job = self.kernel._owned(tx, call.subject, self.execution)
@@ -180,7 +193,12 @@ class OperationRunner:
         kernel, execution = self.kernel, self.execution
         with kernel.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
-            kernel._automatic_owned(tx, run, execution)
+            try:
+                kernel._automatic_owned(tx, run, execution)
+            except KernelError as error:
+                if error.code != "executor_fenced":
+                    raise
+                return Step("paused", "", error.code)
             choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity)
             if choice is None:
                 state = kernel.operation_state()
@@ -191,7 +209,7 @@ class OperationRunner:
             if subject is None:
                 world, observed = self._observe(None)
                 if world.source is None or world.target is None:
-                    raise GitHubReadError("final_source_missing", "The original remote Final refs are absent")
+                    raise ReadUnavailable("final_source_missing", "The original remote Final refs are absent")
                 final = kernel._activate_final(execution, world.source, world.target, ancestry=world.ancestry, token=observed)
                 return kernel._finish_automatic_step(token, execution, Step("progress", final, "final_activated"))
             step = (kernel._advance_cleanup(subject, execution, token=token) if cleanup else
@@ -209,12 +227,12 @@ class OperationRunner:
             return kernel._finish_automatic_step(token, execution, step)
         except ReadWait as waiting:
             return waiting.step
-        except GitHubReadError as error:
+        except ReadUnavailable as error:
             return kernel._wait_for_read(token, execution, error.code, error.message)
         except KernelError as error:
-            if error.code not in {"automatic_step_superseded", "automatic_step_paused"}:
+            if error.code not in {"automatic_step_superseded", "automatic_step_paused", "executor_fenced"}:
                 raise
-            return Step("paused" if error.code == "automatic_step_paused" else "waiting", subject or "", error.code)
+            return Step("waiting" if error.code == "automatic_step_superseded" else "paused", subject or "", error.code)
 
     def _effect(self, step: Step) -> Step:
         kernel, execution, effect = self.kernel, self.execution, step.effect
@@ -222,7 +240,9 @@ class OperationRunner:
         read_token = kernel._begin_automatic_step(execution, effect.subject)
         if step.kind == "reconcile":
             token = kernel._begin_automatic_step(execution, effect.subject)
-            waiting = kernel._guard_automatic_step(token, execution, readback=effect)
+            with kernel.storage.transaction(write=False) as tx:
+                sent = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "sent"
+            waiting = kernel._guard_automatic_step(token, execution, readback=effect if sent else None)
             if waiting is not None:
                 raise ReadWait(waiting)
             result = self.ports.reconcile(effect)
@@ -236,7 +256,7 @@ class OperationRunner:
             def authorize() -> None:
                 try:
                     world, token = self._observe(effect.subject)
-                except GitHubReadError as error:
+                except ReadUnavailable as error:
                     raise ReadWait(kernel._wait_for_read(read_token, execution, error.code, error.message)) from error
                 with kernel.storage.transaction(write=False) as tx:
                     kernel._check_operation(tx, token, execution)
@@ -248,12 +268,12 @@ class OperationRunner:
                 kernel._guard_effect(effect, execution, world, resource_inspections=inspections, token=token)
             try:
                 result = self.ports.execute(effect, authorize)
-            except EffectReadError as error:
-                if error.write_returncode != 0:
+            except ReadUnavailable as error:
+                if error.write_returncode is not None and error.write_returncode != 0:
                     kernel.observe_effect_failure(effect, {"returncode": error.write_returncode,
                         "message": bounded_error(error.write_diagnostic)})
                 raise ReadWait(kernel._wait_for_read(read_token, execution, error.code, error.message)) from error
-            except (OSError, GitHubReadError) as error:
+            except OSError as error:
                 # A real adapter failure is not proof that the write was absent.
                 # Keep the durable original sent intent for the next readback.
                 with kernel.storage.transaction(write=False) as tx:

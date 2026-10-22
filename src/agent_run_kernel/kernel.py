@@ -58,8 +58,11 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             self._automatic_owned(tx, run, execution)
+            if run["source_sequence"] is None:
+                raise KernelError("source_not_configured")
             inputs = CreationInputs(profiles=self._profile_document(tx, 1), **self._inputs(tx, run))
-            if not run["repository_root"] or not inputs.repository_remote:
+            if (not run["repository_root"] or not Path(run["repository_root"]).is_absolute()
+                    or Path(run["repository_root"]).resolve() != Path(run["repository_root"]) or not inputs.repository_remote):
                 raise KernelError("managed_repository_required")
             paths, variables = [self.storage.path.parent], []
             for identity in (inputs.runner_identity, inputs.worker_identity):
@@ -87,6 +90,25 @@ class Kernel:
                 or value["source_sequence"] != run["source_sequence"]):
             raise KernelError("automatic_step_superseded")
 
+    def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
+        """Use the Attempt's single native-or-Opening facts loader."""
+        subject = job["id"]
+        if job["current_attempt"]:
+            attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
+            facts = load_continuation(tx, attempt["id"]) if attempt["thread_id"] is not None or attempt["opening_id"] is not None else None
+            prior = None if facts is None else facts.prior
+            if prior is not None:
+                if prior.status != "running" and prior.dispatch_state in {"sent", "started", "unknown"}:
+                    return Step("waiting", subject, "previous_invocation_exit")
+                if prior.status == "running" and not (prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
+                    return Step("waiting", subject, "agent_running")
+                if prior.failure_kind == "capacity" and prior.recovery_ready_at is not None and self.clock() < prior.recovery_ready_at:
+                    return Step("waiting", subject, "capacity_recovery_wait", retry_at=prior.recovery_ready_at)
+            if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)) and not (
+                    prior is not None and prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
+                return Step("waiting", subject, "previous_invocation_exit")
+        return None
+
     def _subject_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> Step | None:
         """The transition's read-only admission prefix, also used at Host exit."""
         subject = job["id"]
@@ -102,6 +124,9 @@ class Kernel:
             if not self._requeue_versions_current(tx, run, job, requeue, None):
                 return None
             return Step("paused", subject, self._pause_reason(tx, subject, run)) if run["stopped"] or gates - {"requeue_required"} else None
+        continuation = self._continuation_wait(tx, job)
+        if continuation is not None and continuation.reason in {"agent_running", "previous_invocation_exit"}:
+            return continuation
         refreshing = job["refresh_revision"] is not None and run["blocked"] == "final_refresh" and "operator_stopped" not in gates
         if run["stopped"] or (run["blocked"] or gates) and not refreshing:
             return Step("paused", subject, self._pause_reason(tx, subject, run))
@@ -117,15 +142,9 @@ class Kernel:
             return Step("waiting", subject, "dependencies")
         if job["phase"] == "approval":
             return Step("waiting", subject, "approval")
-        if job["current_attempt"]:
-            attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
-            outputs = tx.rows("SELECT i.status,i.deadline_at,o.dispatch_state,o.failure_kind,o.recovery_ready_at FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id WHERE i.id=? ORDER BY o.ordinal DESC LIMIT 1", (attempt["current_invocation"],))
-            if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
-                if outputs and outputs[0]["dispatch_state"] == "allocated" and self.clock() >= outputs[0]["deadline_at"]:
-                    return None
-                return Step("waiting", subject, "previous_invocation_exit")
-            if outputs and outputs[0]["failure_kind"] == "capacity" and outputs[0]["recovery_ready_at"] > self.clock():
-                return Step("waiting", subject, "capacity_recovery_wait", retry_at=outputs[0]["recovery_ready_at"])
+        if continuation is not None:
+            return continuation
+
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1) -> tuple[str | None, bool] | None:
@@ -150,7 +169,9 @@ class Kernel:
                 continue
             if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not self._pending_effect(tx, subject):
                 # A ready return may still perform program work without a slot.
-                if not job["current_attempt"] or not tx.one("SELECT result_id FROM attempts WHERE id=?", (job["current_attempt"],))[0]:
+                if not tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)) and (
+                        not job["current_attempt"] or not tx.one("SELECT result_id FROM attempts WHERE id=?", (job["current_attempt"],))[0]) and tx.rows(
+                        "SELECT subject FROM work_queue WHERE subject=?", (subject,)):
                     continue
             return subject, cleanup
         tickets = tx.all("SELECT * FROM subjects WHERE kind='ticket' ORDER BY issue")
@@ -185,6 +206,9 @@ class Kernel:
             return Step("complete", subject, "abandoned")
         if tx.rows("SELECT id FROM leases LIMIT 1"):
             return Step("waiting", subject, "worker_exit_unproven")
+        if any((waiting := self._continuation_wait(tx, job)) is not None and waiting.reason in {
+                "agent_running", "previous_invocation_exit"} for job in tx.all("SELECT * FROM subjects ORDER BY rowid")):
+            return Step("waiting", subject, "worker_exit_unproven")
         if self._abandon_reconciliation_blocked(tx, action):
             return Step("paused", subject, "abandon_outcome_unproven")
         inspection = self._abandon_inspection(tx, action)
@@ -203,7 +227,12 @@ class Kernel:
             for row in tx.all("SELECT w.*,m.body FROM waits w JOIN material m ON m.id=w.scope_id"):
                 if json.loads(row["body"]) in (self._automatic_scope(tx, run, row["subject"], False), self._automatic_scope(tx, run, row["subject"], True)):
                     deadlines.append(float(row["next_retry_at"] or row["deadline"]))
-            deadlines.extend(float(row[0]) for row in tx.all("SELECT recovery_ready_at FROM invocation_outputs WHERE failure_kind='capacity' AND recovery_ready_at>?", (self.clock(),)))
+            lifetime_wait = False
+            for job in tx.all("SELECT * FROM subjects ORDER BY rowid"):
+                waiting = self._continuation_wait(tx, job)
+                lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
+                if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job) == waiting:
+                    deadlines.append(waiting.retry_at)
             choice = self._operation_choice(tx, run)
             abandoned = self._abandon_action(tx)
             complete = (abandoned is not None and abandoned["status"] == "complete" or
@@ -211,9 +240,9 @@ class Kernel:
                 and not tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run')")
                 and not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1")
                 and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1"))
-            disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if choice is not None else "waiting" if active or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
+            disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if choice is not None else "waiting" if active or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
             cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or self._gates(tx, row["subject"]) or self.clock() >= row["deadline_at"])
-            return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel, min(deadlines, default=None), disposition)
+            return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel, min((t for t in deadlines if t > self.clock()), default=None), disposition)
 
     @classmethod
     def create_task(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:
@@ -823,10 +852,6 @@ class Kernel:
         waiting = self._abandon_wait(tx, action)
         if waiting is not None:
             return waiting
-        if action["status"] == "complete":
-            return Step("complete", subject, "abandoned")
-        if tx.rows("SELECT id FROM leases LIMIT 1"):
-            return Step("waiting", subject, "worker_exit_unproven")
         scope = self._abandon_scope(tx, action)
         for effect_id in scope["unsettled"]:
             row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
@@ -1697,20 +1722,28 @@ class Kernel:
                 original = originals[0]
                 return self._prepare_effect(tx, run, job, execution, world, "validation_cleanup", before=original["reviewed_commit"],
                                             payload={key: original[key] for key in ("checkout", "owned_root", "common_git_dir", "reviewed_commit")})
+            attempt = None
+            facts = None
+            if job["current_attempt"]:
+                attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
+                if attempt["thread_id"] is not None or attempt["opening_id"] is not None:
+                    facts = load_continuation(tx, attempt["id"])
+                    prior = facts.prior
+                    if prior is not None and prior.status == "running" and prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at:
+                        evidence = tx.put(subject, "allocation_expired", wire_json({"invocation": prior.invocation_id,
+                            "ordinal": prior.ordinal, "deadline_at": prior.deadline_at}))
+                        tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
+                                   (evidence, prior.invocation_id, prior.ordinal))
+                        tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (prior.invocation_id,))
+                        tx.execute("DELETE FROM leases WHERE id=?", (prior.lease_id,))
+                        self._gate(tx, subject, "execution_failed", evidence=evidence)
+                        return Step("paused", subject, "invocation_deadline_exceeded")
             if world is None:
                 return Step("observe", subject)
             initialization = self._initial_run_branch(tx, run, job, execution, world)
             if initialization is not None:
                 return initialization
-            if job["current_attempt"]:
-                attempt = tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
-                facts = None
-                if attempt["thread_id"] is not None or attempt["opening_id"] is not None:
-                    facts = load_continuation(tx, attempt["id"])
-                    prior = facts.prior
-                    if (prior is not None and prior.status != "running"
-                            and prior.dispatch_state in {"sent", "started", "unknown"}):
-                        return Step("waiting", subject, "previous_invocation_exit")
+            if attempt is not None:
                 if attempt["result_id"]:
                     return self._consume(tx, run, job, attempt, world, execution, allow_agent)
                 if not self._current(tx, job, run, world):
@@ -1722,19 +1755,6 @@ class Kernel:
                         raise
                     return Step("paused", subject, error.code)
                 prior = facts.prior
-                if prior is not None and prior.status == "running":
-                    if prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at:
-                        evidence = tx.put(subject, "allocation_expired", wire_json({"invocation": prior.invocation_id,
-                            "ordinal": prior.ordinal, "deadline_at": prior.deadline_at}))
-                        tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
-                                   (evidence, prior.invocation_id, prior.ordinal))
-                        tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (prior.invocation_id,))
-                        tx.execute("DELETE FROM leases WHERE id=?", (prior.lease_id,))
-                        self._gate(tx, subject, "execution_failed", evidence=evidence)
-                        return Step("paused", subject, "invocation_deadline_exceeded")
-                    return Step("waiting", subject, "agent_running")
-                if prior is not None and prior.failure_kind == "capacity" and prior.recovery_ready_at is not None and self.clock() < prior.recovery_ready_at:
-                    return Step("waiting", subject, "capacity_recovery_wait")
                 if prior is not None and prior.failure_kind is not None and attempt["resume_action"] is None:
                     return self._recover_agent(tx, run, job, attempt, world, execution, allow_agent, facts)
                 return self._allocate(tx, run, job, execution, world, allow_agent, attempt, continuation=facts)
@@ -2951,6 +2971,7 @@ class Kernel:
 
     def _gate(self, tx: Transaction, subject: str, code: str, *, purpose: str | None = None, evidence: str | None = None) -> None:
         tx.execute("INSERT OR IGNORE INTO gates VALUES (?,?,?,?)", (subject, code, purpose, evidence))
+        tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
         self._event(tx, subject, "paused", code, evidence)
 
     def _current(self, tx: Transaction, job: sqlite3.Row, run: sqlite3.Row, world: World) -> bool:
@@ -3120,6 +3141,7 @@ class Kernel:
         if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)):
             return Step("waiting", subject, "previous_invocation_exit")
         if not allow_agent:
+            self._ready(tx, subject, "work_queue")
             return Step("needs_agent", subject)
         role = (Role(pending["role"]) if pending is not None else
                 {"development": Role.DEVELOPMENT, "review": Role.REVIEW, "publish": Role.PUBLICATION}[job["phase"]])
