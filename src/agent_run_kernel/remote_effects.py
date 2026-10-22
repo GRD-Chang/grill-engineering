@@ -8,15 +8,17 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
+from functools import wraps
 import json
 from pathlib import Path
 import re
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, NoReturn, TYPE_CHECKING
+from typing import Any, NoReturn, ParamSpec, TYPE_CHECKING, TypeVar
 from urllib.parse import urlencode
 
 from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.error_safety import bounded_error
 from agent_run.github_identity import validate_identity_snapshot
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.runner_transport import runner_git_environment
@@ -49,6 +51,29 @@ class EffectReadError(GitHubReadError):
         self.write_diagnostic = response.stderr[:4096]
 
 
+_Arguments = ParamSpec("_Arguments")
+_Result = TypeVar("_Result")
+
+
+def _operation_errors(method: Callable[_Arguments, _Result]) -> Callable[_Arguments, _Result]:
+    """Translate physical transport failures at the Core port boundary only."""
+    @wraps(method)
+    def invoke(*args: _Arguments.args, **kwargs: _Arguments.kwargs) -> _Result:
+        from .operation_runner import ReadUnavailable
+        try:
+            return method(*args, **kwargs)
+        except GitHubReadError as error:
+            returncode, diagnostic = None, ""
+            if isinstance(error, EffectReadError) and error.write_returncode != 0:
+                returncode, diagnostic = error.write_returncode, bounded_error(error.write_diagnostic)
+            raise ReadUnavailable(error.code, bounded_error(error.message),
+                                  write_returncode=returncode, write_diagnostic=diagnostic) from error
+        except OSError as error:
+            # An interrupted read/transport supplies no observed write status.
+            raise ReadUnavailable("operation_io_unavailable", bounded_error(str(error))) from error
+    return invoke
+
+
 class RemoteEffects:
     """A concrete execute/reconcile port; authorize is required for every write.
 
@@ -76,6 +101,7 @@ class RemoteEffects:
                                                      Path(profile["private_key_path"])))
         return _text(self._api("user")["login"])
 
+    @_operation_errors
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
         """One original operation, after exact readback and current authorization."""
         if effect.operation in LocalEffects.OPERATIONS:
@@ -91,7 +117,7 @@ class RemoteEffects:
             return self._reopen_ticket(effect, authorize)
         if effect.operation == "recovery_comment":
             return self._recovery_comment(effect, authorize)
-        observed = self.reconcile(effect)
+        observed = self._reconcile(effect)
         prior = effect.payload.get("prior")
         if (effect.operation == "pr_write" and effect.pr_number is not None and isinstance(prior, Mapping)
                 and prior.get("title") == effect.payload.get("title")
@@ -102,7 +128,7 @@ class RemoteEffects:
             if self.actor() != effect.actor:
                 raise KernelError("remote_actor_changed")
             authorize()
-            fresh = self._current_pr_edit(effect, self.reconcile(effect))
+            fresh = self._current_pr_edit(effect, self._reconcile(effect))
             return replace(fresh, disposition="third") if fresh.disposition == "target" and fresh != observed else fresh
         if observed.disposition != "prior":
             return observed
@@ -150,13 +176,17 @@ class RemoteEffects:
 
     def _readback(self, effect: Effect, response: subprocess.CompletedProcess[str]) -> EffectResult:
         try:
-            result = self.reconcile(effect)
+            result = self._reconcile(effect)
         except GitHubReadError as error:
             raise EffectReadError(error, response) from error
         return replace(result, raw={**result.raw, "write_returncode": response.returncode,
                                     "write_diagnostic": response.stderr[:4096]})
 
+    @_operation_errors
     def reconcile(self, effect: Effect) -> EffectResult:
+        return self._reconcile(effect)
+
+    def _reconcile(self, effect: Effect) -> EffectResult:
         """Only inspect this intent: target, unchanged prior, third or unknown."""
         if effect.operation in LocalEffects.OPERATIONS:
             return self._local(effect).reconcile(effect)
@@ -197,6 +227,7 @@ class RemoteEffects:
         """Original PR identity and actual commit trees, for reads and receipts."""
         return self._pr(self._api(f"repos/{self.repository}/pulls/{number}"))
 
+    @_operation_errors
     def prepare_retirement(self, effect: Effect) -> dict[str, Any]:
         """Read the original OPEN PR and its event watermark before Core attachment."""
         self._binding(effect)
@@ -503,10 +534,12 @@ class RemoteEffects:
         response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, guard)
         return self._readback(effect, response)
 
+    @_operation_errors
     def source(self, parent_number: int) -> Requirements:
         reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
         return read_requirements(reader, parent_number)
 
+    @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
         from .operation_runner import DeliveryFacts
@@ -528,9 +561,11 @@ class RemoteEffects:
                          if self._ancestor(_sha(before), _sha(after)))
         return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity))
 
+    @_operation_errors
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
         return LocalEffects(self.git).inspect_resources(resources)
 
+    @_operation_errors
     def prepare_publication(self, effect: Effect) -> Mapping[str, Any]:
         return self._local(effect).prepare_publication(effect)
 

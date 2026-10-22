@@ -1,4 +1,6 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
+import pytest
+
 from agent_run_kernel import executor
 from agent_run_kernel.offline import GraphScenario
 from test_kernel_operation_runner import Ports
@@ -61,30 +63,54 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
     assert sum(item["operation"] == "merge" for item in scenario.port.writes()) == 3
 
 
-def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stage", ["source", "delivery"])
+def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_path, monkeypatch, stage):
     import pytest
-    from agent_run.github import GitHubReadError
     from agent_run_kernel.model import ReadWait
-    scenario = GraphScenario(tmp_path / "bootstrap", independent_source())
-    ports = Ports(scenario)
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
-    for _ in range(30):
-        step = runner.run_once()
-        if step.call is not None:
-            call = step.call
-            break
-    else:
-        raise AssertionError("normal Development call was not allocated")
-    assert scenario.kernel.dispatch_agent(call)
-    def unavailable(_parent):
-        raise GitHubReadError("github_read_failed", "synthetic source outage")
-    monkeypatch.setattr(ports, "source", unavailable)
-    with pytest.raises(ReadWait) as waiting:
-        runner.authorize_agent(call)
-    assert waiting.value.step.kind == "waiting" and waiting.value.retry_at is not None
+    from support.core_operations import CoreOperations
+    from test_kernel_remote_effects import _change, _fixture, _source_kernel
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    kernel = _source_kernel(tmp_path, port, push)
+    execution = kernel.claim_executor("real-port-bootstrap")
+    now = [100.25]
+    kernel.clock = lambda: now[0]
+    operations = CoreOperations(kernel, execution, lambda binding: port)
+    call = operations.until(lambda step: step.call is not None).call
+    assert call is not None and kernel.dispatch_agent(call)
+    runner = operations.runner
+    source = port.source
+    failing = [True]
+    def read_source(parent):
+        if stage == "source":
+            _change(state, read_error=failing[0])
+        facts = source(parent)  # Real fake-gh subprocess transport, no fake port exception.
+        if stage == "delivery":
+            _change(state, read_error=failing[0])
+        return facts
+    monkeypatch.setattr(port, "source", read_source)
+    for instant, expected_retry in ((100.25, 105.25), (110.25, 120.25)):
+        now[0] = instant
+        if stage == "delivery":
+            _change(state, read_error=False)
+        with pytest.raises(ReadWait) as waiting:
+            runner.authorize_agent(call)
+        assert waiting.value.step.kind == "waiting" and waiting.value.retry_at == expected_retry
+        with kernel.storage.transaction(write=False) as tx:
+            window = tx.one("SELECT started_at,deadline FROM waits WHERE subject=?", (call.subject,))
+            assert window["started_at"] == 100.25 and window["deadline"] == 700.25
+            assert tx.one("SELECT id FROM leases")[0] == call.lease_id
+            assert not tx.rows("SELECT * FROM effect_failures")
+        assert not runner.worker_settled(call)
+        assert kernel.status(call.subject)["pending_attempt"] == call.attempt_id
+        assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+    failing[0] = False
+    _change(state, read_error=False)
+    now[0] = 120.25
+    runner.authorize_agent(call)
     assert not runner.worker_settled(call)
-    assert scenario.kernel.status(call.subject)["pending_attempt"] == call.attempt_id
-    assert scenario.kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+    import json
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert actual and not any("--method" in command for command in actual)
 
 
 def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, monkeypatch):

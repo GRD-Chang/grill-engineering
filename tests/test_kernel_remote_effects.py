@@ -11,7 +11,8 @@ import pytest
 from agent_run.github import GitHubReadError
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Effect, Execution, KernelError
-from agent_run_kernel.remote_effects import EffectReadError, RemoteEffects
+from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run_kernel.operation_runner import ReadUnavailable
 
 
 def _fixture(tmp_path, monkeypatch):
@@ -150,16 +151,20 @@ def test_written_pr_target_settles_after_base_append_without_another_write(tmp_p
     assert sum("--method" in c for c in actual) == 1
 
 
-def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lost_response", [True, False], ids=["failed-command", "successful-command"])
+def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch, lost_response):
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     assert port.execute(push, lambda: None).disposition == "target"
     pr = _pr_effect(push)
-    _change(state, lose_operation="pr", read_error_after_write=True)
-    with pytest.raises(EffectReadError) as failed:
+    _change(state, lose_operation="pr" if lost_response else None, read_error_after_write=True)
+    with pytest.raises(ReadUnavailable) as failed:
         port.execute(pr, lambda: None)
     assert failed.value.code == "remote_read_failed"
-    assert failed.value.write_returncode == 1
-    assert "response lost after actual mutation" in failed.value.write_diagnostic
+    assert failed.value.write_returncode == (1 if lost_response else None)
+    if lost_response:
+        assert "response lost after actual mutation" in failed.value.write_diagnostic
+    else:
+        assert failed.value.write_diagnostic == ""
     _change(state, read_error=False)
     assert port.reconcile(pr).disposition == "target"
     assert port.execute(pr, lambda: pytest.fail("original PR write must not repeat")).disposition == "target"
@@ -267,7 +272,7 @@ def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monke
     _change(state, read_error=True)
     for read in (lambda: port.reconcile(_pr_effect(effect)),
                  lambda: port.execute(_pr_effect(effect), lambda: pytest.fail("unknown cannot write"))):
-        with pytest.raises(GitHubReadError) as failure:
+        with pytest.raises(ReadUnavailable) as failure:
             read()
         assert failure.value.code == "remote_read_failed"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
