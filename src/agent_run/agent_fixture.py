@@ -10,11 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
-from agent_run.artifacts import (
-    AcceptanceArtifact,
-    PublicationArtifact,
-    parse_publication_wire_result,
-)
+from agent_run_kernel.artifact_contract import parse_artifact
 from agent_run.worker_sandbox import WorkerSandboxError
 from agent_run.credential_lifecycle import InitialCredentialUnavailable
 
@@ -262,7 +258,7 @@ class FixtureAgentBackend:
             request,
             default_thread="fixture-reviewer",
             decode=_review_artifact,
-            validate=AcceptanceArtifact.parse,
+            validate=lambda value: parse_artifact("review", json.dumps(value).encode()),
         )
         return ReviewResult(thread_id=thread_id, artifact=artifact)
 
@@ -318,7 +314,7 @@ class FixtureAgentBackend:
             if configured_error is not None:
                 raise ValueError("scripted Fresh Acceptance error must be a string")
             try:
-                AcceptanceArtifact.parse(artifact)
+                parse_artifact("review", json.dumps(artifact).encode())
             except ValueError as error:
                 if notify is not None:
                     notify("failed", attempt_count=1, error=str(error))
@@ -334,9 +330,7 @@ class FixtureAgentBackend:
             request,
             default_thread="fixture-run-publication",
             decode=_publication_result,
-            validate=lambda value: _validate_publication(
-                value, delivery_run=str(request.get("run_id", "fixture"))
-            ),
+            validate=lambda value: parse_artifact("publication", json.dumps(value).encode()),
         )
         result["_thread_id"] = thread_id
         return result
@@ -650,12 +644,6 @@ def _publication_result(data: dict[str, Any]) -> dict[str, Any]:
             "human_blockers": list(blockers),
         }
     return _publication_wire(data)
-
-
-def _validate_publication(data: dict[str, Any], *, delivery_run: str) -> None:
-    normalized = parse_publication_wire_result(data)
-    if normalized["result_kind"] == "publication":
-        PublicationArtifact.parse(normalized, delivery_run=delivery_run)
 
 
 def _publication_wire(data: dict[str, Any]) -> dict[str, Any]:

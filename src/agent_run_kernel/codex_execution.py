@@ -19,14 +19,12 @@ import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
-from agent_run.agent_schemas import (
-    acceptance_schema, development_or_human_blocker_schema, publication_or_human_blocker_schema,
-)
 from agent_run.error_safety import bounded_error
 from agent_run.worker_sandbox import _BoundedJsonlStream, WorkerSandboxError, bubblewrap_command, native_worker_environment
 
+from .artifact_contract import role_schema
 from .execution import ProcessExit, _execute
-from .model import AgentCall, Role
+from .model import AgentCall
 
 if TYPE_CHECKING:
     from .kernel import Kernel
@@ -130,12 +128,7 @@ class _CodexCapture:
             gh = temporary / "gh"
             self.environment = self._credential_environment(gh)
             self.guard()
-            schemas = {
-                Role.DEVELOPMENT: development_or_human_blocker_schema,
-                Role.REVIEW: acceptance_schema,
-                Role.PUBLICATION: publication_or_human_blocker_schema,
-            }
-            schema = json.dumps(schemas[self.call.role](), separators=(",", ":")).encode()
+            schema = json.dumps(role_schema(self.call.role.value), separators=(",", ":")).encode()
             if len(schema) > 64 * 1024:
                 raise ValueError("Worker output schema exceeds its file limit")
             _write_member(self.directory, "schema.json", schema)

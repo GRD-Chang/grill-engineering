@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
+from .artifact_contract import ArtifactContractError, parse_artifact
+
 
 class KernelError(RuntimeError):
     def __init__(self, code: str, detail: str = "") -> None:
@@ -376,44 +378,11 @@ def wire_json(value: Any) -> bytes:
 
 
 def artifact(role: Role, raw: bytes) -> dict[str, Any]:
-    """Validate the complete existing role contract; keep original bytes elsewhere."""
+    """Use the role contract while keeping the Core's existing error boundary."""
     try:
-        data = json.loads(raw)
-    except (UnicodeError, ValueError) as error:
+        return parse_artifact(role.value, raw)
+    except ArtifactContractError as error:
         raise KernelError("invalid_artifact", str(error)) from error
-    if not isinstance(data, dict):
-        raise KernelError("invalid_artifact", "expected object")
-
-    def text(value: Any) -> bool:
-        return isinstance(value, str) and bool(value.strip())
-
-    if role == Role.REVIEW:
-        if set(data) != {"checks"} or not isinstance(data["checks"], dict):
-            raise KernelError("invalid_artifact", "review requires checks")
-        if set(data["checks"]) != {"e2e", "standards", "spec"}:
-            raise KernelError("invalid_artifact", "all three review lanes are required")
-        for lane in data["checks"].values():
-            if (not isinstance(lane, dict) or set(lane) != {"status", "evidence", "findings"}
-                    or lane["status"] not in {"pass", "fail", "blocked"}
-                    or not text(lane["evidence"]) or not isinstance(lane["findings"], list)
-                    or not all(text(value) for value in lane["findings"])
-                    or bool(lane["findings"]) != (lane["status"] == "fail")):
-                raise KernelError("invalid_artifact", "inconsistent review lane")
-        return data
-    fields = ({"result_kind", "summary", "human_blockers"} if role == Role.DEVELOPMENT
-              else {"result_kind", "commit_message", "pr_title", "pr_body_markdown", "human_blockers"})
-    if set(data) != fields:
-        raise KernelError("invalid_artifact", "role wire fields do not match")
-    content = ["summary"] if role == Role.DEVELOPMENT else ["commit_message", "pr_title", "pr_body_markdown"]
-    if data["result_kind"] == "human_blocker":
-        blockers = data["human_blockers"]
-        if (not isinstance(blockers, list) or not 1 <= len(blockers) <= 32
-                or not all(text(value) and len(value) <= 8192 for value in blockers)
-                or any(data[key] is not None for key in content)):
-            raise KernelError("invalid_artifact", "human blocker requires original blockers and null content")
-    elif data["result_kind"] != role.value or data["human_blockers"] is not None or not all(text(data[key]) for key in content):
-        raise KernelError("invalid_artifact", "role content is missing")
-    return data
 
 
 def review_outcome(data: Mapping[str, Any]) -> str:
