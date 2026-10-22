@@ -1,9 +1,57 @@
 """The script supplies external facts; production Core chooses every operation."""
 from pathlib import Path
+from dataclasses import replace
 
-from agent_run_kernel import DeliveryKind, Requirements
+import pytest
+
+from agent_run_kernel import DeliveryKind, KernelError, Requirements
 from agent_run_kernel.model import Issue, ParentIssue
 from agent_run_kernel.offline import GraphScenario, Scenario
+
+
+@pytest.mark.parametrize('gate', ['stop', 'requirements'])
+def test_world_before_manual_control_neither_claims_nor_allocates(tmp_path: Path, monkeypatch, gate: str) -> None:
+    scenario = Scenario(tmp_path / gate, DeliveryKind.PARENT_ONLY)
+    kernel = scenario.kernel
+    if gate == 'stop':
+        kernel.control('stop', 'stop-before-observation')
+        kernel.confirm_executor_exit(scenario.execution)
+    else:
+        assert scenario.run().kind == 'approval'
+        scenario.requirements = replace(scenario.requirements,
+            parent=replace(scenario.requirements.parent, body='Changed original requirement.'))
+        kernel.refresh(lambda: scenario.requirements)
+    before = kernel.status(scenario.delivery.key)
+    assert before['stopped'] if gate == 'stop' else before['gates'] == ['requeue_required']
+    writes, calls = scenario.port.writes(), list(scenario.role_calls)
+    with kernel.storage.transaction(write=False) as tx:
+        owner = tuple(tx.one('SELECT executor,epoch FROM runs'))
+        counts = tuple(tx.one('SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)'))
+    monkeypatch.setattr(kernel, 'claim_executor', lambda *a, **kw: pytest.fail('manual observation must not claim'))
+    world = scenario.world()
+    assert world.target == scenario.initial
+    after = kernel.status(scenario.delivery.key)
+    assert before['phase'] == after['phase'] == ('workspace' if gate == 'stop' else 'approval')
+    assert before['budgets'] == after['budgets']
+    assert before['gates'] == after['gates']
+    assert scenario.port.writes() == writes and scenario.role_calls == calls
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one('SELECT executor,epoch FROM runs')) == owner
+        assert tuple(tx.one('SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)')) == counts
+    if gate == 'requirements':
+        # The observed World still carries a precise source revision. A later
+        # real source update must invalidate it at the manual control seam.
+        scenario.requirements = replace(scenario.requirements,
+            parent=replace(scenario.requirements.parent, body='A later original requirement.'))
+        kernel.refresh(lambda: scenario.requirements)
+        replacement = replace(scenario.delivery, source_ref=scenario.delivery.source_ref + '-new',
+                              checkout=scenario.delivery.checkout + '-new', base=world.target)
+        with pytest.raises(KernelError, match='replacement_requirements'):
+            kernel.control('requeue', 'stale-control', subject=scenario.delivery.key,
+                           replacement=replacement, world=world)
+        assert kernel.control('requeue', 'fresh-control', subject=scenario.delivery.key,
+                              replacement=replacement, world=scenario.world()) == 'pending'
+        assert kernel.status(scenario.delivery.key)['generation'] == before['generation']
 
 
 def test_first_scenario_world_is_a_real_core_observation_without_work(tmp_path: Path) -> None:

@@ -811,7 +811,7 @@ class Scenario:
         return self.port.writes()[getattr(self, "observation_start", 0):]
 
     def world(self) -> World:
-        return self.runner().observe(self.delivery.key)
+        return self.kernel.observe_control(self.delivery.key, self.make_ports)
 
     def make_ports(self, binding: OperationBinding) -> OperationPorts:
         return _ScenarioPorts(self, binding)
