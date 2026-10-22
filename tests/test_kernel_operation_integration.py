@@ -3,6 +3,7 @@ import pytest
 
 from agent_run_kernel import executor
 from agent_run_kernel.offline import GraphScenario
+from test_kernel_host_observation import admit_scenario
 from test_kernel_operation_runner import Ports
 from test_kernel_requirements import independent_source
 
@@ -14,6 +15,17 @@ class Notifications:
         pass
     def close(self, **_kwargs):
         pass
+
+
+def _admit_host(scenario, tmp_path):
+    """Use the admitted manager witness for this synthetic process adapter."""
+    admit_scenario(scenario, tmp_path)
+    action = scenario.kernel.active_host_action()
+    assert action is not None
+    usage = scenario.kernel.host_usage(action)
+    assert usage is not None and usage.usage_ready and not usage.usage_released
+    return {"host_pid": usage.main_pid, "host_start_token": usage.start_token,
+            "boot_id": usage.boot_id, "host_cgroup": usage.cgroup, "cgroup": usage.cgroup}
 
 
 def test_github_reader_can_be_imported_cold_in_an_independent_process():
@@ -30,6 +42,7 @@ def test_github_reader_can_be_imported_cold_in_an_independent_process():
 
 def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_path, monkeypatch):
     scenario = GraphScenario(tmp_path / "host", independent_source())
+    host = _admit_host(scenario, tmp_path)
     ports = Ports(scenario)
     scenario.port.lose_response.add("merge")
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
@@ -37,8 +50,7 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
     def execute(kernel, call, **kwargs):
         assert kernel.dispatch_agent(call)
         kwargs["authorize_source"]()
-        process = {"pid": 4242, "start_token": "synthetic-worker", "pgid": 4242,
-                   "host_pid": 4241, "host_start_token": "synthetic-host"}
+        process = {"pid": 4242, "start_token": "synthetic-worker", "pgid": 4242, **host}
         kernel.agent_started(call, process)
         try:
             scenario.select(call.subject)  # Metadata for the call Core already allocated.
@@ -117,10 +129,10 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     from dataclasses import replace
     import threading
     from agent_run_kernel.model import Checks, Policy
-    from test_kernel_operation_runner import settle_agent
     source = independent_source()
     source = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 4 else issue for issue in source.issues))
     scenario = GraphScenario(tmp_path / "concurrent", source, policy=Policy(concurrency=1))
+    host = _admit_host(scenario, tmp_path)
     ports = Ports(scenario)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
@@ -130,7 +142,18 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             break
         step = runner.run_once()
         if step.call is not None:
-            settle_agent(scenario, runner, step.call)
+            # Preserve the synthetic producer's exact start/return/exit hooks,
+            # with a process witness belonging to this already admitted Host.
+            call = step.call
+            assert scenario.kernel.dispatch_agent(call)
+            runner.authorize_agent(call)
+            process = {"pid": 4242, "start_token": "synthetic", "pgid": 4242, **host}
+            scenario.kernel.agent_started(call, process)
+            scenario.select(call.subject)
+            scenario.kernel.receive(call, scenario.agent(call))
+            assert not runner.worker_settled(call)
+            scenario.kernel.agent_exited(call, process, 0)
+            assert runner.worker_settled(call)
     else:
         raise AssertionError("first Ticket did not reach normal CI")
     # Reopening the independent external Ticket makes fresh work eligible;
@@ -154,8 +177,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     def execute(kernel, call, **kwargs):
         assert kernel.dispatch_agent(call)
         kwargs["authorize_source"]()
-        process = {"pid": 5252, "start_token": "synthetic-worker", "pgid": 5252,
-                   "host_pid": 5251, "host_start_token": "synthetic-host"}
+        process = {"pid": 5252, "start_token": "synthetic-worker", "pgid": 5252, **host}
         kernel.agent_started(call, process)
         try:
             if call.subject == "ticket:4" and not entered.is_set():
@@ -177,6 +199,7 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
     import pytest
     from agent_run_kernel.execution import ProcessExitUnknown
     scenario = GraphScenario(tmp_path / "unknown", independent_source())
+    host = _admit_host(scenario, tmp_path)
     ports = Ports(scenario)
     selected = []
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
@@ -184,8 +207,7 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
         selected.append(call)
         assert kernel.dispatch_agent(call)
         kwargs["authorize_source"]()
-        process = {"pid": 6262, "start_token": "synthetic-worker", "pgid": 6262,
-                   "host_pid": 6261, "host_start_token": "synthetic-host"}
+        process = {"pid": 6262, "start_token": "synthetic-worker", "pgid": 6262, **host}
         kernel.agent_started(call, process)
         scenario.select(call.subject)
         kernel.receive(call, scenario.agent(call))
