@@ -29,7 +29,7 @@ from .storage import PROTOCOL, SCHEMA, Transaction
 # Static column inventory, deliberately independent of the candidate's schema.
 _COLUMNS: dict[str, tuple[str, ...]] = {
     'actions': tuple('id run_id kind subject payload_id status receipt_id'.split()),
-    'attempts': tuple('id subject generation ordinal role purpose window parent_revision graph_revision revision base_sha candidate_sha candidate_tree expected_tree completion_revision context_id current_invocation result_id status accounted outcome new_thread resume_action'.split()),
+    'attempts': tuple('id subject generation ordinal role purpose window parent_revision graph_revision revision base_sha candidate_sha candidate_tree expected_tree completion_revision context_id current_invocation result_id status accounted outcome new_thread resume_action thread_id opening_id'.split()),
     'budgets': tuple('subject purpose window developments_used reviews_used development_limit review_limit review_required current'.split()),
     'checks': tuple('id subject pr_number head_sha result material_id'.split()),
     'completions': tuple('subject generation revision parent_revision graph_revision source_sha merge_sha tree pr_number gate_mode review_attempt development_attempt comment_effect close_effect'.split()),
@@ -75,6 +75,10 @@ _SCHEMA_OBJECTS = 'SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY typ
 # references imply inert data. Core also discovers material by subject/purpose
 # (fixture_evidence), and migration can discover v6_import_identity likewise.
 # Every other material must belong to the source-derived installation below.
+# In particular, Opening, its provenance and prior raw/process/start evidence
+# are authoritative material, never inert exceptions. This importer has no
+# certified Opening producer: its Attempt basis stays double-NULL, so that
+# entire extra material closure remains absent from the expected installation.
 _UNREFERENCED_MATERIAL = {
     'inspection_note': 'diagnostic-only; no runtime or migration selector',
     'profile_revision': 'only consumed through exact profile_revisions and Thread bindings',

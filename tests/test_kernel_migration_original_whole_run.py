@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from support.v6_whole_run_source import whole_run_managed_source, continue_original_whole_run
+from test_kernel_continuation_upgrade import native_v17_source
 
 
 def test_original_whole_run_producer_retains_completed_returned_and_unallocated_tickets(
@@ -201,7 +202,7 @@ def test_prepared_whole_run_refuses_changed_canonical_installation(
 
 def test_original_whole_run_formal_cutover_continues_c_and_final_against_original(
     tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, *,
-    inverse: bool = False, foreign_marker: bool = False,
+    inverse: bool = False, foreign_marker: bool = False, initial_native_source: Path | None = None,
 ) -> None:
     from dataclasses import replace
     from agent_run_kernel import Kernel
@@ -209,6 +210,7 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
     from agent_run_kernel.migration import capture_v6
     from agent_run_kernel.migration_records import V6RecordReader
     from agent_run_kernel.model import CreationInputs, Policy, RunSpec, wire_json
+    from agent_run_kernel.storage import PREVIOUS_PROTOCOL, PROTOCOL, Storage
     from agent_run_kernel.offline import Scenario, review_result
     from support.cli_payloads import publication, final_run_publication
     from support.returned_remote import ReturnedRemote
@@ -237,11 +239,23 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
     evidence = tmp_path / 'formal-whole'
     command = [sys.executable, '-m', 'agent_run_kernel.migration_cutover', '--repo', 'example/project',
                '--parent', '1', '--evidence-dir', str(evidence)]
-    applied = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=30)
+    initial_environment = environment if initial_native_source is None else {
+        **environment, 'PYTHONPATH': str(initial_native_source)}
+    applied = subprocess.run(command, env=initial_environment, capture_output=True, text=True, timeout=30)
     assert applied.returncode == 0, applied.stdout + applied.stderr
     result = json.loads(applied.stdout)
     assert result['status'] == 'migrated' and result['supported_source']['kind'] == 'original_run'
-    kernel = Kernel(Path(result['target']['database']))
+    target = Path(result['target']['database'])
+    if initial_native_source is not None:
+        with Storage(target).transaction(write=False) as tx:
+            assert tx.one('SELECT protocol FROM meta')[0] == PREVIOUS_PROTOCOL
+            assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+    kernel = Kernel(target)
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT protocol FROM meta')[0] == PROTOCOL
+        assert all(tuple(row) == (None, None, None) for row in tx.all(
+            'SELECT current_invocation,thread_id,opening_id FROM attempts'))
+        assert tx.one("SELECT count(*) FROM material WHERE purpose='attempt_continuation_opening'")[0] == 0
     assert (evidence / 'source.sqlite3').read_bytes() == original_bytes
     retained = paths['database'].read_bytes(), kernel.storage.path.read_bytes(), _git_bytes(managed.repository_root)
     resumed = subprocess.run(command + ['--resume'], env=environment, capture_output=True, text=True, timeout=30)
@@ -380,6 +394,15 @@ def test_original_whole_run_formal_cutover_continues_c_and_final_against_origina
     advanced = subprocess.run(command + ['--rollback'], env=environment, capture_output=True, text=True, timeout=30)
     assert advanced.returncode == 1 and json.loads(advanced.stdout)['code'] == 'native_original_cutover_advanced', advanced.stdout + advanced.stderr
     assert json.loads(advanced.stdout)['next_action'] == 'rollforward'
+
+
+@pytest.mark.parametrize('inverse', [False, True], ids=['forward', 'inverse'])
+def test_original_whole_run_v17_prepared_upgrade_keeps_source_contract(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    native_v17_source: Path, inverse: bool,
+) -> None:
+    test_original_whole_run_formal_cutover_continues_c_and_final_against_original(
+        tmp_path, git_repo, monkeypatch, inverse=inverse, initial_native_source=native_v17_source)
 
 
 def test_original_whole_run_formal_inverse_returns_all_owners_to_original_continuation(tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:

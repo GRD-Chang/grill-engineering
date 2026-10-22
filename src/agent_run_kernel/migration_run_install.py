@@ -73,7 +73,10 @@ def attempt_values(facts: OriginalRunFacts, ticket: WorkedTicket, call: AttemptF
         graph_revision=facts.header.graph_revision, revision=revision, base_sha=ticket.base_sha,
         candidate_sha=boundary.get('candidate_sha'), candidate_tree=boundary.get('candidate_tree'),
         expected_tree=boundary.get('candidate_tree'), completion_revision=completion_revision,
-        context_id=context_id, current_invocation=None, result_id=result_id,
+        # Old source Thread/input witnesses are historical evidence, not a
+        # certified native Continuation basis. Preserve returned raw for normal
+        # consumption without manufacturing an Invocation or a zero Opening.
+        context_id=context_id, current_invocation=None, thread_id=None, opening_id=None, result_id=result_id,
         status='returned' if call.pending else 'consumed',
         accounted=int(call.role == Role.REVIEW and call.selected_version['budget_consumed'] == 1), outcome=outcome)
 
