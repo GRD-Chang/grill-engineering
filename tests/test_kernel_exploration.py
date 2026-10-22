@@ -1,8 +1,9 @@
 """Behavioral probes for the isolated replacement kernel, never legacy fixtures."""
 
 from pathlib import Path
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
+import os
 import subprocess
 import sys
 import sqlite3
@@ -11,7 +12,9 @@ import pytest
 
 from agent_run_kernel import Checks, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
 from agent_run_kernel.offline import Scenario, review_result
-from agent_run_kernel.model import Effect, EffectResult, wire_json
+from agent_run_kernel.model import wire_json
+from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
+from test_kernel_remote_effects import EffectBoundary, effect_boundary
 
 
 def ticket_spec() -> RunSpec:
@@ -26,13 +29,14 @@ def ticket_spec() -> RunSpec:
 
 def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(tmp_path: Path) -> None:
     path = tmp_path / "kernel.sqlite3"
-    kernel = Kernel.create(path, ticket_spec())
+    kernel, ports = native_agent_fixture(path, ticket_spec())
     token = kernel.claim_executor("executor-one")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    first = kernel.advance("ticket:2", token, world)
+    operations = CoreOperations(kernel, token, lambda binding: ports)
+    first = operations.until(lambda step: step.call is not None)
     assert first.kind == "agent"
     assert first.call is not None
     assert first.call.role.value == "development"
+    operations.runner.authorize_agent(first.call)
     kernel.receive(first.call, b'{"result_kind":"development","summary":"changed","human_blockers":null}')
 
     reopened = Kernel(path)
@@ -40,10 +44,11 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     assert observed["pending_return"] is True
     assert observed["budgets"]["requirements"]["developments_used"] == 1
     assert observed["phase"] == "development"
-    consumed = reopened.advance("ticket:2", token, world, allow_agent=False)
+    consumed = CoreOperations(reopened, token, lambda binding: ports).once(agent_capacity=0)
     assert consumed.kind == "progress"
     assert reopened.status("ticket:2")["phase"] == "candidate"
     assert reopened.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
+
 
 
 @pytest.mark.parametrize(("kind", "expected_roles", "development_purpose"), [
@@ -106,17 +111,21 @@ def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Pat
 
 def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tmp_path: Path) -> None:
     path = tmp_path / "kernel.sqlite3"
-    kernel = Kernel.create(path, ticket_spec())
+    kernel, ports = native_agent_fixture(path, ticket_spec())
     token = kernel.claim_executor("executor-one")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    step = kernel.advance("ticket:2", token, world)
+    operations = CoreOperations(kernel, token, lambda binding: ports)
+    step = operations.until(lambda step: step.call is not None)
     assert step.call is not None
+    operations.runner.authorize_agent(step.call)
     kernel.control("stop", "stop-original")
     kernel.receive(step.call, b'{"result_kind":"development","summary":"retained","human_blockers":null}')
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel.advance("ticket:2", token, world)
+        operations.runner.authorize_agent(step.call)
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join((
+        str(Path(__file__).resolve().parents[1] / "src"), str(Path(__file__).resolve().parent))))
     command = "from pathlib import Path; from agent_run_kernel import Kernel; import json,sys; print(json.dumps(Kernel(Path(sys.argv[1])).status('ticket:2')))"
-    process = subprocess.run([sys.executable, "-c", command, str(path)], text=True, capture_output=True, check=True, timeout=15)
+    process = subprocess.run([sys.executable, "-c", command, str(path)], env=environment,
+                             text=True, capture_output=True, check=True, timeout=15)
     observed = json.loads(process.stdout)
     assert observed["stopped"] is True
     assert observed["pending_return"] is True
@@ -125,13 +134,28 @@ def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tm
     kernel.confirm_executor_exit(token)
     kernel.control("resume", "resume-original")
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel.advance("ticket:2", token, world)
+        operations.runner.authorize_agent(step.call)
     replacement = kernel.claim_executor("executor-two")
-    consume_command = "from pathlib import Path; from agent_run_kernel import Kernel,Execution,World,Commit; import json,sys; k=Kernel(Path(sys.argv[1])); step=k.advance('ticket:2',Execution('offline-run',sys.argv[2],int(sys.argv[3])),World('parent-v1','graph-v1','ticket-v1',Commit('base','base-tree')),allow_agent=False); print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))"
-    resumed = subprocess.run([sys.executable, "-c", consume_command, str(path), replacement.owner, str(replacement.epoch)], text=True, capture_output=True, check=True, timeout=15)
+    consume_command = """from pathlib import Path
+from agent_run_kernel import Kernel, Execution, Commit, Requirements, ParentIssue, Issue
+from agent_run_kernel.operation_runner import DeliveryFacts
+from support.core_operations import CoreOperations, ReadOnlyPorts
+import json, sys
+k = Kernel(Path(sys.argv[1]))
+wire = json.loads(sys.argv[4])
+parent = wire['parent']; parent['sub_issue_numbers'] = tuple(parent['sub_issue_numbers'])
+source = Requirements(ParentIssue(**parent), tuple(Issue(**dict(item, labels=frozenset(item['labels']), blocked_by=())) for item in wire['issues']))
+ports = ReadOnlyPorts(source, 'refs/heads/ticket-2', 'refs/heads/run', DeliveryFacts(Commit('base','base-tree'), None))
+step = CoreOperations(k, Execution('offline-run',sys.argv[2],int(sys.argv[3])), lambda binding: ports).once(agent_capacity=0)
+print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
+"""
+    resumed = subprocess.run([sys.executable, "-c", consume_command, str(path), replacement.owner, str(replacement.epoch),
+                              json.dumps(asdict(ports.requirements), default=list)],
+                             env=environment, text=True, capture_output=True, check=True, timeout=15)
     assert json.loads(resumed.stdout)["step"] == "progress"
     assert json.loads(resumed.stdout)["status"]["phase"] == "candidate"
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
+
 
 
 def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path) -> None:
@@ -151,22 +175,33 @@ def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_pat
     assert scenario.publication_count == 1
 
 
-def advance_to_effect(scenario: Scenario, operation: str, *, developments: int = 0) -> Effect:
+def advance_to_effect(scenario: Scenario, monkeypatch, operation: str, *, developments: int = 0,
+                      sent: bool = False) -> EffectBoundary:
+    # The existing runner chooses every subject and transition. Only the real
+    # physical port is held, using the same boundary fixture as remote tests.
     for _ in range(150):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-        if step.effect is not None and step.effect.operation == operation and scenario.development_count >= developments:
-            return step.effect
-        scenario.handle(step)
-        assert step.kind not in {"paused", "complete", "approval", "waiting"}
-    raise AssertionError("requested effect never became ready")
+        if scenario.development_count >= developments:
+            break
+        scenario.step()
+    with effect_boundary(scenario, monkeypatch, operation, sent=sent):
+        with pytest.raises(EffectBoundary) as boundary:
+            for _ in range(150):
+                step = scenario.step()
+                assert step.kind not in {"paused", "complete", "approval", "waiting"}
+    assert boundary.value.effect.operation == operation and boundary.value.phase == "execute"
+    if sent:
+        assert scenario.kernel.status(boundary.value.effect.subject)["pending_write"]["status"] == "sent"
+    return boundary.value
+
 
 
 @pytest.mark.parametrize("boundary", ["current", "stopped", "checkout_changed", "unclaimed"])
 def test_noop_integration_requires_current_dispatch_before_consuming_exact_candidate(
-    tmp_path: Path, boundary: str,
+    tmp_path: Path, monkeypatch, boundary: str,
 ) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    effect = advance_to_effect(scenario, "integrate")
+    held = advance_to_effect(scenario, monkeypatch, "integrate")
+    effect = held.effect
     local = scenario.port.local
     observed = local.reconcile(effect)
     assert observed.disposition == "target" and observed.commit == effect.candidate
@@ -174,7 +209,11 @@ def test_noop_integration_requires_current_dispatch_before_consuming_exact_candi
     assert effect.dispatch_serial == 1  # An allocated serial is not a dispatch receipt.
 
     if boundary == "unclaimed":
-        settled = scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world())
+        execute = scenario.port.execute
+        def without_dispatch(selected, authorize):
+            return observed if selected.effect_id == effect.effect_id else execute(selected, authorize)
+        monkeypatch.setattr(scenario.port, "execute", without_dispatch)
+        settled = scenario.step()
         assert settled.kind == "paused" and settled.reason == "write_not_dispatched"
         assert "write_conflict" in scenario.kernel.status(effect.subject)["gates"]
         return
@@ -182,10 +221,7 @@ def test_noop_integration_requires_current_dispatch_before_consuming_exact_candi
         scenario.kernel.control("stop", "stop-before-noop")
 
     def authorize() -> None:
-        world = scenario.world()
-        if not scenario.kernel.dispatch(effect, scenario.execution, world):
-            raise KernelError("operation_cancelled")
-        scenario.kernel.guard_effect(effect, scenario.execution, world)
+        held.authorize()
         if boundary == "checkout_changed":
             (Path(effect.payload["checkout"]) / "concurrent-work.txt").write_text("Preserve this work.\n")
 
@@ -208,36 +244,33 @@ def test_noop_integration_requires_current_dispatch_before_consuming_exact_candi
     result = local.execute(effect, authorize)
     assert result == observed
     assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    # Reopening only reads the original target; it needs no new authorization.
     assert local.reconcile(effect) == observed
-    assert scenario.kernel.reconcile(effect, result, scenario.execution, scenario.world()).kind == "progress"
-    assert scenario.kernel.advance(effect.subject, scenario.execution, scenario.world()).kind == "progress"
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    assert operations.once().kind == "progress"
+    assert operations.once().kind == "progress"
     assert scenario.kernel.status(effect.subject)["phase"] == "ready_publication"
+
 
 
 @pytest.mark.parametrize("ci", [False, True])
 def test_unchanged_development_candidate_requires_lazy_authority_and_keeps_its_charge(
-    tmp_path: Path, ci: bool,
+    tmp_path: Path, monkeypatch, ci: bool,
 ) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET,
                         checks=("fail", "none") if ci else ("none",),
                         edits=({"implemented.txt": "Requested work.\n"}, {}) if ci else ({},))
-    effect = advance_to_effect(scenario, "candidate", developments=2 if ci else 1)
+    held = advance_to_effect(scenario, monkeypatch, "candidate", developments=2 if ci else 1)
+    effect = held.effect
     before = scenario.kernel.status(effect.subject)["budgets"]
     observed = scenario.port.local.reconcile(effect)
     assert observed.disposition == "target" and observed.raw["no_change"] is True
     assert observed.commit is not None and observed.commit.sha == effect.before_sha
-
-    def authorize() -> None:
-        world = scenario.world()
-        assert scenario.kernel.dispatch(effect, scenario.execution, world)
-        scenario.kernel.guard_effect(effect, scenario.execution, world)
-
-    result = scenario.port.local.execute(effect, authorize)
+    result = scenario.port.local.execute(effect, held.authorize)
     assert result == observed
     assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    scenario.kernel.reconcile(effect, result, scenario.execution, scenario.world())
-    consumed = scenario.kernel.advance(effect.subject, scenario.execution, scenario.world())
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations.once()
+    consumed = operations.once()
     assert consumed.kind == ("paused" if ci else "progress")
     state = scenario.kernel.status(effect.subject)
     assert state["budgets"] == before
@@ -245,52 +278,33 @@ def test_unchanged_development_candidate_requires_lazy_authority_and_keeps_its_c
     assert ("ci_investigation_paused" in state["gates"]) if ci else state["phase"] == "review"
 
 
-def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_path: Path) -> None:
+
+def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_path: Path, monkeypatch) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
-    effect = advance_to_effect(scenario, "publication_commit")
+    held = advance_to_effect(scenario, monkeypatch, "publication_commit")
+    effect = held.effect
     observed = scenario.port.local.reconcile(effect)
     assert observed.disposition == "target" and observed.commit is not None
     assert observed.commit.sha == effect.payload["reuse_sha"]
-
-    def authorize() -> None:
-        world = scenario.world()
-        assert scenario.kernel.dispatch(effect, scenario.execution, world)
-        scenario.kernel.guard_effect(effect, scenario.execution, world)
-
-    assert scenario.port.local.execute(effect, authorize) == observed
+    assert scenario.port.local.execute(effect, held.authorize) == observed
     assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world())
-    assert scenario.kernel.advance(effect.subject, scenario.execution, scenario.world()).kind == "progress"
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations.once()
+    assert operations.once().kind == "progress"
     assert scenario.kernel.status(effect.subject)["phase"] == "push"
 
 
+
 @pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
-def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, operation: str) -> None:
+def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, monkeypatch, operation: str) -> None:
     from agent_run_kernel.offline import GraphScenario
     from test_kernel_requirements import independent_source
 
-    # Native workspace effects establish ownership; a pre-created fixture ref
-    # is not sufficient authority for deleting even an already absent marker.
     scenario = GraphScenario(tmp_path / "scenario", independent_source())
-    if operation == "validation_cleanup":
-        effect = advance_to_effect(scenario, operation)
-    else:
-        close = advance_to_effect(scenario, "close")
-        assert scenario.kernel.dispatch(close, scenario.execution, scenario.world())
-        scenario.port.execute(close)
-        scenario.kernel.reconcile(close, scenario.port.reconcile(close), scenario.execution, scenario.world())
-        assert scenario.kernel.advance(close.subject, scenario.execution, scenario.world()).kind == "progress"
-        assert scenario.kernel.status(close.subject)["phase"] == "complete"
-        first = scenario.kernel.advance_cleanup(close.subject, scenario.execution, scenario.world())
-        assert first.effect is not None and first.effect.operation == "cleanup_worktree"
-        if operation == "cleanup_worktree":
-            effect = first.effect
-        else:
-            scenario.handle(first)
-            assert scenario.kernel.advance_cleanup(close.subject, scenario.execution, scenario.world()).kind == "progress"
-            following = scenario.kernel.advance_cleanup(close.subject, scenario.execution, scenario.world())
-            assert following.effect is not None and following.effect.operation == operation
-            effect = following.effect
+    held = advance_to_effect(scenario, monkeypatch, operation)
+    effect = held.effect
+    if operation != "validation_cleanup":
+        assert scenario.kernel.status(effect.subject)["phase"] == "complete"
     git = scenario.port.git
     if operation == "cleanup_local_ref":
         git.run("update-ref", "-d", effect.source_ref, effect.payload["expected_head"])
@@ -303,54 +317,56 @@ def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, o
     observed = local.reconcile(effect)
     assert observed.disposition == "target"
     before = scenario.kernel.status(effect.subject)
-
-    def authorize() -> None:
-        world = scenario.world()
-        assert scenario.kernel.dispatch(effect, scenario.execution, world)
-        scenario.kernel.guard_effect(effect, scenario.execution, world)
-
-    assert local.execute(effect, authorize) == observed
+    if operation != "validation_cleanup":
+        assert before["resource_cleanup"]["stage"] == (0 if operation == "cleanup_worktree" else 1)
+        assert [write["operation"] for write in scenario.port.writes()
+                if write["operation"] in scenario.kernel.CLEANUP] == ([] if operation == "cleanup_worktree" else ["cleanup_worktree"])
+    assert local.execute(effect, held.authorize) == observed
     assert any(event["kind"] == "effect_dispatched" and event["identity"] == effect.effect_id
                for event in scenario.kernel.history(effect.subject))
-    scenario.kernel.reconcile(effect, observed, scenario.execution, scenario.world())
-    consume = (scenario.kernel.advance if operation == "validation_cleanup" else scenario.kernel.advance_cleanup)
-    assert consume(effect.subject, scenario.execution, scenario.world()).kind == "progress"
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations.once()
+    assert operations.once().kind == "progress"
     after = scenario.kernel.status(effect.subject)
     assert after["phase"] == before["phase"] and after["budgets"] == before["budgets"]
     if operation != "validation_cleanup":
         assert after["resource_cleanup"]["stage"] == before["resource_cleanup"]["stage"] + 1
 
 
+
 @pytest.mark.parametrize("disposition", ["prior", "target", "third", "unknown"])
-def test_unknown_write_branches_preserve_intent_and_resume_only_original_outcome(tmp_path: Path, disposition: str) -> None:
+def test_unknown_write_branches_preserve_intent_and_resume_only_original_outcome(tmp_path: Path, monkeypatch, disposition: str) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    effect = advance_to_effect(scenario, "pr_write")
-    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+    held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
+    effect = held.effect
     if disposition != "prior":
-        scenario.port.execute(effect)
-    actual = scenario.port.reconcile(effect) if disposition in {"prior", "target"} else EffectResult(disposition)
-    scenario.kernel.reconcile(effect, actual, scenario.execution, scenario.world())
+        scenario.port.execute(effect, held.authorize)
+    if disposition in {"third", "unknown"}:
+        scenario.port.force_read["pr_write"] = disposition
+    scenario.step()
     if disposition in {"third", "unknown"}:
         assert scenario.kernel.status(scenario.delivery.key)["pending_write"]["status"] == "sent"
         assert scenario.kernel.status(scenario.delivery.key)["holds_integration"]
         assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-        scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world())
+        del scenario.port.force_read["pr_write"]
+        scenario.step()
         scenario.kernel.control("resume", "resume-exact-write", subject=scenario.delivery.key)
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
 
 
+
 @pytest.mark.parametrize("already_written", [False, True])
-def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, already_written: bool) -> None:
+def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, already_written: bool) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    effect = advance_to_effect(scenario, "pr_write")
-    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+    held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
+    effect = held.effect
     if already_written:
-        scenario.port.execute(effect)
+        scenario.port.execute(effect, held.authorize)
     scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Other actor's retained work\n"}, "external")
-    scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world())
+    scenario.step()
     if already_written:
-        assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
+        assert scenario.step().kind == "progress"
     status = scenario.kernel.status(scenario.delivery.key)
     assert status["phase"] == "integration"
     assert status["pending_write"] is None
@@ -359,18 +375,20 @@ def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_p
     assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:external.txt").stdout == "Other actor's retained work\n"
 
 
+
 def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_original_context(tmp_path: Path) -> None:
     path = tmp_path / "kernel.sqlite3"
-    kernel = Kernel.create(path, ticket_spec())
+    kernel, ports = native_agent_fixture(path, ticket_spec())
     token = kernel.claim_executor("executor-one")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    first = kernel.advance("ticket:2", token, world).call
+    operations = CoreOperations(kernel, token, lambda binding: ports)
+    first = operations.until(lambda step: step.call is not None).call
     assert first is not None
+    operations.runner.authorize_agent(first)
     kernel.bind_thread(first, "reported-first")
     kernel.receive(first, wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": ["Provide the external decision."]}))
-    assert kernel.advance("ticket:2", token, world).kind == "paused"
+    assert operations.once().kind == "paused"
     kernel.control("resume", "human-resume", subject="ticket:2", message="Decision: retain original formatting.\r\n", new_thread=True)
-    second = kernel.advance("ticket:2", token, world).call
+    second = operations.until(lambda step: step.call is not None).call
     assert second is not None
     assert second.attempt_id == first.attempt_id
     assert second.thread_id != first.thread_id
@@ -380,7 +398,12 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
     first_raw = wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": ["Provide the external decision."]})
     kernel.receive(first, first_raw)
-    assert kernel.scheduling()["active"] == [{"id": second.lease_id, "subject": "ticket:2", "invocation": second.invocation_id}]
+    assert operations.runner.state().active == (second.lease_id,)
+    assert second.subject == "ticket:2"
+    with kernel.storage.transaction(write=False) as tx:
+        assert [dict(row) for row in tx.rows("SELECT id,subject,invocation FROM leases")] == [
+            {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
+
 
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))
@@ -409,10 +432,10 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:{file_name}").stdout == "Resolved complete content\n"
 
 
-def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path: Path) -> None:
+def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path: Path, monkeypatch) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    effect = advance_to_effect(scenario, "candidate")
-    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
+    held = advance_to_effect(scenario, monkeypatch, "candidate", sent=True)
+    effect = held.effect
     guards = 0
 
     def authorize() -> None:
@@ -420,7 +443,7 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
         guards += 1
         if guards == 2:
             scenario.kernel.control("stop", "stop-after-git-add")
-        scenario.kernel.guard_effect(effect, scenario.execution, scenario.world())
+        held.authorize()
 
     before = scenario.port.git.commit(scenario.delivery.base.sha)
     with pytest.raises(KernelError, match="executor_fenced|operation_cancelled"):
@@ -430,30 +453,45 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
     assert not any(write["operation"] == "candidate" for write in scenario.port.writes())
 
 
+
 def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) -> None:
     original = ticket_spec()
     deliveries = tuple(replace(original.deliveries[0], key=f"ticket:{number}", issue=number) for number in (2, 3, 4))
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries,
+    kernel, ports = native_agent_fixture(tmp_path / "kernel.sqlite3", replace(original, deliveries=deliveries,
                            policy=replace(original.policy, concurrency=1)))
     token = kernel.claim_executor("executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    first = kernel.advance("ticket:2", token, world).call
-    assert first is not None
-    assert kernel.advance("ticket:3", token, world).reason == "agent_capacity"
-    assert kernel.advance("ticket:4", token, world).reason == "agent_capacity"
-    assert kernel.scheduling()["work_fifo"] == ["ticket:3", "ticket:4"]
+    operations = CoreOperations(kernel, token, lambda binding: ports)
+    first = operations.until(lambda step: step.call is not None).call
+    assert first is not None and first.subject == "ticket:2"
+    operations.runner.authorize_agent(first)
+    before = {subject: kernel.status(subject)["budgets"] for subject in ("ticket:3", "ticket:4")}
+    for subject in ("ticket:3", "ticket:4"):
+        waiting = operations.until(lambda step: step.kind == "needs_agent", agent_capacity=0)
+        assert waiting.subject == subject and waiting.call is None
+    with kernel.storage.transaction(write=False) as tx:
+        assert [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")] == ["ticket:3", "ticket:4"]
+    assert {subject: kernel.status(subject)["budgets"] for subject in before} == before
     raw = wire_json({"result_kind": "development", "summary": "Retained", "human_blockers": None})
     kernel.receive(first, raw)
-    assert kernel.advance("ticket:2", token, world, allow_agent=False).kind == "progress"
-    second = kernel.advance("ticket:3", token, world).call
-    assert second is not None
+    assert operations.once(agent_capacity=0).kind == "progress"
+    second = operations.until(lambda step: step.call is not None).call
+    assert second is not None and second.subject == "ticket:3"
     kernel.receive(first, raw)
-    assert kernel.scheduling()["active"] == [{"id": second.lease_id, "subject": "ticket:3", "invocation": second.invocation_id}]
-    assert kernel.advance("ticket:4", token, world).reason == "agent_capacity"
+    assert operations.runner.state().active == (second.lease_id,)
+    with kernel.storage.transaction(write=False) as tx:
+        assert [dict(row) for row in tx.rows("SELECT id,subject,invocation FROM leases")] == [
+            {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
+    assert operations.runner.state().concurrency == 1
+    assert kernel.status("ticket:4")["pending_attempt"] is None
+    assert kernel.status("ticket:4")["budgets"] == before["ticket:4"]
+    with kernel.storage.transaction(write=False) as tx:
+        assert [row[0] for row in tx.rows("SELECT subject FROM work_queue ORDER BY ready")] == ["ticket:4"]
+    operations.runner.authorize_agent(second)
     kernel.receive(second, raw)
-    third = kernel.advance("ticket:4", token, world).call
-    assert third is not None
-    assert len(kernel.scheduling()["active"]) == 1
+    third = operations.until(lambda step: step.call is not None).call
+    assert third is not None and third.subject == "ticket:4"
+    assert operations.runner.state().active == (third.lease_id,)
+
 
 
 def test_full_parent_resume_renews_only_exhausted_development_allowance(tmp_path: Path) -> None:
@@ -546,12 +584,14 @@ def test_parent_ci_target_append_changes_current_work_to_integration_and_retains
     original_ci_events = [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"]
     assert len(original_ci_events) == 1
     scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Default branch advanced\n"}, "ci-then-append")
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     for _ in range(80):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is not None and step.call.role.value == "development" and step.call.purpose.value == "integration":
             call = step.call
             break
-        scenario.handle(step)
+        if step.call is not None:
+            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
         assert step.kind not in {"paused", "complete", "approval", "waiting"}
     else:
         raise AssertionError("new integration Findings did not return to Development")
