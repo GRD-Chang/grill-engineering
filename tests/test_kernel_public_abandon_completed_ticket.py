@@ -10,7 +10,7 @@ from agent_run.runner_lease import default_runner_lock_path, runner_management_l
 from agent_run_kernel import Kernel
 from support.managed_abandon_transport import install_currentness
 from tests.test_kernel_managed_entry_end_to_end import (
-    _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
+    _CODEX, _approval_read_barrier, _control_environment, _git, _hold_host_operation_return, _local_manager,
 )
 
 
@@ -25,6 +25,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
     codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
     codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
     with _approval_read_barrier() as (address, databases, reached, release):
+        _hold_host_operation_return(tmp_path, monkeypatch)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
         install_currentness(tmp_path, state)
