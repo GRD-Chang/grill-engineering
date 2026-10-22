@@ -11,16 +11,27 @@ from agent_run_kernel import DeliveryKind, Kernel, KernelError
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.model import Effect, EffectResult
 from agent_run_kernel.offline import Scenario
+from test_kernel_remote_effects import EffectBoundary, effect_boundary
 
 
 def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
     scenario = Scenario(path, DeliveryKind.PARENT_ONLY)
-    scenario.spec = freeze_creation(scenario.spec, UserDefaultsStore(path / "personal.json"))
-    scenario.kernel = Kernel.create(path / "frozen.sqlite3", scenario.spec)
+    remote = scenario.spec.inputs.repository_remote
+    frozen = freeze_creation(scenario.spec, UserDefaultsStore(path / "personal.json"))
+    scenario.spec = replace(frozen, inputs=replace(frozen.inputs, repository_remote=remote))
+    scenario.kernel = Kernel.create(path / "frozen.sqlite3", scenario.spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("publisher-owner")
-    original = scenario.world
-    monkeypatch.setattr(scenario, "world", lambda: replace(original(), publisher_actor="actual-runner",
-                                                         publisher_identity={"source": "host"}))
+    scenario.publisher = {"actor": "actual-runner", "identity": {"source": "host"}}
+    make_ports = scenario.make_ports
+
+    def selected(binding):
+        ports = make_ports(binding)
+        delivery = ports.delivery
+        ports.delivery = lambda request: replace(delivery(request), publisher_actor=scenario.publisher["actor"],
+            publisher_identity=scenario.publisher["identity"])
+        return ports
+
+    monkeypatch.setattr(scenario, "make_ports", selected)
     return scenario
 
 
@@ -32,13 +43,20 @@ def reach_phase(scenario: Scenario, phase: str) -> None:
     raise AssertionError("delivery never reached " + phase)
 
 
-def prepare_comment(scenario: Scenario) -> Effect:
+def capture_effect(scenario, monkeypatch, operation):
+    with effect_boundary(scenario, monkeypatch, operation):
+        with pytest.raises(EffectBoundary) as boundary:
+            scenario.run()
+    return boundary.value
+
+
+def prepare_comment(scenario: Scenario, monkeypatch) -> Effect:
     assert scenario.run().kind == "approval"
     scenario.kernel.control("approve", "original-approval", subject=scenario.delivery.key, world=scenario.world())
     reach_phase(scenario, "completion_comment")
-    step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-    assert step.effect is not None and step.effect.operation == "completion_comment"
-    return step.effect
+    effect = capture_effect(scenario, monkeypatch, "completion_comment").effect
+    assert effect.operation == "completion_comment"
+    return effect
 
 
 def close_intent(effect: Effect) -> dict:
@@ -53,11 +71,16 @@ def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tm
     scenario.spec = replace(scenario.spec, inputs=None)
     scenario.kernel = Kernel.create(tmp_path / "unconfigured.sqlite3", scenario.spec)
     scenario.execution = scenario.kernel.claim_executor("unconfigured-owner")
-    reach_phase(scenario, "push")
-    world = scenario.world()
+    # A deliberately unconfigured input is a publisher-validation unit, not
+    # a managed native Run. The runner rejects its missing creation binding.
+    from agent_run_kernel.model import World
+    world = World("parent", "graph", "subject", scenario.initial,
+                  publisher_actor="offline-publisher", publisher_identity=None)
     assert world.publisher_actor is not None and world.publisher_identity is None
-    with pytest.raises(KernelError, match="publisher_identity_unproven"):
-        scenario.kernel.advance(scenario.delivery.key, scenario.execution, world)
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        run = tx.one("SELECT * FROM runs")
+        with pytest.raises(KernelError, match="publisher_identity_unproven"):
+            scenario.kernel._publisher_actor(tx, run, world)
 
 
 @pytest.mark.parametrize("changed", ["missing-actor", "missing-selection", "other-selection"])
@@ -66,16 +89,15 @@ def test_remote_intent_requires_the_observed_frozen_runner_identity(
 ) -> None:
     scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
     reach_phase(scenario, "push")
-    world = scenario.world()
     if changed == "missing-actor":
-        world = replace(world, publisher_actor=None)
+        scenario.publisher["actor"] = None
     elif changed == "missing-selection":
-        world = replace(world, publisher_identity=None)
+        scenario.publisher["identity"] = None
     else:
-        world = replace(world, publisher_identity={"source": "pat", "pat": {"env": "OTHER_TOKEN"}})
+        scenario.publisher["identity"] = {"source": "pat", "pat": {"env": "OTHER_TOKEN"}}
     before = scenario.kernel.history(scenario.delivery.key)
     with pytest.raises(KernelError, match="publisher_identity_unproven"):
-        scenario.kernel.advance(scenario.delivery.key, scenario.execution, world)
+        scenario.runner().run_once()
     assert scenario.kernel.history(scenario.delivery.key) == before
 
 
@@ -84,22 +106,26 @@ def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
 ) -> None:
     scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
     reach_phase(scenario, "push")
-    world = scenario.world()
-    effect = scenario.kernel.advance(scenario.delivery.key, scenario.execution, world).effect
-    assert effect is not None and effect.operation == "push"
+    boundary = capture_effect(scenario, monkeypatch, "push")
+    effect = boundary.effect
+    assert effect.operation == "push"
     assert effect.actor == "actual-runner"
-    changed = replace(world, publisher_actor="different-account")
+    scenario.publisher["actor"] = "different-account"
     with pytest.raises(KernelError, match="publisher_identity_changed"):
-        scenario.kernel.dispatch(effect, scenario.execution, changed)
-    assert scenario.kernel.dispatch(effect, scenario.execution, world)
+        boundary.authorize()
+    scenario.publisher["actor"] = "actual-runner"
+    boundary.authorize()
+    scenario.publisher["actor"] = "different-account"
     with pytest.raises(KernelError, match="publisher_identity_changed"):
-        scenario.kernel.guard_effect(effect, scenario.execution, changed)
-    scenario.kernel.guard_effect(effect, scenario.execution, world)
-    scenario.port.execute(effect)
-    scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, world)
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, world).kind == "progress"
+        boundary.authorize()
+    scenario.publisher["actor"] = "actual-runner"
+    boundary.authorize()
+    scenario.port.execute(effect)  # Complete the physical request already authorized above.
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    scenario.publisher["actor"] = "different-account"
     with pytest.raises(KernelError, match="publisher_identity_changed"):
-        scenario.kernel.advance(scenario.delivery.key, scenario.execution, replace(scenario.world(), publisher_actor="different-account"))
+        scenario.runner().run_once()
     with scenario.kernel.storage.transaction(write=False) as tx:
         local = tx.rows("SELECT actor FROM effects WHERE operation IN ('candidate','integrate','publication_commit')")
         assert local and all(row[0] is None for row in local)
@@ -110,22 +136,38 @@ def test_close_inherits_only_the_confirmed_original_comment_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign: bool,
 ) -> None:
     scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
-    comment = prepare_comment(scenario)
-    assert scenario.kernel.dispatch(comment, scenario.execution, scenario.world())
+    comment = prepare_comment(scenario, monkeypatch)
     intent = close_intent(comment)
     if foreign:
         intent["merge_sha"] = "another-merge"
-    scenario.kernel.reconcile(comment, EffectResult("target", raw={"close_intent": intent}),
-                              scenario.execution, scenario.world())
+    make_ports = scenario.make_ports
+
+    def comment_receipt(binding):
+        ports = make_ports(binding)
+        execute = ports.execute
+
+        def written(effect, authorize):
+            if effect.operation == "completion_comment":
+                assert effect == comment
+                authorize()
+                return EffectResult("target", raw={"close_intent": intent})
+            return execute(effect, authorize)
+
+        ports.execute = written
+        return ports
+
+    with monkeypatch.context() as receipt_patch:
+        receipt_patch.setattr(scenario, "make_ports", comment_receipt)
+        assert scenario.runner().run_once().kind == "progress"
     if foreign:
         with pytest.raises(KernelError, match="foreign_close_intent"):
-            scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+            scenario.runner().run_once()
         assert scenario.kernel.status(scenario.delivery.key)["phase"] == "completion_comment"
         return
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
-    reopened = Kernel(scenario.kernel.storage.path)
-    close = reopened.advance(scenario.delivery.key, scenario.execution, scenario.world()).effect
-    assert close is not None and close.operation == "close"
+    assert scenario.runner().run_once().kind == "progress"
+    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    close = capture_effect(scenario, monkeypatch, "close").effect
+    assert close.operation == "close"
     assert close.payload.get("close_intent") == intent
     assert close.actor == comment.actor
     assert close.effect_id != comment.effect_id
@@ -135,21 +177,17 @@ def test_same_actor_close_seen_before_first_dispatch_is_not_adopted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
-    comment = prepare_comment(scenario)
-    assert scenario.kernel.dispatch(comment, scenario.execution, scenario.world())
-    scenario.port.execute(comment)
-    scenario.kernel.reconcile(comment, scenario.port.reconcile(comment), scenario.execution, scenario.world())
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
-    step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-    close = step.effect
-    assert close is not None and close.operation == "close"
+    comment = prepare_comment(scenario, monkeypatch)
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    close = capture_effect(scenario, monkeypatch, "close").effect
+    assert close.operation == "close"
     # Even the exact actor and prospective target cannot prove a request which
     # this Run has not dispatched. This is a separate external-store change.
     with sqlite3.connect(scenario.port.database) as db:
         db.execute("INSERT INTO closed VALUES (?,?,?,?)", (close.payload["issue"], close.effect_id,
                                                           close.actor, close.payload["merge_sha"]))
-    scenario.handle(step)
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "paused"
+    assert scenario.runner().run_once().kind == "paused"
     with scenario.kernel.storage.transaction(write=False) as tx:
         original = tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (close.effect_id,))
         assert tuple(original) == ("prepared", 0, None)
@@ -161,26 +199,25 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
-    comment = prepare_comment(scenario)
-    assert scenario.kernel.dispatch(comment, scenario.execution, scenario.world())
-    scenario.port.execute(comment)
-    scenario.kernel.reconcile(comment, scenario.port.reconcile(comment), scenario.execution, scenario.world())
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
-    close = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).effect
-    assert close is not None and close.operation == "close"
-    assert scenario.kernel.dispatch(close, scenario.execution, scenario.world())
+    comment = prepare_comment(scenario, monkeypatch)
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    boundary = capture_effect(scenario, monkeypatch, "close")
+    close = boundary.effect
+    assert close.operation == "close"
+    boundary.authorize()
     prior = scenario.port.reconcile(close)
     assert prior.disposition == "prior"
-    assert scenario.kernel.reconcile(close, prior, scenario.execution, scenario.world()).kind == "progress"
-    rearmed = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).effect
-    assert rearmed is not None and rearmed.effect_id == close.effect_id
+    assert scenario.runner().run_once().kind == "progress"
+    rearmed = capture_effect(scenario, monkeypatch, "close").effect
+    assert rearmed.effect_id == close.effect_id
     assert rearmed.dispatch_serial == 2
     # The original dispatched request completes after its earlier prior read.
     scenario.port.execute(close)
     target = scenario.port.reconcile(rearmed)
     assert target.disposition == "target"
-    assert scenario.kernel.reconcile(rearmed, target, scenario.execution, scenario.world()).kind == "progress"
-    assert scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world()).kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (close.effect_id,))) == ("confirmed", 1)

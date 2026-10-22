@@ -21,6 +21,7 @@ class EffectBoundary(Exception):
 
     def __init__(self, effect, authorize):
         self.effect, self.authorize = effect, authorize
+        self.phase = "execute" if authorize is not None else "reconcile"
         super().__init__(effect.operation)
 
 
@@ -30,7 +31,7 @@ def effect_boundary(scenario, monkeypatch, operation, *, sent=False):
 
     def intercepted(binding):
         ports = make_ports(binding)
-        execute = ports.execute
+        execute, reconcile = ports.execute, ports.reconcile
 
         def hold(effect, authorize):
             if effect.operation == operation:
@@ -39,7 +40,12 @@ def effect_boundary(scenario, monkeypatch, operation, *, sent=False):
                 raise EffectBoundary(effect, authorize)
             return execute(effect, authorize)
 
-        ports.execute = hold
+        def readback(effect):
+            if effect.operation == operation:
+                raise EffectBoundary(effect, None)
+            return reconcile(effect)
+
+        ports.execute, ports.reconcile = hold, readback
         return ports
 
     with monkeypatch.context() as boundary_patch:

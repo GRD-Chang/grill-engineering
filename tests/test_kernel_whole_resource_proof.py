@@ -2,6 +2,9 @@
 
 These synthetic import records test the Kernel consumer, not v6 conversion or
 Task admission. The migration writer has its own original-source oracle.
+This file calls the internal consumer transitions explicitly: it is not a runner,
+physical deletion or end-to-end migration test, and does not bypass native source
+admission by supplying fake ports.
 """
 from __future__ import annotations
 
@@ -154,7 +157,7 @@ def test_returned_ticket_cleanup_uses_its_proof_when_another_ticket_owns_the_run
     tmp_path: Path, stage: int, operation: str, head: str,
 ) -> None:
     kernel, execution, world = imported_cleanup(tmp_path, stage=stage)
-    step = kernel.advance_cleanup("ticket:3", execution, world)
+    step = kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     assert step.kind == "effect" and step.effect is not None
     assert step.effect.operation == operation
     assert step.effect.before_sha == step.effect.payload["expected_head"] == head
@@ -163,7 +166,7 @@ def test_returned_ticket_cleanup_uses_its_proof_when_another_ticket_owns_the_run
 
 def test_final_cleanup_uses_the_original_run_root_ref_not_the_later_published_head(tmp_path: Path) -> None:
     kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1")
-    step = kernel.advance_cleanup("final:1", execution, world)
+    step = kernel._advance_cleanup("final:1", execution, world, token=kernel._begin_automatic_step(execution, "final:1", cleanup=True))
     assert step.kind == "effect" and step.effect is not None
     assert step.effect.operation == "cleanup_local_ref"
     assert step.effect.source_ref == "refs/heads/original/run"
@@ -213,31 +216,31 @@ def test_whole_run_cleanup_refuses_unproven_or_cross_subject_ownership(tmp_path:
                 (selected["proof_id"], old_id))
         updated = tx.put(manifest["subject"], "v6_run_import", wire_json(body))
         tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (updated,))
-    step = kernel.advance_cleanup("ticket:3", execution, world)
+    step = kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
     assert kernel.status("ticket:3")["resource_cleanup"]["effect_id"] is None
 
 
 def test_imported_cleanup_unknown_result_remains_the_same_intent_across_reopen(tmp_path: Path) -> None:
     kernel, execution, world = imported_cleanup(tmp_path)
-    step = kernel.advance_cleanup("ticket:3", execution, world)
-    assert step.effect is not None and kernel.dispatch(step.effect, execution, world)
+    step = kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
+    assert step.effect is not None and kernel._dispatch(step.effect, execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     kernel = Kernel(kernel.storage.path)
-    assert kernel.advance_cleanup("ticket:3", execution, world).effect == step.effect
-    kernel.reconcile(step.effect, EffectResult("unknown"), execution, world)
-    pending = kernel.advance_cleanup("ticket:3", execution, world)
+    assert kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True)).effect == step.effect
+    kernel._reconcile(step.effect, EffectResult("unknown"), execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
+    pending = kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     assert pending.kind == "reconcile" and pending.effect == step.effect
     assert kernel.status("ticket:3")["resource_cleanup"]["stage"] == 0
-    kernel.reconcile(step.effect, EffectResult("target"), execution, world)
-    assert kernel.advance_cleanup("ticket:3", execution, world).kind == "progress"
+    kernel._reconcile(step.effect, EffectResult("target"), execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
+    assert kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True)).kind == "progress"
     assert kernel.status("ticket:3")["resource_cleanup"]["stage"] == 1
 
 
 def test_stop_after_preparation_fences_imported_cleanup_before_dispatch(tmp_path: Path) -> None:
     kernel, execution, world = imported_cleanup(tmp_path)
-    step = kernel.advance_cleanup("ticket:3", execution, world)
+    step = kernel._advance_cleanup("ticket:3", execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     assert step.effect is not None
     kernel.control("stop", "stop-before-imported-delete")
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel.dispatch(step.effect, execution, world)
+        kernel._dispatch(step.effect, execution, world, token=kernel._begin_automatic_step(execution, "ticket:3", cleanup=True))
     assert kernel.status("ticket:3")["resource_cleanup"]["stage"] == 0
