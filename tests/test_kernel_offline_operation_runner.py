@@ -9,6 +9,32 @@ from agent_run_kernel.model import Issue, ParentIssue
 from agent_run_kernel.offline import GraphScenario, Scenario
 
 
+def test_abandon_terminal_comes_from_core_without_completing_the_delivery(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / 'abandon', DeliveryKind.PARENT_ONLY)
+    from agent_run_kernel.local_effects import LocalEffects
+    before = scenario.kernel.status(scenario.delivery.key)
+    inspections = LocalEffects(scenario.port.git).inspect_resources(scenario.kernel.generation_resources())
+    assert scenario.kernel.control('abandon', 'original-abandon', resource_inspections=inspections) == 'pending'
+    assert scenario.run().kind == 'complete'
+    assert scenario.kernel.operation_state().disposition == 'complete'
+    after = scenario.kernel.status(scenario.delivery.key)
+    assert after['phase'] == before['phase'] == 'workspace'
+    assert after['budgets'] == before['budgets']
+    assert scenario.role_calls == []
+    assert [write['operation'] for write in scenario.port.writes()] == ['inspect_resources', 'abandon_worktree']
+
+
+def test_quiescent_run_uses_core_state_and_does_not_allocate_work(tmp_path: Path) -> None:
+    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement.', (2,)), (
+        Issue(2, 'Ticket', 'Waiting for the operator ready label.', 'OPEN'),))
+    scenario = GraphScenario(tmp_path / 'not-ready', source)
+    assert scenario.kernel.operation_state().disposition == 'quiescent'
+    boundary = scenario.run()
+    assert (boundary.kind, boundary.reason) == ('waiting', 'quiescent')
+    assert scenario.kernel.status('ticket:2')['pending_attempt'] is None
+    assert scenario.role_calls == [] and scenario.port.writes() == []
+
+
 @pytest.mark.parametrize('gate', ['stop', 'requirements'])
 def test_world_before_manual_control_neither_claims_nor_allocates(tmp_path: Path, monkeypatch, gate: str) -> None:
     scenario = Scenario(tmp_path / gate, DeliveryKind.PARENT_ONLY)

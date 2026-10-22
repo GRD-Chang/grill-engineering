@@ -878,11 +878,14 @@ class Scenario:
             if step.subject and step.subject != self.delivery.key:
                 continue  # The assertion focus never chooses Core's work.
             if not step.subject:
+                if step.kind == "complete":
+                    return Step("complete", self.delivery.key, step.reason)
                 state = self.kernel.status(self.delivery.key)
+                blocked = self.kernel.source_status()["blocked"]
                 if state["phase"] == "approval":
                     step = Step("approval", self.delivery.key)
-                elif state["gates"] or state["stopped"] or state["blocked"]:
-                    reason = state["gates"][0] if state["gates"] else state["blocked"] or "operator_stopped"
+                elif state["gates"] or state["stopped"] or blocked:
+                    reason = state["gates"][0] if state["gates"] else blocked or "operator_stopped"
                     step = Step("paused", self.delivery.key, reason)
                 elif step.kind == "quiescent":
                     step = Step("waiting", self.delivery.key, "quiescent", retry_at=step.retry_at)
