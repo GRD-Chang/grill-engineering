@@ -163,7 +163,11 @@ if {replacement!r} == 'symlink':
 def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:
     scenario = final_scenario(tmp_path / "scenario")
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    call = operations.until(lambda step: step.call is not None).call
+    def review_ready(step):
+        if step.call is None:
+            assert step.kind in {"effect", "progress"}, step
+        return step.call is not None
+    call = operations.until(review_ready).call
     assert call is not None and call.role.value == "review" and call.context["readonly"] is True
     checkout = Path(call.context["checkout"])
     original = (checkout / "README.md").read_bytes()
