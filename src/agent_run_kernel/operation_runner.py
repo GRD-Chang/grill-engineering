@@ -64,8 +64,8 @@ class DeliveryFacts:
 class OperationState:
     concurrency: int
     active: tuple[str, ...]  # Durable lease identities, never Future completion.
-    cancel: tuple[str, ...]
-    wake_at: float | None
+    cancel: tuple[str, ...]  # The same lease identity space as active.
+    wake_at: float | None  # Absolute time in Kernel.clock's domain.
     disposition: Literal["ready", "waiting", "quiescent", "complete"]
 
 
@@ -82,17 +82,28 @@ class OperationPorts(Protocol):
 
 
 class OperationRunner:
-    """Factory: kernel.operation_runner(execution, ports).
+    """Factory: kernel.operation_runner(execution, make_ports).
 
-    Build ports with kernel.operation_binding(execution), a read-only frozen
-    configuration call. Host runs at most one run_once Future in its independent I/O pool. A
+    Core obtains the frozen binding, then calls make_ports(binding); Host never
+    pre-reads Core SQL or substitutes future defaults. Host runs at most one
+    run_once Future in its independent I/O pool. A
     bootstrap authorization reads inline in the Agent thread, never queues back
     into a pool it is waiting on. Native raw/exit/thread/activity hooks remain
     their existing exact-call record interfaces.
+
+    agent_capacity is this call's available new physical Agent slots. Zero
+    still permits returned-result consumption, mechanical work and polls.
+    state and run_once use the same transition selection. worker_settled uses
+    exact durable exit/non-start proof plus lease release, never Future.done.
+    Source outages retain their existing bounded wait; failed post-write reads
+    retain the sent intent, and unknown does not authorize rewriting. Each real
+    write calls authorize immediately beforehand; external I/O holds no SQL tx.
     """
-    def __init__(self, kernel: Kernel, execution: Execution, ports: OperationPorts) -> None:
-        self.kernel, self.execution, self.ports = kernel, execution, ports
-        self.binding = kernel.operation_binding(execution)
+    def __init__(self, kernel: Kernel, execution: Execution,
+                 make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
+        self.kernel, self.execution = kernel, execution
+        self.binding = kernel._operation_binding(execution)
+        self.ports = make_ports(self.binding)
 
     def state(self) -> OperationState:
         return self.kernel.operation_state()

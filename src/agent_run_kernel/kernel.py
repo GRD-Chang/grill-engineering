@@ -50,10 +50,10 @@ class Kernel:
         self.storage = Storage(path)
         self.clock: Callable[[], float] = time.time
 
-    def operation_runner(self, execution: Execution, ports: OperationPorts) -> OperationRunner:
-        return OperationRunner(self, execution, ports)
+    def operation_runner(self, execution: Execution, make_ports: Callable[[OperationBinding], OperationPorts]) -> OperationRunner:
+        return OperationRunner(self, execution, make_ports)
 
-    def operation_binding(self, execution: Execution) -> OperationBinding:
+    def _operation_binding(self, execution: Execution) -> OperationBinding:
         """Frozen physical configuration; no source refresh or work admission."""
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")

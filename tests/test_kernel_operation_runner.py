@@ -59,7 +59,7 @@ class Ports:
 def setup(tmp_path, *, concurrency=1):
     s = GraphScenario(tmp_path / "graph", independent_source(), policy=Policy(concurrency=concurrency))
     ports = Ports(s)
-    return s, ports, s.kernel.operation_runner(s.execution, ports)
+    return s, ports, s.kernel.operation_runner(s.execution, lambda binding: ports)
 
 
 def test_readonly_selection_pages_130_tickets_without_allocating(tmp_path: Path):
@@ -147,3 +147,17 @@ def test_one_operation_returns_committed_publication_final_and_cleanup_boundarie
                 assert s.kernel.status(subject)["resource_cleanup"]["state"] == "complete"
             return
     raise AssertionError("Core did not admit Final after original Ticket completion")
+
+
+def test_binding_factory_runs_after_core_fixes_frozen_inputs(tmp_path):
+    s = GraphScenario(tmp_path / "binding", independent_source())
+    seen = []
+    def make_ports(binding):
+        assert binding.repository == "example/project"
+        assert binding.parent_number == 1
+        assert binding.inputs.runner_identity == {"source": "host"}
+        seen.append(binding)
+        return Ports(s)
+    runner = s.kernel.operation_runner(s.execution, make_ports)
+    assert seen == [runner.binding]
+    assert runner.binding.repository_root == s.port.git.root.resolve()
