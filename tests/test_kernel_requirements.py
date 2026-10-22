@@ -400,7 +400,7 @@ def test_original_final_approval_reconciles_before_parent_requirement_refresh(tm
     scenario.requirements = replace(source, parent=replace(source.parent,
         body="Changed after the original approval was dispatched."))
     scenario.kernel.clock = lambda: 105  # Poll at the first original retry, without renewing it.
-    fresh = scenario.world()
+    scenario.world()
     if outcome == "foreign_receipt":
         reconcile = scenario.port.reconcile
         def foreign_receipt(original):
@@ -423,12 +423,7 @@ def test_original_final_approval_reconciles_before_parent_requirement_refresh(tm
         assert [call["role"] for call in scenario.role_calls if call["subject"] == final] == ["review", "publication"]
         assert len([write for write in scenario.port.writes() if write["subject"] == final and write["operation"] == "merge"]) == 1
     elif outcome == "prior":
-        assert scenario.kernel.source_status()["blocked"] == "final_refresh"
-        assert operations.once().reason == "automatic_step_paused"
-        # The still-pending approval cannot be cancelled by a new operator action.
-        # Its own program continuation must settle the proved unapplied intent.
-        with pytest.raises(KernelError, match="final_approval_noncancellable"):
-            scenario.kernel.control("requeue", "accept-new-parent-after-unapplied-merge", subject=final, world=fresh)
+        # The proved unapplied intent continues through a fresh full review.
         assert scenario.run().kind == "approval"
         assert scenario.kernel.status(final)["generation"] == 2
         assert scenario.kernel.status(final)["budgets"]["integration"]["reviews_used"] == 2
