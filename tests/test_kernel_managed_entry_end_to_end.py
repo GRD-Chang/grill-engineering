@@ -680,6 +680,35 @@ def _approval_read_barrier(*, boundary=None, released=None):
         assert not serving.is_alive() and not errors, errors
 
 
+def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offer committed operation returns to the existing control barrier.
+
+    A quiescent approval needs no extra source poll. Instrument only the actual
+    Host process at the public operation seam; keep its command, Core execution
+    and returned Step intact. Other Python processes retain their normal entry.
+    """
+    hook = directory / "host-return-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text('''import os, sys
+if sys.orig_argv[1:3] == ["-m", "agent_run_kernel.executor"]:
+    import socket
+    from agent_run_kernel.operation_runner import OperationRunner
+    original_run_once = OperationRunner.run_once
+    def observe_return(self, *, agent_capacity=1):
+        step = original_run_once(self, agent_capacity=agent_capacity)
+        if step.kind in {"progress", "approval"} and step.call is None:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                channel.settimeout(25)
+                channel.connect(chr(0) + os.environ["ENTRY_APPROVAL_CONTROL"][1:])
+                channel.sendall(b"1")
+                channel.shutdown(socket.SHUT_WR)
+                assert channel.recv(1) == b"1"
+        return step
+    OperationRunner.run_once = observe_return
+''')
+    monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+
+
 def test_public_revise_repairs_the_real_final_pr_from_original_feedback_in_the_same_managed_host(
     git_repo: Path, tmp_path: Path, monkeypatch,
 ) -> None:
@@ -704,6 +733,7 @@ content = 'Implementation""")
 if role == 'development':
 """)
     with _approval_read_barrier() as (address, databases, reached, release):
+        _hold_host_operation_return(tmp_path, monkeypatch)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         monkeypatch.setenv("ENTRY_REVISION_MESSAGE", message)
         environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
@@ -820,6 +850,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 "SELECT id FROM leases WHERE subject='ticket:2'")
 
     with _worker_controls(tmp_path) as (worker_address, arrivals), _approval_read_barrier(boundary=current_boundary, released=released) as (address, databases, reached, release):
+        _hold_host_operation_return(tmp_path, monkeypatch)
         monkeypatch.setenv("ENTRY_WORKER_CONTROL", worker_address)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         monkeypatch.setenv("ENTRY_REQUEUE_BODY", fresh_body)
