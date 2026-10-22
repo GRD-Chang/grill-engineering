@@ -389,3 +389,57 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
     assert s.port.writes() == writes
     assert sum(write["operation"] == "merge" for write in writes) == 1
     assert ("write_result_unknown" if uncertain == "unknown" else "write_conflict") in s.kernel.status(effect.subject)["gates"]
+
+
+def test_original_approved_prior_merge_continues_new_review_without_a_new_control(tmp_path):
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)),
+                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
+    s = GraphScenario(tmp_path / "graph", source)
+    ports = Ports(s)
+    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    for _ in range(120):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        if s.kernel.source_status()["final_subject"] is not None and s.kernel.status("final:1")["phase"] == "approval":
+            break
+    else:
+        raise AssertionError("Final did not reach its real first approval")
+    s.kernel.control("approve", "original-final-approval", subject="final:1", world=runner.observe("final:1"))
+    execute = ports.execute
+    sent = []
+
+    def interrupted(effect, authorize):
+        if effect.subject == "final:1" and effect.operation == "merge":
+            authorize()
+            sent.append(effect)
+            raise OSError("Original merge was interrupted before remote application")
+        return execute(effect, authorize)
+
+    ports.execute = interrupted
+    for _ in range(10):
+        runner.run_once()
+        if sent:
+            break
+    effect, = sent
+    assert ports.reconcile(effect).disposition == "prior"
+    s.requirements = replace(source, parent=replace(source.parent, body="Changed after the original approval"))
+    runner.observe("final:1")
+    ports.execute = execute
+    assert runner.run_once().kind == "progress"
+    assert s.kernel.source_status()["blocked"] == "final_refresh"
+    with pytest.raises(KernelError, match="final_approval_noncancellable"):
+        s.kernel.control("requeue", "cannot-replace-approval", subject="final:1", world=s.kernel.observe_control("final:1", lambda binding: ports))
+    assert runner.state().disposition == "ready"
+    for _ in range(80):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(s, runner, step.call)
+        status = s.kernel.status("final:1")
+        if status["phase"] == "approval":
+            break
+    else:
+        raise AssertionError("The original proved-unapplied approval never continued")
+    assert status["generation"] == 2
+    assert status["budgets"]["integration"]["reviews_used"] == 2
+    assert not [write for write in s.port.writes() if write["subject"] == "final:1" and write["operation"] == "merge"]

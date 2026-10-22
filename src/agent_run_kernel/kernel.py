@@ -139,7 +139,7 @@ class Kernel:
         continuation = self._continuation_wait(tx, job)
         if continuation is not None and continuation.reason in {"agent_running", "previous_invocation_exit"}:
             return continuation
-        refreshing = job["refresh_revision"] is not None and run["blocked"] == "final_refresh" and "operator_stopped" not in gates
+        refreshing = job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False)
         if run["stopped"] or (run["blocked"] or gates) and not refreshing:
             return Step("paused", subject, self._pause_reason(tx, subject, run))
         if pending is not None or refreshing or job["validation_cleanup"] or tx.rows(
@@ -1734,8 +1734,7 @@ class Kernel:
                 if pending["status"] == "observed":
                     return self._apply_effect(tx, run, job, pending, world)
                 return Step("effect", subject, effect=self._effect(tx, pending, execution))
-            if (job["refresh_revision"] is not None and not run["stopped"] and run["blocked"] == "final_refresh"
-                    and not any(gate["code"] == "operator_stopped" for gate in self._gates(tx, subject))):
+            if job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False):
                 if world is None:
                     return Step("observe", subject)
                 return self._refresh_final(tx, run, job, world)
@@ -1840,11 +1839,20 @@ class Kernel:
                 scope["requeue_action"] = requeue["id"]
         return scope
 
-    def _automatic_requeue_read(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> bool:
-        # This permits an observation only. Retirement still checks the exact
-        # accepted versions, PR identity and publisher before any external write.
-        return bool(subject is not None and not cleanup and not run["stopped"] and not run["final_action"]
-                    and run["blocked"] == "requeue_required" and self._pending_requeue(tx, subject) is not None
+    def _automatic_control_read(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> bool:
+        # Observation grants no write. The original approved Final Action owns
+        # its proved-unapplied merge continuation; a new requeue cannot take it.
+        if subject is None or cleanup or run["stopped"]:
+            return False
+        if run["blocked"] == "final_refresh" and run["final_action"]:
+            job = self._job(tx, subject)
+            return bool(job["kind"] == DeliveryKind.FINAL_RUN and job["phase"] == "refresh_final"
+                        and job["refresh_revision"] == run["observed_parent_revision"] and not self._gates(tx, subject)
+                        and tx.rows("SELECT id FROM actions WHERE id=? AND subject=? AND status='pending' AND kind IN ('approve','resume')",
+                                    (run["final_action"], subject)))
+        # Retirement still checks accepted versions, PR identity and publisher.
+        return bool(not run["final_action"] and run["blocked"] == "requeue_required"
+                    and self._pending_requeue(tx, subject) is not None
                     and all(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)))
 
     def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> str:
@@ -1906,7 +1914,7 @@ class Kernel:
                 if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
                     raise KernelError("effect_binding")
             if (readback is None and self._abandon_action(tx) is None
-                    and not self._automatic_requeue_read(tx, run, scope["subject"], scope["cleanup"]) and
+                    and not self._automatic_control_read(tx, run, scope["subject"], scope["cleanup"]) and
                     (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
                 raise KernelError("automatic_step_paused")
             owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
@@ -1959,7 +1967,7 @@ class Kernel:
                 return Step("waiting", subject or "", "observation_superseded")
             gates = [] if subject is None else self._gates(tx, subject)
             abandoned = self._abandon_action(tx)
-            requeue = self._automatic_requeue_read(tx, run, subject, scope["cleanup"])
+            requeue = self._automatic_control_read(tx, run, subject, scope["cleanup"])
             timed_out = run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in gates)
             if (timed_out
                     or ((abandoned is None or abandoned["status"] != "pending") and not requeue
