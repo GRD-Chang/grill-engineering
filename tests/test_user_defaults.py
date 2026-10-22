@@ -150,3 +150,40 @@ def test_save_reports_normalized_model_and_result(tmp_path: Path) -> None:
     assert result["changed"]["profile"]["development_model"] == "custom-model"
     assert result["profile"]["profiles"]["development"]["model"] == "custom-model"
     assert json.loads(store.path.read_text())["profile"]["development_model"] == "custom-model"
+
+
+@pytest.mark.parametrize("source", ["app", "host"])
+def test_app_settings_sync_failure_restores_identity_and_preserves_legacy_materials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+) -> None:
+    import os
+    import stat
+
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    app = {"app_id": "123", "installation_id": "456", "private_key_path": str(tmp_path / "key")}
+    key = tmp_path / "key"
+    key.write_bytes(b"synthetic private material")
+    legacy = tmp_path / "github-app.json"
+    legacy.write_text(json.dumps(app))
+    store.configure(github={"worker_source": "app", "app": app})
+    before = store.path.read_bytes()
+    legacy_before, key_before = legacy.read_bytes(), key.read_bytes()
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_once(descriptor: int) -> None:
+        nonlocal failed
+        if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected settings directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("agent_run.user_defaults.os.fsync", fail_once)
+    with pytest.raises(OSError, match="injected settings directory fsync failure"):
+        store.configure(github={"worker_source": source, "app": {**app, "app_id": "789"}})
+    assert store.path.read_bytes() == before
+    assert store.path.stat().st_mode & 0o777 == 0o600
+    assert store.describe()["github"]["worker"]["app_profile"] == app
+    assert legacy.read_bytes() == legacy_before
+    assert key.read_bytes() == key_before
+    assert not list(tmp_path.glob("*.tmp"))

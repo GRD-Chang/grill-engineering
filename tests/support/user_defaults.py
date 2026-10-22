@@ -6,11 +6,11 @@ import json
 from contextlib import redirect_stdout
 from io import StringIO
 from typing import Any
-from agent_run import cli
+from agent_run_kernel.query_cli import main
 
 
 def settings(*arguments: str) -> tuple[int, dict[str, Any]]:
     output = StringIO()
     with redirect_stdout(output):
-        code = cli.main(["settings", *arguments, "--json"])
+        code = main(["settings", *arguments, "--json"])
     return code, json.loads(output.getvalue())

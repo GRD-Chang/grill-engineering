@@ -590,3 +590,18 @@ def test_private_key_input_is_bounded_and_private(tmp_path, kind):
         key.chmod(0o644 if kind == "public" else 0o600)
     with pytest.raises(GitHubCredentialError, match="private key"):
         mint_installation_credential(GitHubAppProfile("123", "456", key))
+
+
+def test_malformed_private_key_is_rejected_before_issuing_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = tmp_path / "malformed.pem"
+    key.write_text("synthetic malformed private key")
+    key.chmod(0o600)
+
+    def no_request(*args: object, **kwargs: object) -> None:
+        pytest.fail("malformed signing input must not issue an installation credential")
+
+    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", no_request)
+    with pytest.raises(GitHubCredentialError, match="could not sign GitHub App JWT"):
+        mint_installation_credential(GitHubAppProfile("123", "456", key))
