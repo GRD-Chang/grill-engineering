@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
 from agent_run_kernel.offline import Scenario
-from support.core_operations import CoreOperations, native_agent_fixture
+from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
 
 
 @pytest.mark.parametrize(("kind", "expected"), [(DeliveryKind.TICKET, 1), (DeliveryKind.PARENT_ONLY, 2), (DeliveryKind.FINAL_RUN, 2)])
@@ -91,21 +91,29 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
 
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN, policy=Policy(resync_limit=0))
+    scenario = final_scenario(tmp_path / "scenario", policy=Policy(resync_limit=0))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    execute = scenario.port.execute
+    appended = []
+
+    def append_after_integration(effect, authorize=None):
+        result = execute(effect, authorize)
+        if effect.operation == "integrate" and not appended:
+            appended.append(scenario.port.external_remote_append(scenario.delivery.source_ref,
+                {"foreign-source.txt": "Source work\n"}, "open-source"))
+            scenario.port.external_remote_append(scenario.delivery.target_ref,
+                {"foreign-target.txt": "Target work\n"}, "open-target")
+        return result
+
+    scenario.port.execute = append_after_integration
     for _ in range(50):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-        if step.effect is not None and step.effect.operation == "integrate":
+        step = operations.once()
+        assert step.call is None, step
+        if appended:
             break
-        scenario.handle(step)
     else:
         raise AssertionError("Integration was not reached")
-    effect = step.effect
-    assert effect is not None
-    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
-    scenario.port.execute(effect, lambda: scenario.kernel.guard_effect(effect, scenario.execution, scenario.world()))
-    source = scenario.port.external_remote_append(scenario.delivery.source_ref, {"foreign-source.txt": "Source work\n"}, "open-source")
-    scenario.port.external_remote_append(scenario.delivery.target_ref, {"foreign-target.txt": "Target work\n"}, "open-target")
-    scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world())
+    source = appended[0]
     opened = scenario.kernel.status(scenario.delivery.key)["resync"]
     assert (opened["used"], opened["window"], opened["open"]) == (0, 1, True)
     assert scenario.run().kind == "approval"
@@ -128,7 +136,6 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
     operations = CoreOperations(kernel, executor, lambda binding: ports)
-    world = World("parent", "graph", "requirements", base)
     first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "backend-thread")
@@ -167,7 +174,6 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
     operations = CoreOperations(kernel, executor, lambda binding: ports)
-    world = World("parent", "graph", "requirements", base)
     first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "backend-thread")
@@ -207,7 +213,6 @@ def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
     operations = CoreOperations(kernel, executor, lambda binding: ports)
-    world = World("parent", "graph", "requirements", base)
     first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "original-backend-thread")
@@ -251,7 +256,6 @@ def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: 
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
     operations = CoreOperations(kernel, executor, lambda binding: ports)
-    world = World("parent", "graph", "requirements", base)
     call = operations.once().call
     assert call is not None
     now[0] = 107.25
@@ -270,7 +274,6 @@ def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
     operations = CoreOperations(kernel, executor, lambda binding: ports)
-    world = World("parent", "graph", "requirements", base)
     call = operations.once().call
     assert call is not None and kernel.dispatch_agent(call)
     kernel.bind_thread(call, "backend-thread")

@@ -6,10 +6,10 @@ from pathlib import Path
 
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.offline import Scenario
-from support.core_operations import CoreOperations, native_agent_fixture
+from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 
 
 def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_path: Path) -> None:
@@ -54,7 +54,6 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
     kernel.clock = lambda: now[0]
     execution = kernel.claim_executor("owner")
     operations = CoreOperations(kernel, execution, lambda binding: ports)
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
     first = operations.once().call
     assert first is not None and first.profile.model == "first-model" and first.profile_revision == 1
     assert first.context["language"] == "en" and first.context["_prompt_resources"] == resources
@@ -109,9 +108,10 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
     revision = scenario.kernel.configure_profiles("choose-profile", preset="economy", overrides={
         "development_model": "selected-development", "publication_from_development": True,
     })
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     development = None
     for _ in range(40):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is not None and step.call.role == "development":
             development = step.call
         if step.call is not None and step.call.role == "publication":
@@ -123,7 +123,8 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
             assert call.profile_reference == development.profile_reference is None
             assert call.context["language"] == "zh" and call.context["repository_root"] == str(scenario.port.git.root.resolve())
             break
-        scenario.handle(step)
+        if step.call is not None:
+            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
     else:
         raise AssertionError("Publication was not allocated")
     scenario.kernel.configure_profiles("separate-publication", overrides={"publication_model": "independent-publication"})
@@ -135,6 +136,10 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
 def test_publication_failure_observation_survives_successful_exact_readback(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     scenario.port.lose_response.add("pr_write")
+    unresolved = scenario.run()
+    assert unresolved.kind == "waiting" and unresolved.reason == "original_write_readback_required"
+    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     assert scenario.run().kind == "approval"
     assert scenario.port.pull_request(scenario.delivery.key) is not None
     with scenario.kernel.storage.transaction(write=False) as tx:

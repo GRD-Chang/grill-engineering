@@ -7,11 +7,22 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from agent_run_kernel import (Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Kernel,
+from agent_run_kernel import (AgentCall, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Kernel, Policy,
                               ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step)
-from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
+from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner
+
+
+if TYPE_CHECKING:
+    from agent_run_kernel.offline import GraphScenario
+
+
+def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
+                    agent: Callable[[AgentCall], bytes]) -> None:
+    """A fixture Agent's raw result only; no invented start or exit observation."""
+    runner.authorize_agent(call)
+    kernel.receive(call, agent(call))
 
 
 class ReadOnlyPorts:
@@ -73,6 +84,40 @@ def native_agent_fixture(path: Path, spec: RunSpec) -> tuple[Kernel, ReadOnlyPor
                    language=spec.language or 'zh', inputs=inputs, deliveries=deliveries)
     return (Kernel.create(path, spec, requirements=source),
             ReadOnlyPorts(source, first.source_ref, first.target_ref, DeliveryFacts(first.base, None)))
+
+
+def final_scenario(root: Path, *, policy: Policy | None = None,
+                   reviews: tuple[str, ...] = ('pass',), checks: tuple[str, ...] = ('none',),
+                   inputs: CreationInputs | None = None, language: str = 'zh') -> 'GraphScenario':
+    """Reach Final through a real Ticket Completion, never a seeded history row.
+
+    The preparatory Ticket uses successful fixture Agents/checks. Only after
+    Core admits Final do the requested Final Agent/check scripts start.
+    """
+    from agent_run_kernel.offline import GraphScenario
+
+    source = Requirements(ParentIssue(1, 'Parent', 'Deliver the original behavior.', (2,)), (
+        Issue(2, 'Ticket', 'Implement the original behavior.', 'OPEN', frozenset({'ready-for-agent'})),
+    ))
+    scenario = GraphScenario(root, source, policy=policy)
+    if inputs is not None:
+        # Configure the fresh creation before any business operation, never
+        # recreate a progressed Run and lose its real Completion history.
+        scenario.spec = replace(scenario.spec, inputs=inputs, language=language)
+        scenario.kernel = Kernel.create(root / 'configured.sqlite3', scenario.spec, requirements=source)
+        scenario.execution = scenario.kernel.claim_executor('configured-fixture')
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    for _ in range(100):
+        step = operations.once()
+        if step.call is not None:
+            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
+        if scenario.kernel.source_status()['final_subject'] is not None:
+            assert len(scenario.kernel.source_status()['completions']) == 1
+            scenario.select('final:1')  # Assertion/fixture focus, never a Core selection input.
+            scenario.reviews, scenario.checks = list(reviews), list(checks)
+            scenario.development_count = scenario.review_count = scenario.publication_count = 0
+            return scenario
+    raise AssertionError(f'Preparatory Ticket did not reach real Final admission: {operations.steps}')
 
 
 class CoreOperations:

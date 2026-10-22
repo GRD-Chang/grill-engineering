@@ -11,7 +11,7 @@ import agent_run_kernel
 from agent_run import prompt_resources
 from agent_run.managed_workspace import ManagedWorkspace
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.query_cli import main
 from agent_run_kernel.operation_runner import DeliveryFacts
@@ -39,7 +39,6 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
 
     kernel = _published_profile_task(git_repo)
     execution = kernel.claim_executor('profile-test-owner')
-    source = kernel.source_status()
     original_delivery = kernel.delivery('parent:1')
     ports = ReadOnlyPorts(Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()),
         original_delivery.source_ref, original_delivery.target_ref, DeliveryFacts(original_delivery.base, None))

@@ -11,11 +11,13 @@ import tarfile
 
 import pytest
 
-from agent_run_kernel import Commit, Execution, Kernel, World
+from agent_run_kernel import Commit, Execution, Issue, Kernel, ParentIssue, Requirements, World
 from agent_run_kernel.attempt_continuation import load_continuation
 from agent_run_kernel.storage import PREVIOUS_PROTOCOL, PROTOCOL, Storage, Transaction
 from agent_run_kernel.query import read
 from test_kernel_exploration import ticket_spec
+from support.core_operations import CoreOperations, ReadOnlyPorts
+from agent_run_kernel.operation_runner import DeliveryFacts
 
 
 _NATIVE_V17 = '2d25932862c9faf506fef7c5692e78bfb3e7d9ba'
@@ -58,6 +60,21 @@ print(json.dumps({"attempt":c.attempt_id,"thread":c.thread_id,"invocation":c.inv
 '''
 
 
+# _PRODUCE remains the original v17 integrity golden. The runnable variant
+# executes the same frozen v17 product code with explicit source/root inputs.
+_RUNNABLE_SETUP = """
+from agent_run_kernel import Issue, ParentIssue, Requirements
+requirements=Requirements(ParentIssue(1,"Parent","Original requirement",(2,)),
+    (Issue(2,"Ticket","Original behavior","OPEN",frozenset({"ready-for-agent"})),))
+final=Delivery("final:1",DeliveryKind.FINAL_RUN,1,"unread",base,"refs/heads/run","refs/heads/main")
+spec=replace(spec,repository_root=str(Path(r["path"]).parent.resolve()),deliveries=(*spec.deliveries,final))
+k=Kernel.create(Path(r["path"]),spec,requirements=requirements)
+"""
+_RUNNABLE_PRODUCE = _PRODUCE.replace('k=Kernel.create(Path(r["path"]),spec)', _RUNNABLE_SETUP).replace(
+    'w=World("parent-v1","graph-v1","ticket-v1",base)',
+    'w=World(k.source_status()["observed_parent_revision"],k.source_status()["observed_graph_revision"],k.delivery("ticket:2").revision,base)')
+
+
 @pytest.fixture(scope='module')
 def native_v17_source(tmp_path_factory):
     root = tmp_path_factory.mktemp('native-v17-continuation')
@@ -77,8 +94,8 @@ def native_v17_source(tmp_path_factory):
     return root / 'project/src'
 
 
-def _produce(source: Path, path: Path, state: str):
-    result = subprocess.run([sys.executable, '-c', _PRODUCE], input=json.dumps({'path': str(path), 'state': state}),
+def _produce(source: Path, path: Path, state: str, *, script: str = _PRODUCE):
+    result = subprocess.run([sys.executable, '-c', script], input=json.dumps({'path': str(path), 'state': state}),
         env={**os.environ, 'PYTHONPATH': str(source), 'PYTHONDONTWRITEBYTECODE': '1'},
         text=True, capture_output=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -118,20 +135,18 @@ def test_real_native_upgrade_reopen_and_fresh_schema_preserve_exact_facts(tmp_pa
         assert tx.one('SELECT count(*) FROM material')[0] == count
     fresh = Kernel.create(tmp_path / 'fresh.sqlite3', ticket_spec())
     assert _schema(path) == _schema(fresh.storage.path)
-    world = World('parent-v1', 'graph-v1', 'ticket-v1', Commit('base', 'base-tree'))
-    execution = Execution('offline-run', 'native-v17', 1)
-    kernel.clock = lambda: 1000.0
-    if state == 'returned':
-        assert kernel.advance('ticket:2', execution, world).kind == 'progress'
-    elif state != 'consumed':
-        if state == 'failed':
-            assert kernel.advance('ticket:2', execution, world).reason == 'execution_recovery_unavailable'
-        kernel.control('resume', 'resume-upgraded', subject='ticket:2', message='Keep it.')
-        call = kernel.advance('ticket:2', execution, world).call
-        assert call is not None and call.attempt_id == original['attempt']
-        assert call.thread_id == original['thread'] and call.deadline_at == 1007.0
-    else:
+    # This historical fixture lacks repository_root. Keep upgrade/basis unit
+    # assertions here; actual resumed allocations use the runnable v17 fixture.
+    if state == 'consumed':
         assert kernel.status('ticket:2')['phase'] == 'candidate'
+    elif state == 'returned':
+        assert kernel.status('ticket:2')['pending_return'] is True
+    elif state == 'human':
+        kernel.control('resume', 'resume-upgraded', subject='ticket:2', message='Keep it.')
+        with kernel.storage.transaction(write=False) as tx:
+            assert load_continuation(tx, original['attempt']).thread_id == original['thread']
+    else:
+        assert facts.ordinary_used == 1
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
 
 
@@ -156,3 +171,30 @@ def test_upgrade_failure_rolls_back_schema_meta_and_original_native_rows(tmp_pat
     with Storage(path).transaction(write=False) as tx:
         assert tx.one('SELECT protocol FROM meta')[0] == PREVIOUS_PROTOCOL
     assert Kernel(path).status('ticket:2')['pending_return'] is True
+
+
+@pytest.mark.parametrize('state', ['returned', 'human', 'failed', 'consumed'])
+def test_source_backed_v17_upgrade_continues_through_real_runner(tmp_path, native_v17_source, state):
+    path = tmp_path / 'runnable-native.sqlite3'
+    original = _produce(native_v17_source, path, state, script=_RUNNABLE_PRODUCE)
+    kernel = Kernel(path)
+    kernel.clock = lambda: 1000.0
+    requirements = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2,)), (
+        Issue(2, 'Ticket', 'Original behavior', 'OPEN', frozenset({'ready-for-agent'})),
+    ))
+    ports = ReadOnlyPorts(requirements, 'refs/heads/ticket-2', 'refs/heads/run',
+                          DeliveryFacts(Commit('base', 'base-tree'), None))
+    operations = CoreOperations(kernel, Execution('offline-run', 'native-v17', 1), lambda binding: ports)
+    if state == 'returned':
+        assert operations.once().kind == 'progress'
+        assert kernel.status('ticket:2')['phase'] == 'candidate'
+    elif state != 'consumed':
+        if state == 'failed':
+            assert operations.once().reason == 'execution_recovery_unavailable'
+        kernel.control('resume', 'resume-upgraded', subject='ticket:2', message='Keep it.')
+        call = operations.once().call
+        assert call is not None and call.attempt_id == original['attempt']
+        assert call.thread_id == original['thread'] and call.deadline_at == 1007.0
+    else:
+        assert kernel.status('ticket:2')['phase'] == 'candidate'
+    assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1

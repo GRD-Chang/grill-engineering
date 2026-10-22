@@ -109,6 +109,10 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
 def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
     scenario.port.lose_response.add('pr_write')
+    unresolved = scenario.run()
+    assert unresolved.kind == "waiting" and unresolved.reason == "original_write_readback_required"
+    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     assert scenario.run().kind == 'approval'
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'history').data

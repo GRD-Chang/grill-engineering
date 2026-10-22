@@ -10,7 +10,6 @@ from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.task_location import bind_task, locked_task
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations
-from test_kernel_operation_runner import Ports
 
 
 @pytest.mark.parametrize('binding', ['current', 'unbound', 'foreign'])
@@ -40,13 +39,12 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
         return
     scenario.kernel = kernel
     scenario.execution = kernel.claim_executor('profile-executor')
-    operations = CoreOperations(kernel, scenario.execution, lambda binding: Ports(scenario))
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     for _ in range(20):
         step = operations.once()
         if step.call is not None:
             first = step.call
             break
-        scenario.handle(step)
     else:
         raise AssertionError('The original Task did not allocate its Development Thread')
     assert first.role == 'development' and first.profile_revision == 1

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from support.core_operations import CoreOperations, scripted_return
 from agent_run_kernel import Role
 from agent_run_kernel.artifact_contract import role_schema
 from agent_run_kernel.codex_execution import _CodexCapture
@@ -24,18 +25,21 @@ def human(blockers):
 
 
 def next_call(scenario, role):
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     for _ in range(40):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is not None and step.call.role == role:
             return step.call
         assert step.kind in {"agent", "effect", "progress"}, step
-        scenario.handle(step)
+        if step.call is not None:
+            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
     raise AssertionError(f"No {role} call allocated")
 
 
 def returned(scenario, call, raw):
     # Explicit synthetic process observations, as in the native policy tests;
     # these establish returned-result consumption, not OS sandbox enforcement.
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     kernel = scenario.kernel
     assert kernel.dispatch_agent(call)
     kernel.bind_thread(call, call.reported_thread or "synthetic-contract-thread")
@@ -52,10 +56,11 @@ def returned(scenario, call, raw):
                          ids=["closing", "publisher-facts", "blocker-count", "blocker-length"])
 def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_path: Path, value):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = next_call(scenario, Role.PUBLICATION)
     raw = b"\n " + wire_json(value) + b"\n"
     returned(scenario, first, raw)
-    step = scenario.kernel.advance(first.subject, first.execution, scenario.world())
+    step = operations.once()
     repair = step.call
     assert repair is not None and repair.mode == "output-repair", step
     assert repair.attempt_id == first.attempt_id and repair.invocation_id == first.invocation_id
@@ -71,7 +76,7 @@ def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
     valid = b"\n" + wire_json(publication()) + b"\n"
     returned(scenario, repair, valid)
-    consumed = scenario.kernel.advance(first.subject, first.execution, scenario.world(), allow_agent=False)
+    consumed = operations.once(agent_capacity=0)
     assert consumed.kind == "progress"
     with scenario.kernel.storage.transaction(write=False) as tx:
         outputs = tx.rows("SELECT raw_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
@@ -95,6 +100,7 @@ _FAIL_AND_BLOCKED["checks"]["e2e"].update(status="blocked")
 ])
 def test_native_valid_outputs_keep_wire_raw_and_route_all_roles(tmp_path, role, value, outcome):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     call = next_call(scenario, role)
     # Inspect the transport's actual owned schema file without launching a
     # process: UID namespaces are unavailable in some execution environments.
@@ -110,7 +116,7 @@ def test_native_valid_outputs_keep_wire_raw_and_route_all_roles(tmp_path, role, 
             assert json.load(schema) == role_schema(role.value)
     raw = b"\n " + wire_json(value) + b" \n"
     returned(scenario, call, raw)
-    step = scenario.kernel.advance(call.subject, call.execution, scenario.world(), allow_agent=False)
+    step = operations.once(agent_capacity=0)
     blocked = outcome in {"human_blocker", "blocked"}
     assert (step.kind, step.reason) == (("paused", "human_blocker") if blocked else ("progress", ""))
     with scenario.kernel.storage.transaction(write=False) as tx:
@@ -125,18 +131,19 @@ def test_native_valid_outputs_keep_wire_raw_and_route_all_roles(tmp_path, role, 
 
 def test_invalid_repair_is_gated_and_both_original_outputs_remain(tmp_path):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = next_call(scenario, Role.PUBLICATION)
     rejected = [wire_json(publication(body)) for body in
                 ("Resolves #7", "## Completed Tickets\n#2", "Delivery Run: forged-run")]
     call = first
     for raw in rejected[:-1]:
         returned(scenario, call, raw)
-        repair = scenario.kernel.advance(first.subject, first.execution, scenario.world()).call
+        repair = operations.once().call
         assert repair is not None and repair.mode == "output-repair"
         assert repair.invocation_id == first.invocation_id and repair.attempt_id == first.attempt_id
         call = repair
     returned(scenario, call, rejected[-1])
-    step = scenario.kernel.advance(first.subject, first.execution, scenario.world())
+    step = operations.once()
     assert (step.kind, step.reason) == ("paused", "invalid_artifact")
     with scenario.kernel.storage.transaction(write=False) as tx:
         outputs = tx.rows("SELECT raw_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))

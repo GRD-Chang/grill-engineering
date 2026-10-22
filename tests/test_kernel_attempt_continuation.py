@@ -15,7 +15,6 @@ from agent_run_kernel.offline import GraphScenario, fixture_inputs
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from agent_run_kernel.operation_runner import DeliveryFacts
 from test_kernel_exploration import ticket_spec
-from test_kernel_operation_runner import Ports
 
 
 def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_path: Path) -> None:
@@ -24,7 +23,7 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     ))
     scenario = GraphScenario(tmp_path / "scenario", source)
     kernel = scenario.kernel
-    operations = CoreOperations(kernel, scenario.execution, lambda binding: Ports(scenario))
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None
     assert first.subject == "ticket:2" and first.role == "development"
