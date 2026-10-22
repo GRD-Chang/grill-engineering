@@ -162,14 +162,8 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
         roots = _managed_state_roots(repository)
         from .original_query import locator_entries
         try:
-            for route in locator_entries(app_data_root() / "run-locator.json"):
-                exact = getattr(parsed, "run_id", None)
-                if (exact and route["run_id"] != exact
-                        or repository is not None and route.get("repository") is not None
-                        and _repository(route["repository"]) != repository
-                        or parsed.parent is not None and route.get("parent_number") is not None
-                        and route["parent_number"] != parsed.parent):
-                    continue
+            for route in locator_entries(app_data_root() / "run-locator.json",
+                    run_id=getattr(parsed, "run_id", None), repository=repository, parent=parsed.parent):
                 directory = Path(route["state_dir"])
                 if not directory.exists():
                     raise QueryError("run_locator_stale", f"Original Run state is missing: {directory}")
