@@ -3922,11 +3922,17 @@ class Kernel:
         target = self._require_target(world)
         if phase == "workspace":
             payload: dict[str, Any] = {"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN}
+            originals = tx.rows("SELECT payload_id FROM effects WHERE subject=? AND generation=? AND operation='workspace' ORDER BY rowid LIMIT 1",
+                                (subject, job["generation"]))
+            if job["kind"] == DeliveryKind.TICKET and job["generation"] == 1 and originals:
+                saved = json.loads(tx.get(originals[0]["payload_id"], subject))
+                if "prebuilt_workspace" in saved:
+                    payload["prebuilt_workspace"] = saved["prebuilt_workspace"]
             if (job["kind"] == DeliveryKind.TICKET and world.source is None and world.pr is None
                     and all(job[key] is None for key in ("current_attempt", "development_thread", "candidate_sha", "integrated_sha", "publication_sha", "pr_number"))
                     and job["base_sha"] == job["source_sha"] == job["workspace_sha"]
                     and not tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (subject, job["generation"]))
-                    and not tx.rows("SELECT id FROM effects WHERE subject=? AND generation=? AND operation='workspace' LIMIT 1", (subject, job["generation"]))):
+                    and not originals):
                 if job["generation"] == 1:
                     from .migration_run_ownership import prebuilt_workspace_binding
                     binding = prebuilt_workspace_binding(self.storage, tx, run, job)
