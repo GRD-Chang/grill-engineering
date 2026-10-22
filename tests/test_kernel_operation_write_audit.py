@@ -57,3 +57,29 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
     assert runner.run_once().kind == "progress"
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM effect_failures")[0] == 1
+
+
+def test_publication_unknown_response_diagnostic_remains_public_after_successful_exact_readback(tmp_path):
+    from agent_run_kernel.query import read
+
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
+    scenario.port.lose_response.add("pr_write")
+    assert scenario.run().kind == "waiting"
+    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert pending["operation"] == "pr_write" and pending["status"] == "sent"
+    # Repeated waits preserve one diagnostic for this intent and business scope.
+    runner = scenario.runner()
+    assert runner.run_once().kind == "waiting"
+    now[0] = 105.25
+    assert scenario.run().kind == "approval"
+    public = read(scenario.kernel.storage.path, "history").data
+    events = [event for event in public["timeline"] if event.get("evidence") == {
+        "code": "write_response_unavailable", "message": "pr_write took effect; response lost"}]
+    assert len(events) == 1
+    assert pending["id"] in events[0]["identity"]
+    assert public["publication_operation_retries"] == []
+    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT subject FROM waits")

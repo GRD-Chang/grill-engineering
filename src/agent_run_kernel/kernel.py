@@ -1992,6 +1992,14 @@ class Kernel:
                 return Step("paused", subject or "", "supervision_timeout" if timed_out else run["blocked"] or "operator_gate")
             owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
             evidence = tx.put(owner, "github_read_observation", wire_json({"code": code, "message": bounded_error(message)}))
+            scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
+            pending = tx.rows("SELECT id,attempts,generation FROM effects WHERE subject=? "
+                              "AND status IN ('prepared','sent') AND operation!='issue_link' ORDER BY rowid LIMIT 1", (owner,))
+            identity = scope_id if not pending else f"{scope_id}:{pending[0]['id']}:{pending[0]['attempts']}"
+            if not tx.rows("SELECT position FROM history WHERE subject=? AND kind='github_read_observation' "
+                           "AND identity=? AND material_id=? LIMIT 1", (owner, identity, evidence)):
+                self._event(tx, owner, "github_read_observation", identity, evidence,
+                            generation=None if not pending else pending[0]["generation"])
             if code in {"ambiguous_run_pr", "invalid_fixture", "invalid_parent", "missing_parent", "stale_run_pr",
                         "foreign_run_pr", "github_invalid_response", "change_pr_identity_mismatch", "change_pr_head_drift", "parent_close_external_conflict"}:
                 if subject is None:
