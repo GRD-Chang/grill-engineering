@@ -7,7 +7,7 @@ rolls back as a whole, including when a nested failure was caught by a caller.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -17,7 +17,12 @@ from agent_run.sqlite_runtime import require_wal_runtime
 
 from .model import KernelError
 
-PROTOCOL = "independent-delivery-kernel-v17-exploration"
+PREVIOUS_PROTOCOL = "independent-delivery-kernel-v17-exploration"
+PROTOCOL = "independent-delivery-kernel-v18-exploration"
+CONTINUATION_UPGRADE_SQL = (
+    "ALTER TABLE attempts ADD COLUMN thread_id TEXT REFERENCES threads(id)",
+    "ALTER TABLE attempts ADD COLUMN opening_id TEXT REFERENCES material(id)",
+)
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
 DATABASE_LIMIT = 256 * 1024 * 1024
@@ -256,6 +261,8 @@ CREATE TABLE history (
 );
 CREATE INDEX history_action_facts ON history(kind,identity);
 """
+PREVIOUS_SCHEMA = SCHEMA
+SCHEMA += '\n' + ';\n'.join(CONTINUATION_UPGRADE_SQL) + ';\n'
 
 
 class Transaction:
@@ -342,6 +349,59 @@ class Storage:
             pass
 
     @classmethod
+    def upgrade(cls, path: Path) -> None:
+        """Upgrade only canonical v17 native storage, atomically and explicitly.
+
+        Read-only consumers never invoke this. ALTER's official schema text is
+        intentionally not compared with freshly CREATEd v18 text on reopen.
+        Offline prepared classification owns its strict schema variants.
+        """
+        storage = cls(path)
+        connection = sqlite3.connect(path.resolve().as_uri() + '?mode=rw', uri=True, isolation_level=None, timeout=1.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute('PRAGMA foreign_keys=ON')
+            connection.execute('PRAGMA synchronous=FULL')
+            connection.execute('BEGIN IMMEDIATE')
+            protocol = connection.execute('SELECT protocol FROM meta').fetchall()
+            if len(protocol) != 1:
+                raise KernelError('incompatible_database', str(path))
+            if protocol[0][0] == PROTOCOL:
+                connection.rollback()
+                return
+            if protocol[0][0] != PREVIOUS_PROTOCOL:
+                raise KernelError('incompatible_database', str(path))
+            with closing(sqlite3.connect(':memory:')) as expected:
+                expected.executescript(PREVIOUS_SCHEMA)
+                query = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+                if [tuple(row) for row in connection.execute(query)] != expected.execute(query).fetchall():
+                    raise KernelError('continuation_upgrade_schema')
+            storage._capacity(connection)
+            if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                raise KernelError('continuation_upgrade_relations')
+            for sql in CONTINUATION_UPGRADE_SQL:
+                connection.execute(sql)
+            from .attempt_continuation import backfill_native_continuation
+
+            cursor = connection.execute('SELECT * FROM attempts ORDER BY subject,ordinal')
+            while rows := cursor.fetchmany(128):
+                for attempt in rows:
+                    # One bounded row/material closure at a time; the whole
+                    # database is capacity-bounded and still commits atomically.
+                    tx = Transaction(connection)
+                    backfill_native_continuation(tx, attempt)
+                    if tx.failed:
+                        raise KernelError('transaction_aborted')
+            storage._capacity(connection)
+            connection.execute('UPDATE meta SET protocol=? WHERE protocol=?', (PROTOCOL, PREVIOUS_PROTOCOL))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @classmethod
     def create(cls, path: Path) -> Storage:
         require_wal_runtime()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,7 +440,8 @@ class Storage:
                 protocol = connection.execute("SELECT protocol FROM meta").fetchall()
             except sqlite3.Error as error:
                 raise KernelError("incompatible_database", str(self.path)) from error
-            if len(protocol) != 1 or protocol[0][0] != PROTOCOL:
+            supported = {PROTOCOL} if write else {PROTOCOL, PREVIOUS_PROTOCOL}
+            if len(protocol) != 1 or protocol[0][0] not in supported:
                 raise KernelError("incompatible_database", str(self.path))
             self._capacity(connection)
             yield transaction
