@@ -34,7 +34,8 @@ from .attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, 
 from .configuration import checkpoint_policy
 from .task_location import bind_task, read_task
 from .legacy_admission import locked_admission, origin_reference, read_source_fence, source_fence
-from .operation_runner import OperationBinding, OperationPorts, OperationRunner, OperationState, ReadUnavailable, observe_operation
+from .operation_runner import (OperationBinding, OperationPorts, OperationRunner, OperationState,
+                               ReadUnavailable, _ApprovalRead, _ObservationPass, _SentRead, observe_operation)
 
 
 def identity() -> str:
@@ -84,6 +85,66 @@ class Kernel:
                     paths.append(Path(app["private_key_path"]))
             return OperationBinding(Path(run["repository_root"]), run["repository"], run["parent_issue"], inputs,
                                     tuple(paths), tuple(variables))
+
+    @staticmethod
+    def _approval_boundary(run: sqlite3.Row, job: sqlite3.Row) -> tuple[str | int | None, ...]:
+        return (run["parent_revision"], run["graph_revision"], *(job[key] for key in (
+            "revision", "completion_revision", "publication_sha", "pr_number", "source_ref", "target_ref",
+            "review_attempt", "checks_id", "grant_id")))
+
+    def _observation_host(self, tx: Transaction, execution: Execution, action_id: str | None = None) -> sqlite3.Row:
+        run = tx.one("SELECT * FROM runs")
+        self._automatic_owned(tx, run, execution)
+        rows = tx.rows("SELECT h.*,a.kind AS action_kind,a.status AS action_status FROM hosts h JOIN actions a ON a.id=h.action_id "
+                      "WHERE h.run_id=? AND h.owner=? AND h.epoch=? AND h.status='running' AND h.usage_ready=1 AND h.usage_released=0 AND h.dispatched_at IS NOT NULL AND a.run_id=h.run_id",
+                      (execution.run_id, execution.owner, execution.epoch))
+        if (len(rows) != 1 or rows[0]["action_status"] not in {"applied", "pending"}
+                or action_id is not None and rows[0]["action_id"] != action_id):
+            raise KernelError("managed_observation_required")
+        return rows[0]
+
+    def _activate_observation(self, execution: Execution) -> _ObservationPass:
+        with self.storage.transaction(write=False) as tx:
+            host = self._observation_host(tx, execution)
+            run = tx.one("SELECT * FROM runs")
+            pending: list[_SentRead | _ApprovalRead] = [_SentRead(row["id"], row["attempts"], row["subject"], row["generation"])
+                for row in tx.all("SELECT id,attempts,subject,generation FROM effects WHERE status='sent' AND operation!='issue_link' ORDER BY rowid")]
+            if not run["stopped"] and not run["blocked"]:
+                pending.extend(_ApprovalRead(job["id"], job["generation"], self._approval_boundary(run, job))
+                    for job in tx.all("SELECT * FROM subjects WHERE kind!='ticket' AND phase='approval'")
+                    if not job["validation_cleanup"] and not self._gates(tx, job["id"]) and self._pending_effect(tx, job["id"]) is None)
+            return _ObservationPass(execution, host["action_id"], pending)
+
+    def _observation_member(self, tx: Transaction, run: sqlite3.Row, observation: _ObservationPass | None,
+                            subject: str | None = None) -> _SentRead | _ApprovalRead | None:
+        if observation is None:
+            return None
+        with observation.lock:
+            try:
+                self._observation_host(tx, observation.execution, observation.action_id)
+            except KernelError as error:
+                if error.code not in {"executor_fenced", "host_usage_unproven", "managed_observation_required"}:
+                    raise
+                observation.pending.clear()
+                return None
+            for member in tuple(observation.pending):
+                job = self._job(tx, member.subject)
+                if isinstance(member, _SentRead):
+                    rows = tx.rows("SELECT status,attempts,subject,generation FROM effects WHERE id=?", (member.effect_id,))
+                    valid = bool(rows and (rows[0]["status"], rows[0]["attempts"], rows[0]["subject"], rows[0]["generation"]) ==
+                                 ("sent", member.dispatch_serial, member.subject, member.generation))
+                else:
+                    valid = job["phase"] == "approval" and self._approval_boundary(run, job) == member.boundary
+                if not valid or job["generation"] != member.generation:
+                    observation.pending.remove(member)
+                    continue
+                if subject is not None and member.subject != subject:
+                    continue
+                if (run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, member.subject))
+                        or self._operation_wait(tx, run, member.subject, False) is not None):
+                    continue
+                return member
+            return None
 
     def _operation_token(self, tx: Transaction, subject: str | None, cleanup: bool = False) -> str:
         run = tx.one("SELECT * FROM runs")
@@ -158,7 +219,10 @@ class Kernel:
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
-                          poll_manual: bool = False) -> tuple[str | None, bool] | None:
+                          poll_manual: bool = False, observation: _ObservationPass | None = None) -> tuple[str | None, bool] | None:
+        member = self._observation_member(tx, run, observation)
+        if member is not None:
+            return member.subject, False
         agent_capacity = min(agent_capacity, max(0, run["concurrency"] - tx.one("SELECT count(*) FROM leases")[0]))
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
@@ -258,6 +322,9 @@ class Kernel:
         return None
 
     def operation_state(self) -> OperationState:
+        return self._operation_state()
+
+    def _operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             active = tx.all("SELECT l.*,i.deadline_at FROM leases l JOIN invocations i ON i.id=l.invocation")
@@ -271,7 +338,7 @@ class Kernel:
                 lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
                 if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job) == waiting:
                     deadlines.append(waiting.retry_at)
-            choice = self._operation_choice(tx, run)
+            choice = self._operation_choice(tx, run, observation=observation)
             abandoned = self._abandon_action(tx)
             complete = (abandoned is not None and abandoned["status"] == "complete" or
                 not tx.rows("SELECT id FROM subjects WHERE phase!='complete' LIMIT 1")
@@ -1971,7 +2038,7 @@ class Kernel:
                 tx.execute("DELETE FROM waits WHERE subject IS ? AND kind='github_convergence'", (subject,))
             return step
 
-    def _wait_for_read(self, token: str, execution: Execution, code: str, message: str) -> Step:
+    def _wait_for_read(self, token: str, execution: Execution, code: str, message: str, *, readback: Effect | None = None) -> Step:
         """Persist one original read outage; successful reads alone never renew it."""
         from agent_run.error_safety import bounded_error
 
@@ -1985,9 +2052,13 @@ class Kernel:
             gates = [] if subject is None else self._gates(tx, subject)
             abandoned = self._abandon_action(tx)
             requeue = self._automatic_control_read(tx, run, subject, scope["cleanup"])
+            if readback is not None:
+                original = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (readback.effect_id, subject))
+                if original["status"] != "sent" or self._effect(tx, original, execution) != readback:
+                    raise KernelError("effect_binding")
             timed_out = run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in gates)
             if (timed_out
-                    or ((abandoned is None or abandoned["status"] != "pending") and not requeue
+                    or ((abandoned is None or abandoned["status"] != "pending") and not requeue and readback is None
                         and (run["stopped"] or run["blocked"] or gates))):
                 return Step("paused", subject or "", "supervision_timeout" if timed_out else run["blocked"] or "operator_gate")
             owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]

@@ -10,8 +10,9 @@ No Receipt, persisted cursor, or alternative current Run crosses this seam.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol
 from dataclasses import asdict
 import json
@@ -74,6 +75,40 @@ class OperationState:
     cancel: tuple[str, ...]  # The same lease identity space as active.
     wake_at: float | None  # Absolute time in Kernel.clock's domain.
     disposition: Literal["ready", "waiting", "quiescent", "complete"]
+
+
+@dataclass(frozen=True)
+class _SentRead:
+    effect_id: str
+    dispatch_serial: int
+    subject: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class _ApprovalRead:
+    subject: str
+    generation: int
+    boundary: tuple[str | int | None, ...]
+
+
+@dataclass
+class _ObservationPass:
+    execution: Execution
+    action_id: str
+    pending: list[_SentRead | _ApprovalRead]
+    lock: RLock = field(default_factory=RLock, repr=False)
+
+    def complete(self, member: _SentRead | _ApprovalRead) -> None:
+        with self.lock:
+            if member in self.pending:
+                self.pending.remove(member)
+
+    def defer(self, member: _SentRead | _ApprovalRead) -> None:
+        with self.lock:
+            if member in self.pending:
+                self.pending.remove(member)
+                self.pending.append(member)
 
 
 class OperationPorts(Protocol):
@@ -177,9 +212,22 @@ class OperationRunner:
         self.kernel, self.execution = kernel, execution
         self.binding = kernel._operation_binding(execution)
         self.ports = make_ports(self.binding)
+        self._observation: _ObservationPass | None = None
+        self._activation_lock = RLock()
+
+    def activate_observation(self) -> None:
+        """Once per admitted, usage-ready Host entry, before its first state().
+
+        Capture finite original sent identities and approval boundaries only.
+        Repeated activation cannot refresh membership, waits or deadlines.
+        Direct claim_executor fixtures do not possess this admission.
+        """
+        with self._activation_lock:
+            if self._observation is None:
+                self._observation = self.kernel._activate_observation(self.execution)
 
     def state(self) -> OperationState:
-        return self.kernel.operation_state()
+        return self.kernel._operation_state(self._observation)
 
     def observe(self, subject: str | None) -> World:
         return self._observe(subject)[0]
@@ -222,13 +270,19 @@ class OperationRunner:
                 if error.code != "executor_fenced":
                     raise
                 return Step("paused", "", error.code)
-            choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity, poll_manual=True)
+            choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity,
+                poll_manual=self._observation is None, observation=self._observation)
             if choice is None:
-                state = kernel.operation_state()
+                state = self.state()
                 return Step(state.disposition, "", retry_at=state.wake_at)
             subject, cleanup = choice
+            member = kernel._observation_member(tx, run, self._observation, subject)
             token = kernel._operation_token(tx, subject, cleanup)
+            original = (kernel._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (member.effect_id,)), execution)
+                        if isinstance(member, _SentRead) else None)
         try:
+            if original is not None:
+                return self._observe_sent(member, original, token)
             if subject is None:
                 world, observed = self._observe(None)
                 if world.source is None or world.target is None:
@@ -247,15 +301,51 @@ class OperationRunner:
                 return step
             if step.effect is not None:
                 step = self._effect(step)
-            return kernel._finish_automatic_step(token, execution, step)
+            step = kernel._finish_automatic_step(token, execution, step)
+            if isinstance(member, _ApprovalRead) and self._observation is not None:
+                self._observation.complete(member)
+            return step
         except ReadWait as waiting:
+            if member is not None and self._observation is not None:
+                self._observation.defer(member)
             return waiting.step
         except ReadUnavailable as error:
-            return kernel._wait_for_read(token, execution, error.code, error.message)
+            if member is not None and self._observation is not None:
+                self._observation.defer(member)
+            return kernel._wait_for_read(token, execution, error.code, error.message, readback=original)
         except KernelError as error:
             if error.code not in {"automatic_step_superseded", "automatic_step_paused", "executor_fenced"}:
                 raise
+            if member is not None and self._observation is not None:
+                self._observation.defer(member)
+                if error.code == "automatic_step_superseded":
+                    return kernel._wait_for_read(token, execution, error.code, str(error), readback=original)
             return Step("waiting" if error.code == "automatic_step_superseded" else "paused", subject or "", error.code)
+
+    def _observe_sent(self, member: _SentRead | _ApprovalRead | None, effect: Effect, token: str) -> Step:
+        waiting = self.kernel._guard_automatic_step(token, self.execution, readback=effect)
+        if waiting is not None:
+            raise ReadWait(waiting)
+        result = self.ports.reconcile(effect)
+        self._record_readback(effect, result)
+        if result.disposition not in {"target", "unknown", "third"}:
+            if self._observation is not None and member is not None:
+                self._observation.defer(member)
+            return self.kernel._wait_for_read(token, self.execution, "original_write_readback_pending",
+                "The original sent request has no final readback yet", readback=effect)
+        step = self.kernel._reconcile(effect, result, self.execution)
+        step = self.kernel._finish_automatic_step(token, self.execution, step)
+        if self._observation is not None and member is not None:
+            self._observation.complete(member)
+        return step
+
+    def _record_readback(self, effect: Effect, result: EffectResult) -> None:
+        with self.kernel.storage.transaction() as tx:
+            row = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
+            if self.kernel._effect(tx, row, effect.execution) != effect:
+                raise KernelError("effect_binding")
+            evidence = tx.put(effect.subject, "effect_readback", wire_json({"dispatch_serial": effect.dispatch_serial, "result": asdict(result)}))
+            self.kernel._event(tx, effect.subject, "effect_readback", effect.effect_id, evidence, generation=row["generation"])
 
     def _effect(self, step: Step) -> Step:
         kernel, execution, effect = self.kernel, self.execution, step.effect
@@ -315,12 +405,7 @@ class OperationRunner:
             if effect.operation == "issue_link":
                 kernel.acknowledge_link(effect, result)
                 return Step("progress", effect.subject)
-        with kernel.storage.transaction() as tx:
-            row = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
-            if kernel._effect(tx, row, effect.execution) != effect:
-                raise KernelError("effect_binding")
-            evidence = tx.put(effect.subject, "effect_readback", wire_json({"dispatch_serial": effect.dispatch_serial, "result": asdict(result)}))
-            kernel._event(tx, effect.subject, "effect_readback", effect.effect_id, evidence, generation=row["generation"])
+        self._record_readback(effect, result)
         settled = kernel._reconcile(effect, result, execution)
         if settled.kind == "observe":
             world, token = self._observe(effect.subject)
