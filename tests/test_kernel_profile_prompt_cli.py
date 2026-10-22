@@ -14,6 +14,8 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec, World
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.query_cli import main
+from agent_run_kernel.operation_runner import DeliveryFacts
+from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
 def _published_profile_task(git_repo: Path) -> Kernel:
@@ -39,9 +41,10 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
     execution = kernel.claim_executor('profile-test-owner')
     source = kernel.source_status()
     original_delivery = kernel.delivery('parent:1')
-    world = World(source['observed_parent_revision'], source['observed_graph_revision'],
-                  original_delivery.revision, original_delivery.base)
-    original = kernel.advance('parent:1', execution, world).call
+    ports = ReadOnlyPorts(Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()),
+        original_delivery.source_ref, original_delivery.target_ref, DeliveryFacts(original_delivery.base, None))
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    original = operations.once().call
     assert original is not None and original.profile_revision == 1
     assert kernel.dispatch_agent(original)
     kernel.bind_thread(original, 'original-backend')
@@ -81,16 +84,16 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
     # Explicit synthetic process observations exercise the real recovery and
     # Thread allocation authority; no Worker subprocess is claimed here.
     kernel.agent_exited(original, process, 1)
-    continuing = kernel.advance('parent:1', execution, world).call
+    continuing = operations.once().call
     assert continuing is not None and continuing.thread_id == original.thread_id
     assert continuing.profile_revision == 1 and continuing.profile == original.profile
     assert kernel.dispatch_agent(continuing)
     successor_process = {**process, 'pid': 22, 'pgid': 22, 'start_token': 'profile-continuing'}
     kernel.agent_started(continuing, successor_process)
     kernel.agent_exited(continuing, successor_process, 1)
-    assert kernel.advance('parent:1', execution, world).kind == 'paused'
+    assert operations.once().kind == 'paused'
     assert kernel.control('resume', 'replace-profile-thread', subject='parent:1', new_thread=True) == 'applied'
-    changed = kernel.advance('parent:1', execution, world).call
+    changed = operations.once().call
     assert changed is not None and changed.thread_id != original.thread_id
     assert changed.profile_revision == 2 and changed.profile.model == 'future-development'
     assert changed.attempt_id == original.attempt_id
