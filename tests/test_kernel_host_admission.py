@@ -11,21 +11,22 @@ from typing import Iterator
 import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, ParentIssue, Requirements, RunSpec
-from agent_run_kernel.model import Execution, HostObservation, World
+from agent_run_kernel.model import Execution, HostObservation
+from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
 from agent_run_kernel.offline import GraphScenario, Scenario
 from agent_run_kernel.storage import Transaction
 
 
-def task_run(root: Path, run_id: str, *, parent: int = 1) -> Kernel:
+def task_run(root: Path, run_id: str, *, parent: int = 1) -> tuple[Kernel, ReadOnlyPorts]:
     base = Commit("base", "tree")
     delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, parent, "v1", base, "refs/heads/task", "refs/heads/main")
-    return Kernel.create(root / (run_id + ".sqlite3"), RunSpec(run_id, "example/project", parent, "v1", "graph", (delivery,),
+    return native_agent_fixture(root / (run_id + ".sqlite3"), RunSpec(run_id, "example/project", parent, "v1", "graph", (delivery,),
                          language="en", repository_root=str(root / "repository")))
 
 
 def test_host_preflight_rejects_before_action_or_task_binding(tmp_path: Path) -> None:
-    first = task_run(tmp_path, "first")
-    other = task_run(tmp_path, "other")
+    first = task_run(tmp_path, "first")[0]
+    other = task_run(tmp_path, "other")[0]
 
     def unavailable() -> None:
         raise KernelError("user_bus_unavailable")
@@ -43,9 +44,9 @@ def test_host_preflight_rejects_before_action_or_task_binding(tmp_path: Path) ->
 
 
 def test_same_task_other_run_cannot_claim_an_allocated_or_unknown_host(tmp_path: Path) -> None:
-    first = task_run(tmp_path, "first")
-    other = task_run(tmp_path, "other")
-    independent = task_run(tmp_path, "independent", parent=2)
+    first = task_run(tmp_path, "first")[0]
+    other = task_run(tmp_path, "other")[0]
+    independent = task_run(tmp_path, "independent", parent=2)[0]
     arguments = {"kind": "run", "command": ("python", "-m", "native-host"),
                  "environment_carrier": tmp_path / "carrier", "preflight": lambda: None}
     launch = first.admit_host("start", **arguments)
@@ -63,7 +64,7 @@ def test_same_task_other_run_cannot_claim_an_allocated_or_unknown_host(tmp_path:
 
 
 def test_host_observation_cannot_replace_the_first_systemd_invocation(tmp_path: Path) -> None:
-    kernel = task_run(tmp_path, "first")
+    kernel = task_run(tmp_path, "first")[0]
     launch = kernel.admit_host("start", kind="run", command=("python", "-m", "native-host"),
                               environment_carrier=tmp_path / "carrier", preflight=lambda: None)
     assert kernel.dispatch_host(launch)
@@ -83,7 +84,7 @@ def test_host_observation_cannot_replace_the_first_systemd_invocation(tmp_path: 
 
 
 def test_two_processes_cannot_admit_different_runs_for_one_task(tmp_path: Path) -> None:
-    first, other = task_run(tmp_path, "first"), task_run(tmp_path, "other")
+    first, other = task_run(tmp_path, "first")[0], task_run(tmp_path, "other")[0]
     script = """\
 import json,sys
 from pathlib import Path
@@ -117,7 +118,7 @@ except KernelError as error:
 
 
 def test_bound_run_survives_admission_transaction_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    first, other = task_run(tmp_path, "first"), task_run(tmp_path, "other")
+    first, other = task_run(tmp_path, "first")[0], task_run(tmp_path, "other")[0]
     transaction = first.storage.transaction
 
     @contextmanager
@@ -141,17 +142,16 @@ def test_bound_run_survives_admission_transaction_failure(tmp_path: Path, monkey
 
 
 def test_observed_running_requires_actual_usage_handoff_before_work(tmp_path: Path) -> None:
-    kernel = task_run(tmp_path, "first")
+    kernel, ports = task_run(tmp_path, "first")
     request = kernel.admit_host("start", kind="run", command=("native-host",), environment_carrier=tmp_path / "carrier", preflight=lambda: None)
     assert kernel.dispatch_host(request)
     observation = HostObservation("running", request.unit_name, "original", "/host", "boot", 42, "start")
     assert kernel.observe_host(request, observation) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
-    world = World("v1", "graph", "v1", Commit("base", "tree"))
     with pytest.raises(KernelError, match="host_usage_unproven"):
-        kernel.advance("parent", execution, world)
+        CoreOperations(kernel, execution, lambda binding: ports).once()
     assert kernel.observe_host(request, replace(observation, usage_ready=True, evidence="controlled Host owns shared usage lease")) == "running"
-    assert kernel.advance("parent", execution, world).kind == "agent"
+    assert CoreOperations(kernel, execution, lambda binding: ports).once().kind == "agent"
 
 
 def test_complete_run_cannot_be_rebound_until_host_and_usage_retire(tmp_path: Path) -> None:

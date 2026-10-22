@@ -140,7 +140,7 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
                 host = tx.one("SELECT status,usage_released FROM hosts")
                 assert tuple(host) == ("running", 0)  # Main exit does not prove Host release.
             kernel.stop_task("ticket-stop", subject="native-ticket")
-            assert kernel.scheduling()["disposition"] == "quiescent"
+            assert kernel.operation_state().disposition == "quiescent"
             with kernel.storage.transaction(write=False) as tx:
                 assert tuple(tx.one("SELECT stopped,executor,epoch FROM runs")) == (0, request.owner, request.epoch)
             assert not host_exit_current(kernel.storage.path, notice)  # Original normal wait, same Host.

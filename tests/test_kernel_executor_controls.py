@@ -1,14 +1,13 @@
 """The native executor consumes original control effects and real source reads."""
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
 
 import pytest
 
 from agent_run_kernel import Policy
-from agent_run_kernel.executor import _Executor
-from agent_run_kernel.local_effects import LocalEffects
+from agent_run_kernel.executor import _make_ports
+from support.core_operations import CoreOperations
 from agent_run_kernel.model import Execution, HostObservation
 from agent_run_kernel.offline import GraphScenario
 from test_kernel_remote_effects import _fixture
@@ -68,22 +67,27 @@ def test_native_executor_consumes_the_original_control_action_with_fresh_source_
                        "repo": {"full_name": prior.repository}}}
     state.write_text(json.dumps({"prs": [raw_pr], "comments": [], "events": [], "issue_state": "open",
                                  "source_graph": graph, "lose_operation": "pr"}))
-    driver = _Executor(kernel, scenario.execution, os.environ)
-    world = driver.observe(subject)
+    operations = CoreOperations(kernel, scenario.execution, _make_ports)
+    world = operations.runner.observe(subject)
     if control_kind == "requeue":
         replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
                               checkout=str(Path(original.checkout).with_name("replacement-g2")))
         assert kernel.control_host(request, "requeue", "replace-original", subject=subject,
                                    world=world, replacement=replacement) == "pending"
-        assert driver.advance(subject).kind == "progress"
-        assert driver.advance(subject).kind == "progress"
+        for _ in range(30):
+            step = operations.once()
+            assert step.call is None and step.kind == "progress"
+            if kernel.status(subject)["generation"] == 2:
+                break
+        else:
+            raise AssertionError("The original requeue Action did not apply its replacement")
         assert kernel.status(subject)["generation"] == 2
     else:
         resources = kernel.generation_resources()
-        inspections = LocalEffects(driver.remote.git).inspect_resources(resources)
+        inspections = operations.runner.ports.inspect(resources)
         assert kernel.control_host(request, "abandon", "abandon-original", resource_inspections=inspections) == "pending"
         for _ in range(30):
-            step = driver.advance("ticket:4")
+            step = operations.once()
             assert step.call is None and step.kind in {"progress", "complete"}
             if step.kind == "complete":
                 break
@@ -127,18 +131,18 @@ def test_native_executor_abandons_before_the_remote_run_branch_is_created(
              "issues": {str(issue.number): {"number": issue.number, "title": issue.title, "body": issue.body,
                                              "state": issue.state, "labels": sorted(issue.labels)} for issue in source.issues}}
     state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": graph}))
-    driver = _Executor(kernel, execution, os.environ)
-    world = driver.observe(subject)
+    operations = CoreOperations(kernel, execution, _make_ports)
+    world = operations.runner.observe(subject)
     assert world.target is None and world.source is None and world.pr is None
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM effects")
     resources = kernel.generation_resources()
     assert resources and all(not Path(resource.checkout).exists() for resource in resources)
-    inspections = LocalEffects(driver.remote.git).inspect_resources(resources)
+    inspections = operations.runner.ports.inspect(resources)
     assert kernel.control_host(request, "abandon", "abandon-before-run-branch",
                                resource_inspections=inspections) == "pending"
     for _ in range(30):
-        step = driver.advance(subject)
+        step = operations.once()
         assert step.call is None and step.kind in {"progress", "complete"}
         if step.kind == "complete":
             break
@@ -147,5 +151,5 @@ def test_native_executor_abandons_before_the_remote_run_branch_is_created(
     assert all(not Path(resource.checkout).exists() for resource in resources)
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
     assert not any("--method" in call for call in observed_calls)
-    assert driver.remote.git.run("ls-remote", "--refs", "offline-remote", scenario.delivery.target_ref).stdout == ""
-    assert driver.remote.git.run("ls-remote", "--refs", "offline-remote", "refs/heads/main").stdout.split()[0] == scenario.initial.sha
+    assert operations.runner.ports.git.run("ls-remote", "--refs", "offline-remote", scenario.delivery.target_ref).stdout == ""
+    assert operations.runner.ports.git.run("ls-remote", "--refs", "offline-remote", "refs/heads/main").stdout.split()[0] == scenario.initial.sha

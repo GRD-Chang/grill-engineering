@@ -9,7 +9,8 @@ from threading import Event, Thread
 import pytest
 
 from agent_run_kernel.execution import execute
-from agent_run_kernel.executor import _Executor
+from agent_run_kernel.executor import _make_ports
+from support.core_operations import CoreOperations
 from agent_run_kernel.model import KernelError, ReadWait
 from test_kernel_remote_effects import _fixture, _publish_pr, _source_kernel
 from test_kernel_worker_source_windows import _allocated_worker, RAW
@@ -22,7 +23,7 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
     now = 1000.25
     kernel.clock = lambda: now
     execution = kernel.claim_executor("read-supervision")
-    driver = _Executor(kernel, execution, {})
+    operations = CoreOperations(kernel, execution, _make_ports)
     # Git already has the published head. The independently read PR has not
     # converged yet: this is the adapter's actual github_observation_pending
     # producer, not an injected exception or a contradictory repository binding.
@@ -31,11 +32,11 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
     state.write_text(json.dumps(document))
     previous_calls = len(calls.read_text().splitlines())
 
-    step = driver.advance("parent:1")
+    step = operations.once()
 
     assert step.kind == "waiting" and step.call is None and step.effect is None
     assert step.retry_at == now + 5
-    assert kernel.scheduling()["next_deadline_at"] == step.retry_at
+    assert kernel.operation_state().wake_at == step.retry_at
     assert kernel.status("parent:1")["gates"] == []
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM attempts")
@@ -47,10 +48,10 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()][previous_calls:]
     assert observed_calls and not any("--method" in call for call in observed_calls)
     first_wait_calls = calls.read_text()
-    repeated = driver.advance("parent:1")
+    repeated = operations.once()
     assert repeated.kind == "waiting" and repeated.retry_at == step.retry_at
     assert calls.read_text() == first_wait_calls
-    assert kernel.scheduling()["next_deadline_at"] == step.retry_at
+    assert kernel.operation_state().wake_at == step.retry_at
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT deadline FROM waits WHERE subject=? AND kind=?",
                       ("parent:1", "github_convergence"))[0] == now + 600
@@ -58,13 +59,14 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
     # anything. The ordinary loop, rather than an execute retry, owns that read.
     document["prs"][0]["head"]["sha"] = published.head.sha
     state.write_text(json.dumps(document))
-    assert driver.observe("parent:1").pr == published
+    now = step.retry_at
+    assert operations.runner.observe("parent:1").pr == published
 
 
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
 @pytest.mark.parametrize("outcome", ["converge", "stop", "timeout"])
 def test_worker_read_wait_keeps_original_call_and_one_process(tmp_path, monkeypatch, window, outcome):
-    scenario, driver, state, call = _allocated_worker(tmp_path, monkeypatch)
+    scenario, operations, state, call = _allocated_worker(tmp_path, monkeypatch)
     kernel = scenario.kernel
     now = [kernel.clock()]
     kernel.clock = lambda: now[0]
@@ -82,7 +84,7 @@ def test_worker_read_wait_keeps_original_call_and_one_process(tmp_path, monkeypa
             document["read_error"] = True
             state.write_text(json.dumps(document))
         try:
-            driver.authorize_agent_source(call)
+            operations.runner.authorize_agent(call)
         except ReadWait as waiting:
             waits.append(waiting.step)
             reached.set()
@@ -137,7 +139,7 @@ def test_worker_read_wait_keeps_original_call_and_one_process(tmp_path, monkeypa
     expected_starts = 1 if outcome == "converge" else window - 1
     assert sum(event["kind"] == "worker_started" for event in kernel.history(call.subject)) == expected_starts
     assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
     if outcome != "converge":
         assert results == [] and len(failures) == 1
         assert isinstance(failures[0], ReadWait if outcome == "timeout" else KernelError)

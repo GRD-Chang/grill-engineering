@@ -15,8 +15,9 @@ import threading
 import pytest
 
 from agent_run.runner_lease import RunnerLeaseBusy, runner_management_lease, runner_usage_lease
-from agent_run_kernel import Commit, Kernel, KernelError
-from agent_run_kernel.model import Execution, HostObservation, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, RunSpec
+from agent_run_kernel.model import Execution, HostObservation
+from support.core_operations import CoreOperations, native_agent_fixture
 from agent_run_kernel.native_host import HandoffError, host_environment, launch_handoff, prepare_handoff
 from test_kernel_host_adapter import controlled_manager, host_kernel
 
@@ -30,7 +31,11 @@ def test_kernel_ready_and_released_follow_actual_host_and_manager_lease_handoff(
 
 
 def _exercise_handoff(tmp_path: Path, *, managed: bool) -> None:
-    kernel = host_kernel(tmp_path)
+    base = Commit("base", "tree")
+    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "requirements", base, "source", "target")
+    kernel, ports = native_agent_fixture(tmp_path / "state" / "kernel.sqlite3", RunSpec(
+        "host-run", "example/repository", 1, "requirements", "graph", (delivery,),
+        language="en", repository_root=str(tmp_path / "repository")))
     manager, fixture, response, calls = controlled_manager(tmp_path)
     private = tmp_path / "handoff"
     private.mkdir(mode=0o700)
@@ -38,7 +43,6 @@ def _exercise_handoff(tmp_path: Path, *, managed: bool) -> None:
     launch = kernel.admit_host("handoff", kind="run", command=fixture.command,
                                environment_carrier=carrier, preflight=manager.preflight)
     execution = Execution(launch.run_id, launch.owner, launch.epoch)
-    world = World("requirements", "graph", "requirements", Commit("base", "tree"))
     launch_listener = None
     launch_channel = None
     launch_thread = None
@@ -118,7 +122,7 @@ def _exercise_handoff(tmp_path: Path, *, managed: bool) -> None:
                 assert launch_listener is not None
                 launch_channel, _ = launch_listener.accept()
                 with pytest.raises(KernelError, match="host_usage_unproven"):
-                    kernel.advance("parent", execution, world)
+                    CoreOperations(kernel, execution, lambda binding: ports).once()
         # The terminal's descriptor has closed; the acknowledged guardian alone
         # protects the active Runner before the Host even exists.
         with pytest.raises(RunnerLeaseBusy):
@@ -174,7 +178,7 @@ with selected as inherited:
             launch_thread.join(timeout=3)
             assert not launch_thread.is_alive() and not launch_errors
             assert len(launch_results) == 1 and launch_results[0].disposition == "unknown"
-            assert reopened.advance("parent", execution, world).kind in {"progress", "effect", "agent"}
+            assert CoreOperations(reopened, execution, lambda binding: ports).once().kind in {"progress", "effect", "agent"}
         assert handoff.process.wait(timeout=3) == 0
         assert not carrier.exists()
         with pytest.raises(RunnerLeaseBusy):

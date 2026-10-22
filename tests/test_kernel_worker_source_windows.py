@@ -9,10 +9,11 @@ from threading import Event, Thread, current_thread
 
 import pytest
 
-from agent_run.github import GitHubReadError
 from agent_run_kernel import Issue, KernelError, ParentIssue, Requirements
+from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.execution import execute
-from agent_run_kernel.executor import _Executor
+from agent_run_kernel.executor import _make_ports
+from support.core_operations import CoreOperations
 from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.remote_effects import RemoteEffects
 from agent_run_kernel.source_reading import read_requirements
@@ -25,14 +26,9 @@ def _allocated_worker(tmp_path, monkeypatch):
     source = Requirements(ParentIssue(1, "Parent", "Original scope", (2,)),
                           (Issue(2, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "scenario", source)
-    for _ in range(16):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-        if step.call is not None:
-            call = step.call
-            break
-        scenario.handle(step)  # Existing fixture driver prepares the original workspace only.
-    else:
-        raise AssertionError("The original Core did not allocate Development")
+    preparation = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    call = preparation.until(lambda step: step.call is not None).call
+    assert call is not None
     transport = tmp_path / "transport"
     transport.mkdir()
     _port, _git, _push, state, _calls = _fixture(transport, monkeypatch)
@@ -45,9 +41,9 @@ def _allocated_worker(tmp_path, monkeypatch):
         "parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issues": [2]},
         "issues": {"2": {"number": 2, "title": "Ticket", "body": "Original task", "state": "OPEN",
                            "labels": ["ready-for-agent"]}}}}))
-    driver = _Executor(scenario.kernel, scenario.execution, os.environ)
-    driver.observe(scenario.delivery.key)
-    return scenario, driver, state, call
+    operations = CoreOperations(scenario.kernel, scenario.execution, _make_ports)
+    operations.runner.observe(scenario.delivery.key)
+    return scenario, operations, state, call
 
 
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
@@ -55,7 +51,7 @@ def _allocated_worker(tmp_path, monkeypatch):
 def test_worker_source_callback_preserves_authority_and_exact_process_settlement(tmp_path, monkeypatch, window, change):
     import agent_run_kernel.remote_effects as external
 
-    scenario, driver, state, call = _allocated_worker(tmp_path, monkeypatch)
+    scenario, operations, state, call = _allocated_worker(tmp_path, monkeypatch)
     kernel = scenario.kernel
     canary = tmp_path / "actual-worker-starts"
     reached, release = Event(), Event()
@@ -77,7 +73,7 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
     def authorize_source():
         nonlocal callbacks
         callbacks += 1
-        driver.observe(call.subject)
+        operations.runner.observe(call.subject)
 
     def run():
         try:
@@ -110,9 +106,10 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
         state.write_text(json.dumps(document))
         # A separate actual source reader, as in a concurrent public control,
         # commits while the original Host callback is outside its transaction.
-        current = RemoteEffects(driver.remote.root, driver.remote.repository,
-                                runner_identity=driver.remote.identity, remote=driver.remote.remote)
-        world = current.observe(kernel, call.subject)
+        port = operations.runner.ports
+        assert isinstance(port, RemoteEffects)
+        current = RemoteEffects(port.root, port.repository, runner_identity=port.identity, remote=port.remote)
+        world = kernel.operation_runner(scenario.execution, lambda binding: current).observe(call.subject)
         if change == "requirement":
             original = kernel.delivery(call.subject)
             replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
@@ -132,7 +129,7 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
             finally:
                 os.close(held_pidfd)
     assert not thread.is_alive()
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
     if change == "labels":
         assert failures == []
         assert len(outcomes) == 1 and outcomes[0] is not None and outcomes[0].returncode == 0
@@ -143,7 +140,7 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
         assert sum(event["kind"] == "worker_started" for event in kernel.history(call.subject)) == 1
     else:
         assert not canary.exists() and len(failures) == 1
-        assert isinstance(failures[0], GitHubReadError if change == "upstream" else KernelError)
+        assert isinstance(failures[0], ReadUnavailable if change == "upstream" else KernelError)
         if change == "requirement":
             assert kernel.status(call.subject)["gates"] == ["requeue_required"]
             assert kernel.requeue(call.subject, "replace-after-exit", replacement, world) == "applied"
