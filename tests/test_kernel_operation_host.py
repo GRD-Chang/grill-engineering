@@ -21,11 +21,16 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
                                (tmp_path / "hidden",), ("FROZEN_SECRET",))
     entered, read_done, exited = threading.Event(), threading.Event(), threading.Event()
     capacities = []
+    lifecycle = []
 
     class Runner:
         def __init__(self):
             self.binding = binding
+        def activate_observation(self):
+            assert lifecycle == [], "Host must activate exactly once before its first state read"
+            lifecycle.append("activate")
         def run_once(self, *, agent_capacity=1):
+            assert lifecycle[:2] == ["activate", "state"]
             capacities.append(agent_capacity)
             if len(capacities) == 1:
                 return Step("agent", call.subject, call=call)
@@ -34,6 +39,8 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
             read_done.set()
             return Step("waiting", call.subject)
         def state(self):
+            assert lifecycle and lifecycle[0] == "activate"
+            lifecycle.append("state")
             return OperationState(1, () if exited.is_set() and settled else (call.lease_id,),
                                   (call.lease_id,) if read_done.is_set() else (), None,
                                   "quiescent" if read_done.is_set() else "ready")
@@ -86,3 +93,4 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
             executor.run(Core(), execution, {"FROZEN_ENV": "captured"})
     assert capacities == [1, 0]
     assert entered.is_set() and read_done.is_set() and exited.is_set()
+    assert lifecycle[:2] == ["activate", "state"] and lifecycle.count("activate") == 1
