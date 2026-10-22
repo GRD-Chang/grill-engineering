@@ -68,6 +68,17 @@ _COLUMNS: dict[str, tuple[str, ...]] = {
     'worker_activity': tuple('invocation ordinal identity active observed_at evidence'.split()),
 }
 _CLOCK = '<non-authorizing mechanical timestamp>'
+# Prepared candidates have the Core-created schema, with no DDL changes
+# permitted. Root-page numbers are physical allocation, not schema semantics.
+_SCHEMA_OBJECTS = 'SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name'
+# This is a closed exception list, not an assumption that missing foreign-key
+# references imply inert data. Core also discovers material by subject/purpose
+# (fixture_evidence), and migration can discover v6_import_identity likewise.
+# Every other material must belong to the source-derived installation below.
+_UNREFERENCED_MATERIAL = {
+    'inspection_note': 'diagnostic-only; no runtime or migration selector',
+    'profile_revision': 'only consumed through exact profile_revisions and Thread bindings',
+}
 
 
 def _refuse() -> MigrationRefused:
@@ -86,7 +97,8 @@ class _Projection:
             tables = {row[0] for row in schema.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if tables != set(_COLUMNS):
                 raise MigrationRefused('native_installation_schema_unclassified')
-            self.schema = {table: [dict(row) for row in schema.execute(f'PRAGMA table_info("{table}")')]
+            self.objects = [dict(row) for row in schema.execute(_SCHEMA_OBJECTS)]
+            self.schema = {table: [dict(row) for row in schema.execute(f'PRAGMA table_xinfo("{table}")')]
                            for table in _COLUMNS}
             self.defaults = {}
             for table, info in self.schema.items():
@@ -94,6 +106,17 @@ class _Projection:
                     raise MigrationRefused('native_installation_schema_unclassified')
                 self.defaults[table] = {row['name']: None if row['dflt_value'] is None else
                     schema.execute('SELECT ' + row['dflt_value']).fetchone()[0] for row in info}
+
+    def verify_schema(self, tx: Transaction) -> None:
+        # Include executable objects, constraints and indexes, not just visible
+        # table columns. SQLite's own canonical stored DDL is compared exactly;
+        # an equivalent rewrite still requires explicit contract review.
+        if [dict(row) for row in tx.all(_SCHEMA_OBJECTS)] != self.objects:
+            raise _refuse()
+        for table in _COLUMNS:
+            actual = [dict(row) for row in tx.execute(f'PRAGMA table_xinfo("{table}")').fetchall()]
+            if actual != self.schema[table]:
+                raise _refuse()
 
     def add(self, table: str, **values: Any) -> dict[str, Any]:
         if not set(values) <= set(_COLUMNS[table]):
@@ -117,10 +140,9 @@ class _Projection:
                  generation=1, created_at=created_at, **values)
 
 
-def _expected(facts: OriginalRunFacts, origin: Mapping[str, str], proof: Mapping[str, Any], proof_sha: str,
+def _expected(state: _Projection, facts: OriginalRunFacts, origin: Mapping[str, str], proof: Mapping[str, Any], proof_sha: str,
               resources: Mapping[str, tuple[ResourceProof, ...]], run_head: str,
-              limits: Mapping[Purpose, tuple[int, int | None]]) -> _Projection:
-    state = _Projection()
+              limits: Mapping[Purpose, tuple[int, int | None]]) -> None:
     header = facts.header
     spec = original_run_spec(facts, header.task.workspace, Path(origin['source_db']).parent)
     anchor = min(ticket.owner.subject for ticket in facts.tickets)
@@ -234,7 +256,6 @@ def _expected(facts: OriginalRunFacts, origin: Mapping[str, str], proof: Mapping
                              whole_source=True, put=lambda purpose, body: put(anchor, purpose, body))
     state.history(anchor, 'v6_record_import', header.run_id,
                   put(anchor, 'v6_record_manifest', wire_json(archive)), _CLOCK)
-    return state
 
 
 def verify_prepared_installation(native: Kernel, facts: OriginalRunFacts, origin: Mapping[str, str],
@@ -243,27 +264,27 @@ def verify_prepared_installation(native: Kernel, facts: OriginalRunFacts, origin
 
     Allowed differences are narrow and non-authorizing: profile/Core/archive
     audit timestamps, history row numbers, SQLite allocation metadata, and
-    unreferenced valid immutable material. Exact-origin rollback audit rows are
+    unreferenced valid immutable material of explicitly inert purposes only.
+    Schema objects and all visible/hidden column metadata must match the trusted
+    Core schema. Exact-origin rollback audit rows are
     additionally allowed; no executor, Action, gate, role result or other
     business change is accepted. All referenced material is exact and validated.
     """
     # Progress is diagnosed before re-reading old Git resources, which native
     # cleanup may already have legitimately retired. This reads no expectation.
+    expected = _Projection()
     with native.storage.transaction(write=False) as tx:
+        expected.verify_schema(tx)
         run = tx.one('SELECT executor,epoch FROM runs')
         if run['executor'] is not None or run['epoch'] != 0:
             raise _refuse()
-    expected = _expected(facts, origin, proof, proof_sha, resources, run_head,
-                         native._budget_limits(facts.header.policy, DeliveryKind.TICKET))
+    _expected(expected, facts, origin, proof, proof_sha, resources, run_head,
+              native._budget_limits(facts.header.policy, DeliveryKind.TICKET))
     with native.storage.transaction(write=False) as tx:
+        expected.verify_schema(tx)
         if tx.execute('PRAGMA foreign_key_check').fetchone() is not None:
             raise _refuse()
-        tables = {row[0] for row in tx.all("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-        if tables != set(_COLUMNS):
-            raise _refuse()
         for table, columns in _COLUMNS.items():
-            if [dict(row) for row in tx.execute(f'PRAGMA table_info("{table}")').fetchall()] != expected.schema[table]:
-                raise _refuse()
             if table in {'material', 'history'}:
                 continue
             actual = [dict(row) for row in tx.all(f'SELECT * FROM "{table}"')]
@@ -300,6 +321,12 @@ def verify_prepared_installation(native: Kernel, facts: OriginalRunFacts, origin
                 wanted.append(dict(position=None, subject=anchor, kind=row['kind'], identity=origin['nonce'],
                     material_id=rollback_material, generation=1, created_at=_CLOCK, phase=None, purpose=None, status=None))
                 clocks.add((anchor, row['kind'], origin['nonce']))
+        # All authoritative references and their complete bodies are exact.
+        # Only these explicitly reviewed, reference-only/diagnostic purposes
+        # can have additional rows; unknown or purpose-discovered inputs cannot.
+        if any(identity not in expected.materials and row['purpose'] not in _UNREFERENCED_MATERIAL
+               for identity, row in materials.items()):
+            raise _refuse()
         for row in actual_history:
             row['position'] = None  # allocation numbers carry no source/execution permission
             if (row['subject'], row['kind'], row['identity']) in clocks:
