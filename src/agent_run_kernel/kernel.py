@@ -1782,6 +1782,95 @@ class Kernel:
                 raise KernelError("agent_not_started")
             tx.execute("DELETE FROM waits WHERE subject=? AND kind='github_convergence'", (call.subject,))
 
+    def _whole_imported_local_resources(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                                       cleanup: sqlite3.Row, origin: Mapping[str, Any], imported: sqlite3.Row) -> tuple[str, str]:
+        proof = json.loads(tx.get(imported["material_id"], imported["subject"]))
+        root_record = {"table": "run_root", "key": [run["id"]]}
+        if (imported["material_purpose"] != "v6_run_import" or imported["identity"] != origin["nonce"]
+                or imported["generation"] != 1 or not isinstance(proof, dict)
+                or proof.get("origin_nonce") != origin["nonce"] or proof.get("source_sha256") != origin["source_sha256"]
+                or proof.get("resource_mode") != "existing-verified" or proof.get("run_record") != root_record
+                or not isinstance(proof.get("subjects"), list)):
+            raise KernelError("cleanup_marker_unproven")
+        native = {row["id"]: row for row in tx.all("SELECT id,issue FROM subjects WHERE kind='ticket'")}
+        capsules: dict[str, dict[str, Any]] = {}
+        refs: set[str] = set()
+        checkouts: set[str] = set()
+        for entry in proof["subjects"]:
+            if (not isinstance(entry, dict) or set(entry) != {"subject", "generation", "proof_id"}
+                    or not isinstance(entry["subject"], str) or not isinstance(entry["proof_id"], str)
+                    or entry["subject"] not in native or entry["subject"] in capsules or entry["generation"] != 1):
+                raise KernelError("cleanup_marker_unproven")
+            facts = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                            "WHERE h.kind='v6_subject_import' AND h.material_id=? LIMIT 2", (entry["proof_id"],))
+            if (len(facts) != 1 or facts[0]["material_purpose"] != "v6_subject_import"
+                    or facts[0]["subject"] != entry["subject"] or facts[0]["generation"] != entry["generation"]
+                    or facts[0]["identity"] != origin["nonce"]):
+                raise KernelError("cleanup_marker_unproven")
+            capsule = json.loads(tx.get(entry["proof_id"], entry["subject"]))
+            if (not isinstance(capsule, dict) or capsule.get("origin_nonce") != origin["nonce"]
+                    or capsule.get("source_sha256") != origin["source_sha256"] or capsule.get("subject") != entry["subject"]
+                    or capsule.get("generation") != entry["generation"] or capsule.get("kind") not in {"completed", "returned", "unallocated"}
+                    or not isinstance(capsule.get("resources"), list)
+                    or (capsule["kind"] == "unallocated" and capsule["resources"])):
+                raise KernelError("cleanup_marker_unproven")
+            capsules[entry["subject"]] = capsule
+            for resource in capsule["resources"]:
+                if (not isinstance(resource, dict) or set(resource) != {"layout", "checkout_index_sha256", "source_record"}
+                        or resource["source_record"] != capsule.get("source_record") or not isinstance(resource["layout"], dict)):
+                    raise KernelError("cleanup_marker_unproven")
+                layout = resource["layout"]
+                if (not isinstance(layout.get("source_ref"), str) or not isinstance(layout.get("checkout"), str)
+                        or layout["source_ref"] in refs or layout["checkout"] in checkouts):
+                    raise KernelError("cleanup_marker_unproven")
+                refs.add(layout["source_ref"])
+                checkouts.add(layout["checkout"])
+        run_ref = proof.get("run_ref_ownership")
+        if (set(capsules) != set(native) or not isinstance(run_ref, dict)
+                or set(run_ref) != {"source_ref", "expected_oid", "source_record", "head_evidence"}
+                or run_ref["source_record"] != root_record or not isinstance(run_ref["source_ref"], str) or run_ref["source_ref"] in refs
+                or not isinstance(run_ref["expected_oid"], str) or len(run_ref["expected_oid"]) not in {40, 64}
+                or any(c not in "0123456789abcdef" for c in run_ref["expected_oid"])
+                or not isinstance(run_ref["head_evidence"], list) or not run_ref["head_evidence"]
+                or cleanup["source_ref"] != job["source_ref"] or cleanup["generation"] != job["generation"]
+                or any(cleanup[key] != job[key] for key in ("checkout", "owned_root", "common_git_dir"))):
+            raise KernelError("cleanup_marker_unproven")
+        if job["kind"] == DeliveryKind.FINAL_RUN and cleanup["stage"] == 1:
+            if run_ref["source_ref"] != cleanup["source_ref"]:
+                raise KernelError("cleanup_marker_unproven")
+            head = run_ref["expected_oid"]
+        elif job["kind"] == DeliveryKind.TICKET and cleanup["stage"] in {0, 1}:
+            capsule = capsules.get(job["id"], {})
+            record = {"table": "work_jobs", "key": [run["id"], f"ticket:{job['issue']}:generation:{job['generation']}"]}
+            resources = [resource for resource in capsule.get("resources", [])
+                         if resource["layout"].get("checkout") == cleanup["checkout"]
+                         and resource["layout"].get("source_ref") == cleanup["source_ref"]]
+            if (capsule.get("generation") != job["generation"] or capsule.get("kind") not in {"completed", "returned"}
+                    or capsule.get("source_record") != record or capsule.get("historical_base") != job["base_sha"] or len(resources) != 1):
+                raise KernelError("cleanup_marker_unproven")
+            resource, layout = resources[0], resources[0]["layout"]
+            checkout = Path(origin["target_db"]).parent.parent / "worktrees" / run["id"] / f"ticket-{job['issue']}"
+            if (set(layout) != {"version", "nonce", "source_sha256", "source_uuid", "repository_root", "checkout", "owned_root",
+                               "common_git_dir", "source_ref", "expected_oid", "before_head", "checkout_archive_sha256"}
+                    or layout["version"] != 1 or layout["nonce"] != origin["nonce"]
+                    or layout["source_sha256"] != origin["source_sha256"] or layout["source_uuid"] != origin["source_uuid"]
+                    or layout["repository_root"] != run["repository_root"] or layout["source_ref"] != cleanup["source_ref"]
+                    or not isinstance(layout["expected_oid"], str) or len(layout["expected_oid"]) not in {40, 64}
+                    or any(c not in "0123456789abcdef" for c in layout["expected_oid"])
+                    or layout["before_head"] != "ref: " + cleanup["source_ref"] + "\n"
+                    or any(layout[key] != cleanup[key] for key in ("checkout", "owned_root", "common_git_dir"))
+                    or cleanup["checkout"] != str(checkout) or cleanup["owned_root"] != str(checkout.parent)
+                    or cleanup["common_git_dir"] != str(Path(run["repository_root"]) / ".git")
+                    or any(not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+                           for value in (resource["checkout_index_sha256"], layout["checkout_archive_sha256"]))):
+                raise KernelError("cleanup_marker_unproven")
+            head = cleanup["workspace_sha"] if cleanup["stage"] == 0 else layout["expected_oid"]
+        else:
+            raise KernelError("cleanup_marker_unproven")
+        if (not isinstance(head, str) or len(head) not in {40, 64} or any(c not in "0123456789abcdef" for c in head)):
+            raise KernelError("cleanup_marker_unproven")
+        return head, str(origin["source_uuid"])
+
     def _imported_local_resources(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                             cleanup: sqlite3.Row) -> tuple[str, str] | None:
         origins = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
@@ -1802,6 +1891,12 @@ class Kernel:
                 or origin["run_id"] != run["id"] or origin["target_db"] != str(self.storage.path)
                 or origin["task_fingerprint"] != self._task(run).fingerprint):
             raise KernelError("cleanup_marker_unproven")
+        manifests = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
+                            "WHERE h.kind='v6_run_import' LIMIT 2")
+        if manifests:
+            if len(manifests) != 1 or manifests[0]["subject"] != anchor["subject"]:
+                raise KernelError("cleanup_marker_unproven")
+            return self._whole_imported_local_resources(tx, run, job, cleanup, origin, manifests[0])
         returned = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
                            "WHERE h.kind='v6_returned_import' LIMIT 2")
         if returned:
