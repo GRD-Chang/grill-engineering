@@ -14,7 +14,7 @@ from agent_run_kernel import Checks, Commit, Delivery, DeliveryKind, Kernel, Ker
 from agent_run_kernel.offline import Scenario, review_result
 from agent_run_kernel.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
-from test_kernel_remote_effects import EffectBoundary, effect_boundary
+from support.effect_boundary import EffectBoundary, effect_boundary
 
 
 def ticket_spec() -> RunSpec:
