@@ -10,10 +10,14 @@ import sys
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Profile, RunSpec, World
+from agent_run.agent_profiles import resolve_profiles
+
+from agent_run_kernel import Blocker, Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Policy, Profile, Requirements, RunSpec
 from agent_run_kernel import query
 from agent_run_kernel.query_cli import main
-from agent_run_kernel.offline import Scenario
+from agent_run_kernel.offline import Scenario, fixture_inputs
+from agent_run_kernel.operation_runner import DeliveryFacts, OperationRunner
+from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
 def test_missing_exact_query_is_actionable_and_does_not_create_storage(
@@ -27,16 +31,48 @@ def test_missing_exact_query_is_actionable_and_does_not_create_storage(
     assert not missing.exists()
 
 
+def _default_deliveries() -> tuple[Delivery, ...]:
+    return (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", Commit("base", "base-tree"),
+                     "refs/heads/ticket", "refs/heads/run"),)
+
+
+def _fixture_source(deliveries: tuple[Delivery, ...], parent: int = 1) -> Requirements:
+    numbers = {item.key: item.issue for item in deliveries}
+    return Requirements(ParentIssue(parent, "Parent", "Original query requirement", tuple(numbers.values())),
+        tuple(Issue(item.issue, "Ticket", item.revision, "OPEN", frozenset({"ready-for-agent"}),
+                    tuple(Blocker(numbers[key], "OPEN") for key in item.dependencies)) for item in deliveries))
+
+
+def _operations(kernel: Kernel, execution, *, deliveries: tuple[Delivery, ...] | None = None) -> CoreOperations:
+    deliveries = deliveries or _default_deliveries()
+
+    class Ports(ReadOnlyPorts):
+        def delivery(self, request):
+            assert (request.source_ref, request.target_ref) in {(item.source_ref, item.target_ref) for item in deliveries}
+            return self.facts
+
+    first = deliveries[0]
+    ports = Ports(_fixture_source(deliveries), first.source_ref, first.target_ref, DeliveryFacts(first.base, None))
+    return CoreOperations(kernel, execution, lambda binding: ports)
+
+
 def _create(root: Path, run_id: str = "run-query", *, language: str | None = "en",
             repository: str = "example/project", parent: int = 1,
             repository_root: Path | None = None, deliveries: tuple[Delivery, ...] | None = None) -> Kernel:
-    base = Commit("base", "base-tree")
-    spec = RunSpec(run_id, repository, parent, "parent-v1", "graph-v1",
-                   deliveries or (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
-                             "refs/heads/ticket", "refs/heads/run"),),
+    deliveries = deliveries or _default_deliveries()
+    spec = RunSpec(run_id, repository, parent, "parent-v1", "graph-v1", deliveries,
                    Policy(development_profile=Profile("recorded-development-model", "high")),
                    language=language, repository_root=str(repository_root or root / "checkout"))
-    return Kernel.create(root / run_id / "kernel.sqlite3", spec)
+    if language is None:
+        # Explicit incompatible historical reader input; no runner is admitted.
+        return Kernel.create(root / run_id / "kernel.sqlite3", spec)
+    inputs = fixture_inputs()
+    profiles = resolve_profiles(preset="economy", overrides={
+        "development_model": "recorded-development-model", "development_effort": "high"})
+    final = Delivery("query-final", DeliveryKind.FINAL_RUN, parent, "unread", deliveries[0].base,
+                     deliveries[0].target_ref, "refs/heads/query-main")
+    return Kernel.create(root / run_id / "kernel.sqlite3", replace(spec, inputs=replace(inputs, profiles=profiles),
+        deliveries=(*deliveries, final)), requirements=_fixture_source(deliveries, parent))
 
 
 def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(tmp_path: Path) -> None:
@@ -52,8 +88,7 @@ def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(
         assert kernel.control("stop", "stop-" + job.key, subject=job.key) == "applied"
         assert kernel.control("resume", "resume-" + job.key, subject=job.key) == "applied"
     execution = kernel.claim_executor("queue-executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
-    assert kernel.advance(independent[0].key, execution, world).call is not None
+    assert _operations(kernel, execution, deliveries=(*independent, dependent)).once().call is not None
     before = _snapshot(tmp_path)
     document = query.read(kernel.storage.path, "status").data
     assert document["scheduling"]["work_fifo"] == [job.key for job in independent[1:]]
@@ -80,14 +115,15 @@ def _arguments(kernel: Kernel, command: str = "status", *extra: str) -> list[str
     return [command, kernel.storage.path.parent.name, "--state-dir", str(kernel.storage.path), *extra]
 
 
-def _human(kernel: Kernel, message: str = "Need the original decision / 保留原文") -> None:
+def _human(kernel: Kernel, message: str = "Need the original decision / 保留原文", *,
+           deliveries: tuple[Delivery, ...] | None = None) -> None:
     execution = kernel.claim_executor("query-executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    call = kernel.advance("ticket:2", execution, world).call
+    operations = _operations(kernel, execution, deliveries=deliveries)
+    call = operations.once().call
     assert call is not None
     kernel.receive(call, json.dumps({"result_kind": "human_blocker", "summary": None,
                                     "human_blockers": [message]}).encode())
-    assert kernel.advance("ticket:2", execution, world).kind == "paused"
+    assert operations.once(agent_capacity=0).kind == "paused"
 
 
 def test_latest_resume_distinguishes_application_from_the_target_start_and_ignores_sibling_progress(
@@ -100,10 +136,10 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
         f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
     kernel = _create(tmp_path, deliveries=deliveries)
-    _human(kernel)
+    _human(kernel, deliveries=deliveries)
     execution = kernel.claim_executor("query-executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
-    sibling = kernel.advance("ticket:3", execution, world).call
+    operations = _operations(kernel, execution, deliveries=deliveries)
+    sibling = operations.once().call
     assert sibling is not None
     # Allocate the sibling before re-enqueueing Ticket 2, respecting the real
     # FIFO. Its physical start below still follows the target's Resume.
@@ -130,7 +166,7 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert _snapshot(tmp_path) == before
 
     kernel.agent_exited(sibling, sibling_process, 0)
-    target = kernel.advance("ticket:2", execution, world).call
+    target = operations.once().call
     assert target is not None and kernel.dispatch_agent(target)
     target_process = {**sibling_process, "pid": 22, "pgid": 22, "start_token": "query-target"}
     kernel.agent_started(target, target_process)
@@ -165,8 +201,7 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
 
     kernel = _create(tmp_path)
     execution = kernel.claim_executor("query-executor")
-    call = kernel.advance("ticket:2", execution,
-        World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))).call
+    call = _operations(kernel, execution).once().call
     assert call is not None and kernel.dispatch_agent(call)
     process = {"pid": 22, "pgid": 22, "start_token": "query-target",
                "host_pid": 10, "host_start_token": "query-host"}
@@ -239,7 +274,9 @@ def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("A query attempted to advance business work")
 
-    monkeypatch.setattr(Kernel, "advance", forbidden)
+    monkeypatch.setattr(Kernel, "operation_runner", forbidden)
+    for method in ("__init__", "run_once", "observe", "authorize_agent", "worker_settled", "state"):
+        monkeypatch.setattr(OperationRunner, method, forbidden)
     assert main(_arguments(kernel, "status", "--json")) == 0
     output = json.loads(capsys.readouterr().out)
     job = output["subjects"][0]
@@ -265,10 +302,9 @@ def test_local_human_boundary_does_not_present_its_sibling_as_globally_paused(tm
     deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
         f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
     kernel = _create(tmp_path, deliveries=deliveries)
-    _human(kernel, "Only Ticket 2 requires this decision")
+    _human(kernel, "Only Ticket 2 requires this decision", deliveries=deliveries)
     execution = kernel.claim_executor("query-executor")
-    call = kernel.advance("ticket:3", execution,
-        World("parent-v1", "graph-v1", "ticket-v1", base)).call
+    call = _operations(kernel, execution, deliveries=deliveries).once().call
     assert call is not None
     before = _snapshot(tmp_path)
     document = query.read(kernel.storage.path, "status").data
@@ -538,7 +574,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
 
     def configured_create(path, spec, **kwargs):
         return original_create(path, replace(spec, language="en", repository="example/repository",
-                                             repository_root=str(tmp_path.resolve())), **kwargs)
+                                             repository_root=spec.repository_root), **kwargs)
 
     monkeypatch.setattr(Kernel, "create", staticmethod(configured_create))
     tickets = () if kind == DeliveryKind.PARENT_ONLY else (2,)
@@ -546,9 +582,16 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
                           () if not tickets else (Issue(2, "Ticket", "Original task", "OPEN",
                                                         frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "scenario", source)
+    scenario.spec = replace(scenario.spec, language="en", repository="example/repository")
     if kind == DeliveryKind.FINAL_RUN:
         assert scenario.run().kind == "complete"
-        scenario.select(scenario.activate_final())
+        for _ in range(40):
+            scenario.step()
+            if scenario.kernel.source_status()["final_subject"] is not None:
+                break
+        else:
+            raise AssertionError("Real Ticket Completion did not admit Final")
+        scenario.select("final:1")
     if kind != DeliveryKind.TICKET:
         assert scenario.run().kind == "approval"
         before = _snapshot(tmp_path)
