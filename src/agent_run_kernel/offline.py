@@ -13,14 +13,16 @@ import sqlite3
 from typing import Any, Callable, Mapping, Sequence
 
 from agent_run.agent_profiles import resolve_profiles
+from agent_run.github import GitHubReadError
 from agent_run.prompt_resources import resolve_resources
 
 from .effects import LocalGit
 from .local_effects import LocalEffects
 from .remote_effects import RemoteEffects
 from .kernel import Kernel
+from .operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner
 from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult,
-                    KernelError, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json)
+                    Issue, KernelError, ParentIssue, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json)
 
 
 class LostResponse(OSError):
@@ -128,7 +130,7 @@ class OfflinePort:
             db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (target_ref, base.sha))
         checkout = self.root / "work" / key.replace(":", "-")
         checkout.parent.mkdir(exist_ok=True)
-        self.git.run("worktree", "add", "--detach", str(checkout), source.sha)
+        # The shared Core workspace effect creates and authenticates checkout.
         delivery = Delivery(key, kind, ticket_number if kind == DeliveryKind.TICKET else 1, "subject-v1", source,
                             source_ref, target_ref, completion_revision="no-tickets", checkout=str(checkout),
                             owned_root=str(checkout.parent.resolve()), common_git_dir=str((self.git.root / ".git").resolve()))
@@ -158,22 +160,32 @@ class OfflinePort:
                            self.remote_commit(pr.source_ref) or pr.head, self.remote_commit(pr.target_ref) or pr.base, pr.title, pr.body,
                            pr.state, pr.actor, pr.merged, pr.head_repository)
 
-    def world(self, spec: RunSpec, delivery: Delivery, checks_result: str = "none", *, witnesses: Sequence[str] = ()) -> World:
-        pr = self.pull_request(delivery.key, delivery.source_ref)
+    def delivery(self, request: DeliveryRead, checks_script: Sequence[str], heads: list[str], *,
+                 publisher_identity: Mapping[str, Any] | None = None) -> DeliveryFacts:
+        """Read the synthetic remote; revisions and World belong to Core."""
+        pr = (None if not request.read_pr else self.pr_by_number(request.pr_number)
+              if request.pr_number is not None else self.pull_request_by_ref(request.source_ref))
         checks = None
-        if pr is not None:
+        if pr is not None and pr.state == "OPEN":
+            if request.check_head is not None and request.check_head != pr.head.sha:
+                raise GitHubReadError("github_observation_pending", "Synthetic checks head is not current")
+            if pr.head.sha not in heads:
+                heads.append(pr.head.sha)
+            checks_result = checks_script[min(max(0, len(heads) - 1), len(checks_script) - 1)]
             details = () if checks_result == "none" else (("required", checks_result),)
             checks = Checks(pr.number, pr.head.sha, checks_result, details,
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
-        source = self.remote_commit(delivery.source_ref)
-        target = self.remote_commit(delivery.target_ref)
-        if target is None:
-            raise KernelError("remote_target_missing")
-        return World(spec.parent_revision, spec.graph_revision, delivery.revision,
-                     target, source, pr, checks,
-                     delivery.completion_revision,
-                     self.ancestry(source, target, witnesses), "offline-publisher",
-                     None if spec.inputs is None else spec.inputs.runner_identity)
+        source, target = self.remote_commit(request.source_ref), self.remote_commit(request.target_ref)
+        ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
+        ancestry = tuple((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)
+                         if before == after or self.git.is_ancestor(before, after))
+        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", publisher_identity)
+
+    def pull_request_by_ref(self, source_ref: str) -> PullRequest | None:
+        with sqlite3.connect(self.database) as db:
+            numbers = [row[0] for row in db.execute("SELECT number FROM prs ORDER BY number DESC")]
+        return next((pr for number in numbers if (pr := self.pr_by_number(number)) is not None
+                     and pr.source_ref == source_ref), None)
 
     def ancestry(self, source: Commit | None, target: Commit, witnesses: Sequence[str]) -> tuple[tuple[str, str], ...]:
         before_heads = set(witnesses) | {target.sha}
@@ -599,6 +611,55 @@ class OfflinePort:
         return candidate
 
 
+class _ScenarioPorts:
+    """The same physical contract as native, with scripted external outcomes."""
+
+    def __init__(self, scenario: Scenario, binding: OperationBinding) -> None:
+        self.scenario, self.binding = scenario, binding
+        if (binding.repository_root.resolve() != scenario.port.git.root.resolve()
+                or binding.repository != scenario.spec.repository
+                or binding.parent_number != scenario.spec.parent_issue):
+            raise KernelError("synthetic_source_binding")
+
+    def source(self, parent_number: int) -> Requirements:
+        source = self.scenario.requirements
+        if source is None or source.parent.number != parent_number:
+            raise KernelError("synthetic_source_not_configured")
+        with sqlite3.connect(self.scenario.port.database) as db:
+            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
+        return replace(source, issues=tuple(
+            replace(issue, state="CLOSED" if issue.number in closed else issue.state,
+                    blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker
+                                     for blocker in issue.blocked_by)) for issue in source.issues))
+
+    def delivery(self, request: DeliveryRead) -> DeliveryFacts:
+        scenario = self.scenario
+        heads = scenario.check_heads.setdefault(request.source_ref, [])
+        facts = scenario.port.delivery(request, scenario.checks, heads,
+                                       publisher_identity=self.binding.inputs.runner_identity)
+        if request.source_ref == scenario.delivery.source_ref:
+            scenario.heads = heads
+        return facts
+
+    def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
+        return self.scenario.port.inspect_resources(resources)
+
+    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+        result = self.scenario.port.execute(effect, authorize)
+        if effect.operation == "issue_link":
+            return result if result is not None else EffectResult("unknown")
+        return self.scenario.port.reconcile(effect)
+
+    def reconcile(self, effect: Effect) -> EffectResult:
+        return self.scenario.port.reconcile(effect)
+
+    def prepare_publication(self, effect: Effect) -> Mapping[str, Any]:
+        return self.scenario.port.local.prepare_publication(effect)
+
+    def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]:
+        return self.scenario.port.prepare_retirement(effect)
+
+
 class Scenario:
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
                  checks: Sequence[str] = ("none",), policy: Policy | None = None,
@@ -624,9 +685,28 @@ class Scenario:
             ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"] if neutral_script.get("ticket") else 1,
             repository="example/repository" if neutral_script is None else neutral_script["repository"],
             completed_ticket=None if neutral_script is None else neutral_script.get("completed_ticket_precondition"))
+        self.requirements: Requirements | None = None
+        if kind != DeliveryKind.FINAL_RUN:
+            if neutral_script is None:
+                parent = ParentIssue(1, "Parent spec", "Deliver the declared synthetic behavior.",
+                                     (self.delivery.issue,) if kind == DeliveryKind.TICKET else ())
+                issues = (() if kind == DeliveryKind.PARENT_ONLY else
+                          (Issue(self.delivery.issue, "Deliver one ticket", "Implement the declared synthetic behavior.",
+                                 "OPEN", frozenset({"ready-for-agent"})),))
+                self.requirements = Requirements(parent, issues)
+            else:
+                self.requirements = Requirements.from_wire({"parent": neutral_script["parent"],
+                    "issues": [] if kind == DeliveryKind.PARENT_ONLY else [neutral_script["ticket"]]})
+            if kind == DeliveryKind.TICKET:
+                final = Delivery("final:1", DeliveryKind.FINAL_RUN, self.requirements.parent.number, "untrusted", self.initial,
+                    self.delivery.target_ref, "refs/heads/main", checkout=str(self.port.root / "work" / "final-1"),
+                    owned_root=self.delivery.owned_root, common_git_dir=self.delivery.common_git_dir)
+                self.spec = replace(self.spec, deliveries=(*self.spec.deliveries, final))
         evidence = None if neutral_script is None else {"parent": neutral_script["parent"], "ticket": neutral_script.get("ticket"),
             "historical_completion": neutral_script.get("completed_ticket_precondition"), "source": "explicit immutable neutral fixture; not a live Completion import"}
-        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, fixture_evidence=evidence)
+        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=self.requirements,
+                                    fixture_evidence=evidence if self.requirements is None else None)
+        self.delivery = self.kernel.delivery(self.delivery.key)
         self.execution = self.kernel.claim_executor("offline-executor")
         self.reviews = list(reviews)
         self.checks = list(checks)
@@ -634,24 +714,25 @@ class Scenario:
         self.development_count = 0
         self.publication_count = 0
         self.heads: list[str] = []
+        self.check_heads: dict[str, list[str]] = {}
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
         self.edits = edits
         self.reviewed_heads: list[str] = []
 
     def world(self) -> World:
-        pr = self.port.pull_request(self.delivery.key, self.delivery.source_ref)
-        if pr is not None and pr.head.sha not in self.heads:
-            self.heads.append(pr.head.sha)
-        index = max(0, len(self.heads) - 1)
-        state = self.kernel.status(self.delivery.key)
-        witnesses = [state["source_sha"]]
-        witnesses.extend(state["resync"][key] for key in ("source_sha", "target_sha") if state["resync"][key] is not None)
-        return self.port.world(self.spec, self.delivery, self.checks[min(index, len(self.checks) - 1)], witnesses=witnesses)
+        return self.runner().observe(self.delivery.key)
+
+    def make_ports(self, binding: OperationBinding) -> OperationPorts:
+        return _ScenarioPorts(self, binding)
+
+    def runner(self) -> OperationRunner:
+        return self.kernel.operation_runner(self.execution, self.make_ports)
 
     def agent(self, call: AgentCall) -> bytes:
+        delivery = self.kernel.delivery(call.subject)
         self.role_calls.append({"role": call.role.value, "purpose": call.purpose.value,
-                                "owner_kind": self.delivery.kind.value, "attempt": call.attempt_id,
+                                "owner_kind": delivery.kind.value, "attempt": call.attempt_id,
                                 "repair_source": call.context.get("repair_source")})
         self.kernel.bind_thread(call, call.reported_thread or "offline-" + call.thread_id)
         if call.role == Role.DEVELOPMENT:
@@ -670,7 +751,7 @@ class Scenario:
                              {"result_kind": "development", "summary": f"Changed synthetic behavior {self.development_count}", "human_blockers": None})
         if call.role == Role.REVIEW:
             # A Reviewer may produce temporary test files in its own checkout.
-            assert Path(call.context["checkout"]) != Path(self.delivery.checkout)
+            assert Path(call.context["checkout"]) != Path(delivery.checkout)
             assert self.port.git.run("rev-parse", "HEAD", cwd=Path(call.context["checkout"])).stdout.strip() == call.context["reviewed_commit"]
             (Path(call.context["checkout"]) / "validation.tmp").write_text("Reviewer temporary file\n")
             self.reviewed_heads.append(call.context["candidate_sha"])
@@ -687,79 +768,42 @@ class Scenario:
                           "pr_body_markdown": f"Synthetic scenario with recorded evidence {self.publication_count}.", "human_blockers": None})
 
     def step(self) -> Step:
-        world = self.world()
-        step = self.kernel.advance(self.delivery.key, self.execution, world)
-        return self.handle(step)
-
-    def handle(self, step: Step) -> Step:
-        if step.kind == "agent" and step.call is not None:
+        runner = self.runner()
+        step = runner.run_once()
+        if step.call is not None:
+            runner.authorize_agent(step.call)
             self.kernel.receive(step.call, self.agent(step.call))
-        elif step.kind == "effect" and step.effect is not None:
-            effect = step.effect
-            if effect.operation == "publication_commit" and not effect.payload.get("reuse_sha"):
-                witness = self.port.local.prepare_publication(effect)
-                effect = self.kernel.attach_publication_commit(effect, witness, self.execution, self.world())
-            if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
-                effect = self.kernel.attach_retirement(effect, self.port.prepare_retirement(effect), self.execution, self.world())
-            def resource_facts() -> tuple[ResourceInspection, ...] | None:
-                resources = self.kernel.effect_resources(effect) if effect.operation in Kernel.REMOTE else None
-                return None if resources is None else self.port.inspect_resources(resources)
-
-            dispatched = effect.operation != "close" and self.kernel.dispatch(
-                effect, self.execution, self.world(), resource_inspections=resource_facts())
-
-            def authorize() -> None:
-                nonlocal dispatched
-                if not dispatched:
-                    if not self.kernel.dispatch(effect, self.execution, self.world(), resource_inspections=resource_facts()):
-                        raise KernelError("operation_cancelled")
-                    dispatched = True
-                self.kernel.guard_effect(effect, self.execution, self.world(), resource_inspections=resource_facts())
-
-            if dispatched or effect.operation == "close":
-                try:
-                    acknowledgement = self.port.execute(effect, authorize)
-                except LostResponse as error:
-                    self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
-                except Exception as error:
-                    if dispatched:
-                        self.kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": str(error)})
-                    else:
-                        self.kernel.reconcile(effect, EffectResult("unknown", raw={"type": type(error).__name__, "message": str(error)}),
-                                              self.execution, self.world())
-                    raise
-                else:
-                    if effect.operation == "issue_link":
-                        if acknowledgement is not None:
-                            self.kernel.acknowledge_link(effect, acknowledgement)
-                    else:
-                        self.kernel.reconcile(effect, self.port.reconcile(effect), self.execution, self.world())
-        elif step.kind == "reconcile" and step.effect is not None:
-            self.kernel.reconcile(step.effect, self.port.reconcile(step.effect), self.execution, self.world())
         self.checkpoints.append(self.kernel.status(self.delivery.key))
         return step
 
     def run(self, *, approve: bool = False, max_steps: int = 200, cut: str = "complete") -> Step:
         for _ in range(max_steps):
-            if cut == "publication_pending" and self.kernel.status(self.delivery.key)["phase"] == "publish":
+            state = self.kernel.status(self.delivery.key)
+            if cut == "publication_pending" and state["phase"] == "publish":
                 return Step("publication_pending", self.delivery.key)
+            cleanup = state["resource_cleanup"]
+            if state["phase"] == "complete" and (cleanup is None or cleanup["state"] == "complete"):
+                return Step("complete", self.delivery.key)
             step = self.step()
+            if step.subject and step.subject != self.delivery.key:
+                continue  # The assertion focus never chooses Core's work.
+            if not step.subject:
+                state = self.kernel.status(self.delivery.key)
+                if state["phase"] == "approval":
+                    step = Step("approval", self.delivery.key)
+                elif state["gates"] or state["stopped"] or state["blocked"]:
+                    reason = state["gates"][0] if state["gates"] else state["blocked"] or "operator_stopped"
+                    step = Step("paused", self.delivery.key, reason)
+                elif step.kind == "quiescent":
+                    step = Step("waiting", self.delivery.key, "quiescent", retry_at=step.retry_at)
             if step.kind == "approval" and approve:
                 self.kernel.control("approve", f"approval-{self.publication_count}", subject=self.delivery.key, world=self.world())
-            elif step.kind in {"complete", "paused", "approval", "waiting"}:
-                if step.kind == "complete":
-                    self.cleanup()
+            elif step.kind in {"paused", "approval", "waiting"}:
                 return step
-        raise AssertionError("offline driver failed to reach a stable observable boundary")
+        raise AssertionError("offline runner failed to reach the requested observable boundary")
 
     def cleanup(self, *, max_steps: int = 16) -> Step:
-        for _ in range(max_steps):
-            step = self.kernel.advance_cleanup(self.delivery.key, self.execution, self.world())
-            self.handle(step)
-            current = self.kernel.status(self.delivery.key)["resource_cleanup"]
-            if step.kind in {"complete", "paused", "waiting"} or (current and current["outcome"] in {"third", "unknown"}):
-                return step
-        return Step("waiting", self.delivery.key, "cleanup_pending")
+        return self.run(max_steps=max_steps, cut="cleanup")
 
     def trace(self) -> dict[str, Any]:
         return {"role_calls": self.role_calls, "checkpoints": self.checkpoints,
@@ -955,6 +999,7 @@ class GraphScenario(Scenario):
         self.reviews, self.checks = list(reviews), ["none"]
         self.review_count = self.development_count = self.publication_count = 0
         self.heads: list[str] = []
+        self.check_heads: dict[str, list[str]] = {}
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
         self.edits = None
@@ -965,34 +1010,8 @@ class GraphScenario(Scenario):
         self.heads = []
 
     def refresh(self) -> dict[str, Any]:
-        def read() -> Requirements:
-            with sqlite3.connect(self.port.database) as db:
-                closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
-            return replace(self.requirements, issues=tuple(
-                replace(issue, state="CLOSED" if issue.number in closed else issue.state,
-                        blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker for blocker in issue.blocked_by))
-                for issue in self.requirements.issues))
-        return self.kernel.refresh(read)
-
-    def world(self) -> World:
-        receipt = self.refresh()
-        self.delivery = self.kernel.delivery(self.delivery.key)
-        status = self.kernel.status(self.delivery.key)
-        source = self.port.remote_commit(self.delivery.source_ref)
-        target = self.port.remote_commit(self.delivery.target_ref)
-        if target is None:
-            raise KernelError("remote_target_missing")
-        pr = self.port.pull_request(self.delivery.key, self.delivery.source_ref)
-        checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
-        revision = (next(item["revision"] for item in receipt["observed_issues"] if item["issue"] == self.delivery.issue)
-                    if self.delivery.kind == DeliveryKind.TICKET else receipt["observed_parent_revision"])
-        completion = next(item["completion_revision"] for item in receipt["completion_revisions"] if item["subject"] == self.delivery.key)
-        witnesses = [status["source_sha"]]
-        witnesses.extend(status["resync"][key] for key in ("source_sha", "target_sha") if status["resync"][key] is not None)
-        return World(receipt["observed_parent_revision"], receipt["observed_graph_revision"], revision,
-                     target, source, pr, checks, completion,
-                     self.port.ancestry(source, target, witnesses),
-                     "offline-publisher", None if self.spec.inputs is None else self.spec.inputs.runner_identity)
+        self.world()
+        return self.kernel.source_status()
 
     def agent(self, call: AgentCall) -> bytes:
         raw = super().agent(call)
@@ -1000,15 +1019,6 @@ class GraphScenario(Scenario):
         self.role_calls[-1]["context"] = dict(call.context)
         return raw
 
-    def activate_final(self) -> str:
-        receipt = self.refresh()
-        head = self.port.remote_commit("refs/heads/run")
-        default = self.port.remote_commit("refs/heads/main")
-        if head is None or default is None:
-            raise KernelError("final_source_missing")
-        records = receipt["completions"]
-        ancestry = tuple((record["merge_sha"], head.sha) for record in records if self.port.git.is_ancestor(record["merge_sha"], head.sha))
-        return self.kernel.activate_final(self.execution, head, default, ancestry=ancestry)
 
 
 def main() -> None:
