@@ -105,6 +105,10 @@ def observe_operation(kernel: Kernel, binding: OperationBinding, ports: Operatio
         if waiting is not None:
             raise ReadWait(waiting)
     source = ports.source(binding.parent_number)
+    if execution is not None:
+        waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+        if waiting is not None:
+            raise ReadWait(waiting)
     with kernel.storage.transaction() as tx:
         kernel._check_operation(tx, token, execution)
         kernel._refresh(tx, source)
@@ -128,6 +132,10 @@ def observe_operation(kernel: Kernel, binding: OperationBinding, ports: Operatio
                                tuple(sorted(anchors)), job["source_sha"] if subject is not None and job["phase"] == "checks" else None,
                                subject is not None)
     facts = ports.delivery(request)
+    if execution is not None:
+        waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+        if waiting is not None:
+            raise ReadWait(waiting)
     with kernel.storage.transaction(write=False) as tx:
         kernel._check_operation(tx, token, execution)
         run = tx.one("SELECT * FROM runs")
@@ -278,6 +286,9 @@ class OperationRunner:
                     status = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0]
                 resources = kernel.effect_resources(effect)
                 inspections = None if resources is None else self.ports.inspect(resources)
+                waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+                if waiting is not None:
+                    raise ReadWait(waiting)
                 if status == "prepared" and not kernel._dispatch(effect, execution, world, resource_inspections=inspections, token=token):
                     raise KernelError("operation_cancelled")
                 kernel._guard_effect(effect, execution, world, resource_inspections=inspections, token=token)

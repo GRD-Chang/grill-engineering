@@ -1909,18 +1909,17 @@ class Kernel:
                     and not self._automatic_requeue_read(tx, run, scope["subject"], scope["cleanup"]) and
                     (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
                 raise KernelError("automatic_step_paused")
-            if not after_read:
-                owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-                rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
-                               "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
-                               (owner, wire_json(scope)))
-                if rows:
-                    row = rows[0]
-                    if self.clock() >= row["deadline"]:
-                        seconds = 2700 if row["kind"] == "required_checks" else 600
-                        return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
-                    if row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
-                        return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
+            owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+            rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
+                           "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
+                           (owner, wire_json(scope)))
+            if rows:
+                row = rows[0]
+                if self.clock() >= row["deadline"]:
+                    seconds = 2700 if row["kind"] == "required_checks" else 600
+                    return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
+                if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
+                    return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
             return None
 
     def _finish_automatic_step(self, token: str, execution: Execution, step: Step) -> Step:

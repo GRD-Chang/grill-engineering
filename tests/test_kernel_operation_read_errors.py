@@ -83,3 +83,35 @@ def test_source_read_window_survives_stop_and_a_proven_executor_handoff(tmp_path
     with s.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
         assert not tx.rows("SELECT id FROM attempts")
+
+
+@pytest.mark.parametrize("physical_read", ["source", "delivery"])
+def test_slow_successful_read_cannot_allocate_past_the_original_wait_deadline(tmp_path, physical_read):
+    from agent_run_kernel.operation_runner import ReadUnavailable
+
+    s, ports, runner = setup(tmp_path)
+    now = [100.25]
+    s.kernel.clock = lambda: now[0]
+    source, delivery = ports.source, ports.delivery
+
+    def unavailable(parent):
+        raise ReadUnavailable("github_read_failed", "Original source outage")
+
+    ports.source = unavailable
+    assert runner.run_once().retry_at == 105.25
+    ports.source = source
+    read = source if physical_read == "source" else delivery
+
+    def slow(request):
+        result = read(request)
+        now[0] = 701.25
+        return result
+
+    setattr(ports, physical_read, slow)
+    now[0] = 105.25
+    expired = runner.run_once()
+    assert expired.reason == "supervision_timeout" and expired.call is None
+    with s.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
+        assert not tx.rows("SELECT id FROM attempts")
+        assert not tx.rows("SELECT id FROM leases")
