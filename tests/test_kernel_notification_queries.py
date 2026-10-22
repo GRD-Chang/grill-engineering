@@ -86,8 +86,14 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
     assert ticket_only["is_terminal"] is False
     assert ticket_only["status"] == "run_acceptance_pending"
     assert ticket_only["closures"] == []
-    final = scenario.activate_final()
-    scenario.select(final)
+    for _ in range(40):
+        scenario.step()
+        final = scenario.kernel.source_status()["final_subject"]
+        if final is not None:
+            break
+    else:
+        raise AssertionError("Actual Ticket Completion did not admit Final")
+    scenario.select(final)  # Observer focus only; every operation still uses Core's global selector.
     assert scenario.run().kind == "approval"
     with scenario.kernel.storage.transaction(write=False) as tx:
         approval = query.notification_boundaries(tx, scenario.kernel.storage.path)
@@ -144,6 +150,11 @@ def test_public_notification_query_keeps_pending_retry_and_delivery_facts_withou
     def forbidden(*_args, **_kwargs):
         raise AssertionError("A notification query attempted sending, locking or repair")
 
+    from agent_run_kernel.operation_runner import OperationRunner
+    monkeypatch.setattr(Kernel, "operation_runner", forbidden)
+    monkeypatch.setattr(Kernel, "observe_control", forbidden)
+    for method in ("__init__", "run_once", "observe", "authorize_agent", "worker_settled", "state"):
+        monkeypatch.setattr(OperationRunner, method, forbidden)
     monkeypatch.setattr(outbox, "transaction", forbidden)
     monkeypatch.setattr(outbox, "settle", forbidden)
     monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", forbidden)

@@ -13,12 +13,12 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.notifications import NativeNotifications
-from agent_run_kernel.offline import GraphScenario
+from agent_run_kernel.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 
 
 def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
-                      *, reviews: tuple[str, ...] = ("pass",)) -> GraphScenario:
+                      *, reviews: tuple[str, ...] = ("pass",)) -> Scenario:
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language="en", notifications={"enabled": False, "mode": "concise"})
     original_create = Kernel.create
@@ -41,11 +41,12 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
     # produced by the real Core/effect path, never by a synthetic receipt.
     with monkeypatch.context() as patch:
         patch.setattr(Kernel, "create", classmethod(create))
-        scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
-    if kind == DeliveryKind.FINAL_RUN:
-        assert scenario.run().kind == "complete"
-        scenario.select(scenario.activate_final())
-        scenario.reviews, scenario.review_count = list(reviews), 0
+        if kind == DeliveryKind.FINAL_RUN:
+            # d847 builds and retains actual historical Ticket Completion.
+            scenario = Scenario(tmp_path, kind, reviews=reviews)
+            assert len(scenario.kernel.source_status()["completions"]) == 1
+        else:
+            scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
     return scenario
 
 
@@ -103,10 +104,17 @@ def test_formal_acceptance_notification_waits_for_real_promotion(
 def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_branch: str) -> None:
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    issued = []
+    execute = scenario.port.execute
+    def capture(effect, authorize=None):
+        if effect.operation == "run_branch":
+            issued.append(effect)
+        return execute(effect, authorize)
+    monkeypatch.setattr(scenario.port, "execute", capture)
     for _ in range(100):
         step = scenario.step()
-        if step.effect is not None and step.effect.operation == "run_branch":
-            effect = step.effect
+        if issued:
+            effect = issued[0]
             break
         assert step.kind not in {"paused", "waiting", "complete", "approval"}
     else:

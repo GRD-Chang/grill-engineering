@@ -232,8 +232,12 @@ def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(t
     assert len(planned) == 1 and planned[0]["live"] is False
     scenario.requirements = replace(scenario.requirements, parent=replace(
         scenario.requirements.parent, body="A revised whole-Run requirement before automatic repair started"))
-    scenario.world()
+    fresh = scenario.world()
     assert scenario.kernel.status("final:1")["phase"] == "refresh_final"
+    # A new Parent requirement needs the same explicit lifecycle action as the
+    # formal entry; automatic repair must not accept it on the maintainer's behalf.
+    assert scenario.kernel.control("requeue", "accept-revised-whole-run-requirement",
+                                   subject="final:1", world=fresh) == "applied"
     refreshed = scenario.run()
     assert refreshed.kind == "approval", refreshed
     assert scenario.kernel.status("final:1")["generation"] == original_generation + 1
