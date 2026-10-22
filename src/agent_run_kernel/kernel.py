@@ -127,8 +127,8 @@ class Kernel:
         pending = self._pending_effect(tx, subject)
         gates = {row["code"] for row in self._gates(tx, subject)}
         if pending is not None and pending["status"] == "sent":
-            return (Step("paused", subject, "original_write_unresolved") if gates & {
-                "write_result_unknown", "write_conflict", "publication_retry_exhausted", "supervision_timeout"} else None)
+            # Gates prohibit a fresh write, never the original sent readback.
+            return Step("paused", subject, "supervision_timeout") if "supervision_timeout" in gates or run["blocked"] == "supervision_timeout" else None
         if pending is not None and self._effect_stale(tx, run, job, pending):
             return None
         requeue = self._pending_requeue(tx, subject)
@@ -158,7 +158,7 @@ class Kernel:
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
-                          poll_approval: bool = False) -> tuple[str | None, bool] | None:
+                          poll_manual: bool = False) -> tuple[str | None, bool] | None:
         agent_capacity = min(agent_capacity, max(0, run["concurrency"] - tx.one("SELECT count(*) FROM leases")[0]))
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
@@ -167,7 +167,7 @@ class Kernel:
             return tx.one("SELECT id FROM subjects ORDER BY rowid LIMIT 1")[0], False
         order = [row[0] for table in ("work_queue", "integration_queue") for row in tx.all(f"SELECT subject FROM {table} ORDER BY ready")]
         order.extend(row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid"))
-        approval = None
+        manual_poll = None
         for subject in dict.fromkeys(order):
             job = self._job(tx, subject)
             waiting = self._subject_wait(tx, run, job)
@@ -179,12 +179,24 @@ class Kernel:
                 continue
             if self._operation_wait(tx, run, subject, cleanup) is not None:
                 continue
+            pending = self._pending_effect(tx, subject)
+            gated_readback = pending is not None and pending["status"] == "sent" and (
+                run["stopped"] or run["blocked"] or self._gates(tx, subject))
+            if cleanup:
+                gated_readback = bool(tx.rows("SELECT c.subject FROM resource_cleanup c JOIN effects e ON e.id=c.effect_id "
+                    "WHERE c.subject=? AND e.status='sent' AND c.outcome IS NOT NULL", (subject,)))
+            if gated_readback:
+                # Like approval, an explicit poll can settle a late result;
+                # a manual gate does not advertise endless background work.
+                if poll_manual and manual_poll is None:
+                    manual_poll = (subject, cleanup)
+                continue
             if (job["phase"] == "approval" and not job["validation_cleanup"] and job["refresh_revision"] is None
                     and not self._pending_effect(tx, subject) and self._pending_requeue(tx, subject) is None):
                 # An explicit operation call may poll the manual boundary once.
                 # Passive supervision must not advertise perpetual background work.
-                if poll_approval and approval is None:
-                    approval = (subject, False)
+                if poll_manual and manual_poll is None:
+                    manual_poll = (subject, False)
                 continue
             if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not self._pending_effect(tx, subject):
                 # A ready return may still perform program work without a slot.
@@ -199,7 +211,7 @@ class Kernel:
                 and all(self._completion(tx, job) is not None for job in tickets)
                 and self._operation_wait(tx, run, None, False) is None):
             return None, False
-        return approval
+        return manual_poll
 
     def _operation_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> float | None:
         scope = wire_json(self._automatic_scope(tx, run, subject, cleanup))
@@ -213,7 +225,9 @@ class Kernel:
         cleanup = rows[0]
         if cleanup["effect_status"] in {"observed", "cancelled"}:
             return None
-        if cleanup["effect_status"] == "sent" and cleanup["outcome"] is None:
+        if cleanup["effect_status"] == "sent":
+            if run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, job["id"])):
+                return Step("paused", job["id"], "supervision_timeout")
             return None
         if run["stopped"] or run["blocked"] or self._gates(tx, job["id"]) or cleanup["outcome"] is not None:
             return Step("paused", job["id"], "cleanup_authority")
@@ -230,6 +244,11 @@ class Kernel:
             return Step("waiting", subject, "worker_exit_unproven")
         if self._abandon_reconciliation_blocked(tx, action):
             return Step("paused", subject, "abandon_outcome_unproven")
+        run = tx.one("SELECT * FROM runs")
+        for job in tx.all("SELECT id FROM subjects ORDER BY rowid"):
+            retry_at = self._operation_wait(tx, run, job["id"], False)
+            if retry_at is not None:
+                return Step("waiting", job["id"], "github_convergence", retry_at=retry_at)
         inspection = self._abandon_inspection(tx, action)
         if inspection is not None and inspection["status"] in {"observed", "confirmed"}:
             try:
