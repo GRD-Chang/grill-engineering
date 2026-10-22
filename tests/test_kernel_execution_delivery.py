@@ -10,6 +10,7 @@ import pytest
 from agent_run_kernel import DeliveryKind
 from agent_run_kernel.execution import execute
 from agent_run_kernel.offline import Scenario
+from support.core_operations import CoreOperations, final_scenario
 
 
 _CONTENT = "Implemented by the allocated development process.\n"
@@ -50,13 +51,23 @@ sys.stdout.write(json.dumps(result))
 @pytest.mark.parametrize(("kind", "header"), [
     (DeliveryKind.TICKET, "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n"),
     (DeliveryKind.PARENT_ONLY, "Parent Issue: #1\nDelivery Type: Parent-only\n\n"),
-    (DeliveryKind.FINAL_RUN, "Parent Issue: #1\nDelivery Type: Final Run\n\n"),
+    # The shared producer completes real Ticket #2 titled "Ticket" first.
+    (DeliveryKind.FINAL_RUN, "Parent Issue: #1\nDelivery Type: Final Run\n\n## Completed Tickets\n\n- #2: Ticket\n\n"),
 ])
 def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: DeliveryKind, header: str) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind)
+    scenario = (final_scenario(tmp_path / "scenario") if kind == DeliveryKind.FINAL_RUN else
+                Scenario(tmp_path / "scenario", kind))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     processes = tmp_path / "role-processes"
     for _ in range(100):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        state = scenario.kernel.status(scenario.delivery.key)
+        if state["phase"] == "complete" and state["resource_cleanup"]["state"] == "complete":
+            break
+        if state["phase"] == "approval":
+            scenario.kernel.control("approve", "approve-child-delivery", subject=scenario.delivery.key,
+                                    world=operations.runner.observe(scenario.delivery.key))
+            continue
+        step = operations.once()
         if step.kind == "agent":
             assert step.call is not None
             call = step.call
@@ -68,6 +79,7 @@ def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: Del
                 arguments=[sys.executable, "-I", "-c", _ROLE_PROGRAM, call.role.value, str(processes)],
                 cwd=checkout, prompt=json.dumps(dict(call.context)),
                 environment=os.environ.copy(), timeout=5,
+                authorize_source=lambda: operations.runner.authorize_agent(call),
             )
             assert result is not None and result.returncode == 0, result
         elif step.kind == "approval":
@@ -75,9 +87,7 @@ def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: Del
                                     world=scenario.world())
         else:
             assert step.kind not in {"paused", "waiting"}, step
-            scenario.handle(step)
-            if step.kind == "complete":
-                break
+
     else:
         pytest.fail("Real child execution did not reach the delivery boundary")
 

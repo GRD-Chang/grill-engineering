@@ -1,5 +1,6 @@
 """Real local processes cross the allocated-call seam, never live Agent services."""
 
+from dataclasses import replace
 from pathlib import Path
 import json
 import os
@@ -11,16 +12,19 @@ from typing import Any
 
 import pytest
 
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
 from agent_run_kernel.execution import execute
 from agent_run_kernel.model import Requirements
+from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
+from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run_kernel.offline import fixture_inputs
 from agent_run.process_cleanup import child_subreaper
 
 
 RAW = b'{"result_kind":"development","summary":"saved local work","human_blockers":null}'
 
 
-def allocated(tmp_path: Path) -> tuple[Path, Kernel, AgentCall, World]:
+def allocated(tmp_path: Path) -> tuple[Path, Kernel, AgentCall, ReadOnlyPorts]:
     path = tmp_path / "kernel.sqlite3"
     base = Commit("base", "base-tree")
     spec = RunSpec(
@@ -29,16 +33,16 @@ def allocated(tmp_path: Path) -> tuple[Path, Kernel, AgentCall, World]:
                   "refs/heads/ticket-2", "refs/heads/run", checkout=str(tmp_path)),),
         Policy(ticket_rounds=1),
     )
-    kernel = Kernel.create(path, spec)
+    kernel, ports = native_agent_fixture(path, spec)
     execution = kernel.claim_executor("local-executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
-    step = kernel.advance("ticket:2", execution, world)
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    step = operations.until(lambda step: step.call is not None)
     assert step.call is not None
-    return path, kernel, step.call, world
+    return path, kernel, step.call, ports
 
 
 def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_path: Path) -> None:
-    path, kernel, call, world = allocated(tmp_path)
+    path, kernel, call, ports = allocated(tmp_path)
     canary = tmp_path / "actual-agent-starts"
     checks: list[bool] = []
 
@@ -83,12 +87,12 @@ def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_p
         environment={"PATH": os.defpath}, timeout=5,
     ) is None
     assert canary.read_text() == "ran\n"
-    assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
+    assert CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0).kind == "progress"
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
 def test_stopped_epoch_can_settle_its_exact_late_process_return_without_advancing(tmp_path: Path) -> None:
-    path, _, call, world = allocated(tmp_path)
+    path, _, call, ports = allocated(tmp_path)
 
     class StopBeforeSettlement(Kernel):
         def receive(self, exact_call: AgentCall, raw: bytes) -> None:
@@ -109,14 +113,14 @@ def test_stopped_epoch_can_settle_its_exact_late_process_return_without_advancin
     assert status["phase"] == "development" and status["candidate"] is None
     assert status["gates"] == []
     assert status["budgets"]["requirements"]["developments_used"] == 1
-    assert reopened.scheduling()["active"] == []
+    assert reopened.operation_state().active == ()
     with pytest.raises(KernelError, match="executor_fenced"):
-        reopened.advance(call.subject, call.execution, world)
+        CoreOperations(reopened, call.execution, lambda binding: ports).once()
 
 
 @pytest.mark.parametrize("committed", [False, True], ids=["precommit", "committed_reply_loss"])
 def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path, committed: bool) -> None:
-    path, _, call, world = allocated(tmp_path)
+    path, _, call, ports = allocated(tmp_path)
     starts = tmp_path / "actual-agent-pids"
     persistence_error = OSError("The raw persistence operation did not return successfully")
 
@@ -139,7 +143,7 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
     with pytest.raises(ChildProcessError):
         os.waitpid(int(first_start), os.WNOHANG)
     reopened = Kernel(path)
-    assert reopened.scheduling()["active"] == []
+    assert reopened.operation_state().active == ()
     assert any(event["kind"] == "worker_exited" and event["identity"] == call.invocation_id
                for event in reopened.history(call.subject))
     status = reopened.status(call.subject)
@@ -151,10 +155,10 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
                    environment={"PATH": os.defpath}, timeout=5) is None
     assert starts.read_text() == first_start
     if committed:
-        assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
+        assert CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0).kind == "progress"
     else:
         reopened.control("resume", "resume-after-raw-save-failure", subject=call.subject)
-        resumed = reopened.advance(call.subject, call.execution, world).call
+        resumed = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None).call
         assert resumed is not None and resumed.attempt_id == call.attempt_id
         assert resumed.thread_id == call.thread_id and resumed.invocation_id != call.invocation_id
         result = execute(reopened, resumed, arguments=arguments, cwd=tmp_path, prompt="",
@@ -165,7 +169,7 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
 
 
 def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tmp_path: Path) -> None:
-    path, kernel, call, world = allocated(tmp_path)
+    path, kernel, call, ports = allocated(tmp_path)
     credential = tmp_path / "selected-worker-credential"
     canary = tmp_path / "agent-executed"
     arguments = [sys.executable, "-I", "-c", (
@@ -180,10 +184,10 @@ def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tm
     paused = reopened.status(call.subject)
     assert paused["pending_attempt"] == call.attempt_id and paused["gates"] == ["worker_unavailable"]
     assert paused["budgets"]["requirements"]["developments_used"] == 1
-    assert not canary.exists() and reopened.scheduling()["active"] == []
+    assert not canary.exists() and reopened.operation_state().active == ()
     credential.write_text("Controlled reference availability; no online secret.")
     reopened.control("resume", "resume-selected-identity", subject=call.subject)
-    resumed = reopened.advance(call.subject, call.execution, world)
+    resumed = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None)
     assert resumed.call is not None
     assert resumed.call.attempt_id == call.attempt_id and resumed.call.invocation_id != call.invocation_id
     assert resumed.call.thread_id == call.thread_id
@@ -197,7 +201,7 @@ def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tm
 
 
 def test_committed_binding_response_loss_settles_actual_exit_and_resumes_same_attempt(tmp_path: Path) -> None:
-    path, _, call, world = allocated(tmp_path)
+    path, _, call, ports = allocated(tmp_path)
     canary = tmp_path / "agent-starts"
 
     class LostBindingResponse(Kernel):
@@ -216,10 +220,10 @@ def test_committed_binding_response_loss_settles_actual_exit_and_resumes_same_at
     assert not canary.exists()
     assert any(event["kind"] == "worker_started" and event["identity"] == call.invocation_id
                for event in reopened.history(call.subject))
-    assert reopened.scheduling()["active"] == []
+    assert reopened.operation_state().active == ()
     assert reopened.status(call.subject)["gates"] == ["execution_failed"]
     reopened.control("resume", "resume-after-exact-exit", subject=call.subject)
-    resumed = reopened.advance(call.subject, call.execution, world).call
+    resumed = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert resumed is not None and resumed.attempt_id == call.attempt_id
     assert resumed.invocation_id != call.invocation_id
     result = execute(reopened, resumed, arguments=arguments, cwd=tmp_path, prompt="",
@@ -260,7 +264,7 @@ def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(
             pidfd = os.pidfd_open(worker)
             assert execute(kernel, call, arguments=arguments, cwd=tmp_path, prompt="",
                            environment={"PATH": os.defpath}, timeout=5) is None
-            assert len(kernel.scheduling()["active"]) == 1
+            assert len(kernel.operation_state().active) == 1
             assert executor is not None
             os.kill(executor, signal.SIGKILL)
             os.waitpid(executor, 0)
@@ -271,7 +275,7 @@ def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(
             worker = None
             # Actual exit is proved to this observer, but no forged Kernel
             # confirmation or second dispatch may clear the original lease.
-            assert len(Kernel(path).scheduling()["active"]) == 1
+            assert len(Kernel(path).operation_state().active) == 1
             assert Kernel(path).status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
         finally:
             os.close(read_fd)
@@ -302,20 +306,21 @@ def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) 
         Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "read-source", base,
                  "refs/heads/task", "refs/heads/main", checkout=str(tmp_path)),
     ))
+    spec = replace(spec, repository_root=str(tmp_path.resolve()), language="zh", inputs=fixture_inputs())
     kernel = Kernel.create(tmp_path / "kernel.sqlite3", spec, requirements=requirements)
     execution = kernel.claim_executor("source-executor")
-    status = kernel.source_status()
-    delivery = kernel.delivery("parent:1")
-    world = World(status["parent_revision"], status["graph_revision"], delivery.revision, base)
-    call = kernel.advance("parent:1", execution, world).call
+    ports = ReadOnlyPorts(requirements, "refs/heads/task", "refs/heads/main", DeliveryFacts(base, None))
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    call = operations.until(lambda step: step.call is not None).call
     assert call is not None
     canary = tmp_path / "stale-agent-ran"
     reads = 0
 
     def refresh_source() -> None:
         nonlocal reads
-        kernel.refresh(lambda: Requirements.from_wire(json.loads(source_path.read_text())))
+        ports.requirements = Requirements.from_wire(json.loads(source_path.read_text()))
         reads += 1
+        operations.runner.authorize_agent(call)
         if reads == 1:
             source["parent"]["body"] = "Requirement changed while the bootstrap was blocked"
             source_path.write_text(json.dumps(source))
@@ -331,4 +336,4 @@ def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) 
     assert paused["gates"] == ["requeue_required"]
     assert paused["phase"] == "development" and paused["pending_return"] is False
     assert paused["budgets"]["requirements"]["developments_used"] == 1
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
