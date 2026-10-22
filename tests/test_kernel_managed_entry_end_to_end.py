@@ -283,7 +283,7 @@ if '--hostname' in sys.argv:
         kernel = Kernel(database)
         assert kernel.status("ticket:2")["phase"] == "complete"
         assert kernel.status("ticket:3")["phase"] != "complete"
-        assert kernel.scheduling()["active"] == []
+        assert kernel.operation_state().active == ()
         observed = [json.loads(line) for line in roles.read_text().splitlines()]
         assert [row["role"] for row in observed] == ["development", "review", "publication"]
         assert observed[0]["head"] == base

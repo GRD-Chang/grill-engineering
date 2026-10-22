@@ -1,5 +1,6 @@
 """Controlled real CLI processes exercise the Codex transport, never a service."""
 
+from dataclasses import replace
 import json
 import os
 from collections.abc import Mapping
@@ -10,32 +11,38 @@ from typing import Any
 
 import pytest
 
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Profile, RunSpec, World
+from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Profile, RunSpec
 from agent_run_kernel.codex_execution import execute_codex
 from agent_run_kernel.execution import ProcessExit
-from agent_run_kernel.offline import Scenario, review_result
+from agent_run_kernel.offline import fixture_inputs, review_result
+from agent_run.agent_profiles import resolve_profiles
+from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture
 
 
 RAW = b'{"result_kind":"development","summary":"Implemented by the local CLI process.","human_blockers":null}'
 
 
-def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentCall, World]:
+def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentCall, ReadOnlyPorts]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     state = tmp_path / "runner-state"
     state.mkdir()
     base = Commit("base", "tree")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
     spec = RunSpec("codex-boundaries", "example/repository", 1, "parent-v1", "graph-v1", (
         Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
                  "refs/heads/ticket", "refs/heads/run", checkout=str(checkout)),
     ), Policy(development_profile=Profile("bound-model", "high"),
               review_profile=Profile("bound-review-model", "high"),
               publication_profile=Profile("bound-publication-model", "high")))
-    kernel = Kernel.create(state / "kernel.sqlite3", spec)
-    call = kernel.advance("ticket:2", kernel.claim_executor("local-cli-executor"), world).call
+    inputs = replace(fixture_inputs(), profiles=resolve_profiles(preset="economy", overrides={
+        "development_model": "bound-model", "development_effort": "high",
+        "review_model": "bound-review-model", "review_effort": "high",
+        "publication_model": "bound-publication-model", "publication_effort": "high"}))
+    kernel, ports = native_agent_fixture(state / "kernel.sqlite3", replace(spec, inputs=inputs))
+    execution = kernel.claim_executor("local-cli-executor")
+    call = CoreOperations(kernel, execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert call is not None
-    return kernel, call, world
+    return kernel, call, ports
 
 
 def local_codex(kernel: Kernel, call: AgentCall, tmp_path: Path, program: str) -> ProcessExit | None:
@@ -54,7 +61,7 @@ def local_codex(kernel: Kernel, call: AgentCall, tmp_path: Path, program: str) -
 
 @pytest.mark.parametrize("raw", [RAW, b'{"result_kind":"development","summary":42}'], ids=["valid", "invalid"])
 def test_nonzero_exit_preserves_owned_final_raw_for_kernel_decision(tmp_path: Path, raw: bytes) -> None:
-    kernel, call, world = allocated_codex(tmp_path)
+    kernel, call, ports = allocated_codex(tmp_path)
     result = local_codex(kernel, call, tmp_path, f"""\
 print(json.dumps({{"type": "thread.started", "thread_id": "original-thread"}}), flush=True)
 Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
@@ -68,12 +75,12 @@ raise SystemExit(7)
     assert before["pending_return"] is True and before["gates"] == []
     assert before["phase"] == "development" and before["pending_attempt"] == call.attempt_id
     assert before["budgets"]["requirements"]["developments_used"] == 1
-    assert reopened.scheduling()["active"] == []
-    step = reopened.advance(call.subject, call.execution, world, allow_agent=False)
+    assert reopened.operation_state().active == ()
+    step = CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0)
     assert step.kind == ("progress" if raw == RAW else "needs_agent")
     assert reopened.status(call.subject)["gates"] == []
     if raw != RAW:
-        step = reopened.advance(call.subject, call.execution, world)
+        step = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None)
         assert step.call is not None and step.call.mode == "resume"
         assert step.call.invocation_id != call.invocation_id and step.call.thread_id == call.thread_id
 
@@ -84,7 +91,7 @@ raise SystemExit(7)
 def test_real_resume_preserves_original_thread_and_rejects_changed_events(
     tmp_path: Path, events: tuple[str, ...],
 ) -> None:
-    kernel, first, world = allocated_codex(tmp_path)
+    kernel, first, ports = allocated_codex(tmp_path)
     failed = local_codex(kernel, first, tmp_path, """\
 assert sys.argv[1:3] == ['exec', '--json']
 print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
@@ -93,8 +100,8 @@ raise SystemExit(1)
     assert failed is not None and failed.returncode == 1 and failed.raw == b""
     reopened = Kernel(kernel.storage.path)
     assert reopened.status(first.subject)["gates"] == []
-    assert reopened.scheduling()["active"] == []
-    resumed = reopened.advance(first.subject, first.execution, world).call
+    assert reopened.operation_state().active == ()
+    resumed = CoreOperations(reopened, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert resumed is not None and resumed.mode == "resume"
     assert resumed.reported_thread == "original-thread" and resumed.thread_id == first.thread_id
     assert resumed.attempt_id == first.attempt_id and resumed.invocation_id != first.invocation_id
@@ -120,7 +127,7 @@ for thread in {events!r}:
     assert status["pending_return"] is (events == ("original-thread",))
     assert status["gates"] == ([] if events == ("original-thread",) else ["execution_failed"])
     assert status["budgets"]["requirements"]["developments_used"] == 1
-    assert after.scheduling()["active"] == []
+    assert after.operation_state().active == ()
     exits = [event["identity"] for event in after.history(first.subject) if event["kind"] == "worker_exited"]
     assert exits == [first.invocation_id, resumed.invocation_id]
     after.bind_thread(resumed, "original-thread")
@@ -147,22 +154,16 @@ if {replacement!r} == 'symlink':
     assert status["pending_return"] is False and status["gates"] == ["execution_failed"]
     assert status["pending_attempt"] == call.attempt_id and status["candidate"] is None
     assert status["budgets"]["requirements"]["developments_used"] == 1
-    assert reopened.scheduling()["active"] == []
+    assert reopened.operation_state().active == ()
     assert any(event["kind"] == "worker_exited" and event["identity"] == call.invocation_id
                for event in reopened.history(call.subject))
     assert not any(event["kind"] == "raw_returned" for event in reopened.history(call.subject))
 
 
 def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
-    call = None
-    for _ in range(8):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-        if step.call is not None:
-            call = step.call
-            break
-        assert step.kind in {"effect", "progress"}, step
-        scenario.handle(step)
+    scenario = final_scenario(tmp_path / "scenario")
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    call = operations.until(lambda step: step.call is not None).call
     assert call is not None and call.role.value == "review" and call.context["readonly"] is True
     checkout = Path(call.context["checkout"])
     original = (checkout / "README.md").read_bytes()
@@ -190,7 +191,7 @@ output.write_bytes({raw!r})
     assert (checkout / "README.md").read_bytes() == original
     assert not (checkout / "forbidden-new-file").exists()
     assert scenario.kernel.status(call.subject)["pending_return"] is True
-    assert scenario.kernel.scheduling()["active"] == []
+    assert scenario.kernel.operation_state().active == ()
 
 
 def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(tmp_path: Path) -> None:
@@ -200,14 +201,15 @@ def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(t
     state.mkdir()
     path = state / "kernel.sqlite3"
     base = Commit("base", "tree")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
     spec = RunSpec("codex-process", "example/repository", 1, "parent-v1", "graph-v1", (
         Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
                  "refs/heads/ticket", "refs/heads/run", checkout=str(checkout)),
     ), Policy(development_profile=Profile("bound-model", "high")))
-    created = Kernel.create(path, spec)
+    inputs = replace(fixture_inputs(), profiles=resolve_profiles(preset="economy", overrides={
+        "development_model": "bound-model", "development_effort": "high"}))
+    created, ports = native_agent_fixture(path, replace(spec, inputs=inputs))
     execution = created.claim_executor("local-cli-executor")
-    call = created.advance("ticket:2", execution, world).call
+    call = CoreOperations(created, execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert call is not None and call.mode == "fresh" and call.reported_thread is None
     runner = tmp_path / "runner-private"
     runner.mkdir()
@@ -299,10 +301,10 @@ output.write_bytes({RAW!r})
     reopened = Kernel(path)
     assert reopened.status(call.subject)["pending_return"] is True
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
-    assert reopened.scheduling()["active"] == []
+    assert reopened.operation_state().active == ()
     with pytest.raises(KernelError, match="thread_identity_changed"):
         reopened.bind_thread(call, "another-thread")
-    assert reopened.advance(call.subject, call.execution, world, allow_agent=False).kind == "progress"
+    assert CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0).kind == "progress"
 
 
 @pytest.mark.parametrize("error,capacity", [
@@ -313,7 +315,7 @@ output.write_bytes({RAW!r})
     (None, False),
 ], ids=["machine-capacity", "machine-precedes-message", "unknown-machine", "legacy-message", "stderr-only"])
 def test_real_terminal_facts_control_only_kernel_recovery(tmp_path: Path, error: object, capacity: bool) -> None:
-    kernel, first, world = allocated_codex(tmp_path)
+    kernel, first, ports = allocated_codex(tmp_path)
     now = [kernel.clock()]
     kernel.clock = lambda: now[0]
     program = f"""\
@@ -326,7 +328,7 @@ raise SystemExit(7)
 """
     result = local_codex(kernel, first, tmp_path, program)
     assert result is not None and result.returncode == 7 and result.raw == b""
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
         output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=? AND ordinal=?", (first.invocation_id, first.output_ordinal))
         assert output["failure_kind"] == ("capacity" if capacity else "ordinary")
@@ -343,10 +345,10 @@ raise SystemExit(7)
     exited_at = now[0]
     now[0] = exited_at + (29.999 if capacity else 2)
     if capacity:
-        assert kernel.advance(first.subject, first.execution, world).kind == "waiting"
-        assert kernel.scheduling()["active"] == []
+        assert CoreOperations(kernel, first.execution, lambda binding: ports).once().kind == "waiting"
+        assert kernel.operation_state().active == ()
         now[0] = exited_at + 30
-    recovered = kernel.advance(first.subject, first.execution, world).call
+    recovered = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert recovered is not None and recovered.mode == "resume"
     assert recovered.attempt_id == first.attempt_id and recovered.thread_id == first.thread_id
     assert recovered.invocation_id != first.invocation_id and recovered.output_ordinal == 0
@@ -355,15 +357,15 @@ raise SystemExit(7)
     assert recovered.profile_reference == first.profile_reference
     second = local_codex(kernel, recovered, tmp_path, program)
     assert second is not None and second.returncode == 7
-    next_step = kernel.advance(first.subject, first.execution, world)
+    next_step = CoreOperations(kernel, first.execution, lambda binding: ports).once()
     assert next_step.kind == ("waiting" if capacity else "paused")
     assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
 
 
 @pytest.mark.parametrize("raw", [b"", b'{"result_kind":"development","summary":42}'], ids=["empty", "invalid"])
 def test_real_format_repair_keeps_exact_output_identity_deadline_and_profile(tmp_path: Path, raw: bytes) -> None:
-    kernel, first, world = allocated_codex(tmp_path)
+    kernel, first, ports = allocated_codex(tmp_path)
     now = [kernel.clock()]
     kernel.clock = lambda: now[0]
     result = local_codex(kernel, first, tmp_path, f"""\
@@ -373,7 +375,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
     assert result is not None and result.raw == raw and result.returncode == 0
     kernel.configure_profiles("later-model", overrides={"development_model": "new-model"})
     now[0] += 2
-    repair = kernel.advance(first.subject, first.execution, world).call
+    repair = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert repair is not None and repair.mode == "output-repair"
     assert repair.invocation_id == first.invocation_id and repair.output_ordinal == first.output_ordinal + 1
     assert repair.deadline_at == first.deadline_at and repair.deadline_seconds == first.deadline_seconds
@@ -400,7 +402,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
         assert [tx.get(row["raw_id"], first.subject) for row in outputs] == [raw, RAW]
         assert all(row["exit_code"] == 0 and row["dispatch_state"] == "exited" for row in outputs)
         assert outputs[0]["process_identity"] != outputs[1]["process_identity"]
-    assert kernel.advance(first.subject, first.execution, world).kind == "progress"
+    assert CoreOperations(kernel, first.execution, lambda binding: ports).once().kind == "progress"
     assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
@@ -453,7 +455,7 @@ raise SystemExit(7)
 
 
 def test_real_capacity_event_cannot_authorize_recovery_after_corrupt_capture(tmp_path: Path) -> None:
-    kernel, call, world = allocated_codex(tmp_path)
+    kernel, call, ports = allocated_codex(tmp_path)
     observed = Path(call.context["checkout"]) / "terminal-observed"
 
     class ObserveTerminal(Kernel):
@@ -468,6 +470,7 @@ def test_real_capacity_event_cannot_authorize_recovery_after_corrupt_capture(tmp
     with pytest.raises(UnicodeDecodeError):
         local_codex(kernel, call, tmp_path, f"""\
 import time
+from dataclasses import replace
 print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
 print(json.dumps({{'type': 'turn.failed', 'error': {{'codex_error_info': 'server_overloaded'}}}}), flush=True)
 deadline = time.monotonic() + 3
@@ -479,8 +482,9 @@ raise SystemExit(7)
 """)
     assert observed.exists()
     assert kernel.status(call.subject)["gates"] == ["execution_failed"]
-    assert kernel.advance(call.subject, call.execution, world).kind == "paused"
-    assert kernel.scheduling()["active"] == []
+    # The already recorded fatal gate leaves no public runnable operation.
+    assert CoreOperations(kernel, call.execution, lambda binding: ports).once().kind == "quiescent"
+    assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
         output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
         assert output["failure_kind"] == "fatal" and output["raw_id"] is None
@@ -490,25 +494,26 @@ raise SystemExit(7)
 
 
 def test_real_format_repair_process_uses_only_the_original_remaining_deadline(tmp_path: Path) -> None:
-    kernel, first, world = allocated_codex(tmp_path)
+    kernel, first, ports = allocated_codex(tmp_path)
     result = local_codex(kernel, first, tmp_path, """\
 print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
 """)
     assert result is not None and result.raw == b""
     remaining = first.deadline_at - 0.5
     kernel.clock = lambda: remaining
-    repair = kernel.advance(first.subject, first.execution, world).call
+    repair = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
     assert repair is not None and repair.invocation_id == first.invocation_id and repair.output_ordinal == 1
     assert repair.deadline_at == first.deadline_at
     started = time.monotonic()
     with pytest.raises(TimeoutError):
         local_codex(kernel, repair, tmp_path, """\
 import time
+from dataclasses import replace
 print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
 time.sleep(10)
 """)
     assert time.monotonic() - started < 2, "Repair reset the original remaining deadline"
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
         outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
         assert len(outputs) == 2 and outputs[1]["dispatch_state"] == "exited"
