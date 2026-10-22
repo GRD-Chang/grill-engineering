@@ -6,10 +6,10 @@ from typing import Any
 
 import pytest
 
-from agent_run_kernel import AgentCall, Issue, Kernel, ParentIssue, Requirements, Role, Step
+from agent_run_kernel import AgentCall, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, Role, Step
 from agent_run_kernel.model import wire_json
 from agent_run_kernel.notification_events import events
-from agent_run_kernel.offline import GraphScenario
+from agent_run_kernel.offline import GraphScenario, Scenario
 
 
 def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
@@ -88,10 +88,15 @@ def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_fir
                 if step.call.role.value == "publication":
                     assert ended[0]["status_code"] == "publication_artifact"
                     assert not any(event["kind"] == "pr_created" for event in after)
-        elif step.kind == "complete":
-            break
         else:
             assert step.kind not in {"paused", "waiting"}, step
+        # Stop sampling this Ticket only after its actual Completion/cleanup.
+        # The next global operation may legitimately admit Final; no global
+        # quiescence or subject-selected transition is manufactured here.
+        ticket = scenario.kernel.status("ticket:2")
+        if (ticket["phase"] == "complete" and ticket["resource_cleanup"] is not None
+                and ticket["resource_cleanup"]["state"] == "complete"):
+            break
     else:
         raise AssertionError("The real Ticket pipeline did not finish")
     projected = _project(scenario.kernel, mode)
@@ -108,10 +113,11 @@ def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_fir
 def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch, mode):
     from agent_run.notification_event_facts import event_copy
 
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Parent", "Original scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
-        reviews=("pass", "fail", "pass"))
+    # d847's Final fixture retains a real historical Ticket and Completion.
+    # Its prefix has already passed Review; this script begins at Final Review.
+    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    assert scenario.kernel.status("ticket:2")["phase"] == "complete"
+    assert len(scenario.kernel.source_status()["completions"]) == 1
     start_views = {}
 
     def started(call):
@@ -119,8 +125,6 @@ def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp
             start_views[call.attempt_id] = _project(scenario.kernel, mode)
 
     _recorded_agents(scenario, monkeypatch, started=started)
-    assert scenario.run().kind == "complete"
-    scenario.select(scenario.activate_final())
     first_review = repair = None
     planned_id = None
     for _ in range(100):
@@ -203,10 +207,11 @@ def test_human_result_uses_original_paused_material_even_after_resume(tmp_path, 
 def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(tmp_path, monkeypatch):
     from dataclasses import replace
 
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Parent", "Original scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
-        reviews=("pass", "fail", "pass"))
+    # d847's Final fixture retains a real historical Ticket and Completion.
+    # Its prefix has already passed Review; this script begins at Final Review.
+    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    assert scenario.kernel.status("ticket:2")["phase"] == "complete"
+    assert len(scenario.kernel.source_status()["completions"]) == 1
     start_views = {}
 
     def started(call):
@@ -214,8 +219,6 @@ def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(t
             start_views[call.attempt_id] = _project(scenario.kernel, "detailed")
 
     _recorded_agents(scenario, monkeypatch, started=started)
-    assert scenario.run().kind == "complete"
-    scenario.select(scenario.activate_final())
     for _ in range(100):
         step = scenario.step()
         if step.call is not None and step.call.role == Role.REVIEW:
@@ -229,9 +232,10 @@ def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(t
     assert len(planned) == 1 and planned[0]["live"] is False
     scenario.requirements = replace(scenario.requirements, parent=replace(
         scenario.requirements.parent, body="A revised whole-Run requirement before automatic repair started"))
-    scenario.refresh()
+    scenario.world()
     assert scenario.kernel.status("final:1")["phase"] == "refresh_final"
-    assert scenario.run().kind == "approval"
+    refreshed = scenario.run()
+    assert refreshed.kind == "approval", refreshed
     assert scenario.kernel.status("final:1")["generation"] == original_generation + 1
     assert scenario.kernel.control("revise", "human-revision-after-refresh", subject="final:1",
                                    world=scenario.world(), message="A separate maintainer revision") == "applied"
