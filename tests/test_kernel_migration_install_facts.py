@@ -501,8 +501,14 @@ def test_completed_clean_transfer_consumes_only_certified_publication_resource(
 ):
     from agent_run_kernel.local_effects import LocalEffects
     from agent_run_kernel.migration_cutover import migrate_completed_original_v6, rollback_original_v6
+    from collections.abc import Callable
+    from agent_run_kernel.model import Effect, EffectResult, ResourceInspection, ResourceWitness
+    from agent_run_kernel.operation_runner import DeliveryFacts, OperationBinding
+    from support.core_operations import CoreOperations, ReadOnlyPorts
     managed, paths, snapshot, facts, before, evidence = _completed_import_source(
         tmp_path, git_repo, monkeypatch, profile_backend)
+    with closing(sqlite3.connect(paths['database'].as_uri() + '?mode=ro', uri=True)) as source:
+        assert source.execute('SELECT count(*) FROM work_invocations').fetchone()[0] == (5 if profile_backend else 0)
     nonce = 'ce' * 16
     options = dict(repository='example/project', parent_number=1, nonce=nonce,
         external_snapshot=evidence / 'external-readproof.json')
@@ -529,26 +535,43 @@ def test_completed_clean_transfer_consumes_only_certified_publication_resource(
         return
     execution = native.claim_executor('completed-clean-native')
     state, delivery = native.status('ticket:2'), native.delivery('ticket:2')
-    world = World(state['parent_revision'], state['graph_revision'], state['revision'],
-        git.commit(delivery.target_ref), git.commit(resource.source_ref),
-        completion_revision=state['completion_revision'])
     port = LocalEffects(git, owned_root=resource.checkout.parent)
+    observed: list[Effect] = []
+
+    class CleanupPorts(ReadOnlyPorts):
+        def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+            assert effect.operation == operation and effect.payload['expected_head'] == facts.subjects[0].completion.publication.sha
+            assert effect.payload['source_uuid'] == facts.source.checkout_uuid
+            result = port.execute(effect, authorize)
+            assert result.disposition == 'target', result
+            observed.append(effect)
+            return result
+
+        def reconcile(self, effect: Effect) -> EffectResult:
+            return port.reconcile(effect)
+
+        def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
+            return port.inspect_resources(resources)
+
+    def make_ports(binding: OperationBinding) -> CleanupPorts:
+        assert binding.repository_root == git.root and binding.repository == facts.spec.repository
+        # These external source/ref facts stay fixed during local cleanup.
+        # Actual worktree/ref inspection and writes use LocalEffects above.
+        return CleanupPorts(facts.observed_requirements, delivery.source_ref, delivery.target_ref,
+            DeliveryFacts(git.commit(delivery.target_ref), git.commit(resource.source_ref)))
+
+    operations = CoreOperations(native, execution, make_ports)
     for operation in ('cleanup_worktree', 'cleanup_local_ref'):
-        for _ in range(4):
-            step = native.advance_cleanup('ticket:2', execution, world)
-            if step.kind != 'progress':
-                break
-        assert step.kind == 'effect' and step.effect is not None, step
-        effect = step.effect
-        assert effect.operation == operation and effect.payload['expected_head'] == facts.subjects[0].completion.publication.sha
-        assert effect.payload['source_uuid'] == facts.source.checkout_uuid
-        assert native.dispatch(effect, execution, world)
-        result = port.execute(effect, lambda: native.guard_effect(effect, execution, world))
-        assert result.disposition == 'target', result
-        native.reconcile(effect, result, execution, world)
+        count = len(observed)
+        step = operations.until(lambda _: len(observed) > count, agent_capacity=0)
+        assert step.kind == 'progress' and len(observed) == count + 1, step
+    operations.until(lambda _: native.status('ticket:2')['resource_cleanup']['stage'] == 2, agent_capacity=0)
     assert not resource.checkout.exists()
     assert git.run('show-ref', '--verify', '--quiet', resource.source_ref, check=False).returncode == 1
     assert native.status('ticket:2')['budgets'] == state['budgets']
     with native.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert tx.one("SELECT count(*) FROM effects WHERE operation='close'")[0] == 1
+        for effect in observed:
+            assert tuple(tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))) == ('confirmed', 1)
+            assert tx.one("SELECT count(*) FROM history WHERE kind='effect_dispatched' AND identity=?", (effect.effect_id,))[0] == 1
