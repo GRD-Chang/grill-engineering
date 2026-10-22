@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Kernel, Requirements
+from agent_run_kernel import Kernel, KernelError, Requirements
+from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Role
 from agent_run_kernel.offline import GraphScenario
 from test_kernel_requirements import native_input
@@ -92,18 +93,79 @@ def test_new_workspace_never_resets_a_foreign_preexisting_ticket_ref(tmp_path: P
     effect = workspace_intent(scenario, monkeypatch).effect
     assert effect.before_sha == head.sha
     assert scenario.port.local.reconcile(effect).disposition == "third"
-    assert scenario.runner().run_once().kind == "paused"
+
+    def intent():
+        with kernel.storage.transaction(write=False) as tx:
+            row = tx.one("SELECT id,subject,generation,status,attempts,payload_id,receipt_id,before_sha,base_sha,source_ref,target_ref "
+                         "FROM effects WHERE id=?", (effect.effect_id,))
+            assert tuple(row[key] for key in ("status", "attempts", "receipt_id")) == ("prepared", 0, None)
+            assert not tx.rows("SELECT position FROM history WHERE kind='effect_dispatched' AND identity=?", (effect.effect_id,))
+            assert len(tx.rows("SELECT position FROM history WHERE kind='effect_prepared' AND identity=?", (effect.effect_id,))) == 1
+            return tuple(row)
+
+    original = intent()
+    budgets = kernel.status(subject)["budgets"]
+    git_files = lambda: {str(path.relative_to(scenario.port.git.root)): path.read_bytes()
+                        for path in (scenario.port.git.root / ".git").rglob("*") if path.is_file()}
+    before_git = git_files()
+    execute, git_run = scenario.port.execute, LocalGit.run
+    calls, authorizations, physical_writes = [], [], []
+    inside_workspace = False
+
+    def recorded_git(local, *arguments, **kwargs):
+        write = bool(arguments) and (arguments[0] in {"update-ref", "reset", "switch", "commit", "commit-tree", "add", "merge", "write-tree"}
+            or arguments[0] == "worktree" and len(arguments) > 1 and arguments[1] in {"add", "remove", "move", "prune", "repair"}
+            or arguments[0] == "hash-object" and "-w" in arguments)
+        if inside_workspace and write:
+            physical_writes.append(arguments)
+        return git_run(local, *arguments, **kwargs)
+
+    def recorded_execute(current, authorize):
+        nonlocal inside_workspace
+        assert current == effect
+        calls.append(current)
+
+        def guarded():
+            authorizations.append(current.effect_id)
+            authorize()
+
+        inside_workspace = True
+        try:
+            return execute(current, guarded)
+        finally:
+            inside_workspace = False
+
+    monkeypatch.setattr(LocalGit, "run", recorded_git)
+    monkeypatch.setattr(scenario.port, "execute", recorded_execute)
+    refused = scenario.runner().run_once()
+    assert (refused.kind, refused.reason) == ("paused", "write_not_dispatched")
+    assert calls == [effect] and authorizations == physical_writes == []
+    assert intent() == original
     assert scenario.port.git.commit(scenario.delivery.source_ref) == scenario.initial
     assert not Path(scenario.delivery.checkout).exists()
     requests = [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "workspace"]
+    # This is the offline adapter's attempt journal, not a physical Git write.
     assert len(requests) == 1 and requests[0]["intent"] == effect.effect_id
     assert kernel.status(subject)["gates"] == ["write_conflict"]
-    assert scenario.runner().run_once().kind == "paused"
-    with effect_boundary(scenario, monkeypatch, "workspace"):
-        with pytest.raises(EffectBoundary) as readback:
-            scenario.runner().run_once()
-    assert readback.value.phase == "reconcile" and readback.value.effect == effect
-    assert scenario.runner().run_once().kind == "paused"
+
+    # The old Scenario helper eagerly marked this request sent before its
+    # physical preflight. The formal old Host never did: it retained prepared/0.
+    # No sent uncertainty exists to reconcile; the global runner is quiescent
+    # while the subject remains manually paused on its original conflict.
+    scenario.kernel = kernel = Kernel(kernel.storage.path)
+    for _ in range(3):
+        assert kernel.operation_state().disposition == "quiescent"
+        assert scenario.runner().run_once().kind == "quiescent"
+        paused = scenario.run()
+        assert (paused.kind, paused.subject, paused.reason) == ("paused", subject, "write_conflict")
+        assert intent() == original
+        assert kernel.status(subject)["gates"] == ["write_conflict"]
+        assert kernel.status(subject)["budgets"] == budgets
+    with pytest.raises(KernelError, match="unresolved_write_conflict"):
+        kernel.control("resume", "cannot-adopt-foreign-ref", subject=subject)
+    assert intent() == original and kernel.status(subject)["gates"] == ["write_conflict"]
+    assert calls == [effect] and authorizations == physical_writes == []
     assert [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "workspace"] == requests
     assert scenario.port.git.commit(scenario.delivery.source_ref) == scenario.initial
     assert not Path(scenario.delivery.checkout).exists()
+    assert git_files() == before_git
