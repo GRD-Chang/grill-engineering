@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
 from agent_run_kernel.model import Issue, ParentIssue, ReadWait, Requirements
 from agent_run_kernel.offline import GraphScenario, Scenario, fixture_inputs
 from agent_run_kernel.operation_runner import DeliveryFacts, ReadUnavailable
@@ -23,12 +23,6 @@ def delivery_run(path: Path) -> tuple[Kernel, Requirements]:
     final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unread", base, "refs/heads/run", "refs/heads/main")
     return Kernel.create(path, RunSpec("run", "example/repository", 1, "unread", "unread", (*deliveries, final),
         Policy(concurrency=2), language="en", repository_root=str(path.parent.resolve()), inputs=fixture_inputs()), requirements=source), source
-
-
-def current_world(kernel: Kernel, subject: str) -> World:
-    source = kernel.source_status()
-    return World(source["parent_revision"], source["graph_revision"], kernel.delivery(subject).revision,
-                 Commit("base", "base-tree"))
 
 
 def source_operations(kernel, source, execution):
@@ -205,12 +199,14 @@ def test_checks_read_error_reuses_the_original_45_minute_window(tmp_path: Path, 
 def test_timed_out_sent_write_quiesces_until_resume_then_only_reads_back(tmp_path: Path, monkeypatch) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     scenario.port.lose_response.add("push")
+    scenario.kernel.clock = lambda: 100
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     for _ in range(80):
         step = operations.once()
         if step.call is not None:
             scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-        if step.reason == "original_write_readback_required":
+        pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+        if pending is not None and pending["operation"] == "push" and pending["status"] == "sent":
             break
     else:
         raise AssertionError("Original push was never sent")
@@ -221,8 +217,10 @@ def test_timed_out_sent_write_quiesces_until_resume_then_only_reads_back(tmp_pat
     def failed_readback(effect):
         raise ReadUnavailable("github_read_failed", "original readback unavailable")
     monkeypatch.setattr(operations.runner.ports, "reconcile", failed_readback)
-    kernel.clock = lambda: 100
-    assert operations.once().retry_at == 105
+    kernel.clock = lambda: 105
+    assert operations.once().retry_at == 115
+    window = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    assert window["started_at"] == 100 and window["deadline"] == 700
     kernel.clock = lambda: 700
     assert operations.once().reason == "supervision_timeout"
     assert operations.runner.state().disposition == "quiescent"
