@@ -941,7 +941,6 @@ def convert_completed_ticket_v6(
                               or not destination.parent.is_dir() or repository_root.is_symlink()):
         raise MigrationRefused('source_existing_resources')
     from .migration_run_install import install_imported_facts
-    _read_profile(profile_snapshot)
     readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
     if readproof is not None and (not existing_verified or origin is None
             or any(path is not None for path in (github_snapshot, observation_snapshot, original_report))):
@@ -1085,7 +1084,9 @@ def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
             store = common
         else:
             destination, root, final, store = copy_layout
-            if (destination.exists() or destination.is_symlink() or root.exists() or root.is_symlink()
+            if root.exists() or root.is_symlink():
+                raise MigrationRefused('private_destination_exists')
+            if (destination.exists() or destination.is_symlink()
                     or not root.parent.resolve().is_relative_to(destination.parent.resolve())
                     or not root.is_relative_to(destination.parent)
                     or snapshot.source.resolve().is_relative_to(destination.parent.resolve())
