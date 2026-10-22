@@ -5,10 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.github import GitHubReadError
 from agent_run_kernel import DeliveryKind, Effect, KernelError
 from agent_run_kernel.offline import Scenario
-from agent_run_kernel.operation_runner import DeliveryRead, OperationBinding, OperationPorts
+from agent_run_kernel.operation_runner import DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
 
 
 def bound_ports(scenario: Scenario) -> OperationPorts:
@@ -68,7 +67,7 @@ def test_delivery_adapter_reads_real_refs_and_scripted_checks_without_world_vers
     assert observed.checks is not None and observed.checks.result == 'fail'
     assert observed.publisher_identity == {'source': 'host'}
     assert (base.sha, first.sha) in observed.ancestry
-    with pytest.raises(GitHubReadError, match='checks head'):
+    with pytest.raises(ReadUnavailable, match='checks head'):
         operations.delivery(replace(request, check_head=base.sha))
     second = port.external_remote_append(effect.source_ref, {'second.txt': 'second\n'}, 'second')
     observed = operations.delivery(request)

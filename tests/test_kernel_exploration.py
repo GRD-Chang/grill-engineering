@@ -65,9 +65,13 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
     assert boundary.kind == "complete"
     assert [call["role"] for call in scenario.role_calls] == expected_roles
     assert {call["purpose"] for call in scenario.role_calls if call["role"] == "development"} == {development_purpose}
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-    assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
-    assert sum(write["operation"] == "completion_comment" for write in scenario.port.writes()) == 1
+    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
+    assert sum(write["operation"] == "merge" for write in scenario.writes()) == 1
+    assert sum(write["operation"] == "completion_comment" for write in scenario.writes()) == 1
+    if kind == DeliveryKind.FINAL_RUN:
+        assert scenario.historical_trace is not None
+        assert scenario.historical_trace["raw_backend_calls"] == {"development": 1, "review": 1, "publication": 1}
+        assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 2
     target = scenario.port.git.commit(scenario.delivery.target_ref)
     assert len(scenario.port.git.parents(target.sha)) == (1 if kind == DeliveryKind.TICKET else 2)
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
@@ -94,9 +98,10 @@ def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Pat
     assert [call["role"] for call in ci if call["role"] != "publication"] == (
         ["development"] if kind == DeliveryKind.TICKET else ["development", "review"])
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["ci"]["developments_used"] == 1
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 2
+    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 2
     if kind == DeliveryKind.FINAL_RUN:
-        assert {write["subject"] for write in scenario.port.writes()} == {scenario.delivery.key}
+        assert {write["subject"] for write in scenario.writes()} == {scenario.delivery.key}
+        assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 3
 
 
 def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tmp_path: Path) -> None:

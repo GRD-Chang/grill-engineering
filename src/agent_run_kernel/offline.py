@@ -10,23 +10,36 @@ from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from agent_run.agent_profiles import resolve_profiles
+from agent_run.error_safety import bounded_error
 from agent_run.github import GitHubReadError
 from agent_run.prompt_resources import resolve_resources
 
 from .effects import LocalGit
 from .local_effects import LocalEffects
-from .remote_effects import RemoteEffects
+from .remote_effects import EffectReadError, RemoteEffects
 from .kernel import Kernel
-from .operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner
-from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult,
+from .operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner, ReadUnavailable
+from .model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution,
                     Issue, KernelError, ParentIssue, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json)
 
 
 class LostResponse(OSError):
     pass
+
+
+_ReadValue = TypeVar('_ReadValue')
+
+
+def _physical_read(read: Callable[[], _ReadValue]) -> _ReadValue:
+    try:
+        return read()
+    except GitHubReadError as error:
+        raise ReadUnavailable(error.code, error.message) from error
+    except (OSError, sqlite3.Error) as error:
+        raise ReadUnavailable('physical_read_unavailable', bounded_error(str(error))) from error
 
 
 def fixture_inputs() -> CreationInputs:
@@ -104,29 +117,17 @@ class OfflinePort:
         return port
 
     def prepare(self, kind: DeliveryKind, *, policy: Policy | None = None,
-                ticket_number: int = 2, repository: str = "example/repository",
-                completed_ticket: Mapping[str, Any] | None = None) -> tuple[RunSpec, Delivery]:
+                ticket_number: int = 2, repository: str = "example/repository") -> tuple[RunSpec, Delivery]:
+        if kind == DeliveryKind.FINAL_RUN:
+            raise KernelError("final_requires_completed_source")
         base = self.git.commit("refs/heads/main")
         source = base
-        key = {DeliveryKind.TICKET: f"ticket:{ticket_number}", DeliveryKind.PARENT_ONLY: "parent:1", DeliveryKind.FINAL_RUN: "final:1"}[kind]
-        source_ref = "refs/heads/run" if kind == DeliveryKind.FINAL_RUN else "refs/heads/task"
+        key = f"ticket:{ticket_number}" if kind == DeliveryKind.TICKET else "parent:1"
+        source_ref = "refs/heads/task"
         target_ref = "refs/heads/run" if kind == DeliveryKind.TICKET else "refs/heads/main"
-        if kind == DeliveryKind.FINAL_RUN:
-            # This is copied/synthetic completed-Ticket input, not a new Agent result.
-            if completed_ticket is not None:
-                source = self.git.make_commit(base.tree, (base.sha,), completed_ticket["commit_message"])
-            else:
-                self.git.run("switch", "-c", "fixture-completed-ticket")
-                (self.git.root / "ticket.txt").write_text("Completed synthetic Ticket.\n")
-                self.git.run("add", "--all")
-                self.git.run("commit", "-m", "completed fixture ticket")
-                source = self.git.commit("HEAD")
-                self.git.run("switch", "main")
         self.git.run("update-ref", source_ref, source.sha)
         self.git.run("update-ref", target_ref, base.sha)
         with sqlite3.connect(self.database) as db:
-            if kind == DeliveryKind.FINAL_RUN:
-                db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (source_ref, source.sha))
             db.execute("INSERT OR IGNORE INTO refs VALUES (?,?)", (target_ref, base.sha))
         checkout = self.root / "work" / key.replace(":", "-")
         checkout.parent.mkdir(exist_ok=True)
@@ -146,6 +147,16 @@ class OfflinePort:
             if source_ref is None or pr.source_ref == source_ref:
                 return self.pr_by_number(pr.number)
         return None
+
+    def source(self, requirements: Requirements, parent_number: int) -> Requirements:
+        if requirements.parent.number != parent_number:
+            raise KernelError("synthetic_source_binding")
+        with sqlite3.connect(self.database) as db:
+            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
+        return replace(requirements, issues=tuple(
+            replace(issue, state="CLOSED" if issue.number in closed else issue.state,
+                    blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker
+                                     for blocker in issue.blocked_by)) for issue in requirements.issues))
 
     def pr_by_number(self, number: int) -> PullRequest | None:
         with sqlite3.connect(self.database) as db:
@@ -168,7 +179,7 @@ class OfflinePort:
         checks = None
         if pr is not None and pr.state == "OPEN":
             if request.check_head is not None and request.check_head != pr.head.sha:
-                raise GitHubReadError("github_observation_pending", "Synthetic checks head is not current")
+                raise ReadUnavailable("github_observation_pending", "Synthetic checks head is not current")
             if pr.head.sha not in heads:
                 heads.append(pr.head.sha)
             checks_result = checks_script[min(max(0, len(heads) - 1), len(checks_script) - 1)]
@@ -625,42 +636,62 @@ class _ScenarioPorts:
         source = self.scenario.requirements
         if source is None or source.parent.number != parent_number:
             raise KernelError("synthetic_source_not_configured")
-        with sqlite3.connect(self.scenario.port.database) as db:
-            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
-        return replace(source, issues=tuple(
-            replace(issue, state="CLOSED" if issue.number in closed else issue.state,
-                    blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker
-                                     for blocker in issue.blocked_by)) for issue in source.issues))
+        return _physical_read(lambda: self.scenario.port.source(source, parent_number))
 
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         scenario = self.scenario
         heads = scenario.check_heads.setdefault(request.source_ref, [])
-        facts = scenario.port.delivery(request, scenario.checks, heads,
-                                       publisher_identity=self.binding.inputs.runner_identity)
+        facts = _physical_read(lambda: scenario.port.delivery(request, scenario.checks, heads,
+                                       publisher_identity=self.binding.inputs.runner_identity))
         if request.source_ref == scenario.delivery.source_ref:
             scenario.heads = heads
         return facts
 
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
-        return self.scenario.port.inspect_resources(resources)
+        return _physical_read(lambda: self.scenario.port.inspect_resources(resources))
 
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
-        result = self.scenario.port.execute(effect, authorize)
+        try:
+            result = self.scenario.port.execute(effect, authorize)
+        except EffectReadError as error:
+            failed = error.write_returncode if error.write_returncode != 0 else None
+            raise ReadUnavailable(error.code, error.message, write_returncode=failed,
+                                  write_diagnostic=error.write_diagnostic if failed is not None else '') from error
+        except GitHubReadError as error:
+            raise ReadUnavailable(error.code, error.message) from error
+        except LostResponse as error:
+            raise ReadUnavailable('write_response_unavailable', bounded_error(str(error))) from error
         if effect.operation == "issue_link":
             return result if result is not None else EffectResult("unknown")
-        return self.scenario.port.reconcile(effect)
+        try:
+            return self.reconcile(effect)
+        except ReadUnavailable as error:
+            code = None if result is None else result.raw.get('write_returncode')
+            if result is not None and type(code) is int and code != 0:
+                raise ReadUnavailable(error.code, error.message, write_returncode=code,
+                    write_diagnostic=str(result.raw.get('write_diagnostic', ''))) from error
+            raise
 
     def reconcile(self, effect: Effect) -> EffectResult:
-        return self.scenario.port.reconcile(effect)
+        return _physical_read(lambda: self.scenario.port.reconcile(effect))
 
     def prepare_publication(self, effect: Effect) -> Mapping[str, Any]:
-        return self.scenario.port.local.prepare_publication(effect)
+        return _physical_read(lambda: self.scenario.port.local.prepare_publication(effect))
 
     def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]:
-        return self.scenario.port.prepare_retirement(effect)
+        return _physical_read(lambda: self.scenario.port.prepare_retirement(effect))
 
 
 class Scenario:
+    port: OfflinePort
+    initial: Commit
+    spec: RunSpec
+    kernel: Kernel
+    requirements: Requirements
+    delivery: Delivery
+    execution: Execution
+    checks: list[str]
+
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
                  checks: Sequence[str] = ("none",), policy: Policy | None = None,
                  edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None) -> None:
@@ -679,14 +710,29 @@ class Scenario:
                             review_deadline_seconds=frozen["invocation_deadlines"]["review"],
                             publication_deadline_seconds=frozen["invocation_deadlines"]["publication"])
             checks = neutral_script["external"]["required_checks"]
-        self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
-        self.initial = self.port.git.commit("refs/heads/main")
-        self.spec, self.delivery = self.port.prepare(kind, policy=policy,
-            ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"] if neutral_script.get("ticket") else 1,
-            repository="example/repository" if neutral_script is None else neutral_script["repository"],
-            completed_ticket=None if neutral_script is None else neutral_script.get("completed_ticket_precondition"))
-        self.requirements: Requirements | None = None
-        if kind != DeliveryKind.FINAL_RUN:
+        self.historical_trace: dict[str, Any] | None = None
+        self.observation_start = 0
+        if kind == DeliveryKind.FINAL_RUN:
+            producer = self._completed_source(root, policy, neutral_script)
+            self.port, self.initial, self.spec = producer.port, producer.initial, producer.spec
+            self.kernel = Kernel(producer.kernel.storage.path)
+            self.requirements = producer.requirements
+            self.historical_trace = producer.trace()
+            self.historical_trace['completion'] = next(row for row in self.kernel.source_status()['completions']
+                                                        if row['subject'] == producer.delivery.key)
+            self.observation_start = len(self.port.writes())
+            self.kernel.control("stop", "historical-source-stop")
+            self.kernel.confirm_executor_exit(producer.execution)
+            self.kernel.control("resume", "historical-final-resume")
+            self.execution = self.kernel.claim_executor("offline-final-executor")
+            final = self.kernel.source_status()["final_subject"]
+            self.delivery = self.kernel.delivery(final)
+        else:
+            self.port = OfflinePort.create(root, None if neutral_script is None else neutral_script["git"])
+            self.initial = self.port.git.commit("refs/heads/main")
+            self.spec, self.delivery = self.port.prepare(kind, policy=policy,
+                ticket_number=2 if neutral_script is None else neutral_script["ticket"]["number"] if neutral_script.get("ticket") else 1,
+                repository="example/repository" if neutral_script is None else neutral_script["repository"])
             if neutral_script is None:
                 parent = ParentIssue(1, "Parent spec", "Deliver the declared synthetic behavior.",
                                      (self.delivery.issue,) if kind == DeliveryKind.TICKET else ())
@@ -702,12 +748,9 @@ class Scenario:
                     self.delivery.target_ref, "refs/heads/main", checkout=str(self.port.root / "work" / "final-1"),
                     owned_root=self.delivery.owned_root, common_git_dir=self.delivery.common_git_dir)
                 self.spec = replace(self.spec, deliveries=(*self.spec.deliveries, final))
-        evidence = None if neutral_script is None else {"parent": neutral_script["parent"], "ticket": neutral_script.get("ticket"),
-            "historical_completion": neutral_script.get("completed_ticket_precondition"), "source": "explicit immutable neutral fixture; not a live Completion import"}
-        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=self.requirements,
-                                    fixture_evidence=evidence if self.requirements is None else None)
-        self.delivery = self.kernel.delivery(self.delivery.key)
-        self.execution = self.kernel.claim_executor("offline-executor")
+            self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=self.requirements)
+            self.delivery = self.kernel.delivery(self.delivery.key)
+            self.execution = self.kernel.claim_executor("offline-executor")
         self.reviews = list(reviews)
         self.checks = list(checks)
         self.review_count = 0
@@ -719,6 +762,53 @@ class Scenario:
         self.checkpoints: list[dict[str, Any]] = []
         self.edits = edits
         self.reviewed_heads: list[str] = []
+
+    @staticmethod
+    def _completed_source(root: Path, policy: Policy | None, script: Mapping[str, Any] | None) -> Scenario:
+        """Produce real historical Completion; never insert accepted state rows."""
+        producer: Scenario
+        if script is None:
+            producer = _CompletedTicketProducer(root, DeliveryKind.TICKET, policy=policy,
+                checks=("pass",), edits=({"ticket.txt": "Completed synthetic Ticket.\n"},))
+        else:
+            historical = script["completed_ticket_precondition"]
+            prefix = {**script, "id": script["id"] + "-historical-source", "delivery_kind": "ticket",
+                "ticket": {**script["ticket"], "state": "OPEN", "labels": ["ready-for-agent"]},
+                "external": {**script["external"], "required_checks": ["pass"]},
+                "agents": {
+                    "development": [{"edits": {}, "wire": {"result_kind": "development",
+                        "summary": "Verify the declared historical tree.", "human_blockers": None}}],
+                    "review": [historical["review_artifact"]],
+                    "publication": [{"result_kind": "publication", "commit_message": historical["commit_message"],
+                        "pr_title": "feat(ticket): accepted historical fixture",
+                        "pr_body_markdown": "Accepted historical Ticket with recorded review, checks and exact Git evidence.",
+                        "human_blockers": None}]}}
+            producer = Scenario(root, DeliveryKind.TICKET, neutral_script=prefix)
+        if producer.run().kind != "complete":
+            raise KernelError("historical_source_incomplete")
+        if script is not None:
+            producer.requirements = Requirements.from_wire({"parent": script["parent"], "issues": [script["ticket"]]})
+            head = producer.port.remote_commit(producer.delivery.target_ref)
+            if head is None:
+                raise KernelError("historical_source_incomplete")
+            files = {name: producer.port.git.run("show", f"{head.sha}:{name}").stdout for name in
+                     producer.port.git.run("ls-tree", "-r", "--name-only", head.sha).stdout.splitlines()}
+            budget = producer.kernel.status(producer.delivery.key)["budgets"]["requirements"]
+            expected = script["completed_ticket_precondition"]
+            if (files != expected["tree_files"] or producer.port.git.run("show", "-s", "--format=%B", head.sha).stdout.strip()
+                    != expected["commit_message"].strip() or
+                    (budget["developments_used"], budget["reviews_used"], budget["window"]) !=
+                    tuple(expected["historical_budget"][key] for key in ("development_attempts", "reviewer_invocations", "window"))):
+                raise KernelError("historical_fixture_input_changed")
+        for _ in range(10):
+            if producer.kernel.source_status()["final_subject"] is not None:
+                return producer
+            producer.step()
+        raise KernelError("historical_final_not_activated")
+
+    def writes(self) -> list[dict[str, Any]]:
+        """This observer's new calls; the historical producer retains its journal."""
+        return self.port.writes()[getattr(self, "observation_start", 0):]
 
     def world(self) -> World:
         return self.runner().observe(self.delivery.key)
@@ -809,7 +899,8 @@ class Scenario:
         return {"role_calls": self.role_calls, "checkpoints": self.checkpoints,
                 "raw_backend_calls": {"development": self.development_count, "review": self.review_count,
                                       "publication": self.publication_count},
-                "external_writes": self.port.writes(), "final": self.kernel.status(self.delivery.key)}
+                "external_writes": self.writes(), "final": self.kernel.status(self.delivery.key),
+                **({"historical_source": self.historical_trace} if getattr(self, "historical_trace", None) else {})}
 
     def observable(self, scenario_id: str, boundary: Step) -> dict[str, Any]:
         """A declared read-side projection, not an expected-value generator."""
@@ -842,7 +933,7 @@ class Scenario:
                 "policy": asdict(self.spec.policy)}, "role_calls": calls,
                 "raw_backend_calls": {"development": self.development_count, "reviewer": self.review_count,
                                       "publication": self.publication_count},
-                "checkpoints": self.checkpoints, "external_writes": self.port.writes(),
+                "checkpoints": self.checkpoints, "external_writes": self.writes(),
                 "final": self.kernel.status(self.delivery.key), "terminal": boundary.kind,
                 "world": asdict(world), "git_evidence": refs}
 
@@ -883,6 +974,11 @@ class Scenario:
             closed = db.execute("SELECT issue,intent,actor,merge_sha FROM closed ORDER BY issue").fetchall()
             comments = db.execute("SELECT intent,issue,actor,body FROM comments ORDER BY rowid").fetchall()
             linked = db.execute("SELECT issue,ref,sha,intent FROM links ORDER BY issue").fetchall()
+        if getattr(self, "observation_start", 0):
+            intents = {write["intent"] for write in self.writes()}
+            closed = [row for row in closed if row[1] in intents]
+            comments = [row for row in comments if row[0] in intents]
+            linked = [row for row in linked if row[3] in intents]
         mutations: list[dict[str, Any]] = []
         for _, issue, _, raw in comments:
             body = json.loads(raw)
@@ -899,7 +995,7 @@ class Scenario:
             if self.delivery.kind != DeliveryKind.TICKET:
                 mutation["delivery_type"] = delivery_type
             mutations.append(mutation)
-        for write in self.port.writes():
+        for write in self.writes():
             if write["operation"] == "cleanup_remote_ref" and self.delivery.source_ref not in self.port.remote_refs():
                 mutations.append({"action": "delete_managed_branch", "branch": source_label})
         current = self.kernel.status(self.delivery.key)
@@ -910,6 +1006,7 @@ class Scenario:
             publication_wire = json.loads(tx.get(publication[0], self.delivery.key))
         approval = any(checkpoint["phase"] == "approval" for checkpoint in self.checkpoints)
         historical = script.get("completed_ticket_precondition")
+        history = getattr(self, "historical_trace", None)
         display_attempts = [{"issue_number": issue, "branch": labels.get(ref, ref),
                              "head_sha": head_identity(head)} for issue, ref, head, _ in linked]
         context_paths = {"review": current["reviewed_checkout"], "publication": self.delivery.checkout}
@@ -952,13 +1049,25 @@ class Scenario:
                 "publication_wire": publication_wire, "cross_architecture_compared": False,
                 "delivery_kind": "full_parent" if self.delivery.kind == DeliveryKind.FINAL_RUN else self.delivery.kind.value,
                 "approval_boundary": ("run_approval_pending" if self.delivery.kind == DeliveryKind.FINAL_RUN else "parent_approval_pending") if approval else None,
-                "historical_input": None if historical is None else {
-                    "kind": "completed Ticket fixture, no backend called for this prefix",
-                    "budget": {key: historical["historical_budget"][key] for key in ("development_attempts", "reviewer_invocations")},
-                    "head": heads["candidate"]},
+                "historical_input": None if historical is None or history is None else {
+                    "kind": "completed Ticket from an authenticated historical producer",
+                    "budget": {"development_attempts": history["final"]["budgets"]["requirements"]["developments_used"],
+                               "reviewer_invocations": history["final"]["budgets"]["requirements"]["reviews_used"]},
+                    "head": history["completion"]["merge_sha"]},
                 "source_ref_identity": self.delivery.source_ref.removeprefix("refs/heads/"),
                 "known_gaps": ["GitHub Issue branch linking uses a persistent synthetic remote, not the native online API"],
-                "raw_effects": self.port.writes()}
+                "raw_effects": self.writes(),
+                **({"historical_source": self.historical_trace} if getattr(self, "historical_trace", None) else {})}
+
+
+class _CompletedTicketProducer(Scenario):
+    def agent(self, call: AgentCall) -> bytes:
+        raw = super().agent(call)
+        if call.role == Role.PUBLICATION:
+            value = json.loads(raw)
+            value["commit_message"] = "completed fixture ticket"
+            return wire_json(value)
+        return raw
 
 
 class GraphScenario(Scenario):
