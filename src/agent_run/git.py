@@ -1275,12 +1275,12 @@ class GitRepository:
                 self._check_write_guard()
                 return run_git(
                     ["git", *arguments], cwd=directory, input=input,
-                    **({"timeout": timeout} if timeout is not None else {}),
+                    timeout=timeout,
                     **runner_options(self.runner_identity),
                 )
         return run_git(
             ["git", *arguments], cwd=directory, input=input,
-            **({"timeout": timeout} if timeout is not None else {}),
+            timeout=timeout,
             **runner_options(self.runner_identity),
         )
 
