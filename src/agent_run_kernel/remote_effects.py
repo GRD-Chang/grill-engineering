@@ -24,13 +24,16 @@ from agent_run.runner_transport import runner_git_environment
 from .cleanup_adapter import cleanup_remote_ref, inspect_remote_ref
 
 from .effects import LocalGit
-from .model import Commit, Effect, EffectResult, KernelError, PullRequest, World
+from .model import (Commit, Effect, EffectResult, KernelError, PullRequest, Requirements,
+                    ResourceInspection, ResourceWitness)
+from .local_effects import LocalEffects
 from .source_reading import (read_remote_heads, read_requirements, read_required_check_facts,
                              normalize_required_checks)
 
+from .storage import MATERIAL_LIMIT
+
 if TYPE_CHECKING:
-    from .kernel import Kernel
-from .storage import MATERIAL_LIMIT, Transaction
+    from .operation_runner import DeliveryFacts, DeliveryRead
 
 
 class ObservationSuperseded(KernelError):
@@ -75,6 +78,8 @@ class RemoteEffects:
 
     def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
         """One original operation, after exact readback and current authorization."""
+        if effect.operation in LocalEffects.OPERATIONS:
+            return self._local(effect).execute(effect, authorize)
         self._binding(effect)
         if effect.operation == "issue_link":
             return self._link_issue(effect, authorize)
@@ -153,6 +158,8 @@ class RemoteEffects:
 
     def reconcile(self, effect: Effect) -> EffectResult:
         """Only inspect this intent: target, unchanged prior, third or unknown."""
+        if effect.operation in LocalEffects.OPERATIONS:
+            return self._local(effect).reconcile(effect)
         self._binding(effect)
         try:
             if effect.operation == "issue_link":
@@ -496,109 +503,44 @@ class RemoteEffects:
         response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, guard)
         return self._readback(effect, response)
 
-    def observe(self, kernel: Kernel, subject: str) -> World:
-        """Read external facts using this input's exact refresh receipt.
-
-        Storage is used only for the fixed input/resource identities and exact
-        current Git anchors. Kernel.refresh alone accepts requirements; no
-        eligibility, currentness, completion or allowance is computed here.
-        """
-        with kernel.storage.transaction(write=False) as tx:
-            parent = self._source_parent(tx)
-            job = dict(tx.one("SELECT * FROM subjects WHERE id=?", (subject,)))
-            anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
-            snapshots = tx.rows("SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
-            if snapshots:
-                anchors.update(snapshots[0])
-            if job["review_attempt"] is not None:
-                review = tx.one("SELECT context_id FROM attempts WHERE id=? AND subject=?", (job["review_attempt"], subject))
-                context = json.loads(tx.get(review["context_id"], subject))
-                if "review_context" in context:
-                    anchors.add(context["review_context"]["full_range"]["candidate_sha"])
+    def source(self, parent_number: int) -> Requirements:
         reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-        receipt = self._refresh_requirements(kernel, reader, parent)
-        completions = [row for row in receipt["completion_revisions"] if row["subject"] == subject]
-        if len(completions) != 1 or completions[0]["generation"] != job["generation"]:
-            with kernel.storage.transaction(write=False) as tx:
-                current = tx.one("SELECT generation FROM subjects WHERE id=?", (subject,))[0]
-            if current != job["generation"]:
-                raise ObservationSuperseded("source_subject_changed")
-            raise KernelError("source_subject_changed")
-        revision = receipt["observed_parent_revision"]
-        if job["kind"] == "ticket":
-            issues = [row for row in receipt["observed_issues"] if row["issue"] == job["issue"]]
-            if len(issues) != 1:
-                raise KernelError("source_issue_missing")
-            revision = issues[0]["revision"]
-        source_sha, target_sha = read_remote_heads(self.root, job["source_ref"], job["target_ref"],
+        return read_requirements(reader, parent_number)
+
+    def delivery(self, request: DeliveryRead) -> DeliveryFacts:
+        """Read exact Core-supplied refs and immutable ancestry anchors."""
+        from .operation_runner import DeliveryFacts
+        source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
                                                   runner_identity=self.identity, remote=self.remote)
-        target = None if target_sha is None else self._commit(target_sha)[0]
         source = None if source_sha is None else self._commit(source_sha)[0]
-        raw_pr = self._find_pr(job["source_ref"], job["target_ref"], job["pr_number"])
+        target = None if target_sha is None else self._commit(target_sha)[0]
+        raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         pr = None if raw_pr is None else self._pr(raw_pr)
         checks = None
         if pr is not None and pr.state == "OPEN":
             if source is None or target is None or pr.head.sha != source.sha or pr.base.sha != target.sha:
                 raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
-            checks = normalize_required_checks(read_required_check_facts(reader, pr.number, expected_head_sha=source.sha))
-        if target is not None:
-            anchors.add(target.sha)
-        after = {sha for sha in (target_sha, source_sha, job["candidate_sha"], job["integrated_sha"]) if sha is not None}
-        ancestry = tuple((before, head) for before in sorted(anchors) for head in sorted(after)
-                         if self._ancestor(_sha(before), _sha(head)))
-        return World(_text(receipt["observed_parent_revision"]), _text(receipt["observed_graph_revision"]),
-                     _text(revision), target, source, pr, checks,
-                     _text(completions[0]["completion_revision"]), ancestry, self.actor(), dict(self.identity))
+            reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
+            checks = normalize_required_checks(read_required_check_facts(
+                reader, pr.number, expected_head_sha=request.check_head or source.sha))
+        heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
+        ancestry = tuple((before, after) for before in sorted(heads) for after in sorted(heads)
+                         if self._ancestor(_sha(before), _sha(after)))
+        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity))
 
-    def final_observation(self, kernel: Kernel) -> tuple[Commit, Commit, tuple[tuple[str, str], ...]]:
-        """Facts for activate_final; Kernel alone admits the Completion barrier.
+    def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
+        return LocalEffects(self.git).inspect_resources(resources)
 
-        Ordinary subject World reads never enumerate sibling ancestry. This
-        explicit consumer proves current-generation Completions into the actual
-        remote Run head using this refresh's receipt, not a later global read.
-        """
-        with kernel.storage.transaction(write=False) as tx:
-            parent = self._source_parent(tx)
-            target = tx.one("SELECT source_ref,target_ref FROM final_target")
-            source_ref, target_ref = target["source_ref"], target["target_ref"]
-        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-        receipt = self._refresh_requirements(kernel, reader, parent)
-        run_sha, default_sha = read_remote_heads(self.root, source_ref, target_ref,
-                                                 runner_identity=self.identity, remote=self.remote)
-        if run_sha is None:
-            raise GitHubReadError("final_source_missing", "The original remote Run ref is absent")
-        if default_sha is None:
-            raise GitHubReadError("missing_target_branch", "The exact remote default ref is absent")
-        run_head, default_head = self._commit(run_sha)[0], self._commit(default_sha)[0]
-        generations = {row["subject"]: row["generation"] for row in receipt["completion_revisions"]}
-        anchors = {row["merge_sha"] for row in receipt["completions"]
-                   if generations.get(row["subject"]) == row["generation"]}
-        proof = tuple((before, run_sha) for before in sorted(anchors) if self._ancestor(_sha(before), run_sha))
-        return run_head, default_head, proof
+    def prepare_publication(self, effect: Effect) -> Mapping[str, Any]:
+        return self._local(effect).prepare_publication(effect)
 
-    def _refresh_requirements(self, kernel: Kernel, reader: GhGitHubReader, parent: int) -> dict[str, Any]:
-        with kernel.storage.transaction(write=False) as tx:
-            sequence = tx.one("SELECT source_sequence FROM runs")[0]
-        try:
-            return kernel.refresh(lambda: read_requirements(reader, parent))
-        except KernelError as error:
-            if error.code != "source_observation_changed":
-                raise
-            with kernel.storage.transaction(write=False) as tx:
-                current = tx.one("SELECT source_sequence FROM runs")[0]
-            if current == sequence:
-                raise
-            raise ObservationSuperseded(error.code) from error
-
-    def _source_parent(self, tx: Transaction) -> int:
-        run = tx.one("SELECT * FROM runs")
-        inputs = tx.one("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
-        frozen = json.loads(tx.get(inputs["material_id"], inputs["subject"]))
-        if (run["repository"].casefold() != self.repository.casefold()
-                or run["repository_root"] is None or Path(run["repository_root"]).resolve() != self.root.resolve()
-                or validate_identity_snapshot(frozen["runner_identity"]) != self.identity):
-            raise KernelError("source_input_binding")
-        return _number(run["parent_issue"])
+    def _local(self, effect: Effect) -> LocalEffects:
+        # Physical capability dispatch only. Core already selected this exact
+        # operation and owns every authorization and durable intent.
+        root = (None if effect.operation == "inspect_resources" else
+                Path(effect.payload["resource"]["owned_root"] if effect.operation == "abandon_worktree"
+                     else effect.payload["owned_root"]))
+        return LocalEffects(self.git, owned_root=root)
 
     def _ancestor(self, before: str, after: str) -> bool:
         if before == after:

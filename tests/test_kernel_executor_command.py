@@ -8,9 +8,8 @@ import pytest
 
 from agent_run_kernel import executor
 from agent_run_kernel import codex_execution
-from agent_run_kernel import local_effects
 from agent_run_kernel.kernel import Kernel
-from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec, World
+from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec
 
 
 def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secrets(
@@ -45,33 +44,44 @@ def test_unmanaged_executor_entry_refuses_before_accessing_a_database(
 
 
 def test_native_executor_enumerates_more_than_one_query_page(tmp_path: Path) -> None:
-    keys = [f"ticket:{number}" for number in range(2, 132)]
-    deliveries = tuple(Delivery(key, DeliveryKind.TICKET, number, "revision", Commit("base", "tree"),
-                                f"refs/heads/{key}", "refs/heads/run")
-                       for number, key in enumerate(keys, 2))
-    kernel = Kernel.create(tmp_path / "wide.sqlite", RunSpec("wide", "example/project", 1, "parent", "graph", deliveries))
-    driver = object.__new__(executor._Executor)
-    driver.kernel = kernel
-    ordered = driver.subjects({"work_fifo": [keys[-1]], "integration_fifo": [keys[0]]})
-    assert ordered == [keys[-1], *keys[:-1]]
-    assert len(ordered) == 130
+    from agent_run_kernel.model import Issue, ParentIssue, Requirements
+    numbers = tuple(range(2, 132))
+    deliveries = tuple(Delivery(f"ticket:{n}", DeliveryKind.TICKET, n, "untrusted", Commit("base", "tree"),
+                                f"refs/heads/ticket-{n}", "refs/heads/run") for n in numbers)
+    deliveries += (Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "untrusted", Commit("base", "tree"),
+                            "refs/heads/run", "refs/heads/main"),)
+    source = Requirements(ParentIssue(1, "Parent", "Whole requirement", numbers), tuple(
+        Issue(n, f"Ticket {n}", "Required change", "OPEN", frozenset({"ready-for-agent"})) for n in numbers))
+    kernel = Kernel.create(tmp_path / "wide.sqlite", RunSpec("wide", "example/project", 1, "parent", "graph", deliveries),
+                           requirements=source)
+    before = kernel.history("ticket:131")
+    state = kernel.operation_state()
+    assert state.disposition == "ready" and state.active == ()
+    assert kernel.history("ticket:131") == before
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM subjects WHERE kind='ticket'")[0] == 130
+        assert not tx.rows("SELECT id FROM attempts")
+        assert not tx.rows("SELECT id FROM leases")
 
 
 def test_prompt_preparation_failure_durably_releases_only_its_original_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    base = Commit("base", "tree")
-    delivery = Delivery("ticket:2", DeliveryKind.TICKET, 2, "revision", base, "refs/heads/ticket", "refs/heads/run")
-    kernel = Kernel.create(tmp_path / "run.sqlite", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
-    execution = kernel.claim_executor("executor")
-    call = kernel.advance(delivery.key, execution, World("parent", "graph", "revision", base)).call
-    assert call is not None
-    driver = object.__new__(executor._Executor)
-    driver.kernel = kernel
-    driver.worker_identity = {"source": "host"}
-    driver.environment = {}
-    driver.hidden_paths = ()
-    driver.hidden_environment = ()
+    import threading
+    from agent_run_kernel.offline import GraphScenario
+    from test_kernel_operation_runner import Ports
+    from test_kernel_requirements import independent_source
+    scenario = GraphScenario(tmp_path / "preparation", independent_source())
+    kernel = scenario.kernel
+    runner = kernel.operation_runner(scenario.execution, lambda binding: Ports(scenario))
+    for _ in range(30):
+        step = runner.run_once()
+        if step.call is not None:
+            call = step.call
+            break
+    else:
+        raise AssertionError("Core did not allocate the normal Development call")
+    driver = executor._Executor(kernel, runner, {})
 
     def invalid_prompt(call: object) -> str:
         raise KernelError("prompt_resources_unavailable")
@@ -81,47 +91,45 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
 
     monkeypatch.setattr(codex_execution, "execute_selected_codex", unexpected_worker, raising=False)
     monkeypatch.setattr(executor, "render_role_prompt", invalid_prompt)
-    driver.agent(call)
+    driver.agent(call, threading.Event())
+    assert runner.worker_settled(call)
     status = kernel.status(call.subject)
     assert status["pending_attempt"] == call.attempt_id
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert "worker_unavailable" in status["gates"]
-    assert kernel.scheduling()["active"] == []
+    assert kernel.operation_state().active == ()
 
 
 def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    base = Commit("base", "tree")
-    delivery = Delivery("ticket:2", DeliveryKind.TICKET, 2, "revision", base, "refs/heads/ticket", "refs/heads/run")
-    kernel = Kernel.create(tmp_path / "run.sqlite", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
-    execution = kernel.claim_executor("executor")
-    world = World("parent", "graph", "revision", base)
-    call = kernel.advance(delivery.key, execution, world).call
-    assert call is not None
-    kernel.receive(call, b'{"result_kind":"development","summary":"changed","human_blockers":null}')
-    assert kernel.advance(delivery.key, execution, world, allow_agent=False).kind == "progress"
-    step = kernel.advance(delivery.key, execution, world)
-    assert step.effect is not None and step.effect.operation == "candidate"
+    from agent_run_kernel.offline import GraphScenario
+    from test_kernel_operation_runner import Ports, settle_agent
+    from test_kernel_requirements import independent_source
+    scenario = GraphScenario(tmp_path / "stop", independent_source())
+    kernel = scenario.kernel
+    ports = Ports(scenario)
+    original = ports.execute
     writes: list[str] = []
+    selected = []
 
-    class Local:
-        def __init__(self, *arguments: object, **keywords: object) -> None:
-            pass
+    def execute(effect, authorize):
+        if effect.operation != "candidate":
+            return original(effect, authorize)
+        selected.append(effect)
+        authorize()
+        kernel.control("stop", "operator-stop")
+        authorize()
+        writes.append("unexpected")
+        raise AssertionError("Stop must reject the second write guard")
 
-        def execute(self, effect: object, authorize: object) -> None:
-            assert callable(authorize)
-            authorize()
-            kernel.control("stop", "operator-stop")
-            authorize()
-            writes.append("unexpected")
-
-    monkeypatch.setattr(local_effects, "LocalEffects", Local)
-    driver = object.__new__(executor._Executor)
-    driver.kernel, driver.execution = kernel, execution
-    driver.remote = type("Remote", (), {"git": object()})()
-    driver.observe = lambda subject: world
+    monkeypatch.setattr(ports, "execute", execute)
+    runner = kernel.operation_runner(scenario.execution, lambda binding: ports)
     with pytest.raises(KernelError, match="executor_fenced"):
-        driver.effect(step)
-    assert writes == []
-    assert not any(event["kind"] == "effect_failed" for event in kernel.history(delivery.key))
+        for _ in range(30):
+            step = runner.run_once()
+            if step.call is not None:
+                settle_agent(scenario, runner, step.call)
+        raise AssertionError("The normal candidate boundary was not reached")
+    assert len(selected) == 1 and writes == []
+    assert not any(event["kind"] == "effect_failed" for event in kernel.history(selected[0].subject))

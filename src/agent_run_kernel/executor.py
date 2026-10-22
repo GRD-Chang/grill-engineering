@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
-import json
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import os
 from pathlib import Path
 import sys
@@ -17,14 +16,14 @@ import time
 from typing import Any
 
 from agent_run.error_safety import bounded_error
-from agent_run.github import GitHubReadError
 
 from .host_adapter import SystemdHost
 from .execution import ProcessExitUnknown
 from .kernel import Kernel
-from .model import AgentCall, Execution, KernelError, ReadWait, Step, World
+from .model import AgentCall, Execution, KernelError, Step
+from .operation_runner import OperationBinding, OperationRunner
 from .native_host import managed_host_environment
-from .remote_effects import EffectReadError, ObservationSuperseded, RemoteEffects
+from .remote_effects import RemoteEffects
 from .role_prompt import render_role_prompt
 
 
@@ -49,313 +48,104 @@ def command(database: Path, action: str, runner_lock: Path,
 
 
 class _Executor:
-    def __init__(self, kernel: Kernel, execution: Execution, environment: Mapping[str, str]) -> None:
-        self.kernel, self.execution = kernel, execution
+    """Launch exact allocated calls; Core owns operation selection and grants."""
+    def __init__(self, kernel: Kernel, runner: OperationRunner, environment: Mapping[str, str]) -> None:
+        self.kernel, self.runner = kernel, runner
         self.environment = dict(environment)
-        with kernel.storage.transaction(write=False) as tx:
-            row = tx.one("SELECT repository,repository_root FROM runs WHERE id=?", (execution.run_id,))
-            binding = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (execution.run_id,))
-            inputs = json.loads(tx.get(binding["material_id"], binding["subject"]))
-        if not isinstance(row["repository_root"], str):
-            raise KernelError("managed_repository_required")
-        root = Path(row["repository_root"])
-        if not root.is_absolute() or root.resolve() != root:
-            raise KernelError("managed_repository_required")
-        remote = inputs.get("repository_remote")
-        if not isinstance(remote, str) or not remote:
-            raise KernelError("creation_repository_remote_required")
-        self.remote = RemoteEffects(root, row["repository"], runner_identity=inputs["runner_identity"], remote=remote)
-        self.worker_identity = inputs["worker_identity"]
-        self.source_lock = threading.Lock()
-        self.cancelled = threading.Event()
-        self.hidden_paths: tuple[Path, ...] = (kernel.storage.path.parent,)
-        self.hidden_environment: tuple[str, ...] = ()
-        protected = list(self.hidden_paths)
-        variables: list[str] = []
-        for identity in (inputs["runner_identity"], self.worker_identity):
-            reference = identity.get("pat", {})
-            if reference.get("file"):
-                protected.append(Path(reference["file"]))
-            if reference.get("env"):
-                variables.append(reference["env"])
-            app = identity.get("app_profile", {})
-            if app.get("private_key_path"):
-                protected.append(Path(app["private_key_path"]))
-        self.hidden_paths, self.hidden_environment = tuple(protected), tuple(variables)
 
-    def observe(self, subject: str) -> World:
-        # One source reader for this Host's own calls. Cross-process version
-        # checks remain in Kernel; this lock does not grant mutation authority.
-        with self.source_lock:
-            return self.remote.observe(self.kernel, subject)
-
-    def observed(self, subject: str) -> World:
-        """Bind each I/O read to Core's current narrow business scope."""
-        token = self.kernel.begin_automatic_step(self.execution, subject)
-        waiting = self.kernel.guard_automatic_step(token, self.execution)
-        if waiting is not None:
-            raise ReadWait(waiting)
-        try:
-            world = self.observe(subject)
-        except GitHubReadError as error:
-            raise ReadWait(self.kernel.wait_for_read(token, self.execution, error.code, error.message)) from error
-        self.kernel.guard_automatic_step(token, self.execution, after_read=True)
-        return world
-
-    def agent(self, call: AgentCall) -> None:
+    def agent(self, call: AgentCall, cancelled: threading.Event) -> None:
         try:
             prompt = render_role_prompt(call)
         except Exception as error:
-            # Match the process adapter's dispatch-before-preparation contract:
-            # this exact allocated call is known not to have launched anything.
             if self.kernel.dispatch_agent(call):
                 self.kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
             return
         from .codex_execution import execute_selected_codex
-
-        def authorize_source() -> None:
-            self.authorize_agent_source(call)
-
+        binding = self.runner.binding
+        # Keep the native credential/sandbox/process/raw/exit hooks. Bootstrap
+        # authorization executes inline here, never in a successor pool task.
         execute_selected_codex(
-            self.kernel, call, identity=self.worker_identity, environment=self.environment,
-            prompt=prompt, hidden_paths=self.hidden_paths,
-            hidden_environment=self.hidden_environment,
-            authorize_source=authorize_source, cancelled=self.cancelled,
+            self.kernel, call, identity=binding.inputs.worker_identity, environment=self.environment,
+            prompt=prompt, hidden_paths=binding.hidden_paths, hidden_environment=binding.hidden_environment,
+            authorize_source=lambda: self.runner.authorize_agent(call), cancelled=cancelled,
         )
 
-    def authorize_agent_source(self, call: AgentCall) -> None:
-        """Read for the original call; the process adapter consumes the wait."""
-        try:
-            self.observed(call.subject)
-        except KernelError as error:
-            if error.code == "automatic_step_paused":
-                raise ReadWait(Step("paused", call.subject, error.code)) from error
-            if error.code == "automatic_step_superseded":
-                raise ObservationSuperseded(error.code) from error
-            raise
 
-    def effect(self, step: Step) -> Step:
-        from .local_effects import LocalEffects
-
-        effect = step.effect
-        if effect is None:
-            raise KernelError("effect_request_required")
-        token = self.kernel.begin_automatic_step(self.execution, effect.subject)
-        waiting = self.kernel.guard_automatic_step(
-            token, self.execution, readback=effect if step.kind == "reconcile" else None,
-        )
-        if waiting is not None:
-            raise ReadWait(waiting)
-        port: RemoteEffects | LocalEffects
-        if effect.operation in Kernel.REMOTE:
-            port = self.remote
-        else:
-            local_root: Path | None = None
-            if effect.operation == "abandon_worktree":
-                local_root = Path(effect.payload["resource"]["owned_root"])
-            elif effect.operation != "inspect_resources":
-                local_root = Path(effect.payload["owned_root"])
-            port = LocalEffects(self.remote.git, owned_root=local_root)
-        if step.kind == "reconcile":
-            # Original physical outcome is durable before any new source I/O.
-            result = port.reconcile(effect)
-            settled = self.kernel.reconcile(effect, result, self.execution)
-            if settled.kind != "observe":
-                return settled
-            return self.kernel.reconcile(effect, result, self.execution, self.observed(effect.subject))
-        if (effect.operation == "publication_commit" and not effect.payload.get("reuse_sha")
-                and not effect.payload.get("publication_commit_intent")):
-            if not isinstance(port, LocalEffects):
-                raise KernelError("local_publication_required")
-            effect = self.kernel.attach_publication_commit(
-                effect, port.prepare_publication(effect), self.execution, self.observed(effect.subject),
-            )
-        if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
-            if not isinstance(port, RemoteEffects):
-                raise KernelError("remote_retirement_required")
-            effect = self.kernel.attach_retirement(
-                effect, port.prepare_retirement(effect), self.execution, self.observed(effect.subject),
-            )
-        dispatched = False
-
-        def authorize() -> None:
-            nonlocal dispatched
-            world = self.observed(effect.subject)
-            resources = self.kernel.effect_resources(effect)
-            inspections = (None if resources is None else
-                           LocalEffects(self.remote.git).inspect_resources(resources))
-            if not dispatched:
-                if not self.kernel.dispatch(effect, self.execution, world, resource_inspections=inspections):
-                    raise KernelError("operation_cancelled")
-                dispatched = True
-            self.kernel.guard_effect(effect, self.execution, world, resource_inspections=inspections)
-
-        # Authorization cancellation is not a failed external command. Only
-        # the adapter's actual command result below can create that audit fact.
-        try:
-            result = port.execute(effect, authorize)
-        except EffectReadError as error:
-            if dispatched and error.write_returncode != 0:
-                self.kernel.observe_effect_failure(effect, {
-                    "returncode": error.write_returncode,
-                    "message": bounded_error(error.write_diagnostic),
-                })
-            raise
-        if dispatched and result.raw.get("write_returncode") not in (None, 0):
-            self.kernel.observe_effect_failure(effect, {
-                "returncode": result.raw["write_returncode"],
-                "message": bounded_error(str(result.raw.get("write_diagnostic", ""))),
-            })
-        if effect.operation == "issue_link":
-            self.kernel.acknowledge_link(effect, result)
-            return Step("progress", effect.subject)
-        settled = self.kernel.reconcile(effect, result, self.execution)
-        if settled.kind == "observe":
-            settled = self.kernel.reconcile(effect, result, self.execution, self.observed(effect.subject))
-        return settled
-
-    def advance(self, subject: str, *, cleanup: bool = False) -> Step:
-        advance = self.kernel.advance_cleanup if cleanup else self.kernel.advance
-        token = self.kernel.begin_automatic_step(self.execution, subject, cleanup=cleanup)
-        read_token = token
-        try:
-            step = advance(subject, self.execution)
-            if step.kind == "observe":
-                subject = step.subject
-                read_token = self.kernel.begin_automatic_step(self.execution, subject, cleanup=cleanup)
-                step = advance(subject, self.execution, self.observed(subject))
-            if step.kind in {"effect", "reconcile"}:
-                read_token = self.kernel.begin_automatic_step(self.execution, step.subject, cleanup=cleanup)
-                step = self.effect(step)
-            return self.kernel.finish_automatic_step(token, self.execution, step)
-        except ReadWait as waiting:
-            return waiting.step
-        except GitHubReadError as error:
-            return self.kernel.wait_for_read(read_token, self.execution, error.code, error.message)
-        except ObservationSuperseded:
-            # Yield this obsolete read; sent effects retain their durable receipt
-            # and the next ordinary advance chooses reconciliation, never replay.
-            return Step("waiting", subject, "observation_superseded")
-        except KernelError as error:
-            if error.code == "automatic_step_superseded":
-                return Step("waiting", subject, "observation_superseded")
-            if error.code == "automatic_step_paused":
-                return Step("paused", subject, error.code)
-            raise
-
-    def subjects(self, scheduling: Mapping[str, Any]) -> list[str]:
-        with self.kernel.storage.transaction(write=False) as tx:
-            ids = [row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid")]
-        return list(dict.fromkeys([*scheduling["work_fifo"], *scheduling["integration_fifo"], *ids]))
-
-    def worker_finished(self, call: AgentCall) -> bool:
-        """Read exact durable physical facts before forgetting a failed future."""
-        with self.kernel.storage.transaction(write=False) as tx:
-            row = tx.one("SELECT dispatch_state,exit_code,process_identity,start_evidence "
-                         "FROM invocation_outputs WHERE invocation=? AND ordinal=?",
-                         (call.invocation_id, call.output_ordinal))
-            leased = tx.rows("SELECT id FROM leases WHERE id=?", (call.lease_id,))
-        return not leased and (
-            row["dispatch_state"] == "exited" and row["exit_code"] is not None
-            or row["dispatch_state"] == "unavailable" and row["process_identity"] is None
-            and row["start_evidence"] is not None
-        )
-
-    def activate_final(self) -> bool:
-        with self.kernel.storage.transaction(write=False) as tx:
-            if not tx.rows("SELECT id FROM final_target") or tx.rows("SELECT id FROM subjects WHERE kind='final_run'"):
-                return False
-        token = self.kernel.begin_automatic_step(self.execution, None)
-        try:
-            waiting = self.kernel.guard_automatic_step(token, self.execution)
-            if waiting is not None:
-                return False
-            with self.source_lock:
-                head, default, proof = self.remote.final_observation(self.kernel)
-            self.kernel.guard_automatic_step(token, self.execution, after_read=True)
-        except ObservationSuperseded:
-            return False
-        except GitHubReadError as error:
-            self.kernel.wait_for_read(token, self.execution, error.code, error.message)
-            return False
-        except KernelError as error:
-            if error.code in {"automatic_step_superseded", "automatic_step_paused"}:
-                return False
-            raise
-        try:
-            self.kernel.activate_final(self.execution, head, default, ancestry=proof)
-        except KernelError as error:
-            if error.code in {"ticket_completion_required", "final_admission_closed"}:
-                return False
-            raise
-        self.kernel.finish_automatic_step(token, self.execution, Step("progress", ""))
-        return True
+def _make_ports(binding: OperationBinding) -> RemoteEffects:
+    return RemoteEffects(binding.repository_root, binding.repository,
+                         runner_identity=binding.inputs.runner_identity, remote=binding.inputs.repository_remote)
 
 
 def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) -> int:
-    """Supervise allocated calls while other subjects' program work advances."""
+    """Supervise physical calls and one bounded Core operation independently."""
     from .notifications import NativeNotifications
-
-    driver = _Executor(kernel, execution, environment)
-    scheduling = kernel.scheduling()
-    workers: dict[str, tuple[AgentCall, Future[None]]] = {}
+    runner: OperationRunner = kernel.operation_runner(execution, _make_ports)
+    driver = _Executor(kernel, runner, environment)
+    state = runner.state()
+    workers: dict[str, tuple[AgentCall, Future[None], threading.Event]] = {}
+    operation: Future[Step] | None = None
     notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent)
     drain_notifications = False
     try:
-        with ThreadPoolExecutor(max_workers=scheduling["concurrency"], thread_name_prefix="agent-run") as pool:
+        with ThreadPoolExecutor(max_workers=state.concurrency, thread_name_prefix="agent-run") as agents, \
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-run-io") as io:
             try:
                 while True:
-                    if scheduling.get("cancel_workers") is True:
-                        driver.cancelled.set()
-                    # Also picks up Worker-thread commits during long calls.
-                    # Observation is lock-free; the I/O loop's bounded calls
-                    # can delay this tick, so no one-second delivery is promised.
-                    notifications.observe_committed()
-                    for subject, (call, future) in list(workers.items()):
-                        if future.done():
-                            try:
-                                future.result()
-                            except ProcessExitUnknown:
-                                raise
-                            except Exception as error:
-                                if not driver.worker_finished(call):
-                                    raise ProcessExitUnknown("Worker outcome was not durably settled") from error
-                                # Kernel alone chooses recovery from the exact
-                                # unavailable/exit facts, never this exception.
-                                print(bounded_error(str(error)), file=sys.stderr)
-                            del workers[subject]
-                    progress = False
-                    for subject in driver.subjects(scheduling):
-                        if subject in workers:
+                    if operation is not None and operation.done():
+                        step = operation.result()
+                        operation = None
+                        if step.call is not None:
+                            # Hand off an allocated call before state, observer,
+                            # or another potentially slow operation is touched.
+                            call = step.call
+                            if call.lease_id in workers:
+                                raise KernelError("duplicate_host_call")
+                            cancelled = threading.Event()
+                            workers[call.lease_id] = (call, agents.submit(driver.agent, call, cancelled), cancelled)
+                    for lease, (call, future, _) in list(workers.items()):
+                        if not future.done():
                             continue
-                        step = driver.advance(subject)
-                        if step.kind == "agent" and step.call is not None:
-                            workers[subject] = (step.call, pool.submit(driver.agent, step.call))
-                            progress = True
-                        elif step.kind == "complete":
-                            retired = driver.advance(subject, cleanup=True)
-                            progress = progress or retired.kind == "progress"
-                        else:
-                            progress = progress or step.kind == "progress"
+                        failure: Exception | None = None
+                        try:
+                            future.result()
+                        except Exception as error:
+                            failure = error
+                        # Future completion releases no durable lease. Even a
+                        # successful Python return requires exact Core evidence.
+                        if isinstance(failure, ProcessExitUnknown) or not runner.worker_settled(call):
+                            raise ProcessExitUnknown("Worker outcome was not durably settled") from failure
+                        if failure is not None:
+                            print(bounded_error(str(failure)), file=sys.stderr)
+                        del workers[lease]
+                    state = runner.state()
+                    for lease in state.cancel:
+                        active = workers.get(lease)
+                        if active is not None:
+                            active[2].set()
                     notifications.observe_committed()
-                    scheduling = kernel.scheduling()
-                    if not workers and not progress and scheduling["disposition"] in {"quiescent", "complete"}:
+                    if operation is None and not workers and state.disposition in {"quiescent", "complete"}:
                         drain_notifications = True
                         return 0
-                    if not progress and not workers:
-                        progress = driver.activate_final()
-                    if not progress:
-                        deadline = scheduling["next_deadline_at"]
-                        delay = 1.0 if deadline is None else min(1.0, max(0.01, deadline - kernel.clock()))
-                        if workers:
-                            wait((future for _, future in workers.values()), timeout=delay)
-                        else:
-                            time.sleep(delay)
+                    now = kernel.clock()
+                    ready = (state.disposition == "ready" or state.disposition == "waiting"
+                             and state.wake_at is not None and state.wake_at <= now)
+                    if operation is None and ready:
+                        operation = io.submit(runner.run_once, agent_capacity=max(0, state.concurrency-len(workers)))
+                    delay = 1.0 if state.wake_at is None else min(1.0, max(0.01, state.wake_at-now))
+                    # The heterogeneous collection is used only for readiness;
+                    # results are consumed through their typed handles above.
+                    pending: list[Future[Any]] = [future for _, future, _ in workers.values()]
+                    if operation is not None:
+                        pending.append(operation)
+                    if pending:
+                        wait(pending, timeout=delay, return_when=FIRST_COMPLETED)
+                    else:
+                        time.sleep(delay)
             finally:
-                # Set before ThreadPoolExecutor.__exit__ waits. Every known
-                # process follows its original terminate/pidfd/raw-finally path;
-                # the actual managed Host exit must prove any unknown survivor.
-                driver.cancelled.set()
+                # Set before the pools wait. Native hooks retain physical exit
+                # evidence; Host never confirms exit by dropping a Future.
+                for _, _, cancelled in workers.values():
+                    cancelled.set()
     finally:
         notifications.close(drain=drain_notifications)
 

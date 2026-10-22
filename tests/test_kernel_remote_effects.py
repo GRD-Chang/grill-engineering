@@ -312,34 +312,46 @@ def test_optional_issue_link_keeps_exact_successful_graphql_acknowledgement(tmp_
 
 @pytest.mark.parametrize("mode", ["acknowledged", "ack-lost", "unavailable"])
 def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, mode):
-    from agent_run_kernel import DeliveryKind, Kernel
-    from agent_run_kernel.offline import Scenario
-    port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
-    # A separate synthetic authenticated principal, explicitly observed by gh;
-    # no PR author or personal default is used as credential evidence.
+    from agent_run_kernel import Kernel
+    from agent_run_kernel.model import Issue, ParentIssue, Requirements
+    from agent_run_kernel.offline import GraphScenario
+    from test_kernel_operation_runner import Ports, settle_agent
+    _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
     _change(state, actor="offline-publisher", lose_operation="issue_link" if mode == "ack-lost" else None,
             issue_read_error=mode == "unavailable")
-    fake = tmp_path / "bin" / "gh"
-    fake.write_text(fake.read_text().replace("example/project", "example/repository"))
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    original = scenario.port.execute
-    selected = RemoteEffects(scenario.port.git.root, "example/repository", runner_identity={"source": "host"})
-    def execute(effect, authorize=None):
+    source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
+                          (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    ports = Ports(scenario)
+    original = ports.execute
+    selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
+                             runner_identity=scenario.spec.inputs.runner_identity,
+                             remote=scenario.spec.inputs.repository_remote)
+    def execute(effect, authorize):
         if effect.operation != "issue_link":
             return original(effect, authorize)
         scenario.port.git.run("push", str(tmp_path / "origin.git"), effect.before_sha + ":" + effect.source_ref)
-        assert authorize is not None
         return selected.execute(effect, authorize)
-    monkeypatch.setattr(scenario.port, "execute", execute)
-    assert scenario.run().kind == "complete"
+    monkeypatch.setattr(ports, "execute", execute)
+    def finish_ticket():
+        runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
+        for _ in range(100):
+            status = scenario.kernel.status("ticket:2")
+            if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
+                return
+            step = runner.run_once()
+            if step.call is not None:
+                settle_agent(scenario, runner, step.call)
+        raise AssertionError("original Ticket did not complete with mandatory cleanup")
+    finish_ticket()
     durable = Kernel(scenario.kernel.storage.path)
-    assert durable.status(scenario.delivery.key)["phase"] == "complete"
-    assert durable.status(scenario.delivery.key)["issue_link"]["state"] == {"ack-lost": "indeterminate", "acknowledged": "linked", "unavailable": "unavailable"}[mode]
+    assert durable.status("ticket:2")["phase"] == "complete"
+    assert durable.status("ticket:2")["issue_link"]["state"] == {"ack-lost": "indeterminate", "acknowledged": "linked", "unavailable": "unavailable"}[mode]
     before_roles = list(scenario.role_calls)
-    before_usage = durable.status(scenario.delivery.key)["budgets"]
+    before_usage = durable.status("ticket:2")["budgets"]
     scenario.kernel = durable
-    assert scenario.run().kind == "complete"
-    assert scenario.role_calls == before_roles and durable.status(scenario.delivery.key)["budgets"] == before_usage
+    finish_ticket()
+    assert scenario.role_calls == before_roles and durable.status("ticket:2")["budgets"] == before_usage
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum(c[1] == "graphql" and "POST" in c for c in actual) == (0 if mode == "unavailable" else 1)
     assert len(json.loads(state.read_text()).get("links", [])) == (0 if mode == "unavailable" else 1)
@@ -424,7 +436,9 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
     refs_before = git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout
     previous_calls = len(calls.read_text().splitlines())
     monkeypatch.setattr(kernel, "source_status", lambda: pytest.fail("must use this refresh receipt, never latest global status"))
-    world = port.observe(kernel, "parent:1")
+    execution = kernel.claim_executor("source-observer")
+    runner = kernel.operation_runner(execution, lambda binding: port)
+    world = runner.observe("parent:1")
     assert world.parent_revision == receipt["observed_parent_revision"] and world.graph_revision == receipt["observed_graph_revision"]
     assert world.revision == world.parent_revision and world.completion_revision == "no-tickets"
     assert world.source == latest and world.target == published.base
@@ -450,6 +464,8 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
     port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
     kernel = _source_kernel(tmp_path, port, push)
     before = kernel.source_status()
+    execution = kernel.claim_executor("source-observer")
+    runner = kernel.operation_runner(execution, lambda binding: port)
     reached, release = Event(), Event()
     failures = []
     def delayed(reader, parent):
@@ -460,7 +476,7 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
     monkeypatch.setattr(external, "read_requirements", delayed)
     def old_observer():
         try:
-            port.observe(kernel, "parent:1")
+            runner.observe("parent:1")
         except Exception as error:
             failures.append(error)
     thread = Thread(target=old_observer)
@@ -474,7 +490,7 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
         release.set()
         thread.join(10)
     assert not thread.is_alive() and len(failures) == 1
-    assert isinstance(failures[0], KernelError) and failures[0].code == "source_observation_changed"
+    assert isinstance(failures[0], KernelError) and failures[0].code == "automatic_step_superseded"
     assert newer["observed_parent_revision"] != before["observed_parent_revision"]
     assert kernel.source_status() == newer
 
@@ -486,7 +502,17 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
                           (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "graph", source)
-    assert scenario.run().kind == "complete"
+    from test_kernel_operation_runner import Ports, settle_agent
+    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: Ports(scenario))
+    for _ in range(100):
+        step = runner.run_once()
+        if step.call is not None:
+            settle_agent(scenario, runner, step.call)
+        status = scenario.kernel.status("ticket:2")
+        if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
+            break
+    else:
+        raise AssertionError("Ticket completion and required cleanup were not reached")
     completed = scenario.kernel.source_status()["completions"]
     assert len(completed) == 1 and completed[0]["subject"] == "ticket:2"
     assert scenario.kernel.source_status()["final_subject"] is None
@@ -494,8 +520,8 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     default = scenario.port.git.commit("refs/heads/main")
     remote = tmp_path / "final-origin.git"
     scenario.port.git.run("init", "--bare", str(remote))
-    scenario.port.git.run("remote", "add", "actual", str(remote))
-    scenario.port.git.run("push", "actual", "refs/heads/run", "refs/heads/main")
+    scenario.port.git.run("remote", "add", "offline-remote", str(remote))
+    scenario.port.git.run("push", "offline-remote", "refs/heads/run", "refs/heads/main")
     other = tmp_path / "final-external"
     scenario.port.git.run("clone", "--branch", "run", str(remote), str(other))
     external = LocalGit(other)
@@ -511,13 +537,16 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     monkeypatch.setenv("REMOTE_TEST_BARE", str(remote))
     _change(state, source_graph={"parent": {"number": 1, "title": "Parent", "body": "Whole requirement", "sub_issues": [2]},
         "issues": {"2": {"number": 2, "title": "Ticket", "body": "Whole ticket", "state": "CLOSED", "labels": ["ready-for-agent"]}}})
-    selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="actual")
+    selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
     role_calls = list(scenario.role_calls)
     before_calls = len(calls.read_text().splitlines()) if calls.exists() else 0
-    run_head, default_head, proof = selected.final_observation(scenario.kernel)
-    assert run_head == latest and default_head == default
-    assert (completed[0]["merge_sha"], latest.sha) in proof
-    final = scenario.kernel.activate_final(scenario.execution, run_head, default_head, ancestry=proof)
+    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: selected)
+    world = runner.observe(None)
+    assert world.source == latest and world.target == default
+    assert (completed[0]["merge_sha"], latest.sha) in world.ancestry
+    step = runner.run_once()
+    assert step.kind == "progress" and step.reason == "final_activated" and step.call is None
+    final = step.subject
     assert scenario.kernel.delivery(final).base == latest
     assert scenario.kernel.delivery(final).source_ref == "refs/heads/run"
     assert scenario.kernel.status(final)["phase"] == "workspace"
