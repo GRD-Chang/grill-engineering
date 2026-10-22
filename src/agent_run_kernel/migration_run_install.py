@@ -173,6 +173,71 @@ def imported_completion_rows(facts: ImportedRunFacts, subject: ImportedSubject, 
 
 
 @contextmanager
+def _copied_marker(common: Path, copy_uuid: str) -> Iterator[None]:
+    """One private clone marker, removed on failure only while still ours."""
+    marker, owned = common / 'agent-run-checkout-id', None
+    try:
+        try:
+            descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError as error:
+            raise MigrationRefused('copied_repository_identity_exists') from error
+        with os.fdopen(descriptor, 'wb') as stream:
+            physical = os.fstat(stream.fileno())
+            owned = physical.st_dev, physical.st_ino
+            stream.write(copy_uuid.encode('ascii') + b'\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = os.open(common, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        yield
+    except BaseException:
+        if owned is not None:
+            try:
+                physical = marker.lstat()
+                if (physical.st_dev, physical.st_ino) != owned or marker.is_symlink():
+                    raise MigrationRefused('copied_mirror_recovery_required')
+                marker.unlink()
+            except OSError as error:
+                raise MigrationRefused('copied_mirror_recovery_required') from error
+        raise
+
+
+@contextmanager
+def _copied_idle_marker(facts: ImportedRunFacts, destination: Path) -> Iterator[None]:
+    from .migration_run_ownership import _idle_checkout_state
+    from .migration_run_proof import copied_resource_proof
+    from .effects import LocalGit
+    from .model import KernelError
+    proof = copied_resource_proof(facts)
+    if proof is None or proof['format'] != 'copied-idle-resources/1':
+        yield
+        return
+    root, common = Path(proof['repository_root']), Path(proof['common_git_dir'])
+    parent = destination.parent.resolve()
+    if (root.resolve() != root or root == parent or not root.is_relative_to(parent)
+            or common.is_symlink() or common.resolve() != common):
+        raise MigrationRefused('copied_repository_required')
+    git = LocalGit(root)
+    for subject in facts.subjects:
+        resource = subject.resources[0]
+        if (resource.checkout is None or resource.owned_root is None
+                or not resource.owned_root.is_relative_to(parent)
+                or resource.checkout.parent != resource.owned_root
+                or _git(root, 'for-each-ref', '--format=%(refname)', resource.source_ref)):
+            raise MigrationRefused('copied_idle_scope')
+        try:
+            if _idle_checkout_state(git, resource.checkout, common) != (resource.before_head, resource.checkout_status):
+                raise MigrationRefused('source_checkout')
+        except KernelError as error:
+            raise MigrationRefused(error.code) from error
+    with _copied_marker(common, proof['copy_uuid']):
+        yield
+
+
+@contextmanager
 def _copied_returned_mirror(facts: ImportedRunFacts, destination: Path, archive: Path | None) -> Iterator[None]:
     returned = [subject for subject in facts.subjects if subject.kind == 'returned']
     if facts.source.mode != 'copied' or not returned:
@@ -203,8 +268,6 @@ def _copied_returned_mirror(facts: ImportedRunFacts, destination: Path, archive:
     candidate = subject.candidate
     archive_ref = f'refs/agent-run-kernel-migration/{facts.spec.run_id}/ticket-{subject.issue}'
     archived = normalized = False
-    marker = resource.common_git_dir / 'agent-run-checkout-id'
-    owned_marker = None
     try:
         if candidate is not None:
             _git(root, 'update-ref', archive_ref, candidate.sha, '0' * len(base))
@@ -219,33 +282,14 @@ def _copied_returned_mirror(facts: ImportedRunFacts, destination: Path, archive:
         from .migration_run_proof import copied_resource_proof
         proof = copied_resource_proof(facts)
         assert proof is not None
-        try:
-            descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        except FileExistsError as error:
-            raise MigrationRefused('copied_repository_identity_exists') from error
-        with os.fdopen(descriptor, 'wb') as stream:
-            physical = os.fstat(stream.fileno())
-            owned_marker = physical.st_dev, physical.st_ino
-            stream.write(proof['copy_uuid'].encode('ascii') + b'\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        descriptor = os.open(resource.common_git_dir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        yield
+        with _copied_marker(resource.common_git_dir, proof['copy_uuid']):
+            yield
     except BaseException:
         try:
             if normalized and candidate is not None:
                 _git(root, 'update-ref', resource.source_ref, candidate.sha, base)
             if archived and candidate is not None:
                 _git(root, 'update-ref', '-d', archive_ref, candidate.sha)
-            if owned_marker is not None:
-                physical = marker.lstat()
-                if (physical.st_dev, physical.st_ino) != owned_marker or marker.is_symlink():
-                    raise MigrationRefused('copied_mirror_recovery_required')
-                marker.unlink()
         except (MigrationRefused, OSError) as error:
             raise MigrationRefused('copied_mirror_recovery_required') from error
         raise
@@ -312,7 +356,7 @@ def install_imported_facts(facts: ImportedRunFacts, destination: Path, *, origin
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        with _copied_returned_mirror(facts, destination, copied_checkout_archive):
+        with _copied_returned_mirror(facts, destination, copied_checkout_archive), _copied_idle_marker(facts, destination):
             linked = False
             try:
                 try:

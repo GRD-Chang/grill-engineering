@@ -284,8 +284,8 @@ def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,
     graph, policy, notification and evidence checks are shared, not weakened.
     """
     validate_snapshot(snapshot)
-    repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.resolve(),
-                                                 final_checkout.resolve())
+    repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.absolute(),
+                                                 final_checkout.absolute())
     if not source_ref.startswith("refs/heads/") or source_ref == "refs/heads/":
         raise MigrationRefused("new_source_ref")
     profiles = {"development": development_profile, "review": review_profile,
@@ -307,7 +307,7 @@ def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,
         if set(additional) != expected_additional:
             raise MigrationRefused("new_ticket_workspaces")
         workspaces = {ticket_number: (source_ref, checkout), **{
-            number: (ref, path.resolve()) for number, (ref, path) in additional.items()}}
+            number: (ref, path.absolute()) for number, (ref, path) in additional.items()}}
         if (len({ref for ref, _ in workspaces.values()}) != len(workspaces)
                 or len({path for _, path in workspaces.values()}) != len(workspaces)):
             raise MigrationRefused("new_ticket_workspaces")
@@ -324,22 +324,23 @@ def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,
         if not tree:
             raise MigrationRefused("source_git")
         common = (repository_root / ".git").resolve()
+        from .migration_run_ownership import _idle_checkout_state
+        observed = {}
         for ref, path in workspaces.values():
             if not ref.startswith("refs/heads/") or ref == "refs/heads/":
                 raise MigrationRefused("new_source_ref")
             if _git(repository_root, "for-each-ref", "--format=%(refname)", ref):
                 raise MigrationRefused("new_source_ref_exists")
-            if (not path.is_dir() or path == repository_root
-                    or _git(path, "rev-parse", "--show-toplevel") != str(path)
-                    or _git(path, "rev-parse", "HEAD") != base_sha):
+            if path == repository_root:
                 raise MigrationRefused("new_checkout")
-            if _git(path, "status", "--porcelain"):
-                raise MigrationRefused("new_checkout_dirty")
-            common_value = Path(_git(path, "rev-parse", "--git-common-dir") or "")
-            found_common = (common_value if common_value.is_absolute() else path / common_value).resolve()
-            if found_common != common:
+            try:
+                observed[path] = _idle_checkout_state(LocalGit(repository_root), path, common)
+            except KernelError as error:
+                raise MigrationRefused(error.code) from error
+            if observed[path][0] not in (None, (base_sha + '\n').encode('ascii')):
                 raise MigrationRefused("new_checkout")
-        if final_checkout == repository_root or final_checkout in {path for _, path in workspaces.values()} or final_checkout.exists():
+        if (final_checkout == repository_root or final_checkout in {path for _, path in workspaces.values()}
+                or final_checkout.exists() or final_checkout.is_symlink() or final_checkout.resolve() != final_checkout):
             raise MigrationRefused("new_final_checkout")
         profile_document = {"preset": None, "profiles": {
             role: {"model": profile.model, "reasoning_effort": profile.effort,
@@ -382,10 +383,9 @@ def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,
             resource = ImportedResource(owner=key, kind="ticket-workspace", disposition="new-unused",
                 source_ref=workspaces[number][0], expected_oid=None, checkout=workspaces[number][1],
                 workspace_oid=base_sha, owned_root=workspaces[number][1].parent, common_git_dir=common,
-                before_head=Path(_git(workspaces[number][1], "rev-parse", "--path-format=absolute",
-                                      "--git-path", "HEAD")).read_bytes(),
+                before_head=observed[workspaces[number][1]][0],
                 checkout_archive_sha256=None, checkout_index_sha256=None,
-                head_evidence=(), cleanup_pending=False)
+                head_evidence=(), cleanup_pending=False, checkout_status=observed[workspaces[number][1]][1])
             subjects.append(ImportedSubject(subject=f"ticket:{number}", issue=number, generation=1,
                 record=key, aliases=aliases, kind="unallocated", historical_base=None, budgets=(), attempts=(),
                 candidate=None, integration=None, accepted_review=None, completion=None, resources=(resource,)))

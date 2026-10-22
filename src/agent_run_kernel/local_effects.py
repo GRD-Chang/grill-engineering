@@ -231,6 +231,12 @@ class LocalEffects:
     def reconcile(self, effect: Effect) -> EffectResult:
         """Observe original physical facts without using response receipts as proof."""
         try:
+            prebuilt = None
+            if "prebuilt_workspace" in effect.payload:
+                from .migration_run_ownership import authenticate_prebuilt_workspace
+                prebuilt = authenticate_prebuilt_workspace(self.git, effect)
+                if prebuilt is None:
+                    raise KernelError("foreign_local_checkout")
             if effect.operation == "inspect_resources":
                 return self._resource_result(effect)
             if effect.operation == "cleanup_local_ref":
@@ -240,15 +246,19 @@ class LocalEffects:
             checkout, head = self._checkout(effect)
             if effect.operation in {"workspace", "validation_checkout"}:
                 expected = effect.before_sha if effect.operation == "workspace" else effect.payload["reviewed_commit"]
+                initial = (prebuilt["workspace_oid"] if prebuilt is not None
+                           and prebuilt["before_head"] is not None and prebuilt["checkout_status"] == [] else None)
                 if effect.operation == "workspace" and effect.payload["create_ref"]:
                     refs = self.git.run("for-each-ref", "--format=%(refname) %(objectname)", effect.source_ref).stdout.splitlines()
                     if refs and refs != [f"{effect.source_ref} {expected}"]:
                         return EffectResult("third")
                     if not refs:
-                        return EffectResult("prior" if head in {None, expected} else "third")
+                        return EffectResult("prior" if head in {None, initial, expected} else "third")
                 if head is None:
                     return EffectResult("prior")
-                return EffectResult("target", self.git.commit(head)) if head == expected else EffectResult("third")
+                if head == expected:
+                    return EffectResult("target", self.git.commit(head))
+                return EffectResult("prior" if initial is not None and head == initial else "third")
             if head is None:
                 return EffectResult("unknown")
             if effect.operation == "candidate":
@@ -310,6 +320,8 @@ class LocalEffects:
                     writer.run("update-ref", effect.source_ref, expected, "0" * len(expected))
             if head is None:
                 writer.run("worktree", "add", "--detach", str(checkout), expected)
+            elif effect.operation == "workspace" and "prebuilt_workspace" in effect.payload and head != expected:
+                writer.run("switch", "--detach", "--no-overwrite-ignore", "--no-recurse-submodules", expected, cwd=checkout)
         elif effect.operation == "candidate":
             writer.candidate(checkout, effect.before_sha, effect.effect_id, tuple(effect.payload["parents"]))
         elif effect.operation == "integrate":

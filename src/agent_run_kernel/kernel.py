@@ -3921,18 +3921,23 @@ class Kernel:
         subject, phase = job["id"], job["phase"]
         target = self._require_target(world)
         if phase == "workspace":
+            payload: dict[str, Any] = {"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN}
             if (job["kind"] == DeliveryKind.TICKET and world.source is None and world.pr is None
                     and all(job[key] is None for key in ("current_attempt", "development_thread", "candidate_sha", "integrated_sha", "publication_sha", "pr_number"))
                     and job["base_sha"] == job["source_sha"] == job["workspace_sha"]
                     and not tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (subject, job["generation"]))
                     and not tx.rows("SELECT id FROM effects WHERE subject=? AND generation=? AND operation='workspace' LIMIT 1", (subject, job["generation"]))):
+                if job["generation"] == 1:
+                    from .migration_run_ownership import prebuilt_workspace_binding
+                    binding = prebuilt_workspace_binding(self.storage, tx, run, job)
+                    if binding is not None:
+                        payload["prebuilt_workspace"] = binding
                 # Job allocation fixes the dependency-visible Run head once.
                 # A durable workspace intent, including a failed one, keeps it.
                 tx.execute("UPDATE subjects SET base_sha=?,base_tree=?,source_sha=?,workspace_sha=? WHERE id=?",
                            (target.sha, target.tree, target.sha, target.sha, subject))
                 job = self._job(tx, subject)
-            return self._prepare_effect(tx, run, job, execution, world, "workspace", before=job["source_sha"],
-                                        payload={"checkout": job["checkout"], "create_ref": job["kind"] != DeliveryKind.FINAL_RUN})
+            return self._prepare_effect(tx, run, job, execution, world, "workspace", before=job["source_sha"], payload=payload)
         integrated_phases = {"ready_publication", "publication_commit", "push", "pr", "checks", "approval", "merge"}
         changed_source = world.source is not None and world.source.sha != job["source_sha"]
         if phase in integrated_phases | {"integration"} and not self._observe_integration_snapshot(tx, job, world):

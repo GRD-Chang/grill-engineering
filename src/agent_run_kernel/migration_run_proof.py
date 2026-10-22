@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from contextlib import closing
 import hashlib
 import json
+from pathlib import Path
 import sqlite3
 from typing import Any, Mapping
 
@@ -74,8 +75,40 @@ def completed_oracle(facts: ImportedRunFacts) -> bool:
 
 
 def copied_resource_proof(facts: ImportedRunFacts) -> dict[str, Any] | None:
-    """The exact private resource adopted by the checked copied-return transport."""
-    if facts.source.mode != 'copied' or len(facts.subjects) != 1 or facts.subjects[0].kind != 'returned':
+    """Private copied idle/returned ownership, distinct from original authority."""
+    if facts.source.mode != 'copied':
+        return None
+    if facts.subjects and all(subject.kind == 'unallocated' for subject in facts.subjects):
+        root = Path(facts.spec.repository_root or '')
+        # Old offline conversions can share the source Git. They retain their
+        # ordinary workspace contract; they grant no private-copy adoption.
+        if facts.source.snapshot.source.is_relative_to(root) or facts.source.snapshot.path.is_relative_to(root):
+            return None
+        if facts.source.scope not in ('single-ticket', 'selected-graph') or not root.is_absolute():
+            raise MigrationRefused('copied_idle_scope')
+        entries: list[dict[str, Any]] = []
+        for subject in sorted(facts.subjects, key=lambda item: item.subject):
+            if subject.generation != 1 or len(subject.resources) != 1:
+                raise MigrationRefused('copied_idle_scope')
+            resource = subject.resources[0]
+            if (resource.owner != subject.record or subject.record.table != 'run_graph_members'
+                    or resource.disposition != 'new-unused' or resource.expected_oid is not None
+                    or resource.checkout is None or resource.owned_root is None or resource.workspace_oid is None
+                    or resource.common_git_dir != root / '.git'
+                    or (resource.before_head, resource.checkout_status) not in
+                        ((None, None), ((resource.workspace_oid + '\n').encode('ascii'), ()))):
+                raise MigrationRefused('copied_idle_scope')
+            entries.append(dict(subject=subject.subject, generation=1,
+                source_record={'table': resource.owner.table, 'key': list(resource.owner.key)},
+                disposition=resource.disposition, source_ref=resource.source_ref, expected_oid=None,
+                checkout=str(resource.checkout), owned_root=str(resource.owned_root),
+                workspace_oid=resource.workspace_oid,
+                before_head=None if resource.before_head is None else resource.before_head.decode('ascii'),
+                checkout_status=None if resource.checkout_status is None else list(resource.checkout_status)))
+        body: dict[str, Any] = dict(format='copied-idle-resources/1', source_sha256=facts.source.snapshot.sha256,
+            run_id=facts.spec.run_id, repository_root=str(root), common_git_dir=str(root / '.git'), resources=entries)
+        return {**body, 'copy_uuid': hashlib.sha256(wire_json(body)).hexdigest()[:32]}
+    if len(facts.subjects) != 1 or facts.subjects[0].kind != 'returned':
         return None
     subject = facts.subjects[0]
     if (facts.source.scope != 'single-ticket' or subject.generation != 1 or len(subject.resources) != 1

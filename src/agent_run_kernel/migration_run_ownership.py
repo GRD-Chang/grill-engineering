@@ -24,8 +24,192 @@ from .effects import LocalGit
 from .legacy_admission import read_source_fence
 from .migration import source_identity
 from .migration_records import V6RecordReader
-from .model import Blocker, Issue, ParentIssue, Requirements, wire_json
+from .model import Blocker, Effect, Issue, KernelError, ParentIssue, Requirements, wire_json
 from .storage import Storage, Transaction
+
+
+def _idle_checkout_state(git: LocalGit, checkout: Path, common: Path
+        ) -> tuple[bytes | None, tuple[str, ...] | None]:
+    """Read a detached registration, or prove both path and registration absent."""
+    try:
+        try:
+            mode = checkout.lstat().st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISDIR(mode) or checkout.resolve() != checkout:
+            raise KernelError('foreign_local_checkout')
+        registered = []
+        for entry in git.run('worktree', 'list', '--porcelain', '-z').stdout.split('\0\0'):
+            fields = entry.strip('\0').split('\0')
+            if fields[0] == 'worktree ' + str(checkout):
+                registered.append(fields)
+        if mode is None and not registered:
+            return None, None
+        if (mode is None or len(registered) != 1 or 'detached' not in registered[0]
+                or any(field.startswith(('prunable', 'locked', 'branch ')) for field in registered[0])):
+            raise KernelError('foreign_local_checkout')
+        if (git.run('rev-parse', '--show-toplevel', cwd=checkout).stdout.strip() != str(checkout)
+                or Path(git.run('rev-parse', '--path-format=absolute', '--git-common-dir', cwd=checkout).stdout.strip()).resolve() != common):
+            raise KernelError('foreign_local_checkout')
+        symbolic = git.run('symbolic-ref', '-q', 'HEAD', cwd=checkout, check=False)
+        if symbolic.returncode == 0:
+            raise KernelError('foreign_local_checkout')
+        if symbolic.returncode != 1:
+            raise KernelError('local_read_failed')
+        head = git.run('rev-parse', '--verify', 'HEAD^{commit}', cwd=checkout).stdout.strip()
+        raw = Path(git.run('rev-parse', '--path-format=absolute', '--git-path', 'HEAD', cwd=checkout).stdout.strip()).read_bytes()
+        status = tuple(git.run('status', '--porcelain', cwd=checkout).stdout.splitlines())
+        if raw != (head + '\n').encode('ascii') or 'HEAD ' + head not in registered[0] or status:
+            raise KernelError('foreign_local_checkout')
+        return raw, status
+    except (OSError, UnicodeError) as error:
+        raise KernelError('local_read_failed') from error
+    except KernelError as error:
+        if error.code == 'git_operation_failed':
+            raise KernelError('local_read_failed') from error
+        raise
+
+
+_IDLE_ENTRY_KEYS = {'subject', 'generation', 'source_record', 'disposition', 'source_ref',
+    'expected_oid', 'checkout', 'owned_root', 'workspace_oid', 'before_head', 'checkout_status'}
+_IDLE_HEADER_KEYS = {'format', 'source_sha256', 'run_id', 'repository_root', 'common_git_dir',
+    'copy_uuid', 'resources'}
+
+
+def prebuilt_workspace_binding(storage: Storage, tx: Transaction, run: sqlite3.Row,
+        job: sqlite3.Row) -> dict[str, Any] | None:
+    """Authenticate immutable copied idle membership without Git or live source IO."""
+    if job['kind'] != 'ticket' or job['generation'] != 1:
+        return None
+    rows = tx.rows("SELECT id,subject FROM material WHERE purpose='v6_import_identity'", limit=2)
+    if not rows:
+        return None
+    try:
+        if len(rows) != 1:
+            raise ValueError('identity')
+        imported = json.loads(tx.get(rows[0]['id'], rows[0]['subject']))
+        if not isinstance(imported, dict):
+            raise ValueError('identity')
+        proof = imported.get('local_resources')
+        if proof is None or isinstance(proof, dict) and proof.get('format') == 'copied-returned-resource/1':
+            return None
+        if (not isinstance(proof, dict) or set(proof) != _IDLE_HEADER_KEYS
+                or proof['format'] != 'copied-idle-resources/1' or imported['source_mode'] != 'copied'
+                or imported['scope'] not in ('single-ticket', 'selected-graph')
+                or proof['run_id'] != run['id'] or proof['source_sha256'] != imported['source_sha256']
+                or proof['repository_root'] != run['repository_root']
+                or proof['common_git_dir'] != str(Path(run['repository_root']) / '.git')
+                or not isinstance(proof['resources'], list) or not proof['resources']):
+            raise ValueError('identity')
+        expected = hashlib.sha256(wire_json({k: v for k, v in proof.items() if k != 'copy_uuid'})).hexdigest()[:32]
+        if proof['copy_uuid'] != expected:
+            raise ValueError('commitment')
+        records = V6RecordReader(storage)
+        root = records.row('run_root', (run['id'],))
+        graph = records.row('run_graph_snapshots', (run['id'], root['value_graph_snapshot_id']))
+        base = records.row('run_condition_base', (run['id'],))['value_sha']
+        if records.source['sha256'] != proof['source_sha256'] or records.source['run_id'] != run['id']:
+            raise ValueError('source')
+        members: list[list[Any]] = []
+        after = 0
+        while True:
+            page = records.read('run_graph_members', after=after)
+            members.extend(item['key'] for item in page['records'] if item['key'][1] == graph['version_id'])
+            if page['next'] is None:
+                break
+            after = page['next']
+        entries = proof['resources']
+        if (any(not isinstance(item, dict) or set(item) != _IDLE_ENTRY_KEYS for item in entries)
+                or [item['subject'] for item in entries] != sorted({item['subject'] for item in entries})
+                or {tuple(item['source_record']['key']) for item in entries} != {tuple(key) for key in members}):
+            raise ValueError('members')
+        for item in entries:
+            key = item['source_record']['key']
+            if (item['source_record'] != {'table': 'run_graph_members', 'key': key}
+                    or len(key) != 3 or key[:2] != [run['id'], graph['version_id']]
+                    or type(key[2]) is not int or item['subject'] != f'ticket:{key[2]}'
+                    or type(item['generation']) is not int or item['generation'] != 1
+                    or item['disposition'] != 'new-unused' or item['expected_oid'] is not None
+                    or item['workspace_oid'] != base
+                    or (item['before_head'], item['checkout_status']) not in ((None, None), (base + '\n', []))
+                    or Path(item['checkout']).parent != Path(item['owned_root'])
+                    or not Path(item['owned_root']).is_relative_to(storage.path.parent)
+                    or not Path(proof['repository_root']).is_relative_to(storage.path.parent)):
+                raise ValueError('resource')
+            records.row('run_graph_members', key)
+        selected = [item for item in entries if item['subject'] == job['id']]
+        if not selected:
+            return None  # Later native members are outside the imported graph.
+        item = selected[0]
+        if (item['source_record']['key'][2] != job['issue']
+                or any(item[k] != job[k] for k in ('source_ref', 'checkout', 'owned_root'))
+                or proof['common_git_dir'] != job['common_git_dir']):
+            raise ValueError('native_resource')
+        return {**{k: v for k, v in proof.items() if k != 'resources'}, **item,
+            'format': 'copied-idle-workspace/1'}
+    except (ValueError, KeyError, TypeError, IndexError, KernelError) as error:
+        raise KernelError('prebuilt_workspace_unproven') from error
+
+
+def authenticate_prebuilt_workspace(git: LocalGit, effect: Effect) -> dict[str, Any] | None:
+    """Check current private physical identity; H1 and dispatch belong to the caller."""
+    if 'prebuilt_workspace' not in effect.payload:
+        return None
+    try:
+        value = effect.payload['prebuilt_workspace']
+        keys = (_IDLE_HEADER_KEYS - {'resources'}) | _IDLE_ENTRY_KEYS
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ValueError('shape')
+        proof = dict(value)
+        key = proof['source_record']
+        if (effect.operation != 'workspace' or effect.payload.get('create_ref') is not True
+                or proof['format'] != 'copied-idle-workspace/1' or type(proof['generation']) is not int
+                or proof['generation'] != 1 or proof['run_id'] != effect.execution.run_id
+                or proof['subject'] != effect.subject or proof['disposition'] != 'new-unused'
+                or proof['expected_oid'] is not None or proof['source_ref'] != effect.source_ref
+                or not effect.source_ref.startswith('refs/heads/')
+                or proof['repository_root'] != str(git.root)
+                or proof['common_git_dir'] != str(git.root / '.git')
+                or any(proof[k] != effect.payload.get(k) for k in ('checkout', 'owned_root', 'common_git_dir'))
+                or not isinstance(key, dict) or set(key) != {'table', 'key'} or key['table'] != 'run_graph_members'
+                or not isinstance(key['key'], list) or len(key['key']) != 3
+                or key['key'][0] != proof['run_id'] or type(key['key'][2]) is not int
+                or effect.subject != f"ticket:{key['key'][2]}"
+                or not isinstance(proof['workspace_oid'], str) or re.fullmatch('[0-9a-f]{40,64}', proof['workspace_oid']) is None
+                or not isinstance(proof['copy_uuid'], str) or re.fullmatch('[0-9a-f]{32}', proof['copy_uuid']) is None
+                or not isinstance(proof['source_sha256'], str) or re.fullmatch('[0-9a-f]{64}', proof['source_sha256']) is None
+                or (proof['before_head'], proof['checkout_status']) not in ((None, None), (proof['workspace_oid'] + '\n', []))):
+            raise ValueError('identity')
+        checkout, common = Path(proof['checkout']), Path(proof['common_git_dir'])
+        if (checkout.parent != Path(proof['owned_root']) or checkout == git.root
+                or common.is_symlink() or common.resolve() != common
+                or git.root.resolve() != git.root
+                or Path(git.run('rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()).resolve() != common):
+            raise ValueError('paths')
+        descriptor = os.open(common / 'agent-run-checkout-id', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as marker:
+            physical = os.fstat(marker.fileno())
+            if (not stat.S_ISREG(physical.st_mode) or physical.st_nlink != 1 or physical.st_size != 33
+                    or marker.read(34) != proof['copy_uuid'].encode('ascii') + b'\n'):
+                raise ValueError('marker')
+        head, _ = _idle_checkout_state(git, checkout, common)
+        allowed = {effect.before_sha + '\n'}
+        if proof['before_head'] is not None:
+            allowed.add(proof['before_head'])
+        if head is not None and head.decode('ascii') not in allowed or head is None and proof['before_head'] is not None:
+            raise ValueError('head')
+        refs = git.run('for-each-ref', '--format=%(refname) %(objectname)', effect.source_ref).stdout.splitlines()
+        if refs and refs != [effect.source_ref + ' ' + effect.before_sha]:
+            raise ValueError('ref')
+        return proof
+    except (OSError, UnicodeError) as error:
+        raise KernelError('local_read_failed') from error
+    except (ValueError, KeyError, TypeError, IndexError) as error:
+        raise KernelError('foreign_local_checkout') from error
+    except KernelError as error:
+        if error.code == 'git_operation_failed':
+            raise KernelError('local_read_failed') from error
+        raise
 
 
 def authenticate_copied_cleanup(storage: Storage, tx: Transaction, run: sqlite3.Row,
