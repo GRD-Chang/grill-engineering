@@ -87,7 +87,7 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
         aliases = [{'table': 'work_job_slots', 'key': [run_id, row[0], row[1]]}
             for row in selected if row[2] == job_id]
         jobs = [] if job_id is None else db.execute('SELECT stage,value_ticket_number,value_base_sha,value_ticket_branch,'
-            'value_candidate_sha,budget_owner_id FROM work_jobs WHERE run_id=? AND job_id=?', (run_id, job_id)).fetchall()
+            'value_candidate_sha,budget_owner_id,value_publication_sha FROM work_jobs WHERE run_id=? AND job_id=?', (run_id, job_id)).fetchall()
         if job_id is not None and (len(jobs) != 1 or jobs[0][1] != number):
             raise _refuse()
         if job_id == f'ticket:{number}:selection':
@@ -109,17 +109,20 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
             raise _refuse()
         current_jobs.add(job_id)
         job = jobs[0]
+        completed_single = scope == 'single-ticket' and proof['kind'] == 'completed'
         record = {'table': 'work_jobs', 'key': [run_id, job_id]}
         attempts = db.execute('SELECT pending_attempt_id FROM work_job_attempt_roots WHERE run_id=? AND job_id=?', (run_id, job_id)).fetchall()
         if (len(attempts) != 1 or proof['source_record'] != record or proof['budget_owner'] != record
                 or job[5] != job_id or proof['historical_base'] != job[2]
                 or proof['current_attempt'] != attempts[0][0]
-                or (job[0] == 'completed') != (proof['kind'] == 'completed')
+                or (job[0] == 'completed' or completed_single and job[0] == 'merged') != (proof['kind'] == 'completed')
                 or proof['kind'] == 'returned' and job[0] not in {'developing', 'reviewing', 'accepted'}
                 or db.execute('SELECT 1 FROM work_job_gates WHERE run_id=? AND job_id=? LIMIT 1', (run_id, job_id)).fetchone()):
             raise _refuse()
-        if proof['kind'] == 'completed' and proof['resources']:
+        if proof['kind'] == 'completed' and not (completed_single and job[0] == 'merged') and proof['resources']:
             raise _refuse()  # First whole-Run unit proves completed resources absent.
+        if completed_single and job[0] == 'merged' and len(proof['resources']) != 1:
+            raise _refuse()
         if proof['kind'] == 'returned' and len(proof['resources']) != 1:
             raise _refuse()
         for resource in proof['resources']:
@@ -127,17 +130,20 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
                 raise _refuse()
             layout = resource['layout']
             archive = layout.get('checkout_archive_sha256') if isinstance(layout, dict) else None
+            clean = completed_single and job[0] == 'merged'
             checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{number}'
             ref = 'refs/heads/' + job[3]
             expected = {'version': 1, 'nonce': receipt['nonce'], 'source_sha256': receipt['source_sha256'],
                 'source_uuid': receipt['source_uuid'], 'repository_root': str(managed.repository_root),
                 'checkout': str(checkout), 'owned_root': str(checkout.parent), 'common_git_dir': str(managed.repository_root / '.git'),
-                'source_ref': ref, 'expected_oid': job[4] or job[2], 'before_head': 'ref: ' + ref + '\n',
+                'source_ref': ref, 'expected_oid': job[6] if clean else job[4] or job[2], 'before_head': 'ref: ' + ref + '\n',
                 'checkout_archive_sha256': archive}
-            if (layout != expected or resource['source_record'] != record or ref in seen_refs or str(checkout) in seen_checkouts
-                    or not isinstance(archive, str) or re.fullmatch('[0-9a-f]{64}', archive) is None
-                    or not isinstance(resource['checkout_index_sha256'], str)
-                    or re.fullmatch('[0-9a-f]{64}', resource['checkout_index_sha256']) is None):
+            digests_valid = (archive is None and resource['checkout_index_sha256'] is None) if clean else (
+                isinstance(archive, str) and re.fullmatch('[0-9a-f]{64}', archive) is not None
+                and isinstance(resource['checkout_index_sha256'], str)
+                and re.fullmatch('[0-9a-f]{64}', resource['checkout_index_sha256']) is not None)
+            if (layout != expected or resource['source_record'] != record or ref in seen_refs
+                    or str(checkout) in seen_checkouts or not digests_valid):
                 raise _refuse()
             seen_refs.add(ref)
             seen_checkouts.add(str(checkout))
@@ -148,6 +154,8 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
 
     try:
         records = V6RecordReader(Storage(Path(receipt['target_db'])))
+        if records.document('profile')['sha256'] != body['profile_sha256']:
+            raise _refuse()
         authenticate_run_ownership(tx, body, receipt, managed.repository_root, records, source=db)
     except (KernelError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as error:
         raise _refuse() from error

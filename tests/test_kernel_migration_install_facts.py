@@ -409,10 +409,7 @@ def test_canonical_original_executor_transfers_reenters_and_restores_real_return
         assert resumed['candidate_tree'] == candidate.tree
 
 
-@pytest.mark.parametrize('profile_backend', [False, True])
-def test_canonical_completed_install_keeps_cleanup_and_optional_history(
-    tmp_path, git_repo, monkeypatch, profile_backend,
-):
+def _completed_import_source(tmp_path, git_repo, monkeypatch, profile_backend):
     import shutil
     managed = ManagedWorkspace.for_repository('example/project')
     managed.root.mkdir(parents=True)
@@ -433,6 +430,15 @@ def test_canonical_completed_install_keeps_cleanup_and_optional_history(
     _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
     facts = read_original_completed_import(snapshot, profile_snapshot=evidence / 'profile.json',
         external_snapshot=evidence / 'external-readproof.json')
+    return managed, paths, snapshot, facts, before, evidence
+
+
+@pytest.mark.parametrize('profile_backend', [False, True])
+def test_canonical_completed_install_keeps_cleanup_and_optional_history(
+    tmp_path, git_repo, monkeypatch, profile_backend,
+):
+    managed, paths, snapshot, facts, before, evidence = _completed_import_source(
+        tmp_path, git_repo, monkeypatch, profile_backend)
     native = install_imported_facts(facts, tmp_path / 'canonical-completed.sqlite3')
     verify_imported_installation(native, facts)
     assert native.status('ticket:2')['phase'] == 'complete'
@@ -486,3 +492,63 @@ def test_canonical_whole_install_preserves_real_owner_and_resource_union(
         assert body['run_ref_ownership']['expected_oid'] == facts.subjects[0].completion.integrated.sha
     _assert_original_records(snapshot, V6RecordReader(native))
     assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
+
+
+@pytest.mark.parametrize('profile_backend', [False, True])
+@pytest.mark.parametrize('mode', ['inverse', 'native'])
+def test_completed_clean_transfer_consumes_only_certified_publication_resource(
+    tmp_path, git_repo, monkeypatch, profile_backend, mode,
+):
+    from agent_run_kernel.local_effects import LocalEffects
+    from agent_run_kernel.migration_cutover import migrate_completed_original_v6, rollback_original_v6
+    managed, paths, snapshot, facts, before, evidence = _completed_import_source(
+        tmp_path, git_repo, monkeypatch, profile_backend)
+    nonce = 'ce' * 16
+    options = dict(repository='example/project', parent_number=1, nonce=nonce,
+        external_snapshot=evidence / 'external-readproof.json')
+    native = migrate_completed_original_v6(snapshot, profile_snapshot=evidence / 'profile.json', **options)
+    assert isinstance(native, Kernel)
+    again = migrate_completed_original_v6(snapshot, profile_snapshot=evidence / 'profile.json', **options)
+    assert isinstance(again, Kernel) and again.storage.path == native.storage.path
+    resource = facts.subjects[0].resources[0]
+    assert resource.checkout is not None
+    git = LocalGit(managed.repository_root)
+    assert git.run('symbolic-ref', 'HEAD', cwd=resource.checkout).stdout.strip() == resource.source_ref
+    assert _git_bytes(managed.repository_root) == before[1]
+    if mode == 'inverse':
+        result = rollback_original_v6(snapshot, **options)
+        assert isinstance(result, dict) and result['status'] == 'rolled_back'
+        assert rollback_original_v6(snapshot, **options) == result
+        assert facts.source.task is not None and read_task(task_path(facts.source.task)) is None
+        assert git.run('symbolic-ref', 'HEAD', cwd=resource.checkout).stdout.strip() == resource.source_ref
+        with closing(sqlite3.connect(snapshot.source)) as db:
+            from agent_run_kernel.migration_cutover import _same_original_rows, _OLD_PROTOCOL
+            _same_original_rows(db, snapshot.path, _OLD_PROTOCOL)
+        with pytest.raises(KernelError, match='legacy_requires_offline_migration'):
+            native.claim_executor('stale-after-completed-inverse')
+        return
+    execution = native.claim_executor('completed-clean-native')
+    state, delivery = native.status('ticket:2'), native.delivery('ticket:2')
+    world = World(state['parent_revision'], state['graph_revision'], state['revision'],
+        git.commit(delivery.target_ref), git.commit(resource.source_ref),
+        completion_revision=state['completion_revision'])
+    port = LocalEffects(git, owned_root=resource.checkout.parent)
+    for operation in ('cleanup_worktree', 'cleanup_local_ref'):
+        for _ in range(4):
+            step = native.advance_cleanup('ticket:2', execution, world)
+            if step.kind != 'progress':
+                break
+        assert step.kind == 'effect' and step.effect is not None, step
+        effect = step.effect
+        assert effect.operation == operation and effect.payload['expected_head'] == facts.subjects[0].completion.publication.sha
+        assert effect.payload['source_uuid'] == facts.source.checkout_uuid
+        assert native.dispatch(effect, execution, world)
+        result = port.execute(effect, lambda: native.guard_effect(effect, execution, world))
+        assert result.disposition == 'target', result
+        native.reconcile(effect, result, execution, world)
+    assert not resource.checkout.exists()
+    assert git.run('show-ref', '--verify', '--quiet', resource.source_ref, check=False).returncode == 1
+    assert native.status('ticket:2')['budgets'] == state['budgets']
+    with native.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        assert tx.one("SELECT count(*) FROM effects WHERE operation='close'")[0] == 1

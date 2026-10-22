@@ -644,14 +644,15 @@ def migrate_completed_original_v6(
     if snapshot.source != source or snapshot.path.is_symlink() or snapshot.path.samefile(source):
         raise MigrationRefused('source_original_identity')
     run_id, returned = _original_header(snapshot, task)
-    if returned:
+    if returned or external_snapshot is not None:
         if external_snapshot is None:
             raise MigrationRefused('source_external_readback_required')
         from .migration_active import read_original_returned_import
+        from .migration_completed import read_original_completed_import
         from .migration_run_cutover import _execute_original_import
-        canonical = read_original_returned_import(snapshot,
-            profile_snapshot=profile_snapshot,
-            external_snapshot=external_snapshot, checkout_archive=external_snapshot.parent / 'checkout.tar')
+        canonical = (read_original_returned_import(snapshot, profile_snapshot=profile_snapshot,
+            external_snapshot=external_snapshot, checkout_archive=external_snapshot.parent / 'checkout.tar') if returned else
+            read_original_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=external_snapshot))
         return cast(Kernel, _execute_original_import(canonical, nonce=nonce,
             evidence=external_snapshot.parent, inverse=False))
     with runner_management_lease(default_runner_lock_path()), legacy_task_lock(task, managed.state_root), locked_task(task) as location:
@@ -746,16 +747,20 @@ def rollback_original_v6(snapshot: SourceSnapshot, *, repository: str,
     if snapshot.source != source or snapshot.path.is_symlink() or snapshot.path.samefile(source):
         raise MigrationRefused('source_original_identity')
     run_id, returned = _original_header(snapshot, task)
-    if returned:
+    if returned or external_snapshot is not None:
         if external_snapshot is None:
             raise MigrationRefused('source_external_readback_required')
         from .migration_active import read_original_returned_import
+        from .migration_completed import read_original_completed_import
         from .migration_run_cutover import _execute_original_import
-        canonical = read_original_returned_import(snapshot,
-            profile_snapshot=managed.state_root / 'profiles' / (run_id + '.json'),
-            external_snapshot=external_snapshot, checkout_archive=external_snapshot.parent / 'checkout.tar')
-        return cast(dict[str, str], _execute_original_import(canonical, nonce=nonce,
+        profile_snapshot = managed.state_root / 'profiles' / (run_id + '.json')
+        canonical = (read_original_returned_import(snapshot, profile_snapshot=profile_snapshot,
+            external_snapshot=external_snapshot, checkout_archive=external_snapshot.parent / 'checkout.tar') if returned else
+            read_original_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=external_snapshot))
+        result = cast(dict[str, str], _execute_original_import(canonical, nonce=nonce,
             evidence=external_snapshot.parent, inverse=True))
+        result.pop('next_action', None)  # Preserve the existing Single CLI result.
+        return result
     with runner_management_lease(default_runner_lock_path()), legacy_task_lock(task, managed.state_root), locked_task(task) as location:
         managed.open_path()
         sentinel = managed.state_root / 'task-control' / (task.fingerprint + '.json')

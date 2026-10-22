@@ -52,8 +52,8 @@ def run_import_document(*, origin: Mapping[str, Any], profile_sha256: str,
 def imported_resource_layout(resource: ImportedResource, origin: Mapping[str, str]) -> dict[str, Any]:
     if (resource.kind != 'ticket-workspace' or resource.disposition != 'existing'
             or resource.checkout is None or resource.owned_root is None or resource.expected_oid is None
-            or resource.before_head is None or resource.checkout_archive_sha256 is None
-            or resource.checkout_index_sha256 is None):
+            or resource.before_head is None
+            or (resource.checkout_archive_sha256 is None) != (resource.checkout_index_sha256 is None)):
         raise MigrationRefused('source_import_resource')
     return {'version': 1, 'nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
         'source_uuid': origin['source_uuid'], 'repository_root': str(resource.common_git_dir.parent),

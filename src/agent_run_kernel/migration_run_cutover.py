@@ -127,7 +127,7 @@ def _execute_original_import(facts: ImportedRunFacts, *, nonce: str, evidence: P
                             (anchor, 'v6_original_rollback_started', nonce, material, native.clock()))
                 for subject in sorted(current.subjects, key=lambda value: value.subject):
                     for resource in subject.resources:
-                        if resource.disposition == 'existing':
+                        if resource.disposition == 'existing' and not resource.cleanup_pending:
                             layout = imported_resource_layout(resource, origin)
                             (layouts.restore_layout if inverse else layouts.detach_layout)(layout)
                 authenticate_imported_resources(current, origin, evidence, detached=not inverse)

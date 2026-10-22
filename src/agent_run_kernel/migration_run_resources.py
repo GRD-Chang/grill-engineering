@@ -91,17 +91,27 @@ def authenticate_imported_resources(facts: ImportedRunFacts, origin: Mapping[str
                 raise MigrationRefused('source_existing_ref')
             layout = imported_resource_layout(resource, origin)
             verify_layout(layout, state='either' if detached else 'attached')
-            folder = evidence / ('ticket-' + str(subject.issue)) if facts.source.scope == 'whole-run' else evidence
-            _verify_checkout_archive(folder / 'checkout.tar', checkout, resource.checkout_archive_sha256 or '')
-            index = Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
-            saved = folder / 'checkout-index'
-            if (index.is_symlink() or index.resolve() != index or not index.is_relative_to(common / 'worktrees')
-                    or not index.is_file() or index.stat().st_nlink != 1 or index.stat().st_size > 32 * 1024 * 1024
-                    or saved.is_symlink() or not saved.is_file() or saved.stat().st_nlink != 1
-                    or saved.stat().st_size > 32 * 1024 * 1024
-                    or hashlib.sha256(saved.read_bytes()).hexdigest() != resource.checkout_index_sha256
-                    or saved.read_bytes() != index.read_bytes() or _git(checkout, 'diff', '--cached', '--name-only')):
-                raise MigrationRefused('source_checkout_index')
+            if subject.completion is not None and resource.cleanup_pending:
+                # The completed-clean source owns publication, not a dirty
+                # returned workspace. No absent archive is invented or ignored.
+                if (subject.kind != 'completed' or facts.source.scope != 'single-ticket'
+                        or resource.expected_oid != subject.completion.publication.sha
+                        or resource.workspace_oid != subject.completion.publication.sha
+                        or resource.checkout_archive_sha256 is not None or resource.checkout_index_sha256 is not None
+                        or subject.completion.close_readproof is None or _git(checkout, 'status', '--porcelain')):
+                    raise MigrationRefused('source_completed_resource')
+            else:
+                folder = evidence / ('ticket-' + str(subject.issue)) if facts.source.scope == 'whole-run' else evidence
+                _verify_checkout_archive(folder / 'checkout.tar', checkout, resource.checkout_archive_sha256 or '')
+                index = Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'index'))
+                saved = folder / 'checkout-index'
+                if (index.is_symlink() or index.resolve() != index or not index.is_relative_to(common / 'worktrees')
+                        or not index.is_file() or index.stat().st_nlink != 1 or index.stat().st_size > 32 * 1024 * 1024
+                        or saved.is_symlink() or not saved.is_file() or saved.stat().st_nlink != 1
+                        or saved.stat().st_size > 32 * 1024 * 1024
+                        or hashlib.sha256(saved.read_bytes()).hexdigest() != resource.checkout_index_sha256
+                        or saved.read_bytes() != index.read_bytes() or _git(checkout, 'diff', '--cached', '--name-only')):
+                    raise MigrationRefused('source_checkout_index')
             expected_paths.add(str(checkout))
         else:
             raise MigrationRefused('source_existing_resources')
