@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, Issue, ParentIssue, Requirements
@@ -11,6 +13,7 @@ from agent_run_kernel.query import read
 from agent_run_kernel.query_cli import main
 from agent_run_kernel.operation_runner import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
+from test_kernel_configuration import _actual_publication_push
 
 
 def _kernel(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
@@ -106,24 +109,52 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     assert _durable(tmp_path) == before
 
 
-def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback(tmp_path: Path) -> None:
+def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, effect = _actual_publication_push(tmp_path, monkeypatch, 7)
+    before = _durable(tmp_path)
+    data = read(scenario.kernel.storage.path, 'history').data
+    failures = data['publication_operation_retries']
+    assert len(failures) == 1 and failures[0]['operation'] == 'push'
+    assert failures[0]['effect'] == effect.effect_id and failures[0]['dispatch_serial'] == 1
+    assert failures[0]['evidence']['returncode'] == 7
+    assert "actual transport command exited nonzero" in failures[0]['evidence']['message']
+    assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
+    assert next(row for row in data['effect_operations'] if row['id'] == effect.effect_id)['status'] == 'observed'
+    assert _durable(tmp_path) == before
+
+
+def test_publication_unknown_response_diagnostic_remains_public_after_successful_exact_readback(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add('pr_write')
     unresolved = scenario.run()
-    assert unresolved.kind == "waiting" and unresolved.reason == "original_write_readback_required"
+    assert unresolved.kind == "waiting" and unresolved.reason == "github_convergence"
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
     assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
+    diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
+    assert read(scenario.kernel.storage.path, 'history').data['supervision']['latest_observation'] == diagnostic
+    assert unresolved.retry_at is not None
+    now[0] = unresolved.retry_at
     assert scenario.run().kind == 'approval'
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'history').data
     failures = data['publication_operation_retries']
-    assert len(failures) == 1 and failures[0]['operation'] == 'pr_write'
-    assert failures[0]['evidence']['type'] == 'LostResponse' and failures[0]['dispatch_serial'] == 1
+    assert failures == []  # Unknown response is not a proved nonzero command exit.
     assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
     assert scenario.port.pull_request(scenario.delivery.key) is not None
+    operation = next(row for row in data['effect_operations'] if row['id'] == pending['id'])
+    assert operation['attempts'] == 1 and operation['status'] == 'confirmed'
+    assert sum(row['operation'] == 'pr_write' for row in scenario.port.writes()) == 1
     ci = next(row for row in data['budget_windows'] if row['purpose'] == 'ci' and row['current'])
     assert ci['review_limit'] is None and data['ci_recovery']['review_required'] is True
     assert _durable(tmp_path) == before
+    # Immutable storage alone is insufficient: the public audit must still make
+    # the original uncertainty diagnosable after the exact intent is consumed.
+    audit = json.dumps(data, ensure_ascii=False)
+    assert diagnostic['code'] in audit and diagnostic['message'] in audit
 
 
 def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_renewal(tmp_path: Path) -> None:

@@ -2,13 +2,20 @@
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import shutil
+import sys
+
+import pytest
 
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Effect, EffectResult, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.offline import Scenario
+from agent_run_kernel.offline import LostResponse, Scenario
+from agent_run_kernel.query import read
+from agent_run_kernel.remote_effects import RemoteEffects
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 
 
@@ -133,20 +140,135 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
     scenario.kernel.guard_agent(call)
 
 
-def test_publication_failure_observation_survives_successful_exact_readback(tmp_path: Path) -> None:
+def _actual_publication_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                             command_exit: int) -> tuple[Scenario, Effect]:
+    """Use a real Git transport command; its outer exit is not a forged result.
+
+    Adapted from the independent dbfddc8d operation review. All network commands
+    are confined to a local bare repository; gh may only return the fixture actor.
+    """
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    bare = tmp_path / "audit-origin.git"
+    scenario.port.git.run("init", "--bare", str(bare))
+    scenario.port.git.run("remote", "add", "audit-origin", str(bare))
+    scenario.port.git.run("push", "audit-origin", scenario.initial.sha + ":refs/heads/main")
+    real_git = shutil.which("git")
+    assert real_git is not None
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    trace = tmp_path / "push-command.jsonl"
+    actor = binary / "gh"
+    actor.write_text(f"#!{sys.executable}\nimport json,sys\nassert sys.argv[1:]==['api','user']\n"
+                     "print(json.dumps({'login':'offline-publisher'}))\n")
+    actor.chmod(0o755)
+    command = binary / "git"
+    command.write_text(f"""#!{sys.executable}
+import json,subprocess,sys
+from pathlib import Path
+arguments=sys.argv[1:]
+response=subprocess.run([{real_git!r},*arguments])
+if arguments[:2]==['push','audit-origin']:
+    actual_exit={command_exit} if response.returncode==0 else response.returncode
+    with Path({str(trace)!r}).open('a') as output:
+        output.write(json.dumps({{'arguments':arguments,'inner_git_returncode':response.returncode,
+                                 'actual_command_returncode':actual_exit}})+'\\n')
+    if actual_exit:
+        print('actual transport command exited nonzero after the local push',file=sys.stderr)
+    raise SystemExit(actual_exit)
+raise SystemExit(response.returncode)
+""")
+    command.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(variable, raising=False)
+    native = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
+                           runner_identity={"source": "host"}, remote="audit-origin")
+    runner = scenario.runner()
+    execute = runner.ports.execute
+    observed: list[tuple[Effect, EffectResult]] = []
+    grants: list[str] = []
+
+    def execute_original(effect, authorize):
+        if effect.operation != "push":
+            return execute(effect, authorize)
+        def current_grant():
+            authorize()
+            grants.append(effect.effect_id)
+        result = native.execute(effect, current_grant)
+        observed.append((effect, result))
+        return result
+
+    monkeypatch.setattr(runner.ports, "execute", execute_original)
+    for _ in range(48):
+        step = runner.run_once()
+        if step.call is not None:
+            scripted_return(scenario.kernel, runner, step.call, scenario.agent)
+        if observed:
+            break
+    else:
+        raise AssertionError("Normal public operations never reached the original push")
+    effect, physical = observed[0]
+    assert grants == [effect.effect_id]
+    commands = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert len(commands) == 1 and commands[0]["inner_git_returncode"] == 0
+    assert commands[0]["actual_command_returncode"] == command_exit
+    assert physical.disposition == "target" and physical.raw["write_returncode"] == command_exit
+    assert scenario.port.git.run("--git-dir", str(bare), "rev-parse", effect.source_ref).stdout.strip() == effect.after_sha
+    return scenario, effect
+
+
+@pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])
+def test_publication_failure_observation_survives_successful_exact_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int,
+) -> None:
+    scenario, effect = _actual_publication_push(tmp_path, monkeypatch, command_exit)
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "observed"
+        failures = tx.rows("SELECT e.operation,e.subject,f.* FROM effect_failures f JOIN effects e ON e.id=f.effect")
+        assert len(failures) == (1 if command_exit else 0)
+        if command_exit:
+            assert failures[0]["operation"] == "push" and failures[0]["effect"] == effect.effect_id
+            assert failures[0]["dispatch_serial"] == 1
+            evidence = json.loads(tx.get(failures[0]["evidence"], failures[0]["subject"]))
+            assert evidence["returncode"] == command_exit
+            assert "actual transport command exited nonzero" in evidence["message"]
+        assert tx.one("SELECT sum(attempts) FROM effects")[0] > len(failures)
+
+
+def test_publication_unknown_response_retains_the_original_intent_without_inventing_an_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
+    execute = scenario.port.execute
+    exceptions = []
+    def capture(effect, authorize):
+        try:
+            return execute(effect, authorize)
+        except LostResponse as error:
+            exceptions.append((effect.effect_id, effect.dispatch_serial,
+                               getattr(error, "write_returncode", None)))
+            raise
+    monkeypatch.setattr(scenario.port, "execute", capture)
     unresolved = scenario.run()
-    assert unresolved.kind == "waiting" and unresolved.reason == "original_write_readback_required"
+    assert unresolved.kind == "waiting" and unresolved.reason == "github_convergence"
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
     assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
+    assert exceptions == [(pending["id"], 1, None)]
+    diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
+    assert read(scenario.kernel.storage.path, "status").data["supervision"]["latest_observation"] == diagnostic
+    assert unresolved.retry_at is not None
+    now[0] = unresolved.retry_at
     assert scenario.run().kind == "approval"
     assert scenario.port.pull_request(scenario.delivery.key) is not None
+    assert sum(row["operation"] == "pr_write" for row in scenario.port.writes()) == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
         failures = tx.rows("SELECT e.operation,e.subject,f.* FROM effect_failures f JOIN effects e ON e.id=f.effect")
-        assert len(failures) == 1 and failures[0]["operation"] == "pr_write"
-        assert failures[0]["dispatch_serial"] == 1
-        evidence = json.loads(tx.get(failures[0]["evidence"], failures[0]["subject"]))
-        assert evidence["type"] == "LostResponse"
+        assert failures == []  # No physical command response proved a nonzero exit.
         assert tx.one("SELECT sum(attempts) FROM effects")[0] > len(failures)
-        assert tx.one("SELECT status FROM effects WHERE id=?", (failures[0]["effect"],))[0] == "confirmed"
+        assert tx.one("SELECT attempts,status FROM effects WHERE id=?", (pending["id"],))[:] == (1, "confirmed")
+        observations = [json.loads(row[0]) for row in tx.rows(
+            "SELECT body FROM material WHERE subject=? AND purpose='github_read_observation'", (scenario.delivery.key,))]
+        assert diagnostic in observations
