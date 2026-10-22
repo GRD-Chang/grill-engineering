@@ -13,7 +13,7 @@ import time
 import pytest
 
 from agent_run.task_identity import TaskKey
-from agent_run_kernel import migration_cutover as cutover
+from support import copied_cutover as cutover
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.migration import MigrationRefused, capture_v6
 from agent_run_kernel.migration_conversion import convert_initial_v6
@@ -34,7 +34,7 @@ import os, sys
 from pathlib import Path
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.migration import capture_v6
-import agent_run_kernel.migration_cutover as cutover
+from support import copied_cutover as cutover
 assert Path(cutover.__file__).resolve().is_relative_to(Path(sys.argv[8]))
 snapshot = capture_v6(Path(sys.argv[1]), Path(sys.argv[2]))
 actual = cutover._handoff_copy_marker
@@ -145,7 +145,7 @@ def test_copied_marker_handoff_and_reentry_preserve_source_and_original_resume(
         process = subprocess.Popen([
             sys.executable, '-c', _HANDOFF_EXIT, str(snapshot.source), str(tmp_path / 'inverse-child-sealed.sqlite3'),
             str(old), str(kernel.storage.path), nonce, 'workspace' if workspace else 'idle', checkpoint,
-            str(Path(__file__).resolve().parents[1] / 'src'),
+            str(Path(__file__).resolve().parent),
         ], cwd=tmp_path, env=_python_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
         finished = False

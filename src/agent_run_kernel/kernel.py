@@ -222,7 +222,12 @@ class Kernel:
             return Step("waiting", subject, "dependencies")
         if continuation is not None:
             return continuation
-
+        # First admission still registers the existing FIFO queue. Once queued,
+        # a seat waiter must yield to its holder's readback and completion.
+        if (job["phase"] == "integration" and job["kind"] == DeliveryKind.TICKET
+                and run["integration_holder"] not in (None, subject)
+                and tx.rows("SELECT subject FROM integration_queue WHERE subject=?", (subject,))):
+            return Step("waiting", subject, "integration_seat")
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
@@ -4452,6 +4457,7 @@ class Kernel:
                     if (not run["stopped"] and not run["blocked"] and not self._gates(tx, effect.subject)
                             and self._cleanup_current(tx, job, row) and row["attempts"] < 3):
                         tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
+                        tx.execute("UPDATE resource_cleanup SET outcome=NULL WHERE effect_id=?", (effect.effect_id,))
                         return Step("progress", effect.subject)
                 return Step("waiting", effect.subject, "cleanup_pending")
             if result.disposition in {"target", "failure"}:

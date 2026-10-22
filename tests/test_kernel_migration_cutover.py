@@ -21,9 +21,9 @@ from agent_run.task_identity import TaskKey
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.migration import MigrationRefused, capture_v6
 from agent_run_kernel.migration_conversion import convert_initial_v6
-from agent_run_kernel.migration_cutover import (cutover_idle_copied_v6,
-                                                 restore_idle_copied_v6_without_new_effects,
-                                                 restore_copied_v6_after_workspace)
+from support.copied_cutover import (cutover_idle_copied_v6,
+                                    restore_idle_copied_v6_without_new_effects,
+                                    restore_copied_v6_after_workspace)
 from agent_run_kernel.model import HostObservation, Profile
 from agent_run_kernel.offline import OfflinePort
 from agent_run_kernel.task_location import locked_task, read_task
@@ -401,9 +401,10 @@ _INTERRUPTED_RETURN = r"""
 import os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[7])
+sys.path.insert(0, sys.argv[8])
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.migration import capture_v6
-import agent_run_kernel.migration_cutover as cutover
+from support import copied_cutover as cutover
 snapshot = capture_v6(Path(sys.argv[1]), Path(sys.argv[2]))
 bind = cutover.bind_task
 def interrupted(*args):
@@ -561,7 +562,7 @@ def test_real_workspace_effect_returns_to_unchanged_02_and_continues(
             port.git.run("symbolic-ref", delivery.source_ref, run_ref)
             assert port.git.run("symbolic-ref", delivery.source_ref).stdout.strip() == run_ref
         elif checkpoint == "symbolic_ref_race":
-            import agent_run_kernel.migration_cutover as cutover
+            from support import copied_cutover as cutover
             checked = cutover._workspace_git
             changed: list[bool] = []
 
@@ -615,6 +616,7 @@ def test_real_workspace_effect_returns_to_unchanged_02_and_continues(
             sys.executable, "-c", _INTERRUPTED_RETURN, str(source), str(interrupted / "sealed.sqlite3"),
             str(old), str(kernel.storage.path), nonce, checkpoint,
             str(Path(__file__).resolve().parents[1] / "src"),
+            str(Path(__file__).resolve().parent),
         ], capture_output=True, text=True, timeout=15)
         assert child.returncode == (73 if checkpoint == "after_git_crash" else 74), child.stdout + child.stderr
         assert old.read_bytes() == fenced

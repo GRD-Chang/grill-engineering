@@ -203,10 +203,10 @@ def test_checks_observation_retains_configuration_and_never_invents_none_or_pass
     observed = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     assert observed['required_checks'] == []
     normalized = normalize_required_checks(observed)
-    assert normalized.result == ('unknown' if configured else 'none')
+    assert normalized.result == ('pending' if configured else 'none')
     assert normalized.pr_number == 17 and normalized.head_sha == '2' * 40
     if configured:
-        assert dict(normalized.details) == {'classic-ci': 'unknown', 'not-yet-reported': 'unknown'}
+        assert dict(normalized.details) == {'classic-ci': 'pending', 'not-yet-reported': 'pending'}
     assert json.loads(normalized.logs)['job_logs'] == 'not_collected'
     assert observed['pr_before']['head']['sha'] == observed['pr_after']['head']['sha'] == '2' * 40
     if configured:
@@ -214,6 +214,21 @@ def test_checks_observation_retains_configuration_and_never_invents_none_or_pass
         assert observed['classic_contexts'] == ['classic-ci']
     else:
         assert observed['rulesets'] == [] and observed['classic_contexts'] == []
+    if configured:
+        # A configured context with no report differs from a report whose
+        # server state is not recognized. Preserve both Original facts.
+        data['checks'] = [{'name': 'classic-ci', 'bucket': 'new-server-state'},
+                          {'name': 'not-yet-reported', 'bucket': 'pass'}]
+        responses.write_text(json.dumps(data))
+        uncertain = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+        assert uncertain.result == 'unknown'
+        assert dict(uncertain.details) == {'classic-ci': 'unknown', 'not-yet-reported': 'pass'}
+        assert json.loads(uncertain.logs)['observation']['required_checks'] == data['checks']
+        data['checks'].pop()
+        responses.write_text(json.dumps(data))
+        unfinished = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+        assert unfinished.result == 'pending'  # Fixed old consumer prioritizes pending over unknown.
+        assert dict(unfinished.details) == {'classic-ci': 'unknown', 'not-yet-reported': 'pending'}
 
 
 def test_check_head_race_and_malformed_check_output_are_errors_not_empty_success(tmp_path: Path, monkeypatch) -> None:
@@ -272,7 +287,12 @@ def test_classic_protection_absence_and_permission_failure_have_distinct_meaning
         observed = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
         assert observed['classic_protection_absent'] is True and observed['classic_contexts'] is None
         normalized = normalize_required_checks(observed)
-        assert normalized.result == 'unknown' and normalized.details == (('still-required', 'unknown'),)
+        assert normalized.result == 'pending' and normalized.details == (('still-required', 'pending'),)
+        data['checks'] = [{'name': 'still-required', 'bucket': 'new-server-state'}]
+        responses.write_text(json.dumps(data))
+        uncertain = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+        assert uncertain.result == 'unknown' and uncertain.details == (('still-required', 'unknown'),)
+        assert json.loads(uncertain.logs)['observation']['classic_protection_absent'] is True
 
 
 def _failed_job(root: Path, *, logs_http: int = 0) -> None:
