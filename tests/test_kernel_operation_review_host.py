@@ -1,7 +1,7 @@
-"""Actual Host supervision at a manual write gate and explicit resume.
+"""Direct Core quiescence and admitted Host recovery at a manual write gate.
 
 Agent calls before the cut are fixture files/raw; no Agent starts during either
-Host run. Git/SQLite and the executor.run supervision loop remain real. A
+operational observation. Git/SQLite and the admitted executor.run loop remain real. A
 controlled systemd process and OS sandbox acceptance are separate obligations.
 """
 import os
@@ -25,7 +25,7 @@ class _NoNotifications:
         pass
 
 
-def test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback(
+def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
@@ -56,17 +56,30 @@ def test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback(
     monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
     monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
                         lambda *a, **kw: pytest.fail("Original push recovery allocates no Agent"))
-    # The real Host exits at this manual boundary without a background poll or
-    # a fresh write. An available target is not itself permission to continue.
+    # This fixture has a direct Core claim, not an admitted native Host. Its
+    # passive state never activates an operational poll or grants a fresh write.
     scenario.port.force_read.clear()
-    assert executor.run(kernel, scenario.execution, {}) == 0
+    runner = scenario.runner()
+    with monkeypatch.context() as passive:
+        passive.setattr(runner.ports, "source", lambda *a: pytest.fail("passive state reads no source"))
+        passive.setattr(runner.ports, "delivery", lambda *a: pytest.fail("passive state reads no delivery"))
+        assert runner.state().disposition == "quiescent"
+        with pytest.raises(KernelError, match="managed_observation_required"):
+            runner.activate_observation()
+        assert runner.state().disposition == "quiescent"
     assert reconciled == []
     assert scenario.port.writes() == writes
     assert kernel.status(scenario.delivery.key)["pending_write"]["id"] == original["id"]
     assert kernel.status(scenario.delivery.key)["gates"] == ["write_result_unknown"]
 
     kernel.control("resume", "resume-original-push", subject=scenario.delivery.key)
-    assert executor.run(kernel, scenario.execution, {}) == 0
+    for _ in range(12):
+        step = runner.run_once()
+        assert step.call is None
+        if kernel.status(scenario.delivery.key)["phase"] == "approval":
+            break
+    else:
+        raise AssertionError("Explicit resume did not consume the original push")
     assert original["id"] in reconciled
     assert kernel.status(scenario.delivery.key)["phase"] == "approval"
     assert scenario.role_calls == calls

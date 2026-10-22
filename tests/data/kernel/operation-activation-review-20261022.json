@@ -1,0 +1,233 @@
+{
+  "schema": "operation-activation-independent-review/1",
+  "candidate_core": "fe1c3bf47be86ad200eb2877c9e0b301981bd195",
+  "candidate_parent": "da2e815b71d84c3fe00da46213950405f85dde9c",
+  "local_combination": "941ef96b83192c33adfcb5749fa1c77f5075446a",
+  "combination_base": "247a21fb9cbedc438622a67130f6394bfa55de50",
+  "local_applied_chain": [
+    "530700e21dc41372f05b8893e379cf2ab52371f5 247a21fb9cbedc438622a67130f6394bfa55de50 fix(core): audit nonzero write responses before successful settlement",
+    "6e9feb44d7f9d710f6ea3234c6d1d71e55e7acb1 530700e21dc41372f05b8893e379cf2ab52371f5 fix(core): recheck original read deadlines after physical IO",
+    "060f0e6dde7f608c6ecae023c4bcaf2fcdce265b 6e9feb44d7f9d710f6ea3234c6d1d71e55e7acb1 fix(core): continue the original proved-unapplied Final approval",
+    "3a25d26c04e29ee34f8709031ae175ac15e4d825 060f0e6dde7f608c6ecae023c4bcaf2fcdce265b fix(core): persist foreign cleanup observations without dispatch",
+    "9857524b35bec6e345cff3429f631096e4e07c87 3a25d26c04e29ee34f8709031ae175ac15e4d825 fix(core): share the superseded observation exception with source retries",
+    "9847561f7f869f5be22303c5b652999441a81bf1 9857524b35bec6e345cff3429f631096e4e07c87 fix(core): finish fresh reads without granting gated work",
+    "a6c46a7ef0ba375e78d80ee1c92239129f083fc4 9847561f7f869f5be22303c5b652999441a81bf1 fix(core): count the current retirement proof as business progress",
+    "c7971d6f8cdf0ef450619e428fd3476796881b29 a6c46a7ef0ba375e78d80ee1c92239129f083fc4 fix(core): retain scoped read uncertainty in public history",
+    "941ef96b83192c33adfcb5749fa1c77f5075446a c7971d6f8cdf0ef450619e428fd3476796881b29 feat(core): activate a finite observation pass for admitted Hosts"
+  ],
+  "source_identity": "kernel.py and operation_runner.py exactly match fe1c3bf; existing Host affb, adapter de7889 and offline d847/6e981 are retained. The 602c3d import conflict was composed by retaining existing adapter imports and importing the exact published shared ObservationSuperseded alias; no new implementation. executor.py exactly matches 9084ae4 after applying its single published line. Original b6f multi-intent test materialized unchanged.",
+  "host_activation_wiring": "9084ae4e6a0534394d2843c59f6f4a942a1b2779, parent b6f187f6f934f469b73a2f4b7518abcc4ea2934a, exact single executor activation line. e5b83706161764d84d83b3ca2f29314bf46bd5d6 was inspected for assertion retention; not merged for these runs.",
+  "results": {
+    "core_contract_tests": 10,
+    "failures": 1,
+    "seconds": 19.698,
+    "nodes": [
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_readwait_defers_without_consuming_and_second_intent_is_observed",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_original_sent_read_finishing_after_deadline_keeps_original_wait",
+        "outcome": "failed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_prior_observation_does_not_rearm_or_write_and_other_intent_finishes",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_approval_source_cas_is_deferred_without_consuming_the_observation",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_sent_unknown_read_after_public_stop_adds_no_new_gate",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_approval_initial_observation_keeps_original_change_gates[source]",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_operation_activation_review::test_approval_initial_observation_keeps_original_change_gates[target]",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_host_observation::test_activation_rejects_direct_claim_without_external_reads",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_host_observation::test_managed_activation_reads_the_original_sent_target_once",
+        "outcome": "passed"
+      },
+      {
+        "name": "tests.test_kernel_host_observation::test_managed_approval_observation_is_finite_and_passive_afterwards",
+        "outcome": "passed"
+      }
+    ],
+    "original_nine": "9 passed in 31.20s, original module SHA256 5e71e21834eb5818b72da8460798cb06c3b44a394bba1a194992d795cc5ebecb unchanged",
+    "typecheck": "python -m mypy --cache-dir /tmp/grill-review-mypy-cache src: Success, 125 source files"
+  },
+  "finding": {
+    "node": "tests/test_kernel_operation_activation_review.py::test_original_sent_read_finishing_after_deadline_keeps_original_wait",
+    "source": "project/src/agent_run_kernel/operation_runner.py:329-337 at fe1c3bf",
+    "normal_story": "Two actual Git workspace intents have conflict gates. Public Stop/exit/resume retires setup owner, public admit/dispatch/observe creates exact current Host Execution. Activate finite observation; first original read outage starts wait at100.25/deadline700.25. Second intent completes fairly. First retry starts105.25; physical target read finishes701.25.",
+    "actual": {
+      "step": "progress",
+      "original_effect": [
+        "observed",
+        1
+      ],
+      "original_waits": []
+    },
+    "expected": "Pause supervision_timeout under original wait 100.25/700.25; do not erase/renew its deadline merely because the slow read returned target. No assertion here requires discarding the physical fact itself.",
+    "cause": "New _observe_sent invokes guard only before physical reconcile, then records/reconciles and finish clears the read wait without the existing _finish_operation_read check."
+  },
+  "covered": "ReadWait defers first and lets second original intent settle; repeated activation preserves retry; prior original remains sent attempts1 and no write; real public Stop during unknown read fences mutation; approval CAS caused by normal refresh metadata is not consumed and is read again after original retry; source and target changes retain gates and budgets; author activation admission/finite read/passive query contracts. Complete executor.run ReadWait story passes: first outage, second target, first retry with original100.25/700.25 window, no write/Agent. Complete executor.run approval CAS story passes: real public refresh during physical delivery invalidates first read; original bounded wait is inspected before controlled clock advances at Host idle, then a second actual delivery observation completes; no write or Agent.",
+  "limitations": [
+    "No live systemd/bwrap process acceptance; full Host loops use controlled manager evidence and physical source/Agent boundaries. Exact published 9084ae4 wiring is independently exercised.",
+    "Synthetic physical GitHub results and controlled Host manager evidence; no live systemd, sandbox, external service or credentials.",
+    "No prepared DB tampering, product edits, xfail or skip.",
+    "The generic slow source/delivery and actual nonzero write audits are fixed and passed in the original nine; only the newly activated sent path is red."
+  ],
+  "test_module_sha256": "3544ddbafa9bb1b02c3ee651f8729bebf6564df8bf95308fbb13594db6256ec3",
+  "local_combination_with_host": "02237f6bfc3169ef8b153c7fae05369c17078818",
+  "runs": [
+    {
+      "label": "original_nine",
+      "tests": 9,
+      "failures": 0,
+      "skipped": 0,
+      "seconds": 31.197,
+      "nodes": [
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_stop_resume_preserves_the_original_source_wait_deadline",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[source]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[delivery]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-zero]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-nonzero]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-zero]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-nonzero]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_offline_lost_response_is_unknown_without_an_observed_command_failure",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_regressions::test_formal_graph_completion_final_still_retires_the_remote_run_branch",
+          "outcome": "passed"
+        }
+      ]
+    },
+    {
+      "label": "core_contracts",
+      "tests": 10,
+      "failures": 1,
+      "skipped": 0,
+      "seconds": 19.698,
+      "nodes": [
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_readwait_defers_without_consuming_and_second_intent_is_observed",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_original_sent_read_finishing_after_deadline_keeps_original_wait",
+          "outcome": "failed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_prior_observation_does_not_rearm_or_write_and_other_intent_finishes",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_approval_source_cas_is_deferred_without_consuming_the_observation",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_sent_unknown_read_after_public_stop_adds_no_new_gate",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_approval_initial_observation_keeps_original_change_gates[source]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_approval_initial_observation_keeps_original_change_gates[target]",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_host_observation::test_activation_rejects_direct_claim_without_external_reads",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_host_observation::test_managed_activation_reads_the_original_sent_target_once",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_host_observation::test_managed_approval_observation_is_finite_and_passive_afterwards",
+          "outcome": "passed"
+        }
+      ]
+    },
+    {
+      "label": "formal_host_and_direct_claim",
+      "tests": 4,
+      "failures": 0,
+      "skipped": 0,
+      "seconds": 8.169,
+      "nodes": [
+        {
+          "node": "tests.test_kernel_operation_review_host::test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_review_host::test_public_run_reads_a_restored_third_push_before_conflict_resume",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_host_initial_observation::test_admitted_run_does_not_starve_later_gated_intent_behind_unknown",
+          "outcome": "passed"
+        },
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_formal_host_readwait_observes_second_before_retrying_first",
+          "outcome": "passed"
+        }
+      ]
+    },
+    {
+      "label": "formal_host_cas",
+      "tests": 1,
+      "failures": 0,
+      "skipped": 0,
+      "seconds": 3.654,
+      "nodes": [
+        {
+          "node": "tests.test_kernel_operation_activation_review::test_formal_host_approval_cas_retries_without_consuming_its_observation",
+          "outcome": "passed"
+        }
+      ]
+    }
+  ],
+  "aggregate": "24 distinct normal regression nodes: 23 passed, 1 failed; no skips/xfails. The sole failure is the activated original sent read crossing its absolute deadline.",
+  "direct_claim_migration": {
+    "old_node": "test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback",
+    "new_node": "test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original",
+    "reason": "The original fixture claims Core directly and never admits a Host. executor.run now correctly requires managed activation. The test uses passive runner.state plus rejected activate_observation with source/delivery forbidden, then bounded public run_once after its explicit Resume. Original intent/gate/write-count/Attempt/history assertions remain. The separate formal third Host story stays unchanged and passes."
+  }
+}
