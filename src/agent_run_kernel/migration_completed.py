@@ -75,7 +75,8 @@ def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, reposito
                           integrated_sha: str, base_sha: str, run_branch: str,
                           ticket_branch: str, base_branch: str, source_sha: str,
                           intent: Mapping[str, Any], requirements: Requirements,
-                          runner_identity: Mapping[str, Any]) -> dict[str, Any]:
+                          runner_identity: Mapping[str, Any],
+                          proved_run_head: str | None = None) -> dict[str, Any]:
     """Bind original intent/merge authority to observed external facts once.
 
     This is evidence validation for the shared importer, not a close retry or
@@ -127,7 +128,9 @@ def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, reposito
                     or pr['merge_commit_sha'] != integrated_sha or pr['user']['login'] != login
                     or pr['head']['sha'] != publication_sha or pr['head']['ref'] != ticket_branch
                     or pr['head']['repo']['full_name'] != repository
-                    or pr['base']['sha'] not in {base_sha, integrated_sha} or pr['base']['ref'] != run_branch
+                    or pr['base']['sha'] not in ({base_sha, integrated_sha} if proved_run_head is None
+                                                 else {base_sha, integrated_sha, proved_run_head})
+                    or pr['base']['ref'] != run_branch
                     or pr['base']['repo']['full_name'] != repository):
                 raise MigrationRefused('source_external_pr')
         expected_requirements = {
@@ -136,15 +139,15 @@ def _external_close_proof(readproof: Mapping[str, Any], *, run_id: str, reposito
                        'sub_issue_numbers': list(requirements.parent.sub_issue_numbers),
                        'sub_issue_order_reliable': requirements.parent.sub_issue_order_reliable},
             'issues': [{'number': item.number, 'title': item.title, 'body': item.body,
-                        'state': 'CLOSED', 'labels': sorted(item.labels),
+                        'state': 'CLOSED' if item.number == ticket else item.state, 'labels': sorted(item.labels),
                         'blocked_by': [{'number': edge.number, 'state': edge.state} for edge in item.blocked_by]}
-                       for item in requirements.issues],
+                       for item in sorted(requirements.issues, key=lambda item: item.number)],
         }
         if readproof['requirements'] != expected_requirements:
             raise MigrationRefused('source_external_requirements')
         heads = readproof['remote_heads']
         if (set(heads) != {'refs/heads/' + branch for branch in (run_branch, ticket_branch, base_branch)}
-                or heads['refs/heads/' + run_branch] != integrated_sha
+                or heads['refs/heads/' + run_branch] != (integrated_sha if proved_run_head is None else proved_run_head)
                 or not isinstance(heads['refs/heads/' + base_branch], str)
                 or re.fullmatch(r'[0-9a-f]{40}', heads['refs/heads/' + base_branch]) is None
                 or heads['refs/heads/' + ticket_branch] not in {publication_sha, None}):

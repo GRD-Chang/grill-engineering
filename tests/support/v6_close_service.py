@@ -50,10 +50,13 @@ elif args[:2]==['api','repos/example/project/pulls/1']:
         'base':{'ref':pr['base_branch'],'sha':data.get('pr_base_sha',pr['base_sha']),'repo':{'full_name':external['repository']}}}))
 elif args[:2]==['api','repos/example/project/issues/2']:
     issue=external['issues']['2']
-    print(json.dumps({**issue,'state':data['state'].lower(),'updated_at':data['updated_at']}))
+    whole=external.get('delivery',{}).get('whole_close_events',{}).get('2')
+    print(json.dumps({**issue,'state':issue['state'].lower() if whole else data['state'].lower(),
+                     'updated_at':whole['created_at'] if whole else data['updated_at']}))
 elif args[:2]==['api','repos/example/project/issues/2/comments']:
     assert '--paginate' in args and '--slurp' in args
-    print(json.dumps([[{'id':comment['id'],'body':comment['body'],
+    whole=external.get('delivery',{}).get('whole_close_comments',{}).get('2')
+    print(json.dumps([[whole]] if whole else [[{'id':comment['id'],'body':comment['body'],
                         'user':comment['author'],'created_at':comment['createdAt']}
                       for comment in data['comments']]]))
 elif args[:2]==['api','user']:
@@ -62,7 +65,8 @@ elif args[:3]==['issue','view','2']:
     print(json.dumps({'state':data['state'],'comments':data['comments'],'updatedAt':data['updated_at']}))
 elif args[:2]==['api','repos/example/project/issues/2/events']:
     assert '--paginate' in args and '--slurp' in args
-    print(json.dumps([data['events']]))
+    whole=external.get('delivery',{}).get('whole_close_events',{}).get('2')
+    print(json.dumps([[whole]] if whole else [data['events']]))
 elif args[:3]==['issue','comment','2']:
     body=args[args.index('--body')+1]
     data['comments'].append({'id':301,'body':body,'author':{'login':'fixture-publisher'},

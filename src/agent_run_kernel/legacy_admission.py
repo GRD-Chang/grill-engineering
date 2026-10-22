@@ -222,7 +222,7 @@ def _original_transfer(task: TaskKey, source: _Source, path: Path,
     with Storage(origin).transaction(write=False) as tx:
         proof = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_original_cutover'")
         imports = tx.rows("SELECT h.subject,h.kind,h.identity,h.material_id,h.generation,m.purpose FROM history h "
-                          "JOIN material m ON m.id=h.material_id WHERE h.kind IN ('v6_completed_import','v6_returned_import')", limit=2)
+                          "JOIN material m ON m.id=h.material_id WHERE h.kind IN ('v6_completed_import','v6_returned_import','v6_run_import')", limit=2)
         if len(imports) != 1 or tx.rows("SELECT identity FROM history WHERE kind='v6_original_rollback_started' LIMIT 1"):
             raise _refuse()
         imported = imports[0]
@@ -236,7 +236,13 @@ def _original_transfer(task: TaskKey, source: _Source, path: Path,
                 or record_body.get("source", {}).get("sha256") != receipt["source_sha256"]
                 or record_body.get("source", {}).get("run_id") != receipt["run_id"]):
             raise _refuse()
-        if imported["kind"] == "v6_completed_import":
+        if imported["kind"] == "v6_run_import":
+            if (proof['subject'] != imported['subject'] or records['subject'] != imported['subject']
+                    or imported_body.get('profile_sha256') != record_body.get('documents', {}).get('profile', {}).get('sha256')):
+                raise _refuse()
+            from .migration_run_admission import authenticate_run_transfer
+            authenticate_run_transfer(tx, imported, imported_body, receipt, managed, db)
+        elif imported["kind"] == "v6_completed_import":
             if (imported["identity"] != receipt["run_id"] or imported["purpose"] != "v6_completed_import_identity"
                     or imported_body.get("copied_repository_root") != str(transferred.workspace)):
                 raise _refuse()

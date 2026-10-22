@@ -66,6 +66,57 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _collect_original_run_locked(managed: ManagedWorkspace, task: TaskKey, destination: Path,
+                                 snapshot: SourceSnapshot, *, external: bool) -> tuple[dict[str, Any], SourceSnapshot]:
+    """Collect one whole Run while the caller holds management and both Task locks."""
+    from .migration_conversion import _git
+    from .migration_run import read_original_run, WorkedTicket
+    from .migration_run_cutover import _origin
+    from .migration_run_external import collect_run_external, prove_run_head, verify_run_external
+    from .migration_run_resources import authenticate_run_resources, seal_run_checkouts
+    with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        run_id = db.execute('SELECT run_id FROM runs').fetchone()[0]
+    profile_path = managed.state_root / 'profiles' / (run_id + '.json')
+    facts = read_original_run(snapshot, profile_path)
+    header = facts.header
+    if header.task != task:
+        raise MigrationRefused('source_original_identity')
+    target = managed.state_root / run_id / 'kernel.sqlite3'
+    if target.exists() or target.is_symlink():
+        raise MigrationRefused('native_original_candidate_exists')
+    proof = collect_run_external(facts, managed.repository_root) if external else None
+    if proof is not None:
+        run_head, _ = verify_run_external(facts, proof, managed.repository_root)
+    else:
+        run_head = _git(managed.repository_root, 'rev-parse', '--verify', 'refs/heads/' + header.run_branch)
+        prove_run_head(facts, managed.repository_root, run_head)
+    sealed = seal_run_checkouts(facts, destination)
+    origin = _origin(snapshot, facts, managed, '0' * 32)
+    authenticate_run_resources(snapshot, facts, origin, destination, sealed, run_head)
+    _write(destination / 'checkouts.json', wire_json(sealed))
+    if proof is not None:
+        _write(destination / 'external-readproof.json', wire_json(proof))
+    profile_body = profile_path.read_bytes()
+    if hashlib.sha256(profile_body).hexdigest() != facts.profile_sha256:
+        raise MigrationRefused('source_profile_changed')
+    _write(destination / 'profile.json', profile_body)
+    result: dict[str, Any] = {
+        'status': 'inspection_only', 'external_status': 'verified' if external else 'not_read',
+        'source': {'path': str(snapshot.source), 'run_id': run_id, 'sha256': snapshot.sha256,
+                   'task_fingerprint': task.fingerprint},
+        'profile': {'source_path': str(profile_path), 'sha256': facts.profile_sha256},
+        'git': {'repository_root': str(managed.repository_root), 'clone_uuid': origin['source_uuid'],
+                'common_git_dir': str(managed.repository_root / '.git'), 'run_ref': 'refs/heads/' + header.run_branch,
+                'run_head': run_head, 'default_ref': 'refs/heads/' + header.default_branch, 'default_head': header.default_sha},
+        'supported_source': {'kind': 'original_run', 'generation': 1, 'review_window': 1,
+            'physical_scope': 'reaped-local', 'subjects': [
+                {'subject': ticket.owner.subject, 'kind': ticket.kind if isinstance(ticket, WorkedTicket) else 'unallocated'}
+                for ticket in facts.tickets]}, 'evidence_dir': str(destination)}
+    _write(destination / 'inspection.json', wire_json(result))
+    _sync_directory(destination)
+    return result, snapshot
+
+
 def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path, *,
                          external: bool = False) -> tuple[dict[str, Any], SourceSnapshot]:
     """Collect one supported original unit without changing its authority."""
@@ -94,6 +145,10 @@ def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path
                     or not isinstance(runs[0][0], str)
                     or re.fullmatch(r'run-[1-9][0-9]*-[0-9a-f]{16}', runs[0][0]) is None):
                 raise MigrationRefused('source_original_identity')
+            root_id = db.execute('SELECT value_graph_snapshot_id FROM run_root WHERE run_id=?', (runs[0][0],)).fetchone()
+            if root_id is not None and db.execute('SELECT count(*) FROM run_graph_scope_order WHERE run_id=? AND snapshot_id=?',
+                                                  (runs[0][0], root_id[0])).fetchone()[0] > 1:
+                return _collect_original_run_locked(managed, task, destination, snapshot, external=external)
             run_id = runs[0][0]
             root = db.execute('SELECT * FROM run_root WHERE run_id=?', (run_id,)).fetchone()
             job = db.execute('SELECT j.* FROM work_jobs j JOIN work_job_layout l ON l.run_id=j.run_id AND l.active_job_id=j.job_id WHERE j.run_id=?', (run_id,)).fetchone()
@@ -245,13 +300,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             recovery_paths = {'source_database': str(snapshot.source), 'retained_native_database': str(
                 managed.state_root / result['source']['run_id'] / 'kernel.sqlite3')}
             if options.rollback:
-                result = rollback_original_v6(snapshot, repository=options.repo, parent_number=options.parent,
+                if result.get('supported_source', {}).get('kind') == 'original_run':
+                    from .migration_run_cutover import rollback_original_run_v6
+                    result = rollback_original_run_v6(snapshot, repository=options.repo, parent_number=options.parent,
+                        nonce=nonce, external_snapshot=options.evidence_dir / 'external-readproof.json')
+                else:
+                    result = rollback_original_v6(snapshot, repository=options.repo, parent_number=options.parent,
                                                nonce=nonce, external_snapshot=options.evidence_dir / 'external-readproof.json')
             else:
-                kernel = migrate_completed_original_v6(
-                    snapshot, repository=options.repo, parent_number=options.parent, nonce=nonce,
-                    profile_snapshot=options.evidence_dir / 'profile.json',
-                    external_snapshot=options.evidence_dir / 'external-readproof.json')
+                if result.get('supported_source', {}).get('kind') == 'original_run':
+                    from .migration_run_cutover import migrate_original_run_v6
+                    kernel = migrate_original_run_v6(snapshot, repository=options.repo, parent_number=options.parent, nonce=nonce,
+                        profile_snapshot=options.evidence_dir / 'profile.json', external_snapshot=options.evidence_dir / 'external-readproof.json')
+                else:
+                    kernel = migrate_completed_original_v6(
+                        snapshot, repository=options.repo, parent_number=options.parent, nonce=nonce,
+                        profile_snapshot=options.evidence_dir / 'profile.json',
+                        external_snapshot=options.evidence_dir / 'external-readproof.json')
                 result.update(status='migrated', nonce=nonce,
                               target={'database': str(kernel.storage.path), 'run_id': result['source']['run_id']})
     except (MigrationRefused, KernelError, GitError, GitHubReadError, RunnerLeaseError, OSError, sqlite3.Error) as error:
