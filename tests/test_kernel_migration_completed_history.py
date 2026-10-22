@@ -101,6 +101,25 @@ if not request.get('profile_backend', True):
             thread = json.loads(agents_file.read_text())['publications'][0]['thread_id']
             return PublicationResult(thread, artifact)
     backend = SynchronousBackend()
+if request.get('segmentless_events', False):
+    # The copied-returned oracle's existing contract records API lifecycle
+    # events, not OS worker boundaries. Use the real optional event protocol.
+    class SegmentlessAgents(Agents):
+        def call(self, method, request):
+            event = request['_invocation_event']
+            event('started', requested_thread_id=request.get('thread_id'), attempt_count=0)
+            result = getattr(super(), method)({key:value for key,value in request.items() if key != '_invocation_event'})
+            if method == 'publication':
+                from agent_run.agents import PublicationResult
+                thread = json.loads(agents_file.read_text())['publications'][0]['thread_id']
+                result = PublicationResult(thread, result)
+            event('thread_started', reported_thread_id=result.thread_id, attempt_count=1)
+            event('completed', reported_thread_id=result.thread_id, attempt_count=1)
+            return result
+        def develop(self, request): return self.call('develop', request)
+        def review(self, request): return self.call('review', request)
+        def publication(self, request): return self.call('publication', request)
+    backend = ProfiledAgentBackend(SegmentlessAgents(agents_file), profiles, run_id=run_id)
 publisher = FixtureGitHubPublisher(fixture, git)
 if request.get('actual_github_close'):
     from agent_run.github_publish import GhGitHubPublisher

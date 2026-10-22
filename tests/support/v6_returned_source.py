@@ -48,7 +48,8 @@ print(json.dumps({'run_id':run_id,'status':after['status']}))
 '''
 
 
-def returned_managed_source(root: Path, repository: Path, role: str, *, review_findings: bool = False) -> tuple[ManagedWorkspace, dict[str, Path]]:
+def returned_managed_source(root: Path, repository: Path, role: str, *, review_findings: bool = False,
+        segmentless_events: bool = False) -> tuple[ManagedWorkspace, dict[str, Path]]:
     """Run unchanged 02 through a real local Host and keep original SQL/Git."""
     root.mkdir(parents=True, exist_ok=True)
     managed = ManagedWorkspace.for_repository('example/project')
@@ -72,6 +73,7 @@ def returned_managed_source(root: Path, repository: Path, role: str, *, review_f
                           'output': str(output), 'state_root': str(managed.state_root),
                           'rounds': 2 if review_findings else 1, 'controlled': True, 'actual_github_close': False,
                           'review_findings': review_findings,
+                          'segmentless_events': segmentless_events,
                           'returned_role': role}), capture_output=True, timeout=45)
     assert observed.returncode == 0, observed.stdout + observed.stderr
     run_id = json.loads(observed.stdout)['run_id']
