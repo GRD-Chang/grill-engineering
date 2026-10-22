@@ -138,7 +138,9 @@ def task_published(candidate: Mapping[str, Any]) -> bool:
     return binding == (candidate["run_id"], Path(candidate["database"]).resolve())
 
 
-def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list[dict[str, Any]]:
+def discover(root: Path, *, published: Mapping[Path, str] | None = None,
+             run_id: str | None = None, repository: str | None = None,
+             parent: int | None = None) -> list[dict[str, Any]]:
     """Discover canonical databases without creating a locator or repairing one."""
     if not root.exists() and published is None:
         return []
@@ -154,9 +156,9 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list
         for visited, (directory, _children, files) in enumerate(os.walk(root, followlinks=False, onerror=unreadable)):
             if visited >= 4096:
                 raise QueryError("query_limit", "Discovery directory limit; provide --state-dir")
-            if "kernel.sqlite3" in files:
-                path = Path(directory) / "kernel.sqlite3"
-                if path not in paths:
+            for name in ("kernel.sqlite3", "state.sqlite3"):
+                path = Path(directory) / name
+                if name in files and path not in paths:
                     paths.append(path)
                 if published is None and len(paths) > 256:
                     raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
@@ -168,14 +170,20 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None) -> list
                 continue
             raise QueryError("run_locator_conflict", f"Symbolic database path: {path}")
         try:
-            candidate = header(path)
-        except QueryError:
+            from . import original_query
+            original = original_query.protocol(path)
+            found = (original_query.headers(path, run_id=run_id, repository=repository, parent=parent)
+                     if original else [header(path)])
+        except (ValueError, sqlite3.Error, OSError, KernelError, KeyError, TypeError) as error:
             if published is not None and expected is None:
                 continue
-            raise
-        if expected is not None and candidate["run_id"] != expected:
-            raise QueryError("run_locator_conflict", f"Task publication names a different Run: {path}")
-        candidates.append(candidate)
+            if isinstance(error, QueryError):
+                raise
+            raise QueryError("incompatible_run_state", str(error)) from error
+        for candidate in found:
+            if expected is not None and candidate["run_id"] != expected:
+                raise QueryError("run_locator_conflict", f"Task publication names a different Run: {path}")
+            candidates.append(candidate)
         if published is None and len(candidates) > 256:
             raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
     return candidates
@@ -735,6 +743,66 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
 
 def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
          expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
+    """Select original read facts or current native facts; neither grants control."""
+    from . import original_query
+    from .kernel import Kernel
+    from .migration_records import V6RecordReader
+    if after < 0 or (limit is not None and not 1 <= limit <= 128):
+        raise QueryError("query_limit", "History requires after >= 0 and limit between 1 and 128")
+    try:
+        if original_query.protocol(path):
+            if kind == "settings":
+                raise QueryError("recovery_materials_missing", "Original records are available through status and history")
+            with original_query.connection(path) as db:
+                if expected_run is None:
+                    rows = db.execute("SELECT run_id FROM runs LIMIT 2").fetchall()
+                    if len(rows) != 1:
+                        raise QueryError("run_locator_conflict", "Select an exact original Run")
+                    expected_run = rows[0][0]
+                reader = original_query.OriginalRecords(db, path, expected_run)
+                data = original_query.document(reader, path, history=kind == "history", after=after, limit=limit or 128)
+            if expected_repository is not None and data["repository"].lower() != expected_repository:
+                raise QueryError("run_locator_conflict", "Original Run and repository do not match")
+            if len(json.dumps(data, ensure_ascii=False).encode()) > QUERY_LIMIT:
+                raise QueryError("query_limit", "Original query exceeds byte limit")
+            return QueryDocument(kind, data["language"], data)
+        with Storage(path).transaction(write=False) as tx:
+            imported = bool(tx.rows("SELECT position FROM history WHERE kind='v6_record_import'", limit=1))
+        if not imported or kind == "settings":
+            return _read_native(path, kind, after=after, limit=limit, expected_run=expected_run,
+                                expected_repository=expected_repository)
+        imported_reader = V6RecordReader(Kernel(path))
+        count = imported_reader.tables()["run_timeline_slots"]["count"]
+        original = original_query.document(imported_reader, path, history=kind == "history",
+                                           after=min(after, count), limit=limit or 128)
+        old_count = len(original["events"]) if kind == "history" else 0
+        remaining = (limit or 128) - old_count
+        deferred = kind == "history" and (remaining == 0 or original["history_page"]["has_more"])
+        native = _read_native(path, kind, after=max(0, after - count) if kind == "history" else 0,
+                              limit=max(1, remaining), expected_run=expected_run,
+                              expected_repository=expected_repository, defer_history=deferred)
+        combined = dict(native.data)
+        combined["original"] = original
+        if kind == "history":
+            native_more = combined["history_page"]["has_more"]
+            if deferred:
+                next_after = after + old_count
+            else:
+                next_after = count + combined["history_page"]["next_after"]
+            combined["history_page"] = {"after": after, "next_after": next_after,
+                "has_more": original["history_page"]["has_more"] or native_more}
+        if len(json.dumps(combined, ensure_ascii=False).encode()) > QUERY_LIMIT:
+            raise QueryError("query_limit", "Combined original/native response exceeds byte limit")
+        return QueryDocument(kind, native.language, combined)
+    except QueryError:
+        raise
+    except (ValueError, sqlite3.Error, OSError, KeyError, TypeError, KernelError) as error:
+        raise QueryError("incompatible_run_state", str(error)) from error
+
+
+def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
+                 expected_run: str | None = None, expected_repository: str | None = None,
+                 defer_history: bool = False) -> QueryDocument:
     if after < 0 or (limit is not None and not 1 <= limit <= 128):
         raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
     try:
@@ -788,7 +856,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             run_windows = [window for window in windows if window["subject"] is None]
             data["supervision"] = run_windows[0] if len(run_windows) == 1 else windows[0] if len(windows) == 1 else None
             data["supervision_windows"] = windows
-            control = _control_history(tx, latest_resume_only=kind == "status")
+            control = _control_history(tx, latest_resume_only=kind == "status" or defer_history)
             resumes = _resume_history(tx, control)
             data["latest_resume"] = resumes[-1] if resumes else None
             data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
@@ -803,7 +871,9 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             if data["notifications"]["configuration"] is None:
                 data["unavailable_facts"].append("notifications.configuration")
             if kind == "history":
-                events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
+                # Imported pages come first. Existence is enough to offer the
+                # native continuation; unread material must not block that page.
+                events = [] if defer_history else (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
                           [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
                 for event in events:
                     if (not isinstance(event["position"], int) or isinstance(event["position"], bool)
@@ -815,17 +885,18 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                     event["evidence"] = _material(tx, event["material_id"], event["subject"])
                 next_after = events[-1]["position"] if events else after
                 has_more = bool(tx.rows("SELECT position FROM history WHERE position>? LIMIT 1", (next_after,)))
-                attempts = _all(tx, "SELECT * FROM attempts ORDER BY subject,ordinal")
+                attempts = [] if defer_history else _all(tx, "SELECT * FROM attempts ORDER BY subject,ordinal")
                 for attempt in attempts:
                     attempt["artifact"] = _material(tx, attempt["result_id"], attempt["subject"])
                     attempt.pop("context_id")
                     attempt.update({"attempt_id": attempt["id"], "work_subject": attempt["subject"], "budget_window": attempt["window"]})
-                all_invocations = [invocation for job in subjects for invocation in _invocations(tx, job["subject"])]
+                all_invocations = ([] if defer_history else
+                                   [invocation for job in subjects for invocation in _invocations(tx, job["subject"])])
                 data.update({"timeline": events, "timeline_continuation": [],
                              "semantic_agent_attempts": attempts,
                              "agent_invocations": all_invocations,
-                             "publication_operation_retries": _effect_failures(tx),
-                             "effect_operations": _all(tx, "SELECT id,subject,operation,attempts,status FROM effects ORDER BY rowid"),
+                             "publication_operation_retries": [] if defer_history else _effect_failures(tx),
+                             "effect_operations": [] if defer_history else _all(tx, "SELECT id,subject,operation,attempts,status FROM effects ORDER BY rowid"),
                              "budget_windows": [budget for job in subjects for budget in job["budgets"]],
                              "output_attempts": [dict(output, subject=invocation["subject"]) for invocation in all_invocations for output in invocation["outputs"]], "agent_resumes": resumes, "resume_audit": resumes,
                              "actions": control,
