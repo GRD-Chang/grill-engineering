@@ -1,6 +1,8 @@
 """Consumer regressions from the independent Run-ref ownership review."""
 import json
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -56,16 +58,53 @@ def test_final_ref_is_bound_to_the_original_archive_not_only_native_material(tmp
 
 @pytest.mark.parametrize("source", ["work_jobs", "run_condition_base"])
 def test_exact_archived_head_can_dispatch_without_inventing_a_new_authority(tmp_path: Path, source: str) -> None:
-    kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1")
-    head = "e" * 40
-    if source == "run_condition_base":
-        with kernel.storage.transaction() as tx:
-            row = tx.one("SELECT * FROM history WHERE kind='v6_run_import'")
-            manifest = json.loads(tx.get(row["material_id"], row["subject"]))
-            manifest["run_ref_ownership"]["head_evidence"] = [{"table": source, "key": [execution.run_id]}]
-            head = manifest["run_ref_ownership"]["expected_oid"] = "a" * 40
-            material = tx.put(row["subject"], "v6_run_import", wire_json(manifest))
-            tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (material,))
+    kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1", head_source=source)
+    head = "e" * 40 if source == "work_jobs" else "a" * 40
     step = kernel.advance_cleanup("final:1", execution, world)
     assert step.effect is not None and step.effect.before_sha == head
     assert kernel.dispatch(step.effect, execution, world)
+
+
+def test_historical_base_does_not_override_an_original_completed_head(tmp_path: Path) -> None:
+    kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1")
+    with kernel.storage.transaction() as tx:
+        row = tx.one("SELECT * FROM history WHERE kind='v6_run_import'")
+        manifest = json.loads(tx.get(row["material_id"], row["subject"]))
+        manifest["run_ref_ownership"]["head_evidence"] = [
+            {"table": "run_condition_base", "key": [execution.run_id]}]
+        manifest["run_ref_ownership"]["expected_oid"] = "a" * 40
+        material = tx.put(row["subject"], "v6_run_import", wire_json(manifest))
+        tx.execute("UPDATE history SET material_id=? WHERE kind='v6_run_import'", (material,))
+    step = kernel.advance_cleanup("final:1", execution, world)
+    assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
+    assert kernel.status("final:1")["resource_cleanup"]["effect_id"] is None
+
+
+@pytest.mark.parametrize("change", ["missing", "unfenced", "foreign_nonce"])
+def test_native_archive_claims_do_not_replace_the_retired_source_fence(tmp_path: Path, change: str) -> None:
+    kernel, execution, world = imported_cleanup(tmp_path, stage=1, subject="final:1")
+    source = kernel.storage.path.parent.parent / "state.sqlite3"
+    if change == "missing":
+        source.unlink()
+    else:
+        from agent_run_kernel.legacy_admission import read_source_fence, source_fence
+
+        with closing(sqlite3.connect(source)) as db, db:
+            receipt = read_source_fence(db.execute("SELECT value FROM schema_meta").fetchone()[0])
+            receipt["nonce"] = "00" * 16
+            protocol = "sqlite-work-records-v6" if change == "unfenced" else source_fence(receipt)
+            db.execute("UPDATE schema_meta SET value=?", (protocol,))
+    step = kernel.advance_cleanup("final:1", execution, world)
+    assert (step.kind, step.reason, step.effect) == ("paused", "cleanup_marker_unproven", None)
+    assert kernel.status("final:1")["resource_cleanup"]["effect_id"] is None
+
+
+def test_archive_reader_accepts_storage_without_a_kernel_handle_or_writes(tmp_path: Path) -> None:
+    from agent_run_kernel.migration_records import V6RecordReader
+    from agent_run_kernel.storage import Storage
+
+    kernel, execution, _ = imported_cleanup(tmp_path)
+    before = kernel.storage.path.read_bytes()
+    reader = V6RecordReader(Storage(kernel.storage.path))
+    assert reader.row("run_root", [execution.run_id]) == V6RecordReader(kernel).row("run_root", [execution.run_id])
+    assert kernel.storage.path.read_bytes() == before

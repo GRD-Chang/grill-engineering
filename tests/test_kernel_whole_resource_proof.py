@@ -5,7 +5,10 @@ Task admission. The migration writer has its own original-source oracle.
 """
 from __future__ import annotations
 
+from contextlib import closing
+import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -17,7 +20,7 @@ from agent_run_kernel.model import wire_json
 from agent_run_kernel.offline import fixture_inputs
 
 
-def imported_cleanup(tmp_path: Path, *, stage: int = 0, subject: str = "ticket:3") -> tuple[Kernel, Execution, World]:
+def imported_cleanup(tmp_path: Path, *, stage: int = 0, subject: str = "ticket:3", head_source: str = "work_jobs") -> tuple[Kernel, Execution, World]:
     repository = tmp_path / "repository"
     repository.mkdir()
     run_id = "whole-run"
@@ -35,17 +38,53 @@ def imported_cleanup(tmp_path: Path, *, stage: int = 0, subject: str = "ticket:3
     # Claim before installing synthetic origin records: real imported admission
     # must additionally prove the source fence and Task pointer, outside this seam.
     execution = kernel.claim_executor("native")
-    origin = {"nonce": "ab" * 16, "source_db": str(tmp_path / "source.sqlite3"),
+    origin = {"nonce": "ab" * 16, "source_db": str(database.parent.parent / "state.sqlite3"),
         "source_sha256": "cd" * 32, "run_id": run_id, "source_uuid": "ef" * 16,
         "target_db": str(database), "task_fingerprint": TaskKey(repository, "example/project", 1).fingerprint}
+    # Model the already retired source independently of mutable native materials.
+    # The real forward tests supply the original v6 producer and Git ancestry.
+    from agent_run_kernel.legacy_admission import source_fence
+
+    head = "e" * 40 if head_source == "work_jobs" else base.sha
+    source_tables = {
+        "run_root": (["run_id", "value_run_branch", "value_checkout_identity", "value_graph_snapshot_id"],
+            [[run_id, "original/run", origin["source_uuid"], "snapshot"]], ["run_id"]),
+        "run_condition_base": (["run_id", "value_sha"], [[run_id, base.sha]], ["run_id"]),
+        "work_jobs": (["run_id", "job_id", "stage", "value_integrated_sha", "owner_kind", "owner_key",
+            "value_ticket_number", "value_ticket_branch_generation"],
+            ([[run_id, "ticket:2:generation:1", "completed", head, "ticket", "2", 2, 1]] if head_source == "work_jobs" else [])
+            + [[run_id, "ticket:3:generation:1", "reviewing", None, "ticket", "3", 3, 1]], ["run_id", "job_id"]),
+    }
+    with closing(sqlite3.connect(origin["source_db"])) as db, db:
+        db.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY,value TEXT)")
+        db.execute("INSERT INTO schema_meta VALUES ('protocol',?)", (source_fence(origin),))
+        db.execute("CREATE TABLE runs (run_id TEXT,repository TEXT,parent_number INTEGER)")
+        db.execute("INSERT INTO runs VALUES (?,?,1)", (run_id, "example/project"))
+        for table, (names, rows, primary) in source_tables.items():
+            db.execute("CREATE TABLE " + table + " (" + ",".join(names) + ",PRIMARY KEY (" + ",".join(primary) + "))")
+            db.executemany("INSERT INTO " + table + " VALUES (" + ",".join("?" for _ in names) + ")", rows)
+        db.execute("CREATE TABLE run_graph_snapshots (run_id,snapshot_id,version_id)")
+        db.execute("INSERT INTO run_graph_snapshots VALUES (?,'snapshot','graph-version')", (run_id,))
+        db.execute("CREATE TABLE run_graph_members (run_id,version_id,ticket_number)")
+        db.executemany("INSERT INTO run_graph_members VALUES (?,'graph-version',?)", [(run_id, number) for number in (2, 3, 4)])
+        db.execute("CREATE TABLE work_job_slots (run_id,container,slot,job_id)")
+        db.executemany("INSERT INTO work_job_slots VALUES (?,'ticket_jobs',?,?)",
+            [(run_id, str(row[6]), row[1]) for row in source_tables["work_jobs"][1]])
     with kernel.storage.transaction() as tx:
+        external = wire_json({"source_kind": "original_run", "source_sha256": origin["source_sha256"],
+            "remote_heads": {"refs/heads/original/run": head}})
+        external_sha = hashlib.sha256(external).hexdigest()
+        external_id = tx.put("ticket:2", "v6_external_readproof", external)
+        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,0)",
+            ("ticket:2", "v6_external_readproof", external_sha, external_id))
         material = tx.put("ticket:2", "v6_original_cutover", wire_json(origin))
         tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,0)",
             ("ticket:2", "v6_original_cutover", origin["nonce"], material))
         entries = []
-        for issue, kind in ((2, "completed"), (3, "returned"), (4, "unallocated")):
+        for issue, kind in ((2, "completed" if head_source == "work_jobs" else "unallocated"), (3, "returned"), (4, "unallocated")):
             key = f"ticket:{issue}"
-            record = {"table": "work_jobs", "key": [run_id, f"ticket:{issue}:generation:1"]}
+            record = ({"table": "run_graph_members", "key": [run_id, "graph-version", issue]}
+                if kind == "unallocated" else {"table": "work_jobs", "key": [run_id, f"ticket:{issue}:generation:1"]})
             resources = []
             if issue == 3:
                 layout = {"version": 1, "nonce": origin["nonce"], "source_sha256": origin["source_sha256"],
@@ -63,25 +102,25 @@ def imported_cleanup(tmp_path: Path, *, stage: int = 0, subject: str = "ticket:3
                 (key, "v6_subject_import", origin["nonce"], proof_id))
             entries.append({"subject": key, "generation": 1, "proof_id": proof_id})
         proof = {"origin_nonce": origin["nonce"], "source_sha256": origin["source_sha256"],
-            "resource_mode": "existing-verified", "run_record": {"table": "run_root", "key": [run_id]},
-            "run_ref_ownership": {"source_ref": "refs/heads/original/run", "expected_oid": "e" * 40,
+            "resource_mode": "existing-verified", "external_readproof_sha256": external_sha,
+            "run_record": {"table": "run_root", "key": [run_id]},
+            "run_ref_ownership": {"source_ref": "refs/heads/original/run", "expected_oid": head,
                 "source_record": {"table": "run_root", "key": [run_id]},
-                "head_evidence": [{"table": "work_jobs", "key": [run_id, "ticket:2:generation:1"]}]},
+                "head_evidence": [{"table": "work_jobs", "key": [run_id, "ticket:2:generation:1"]}] if head_source == "work_jobs"
+                    else [{"table": "run_condition_base", "key": [run_id]}]},
             "subjects": entries}
         material = tx.put("ticket:2", "v6_run_import", wire_json(proof))
         tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,0)",
             ("ticket:2", "v6_run_import", origin["nonce"], material))
         tables = {}
-        for table, names, key, values in (
-            ("run_root", ["run_id", "value_run_branch"], [run_id], [run_id, "original/run"]),
-            ("run_condition_base", ["run_id", "value_sha"], [run_id], [run_id, base.sha]),
-            ("work_jobs", ["run_id", "job_id", "stage", "value_integrated_sha"],
-                [run_id, "ticket:2:generation:1"], [run_id, "ticket:2:generation:1", "completed", "e" * 40]),
-        ):
-            page = tx.put("ticket:2", "v6_record_page", wire_json([{"key": key, "size": 256,
-                "cells": [{"type": "text", "value": value} for value in values]}]))
-            tables[table] = {"columns": [{"name": name} for name in names], "primary_key": names[:len(key)],
-                "count": 1, "pages": [{"start": 0, "count": 1, "first": key, "last": key, "material": page}]}
+        for table, (names, rows, primary) in source_tables.items():
+            records = [{"key": [row[names.index(name)] for name in primary], "size": 256,
+                "cells": [{"type": "text" if isinstance(value, str) else "integer" if isinstance(value, int) else "null",
+                    "value": value} for value in row]} for row in rows]
+            page = tx.put("ticket:2", "v6_record_page", wire_json(records))
+            tables[table] = {"columns": [{"name": name} for name in names], "primary_key": primary,
+                "count": len(rows), "pages": [{"start": 0, "count": len(rows),
+                    "first": records[0]["key"], "last": records[-1]["key"], "material": page}]}
         archive = tx.put("ticket:2", "v6_record_manifest", wire_json({"format": "v6-records/1",
             "source": {"run_id": run_id, "sha256": origin["source_sha256"], "protocol": "sqlite-work-records-v6",
                 "schema_sha256": "56" * 32}, "tables": tables, "documents": {}}))

@@ -1,0 +1,162 @@
+"""Authenticate historical Run-ref ownership; never authorize a current write.
+
+The retired source fence anchors the original owner set. Archive labels and
+content-addressed native materials alone cannot authenticate that set. H0 is
+the imported local ref's historical head, not an observation of its current OID
+and not a receipt for a later native write.
+"""
+from __future__ import annotations
+
+from contextlib import closing, contextmanager
+import hashlib
+import json
+from pathlib import Path
+import re
+import sqlite3
+from typing import Any, Iterator, Mapping
+
+from agent_run.task_identity import TaskKey
+
+from .effects import LocalGit
+from .legacy_admission import read_source_fence
+from .migration import source_identity
+from .migration_records import V6RecordReader
+from .model import wire_json
+from .storage import Transaction
+
+
+def _rows(db: sqlite3.Connection, sql: str, values: tuple[Any, ...]) -> list[dict[str, Any]]:
+    cursor = db.execute(sql, values)
+    rows = cursor.fetchmany(4097)
+    if len(rows) > 4096:
+        raise ValueError('original_owner_limit')
+    return [dict(zip((column[0] for column in cursor.description), row, strict=True)) for row in rows]
+
+
+def _one(db: sqlite3.Connection, sql: str, values: tuple[Any, ...]) -> dict[str, Any]:
+    rows = _rows(db, sql, values)
+    if len(rows) != 1:
+        raise ValueError('original_owner_identity')
+    return rows[0]
+
+
+@contextmanager
+def _source(receipt: Mapping[str, str], opened: sqlite3.Connection | None) -> Iterator[sqlite3.Connection]:
+    path = Path(receipt['source_db'])
+    if path.resolve() != path or path != Path(receipt['target_db']).parent.parent / 'state.sqlite3':
+        raise ValueError('original_owner_source')
+    if opened is not None:
+        if Path(opened.execute('PRAGMA database_list').fetchone()[2]) != path:
+            raise ValueError('original_owner_source')
+        yield opened  # Admission already holds its source read transaction.
+        return
+    before = source_identity(path)  # Refuse same-process inode handles before opening.
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=0, isolation_level=None)) as db:
+        db.execute('PRAGMA query_only=ON')
+        db.execute('PRAGMA trusted_schema=OFF')
+        db.execute('BEGIN')
+        yield db
+        after = path.stat()
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError('original_owner_source')
+
+
+def authenticate_run_ownership(tx: Transaction, body: Mapping[str, Any], receipt: Mapping[str, str],
+        repository_root: Path, records: V6RecordReader, *, source: sqlite3.Connection | None = None) -> str:
+    """Return authenticated H0 using one decoder and the unchanged retired source.
+
+    Reuse admission's connection when available: opening/closing a second
+    descriptor could release POSIX inode locks. No prepared-state checks or
+    original business execution belongs here; native progress is permitted.
+    """
+    run_id = receipt['run_id']
+    with _source(receipt, source) as db:
+        protocol = _one(db, 'SELECT value FROM schema_meta WHERE key=?', ('protocol',))['value']
+        if read_source_fence(protocol) != dict(receipt):
+            raise ValueError('original_owner_fence')
+        run = _one(db, 'SELECT * FROM runs', ())
+        task = TaskKey(repository_root, run['repository'], run['parent_number'])
+        root = _one(db, 'SELECT * FROM run_root WHERE run_id=?', (run_id,))
+        base = _one(db, 'SELECT * FROM run_condition_base WHERE run_id=?', (run_id,))
+        if (run['run_id'] != run_id or task.fingerprint != receipt['task_fingerprint']
+                or root['value_checkout_identity'] != receipt['source_uuid']
+                or records.source.get('run_id') != run_id or records.source.get('sha256') != receipt['source_sha256']
+                or records.row('run_root', [run_id]) != root
+                or records.row('run_condition_base', [run_id]) != base):
+            raise ValueError('original_owner_identity')
+        graph = _one(db, 'SELECT version_id FROM run_graph_snapshots WHERE run_id=? AND snapshot_id=?',
+                     (run_id, root['value_graph_snapshot_id']))
+        members = {row['ticket_number'] for row in _rows(db,
+            'SELECT ticket_number FROM run_graph_members WHERE run_id=? AND version_id=?', (run_id, graph['version_id']))}
+        entries = body['subjects']
+        if (not isinstance(entries, list) or len(entries) != len(members)
+                or {entry['subject'] for entry in entries} != {f'ticket:{number}' for number in members}):
+            raise ValueError('original_owner_scope')
+        proofs = {}
+        for entry in entries:
+            if type(entry['generation']) is not int or entry['generation'] != 1:
+                raise ValueError('original_owner_generation')
+            proof = json.loads(tx.get(entry['proof_id'], entry['subject']))
+            if (proof['origin_nonce'] != receipt['nonce'] or proof['source_sha256'] != receipt['source_sha256']
+                    or proof['subject'] != entry['subject'] or type(proof['generation']) is not int or proof['generation'] != 1):
+                raise ValueError('original_owner_identity')
+            proofs[entry['subject']] = proof
+        jobs = {row['job_id']: row for row in _rows(db, 'SELECT * FROM work_jobs WHERE run_id=?', (run_id,))}
+        slots = _rows(db, 'SELECT container,slot,job_id FROM work_job_slots WHERE run_id=?', (run_id,))
+        current: set[str] = set()
+        completed = {}
+        seen: set[int] = set()
+        for slot in slots:
+            job = jobs[slot['job_id']]
+            number = job['value_ticket_number']
+            if (type(number) is not int or number not in members or number in seen
+                    or slot['container'] != 'ticket_jobs' or slot['slot'] != str(number)
+                    or job['owner_kind'] != 'ticket' or job['owner_key'] != str(number)
+                    or job['job_id'] not in {f'ticket:{number}:selection', f'ticket:{number}:generation:1'}
+                    or records.row('work_jobs', [run_id, job['job_id']]) != job):
+                raise ValueError('original_owner_identity')
+            seen.add(number)
+            proof = proofs[f'ticket:{number}']
+            if job['job_id'].endswith(':selection'):
+                if job['stage'] is not None or proof['kind'] != 'unallocated':
+                    raise ValueError('original_owner_generation')
+                continue
+            current.add(job['job_id'])
+            if (type(job['value_ticket_branch_generation']) is not int or job['value_ticket_branch_generation'] != 1
+                    or proof['source_record'] != {'table': 'work_jobs', 'key': [run_id, job['job_id']]}
+                    or proof['kind'] != ('completed' if job['stage'] == 'completed' else 'returned')):
+                raise ValueError('original_owner_generation')
+            if job['stage'] == 'completed':
+                completed[job['job_id']] = job['value_integrated_sha']
+        if (current != {key for key, job in jobs.items() if job['stage'] is not None}
+                or any(proofs[f'ticket:{number}']['kind'] != 'unallocated' for number in members - seen)):
+            raise ValueError('original_owner_scope')
+
+        external = tx.one("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
+                          "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_external_readproof'")
+        raw = tx.get(external['material_id'], external['subject'])
+        evidence = json.loads(raw)
+        ref = 'refs/heads/' + root['value_run_branch']
+        head = evidence.get('remote_heads', {}).get(ref)
+        if (external['purpose'] != 'v6_external_readproof' or external['identity'] != body['external_readproof_sha256']
+                or hashlib.sha256(raw).hexdigest() != external['identity']
+                or evidence.get('source_sha256') != receipt['source_sha256'] or evidence.get('source_kind') != 'original_run'
+                or not isinstance(head, str) or re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', head) is None
+                or head not in {base['value_sha'], *completed.values()}):
+            raise ValueError('original_owner_head')
+        git = LocalGit(repository_root)
+        if any(not isinstance(sha, str) or sha != head and
+               git.run('merge-base', '--is-ancestor', sha, head, check=False).returncode != 0
+               for sha in completed.values()):
+            raise ValueError('original_owner_completed_set')
+        witnesses = [{'table': 'work_jobs', 'key': [run_id, key]} for key, sha in completed.items() if sha == head]
+        if not witnesses:
+            witnesses = [{'table': 'run_condition_base', 'key': [run_id]}]
+        ownership = body['run_ref_ownership']
+        if (not isinstance(ownership, dict) or set(ownership) != {'source_ref', 'expected_oid', 'source_record', 'head_evidence'}
+                or ownership['source_ref'] != ref or ownership['expected_oid'] != head
+                or ownership['source_record'] != {'table': 'run_root', 'key': [run_id]}
+                or not isinstance(ownership['head_evidence'], list)
+                or sorted(ownership['head_evidence'], key=wire_json) != sorted(witnesses, key=wire_json)):
+            raise ValueError('original_owner_head')
+        return head

@@ -20,6 +20,7 @@ from .kernel import Kernel
 from .migration import MigrationRefused, SourceSnapshot, capture_v6
 from .migration_quiescence import CONTROL_TABLES
 from .model import wire_json
+from .storage import Storage
 
 
 RECORD_TABLES = CONTROL_TABLES | frozenset({
@@ -201,8 +202,8 @@ def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: 
 class V6RecordReader:
     """Read original identities, values and chronology with source provenance."""
 
-    def __init__(self, kernel: Kernel) -> None:
-        self.storage = kernel.storage
+    def __init__(self, kernel: Kernel | Storage) -> None:
+        self.storage = kernel if isinstance(kernel, Storage) else kernel.storage
         with self.storage.transaction(write=False) as tx:
             record = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_record_import'")
             self.subject = str(record['subject'])

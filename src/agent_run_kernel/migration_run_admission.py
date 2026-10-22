@@ -1,7 +1,6 @@
 """Authenticate immutable whole-Run conversion facts at existing Task admission."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -11,7 +10,7 @@ from typing import Any, Mapping
 from agent_run.managed_workspace import ManagedWorkspace
 
 from .model import KernelError
-from .storage import Transaction
+from .storage import Storage, Transaction
 from .migration_quiescence import read_v6_host_exit
 
 
@@ -137,24 +136,11 @@ def authenticate_run_transfer(tx: Transaction, imported: sqlite3.Row, body: Mapp
             seen_checkouts.add(str(checkout))
     if current_jobs != {row[0] for row in db.execute('SELECT job_id FROM work_jobs WHERE run_id=? AND stage IS NOT NULL', (run_id,))}:
         raise _refuse()
-    run_ref = body['run_ref_ownership']
-    if (not isinstance(run_ref, dict) or set(run_ref) != {'source_ref', 'expected_oid', 'source_record', 'head_evidence'}
-            or run_ref['source_ref'] != 'refs/heads/' + root[0] or run_ref['source_record'] != body['run_record']
-            or not isinstance(run_ref['head_evidence'], list) or not run_ref['head_evidence']):
-        raise _refuse()
-    for witness in run_ref['head_evidence']:
-        if witness == {'table': 'run_condition_base', 'key': [run_id]} and run_ref['expected_oid'] == root[3]:
-            continue
-        if (not isinstance(witness, dict) or set(witness) != {'table', 'key'} or witness['table'] != 'work_jobs'
-                or not isinstance(witness['key'], list) or len(witness['key']) != 2 or witness['key'][0] != run_id
-                or witness['key'][1] not in current_jobs):
-            raise _refuse()
-        rows = db.execute('SELECT stage,value_integrated_sha FROM work_jobs WHERE run_id=? AND job_id=?', tuple(witness['key'])).fetchall()
-        if rows != [('completed', run_ref['expected_oid'])]:
-            raise _refuse()
-    observed = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_external_readproof'")
-    raw = tx.get(observed['material_id'], observed['subject'])
-    external = json.loads(raw)
-    if (observed['identity'] != body['external_readproof_sha256'] or hashlib.sha256(raw).hexdigest() != observed['identity']
-            or external.get('source_sha256') != receipt['source_sha256'] or external.get('source_kind') != 'original_run'):
-        raise _refuse()
+    from .migration_records import V6RecordReader
+    from .migration_run_ownership import authenticate_run_ownership
+
+    try:
+        records = V6RecordReader(Storage(Path(receipt['target_db'])))
+        authenticate_run_ownership(tx, body, receipt, managed.repository_root, records, source=db)
+    except (KernelError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as error:
+        raise _refuse() from error
