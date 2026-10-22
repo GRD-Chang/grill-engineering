@@ -199,7 +199,7 @@ class OperationRunner:
                 if error.code != "executor_fenced":
                     raise
                 return Step("paused", "", error.code)
-            choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity)
+            choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity, poll_approval=True)
             if choice is None:
                 state = kernel.operation_state()
                 return Step(state.disposition, "", retry_at=state.wake_at)
