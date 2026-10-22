@@ -226,30 +226,34 @@ def read_imported_owner_attempts(db: sqlite3.Connection, header: RunHeader, owne
     native consumption result. Historical execution is preserved evidence;
     it certifies neither process exit nor a native continuation Opening.
     """
-    def decode(attempt_id: str, role: Role, ordinal: int, pending: bool, thread: str,
-               binding: Mapping[str, Any], invocation: Mapping[str, Any],
-               bound: Mapping[str, Any], selected: Mapping[str, Any], current: Mapping[str, Any],
-               raw_id: str, raw: Mapping[str, Any], normalized: Mapping[str, Any],
-               boundary: Mapping[str, Any]) -> ImportedAttempt:
-        attempt = _one(db, 'SELECT * FROM work_attempts WHERE run_id=? AND attempt_id=?',
-                       (header.run_id, attempt_id))
-        return ImportedAttempt(
-            record=SourceRecord('work_attempts', (header.run_id, attempt_id)), role=role,
-            role_ordinal=ordinal, generation=attempt['generation'], purpose=Purpose.REQUIREMENTS,
-            window=attempt['budget_window'], pending=pending,
-            accounted=role == Role.REVIEW and selected['budget_consumed'] == 1,
-            outcome=selected['outcome'], raw_record=SourceRecord('work_evidence', (header.run_id, raw_id)),
-            raw_result=_one(db, 'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m '
-                'ON m.material_id=e.material_id WHERE e.run_id=? AND e.evidence_id=?',
-                (header.run_id, raw_id))[0].encode('utf-8'),
-            normalized_artifact=wire_json(dict(normalized)), bound_version=wire_json(_wire_row(bound)),
-            selected_version=wire_json(_wire_row(selected)), current_version=wire_json(_wire_row(current)),
-            allocation_boundary=wire_json(dict(boundary)), execution=HistoricalExecution(
-                record=SourceRecord('work_invocations',
-                    (header.run_id, invocation['work_subject'], invocation['started_at'])),
-                binding_id=invocation['binding_id'], thread_id=thread,
-                binding=wire_json(dict(binding)), invocation=wire_json(_wire_row(invocation))),
-            continuation_basis=None)
+    def decode(*values: Any) -> ImportedAttempt:
+        return _imported_attempt(db, header.run_id, *values)
 
     return _read_owner_attempts(db, header, owner, budget, profile, decode,
         historical_base=historical_base, effective_revision=effective_revision, completed=completed)
+
+
+def _imported_attempt(db: sqlite3.Connection, run_id: str, attempt_id: str, role: Role, ordinal: int, pending: bool, thread: str,
+           binding: Mapping[str, Any], invocation: Mapping[str, Any],
+           bound: Mapping[str, Any], selected: Mapping[str, Any], current: Mapping[str, Any],
+           raw_id: str, raw: Mapping[str, Any], normalized: Mapping[str, Any],
+           boundary: Mapping[str, Any]) -> ImportedAttempt:
+    attempt = _one(db, 'SELECT * FROM work_attempts WHERE run_id=? AND attempt_id=?',
+                   (run_id, attempt_id))
+    return ImportedAttempt(
+        record=SourceRecord('work_attempts', (run_id, attempt_id)), role=role,
+        role_ordinal=ordinal, generation=attempt['generation'], purpose=Purpose.REQUIREMENTS,
+        window=attempt['budget_window'], pending=pending,
+        accounted=role == Role.REVIEW and selected['budget_consumed'] == 1,
+        outcome=selected['outcome'], raw_record=SourceRecord('work_evidence', (run_id, raw_id)),
+        raw_result=_one(db, 'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m '
+            'ON m.material_id=e.material_id WHERE e.run_id=? AND e.evidence_id=?',
+            (run_id, raw_id))[0].encode('utf-8'),
+        normalized_artifact=wire_json(dict(normalized)), bound_version=wire_json(_wire_row(bound)),
+        selected_version=wire_json(_wire_row(selected)), current_version=wire_json(_wire_row(current)),
+        allocation_boundary=wire_json(dict(boundary)), execution=HistoricalExecution(
+            record=SourceRecord('work_invocations',
+                (run_id, invocation['work_subject'], invocation['started_at'])),
+            binding_id=invocation['binding_id'], thread_id=thread,
+            binding=wire_json(dict(binding)), invocation=wire_json(_wire_row(invocation))),
+        continuation_basis=None)

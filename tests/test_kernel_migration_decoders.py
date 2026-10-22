@@ -308,3 +308,57 @@ def test_completed_decoder_keeps_optional_execution_and_real_pending_cleanup(
         assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == 0
         assert db.execute('SELECT count(*) FROM threads').fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM resource_cleanup WHERE state='pending'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('second_returned', [False, True])
+def test_whole_top_decoder_keeps_one_source_scope_and_each_owners_historical_base(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, second_returned: bool,
+) -> None:
+    import os
+    import shutil
+    from agent_run_kernel.migration_cli import _collect_original_v6
+    from agent_run_kernel.migration_run import read_original_run_import
+    from test_kernel_migration_original_source import _git_bytes
+
+    managed, paths = whole_run_managed_source(tmp_path, git_repo, second_returned=second_returned)
+    report = json.loads(paths['report'].read_bytes())
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    facts = read_original_run_import(snapshot, evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json', checkouts_snapshot=evidence / 'checkouts.json')
+    assert facts.source.mode == 'original' and facts.source.scope == 'whole-run'
+    assert facts.source.task is not None and facts.source.task.workspace == managed.repository_root
+    assert facts.source.profile_document == paths['profile'].read_bytes()
+    assert facts.source.external_readproof == (evidence / 'external-readproof.json').read_bytes()
+    a, b, c = facts.subjects
+    assert [(subject.issue, subject.kind) for subject in facts.subjects] == [
+        (2, 'completed'), (3, 'returned'), (4, 'returned' if second_returned else 'unallocated')]
+    assert a.historical_base.sha == report['default_base']
+    assert b.historical_base.sha == report['a_integrated'] != report['default_base']
+    assert [len(subject.attempts) for subject in facts.subjects] == [3, 2, 2 if second_returned else 0]
+    assert sum(len(subject.attempts) for subject in facts.subjects) == len(report['calls'])
+    assert a.completion is not None and a.completion.close_readproof is not None
+    assert json.loads(a.completion.close_ownership)['value_event_id'] == 4102
+    assert a.resources[0].disposition == 'absent'
+    assert b.resources[0].disposition == 'existing' and b.resources[0].checkout_archive_sha256
+    assert b.attempts[-1].pending and not b.attempts[-1].accounted
+    assert json.loads(b.attempts[-1].allocation_boundary)['base_sha'] == report['a_integrated']
+    if second_returned:
+        assert c.historical_base.sha == report['a_integrated']
+        assert c.resources[0].disposition == 'existing' and c.resources[0].checkout_index_sha256
+        assert c.attempts[-1].pending
+    else:
+        assert c.historical_base is None and c.resources[0].disposition == 'absent'
+        assert c.record.table == 'run_graph_members' and c.budgets == ()
+    assert all(attempt.continuation_basis is None for subject in facts.subjects for attempt in subject.attempts)
+    assert facts.run_resource.expected_oid == report['a_integrated']
+    assert facts.run_resource.head_evidence == (a.record,)
+    assert len(facts.spec.deliveries) == 4 and len(facts.subjects) == 3  # Final is only a target definition.
+    assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
+    assert not (managed.state_root / report['run_id'] / 'kernel.sqlite3').exists()
