@@ -41,6 +41,8 @@ from agent_run_kernel.legacy_admission import read_source_fence
 from agent_run_kernel.migration_completed import read_original_completed_import
 from test_kernel_migration_completed_history import _completed_source, _assert_original_records
 from agent_run.managed_workspace import ManagedWorkspace
+from support.v6_whole_run_source import whole_run_managed_source
+from agent_run_kernel.migration_run import read_original_run_import
 
 
 @pytest.fixture(scope='module')
@@ -449,3 +451,38 @@ def test_canonical_completed_install_keeps_cleanup_and_optional_history(
     _assert_original_records(snapshot, V6RecordReader(native))
     assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
     assert not (managed.state_root / facts.spec.run_id / 'kernel.sqlite3').exists()
+
+
+@pytest.mark.parametrize('second_returned', [False, True])
+def test_canonical_whole_install_preserves_real_owner_and_resource_union(
+    tmp_path, git_repo, monkeypatch, second_returned,
+):
+    import shutil
+    managed, paths = whole_run_managed_source(tmp_path, git_repo, second_returned=second_returned)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    facts = read_original_run_import(snapshot, evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json', checkouts_snapshot=evidence / 'checkouts.json')
+    origin = _import_origin(facts, managed, 'bc' * 16)
+    authenticate_imported_resources(facts, origin, evidence)
+    native = install_imported_facts(facts, tmp_path / 'canonical-whole.sqlite3', origin=origin)
+    verify_imported_installation(native, facts, origin=origin)
+    assert native.status('ticket:2')['phase'] == 'complete'
+    assert native.status('ticket:3')['phase'] == 'review'
+    assert native.status('ticket:4')['phase'] == ('review' if second_returned else 'workspace')
+    with native.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM subjects')[0] == 3
+        assert tx.one('SELECT count(*) FROM completions')[0] == 1
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        assert tx.one('SELECT count(*) FROM resource_cleanup')[0] == 0
+        proof = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_run_import'")
+        body = json.loads(tx.get(proof['material_id'], proof['subject']))
+        assert body['run_ref_ownership']['expected_oid'] == facts.subjects[0].completion.integrated.sha
+    _assert_original_records(snapshot, V6RecordReader(native))
+    assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before

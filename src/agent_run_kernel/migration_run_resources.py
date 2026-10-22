@@ -74,16 +74,19 @@ def authenticate_imported_resources(facts: ImportedRunFacts, origin: Mapping[str
         delivery = deliveries[subject.subject]
         if (resource.kind != 'ticket-workspace' or resource.owner != subject.record
                 or resource.source_ref != delivery.source_ref or resource.source_ref in seen_refs
-                or resource.checkout != checkout or resource.common_git_dir != common
-                or resource.owned_root != checkout.parent):
+                or resource.common_git_dir != common):
             raise MigrationRefused('source_resource_union')
         seen_refs.add(resource.source_ref)
         if resource.disposition == 'absent':
-            if (resource.expected_oid is not None or resource.cleanup_pending or checkout.exists() or checkout.is_symlink()
+            if (any(value is not None for value in (resource.expected_oid, resource.checkout,
+                    resource.workspace_oid, resource.owned_root, resource.before_head,
+                    resource.checkout_archive_sha256, resource.checkout_index_sha256))
+                    or resource.cleanup_pending or checkout.exists() or checkout.is_symlink()
                     or _git(root, 'for-each-ref', '--format=%(refname)', resource.source_ref)):
                 raise MigrationRefused('source_resource_absence')
         elif resource.disposition == 'existing':
-            if (resource.expected_oid is None or reader.run('symbolic-ref', '-q', resource.source_ref, check=False).returncode != 1
+            if (resource.checkout != checkout or resource.owned_root != checkout.parent
+                    or resource.expected_oid is None or reader.run('symbolic-ref', '-q', resource.source_ref, check=False).returncode != 1
                     or _git(root, 'rev-parse', '--verify', resource.source_ref) != resource.expected_oid):
                 raise MigrationRefused('source_existing_ref')
             layout = imported_resource_layout(resource, origin)
