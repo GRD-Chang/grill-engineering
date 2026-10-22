@@ -80,6 +80,7 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
     """Supervise physical calls and one bounded Core operation independently."""
     from .notifications import NativeNotifications
     runner: OperationRunner = kernel.operation_runner(execution, _make_ports)
+    runner.activate_observation()
     driver = _Executor(kernel, runner, environment)
     state = runner.state()
     workers: dict[str, tuple[AgentCall, Future[None], threading.Event]] = {}
