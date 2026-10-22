@@ -23,13 +23,14 @@ from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.local_effects import LocalEffects
 from agent_run_kernel.legacy_admission import read_source_fence
 from agent_run_kernel.migration import MigrationRefused, capture_v6
+from agent_run_kernel.offline import OfflinePort
 from agent_run_kernel.task_location import read_task, task_path
 
 from test_kernel_migration_completed_history import _continue_final, _HistoricalPublisherPort
 from test_kernel_migration_original_source import _git_bytes, _managed_source
 
 
-class _ManagedSourcePort(_HistoricalPublisherPort):
+class _ManagedSourcePort(OfflinePort):
     local_root: Path
 
     @property
@@ -37,6 +38,10 @@ class _ManagedSourcePort(_HistoricalPublisherPort):
         # Match the production Executor's exact managed resource root while
         # retaining the independent fake remote database under self.root.
         return LocalEffects(self.git, owned_root=self.local_root)
+
+
+class _HistoricalManagedSourcePort(_ManagedSourcePort, _HistoricalPublisherPort):
+    """Completed-source driver binds the publisher from its verified close."""
 
 
 _OLD_WRITES = r'''
@@ -113,7 +118,7 @@ def test_original_completed_cutover_fences_old_writers_and_continues_same_manage
     assert _git_bytes(managed.repository_root) == before
     admitted = Kernel.open_task(task)  # The actual Core gate must accept the exact transfer.
     assert admitted is not None and admitted.storage.path == target
-    port = _ManagedSourcePort.create(tmp_path / 'same-workspace-remote')
+    port = _HistoricalManagedSourcePort.create(tmp_path / 'same-workspace-remote')
     port.local_root = managed.root / 'worktrees' / run_id
     port.git = LocalGit(managed.repository_root)
     _continue_final(admitted, port, paths)

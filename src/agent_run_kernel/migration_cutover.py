@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import json
 import os
@@ -18,10 +18,11 @@ import secrets
 import selectors
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 from time import monotonic
-from typing import Any, Callable, cast
+from typing import Any, Callable, Iterator, cast
 
 from agent_run.task_identity import TaskKey
 from agent_run.managed_workspace import ManagedWorkspace
@@ -39,13 +40,15 @@ from .migration_completed import (_Completed, convert_completed_ticket_v6, _exis
 from .migration_quiescence import read_v6_host_exit
 from .migration_records import V6RecordReader
 from .migration_conversion import _git
-from .model import HostLaunch, wire_json
+from .model import HostLaunch, Profile, wire_json
 from .storage import Transaction
 from .task_location import bind_task as bind_task, locked_task, read_task
 
 
 _OLD_PROTOCOL = "sqlite-work-records-v6"
 _RETIRED_PREFIX = "retired-to-native-copy/1:"
+_COPY_IDENTITY_KEYS = frozenset({'legacy_checkout_identity', 'copy_checkout_identity',
+    'marker_device', 'marker_inode', 'copy_proof_sha256'})
 
 
 def _marker(receipt: dict[str, str]) -> str:
@@ -101,8 +104,104 @@ def _workspace_state(tx: Transaction, subject: str) -> dict[str, Any]:
     )})
     state["policy_sha256"] = hashlib.sha256(run["policy"]).hexdigest()
     state["default_ref"] = tx.one("SELECT target_ref FROM final_target")[0]
-    state["legacy_checkout_identity"] = _legacy_checkout_identity(Path(state["common_git_dir"]))
     return state
+
+
+def _copied_workspace_origin(snapshot: SourceSnapshot, native: Kernel, tx: Transaction,
+        subject: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Derive the copy commitment again from the sealed decoder, not native claims."""
+    from .migration_conversion import read_initial_import
+    from .migration_run_proof import copied_resource_proof
+    from .migration_run_projection import verify_imported_installation
+    profiles = native._profile_document(tx, tx.one('SELECT profile_revision FROM runs')[0])['profiles']
+    selected = {role: Profile(profiles[role]['model'], profiles[role]['reasoning_effort'])
+                for role in ('development', 'review', 'publication')}
+    facts = read_initial_import(snapshot, repository_root=Path(state['repository_root']),
+        source_ref=state['source_ref'], checkout=Path(state['checkout']),
+        final_checkout=Path(tx.one('SELECT checkout FROM final_target')[0]),
+        development_profile=selected['development'], review_profile=selected['review'],
+        publication_profile=selected['publication'])
+    verify_imported_installation(native, facts)
+    # Profiles are explicit frozen import inputs; they do not enter this UUID.
+    proof = copied_resource_proof(facts)
+    if (proof is None or proof['format'] != 'copied-idle-resources/1'
+            or facts.spec.run_id != tx.one('SELECT id FROM runs')[0]
+            or len(facts.subjects) != 1 or facts.subjects[0].subject != subject
+            or facts.source.checkout_uuid is None or facts.source.checkout_uuid == proof['copy_uuid']):
+        raise MigrationRefused('workspace_return_origin_unproved')
+    physical = (Path(state['common_git_dir']) / 'agent-run-checkout-id').lstat()
+    result = dict(state, legacy_checkout_identity=facts.source.checkout_uuid,
+        copy_checkout_identity=proof['copy_uuid'], marker_device=physical.st_dev, marker_inode=physical.st_ino,
+        copy_proof_sha256=hashlib.sha256(wire_json(proof)).hexdigest())
+    _verify_copied_origin(snapshot, tx, result)
+    with _copy_marker(result, source_allowed=False):
+        pass
+    return result
+
+
+def _verify_copied_origin(snapshot: SourceSnapshot, tx: Transaction, state: dict[str, Any]) -> None:
+    validate_snapshot(snapshot)
+    if (not _COPY_IDENTITY_KEYS <= state.keys()
+            or any(not isinstance(state[k], str) or len(state[k]) != 32
+                   or any(c not in '0123456789abcdef' for c in state[k])
+                   for k in ('legacy_checkout_identity', 'copy_checkout_identity'))
+            or state['legacy_checkout_identity'] == state['copy_checkout_identity']
+            or any(type(state[k]) is not int for k in ('marker_device', 'marker_inode'))):
+        raise MigrationRefused('workspace_return_origin_unproved')
+    with closing(sqlite3.connect(snapshot.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        roots = db.execute('SELECT run_id,value_checkout_identity FROM run_root').fetchall()
+    run_id = tx.one('SELECT id FROM runs')[0]
+    rows = tx.rows("SELECT id,subject FROM material WHERE purpose='v6_import_identity'", limit=2)
+    if len(rows) != 1 or roots != [(run_id, state['legacy_checkout_identity'])]:
+        raise MigrationRefused('workspace_return_origin_unproved')
+    imported = json.loads(tx.get(rows[0]['id'], rows[0]['subject']))
+    proof = imported.get('local_resources')
+    if (imported.get('source_sha256') != snapshot.sha256 or imported.get('source_mode') != 'copied'
+            or not isinstance(proof, dict) or proof.get('source_sha256') != snapshot.sha256
+            or proof.get('run_id') != run_id or proof.get('copy_uuid') != state['copy_checkout_identity']
+            or hashlib.sha256(wire_json(proof)).hexdigest() != state['copy_proof_sha256']):
+        raise MigrationRefused('workspace_return_origin_unproved')
+
+
+def _check_copy_marker(descriptor: int, state: dict[str, Any], *, source_allowed: bool) -> bytes:
+    marker = Path(state['common_git_dir']) / 'agent-run-checkout-id'
+    opened, current = os.fstat(descriptor), marker.lstat()
+    identity = state['marker_device'], state['marker_inode']
+    if (any(not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 33
+            or (info.st_dev, info.st_ino) != identity for info in (opened, current))):
+        raise MigrationRefused('workspace_return_clone_identity')
+    value = os.pread(descriptor, 34, 0)
+    allowed = {(state['copy_checkout_identity'] + '\n').encode('ascii')}
+    if source_allowed:
+        allowed.add((state['legacy_checkout_identity'] + '\n').encode('ascii'))
+    if value not in allowed:
+        raise MigrationRefused('workspace_return_clone_identity')
+    return value
+
+
+@contextmanager
+def _copy_marker(state: dict[str, Any], *, source_allowed: bool) -> Iterator[int]:
+    try:
+        descriptor = os.open(Path(state['common_git_dir']) / 'agent-run-checkout-id',
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            _check_copy_marker(descriptor, state, source_allowed=source_allowed)
+            yield descriptor
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise MigrationRefused('workspace_return_clone_identity') from error
+
+
+def _handoff_copy_marker(descriptor: int, state: dict[str, Any]) -> None:
+    """Fixed-size write to the authenticated object, never replace a pathname."""
+    _check_copy_marker(descriptor, state, source_allowed=True)
+    target = (state['legacy_checkout_identity'] + '\n').encode('ascii')
+    if os.pwrite(descriptor, target, 0) != len(target):
+        raise MigrationRefused('workspace_return_clone_identity')
+    os.fsync(descriptor)
+    if _check_copy_marker(descriptor, state, source_allowed=True) != target:
+        raise MigrationRefused('workspace_return_clone_identity')
 
 
 def _workspace_git(state: dict[str, Any], *, created: bool) -> bool:
@@ -116,7 +215,7 @@ def _workspace_git(state: dict[str, Any], *, created: bool) -> bool:
             or _git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir") != str(common)
             or _git(checkout, "rev-parse", "HEAD") != state["base_sha"]
             or _git(checkout, "status", "--porcelain")
-            or _legacy_checkout_identity(common) != state["legacy_checkout_identity"]
+            or _legacy_checkout_identity(common) != state.get('_physical_checkout_identity', state['copy_checkout_identity'])
             or _git(root, "rev-parse", state["target_ref"]) != state["base_sha"]
             or _git(root, "rev-parse", state["default_ref"]) != state["base_sha"]):
         raise MigrationRefused("workspace_return_resource_changed")
@@ -195,7 +294,8 @@ def _workspace_inverse(tx: Transaction, receipt: dict[str, str]) -> dict[str, An
     state = _workspace_state(tx, original["id"])
     before = dict(state, version=state["version"] - 1, phase="workspace")
     effects = tx.all("SELECT * FROM effects")
-    if (before != original or state["phase"] != "development" or len(effects) != 1
+    if (before != {k: v for k, v in original.items() if k not in _COPY_IDENTITY_KEYS}
+            or state["phase"] != "development" or len(effects) != 1
             or any(tx.one(f"SELECT count(*) FROM {table}")[0] for table in (
                 "attempts", "completions", "checks", "grants", "final_barriers"))
             or tx.rows("SELECT subject FROM budgets WHERE developments_used!=0 OR reviews_used!=0")
@@ -217,7 +317,7 @@ def _workspace_inverse(tx: Transaction, receipt: dict[str, str]) -> dict[str, An
             or result.get("disposition") != "target"
             or result.get("commit") != {"sha": state["base_sha"], "tree": state["base_tree"]}):
         raise MigrationRefused("workspace_return_effect_unsupported")
-    return state
+    return {**state, **{k: original[k] for k in _COPY_IDENTITY_KEYS}}
 
 
 def _protocol_from_locked_copy(descriptor: int, parent: Path) -> str:
@@ -325,7 +425,7 @@ def cutover_idle_copied_v6(
                "run_id": run_id, "source_sha256": snapshot.sha256,
                "task_fingerprint": task.fingerprint}
     with native.storage.transaction(write=False) as tx:
-        workspace = _workspace_state(tx, subject)
+        workspace = _copied_workspace_origin(snapshot, native, tx, subject, _workspace_state(tx, subject))
     _workspace_git(workspace, created=False)
     receipt["workspace"] = wire_json(workspace).decode()
     if len(_marker(receipt)) > 8192:
@@ -401,31 +501,46 @@ def _restore_copied_v6(
                         or tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0")
                         or tx.rows("SELECT owner FROM retired_executors WHERE status!='exited'")):
                     raise MigrationRefused("native_effect_or_host_unsettled")
-                inverse = _workspace_inverse(tx, receipt) if workspace else None
-                if not workspace and tx.one("SELECT count(*) FROM effects")[0]:
-                    raise MigrationRefused("native_effect_or_host_unsettled")
                 history = tx.rows("SELECT subject,material_id FROM history WHERE kind='v6_private_cutover' AND identity=?",
                                   (nonce,))
                 if len(history) != 1 or json.loads(tx.get(history[0]["material_id"], history[0]["subject"])) != receipt:
                     raise MigrationRefused("copied_v6_fence_identity")
                 binding = read_task(locator)
                 if (binding != (receipt["run_id"], new)
-                        and not (workspace and binding == (receipt["run_id"], old))):
+                        and binding != (receipt["run_id"], old)):
                     raise MigrationRefused("native_task_location_changed")
+                original = json.loads(receipt['workspace'])
+                if not isinstance(original, dict) or not isinstance(original.get('id'), str):
+                    raise MigrationRefused('workspace_return_origin_unproved')
+                _verify_copied_origin(snapshot, tx, original)
+                inverse = _workspace_inverse(tx, receipt) if workspace else None
+                if not workspace and (tx.one("SELECT count(*) FROM effects")[0]
+                        or _workspace_state(tx, original['id']) != {
+                            k: v for k, v in original.items() if k not in _COPY_IDENTITY_KEYS}
+                        or any(tx.one(f'SELECT count(*) FROM {name}')[0] for name in (
+                            'attempts', 'completions', 'checks', 'grants', 'final_barriers'))
+                        or tx.rows("SELECT subject FROM budgets WHERE developments_used!=0 OR reviews_used!=0")
+                        or tx.rows("SELECT id FROM actions WHERE kind NOT IN ('run','stop') OR subject IS NOT NULL")):
+                    raise MigrationRefused('native_effect_or_host_unsettled')
                 with _offline_source(old) as descriptor:
                     if _protocol_from_locked_copy(descriptor, old.parent) != _marker(receipt):
                         raise MigrationRefused("copied_v6_fence_changed")
                     if os.fstat(descriptor).st_nlink != 1:
                         raise MigrationRefused("copied_v6_changed")
-                    if inverse is not None:
-                        # The origin proves absence, and the sole confirmed
-                        # native operation created exactly this local ref.
-                        # CAS never deletes an advanced or borrowed branch.
-                        _delete_workspace_ref(inverse)
-                    # The v6 DB is incompatible with native admission. A
-                    # durable locator tombstone precedes restoring its bytes.
-                    bind_task(locator, receipt["run_id"], old)
-                    os.replace(restored, old)
+                    with _copy_marker(original, source_allowed=binding == (receipt['run_id'], old)) as marker_fd:
+                        current = os.pread(marker_fd, 34, 0).decode('ascii').rstrip('\n')
+                        physical = dict(inverse or original, _physical_checkout_identity=current)
+                        if inverse is not None:
+                            # The sole confirmed native operation created this
+                            # ref; its exact CAS remains idempotent after exit.
+                            _delete_workspace_ref(physical)
+                        else:
+                            _workspace_git(physical, created=False)
+                        # A durable locator tombstone precedes handing back
+                        # the same physical marker and publishing old bytes.
+                        bind_task(locator, receipt["run_id"], old)
+                        _handoff_copy_marker(marker_fd, original)
+                        os.replace(restored, old)
                     parent_fd = os.open(old.parent, os.O_RDONLY | os.O_DIRECTORY)
                     try:
                         os.fsync(parent_fd)

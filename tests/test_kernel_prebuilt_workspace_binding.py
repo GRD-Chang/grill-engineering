@@ -168,6 +168,14 @@ def test_same_gen1_source_change_reuses_binding_after_partial_prior_retirement(t
 
     monkeypatch.setattr(migration_run_ownership, "prebuilt_workspace_binding", source_port)
     original = workspace_intent(scenario, monkeypatch).effect
+
+    # Core client test: authentication matches the mocked source getter. This
+    # is not proof/ownership coverage; Git dispatch and partial readback are real.
+    def physical_binding(git, effect):
+        assert effect.payload["prebuilt_workspace"] == certified
+        return certified
+
+    monkeypatch.setattr(migration_run_ownership, "authenticate_prebuilt_workspace", physical_binding)
     checkout = Path(original.payload["checkout"])
     run = LocalGit.run
 

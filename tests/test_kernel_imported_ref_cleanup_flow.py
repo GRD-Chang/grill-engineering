@@ -15,11 +15,11 @@ from agent_run_kernel.migration import capture_v6
 from agent_run_kernel.migration_cutover import migrate_completed_original_v6
 
 from test_kernel_migration_completed_history import _continue_final
-from test_kernel_migration_original_cutover import _ManagedSourcePort
+from test_kernel_migration_original_cutover import _HistoricalManagedSourcePort
 from test_kernel_migration_original_source import _managed_source
 
 
-class _IndependentRunRefPort(_ManagedSourcePort):
+class _IndependentRunRefPort(_HistoricalManagedSourcePort):
     """Synthetic remote refs stay independent of the original local RunBranch.
 
     Native RemoteEffects pushes an object SHA without updating this local

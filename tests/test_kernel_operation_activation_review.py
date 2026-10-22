@@ -2,6 +2,7 @@
 import os
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -278,7 +279,8 @@ def test_formal_host_approval_cas_retries_without_consuming_its_observation(tmp_
     monkeypatch.setattr(ports, "delivery", physical)
     monkeypatch.setattr(ports, "execute", lambda *a: pytest.fail("CAS recovery grants no write"))
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
-    monkeypatch.setattr(executor.time, "sleep", idle)
+    # Replace only the Host's dependency; subprocess.wait keeps real time.sleep.
+    monkeypatch.setattr(executor, "time", SimpleNamespace(sleep=idle))
     monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
     monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
                         lambda *a, **kw: pytest.fail("CAS recovery allocates no Agent"))

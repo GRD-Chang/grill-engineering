@@ -13,7 +13,7 @@ from agent_run_kernel.migration_cutover import migrate_completed_original_v6
 from agent_run_kernel.offline import fixture_inputs
 from agent_run_kernel.task_location import read_task, task_path
 from test_kernel_migration_completed_history import _continue_final
-from test_kernel_migration_original_cutover import _ManagedSourcePort
+from test_kernel_migration_original_cutover import _HistoricalManagedSourcePort
 from test_kernel_migration_original_source import _managed_source
 
 
@@ -28,7 +28,7 @@ def test_legal_native_successor_keeps_the_fixed_original_task_origin(
         nonce="7d" * 16, profile_snapshot=paths["profile"], github_snapshot=paths["github"],
         observation_snapshot=paths["observation"], original_report=paths["report"])
     assert Kernel.open_task(task).storage.path == kernel.storage.path
-    port = _ManagedSourcePort.create(tmp_path / "remote")
+    port = _HistoricalManagedSourcePort.create(tmp_path / "remote")
     port.local_root = managed.root / "worktrees" / kernel.storage.path.parent.name
     port.git = LocalGit(managed.repository_root)
     _continue_final(kernel, port, paths)

@@ -270,13 +270,23 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    interrupted = scenario.run()
-    assert interrupted.kind == "waiting" and interrupted.reason == "required_checks"
-    assert interrupted.retry_at == 1005.25
+    for _ in range(80):
+        interrupted = scenario.step()
+        if attempts:
+            break
+    else:
+        raise AssertionError("The optional link write was never reached")
+    # Like RemoteEffects._link_issue, a lost optional acknowledgement is an
+    # indeterminate write result, not a source read or required-checks wait.
+    assert interrupted.kind == "progress" and interrupted.retry_at is None
+    assert scenario.runner().state().wake_at is None
     with scenario.kernel.storage.transaction(write=False) as tx:
-        waiting = tx.one("SELECT evidence FROM waits WHERE subject=?", (scenario.delivery.key,))
-        assert json.loads(tx.get(waiting["evidence"], scenario.delivery.key))["code"] == "write_response_unavailable"
-    now[0] = interrupted.retry_at
+        assert not tx.rows("SELECT evidence FROM waits WHERE subject=?", (scenario.delivery.key,))
+    world = scenario.world()
+    assert world.checks is not None and world.checks.result == "none"
+    assert world.pr is not None and world.checks.head_sha == world.pr.head.sha
+    budgets_at_loss = scenario.kernel.status(scenario.delivery.key)["budgets"]
+    calls_at_loss = list(scenario.role_calls)
     # A separate operation continues business after the optional response loss;
     # the original indeterminate display mutation must never be replayed.
     boundary = scenario.run()
@@ -287,6 +297,8 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     assert durable["phase"] == "complete"
     assert durable["issue_link"]["state"] == "indeterminate"
     assert durable["issue_link"]["source_sha"] == original.payload["source_head"]
+    assert durable["budgets"] == budgets_at_loss
+    assert scenario.role_calls == calls_at_loss
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
     assert sum(write["operation"] == "issue_link" for write in writes_before) == 1
     scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")

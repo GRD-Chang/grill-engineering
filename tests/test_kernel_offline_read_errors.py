@@ -71,6 +71,36 @@ def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tm
     assert not [row for row in scenario.kernel.history(call.subject) if row['kind'] == 'effect_failed']
 
 
+def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path: Path, monkeypatch) -> None:
+    scenario = Scenario(tmp_path / 'optional-link', DeliveryKind.TICKET)
+    scenario.kernel.clock = lambda: 1000.25
+    scenario.port.lose_response.add('issue_link')
+    execute = scenario.port.execute
+    attempted = []
+
+    def record(effect, authorize):
+        if effect.operation == 'issue_link':
+            attempted.append(effect)
+        return execute(effect, authorize)
+
+    monkeypatch.setattr(scenario.port, 'execute', record)
+    for _ in range(80):
+        step = scenario.step()
+        if attempted:
+            break
+    else:
+        raise AssertionError('The optional link write was never reached')
+    assert step.kind == 'progress' and step.retry_at is None
+    assert len(attempted) == 1
+    assert scenario.kernel.status(scenario.delivery.key)['issue_link']['state'] == 'indeterminate'
+    world = scenario.world()
+    assert world.checks is not None and world.checks.result == 'none'
+    assert world.pr is not None and world.checks.head_sha == world.pr.head.sha
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT scope_id FROM waits WHERE subject=?', (scenario.delivery.key,))
+    assert [row['operation'] for row in scenario.port.writes()].count('issue_link') == 1
+
+
 @pytest.mark.parametrize('failure', ['readback', 'response'])
 def test_post_write_outage_keeps_sent_merge_without_command_failure_or_replay(tmp_path: Path, failure: str) -> None:
     scenario = Scenario(tmp_path / failure, DeliveryKind.PARENT_ONLY)

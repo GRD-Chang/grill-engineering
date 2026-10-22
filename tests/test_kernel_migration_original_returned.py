@@ -191,7 +191,8 @@ def test_original_returned_role_transfers_exact_pending_work_without_replay(
                 port.git.run('update-ref', effect.source_ref, foreign_oid, expected_oid)
         return original_execute(effect, authorize)
     port.execute = execute
-    boundary = scenario.run()
+    # This drives the whole returned workflow, retaining run()'s 200-step bound.
+    boundary = scenario.cleanup(max_steps=200) if foreign_ref else scenario.run()
     # Business completion survives a refused cleanup of a foreign ref. The
     # runner reports the remaining cleanup separately instead of claiming it
     # succeeded; the original ownership assertions below remain unchanged.

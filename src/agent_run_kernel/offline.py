@@ -660,6 +660,8 @@ class _ScenarioPorts:
         except GitHubReadError as error:
             raise ReadUnavailable(error.code, error.message) from error
         except LostResponse as error:
+            if effect.operation == "issue_link":
+                return EffectResult("unknown", raw={"display": "indeterminate", "diagnostic": bounded_error(str(error))})
             raise ReadUnavailable('write_response_unavailable', bounded_error(str(error))) from error
         if effect.operation == "issue_link":
             return result if result is not None else EffectResult("unknown")

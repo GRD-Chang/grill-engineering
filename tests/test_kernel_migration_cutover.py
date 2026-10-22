@@ -37,9 +37,6 @@ def test_current_workspace_child_uses_frozen_v6_source_and_real_runner(
     """An additional normal producer; never replaces a sealed fixed oracle."""
     private = tmp_path / 'private'
     private.mkdir()
-    moved = private / 'repository'
-    git_repo.rename(moved)
-    git_repo = moved
     old_root = tmp_path / 'original-state'
     issue = {'number': 2, 'title': 'Ticket 2', 'body': 'Deliver the selected ticket.',
              'state': 'OPEN', 'labels': ['ready-for-agent'], 'blocked_by': []}
@@ -47,11 +44,21 @@ def test_current_workspace_child_uses_frozen_v6_source_and_real_runner(
                                issues={'2': issue}))
     state = original_v6('start', root=old_root, git=git_repo, fixture=fixture)['state']
     snapshot = capture_v6(old_root / 'state.sqlite3', tmp_path / 'sealed.sqlite3')
+    # Source authority keeps its original UUID. The current copied transport
+    # receives a new clone, not a borrowed legacy marker in the source clone.
+    from agent_run_kernel.effects import LocalGit
+    source_git = LocalGit(git_repo)
+    copied = private / 'repository'
+    source_git.run('clone', '--no-hardlinks', str(git_repo), str(copied))
+    git_repo = copied
+    git = LocalGit(git_repo)
+    for name in ('user.name', 'user.email'):
+        git.run('config', name, source_git.run('config', '--get', name).stdout.strip())
+    git.run('update-ref', 'refs/heads/' + state['run_branch'], state['base']['sha'])
+    assert not (copied / '.git/agent-run-checkout-id').exists()
     work = private / 'work'
     checkout = work / 'converted-ticket-2'
     work.mkdir(exist_ok=True)
-    from agent_run_kernel.effects import LocalGit
-    git = LocalGit(git_repo)
     git.run('worktree', 'add', '--detach', str(checkout), state['base']['sha'])
     kernel = convert_initial_v6(snapshot, private / 'kernel.sqlite3', repository_root=git_repo,
         source_ref=f"refs/heads/agent-run/{state['run_id']}/converted-ticket-2", checkout=checkout,
@@ -473,13 +480,12 @@ def test_real_workspace_effect_returns_to_unchanged_02_and_continues(
                  f"refs/heads/{run_branch}:refs/remotes/v6/run")
     port.git.run("reset", "--hard", base)
     port.git.run("update-ref", f"refs/heads/{run_branch}", base)
-    # A bundle omits local clone metadata. Copy the sealed v6 clone identity
-    # into this newly owned private clone, rather than bypassing old admission.
+    # Keep the sealed source identity as the inverse expectation. The unique
+    # installer creates this new private clone's distinct copy identity.
     with closing(sqlite3.connect(snapshot.path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
         checkout_identity = db.execute("SELECT value_checkout_identity FROM run_root").fetchone()[0]
     marker = port.git.root / ".git" / "agent-run-checkout-id"
     assert not marker.exists()
-    marker.write_text(checkout_identity + "\n", encoding="ascii")
     checkout = private / "new-runtime" / "work" / "ticket-2"
     checkout.parent.mkdir()
     port.git.run("worktree", "add", "--detach", str(checkout), base)
