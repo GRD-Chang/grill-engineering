@@ -399,5 +399,218 @@
       "result": "1 passed, 5 deselected",
       "seconds": 6.46
     }
+  },
+  "initial_tests_commit": "dbfddc8d9bbe4ce69ee38ac81b2f7715f253acc0",
+  "followup_verification": {
+    "base_tests_commit": "dbfddc8d9bbe4ce69ee38ac81b2f7715f253acc0",
+    "exact_fix_increments": [
+      {
+        "commit": "3f3fcad4eca8d5caaf8c9144b895104e779154a5",
+        "parents": [
+          "bae9d20cf38dc2c3053768707e5a921fae31d5f3"
+        ]
+      },
+      {
+        "commit": "c649dcf949397f0f8de749b3c035b7d7422bd438",
+        "parents": [
+          "3f3fcad4eca8d5caaf8c9144b895104e779154a5"
+        ]
+      },
+      {
+        "commit": "6e981dcdec8986f074a4da0579699cc69bcae9fc",
+        "parents": [
+          "9f8c24eb8e74bf2db65d24c9652468e1f613be8b"
+        ]
+      }
+    ],
+    "local_verification_head": "247a21fb9cbedc438622a67130f6394bfa55de50",
+    "exact_test_overlays": [
+      {
+        "source_commit": "ec872188853c3d261c728a4ecdb86f4118977337",
+        "path": "project/tests/test_kernel_abandon.py",
+        "git_blob": "a00cfebf57df49ea2d5f1ed84c6e6e27c40823ab"
+      },
+      {
+        "source_commit": "ec872188853c3d261c728a4ecdb86f4118977337",
+        "path": "project/tests/test_kernel_abandon_recovery.py",
+        "git_blob": "257764648aa3c11fa9b2121b8095ae5ca973e35a"
+      }
+    ],
+    "command": "python -m pytest -q -n 2 --dist worksteal tests/test_kernel_operation_review_regressions.py tests/test_kernel_control_operation_observation.py tests/test_kernel_operation_read_errors.py tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[unknown] tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[third] tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[unknown] tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[third] tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[reopen_ticket] tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[recovery_comment] tests/test_kernel_operation_integration.py::test_host_real_core_original_merge_readback_final_approval_and_cleanup tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent",
+    "results": {
+      "top_level_nodes": 30,
+      "junit_tests_including_subtests": 38,
+      "failed_nodes": 3,
+      "skipped": 0,
+      "passed_subtests": 8,
+      "seconds": 104.046,
+      "nodes": [
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_stop_resume_preserves_the_original_source_wait_deadline",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[revise]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[source]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[delivery]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-zero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-nonzero]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-zero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-nonzero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_offline_lost_response_is_unknown_without_an_observed_command_failure",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_formal_graph_completion_final_still_retires_the_remote_run_branch",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_never_claims_executor_or_allocates_work",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[source]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[epoch]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[stop]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[approve]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[third]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[unknown]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[requeue]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[third]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[reopen_ticket]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[recovery_comment]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_integration.py::test_host_real_core_original_merge_readback_final_approval_and_cleanup",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_cold_github_import_does_not_cycle_through_operation_runner",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_bootstrap_read_outage_retains_original_wait_and_lease",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_source_read_window_survives_stop_and_a_proven_executor_handoff",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates[stop]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates[requirements]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[unknown]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent",
+          "result": "pass"
+        }
+      ]
+    },
+    "source_mypy": "Success: no issues found in 125 source files",
+    "source_blob_checks": {
+      "kernel.py": "matches exact c649dcf",
+      "operation_runner.py": "matches exact c649dcf",
+      "offline.py": "matches exact 6e981dc"
+    },
+    "conclusions": {
+      "fixed": "Stop/resume original deadline; four Final/Parent late-readback cases; two Abandon original-window cases (8 subtests); manual control observation.",
+      "still_red": "Slow source and delivery reads crossing the absolute wait deadline allocate an Agent; successful readback of actual nonzero command loses the failure audit.",
+      "limited": "One shared choice implementation differentiates explicit manual polls from passive state; late target readback preserves gates and does not grant a new write. Prior/approval behavior is not declared closed. No real online/systemd/sandbox acceptance."
+    },
+    "host_loop_regression": {
+      "module": "tests/test_kernel_operation_review_host.py",
+      "sha256": "3538e9c50afe4dcd3834b07b361f835d57f4a6301f114c12b4b97e2cd9919296",
+      "command": "python -m pytest -q tests/test_kernel_operation_review_host.py",
+      "original_edbbeb62_results": {
+        "top_level_nodes": 1,
+        "junit_tests_including_subtests": 1,
+        "failed_nodes": 0,
+        "skipped": 0,
+        "passed_subtests": 0,
+        "seconds": 2.849,
+        "nodes": [
+          {
+            "nodeid": "tests/test_kernel_operation_review_host.py::test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback",
+            "result": "pass"
+          }
+        ]
+      },
+      "with_exact_fixes_results": {
+        "top_level_nodes": 1,
+        "junit_tests_including_subtests": 1,
+        "failed_nodes": 0,
+        "skipped": 0,
+        "passed_subtests": 0,
+        "seconds": 3.488,
+        "nodes": [
+          {
+            "nodeid": "tests/test_kernel_operation_review_host.py::test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback",
+            "result": "pass"
+          }
+        ]
+      },
+      "contract": "executor.run exits at unknown push without polling or writing despite now-readable target; explicit subject resume uses original readback, preserves one push and Attempt count, and reaches approval. No Agent is allowed to start in the Host runs. NativeNotifications is replaced by a no-I/O observer; this tests the real Host loop, not an actual systemd service or worker namespace."
+    }
   }
 }
