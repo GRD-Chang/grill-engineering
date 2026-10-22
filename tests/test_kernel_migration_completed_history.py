@@ -312,7 +312,9 @@ class _HistoricalPublisherPort(OfflinePort):
                        publisher_actor=self.original_actor)
 
 
-def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[str, Path]) -> None:
+def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[str, Path], *,
+                    reviews: tuple[str, ...] = ('pass',), expected_kind: str = 'complete',
+                    imported_close: dict[str, Any] | None = None, retire_ticket: bool = False) -> None:
     """Reuse the existing native driver, with copied old Git/external facts."""
     report = json.loads(paths['report'].read_text())
     run_id = report['source_identity']['run_id']
@@ -321,8 +323,23 @@ def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[
     assert run_head.sha == report['integrated_sha']
     with closing(sqlite3.connect(paths['database'])) as old:
         old.row_factory = sqlite3.Row
-        close = dict(old.execute('SELECT * FROM work_job_ticket_close_ownership').fetchone())
-    assert json.loads(paths['github'].read_text())['delivery']['ticket_close_ownership']['2']['actor'] == close['value_actor']
+        ownership = old.execute('SELECT * FROM work_job_ticket_close_ownership').fetchone()
+        intent = old.execute('SELECT * FROM work_job_ticket_close_intent').fetchone()
+    if imported_close is None:
+        close = dict(ownership)
+        assert json.loads(paths['github'].read_text())['delivery']['ticket_close_ownership']['2']['actor'] == close['value_actor']
+        close_binding, close_actor = close['value_intent_binding'], close['value_actor']
+    else:
+        # Use the authenticated readback supplied by the real migration story;
+        # an absent original ownership row stays absent.
+        assert ownership is None and retire_ticket
+        assert imported_close['disposition'] == 'target'
+        raw = imported_close['raw']
+        assert raw['event']['event'] == 'closed' and raw['event']['id'] > intent['value_baseline_event_id']
+        assert raw['close_intent']['intent_binding'] == intent['value_intent_binding']
+        assert raw['event']['actor']['login'] == raw['close_intent']['actor'] == intent['value_actor']
+        assert raw['close_intent']['merge_sha'] == run_head.sha and raw['close_intent']['issue'] == 2
+        close_binding, close_actor = raw['close_intent']['intent_binding'], raw['event']['actor']['login']
     prior = report['source_identity']['pull_request']
     prior_pr = PullRequest(prior['number'], 'example/project', 'refs/heads/' + prior['branch'],
                            'refs/heads/' + prior['base_branch'], port.git.commit(prior['head_sha']),
@@ -330,9 +347,13 @@ def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[
                            state=prior['state'], merged=port.git.commit(prior['integrated_sha']))
     with closing(sqlite3.connect(port.database)) as remote:
         remote.execute('DELETE FROM refs')
-        remote.executemany('INSERT INTO refs VALUES (?,?)', [('refs/heads/main', default.sha), (run_ref, run_head.sha)])
+        refs = [('refs/heads/main', default.sha), (run_ref, run_head.sha)]
+        if retire_ticket:
+            assert port.git.commit(prior_pr.source_ref) == prior_pr.head
+            refs.append((prior_pr.source_ref, prior_pr.head.sha))
+        remote.executemany('INSERT INTO refs VALUES (?,?)', refs)
         remote.execute('INSERT INTO closed VALUES (?,?,?,?)',
-                       (2, close['value_intent_binding'], close['value_actor'], run_head.sha))
+                       (2, close_binding, close_actor, run_head.sha))
         remote.execute('INSERT INTO prs VALUES (?,?,?)', (prior_pr.number, 'ticket:2', wire_json(asdict(prior_pr))))
         remote.commit()
     state = kernel.status('ticket:2')
@@ -343,7 +364,7 @@ def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[
         profiles = json.loads(tx.get(profile['material_id'], profile['subject']))
         old_effects = [tuple(row) for row in tx.rows("SELECT id,status,payload_id,receipt_id FROM effects WHERE id LIKE 'v6-import:%' ORDER BY id")]
     execution = kernel.claim_executor('completed-history-native-executor')
-    port.original_actor = close['value_actor']
+    port.original_actor = close_actor
     scenario = Scenario.__new__(Scenario)
     scenario.script, scenario.kernel, scenario.port, scenario.execution = None, kernel, port, execution
     scenario.delivery = kernel.delivery('ticket:2')
@@ -352,17 +373,26 @@ def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[
                                 profiles, inputs['prompt_resources'], inputs['worker_identity'],
                                 inputs['runner_identity'], inputs['notifications'], inputs['provenance']))
     scenario.initial = default
-    scenario.reviews, scenario.checks = ['pass'], ['none']
+    assert reviews in (('pass',), ('fail', 'pass'))
+    scenario.reviews, scenario.checks = list(reviews), ['none']
     scenario.review_count = scenario.development_count = scenario.publication_count = 0
     scenario.heads, scenario.role_calls, scenario.checkpoints, scenario.reviewed_heads = [], [], [], []
     scenario.edits = None
     configure_source(scenario, json.loads(paths['github'].read_text()))
     final = admit_final(scenario)
     scenario.delivery = kernel.delivery(final)
-    assert scenario.run(approve=True).kind == 'complete'
+    assert expected_kind in {'complete', 'paused'}
+    outcome = scenario.run(approve=True)
+    assert outcome.kind == expected_kind, outcome
     assert kernel.status(final)['phase'] == 'complete'
-    assert [call['role'] for call in scenario.role_calls] == ['review', 'publication']
-    assert all(write['subject'] == final for write in port.writes())
+    assert [call['role'] for call in scenario.role_calls] == (
+        ['review', 'publication'] if reviews == ('pass',) else ['review', 'development', 'review', 'publication'])
+    if retire_ticket:
+        assert kernel.status('ticket:2')['resource_cleanup']['state'] == 'complete'
+        assert all(write['subject'] == final or write['subject'] == 'ticket:2'
+            and write['operation'] in {'cleanup_worktree', 'cleanup_local_ref', 'cleanup_remote_ref'} for write in port.writes())
+    else:
+        assert all(write['subject'] == final for write in port.writes())
     assert port.pull_request('ticket:2') == prior_pr
     new_pr = port.pull_request(final)
     assert new_pr is not None and new_pr.number > prior_pr.number

@@ -107,7 +107,8 @@ def _original_cleanup(tmp_path: Path, git_repo: Path, *, foreign_move: bool, rep
         return original_execute(effect, authorize)
 
     port.execute = execute
-    _continue_final(admitted, port, paths, reviews=('fail', 'pass') if repair else ('pass',))
+    _continue_final(admitted, port, paths, reviews=('fail', 'pass') if repair else ('pass',),
+        expected_kind='paused' if foreign_move else 'complete')
     assert len(local_cleanup) == 1
     if foreign_move:
         assert git.commit(run_ref).sha == foreign_oid
