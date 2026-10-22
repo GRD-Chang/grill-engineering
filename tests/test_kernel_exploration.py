@@ -136,7 +136,16 @@ def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tm
 
 def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
+    waiting = scenario.run()
+    assert waiting.kind == "waiting" and waiting.reason == "github_convergence"
+    assert waiting.retry_at == 105.25
+    original = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert original["operation"] == "pr_write" and original["status"] == "sent"
+    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
+    now[0] = waiting.retry_at
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
     assert scenario.publication_count == 1
@@ -380,6 +389,7 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     edits = ({file_name: "Resolved complete content\n"},) if kind == DeliveryKind.FINAL_RUN else (
         {file_name: "Candidate content\n"}, {file_name: "Resolved complete content\n"})
     scenario = Scenario(tmp_path / "scenario", kind, edits=edits)
+    historical_writes = scenario.port.writes()
     if kind != DeliveryKind.FINAL_RUN:
         for _ in range(30):
             if scenario.kernel.status(scenario.delivery.key)["phase"] == "integration":
@@ -392,7 +402,10 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     integration = [call for call in scenario.role_calls if call["role"] == "development" and call["purpose"] == "integration"]
     assert len(integration) == 1
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]["developments_used"] == 1
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
+    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
+    if kind == DeliveryKind.FINAL_RUN:
+        assert scenario.port.writes()[:len(historical_writes)] == historical_writes
+        assert sum(write["operation"] == "pr_write" for write in historical_writes) == 1
     assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:{file_name}").stdout == "Resolved complete content\n"
 
 
