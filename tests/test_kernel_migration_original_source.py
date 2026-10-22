@@ -110,3 +110,28 @@ def test_existing_verified_completion_refuses_replaced_original_uuid(tmp_path: P
     assert not destination.exists()
     assert _git_bytes(managed.repository_root) == before
     assert paths['database'].read_bytes() == original_database
+
+
+@pytest.mark.parametrize('resource', ['destination', 'repository_root', 'final_checkout', 'git_store'])
+def test_existing_verified_completion_checks_every_declared_resource_path(
+    tmp_path: Path, git_repo: Path, resource: str,
+) -> None:
+    managed, paths = _managed_source(tmp_path, git_repo)
+    snapshot = capture_v6(paths['database'], tmp_path / 'sealed.sqlite3')
+    with closing(sqlite3.connect(snapshot.path)) as db:
+        run_id = db.execute('SELECT run_id FROM runs').fetchone()[0]
+    destination = managed.state_root / run_id / 'kernel.sqlite3'
+    destination.parent.mkdir()
+    options = dict(git_store=managed.repository_root / '.git', repository_root=managed.repository_root,
+        final_checkout=managed.root / 'worktrees' / run_id / 'run-publication')
+    if resource == 'destination':
+        destination = tmp_path / 'other-candidate.sqlite3'
+    else:
+        options[resource] = tmp_path / ('other-' + resource)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    with pytest.raises(MigrationRefused, match='^source_existing_resources$'):
+        convert_completed_ticket_v6(snapshot, destination, **options,
+            profile_snapshot=paths['profile'], github_snapshot=paths['github'],
+            observation_snapshot=paths['observation'], original_report=paths['report'], existing_verified=True)
+    assert not destination.exists()
+    assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))

@@ -17,14 +17,14 @@ import sqlite3
 from typing import Any, Mapping
 
 from .kernel import Kernel
-from .migration import MigrationRefused, _created_at_epoch
+from .migration import MigrationRefused
 from .migration_records import record_manifest
 from .model import DeliveryKind, Purpose, Requirements, wire_json
 from .storage import PROTOCOL, SCHEMA, Transaction
 from .migration_facts import ImportedRunFacts
 from .migration_run_install import (imported_subject_values, imported_attempt_values, imported_witness,
-    imported_thread, imported_execution, imported_completion_rows, import_object)
-from .migration_run_proof import imported_proof_documents
+    imported_thread, imported_history, imported_completion_rows, import_object)
+from .migration_run_proof import imported_proof_documents, completed_oracle
 
 
 # Static column inventory, deliberately independent of the candidate's schema.
@@ -315,11 +315,6 @@ def _expected_imported(state: _Projection, facts: ImportedRunFacts, origin: Mapp
             result = state.put(subject.subject, 'v6_normalized_artifact', call.normalized_artifact)
             state.add('attempts', **imported_attempt_values(facts, subject, call, ordinal,
                 revision, delivery.completion_revision, context, result))
-            if call.execution is not None:
-                invocation = import_object(call.execution.invocation)
-                state.history(subject.subject, 'imported_invocation', ':'.join((spec.run_id, subject.subject, invocation['started_at'])),
-                    state.put(subject.subject, 'v6_imported_invocation', wire_json(imported_execution(call))),
-                    _created_at_epoch(invocation['ended_at']))
         if subject.completion is not None:
             for table, rows in imported_completion_rows(facts, subject, revision,
                     lambda purpose, body: state.put(subject.subject, purpose, body)).items():
@@ -330,19 +325,27 @@ def _expected_imported(state: _Projection, facts: ImportedRunFacts, origin: Mapp
                 state.add('resource_cleanup', subject=subject.subject, generation=subject.generation,
                     source_ref=resource.source_ref, source_sha=resource.expected_oid, checkout=str(resource.checkout),
                     workspace_sha=resource.workspace_oid, owned_root=str(resource.owned_root), common_git_dir=str(resource.common_git_dir))
-    for event in facts.history:
-        state.history(event.subject, event.kind, event.identity, state.put(event.subject, 'v6_timeline_event', event.body), event.created_at)
-    for proof_subject, proof_kind, proof_identity, proof_purpose, proof_body in imported_proof_documents(facts, origin, tagged=tagged):
-        material = state.put(proof_subject, proof_purpose, proof_body)
-        if proof_kind is not None:
-            state.history(proof_subject, proof_kind, proof_identity, material, facts.created_at)
+    for subject_id, event_kind, event_id, event_purpose, event_body, generation, at in imported_history(facts):
+        state.add('history', subject=subject_id, kind=event_kind, identity=event_id,
+            material_id=state.put(subject_id, event_purpose, event_body), generation=generation, created_at=at)
     final = next(d for d in spec.deliveries if d.kind == DeliveryKind.FINAL_RUN)
     state.add('final_target', id=final.key, source_ref=final.source_ref, target_ref=final.target_ref,
         checkout=final.checkout, owned_root=final.owned_root, common_git_dir=final.common_git_dir)
+    copied = facts.source.mode == 'copied'
+    oracle = completed_oracle(facts)
     archive = record_manifest(facts.source.snapshot, run_id=spec.run_id,
-        profile_document=facts.source.profile_document, whole_source=facts.source.mode == 'original',
+        profile_document=facts.source.profile_document, whole_source=not copied,
+        documents={name: body for name, body in facts.source.oracle_documents
+            if name in {'oracle:observation', 'oracle:github', 'oracle:report'}},
         put=lambda purpose, body: state.put(anchor, purpose, body))
-    state.history(anchor, 'v6_record_import', spec.run_id, state.put(anchor, 'v6_record_manifest', wire_json(archive)), _CLOCK)
+    manifest = wire_json(archive)
+    state.put(anchor, 'v6_record_manifest', manifest)
+    for proof_subject, proof_kind, proof_identity, proof_purpose, proof_body in imported_proof_documents(
+            facts, origin, tagged=tagged, record_manifest=manifest):
+        material = state.put(proof_subject, proof_purpose, proof_body)
+        if proof_kind is not None:
+            state.history(proof_subject, proof_kind, proof_identity, material,
+                _CLOCK if oracle or proof_kind == 'v6_record_import' else facts.created_at)
     if sequence == 2:
         owner = jobs[first]
         state.history(first, 'source_refreshed', '2', None, _CLOCK, phase=owner['phase'], purpose=owner['purpose'],

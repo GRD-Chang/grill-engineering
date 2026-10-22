@@ -892,6 +892,14 @@ class Scenario:
             if step.kind == "approval" and approve:
                 self.kernel.control("approve", f"approval-{self.publication_count}", subject=self.delivery.key, world=self.world())
             elif step.kind in {"paused", "approval", "waiting"}:
+                current = self.kernel.status(self.delivery.key)
+                cleanup = current["resource_cleanup"]
+                # The operation above attempted cleanup. Preserve the original
+                # run() business result while status retains unresolved assets;
+                # cleanup() itself still reports its pending/conflict boundary.
+                if (cut == "complete" and current["phase"] == "complete" and cleanup
+                        and cleanup["outcome"] in {"third", "unknown"}):
+                    return Step("complete", self.delivery.key)
                 return step
         raise AssertionError("offline runner failed to reach the requested observable boundary")
 

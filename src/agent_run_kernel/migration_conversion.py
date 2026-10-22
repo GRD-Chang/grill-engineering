@@ -6,18 +6,16 @@ explicit worktree identity. Later v6 states require separate mappings.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-import os
 import sqlite3
 import subprocess
-import tempfile
 from typing import Any, Callable, Mapping, TypeVar, cast
 
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _evidence_value, _require_no_v6_notification_journal, capture_v6, validate_snapshot)
+                        _evidence_value, _require_no_v6_notification_journal, validate_snapshot)
 from .migration_facts import (ImportSource, ImportedHistoryEvent, ImportedResource,
                               ImportedRunFacts, ImportedSubject, SourceRecord)
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue, ParentIssue,
@@ -42,26 +40,6 @@ _POLICY_KEYS = frozenset({
 })
 
 
-@dataclass(frozen=True)
-class _InitialFacts:
-    run_id: str
-    repository: str
-    parent_number: int
-    parent_revision: str
-    graph_revision: str
-    created_at: float
-    language: str
-    run_branch: str
-    base_branch: str
-    base_sha: str
-    ticket_number: int
-    requirements: Requirements
-    policy: Policy
-    frozen: dict[str, Any]
-    frozen_ids: dict[str, str]
-    notifications: dict[str, Any]
-    source_evidence: tuple[dict[str, Any], ...]
-    timeline: tuple[dict[str, Any], ...]
 
 
 def _one(db: sqlite3.Connection, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Row:
@@ -267,12 +245,6 @@ def _read_initial(path: Path, emit: Callable[..., _Decoded]) -> _Decoded:
         db.close()
 
 
-def _initial_facts(path: Path) -> _InitialFacts:
-    # Temporary consumer of the same checked SQL until the unique installer is
-    # wired. The canonical decoder never constructs this legacy writer DTO.
-    def legacy(db: sqlite3.Connection, *values: Any) -> _InitialFacts:
-        return _InitialFacts(*values)
-    return _read_initial(path, legacy)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -288,95 +260,16 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
                        development_profile: Profile, review_profile: Profile,
                        publication_profile: Profile,
                        additional_workspaces: Mapping[int, tuple[str, Path]] | None = None) -> Kernel:
-    """Convert an idle accepted graph; publish only after full copied-state validation.
-
-    The caller supplies new, unused work identities because no old Ticket in
-    this no-Attempt state has allocated a branch or worktree.
-    """
+    """Decode once and use the sole strict native candidate installer."""
+    from .migration_run_install import install_imported_facts
     destination = destination.absolute()
-    repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.resolve(),
-                                                  final_checkout.resolve())
     if destination.exists() or destination.is_symlink():
-        raise MigrationRefused("destination_exists")
-    if not source_ref.startswith("refs/heads/") or source_ref == "refs/heads/":
-        raise MigrationRefused("new_source_ref")
-    profiles = {"development": development_profile, "review": review_profile,
-                "publication": publication_profile}
-    if any(not profile.model or not profile.effort or profile.model == "configured-model"
-           or profile.effort == "configured-effort" for profile in profiles.values()):
-        raise MigrationRefused("new_profile_source")
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".v6-convert-") as directory:
-        captured = capture_v6(snapshot.path, Path(directory) / "source.sqlite3")
-        if ((captured.sha256, captured.source_protocol, captured.schema_sha256, captured.table_rows)
-                != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
-            raise MigrationRefused("snapshot_changed")
-        facts = _initial_facts(captured.path)
-        decoded = read_initial_import(replace(captured, source=snapshot.source), repository_root=repository_root,
-            source_ref=source_ref, checkout=checkout, final_checkout=final_checkout,
-            development_profile=development_profile, review_profile=review_profile,
-            publication_profile=publication_profile, additional_workspaces=additional_workspaces)
-        spec = decoded.spec
-        subject = f"ticket:{facts.ticket_number}"
-        workspaces = {delivery.issue: (delivery.source_ref, Path(delivery.checkout))
-                      for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
-        candidate = Path(directory) / "kernel.sqlite3"
-        kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
-        with kernel.storage.transaction() as tx:
-            run = tx.one("SELECT parent_revision,graph_revision,created_at FROM runs")
-            if (run["parent_revision"], run["graph_revision"]) != (facts.parent_revision, facts.graph_revision):
-                raise MigrationRefused("source_revision")
-            tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
-            # The old selection has no Ticket workspace or branch yet. Enter
-            # the kernel's existing durable workspace effect so its normal
-            # CAS, receipt, and unknown-outcome path allocates the new ref.
-            for number in facts.requirements.parent.sub_issue_numbers:
-                tx.execute("UPDATE subjects SET phase='workspace' WHERE id=?", (f"ticket:{number}",))
-            tx.execute("DELETE FROM history")
-            for event in facts.timeline:
-                at = _created_at_epoch(event["value_at"])
-                body = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
-                        "values": {key: value for key, value in event.items()
-                                   if key.startswith("value_") and value is not None}}
-                identity = event["event_id"]
-                material = tx.put(subject, "v6_timeline_event", wire_json(body))
-                tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                           "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}", identity, material, at))
-            for kind, value in facts.frozen.items():
-                tx.put(subject, f"v6_{kind}", wire_json(value))
-            for evidence in facts.source_evidence:
-                tx.put(subject, "v6_evidence", wire_json(evidence))
-            tx.put(subject, "v6_import_identity", wire_json({
-                "source_sha256": snapshot.sha256, "source_protocol": snapshot.source_protocol,
-                "new_source_ref": source_ref, "new_checkout": str(checkout),
-                "new_ticket_workspaces": {str(number): {"source_ref": ref, "checkout": str(path)}
-                                          for number, (ref, path) in workspaces.items()},
-                "new_final_checkout": str(final_checkout),
-                "old_run_branch": facts.run_branch, "old_base_sha": facts.base_sha,
-                "new_profile_source": "explicit-migration-input",
-                "new_profiles": {key: asdict(value) for key, value in profiles.items()},
-            }))
-        status = kernel.status(subject)
-        selected = next(issue for issue in facts.requirements.issues if issue.number == facts.ticket_number)
-        if (status["phase"] != "workspace" or status["pending_attempt"] is not None
-                or status["revision"] != Kernel._fingerprint({
-                    "title": selected.title, "body": selected.body})):
-            raise MigrationRefused("converted_state")
-        if any(kernel.status(f"ticket:{number}")["phase"] != "workspace"
-               for number in facts.requirements.parent.sub_issue_numbers):
-            raise MigrationRefused("converted_state")
-        if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size
-               for suffix in ("-wal", "-journal")):
-            raise MigrationRefused("converted_sidecar")
-        try:
-            os.link(candidate, destination)
-        except FileExistsError as error:
-            raise MigrationRefused("destination_exists") from error
-        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-    return Kernel(destination)
+        raise MigrationRefused('destination_exists')
+    facts = read_initial_import(snapshot, repository_root=repository_root,
+        source_ref=source_ref, checkout=checkout, final_checkout=final_checkout,
+        development_profile=development_profile, review_profile=review_profile,
+        publication_profile=publication_profile, additional_workspaces=additional_workspaces)
+    return install_imported_facts(facts, destination)
 
 
 def read_initial_import(snapshot: SourceSnapshot, *, repository_root: Path,

@@ -10,9 +10,11 @@ from __future__ import annotations
 from contextlib import closing, contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Any, Iterator, Mapping
 
 from agent_run.task_identity import TaskKey
@@ -23,7 +25,60 @@ from .legacy_admission import read_source_fence
 from .migration import source_identity
 from .migration_records import V6RecordReader
 from .model import Blocker, Issue, ParentIssue, Requirements, wire_json
-from .storage import Transaction
+from .storage import Storage, Transaction
+
+
+def authenticate_copied_cleanup(storage: Storage, tx: Transaction, run: sqlite3.Row,
+        job: sqlite3.Row, cleanup: sqlite3.Row) -> tuple[str, str] | None:
+    """Read one installed private-copy witness; no original Task authority."""
+    if job['kind'] != 'ticket':
+        return None  # This witness never owns a Final/local Run branch.
+    rows = tx.rows("SELECT id,subject FROM material WHERE purpose='v6_import_identity'", limit=2)
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise ValueError('copied_resource_identity')
+    imported = json.loads(tx.get(rows[0]['id'], rows[0]['subject']))
+    proof = imported.get('local_resources')
+    if proof is None:
+        return None  # Older candidates have no witness; cleanup remains refused.
+    keys = {'format', 'source_sha256', 'run_id', 'subject', 'generation', 'source_record',
+        'repository_root', 'checkout', 'owned_root', 'common_git_dir', 'source_ref', 'expected_oid', 'initial_head', 'copy_uuid'}
+    if (not isinstance(proof, dict) or set(proof) != keys or imported.get('source_mode') != 'copied'
+            or imported.get('scope') != 'single-ticket' or proof['format'] != 'copied-returned-resource/1'
+            or proof['source_sha256'] != imported['source_sha256'] or proof['run_id'] != run['id']
+            or proof['subject'] != rows[0]['subject'] or proof['subject'] != job['id'] or job['kind'] != 'ticket'
+            or proof['generation'] != 1 or job['generation'] != 1 or cleanup['generation'] != 1
+            or cleanup['stage'] not in (0, 1) or proof['repository_root'] != run['repository_root']
+            or any(proof[key] != job[key] or proof[key] != cleanup[key]
+                   for key in ('source_ref', 'checkout', 'owned_root', 'common_git_dir'))
+            or proof['common_git_dir'] != str(Path(run['repository_root']) / '.git')
+            or Path(proof['checkout']).parent != Path(proof['owned_root'])
+            or not Path(run['repository_root']).is_relative_to(storage.path.parent)
+            or not Path(proof['owned_root']).is_relative_to(storage.path.parent)):
+        raise ValueError('copied_resource_identity')
+    records = V6RecordReader(storage)
+    record: dict[str, Any] = {'table': 'work_jobs', 'key': [run['id'], f"ticket:{job['issue']}:generation:1"]}
+    original = records.row(record['table'], record['key'])
+    base = records.row('run_condition_base', (run['id'],))
+    if (records.source['sha256'] != proof['source_sha256'] or records.source['run_id'] != run['id']
+            or proof['source_record'] != record or original['owner_kind'] != 'ticket'
+            or original['value_ticket_number'] != job['issue'] or original['value_ticket_branch'] != job['source_ref'].removeprefix('refs/heads/')
+            or proof['expected_oid'] != base['value_sha']
+            or proof['initial_head'] != (original['value_candidate_sha'] or base['value_sha'])):
+        raise ValueError('copied_resource_owner')
+    expected = hashlib.sha256(wire_json({key: value for key, value in proof.items() if key != 'copy_uuid'})).hexdigest()[:32]
+    if proof['copy_uuid'] != expected:
+        raise ValueError('copied_resource_marker')
+    descriptor = os.open(Path(proof['common_git_dir']) / 'agent-run-checkout-id', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as marker:
+        physical = os.fstat(marker.fileno())
+        if (not stat.S_ISREG(physical.st_mode) or physical.st_nlink != 1 or physical.st_size != 33
+                or marker.read(34) != expected.encode('ascii') + b'\n'):
+            raise ValueError('copied_resource_marker')
+    # The detached worktree advances natively. Its imported branch stays H0;
+    # the normal local adapter still checks the exact Git identity and CAS.
+    return cleanup['workspace_sha'] if cleanup['stage'] == 0 else proof['expected_oid'], expected
 
 
 def _rows(db: sqlite3.Connection, sql: str, values: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -278,6 +333,10 @@ def authenticate_completed_cleanup(tx: Transaction, imported: sqlite3.Row, body:
     if not isinstance(capsule, dict):
         raise ValueError('original_completed_scope')
     if capsule.get('kind') != 'completed':
+        return None
+    if job['kind'] == 'final_run' and job['id'] != entries[0]['subject']:
+        # This source certificate covers the imported Ticket. The later
+        # native Final must use the caller's separate, full Run-ref proof.
         return None
     from .migration_run_admission import authenticate_run_transfer
 

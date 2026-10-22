@@ -64,6 +64,8 @@ def _execute_original_import(facts: ImportedRunFacts, *, nonce: str, evidence: P
     from . import migration_cutover as original
     from . import migration_layout as layouts
 
+    if facts.source.external_readproof is None:
+        raise MigrationRefused('source_external_readback_required')
     snapshot, spec = facts.source.snapshot, facts.spec
     managed = ManagedWorkspace.for_repository(spec.repository)
     task = TaskKey(managed.repository_root, spec.repository, spec.parent_issue)

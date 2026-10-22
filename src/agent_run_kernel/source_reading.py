@@ -295,7 +295,8 @@ def _configured_contexts(facts: Mapping[str, Any], branch: str) -> list[str]:
 def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
     """Interpret complete GitHub check facts, without selecting any successor.
 
-    Unreported configured checks are unknown. A 404 classic-protection response
+    Unreported configured checks are pending; unrecognized server states stay
+    unknown. A 404 classic-protection response
     removes only classic protection, never rulesets. Errors stay errors. The
     Original API facts and available exact job logs are retained as diagnostic
     evidence. Supplementary log failures stay explicit, never fabricated empty.
@@ -319,9 +320,9 @@ def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
             continue
         observed.add(name)
         details.append((name, states.get(_text(check.get('bucket')).lower(), 'unknown')))
-    details.extend((name, 'unknown') for name in contexts if name not in observed)
+    details.extend((name, 'pending') for name in contexts if name not in observed)
     status = {state for _, state in details}
-    result = ('fail' if 'fail' in status else 'unknown' if 'unknown' in status else 'pending' if 'pending' in status
+    result = ('fail' if 'fail' in status else 'pending' if 'pending' in status else 'unknown' if 'unknown' in status
               else 'pass' if details else 'unknown' if facts['checks_exit_code'] == 8 else 'none')
     evidence = json.dumps({'source': 'original GitHub check/configuration observation',
                            'job_logs': 'per_check' if any('job' in check for check in checks) else 'not_collected',

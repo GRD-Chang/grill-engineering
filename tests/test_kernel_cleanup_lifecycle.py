@@ -152,7 +152,9 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    boundary = scenario.run()
+    # Observe resource retirement, independently of the business-complete
+    # return. Keep run()'s original limit of200 operations for this fresh scenario.
+    boundary = scenario.cleanup(max_steps=200)
     assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == len(foreign_heads) == 1
     original = attempts[0]
@@ -163,6 +165,8 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     assert cleanup["outcome"] == "third"
     assert cleanup["source_sha"] == original.payload["expected_head"]
     assert cleanup["effect_id"] == original.effect_id
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (original.effect_id,))) == ("sent", 1)
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.merged is not None
     assert scenario.port.git.commit(scenario.delivery.target_ref) == pr.merged
@@ -204,7 +208,8 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
-    boundary = scenario.run()
+    # This assertion concerns the cleanup boundary, after business closeout.
+    boundary = scenario.cleanup(max_steps=200)
     assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == 1
     durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
@@ -212,6 +217,9 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     cleanup = durable["resource_cleanup"]
     assert cleanup["state"] == "pending" and cleanup["stage"] == 0
     assert cleanup["outcome"] == "third"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (attempts[0].effect_id,))) == ("sent", 1)
+        assert not tx.rows("SELECT id FROM effects WHERE subject=? AND operation IN ('cleanup_local_ref','cleanup_remote_ref')", (scenario.delivery.key,))
     pr = scenario.port.pull_request(scenario.delivery.key)
     assert pr is not None and pr.merged is not None
     assert _local_head(scenario, scenario.delivery.source_ref) == _local_marker(scenario)

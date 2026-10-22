@@ -27,7 +27,7 @@ from agent_run.task_identity import TaskKey
 from .legacy_admission import legacy_task_lock
 from .migration import MigrationRefused, SOURCE_PROTOCOL, SourceSnapshot, capture_v6
 from .migration_active import _read_profile
-from .migration_completed import _completed_evidence, _existing_completed_git, _read_completed, _read_document
+from .migration_completed import _completed_evidence, _read_document, read_original_completed_inspection
 from .migration_readback import read_issue_close_facts
 from .source_reading import read_pull_request_facts, read_remote_heads, read_requirements
 from .model import KernelError, wire_json
@@ -120,8 +120,8 @@ def _collect_original_run_locked(managed: ManagedWorkspace, task: TaskKey, desti
 def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path, *,
                          external: bool = False) -> tuple[dict[str, Any], SourceSnapshot]:
     """Collect one supported original unit without changing its authority."""
-    from .migration_active import _Active, _existing_returned_git, _seal_returned_checkout
-    from .migration_cutover import _read_original_facts
+    from .migration_active import read_original_returned_inspection, _verify_returned_git
+    from .migration_checkout import seal_checkout
     managed = ManagedWorkspace.for_repository(repository)
     task = TaskKey(managed.repository_root, managed.repository, parent_number)
     destination = evidence_dir.absolute()
@@ -186,20 +186,39 @@ def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path
             else:
                 readproof.update(close=close, pr_before=before, pr_after=after)
             readproof = json.loads(wire_json(readproof))
-        facts = _read_original_facts(snapshot.path, profile, profile_sha, snapshot.sha256, readproof)
         target = managed.state_root / run_id / 'kernel.sqlite3'
-        if target.exists() or target.is_symlink():
-            raise MigrationRefused('native_original_candidate_exists')
-        if isinstance(facts, _Active):
-            archive_sha, index_sha = _seal_returned_checkout(facts, destination / 'checkout.tar')
-            _existing_returned_git(snapshot, facts, target, destination / 'checkout.tar', archive_sha, index_sha)
+        if returned:
+            imported = read_original_returned_inspection(snapshot, profile_snapshot=profile_path, readproof=readproof)
+            selected = imported.subjects[0]
+            resource, candidate, historical_base = selected.resources[0], selected.candidate, selected.historical_base
+            if resource.checkout is None or historical_base is None:
+                raise MigrationRefused('source_existing_resources')
+            if target.exists() or target.is_symlink():
+                raise MigrationRefused('native_original_candidate_exists')
+            archive_sha, index_sha = seal_checkout(resource.checkout, managed.repository_root, destination / 'checkout.tar')
+            _verify_returned_git(snapshot, target, destination / 'checkout.tar', archive_sha, index_sha,
+                repository=imported.spec.repository, run_id=imported.spec.run_id, ticket=selected.issue,
+                source_ref=resource.source_ref, candidate_sha=None if candidate is None else candidate.sha,
+                candidate_tree=None if candidate is None else candidate.tree, base_sha=historical_base.sha,
+                run_branch=imported.run_resource.source_ref.removeprefix('refs/heads/'),
+                base_branch=imported.spec.deliveries[-1].target_ref.removeprefix('refs/heads/'))
             if readproof is not None:
                 readproof.update(checkout_archive_sha256=archive_sha, checkout_index_sha256=index_sha)
-            run_oid = facts.base_sha
+            run_oid = base_sha = historical_base.sha
+            budget = next(item for item in selected.budgets if item.current)
+            pending = next(call for call in selected.attempts if call.pending)
+            supported = {'ticket': selected.issue, 'generation': selected.generation, 'review_window': budget.window,
+                'physical_scope': 'reaped-local', 'kind': 'returned_role', 'role': pending.role.value}
         else:
-            _existing_completed_git(snapshot, snapshot.path, facts, target, managed.repository_root,
-                managed.root / 'worktrees' / run_id / 'run-publication', managed.repository_root / '.git')
-            run_oid = facts.integrated_sha
+            imported = read_original_completed_inspection(snapshot, profile_snapshot=profile_path, readproof=readproof)
+            completed = imported.subjects[0]
+            if completed.completion is None or completed.historical_base is None:
+                raise MigrationRefused('source_completion')
+            run_oid, base_sha = completed.completion.integrated.sha, completed.historical_base.sha
+            budget = next(item for item in completed.budgets if item.current)
+            supported = {'ticket': completed.issue, 'generation': completed.generation, 'review_window': budget.window,
+                'physical_scope': 'reaped-local', 'developments_used': budget.developments_used,
+                'reviews_used': budget.reviews_used}
         if readproof is not None:
             _write(destination / 'external-readproof.json', wire_json(readproof))
         profile_body = profile_path.read_bytes()
@@ -214,15 +233,10 @@ def _collect_original_v6(repository: str, parent_number: int, evidence_dir: Path
             'git': {'repository_root': str(managed.repository_root), 'clone_uuid': clone_uuid,
                     'common_git_dir': str(managed.repository_root / '.git'),
                     'run_ref': run_ref, 'run_head': run_oid,
-                    'default_ref': base_ref, 'default_head': facts.base_sha},
-            'supported_source': {'ticket': facts.ticket, 'generation': 1, 'review_window': 1,
-                                 'physical_scope': 'reaped-local'},
+                    'default_ref': base_ref, 'default_head': base_sha},
+            'supported_source': supported,
             'evidence_dir': str(destination),
         }
-        if isinstance(facts, _Active):
-            result['supported_source'].update(kind='returned_role', role=facts.pending_role.value)
-        else:
-            result['supported_source'].update(developments_used=facts.developments_used, reviews_used=facts.reviews_used)
         _write(destination / 'inspection.json', wire_json(result))
         _sync_directory(destination)
         return result, snapshot

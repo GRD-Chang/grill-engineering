@@ -14,13 +14,13 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .kernel import Kernel
 from .migration import MigrationRefused, SourceSnapshot, capture_v6
 from .migration_quiescence import CONTROL_TABLES
 from .model import wire_json
-from .storage import Storage
+from .storage import Storage, Transaction
 
 
 RECORD_TABLES = CONTROL_TABLES | frozenset({
@@ -85,7 +85,8 @@ def preserve_v6_records(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str
 
 
 def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, subject: str,
-                   profile_document: bytes | None = None, whole_source: bool = False) -> None:
+                   profile_document: bytes | None = None, whole_source: bool = False,
+                   reference_only: bool = False, documents: Mapping[str, bytes] | None = None) -> str:
     """Copy records from an already captured source, without execution authority.
 
     whole_source requires every source row in the one-Run database. The public
@@ -95,7 +96,8 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
     with kernel.storage.transaction(write=False) as tx:
         if (tx.one('SELECT id,executor FROM runs')['id'] != run_id
                 or tx.one('SELECT executor FROM runs')[0] is not None
-                or tx.rows("SELECT position FROM history WHERE kind='v6_record_import'")):
+                or tx.rows("SELECT position FROM history WHERE kind='v6_record_import'")
+                or tx.rows("SELECT id FROM material WHERE purpose='v6_record_manifest'", limit=1)):
             raise MigrationRefused('record_import_identity')
         tx.one('SELECT id FROM subjects WHERE id=?', (subject,))
     def put(purpose: str, body: bytes) -> str:
@@ -103,15 +105,18 @@ def _preserve_copy(snapshot: SourceSnapshot, kernel: Kernel, *, run_id: str, sub
             return tx.put(subject, purpose, body)
 
     manifest = record_manifest(snapshot, run_id=run_id, profile_document=profile_document,
-                               whole_source=whole_source, put=put)
+                               whole_source=whole_source, put=put, documents=documents)
     with kernel.storage.transaction() as tx:
         material = tx.put(subject, 'v6_record_manifest', wire_json(manifest))
-        tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
-                   (subject, 'v6_record_import', run_id, material, 1, kernel.clock()))
+        if not reference_only:
+            tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
+                       (subject, 'v6_record_import', run_id, material, 1, kernel.clock()))
+        return material
 
 
 def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: bytes | None,
-                    whole_source: bool, put: Callable[[str, bytes], str]) -> dict[str, Any]:
+                    whole_source: bool, put: Callable[[str, bytes], str],
+                    documents: Mapping[str, bytes] | None = None) -> dict[str, Any]:
     """Encode authenticated source rows once for writing or an ephemeral expectation.
 
     The callback supplies material identities; this function never opens a
@@ -120,8 +125,13 @@ def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: 
     source = {'run_id': run_id, 'protocol': snapshot.source_protocol,
               'sha256': snapshot.sha256, 'schema_sha256': snapshot.schema_sha256}
     manifest: dict[str, Any] = {'format': _FORMAT, 'source': source, 'tables': {}, 'documents': {}}
+    for name, body in (documents or {}).items():
+        if name not in {'oracle:observation', 'oracle:github', 'oracle:report'} or len(body) > 4 * 1024 * 1024:
+            raise MigrationRefused('source_record_document')
+        manifest['documents'][name] = {'material': put('v6_import_document', body), 'size': len(body),
+            'sha256': hashlib.sha256(body).hexdigest()}
 
-    def cell(value: Any) -> dict[str, Any]:
+    def cell(value: Any, *, evidence: bool = False) -> dict[str, Any]:
         kind = {type(None): 'null', int: 'integer', float: 'real', str: 'text', bytes: 'blob'}.get(type(value))
         if kind is None:
             raise MigrationRefused('source_record_type')
@@ -129,8 +139,8 @@ def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: 
             raw = value.encode('utf-8') if isinstance(value, str) else value
             if len(raw) > 4 * 1024 * 1024:
                 raise MigrationRefused('source_record_size')
-            if len(raw) > (1024 if isinstance(value, str) else 64):
-                return {'type': kind, 'material': put('v6_record_value', raw), 'size': len(raw)}
+            if evidence or len(raw) > (1024 if isinstance(value, str) else 64):
+                return {'type': kind, 'material': put('v6_evidence' if evidence else 'v6_record_value', raw), 'size': len(raw)}
             if isinstance(value, bytes):
                 return {'type': kind, 'hex': value.hex(), 'size': len(value)}
         return {'type': kind, 'value': value}
@@ -187,7 +197,8 @@ def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: 
                 if any(type(value) not in {int, str} or isinstance(value, str) and len(value.encode()) > 1024 for value in key):
                     raise MigrationRefused('source_record_key')
                 size = sum(len(value.encode()) if isinstance(value, str) else len(value) if isinstance(value, bytes) else 16 for value in row)
-                record = {'key': key, 'cells': [cell(value) for value in row], 'size': size}
+                record = {'key': key, 'cells': [cell(row[name], evidence=not whole_source
+                    and table == 'work_evidence_materials' and name == 'body') for name in names], 'size': size}
                 encoded_size = len(wire_json(record))
                 if batch and (len(batch) == 128 or batch_size + size > 4 * 1024 * 1024 or body_size + encoded_size > _PAGE_LIMIT):
                     flush()
@@ -199,18 +210,51 @@ def record_manifest(snapshot: SourceSnapshot, *, run_id: str, profile_document: 
     return manifest
 
 
+def record_reference(tx: Transaction) -> dict[str, Any] | None:
+    """Resolve an exact archive reference, never a business event or authority."""
+    old = tx.rows("SELECT h.subject,h.identity,h.material_id,m.purpose FROM history h "
+        "JOIN material m ON m.id=h.material_id WHERE h.kind='v6_record_import'", limit=2)
+    if old:
+        if len(old) != 1 or old[0]['purpose'] != 'v6_record_manifest':
+            raise MigrationRefused('record_import_identity')
+        return {**dict(old[0]), 'native_history': False, 'source_sha256': None}
+    references = []
+    for row in tx.rows("SELECT id,subject FROM material WHERE purpose='v6_import_identity'", limit=2):
+        proof = json.loads(tx.get(row['id'], row['subject']))
+        if not isinstance(proof, dict) or 'record_manifest' not in proof:
+            continue  # Older copies without an archive keep their old query contract.
+        material = proof['record_manifest']
+        if (proof.get('source_mode') != 'copied' or not isinstance(material, str)
+                or re.fullmatch('[0-9a-f]{64}', material) is None
+                or not isinstance(proof.get('source_sha256'), str)
+                or re.fullmatch('[0-9a-f]{64}', proof['source_sha256']) is None):
+            raise MigrationRefused('record_import_identity')
+        target = tx.one('SELECT subject,purpose FROM material WHERE id=?', (material,))
+        if target['subject'] != row['subject'] or target['purpose'] != 'v6_record_manifest':
+            raise MigrationRefused('record_import_identity')
+        references.append({'subject': row['subject'], 'identity': tx.one('SELECT id FROM runs')[0],
+            'material_id': material, 'native_history': True, 'source_sha256': proof['source_sha256']})
+    if len(references) > 1 or not references and tx.rows("SELECT id FROM material WHERE purpose='v6_record_manifest'", limit=1):
+        raise MigrationRefused('record_import_identity')
+    return references[0] if references else None
+
+
 class V6RecordReader:
     """Read original identities, values and chronology with source provenance."""
 
     def __init__(self, kernel: Kernel | Storage) -> None:
         self.storage = kernel if isinstance(kernel, Storage) else kernel.storage
         with self.storage.transaction(write=False) as tx:
-            record = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_record_import'")
+            record = record_reference(tx)
+            if record is None:
+                raise MigrationRefused('record_import_identity')
             self.subject = str(record['subject'])
             manifest = json.loads(tx.get(record['material_id'], self.subject))
             if (manifest.get('format') != _FORMAT or manifest['source']['run_id'] != record['identity']
-                    or record['identity'] != tx.one('SELECT id FROM runs')[0]):
+                    or record['identity'] != tx.one('SELECT id FROM runs')[0]
+                    or record['source_sha256'] is not None and manifest['source']['sha256'] != record['source_sha256']):
                 raise MigrationRefused('record_import_identity')
+            self.native_history = bool(record['native_history'])
             self._manifest: dict[str, Any] = manifest
 
     @property

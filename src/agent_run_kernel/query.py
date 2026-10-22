@@ -19,6 +19,7 @@ from . import original_query
 from .execution_facts import activity, recorded_profile
 from .notification_events import resume_facts
 from .model import KernelError, Role, artifact
+from .migration_records import record_reference
 from .storage import QUERY_LIMIT, Storage, Transaction
 from .task_location import read_task, task_path
 
@@ -409,7 +410,8 @@ def _public_phase(phase: str) -> str:
 
 
 def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], terminal: bool, *,
-                   abandonment: Mapping[str, Any] | None = None) -> str:
+                   abandonment: Mapping[str, Any] | None = None,
+                   supervision_windows: Sequence[Mapping[str, Any]] = ()) -> str:
     """User-facing classification of recorded phases, with no transition authority."""
     if abandonment is not None:
         return "abandoned" if abandonment["status"] == "complete" else "abandonment_pending"
@@ -434,7 +436,11 @@ def _public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], termi
     current = unfinished
     if not current and subjects and all(job["kind"] == "ticket" for job in subjects):
         return "run_acceptance_pending"
-    if any(job["phase"] == "checks" for job in current):
+    wait_kinds = {window["kind"] for window in supervision_windows if any(
+        job["phase"] in {"checks", "merge"} and job["subject"] == window["subject"] for job in current)}
+    if "github_convergence" in wait_kinds:
+        return "waiting_external"
+    if "required_checks" in wait_kinds or any(job["phase"] == "checks" for job in current):
         return "waiting_checks"
     if len(current) == 1:
         job = current[0]
@@ -739,7 +745,8 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
     return {"actions": _operator_actions(run, subjects, abandonment=abandonment, supervision_windows=windows),
             "supervision_windows": windows,
             "generations": {job["subject"]: job["generation"] for job in subjects},
-            "status": _public_status(run, subjects, location["is_terminal"], abandonment=abandonment),
+            "status": _public_status(run, subjects, location["is_terminal"], abandonment=abandonment,
+                                     supervision_windows=windows),
             "is_terminal": location["is_terminal"], "abandonment": abandonment,
             "delivery_cleanup": _status_fields(run, subjects)["delivery_cleanup"], "closures": closures,
             "highwater": tx.one("SELECT coalesce(max(position),0) FROM history")[0]}
@@ -768,7 +775,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                 raise QueryError("query_limit", "Original query exceeds byte limit")
             return QueryDocument(kind, data["language"], data)
         with Storage(path).transaction(write=False) as tx:
-            imported = bool(tx.rows("SELECT position FROM history WHERE kind='v6_record_import'", limit=1))
+            imported = kind != "settings" and record_reference(tx) is not None
         records = original_query.ImportedRecords(Storage(path)) if imported and kind != "settings" else None
         return _read_native(path, kind, after=after, limit=limit, expected_run=expected_run,
                             expected_repository=expected_repository, records=records)
@@ -847,7 +854,8 @@ def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, 
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
             complete = location["is_terminal"]
-            status = _public_status(run, subjects, complete, abandonment=abandonment)
+            status = _public_status(run, subjects, complete, abandonment=abandonment,
+                                    supervision_windows=windows)
             created = _timestamp(run.get("created_at"))
             closed = tx.rows("SELECT max(h.created_at) FROM history h JOIN effects e ON e.id=h.identity WHERE h.kind='effect_consumed' AND e.operation='close'")
             end = _timestamp(closed[0][0]) if complete and closed else None
@@ -886,11 +894,12 @@ def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, 
                 data["unavailable_facts"].append("notifications")
             if data["notifications"]["configuration"] is None:
                 data["unavailable_facts"].append("notifications.configuration")
-            # One ordered stream: immutable original slots, then native positions.
-            # Selection happens before either segment's evidence closure is read.
+            # Original Task imports prepend archived slots. Copied imports already
+            # retain those business events in native history; do not repeat them.
+            # Select the page before reading either evidence closure.
             original_count = 0
             remaining = limit
-            if records is not None:
+            if records is not None and not (kind == "history" and records.native_history):
                 original_count = records.count('run_timeline_slots')
                 original = original_query.document(records, path, history=kind == "history",
                     after=min(after, original_count), limit=limit or 128)
@@ -899,7 +908,7 @@ def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, 
                              (limit or 128) - len(original["events"]))
             if kind == "history":
                 data.update(_native_history(tx, data, subjects, after=max(0, after-original_count), limit=remaining))
-                if records is not None:
+                if records is not None and not records.native_history:
                     old_page = data["original"]["history_page"]
                     native_page = data["history_page"]
                     next_after = (original_count + native_page["next_after"] if remaining else

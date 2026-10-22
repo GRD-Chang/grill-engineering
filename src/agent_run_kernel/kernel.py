@@ -25,7 +25,7 @@ from agent_run.prompt_resources import validate_resources
 from agent_run.task_identity import TaskKey
 
 from .model import (
-    AgentCall, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError, ObservationSuperseded,
+    AgentCall, Checks, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError, ObservationSuperseded,
     Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
@@ -2041,7 +2041,10 @@ class Kernel:
                     self._gate(tx, subject, "execution_failed", evidence=evidence)
                 self._finish_final_failure(tx, run)
                 return Step("paused", subject or "", "controller_no_progress")
-            if step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"} and step.reason != "supervision_timeout":
+            checks_unchanged = (scope.get("delivery", {}).get("phase") in {"checks", "merge"}
+                                and scope == self._automatic_scope(tx, run, subject, scope["cleanup"]))
+            if (step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"}
+                    and step.reason != "supervision_timeout" and not checks_unchanged):
                 tx.execute("DELETE FROM waits WHERE subject IS ? AND kind='github_convergence'", (subject,))
             return step
 
@@ -2086,16 +2089,24 @@ class Kernel:
                 else:
                     self._gate(tx, subject, "deterministic_contradiction", evidence=evidence)
                 return Step("paused", subject or "", code)
-            kind = "required_checks" if not requeue and subject is not None and self._job(tx, subject)["phase"] == "checks" else "github_convergence"
-            seconds = 2700 if kind == "required_checks" else 600
-            return self._supervised_wait(tx, run, subject, scope, kind, seconds, evidence)
+            return self._supervised_wait(tx, run, subject, scope, "github_convergence", 600, evidence)
 
     def _supervised_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, scope: Mapping[str, Any],
                          kind: str, seconds: int, evidence: str | None = None) -> Step:
         owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
         scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
         now = self.clock()
-        rows = tx.rows("SELECT * FROM waits WHERE scope_id=? AND kind=?", (scope_id, kind))
+        # Actual pending checks establish their own 45-minute window. Later
+        # uncertainty reuses it; an earlier convergence wait cannot shorten it.
+        checks_scope = scope.get("delivery", {}).get("phase") in {"checks", "merge"}
+        rows = tx.rows("SELECT * FROM waits WHERE scope_id=? AND (kind=? OR ?) ORDER BY deadline LIMIT 1",
+                       (scope_id, kind, checks_scope))
+        if checks_scope and kind == "required_checks" and rows and rows[0]["kind"] == "github_convergence":
+            tx.execute("DELETE FROM waits WHERE scope_id=?", (scope_id,))
+            rows = []
+        if rows:
+            kind = rows[0]["kind"]
+            seconds = 2700 if kind == "required_checks" else 600
         if not rows:
             # One current identity per subject and wait kind. Retain immutable
             # evidence, but never let an obsolete object govern a new candidate.
@@ -2239,7 +2250,11 @@ class Kernel:
         origins = tx.rows("SELECT h.*,m.purpose AS material_purpose FROM history h JOIN material m ON m.id=h.material_id "
                           "WHERE h.kind='v6_original_cutover' LIMIT 2")
         if not origins:
-            return None
+            from .migration_run_ownership import authenticate_copied_cleanup
+            try:
+                return authenticate_copied_cleanup(self.storage, tx, run, job, cleanup)
+            except (KernelError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as error:
+                raise KernelError("cleanup_marker_unproven") from error
         if len(origins) != 1:
             raise KernelError("cleanup_marker_unproven")
         anchor = origins[0]
@@ -3993,14 +4008,15 @@ class Kernel:
                 return step
             checks = world.checks
             if checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]:
-                return self._wait(tx, run, job, "required_checks", 2700)
+                return self._wait(tx, run, job, "github_convergence", 600)
             material = tx.put(subject, "required_checks", wire_json(asdict(checks)))
             check_id = material
             tx.execute("INSERT OR IGNORE INTO checks VALUES (?,?,?,?,?,?)", (check_id, subject, checks.pr_number,
                        checks.head_sha, checks.result, material))
             tx.execute("UPDATE subjects SET checks_id=? WHERE id=?", (check_id, subject))
-            if checks.result in {"pending", "unknown"}:
-                return self._wait(tx, run, job, "required_checks", 2700)
+            waiting = self._checks_wait(tx, run, job, checks)
+            if waiting is not None:
+                return waiting
             tx.execute("DELETE FROM waits WHERE subject=? AND kind='required_checks'", (subject,))
             if checks.result == "fail":
                 tx.execute("UPDATE subjects SET phase='development',purpose='ci',repair_source='required_checks',ci_failure=?,last_failure=?,grant_id=NULL,integrated_sha=NULL,integrated_tree=NULL,version=version+1 WHERE id=?",
@@ -4020,8 +4036,10 @@ class Kernel:
             if not self._published(tx, run, job, world):
                 self._finish_final_failure(tx, run)
                 return Step("paused", subject, "merge_authority")
-            if world.checks is None or world.checks.result in {"pending", "unknown"}:
-                return self._wait(tx, run, job, "required_checks", 2700)
+            waiting = self._checks_wait(tx, run, job, world.checks)
+            if waiting is not None:
+                return waiting
+            assert world.checks is not None
             if world.checks.result == "fail":
                 self._finish_final_failure(tx, run, "updating")
                 tx.execute("UPDATE subjects SET phase='checks',grant_id=NULL WHERE id=?", (subject,))
@@ -4067,6 +4085,25 @@ class Kernel:
 
     def _last_attempt(self, tx: Transaction, subject: str, role: Role) -> str:
         return str(tx.one("SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1", (subject, role.value))[0])
+
+    def _checks_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, checks: Checks | None) -> Step | None:
+        if checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]:
+            return self._wait(tx, run, job, "github_convergence", 600)
+        if checks.result == "pending":
+            return self._wait(tx, run, job, "required_checks", 2700)
+        unfinished = checks.result == "fail" and any(state not in {"pass", "fail"} for _, state in checks.details)
+        if checks.result == "unknown" or unfinished:
+            if checks.result == "unknown":
+                code, message = "github_checks_observation_unknown", "GitHub Required Checks returned an unknown state"
+            elif job["kind"] == DeliveryKind.TICKET:
+                code, message = "github_checks_observation_pending", "GitHub Required Checks still contain pending checks"
+            else:
+                code = "github_check_evidence_observation_pending"
+                message = "GitHub Required Check failure evidence has not converged"
+            evidence = tx.put(job["id"], "github_read_observation", wire_json({"code": code, "message": message}))
+            return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False),
+                                         "github_convergence", 600, evidence)
+        return None
 
     def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, kind: str, seconds: int) -> Step:
         return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False), kind, seconds)

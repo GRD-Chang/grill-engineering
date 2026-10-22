@@ -128,6 +128,7 @@ class ImportedResource:
     checkout_index_sha256: str | None
     head_evidence: tuple[SourceRecord, ...]
     cleanup_pending: bool
+    checkout_status: tuple[str, ...] | None = None  # None is unobserved, never clean.
 
 
 @dataclass(frozen=True)

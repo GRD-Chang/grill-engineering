@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import contextmanager
 import json
 import os
+import shutil
 import tempfile
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from .kernel import Kernel
 from .migration import MigrationRefused, _created_at_epoch
 from .migration_records import _preserve_copy
+from .migration_conversion import _git
+from .migration_checkout import _verify_checkout_archive
 from .model import DeliveryKind, Role, wire_json
 from .migration_facts import ImportedAttempt, ImportedRunFacts, ImportedSubject, SourceRecord
 
@@ -108,6 +112,25 @@ def imported_execution(call: ImportedAttempt) -> dict[str, Any]:
         'selected_version': import_object(call.selected_version), 'global_current_version': import_object(call.current_version)}
 
 
+def imported_history(facts: ImportedRunFacts) -> list[tuple[str, str, str, str, bytes, int, float]]:
+    """Source-derived history records, preserving each public source contract."""
+    from .migration_run_proof import completed_oracle
+    timeline = [(event.subject, event.kind, event.identity, 'v6_timeline_event', event.body,
+        event.generation, event.created_at) for event in facts.history]
+    if completed_oracle(facts):
+        return timeline  # Old Completion history retains physical calls only in records.
+    executions = []
+    for subject in facts.subjects:
+        for call in subject.attempts:
+            if call.execution is not None:
+                invocation = import_object(call.execution.invocation)
+                executions.append((subject.subject, 'imported_invocation',
+                    ':'.join((facts.spec.run_id, subject.subject, invocation['started_at'])),
+                    'v6_imported_invocation', wire_json(imported_execution(call)), subject.generation,
+                    _created_at_epoch(invocation['ended_at'])))
+    return timeline + executions if facts.source.mode == 'copied' else executions + timeline
+
+
 def imported_completion_rows(facts: ImportedRunFacts, subject: ImportedSubject, revision: str,
         put: Callable[[str, bytes], str]) -> dict[str, list[dict[str, Any]]]:
     item = subject.completion
@@ -149,11 +172,139 @@ def imported_completion_rows(facts: ImportedRunFacts, subject: ImportedSubject, 
         development_attempt=item.development_attempt, comment_effect=effects[0]['id'], close_effect=effects[1]['id'])]}
 
 
-def install_imported_facts(facts: ImportedRunFacts, destination: Path, *, origin: Mapping[str, str] | None = None) -> Kernel:
+@contextmanager
+def _copied_returned_mirror(facts: ImportedRunFacts, destination: Path, archive: Path | None) -> Iterator[None]:
+    returned = [subject for subject in facts.subjects if subject.kind == 'returned']
+    if facts.source.mode != 'copied' or not returned:
+        if archive is not None:
+            raise MigrationRefused('source_readproof_resources')
+        yield
+        return
+    if len(facts.subjects) != 1 or len(returned[0].resources) != 1:
+        raise MigrationRefused('copied_returned_scope')
+    subject = returned[0]
+    resource = subject.resources[0]
+    root = Path(facts.spec.repository_root or '')
+    if (subject.historical_base is None or resource.checkout is None
+            or root != root.resolve() or root == destination.parent.resolve()
+            or not root.is_relative_to(destination.parent.resolve())
+            or resource.common_git_dir != root / '.git'
+            or resource.common_git_dir.is_symlink() or resource.common_git_dir.resolve() != resource.common_git_dir
+            or facts.source.snapshot.source.resolve().is_relative_to(root)
+            or facts.source.snapshot.path.resolve().is_relative_to(root)):
+        raise MigrationRefused('copied_repository_required')
+    if resource.checkout_status is None:
+        raise MigrationRefused('source_checkout')
+    if archive is not None:
+        _verify_checkout_archive(archive, resource.checkout, resource.checkout_archive_sha256 or '')
+    elif subject.attempts[-1].role == Role.DEVELOPMENT:
+        raise MigrationRefused('source_checkout_archive_required')
+    base = subject.historical_base.sha
+    candidate = subject.candidate
+    archive_ref = f'refs/agent-run-kernel-migration/{facts.spec.run_id}/ticket-{subject.issue}'
+    archived = normalized = False
+    marker = resource.common_git_dir / 'agent-run-checkout-id'
+    owned_marker = None
+    try:
+        if candidate is not None:
+            _git(root, 'update-ref', archive_ref, candidate.sha, '0' * len(base))
+            archived = True
+            _git(root, 'update-ref', resource.source_ref, base, candidate.sha)
+            normalized = True
+        if ((candidate is not None and _git(root, 'rev-parse', archive_ref) != candidate.sha)
+                or _git(root, 'rev-parse', resource.source_ref) != base
+                or _git(resource.checkout, 'rev-parse', 'HEAD') != (base if candidate is None else candidate.sha)
+                or tuple(_git(resource.checkout, 'status', '--porcelain').splitlines()) != resource.checkout_status):
+            raise MigrationRefused('mirror_conversion')
+        from .migration_run_proof import copied_resource_proof
+        proof = copied_resource_proof(facts)
+        assert proof is not None
+        try:
+            descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError as error:
+            raise MigrationRefused('copied_repository_identity_exists') from error
+        with os.fdopen(descriptor, 'wb') as stream:
+            physical = os.fstat(stream.fileno())
+            owned_marker = physical.st_dev, physical.st_ino
+            stream.write(proof['copy_uuid'].encode('ascii') + b'\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = os.open(resource.common_git_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        yield
+    except BaseException:
+        try:
+            if normalized and candidate is not None:
+                _git(root, 'update-ref', resource.source_ref, candidate.sha, base)
+            if archived and candidate is not None:
+                _git(root, 'update-ref', '-d', archive_ref, candidate.sha)
+            if owned_marker is not None:
+                physical = marker.lstat()
+                if (physical.st_dev, physical.st_ino) != owned_marker or marker.is_symlink():
+                    raise MigrationRefused('copied_mirror_recovery_required')
+                marker.unlink()
+        except (MigrationRefused, OSError) as error:
+            raise MigrationRefused('copied_mirror_recovery_required') from error
+        raise
+
+
+@contextmanager
+def _copied_completed_repository(facts: ImportedRunFacts, destination: Path) -> Iterator[None]:
+    """Create only the existing completed-copy transport; never source authority."""
+    if facts.source.mode != 'copied' or not any(s.kind == 'completed' for s in facts.subjects):
+        yield
+        return
+    if len(facts.subjects) != 1 or facts.source.scope != 'single-ticket':
+        raise MigrationRefused('source_import_scope')
+    subject = facts.subjects[0]
+    if (subject.historical_base is None or subject.candidate is None or subject.completion is None
+            or facts.spec.repository_root is None):
+        raise MigrationRefused('source_import_completion')
+    root = Path(facts.spec.repository_root).absolute()
+    final = Path(facts.spec.deliveries[-1].checkout).absolute()
+    parent, store = destination.parent.resolve(), facts.run_resource.common_git_dir
+    if (root.exists() or root.is_symlink() or not root.is_relative_to(destination.parent.absolute())
+            or not root.parent.resolve().is_relative_to(parent) or store.is_symlink()
+            or store.resolve().is_relative_to(parent) or final in {root, destination.absolute()}
+            or final.exists() or final.is_symlink() or not final.is_relative_to(destination.parent.absolute())
+            or not final.parent.resolve().is_relative_to(parent)
+            or facts.source.snapshot.source.resolve().is_relative_to(parent)
+            or facts.source.snapshot.path.resolve().is_relative_to(parent)):
+        raise MigrationRefused('private_destination_required')
+    try:
+        root.mkdir()
+    except FileExistsError as error:
+        raise MigrationRefused('private_destination_exists') from error
+    owned = root.stat()
+    try:
+        from .migration_completed import _copy_loose_git
+        _copy_loose_git(store, root, run_ref=facts.run_resource.source_ref,
+            base=subject.historical_base.sha, candidate=subject.candidate.sha,
+            publication=subject.completion.publication.sha, integrated=subject.completion.integrated.sha,
+            candidate_tree=subject.candidate.tree, integrated_tree=subject.completion.integrated.tree)
+        yield
+    except BaseException as error:
+        if root.exists() or root.is_symlink():
+            current = root.lstat()
+            if root.is_symlink() or (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
+                raise MigrationRefused('copied_completed_recovery_required') from error
+            shutil.rmtree(root)
+        raise
+
+
+def install_imported_facts(facts: ImportedRunFacts, destination: Path, *, origin: Mapping[str, str] | None = None,
+        copied_checkout_archive: Path | None = None) -> Kernel:
     """Publish only a completely installed, strictly verified private candidate."""
+    from .migration_run_proof import completed_oracle
     if destination.exists() or destination.is_symlink():
         raise MigrationRefused('destination_exists')
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.canonical-install-') as directory:
+    if completed_oracle(facts) and origin is not None and origin['target_db'] != str(destination.resolve()):
+        raise MigrationRefused('source_origin_provenance')
+    with _copied_completed_repository(facts, destination), tempfile.TemporaryDirectory(
+            dir=destination.parent, prefix='.canonical-install-') as directory:
         candidate = Path(directory) / 'kernel.sqlite3'
         _install_imported_candidate(facts, candidate, origin=origin)
         descriptor = os.open(candidate, os.O_RDONLY)
@@ -161,15 +312,23 @@ def install_imported_facts(facts: ImportedRunFacts, destination: Path, *, origin
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        try:
-            os.link(candidate, destination)
-        except FileExistsError as error:
-            raise MigrationRefused('destination_exists') from error
-        descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        with _copied_returned_mirror(facts, destination, copied_checkout_archive):
+            linked = False
+            try:
+                try:
+                    os.link(candidate, destination)
+                except FileExistsError as error:
+                    raise MigrationRefused('destination_exists') from error
+                linked = True
+                descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except BaseException:
+                if linked and destination.samefile(candidate):
+                    destination.unlink()
+                raise
     return Kernel(destination)
 
 
@@ -183,7 +342,7 @@ def _install_imported_candidate(facts: ImportedRunFacts, destination: Path, *, o
     from .migration import validate_snapshot, _require_no_v6_notification_journal
     from .model import artifact
     from .migration_run_projection import verify_imported_installation
-    from .migration_run_proof import imported_proof_documents
+    from .migration_run_proof import imported_proof_documents, completed_oracle
 
     validate_snapshot(facts.source.snapshot)
     _require_no_v6_notification_journal(facts.source.snapshot, facts.spec.run_id)
@@ -238,12 +397,6 @@ def _install_imported_candidate(facts: ImportedRunFacts, destination: Path, *, o
                 result_id = tx.put(subject.subject, 'v6_normalized_artifact', call.normalized_artifact)
                 row = imported_attempt_values(facts, subject, call, ordinal, job['revision'], job['completion_revision'], context, result_id)
                 tx.execute('INSERT INTO attempts(' + ','.join(row) + ') VALUES (' + ','.join('?' for _ in row) + ')', tuple(row.values()))
-                if call.execution is not None:
-                    invocation = import_object(call.execution.invocation)
-                    material = tx.put(subject.subject, 'v6_imported_invocation', wire_json(imported_execution(call)))
-                    tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
-                        (subject.subject, 'imported_invocation', ':'.join((facts.spec.run_id, subject.subject, invocation['started_at'])),
-                         material, subject.generation, _created_at_epoch(invocation['ended_at'])))
             if subject.completion is not None:
                 for table, rows in imported_completion_rows(facts, subject, job['revision'],
                         lambda purpose, body: tx.put(subject.subject, purpose, body)).items():
@@ -257,18 +410,25 @@ def _install_imported_candidate(facts: ImportedRunFacts, destination: Path, *, o
                     tx.execute('INSERT INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir) VALUES (?,?,?,?,?,?,?,?)',
                         (subject.subject, subject.generation, resource.source_ref, resource.expected_oid, str(resource.checkout),
                          resource.workspace_oid, str(resource.owned_root), str(resource.common_git_dir)))
-        for event in facts.history:
-            material = tx.put(event.subject, 'v6_timeline_event', event.body)
+        for subject_id, event_kind, event_id, event_purpose, event_body, generation, at in imported_history(facts):
+            material = tx.put(subject_id, event_purpose, event_body)
             tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,?,?)',
-                (event.subject, event.kind, event.identity, material, event.generation, event.created_at))
+                (subject_id, event_kind, event_id, material, generation, at))
         anchor = min(s.subject for s in facts.subjects)
-        for proof_subject, kind, identity, purpose, body in imported_proof_documents(facts, origin):
+    documents = {name: body for name, body in facts.source.oracle_documents
+        if name in {'oracle:observation', 'oracle:github', 'oracle:report'}}
+    copied = facts.source.mode == 'copied'
+    oracle = completed_oracle(facts)
+    manifest = _preserve_copy(facts.source.snapshot, native, run_id=facts.spec.run_id, subject=anchor,
+        profile_document=facts.source.profile_document, whole_source=not copied, reference_only=True, documents=documents)
+    with native.storage.transaction() as tx:
+        for proof_subject, kind, identity, purpose, body in imported_proof_documents(
+                facts, origin, record_manifest=tx.get(manifest, anchor)):
             material = tx.put(proof_subject, purpose, body)
             if kind is not None:
                 tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,?)',
-                    (proof_subject, kind, identity, material, facts.created_at))
-    _preserve_copy(facts.source.snapshot, native, run_id=facts.spec.run_id, subject=anchor,
-        profile_document=facts.source.profile_document, whole_source=facts.source.mode == 'original')
+                    (proof_subject, kind, identity, material,
+                     native.clock() if oracle or kind == 'v6_record_import' else facts.created_at))
     native.refresh(lambda: facts.observed_requirements)
     verify_imported_installation(native, facts, origin=origin)
     return native

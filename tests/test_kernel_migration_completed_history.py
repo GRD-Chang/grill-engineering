@@ -382,7 +382,16 @@ def _continue_final(kernel: Kernel, port: _HistoricalPublisherPort, paths: dict[
     final = admit_final(scenario)
     scenario.delivery = kernel.delivery(final)
     assert expected_kind in {'complete', 'paused'}
-    outcome = scenario.run(approve=True)
+    if expected_kind == 'paused':
+        # Observe resource protection through cleanup(), independently of the
+        # completed business result returned by run(). Approve at its existing
+        # public boundary so cleanup is attempted exactly once.
+        assert scenario.run().kind == 'approval'
+        kernel.control('approve', f'approval-{scenario.publication_count}',
+            subject=final, world=scenario.world())
+        outcome = scenario.cleanup()
+    else:
+        outcome = scenario.run(approve=True)
     assert outcome.kind == expected_kind, outcome
     assert kernel.status(final)['phase'] == 'complete'
     assert [call['role'] for call in scenario.role_calls] == (

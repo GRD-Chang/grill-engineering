@@ -489,7 +489,7 @@ def test_fixed_8d_returned_publication_consumes_old_raw_without_new_agent(tmp_pa
                     for row in tx.rows("SELECT material_id FROM history WHERE kind='imported_invocation'")]
         old_review = next(value for value in imported if value["invocation"]["role"] == "fresh_acceptance")
         assert review_context["bound_version"]["version_id"] == old_review["bound_version"]["version_id"]
-        assert old_review["bound_version"]["version_id"] != old_review["current_version"]["version_id"]
+        assert old_review["bound_version"]["version_id"] != old_review["global_current_version"]["version_id"]
         assert tuple(tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject=? AND purpose='requirements'",
                             (subject,))) == (1, 1)
     delivery = kernel.delivery(subject)
@@ -582,7 +582,7 @@ def test_bound_returned_role_consumes_exact_old_raw(tmp_path: Path, role: str) -
         witnesses = [json.loads(tx.get(row[0], subject)) for row in
                      tx.rows("SELECT material_id FROM history WHERE kind='imported_invocation' ORDER BY position")]
         witness = witnesses[-1]
-        assert witness["bound_version"]["version_id"] != witness["current_version"]["version_id"]
+        assert witness["bound_version"]["version_id"] != witness["global_current_version"]["version_id"]
         assert witness["invocation"]["input_fingerprint"] == facts["completed_invocation"]["input_fingerprint"]
         if role == "development":
             intent = tx.one("SELECT id FROM material WHERE subject=? AND purpose='v6_candidate_commit_intent'", (subject,))

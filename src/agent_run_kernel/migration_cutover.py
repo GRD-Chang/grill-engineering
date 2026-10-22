@@ -33,8 +33,7 @@ from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _offline_source, _source_blocks,
                         restore_v6, capture_v6, source_identity, validate_snapshot)
 from .legacy_admission import legacy_task_lock, read_source_fence, source_fence
-from .migration_active import (_Active, _read_active, _read_profile, _returned_external,
-                               _returned_layout, _existing_returned_git)
+from .migration_active import _read_profile
 from .migration_completed import (_Completed, convert_completed_ticket_v6, _existing_completed_git,
                                   _read_completed, _read_document)
 from .migration_quiescence import read_v6_host_exit
@@ -457,18 +456,6 @@ def _original_protocol(source: Path) -> str:
     if len(rows) != 1 or rows[0][0] != 'protocol' or not isinstance(rows[0][1], str):
         raise MigrationRefused('source_protocol')
     return str(rows[0][1])
-
-
-def _read_original_facts(path: Path, profile: dict[str, Any], profile_sha: str,
-                         source_sha: str, readproof: dict[str, Any] | None) -> _Completed | _Active:
-    with closing(sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
-        active = db.execute('SELECT status FROM runs').fetchone()[0] == 'active'
-    if active:
-        facts = _read_active(path, profile, profile_sha, source_sha, original=True)
-        if readproof is not None:
-            _returned_external(facts, readproof, source_sha)
-        return facts
-    return _read_completed(path, profile, profile_sha, source_sha, readproof)
 
 
 def _original_refs(facts: _Completed) -> dict[str, str]:

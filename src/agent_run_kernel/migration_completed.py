@@ -9,12 +9,10 @@ from contextlib import closing
 from dataclasses import dataclass, replace
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
-import tempfile
 from typing import Any, Callable, Mapping, TypeVar
 
 from agent_run.managed_workspace import ManagedWorkspace
@@ -22,10 +20,10 @@ from agent_run.managed_workspace import ManagedWorkspace
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _require_no_v6_notification_journal, capture_v6, validate_snapshot)
+                        _require_no_v6_notification_journal, validate_snapshot)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
-from .migration_records import RECORD_TABLES, V6RecordReader, _preserve_copy
+from .migration_records import RECORD_TABLES
 from .migration_quiescence import read_v6_host_exit
 from .migration_facts import (ImportSource, ImportedAttempt, ImportedBudget, ImportedCompletion,
     ImportedHistoryEvent, ImportedResource, ImportedRunFacts, ImportedSubject, HistoricalExecution, SourceRecord)
@@ -818,9 +816,6 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
 
 
 
-_COMPLETED_ORACLE_FIELDS = ('run_id', 'developments_used', 'reviews_used', 'physical_invocations', 'candidate_sha', 'integrated_sha', 'repository', 'parent_number', 'requirements', 'ticket', 'pr_number', 'ticket_branch', 'run_branch', 'base_branch', 'publication_sha', 'base_sha', 'close_ownership')
-
-
 def _verify_completed_oracle(source: Mapping[str, Any], observed: Mapping[str, Any],
         report: Mapping[str, Any], github: Mapping[str, Any], git_store: Path, *, existing_verified: bool) -> list[Any]:
     if (observed.get("run_id") != source['run_id']
@@ -945,309 +940,29 @@ def convert_completed_ticket_v6(
     if existing_verified and (destination.exists() or destination.is_symlink()
                               or not destination.parent.is_dir() or repository_root.is_symlink()):
         raise MigrationRefused('source_existing_resources')
-    profile, profile_sha = _read_profile(profile_snapshot)
-    readproof, readproof_sha = (None, None) if external_snapshot is None else _read_document(external_snapshot)
+    from .migration_run_install import install_imported_facts
+    _read_profile(profile_snapshot)
+    readproof = None if external_snapshot is None else _read_document(external_snapshot)[0]
     if readproof is not None and (not existing_verified or origin is None
-                                  or any(path is not None for path in (github_snapshot, observation_snapshot, original_report))):
+            or any(path is not None for path in (github_snapshot, observation_snapshot, original_report))):
         raise MigrationRefused('source_readproof_resources')
-    observed: dict[str, Any] = {}
-    report: dict[str, Any] = {}
-    github: dict[str, Any] = {}
-    observation_sha: str | None = None
-    report_sha: str | None = None
-    github_sha: str | None = None
-    if readproof is None:
+    if existing_verified:
+        facts = read_original_completed_import(snapshot, profile_snapshot=profile_snapshot,
+            external_snapshot=external_snapshot, github_snapshot=github_snapshot,
+            observation_snapshot=observation_snapshot, original_report=original_report)
+        if (str(repository_root) != facts.spec.repository_root
+                or final_checkout != Path(facts.spec.deliveries[-1].checkout)
+                or git_store != facts.run_resource.common_git_dir
+                or destination != snapshot.source.parent / facts.spec.run_id / 'kernel.sqlite3'):
+            raise MigrationRefused('source_existing_resources')
+    else:
         if github_snapshot is None or observation_snapshot is None or original_report is None:
             raise MigrationRefused('source_documents_required')
-        observed, observation_sha = _read_document(observation_snapshot)
-        report, report_sha = _read_document(original_report)
-        github, github_sha = _read_document(github_snapshot)
-        _verify_completed_oracle_documents(snapshot.sha256, profile_sha, observed, report, github_sha, report_sha)
-        registrations = report.get("post_close_worktrees", {}).get("registrations")
-        original_roots = ([Path(row["path"]) for row in registrations
-                           if isinstance(row, dict) and row.get("repository") is True
-                           and isinstance(row.get("path"), str)]
-                          if isinstance(registrations, list) else [])
-        if (len(original_roots) != 1 or not original_roots[0].is_absolute()
-                or (not existing_verified and destination.parent.resolve().is_relative_to(original_roots[0].resolve()))
-                or (existing_verified and original_roots[0] != repository_root)):
-            raise MigrationRefused("old_repository_alias")
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".v6-completed-") as directory:
-        copied = capture_v6(snapshot.path, Path(directory) / "source.sqlite3")
-        if ((copied.sha256, copied.source_protocol, copied.schema_sha256, copied.table_rows)
-                != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
-            raise MigrationRefused("snapshot_changed")
-        facts = _read_completed(copied.path, profile, profile_sha, snapshot.sha256, readproof)
-        _require_no_v6_notification_journal(snapshot, facts.run_id)
-        mutations: list[Any] = []
-        if readproof is None:
-            mutations = _verify_completed_oracle({name: getattr(facts, name) for name in _COMPLETED_ORACLE_FIELDS},
-                observed, report, github, git_store, existing_verified=existing_verified)
-        subject = f"ticket:{facts.ticket}"
-        owned_repository = False
-        try:
-            if existing_verified:
-                _existing_completed_git(snapshot, copied.path, facts, destination,
-                                        repository_root, final_checkout, git_store)
-            else:
-                try:
-                    repository_root.mkdir()
-                except FileExistsError as error:
-                    raise MigrationRefused("private_destination_exists") from error
-                owned_repository = True
-                _copy_loose_git(git_store, repository_root,
-                                run_ref=f"refs/heads/{facts.run_branch}", base=facts.base_sha,
-                                candidate=facts.candidate_sha, publication=facts.publication_sha,
-                                integrated=facts.integrated_sha,
-                                candidate_tree=facts.candidate_tree,
-                                integrated_tree=facts.integrated_tree)
-            base_tree = _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")
-            common = repository_root / ".git"
-            ticket_checkout = ManagedWorkspace.for_repository(facts.repository).state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
-            spec = RunSpec(facts.run_id, facts.repository, facts.parent_number,
-                           facts.parent_revision, facts.graph_revision,
-                           (Delivery(subject, DeliveryKind.TICKET, facts.ticket, "source-verified",
-                                     Commit(facts.base_sha, base_tree),
-                                     f"refs/heads/{facts.ticket_branch}",
-                                     f"refs/heads/{facts.run_branch}",
-                                     checkout=str(ticket_checkout) if facts.pending_resources else '',
-                                     owned_root=str(ticket_checkout.parent) if facts.pending_resources else '',
-                                     common_git_dir=str(common) if facts.pending_resources else ''),
-                            Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN,
-                                     facts.parent_number, facts.parent_revision,
-                                     Commit(facts.base_sha, base_tree),
-                                     f"refs/heads/{facts.run_branch}",
-                                     f"refs/heads/{facts.base_branch}",
-                                     checkout=str(final_checkout), owned_root=str(final_checkout.parent),
-                                     common_git_dir=str(common))),
-                           facts.policy, facts.language, str(repository_root), facts.inputs)
-            candidate = Path(directory) / "kernel.sqlite3"
-            kernel = Kernel.create(candidate, spec, requirements=facts.requirements, source_origin=origin)
-            with kernel.storage.transaction() as tx:
-                native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
-                tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
-                tx.execute("""UPDATE subjects SET phase='complete',purpose='requirements',
-                    source_sha=?,candidate_sha=?,candidate_tree=?,integrated_sha=?,integrated_tree=?,
-                    publication_sha=?,publication_tree=?,workspace_sha=?,expected_tree=?,
-                    integration_target=?,pr_number=?,gate_mode='review',merge_sha=?,
-                    review_attempt=?,current_attempt=NULL WHERE id=?""",
-                           (facts.publication_sha, facts.candidate_sha, facts.candidate_tree,
-                            facts.integrated_sha, facts.integrated_tree, facts.publication_sha,
-                            facts.integrated_tree, facts.publication_sha, facts.candidate_tree,
-                            facts.base_sha, facts.pr_number, facts.integrated_sha,
-                            facts.attempts[1]["attempt_id"], subject))
-                tx.execute("UPDATE budgets SET developments_used=?,reviews_used=? "
-                           "WHERE subject=? AND purpose='requirements' AND window=1",
-                           (facts.developments_used, facts.reviews_used, subject))
-                tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
-                           (subject, 1, 1, f"refs/heads/{facts.ticket_branch}",
-                            f"refs/heads/{facts.run_branch}", facts.base_sha, facts.base_sha))
-                tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
-                tx.execute("DELETE FROM integration_queue WHERE subject=?", (subject,))
-                if origin is None:
-                    tx.execute("DELETE FROM history")
-                else:
-                    tx.execute("DELETE FROM history WHERE kind!='v6_original_cutover' OR identity!=?",
-                               (origin['nonce'],))
-                for event in facts.timeline:
-                    payload = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
-                               "values": {key: value for key, value in event.items()
-                                          if key.startswith("value_") and value is not None}}
-                    material = tx.put(subject, "v6_timeline_event", wire_json(payload))
-                    tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                               "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}",
-                                                       event["event_id"], material,
-                                                       _created_at_epoch(event["value_at"])))
-                for index, call in enumerate(facts.attempts, start=1):
-                    allocation = call.get("allocation_boundary", {})
-                    allocated_candidate = allocation.get("candidate_sha")
-                    allocated_tree = allocation.get("candidate_tree")
-                    context_value: dict[str, Any] = {"source": "v6-completed-semantic-attempt",
-                                                     "old_role_ordinal": call["old_role_ordinal"],
-                                                     "old_current_version": call["current_version"],
-                                                     "original_allocation_boundary": allocation,
-                                                     "completion_identity": {
-                                                         "parent_revision": facts.parent_revision,
-                                                         "graph_revision": facts.graph_revision,
-                                                         "revision": native["revision"],
-                                                         "base_sha": facts.base_sha,
-                                                         "candidate_sha": facts.candidate_sha,
-                                                         "candidate_tree": facts.candidate_tree}}
-                    if call["role"] == "review":
-                        context_value["checkout"] = None
-                    context = tx.put(subject, "v6_attempt_context", wire_json(context_value))
-                    result = tx.put(subject, "v6_normalized_artifact", wire_json(call["artifact"]))
-                    tx.execute("""INSERT INTO attempts(
-                        id,subject,generation,ordinal,role,purpose,window,parent_revision,graph_revision,
-                        revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,
-                        context_id,current_invocation,result_id,status,accounted,outcome)
-                        VALUES (?,?,1,?,?,'requirements',1,?,?,?,?,?,?,?,?,?,NULL,?,'consumed',?,?)""",
-                               (call["attempt_id"], subject, index, call["role"], facts.parent_revision,
-                                facts.graph_revision, native["revision"], facts.base_sha,
-                                allocated_candidate, allocated_tree, allocated_tree,
-                                native["completion_revision"], context, result,
-                                1 if call["role"] == "review" else 0,
-                                "pass" if call["role"] == "review" else
-                                "development" if call["role"] == "development" else "publication"))
-                    tx.put(subject, "v6_semantic_attempt", wire_json(call))
-                receipt_ids = []
-                for index, operation in enumerate(('completion_comment', 'close')):
-                    effect_id = f"v6-import:{facts.run_id}:{facts.ticket}:{operation}"
-                    if facts.close_readproof is None:
-                        payload = mutations[index]
-                        receipt_body = {
-                            'mutation': payload, 'close_intent': facts.close_intent,
-                            'close_ownership': facts.close_ownership if operation == 'close' else None,
-                            'source': 'old-github-fixture-and-v6-close-ledger'}
-                    else:
-                        close_proof = facts.close_readproof
-                        close_intent = {
-                            **close_proof['close_intent'], 'run_id': facts.run_id, 'subject': subject,
-                            'issue': facts.ticket, 'merge_sha': facts.integrated_sha,
-                            'effect_id': f'v6-import:{facts.run_id}:{facts.ticket}:completion_comment',
-                            'pr_number': facts.pr_number, 'kind': 'ticket',
-                            'comment_id': close_proof['comment']['id'],
-                            'comment_created_at': close_proof['comment']['created_at'],
-                            'comment_body': close_proof['comment']['body'],
-                        }
-                        payload = {'issue': facts.ticket, 'merge_sha': facts.integrated_sha,
-                                   'kind': 'ticket', 'close_intent': close_intent}
-                        receipt_body = {'disposition': 'target', 'commit': None, 'pr': None,
-                                        'raw': {**close_proof, 'close_intent': close_intent,
-                                                'source': 'v6-intent-and-external-readproof'}}
-                    receipt = tx.put(subject, 'v6_confirmed_effect_receipt', wire_json(receipt_body))
-                    payload_id = tx.put(subject, 'v6_confirmed_effect_payload', wire_json(payload))
-                    tx.execute("""INSERT INTO effects(
-                        id,subject,operation,status,executor,epoch,parent_revision,graph_revision,
-                        revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
-                        candidate_tree,base_sha,base_tree,pr_number,actor,payload_id,receipt_id)
-                        VALUES (?,?,?,'confirmed',NULL,NULL,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                               (effect_id, subject, operation, facts.parent_revision, facts.graph_revision,
-                                native["revision"], f"refs/heads/{facts.ticket_branch}",
-                                f"refs/heads/{facts.run_branch}", facts.integrated_sha,
-                                facts.integrated_sha, facts.candidate_sha, facts.candidate_tree,
-                                facts.base_sha, base_tree, facts.pr_number,
-                                facts.close_intent['value_actor'], payload_id, receipt))
-                    receipt_ids.append(effect_id)
-                tx.execute("INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (subject, 1, native["revision"], facts.parent_revision,
-                            facts.graph_revision, facts.publication_sha, facts.integrated_sha,
-                            facts.integrated_tree, facts.pr_number, "review",
-                            facts.attempts[1]["attempt_id"], facts.attempts[0]["attempt_id"],
-                            *receipt_ids))
-                identity = tx.put(subject, "v6_completed_import_identity", wire_json({
-                    "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
-                    "github_sha256": github_sha, "observation_sha256": observation_sha,
-                    "original_report_sha256": report_sha,
-                    "old_backend": observed.get('backend'),
-                    "old_physical_invocations": facts.physical_invocations,
-                    "old_profile_bindings": len(profile["bindings"]),
-                    "old_completed_job_revision": facts.old_job_revision,
-                    "copied_repository_root": str(repository_root),
-                    "resource_mode": "existing-verified" if existing_verified else "copy",
-                    "candidate_sha": facts.candidate_sha,
-                    "publication_sha": facts.publication_sha,
-                    "integrated_sha": facts.integrated_sha,
-                    "old_job": facts.old_job,
-                    "old_cleanup": facts.old_cleanup,
-                    "external_readproof_sha256": readproof_sha,
-                }))
-                tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                           "VALUES (?,?,?,?,1,?)", (subject, "v6_completed_import", facts.run_id,
-                                                   identity, kernel.clock()))
-                if readproof is not None:
-                    material = tx.put(subject, 'v6_external_readproof', wire_json(readproof))
-                    tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
-                               'VALUES (?,?,?,?,1,?)', (subject, 'v6_external_readproof', readproof_sha,
-                                                       material, kernel.clock()))
-                if facts.pending_resources:
-                    tx.execute('INSERT INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir) '
-                               'VALUES (?,1,?,?,?,?,?,?)',
-                               (subject, f'refs/heads/{facts.ticket_branch}', facts.publication_sha,
-                                str(ticket_checkout), facts.publication_sha,
-                                str(ticket_checkout.parent), str(common)))
-            profile_body = profile_snapshot.read_bytes()
-            if hashlib.sha256(profile_body).hexdigest() != profile_sha:
-                raise MigrationRefused("source_document_changed")
-            _preserve_copy(copied, kernel, run_id=facts.run_id, subject=subject,
-                           profile_document=profile_body, whole_source=origin is not None)
-            if origin is not None:
-                reader = V6RecordReader(kernel)
-                original_root = reader.row('run_root', [facts.run_id])
-                with kernel.storage.transaction() as tx:
-                    anchor = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_original_cutover' AND identity=?",
-                                    (origin['nonce'],))
-                    imported = tx.one("SELECT subject,material_id FROM history WHERE kind='v6_completed_import'")
-                    original_import = json.loads(tx.get(imported['material_id'], imported['subject']))
-                    if (tx.get(anchor['material_id'], anchor['subject']) != wire_json(origin)
-                            or origin['target_db'] != str(destination.resolve())
-                            or origin['source_db'] != str(snapshot.source.resolve())
-                            or origin['source_sha256'] != snapshot.sha256
-                            or reader.source['sha256'] != snapshot.sha256
-                            or original_import['source_sha256'] != snapshot.sha256
-                            or original_root['value_checkout_identity'] != origin['source_uuid']
-                            or original_root['value_run_branch'] != facts.run_branch):
-                        raise MigrationRefused('source_origin_provenance')
-                    # Transfer the authenticated old RunRoot responsibility,
-                    # without claiming native workspace execution created it.
-                    source_ref = 'refs/heads/' + facts.run_branch
-                    ownership = tx.put(subject, 'v6_local_ref_ownership', wire_json({
-                        'origin_nonce': origin['nonce'], 'source_ref': source_ref,
-                        'expected_oid': facts.integrated_sha,
-                        'source_record': {'table': 'run_root', 'key': [facts.run_id]},
-                    }))
-                    tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
-                               'VALUES (?,?,?,?,1,?)',
-                               (subject, 'v6_local_ref_ownership', source_ref, ownership, kernel.clock()))
-                    if facts.pending_resources:
-                        record = {'table': 'work_jobs', 'key': [facts.run_id, facts.old_job['job_id']]}
-                        for kind, field, resource in (
-                                ('v6_local_ref_ownership', 'source_ref', 'refs/heads/' + facts.ticket_branch),
-                                ('v6_local_worktree_ownership', 'checkout', str(ticket_checkout))):
-                            body = {'origin_nonce': origin['nonce'], field: resource,
-                                    'expected_oid': facts.publication_sha, 'source_record': record}
-                            material = tx.put(subject, kind, wire_json(body))
-                            tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
-                                       'VALUES (?,?,?,?,1,?)', (subject, kind, resource, material, kernel.clock()))
-            latest_requirements = Requirements(facts.requirements.parent,
-                                               (replace(facts.requirements.issues[0], state="CLOSED"),))
-            # This is the sealed copy's verified GitHub readback, not a new
-            # mutable source read. Requirements and all nested facts are frozen.
-            kernel.refresh(lambda: latest_requirements)
-            state = kernel.status(subject)
-            summary = kernel.source_status()
-            if (state["phase"] != "complete" or state["pending_write"] is not None
-                    or state["pending_attempt"] is not None or len(summary["completions"]) != 1
-                    or subject in summary["frontier"]):
-                raise MigrationRefused("converted_state")
-            for path, expected_sha in ((profile_snapshot, profile_sha), (github_snapshot, github_sha),
-                                       (observation_snapshot, observation_sha), (original_report, report_sha),
-                                       (external_snapshot, readproof_sha)):
-                if path is None:
-                    if expected_sha is not None:
-                        raise MigrationRefused('source_document_changed')
-                    continue
-                if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
-                    raise MigrationRefused("source_document_changed")
-            if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size
-                   for suffix in ("-wal", "-journal")):
-                raise MigrationRefused("converted_sidecar")
-            try:
-                os.link(candidate, destination)
-            except FileExistsError as error:
-                raise MigrationRefused("destination_exists") from error
-            parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        except BaseException:
-            if destination.exists() and 'candidate' in locals() and destination.samefile(candidate):
-                destination.unlink()
-            if owned_repository:
-                shutil.rmtree(repository_root)
-            raise
-    return Kernel(destination)
+        facts = read_copied_completed_import(snapshot, destination, git_store=git_store,
+            repository_root=repository_root, final_checkout=final_checkout,
+            profile_snapshot=profile_snapshot, github_snapshot=github_snapshot,
+            observation_snapshot=observation_snapshot, original_report=original_report)
+    return install_imported_facts(facts, destination, origin=origin)
 
 
 def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
@@ -1256,6 +971,19 @@ def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot
     return _read_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=external_snapshot,
         github_snapshot=github_snapshot, observation_snapshot=observation_snapshot, original_report=original_report,
         copy_layout=None)
+
+
+def read_original_completed_inspection(snapshot: SourceSnapshot, *, profile_snapshot: Path,
+        readproof: Mapping[str, Any] | None) -> ImportedRunFacts:
+    """Read the same canonical source facts for the existing inspection contract.
+
+    Offline inspection does not assert a live CLOSED Issue or transfer authority.
+    Pending cleanup still requires the existing authenticated external readback.
+    No oracle or live observation is fabricated for an inspection-only result.
+    """
+    return _read_completed_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=None,
+        github_snapshot=None, observation_snapshot=None, original_report=None, copy_layout=None,
+        inspection=True, inspection_readproof=readproof)
 
 
 def read_copied_completed_import(snapshot: SourceSnapshot, destination: Path, *, git_store: Path,
@@ -1274,7 +1002,8 @@ def read_copied_completed_import(snapshot: SourceSnapshot, destination: Path, *,
 
 def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
         external_snapshot: Path | None, github_snapshot: Path | None, observation_snapshot: Path | None,
-        original_report: Path | None, copy_layout: tuple[Path, Path, Path, Path] | None) -> ImportedRunFacts:
+        original_report: Path | None, copy_layout: tuple[Path, Path, Path, Path] | None,
+        inspection: bool = False, inspection_readproof: Mapping[str, Any] | None = None) -> ImportedRunFacts:
     """Decode the existing external-proof or offline-oracle Completion input.
 
     The old writer DTO is not an intermediate. Historical Invocation absence
@@ -1296,7 +1025,14 @@ def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
     observed: dict[str, Any] = {}
     report: dict[str, Any] = {}
     github: dict[str, Any] = {}
-    if external_snapshot is not None:
+    if inspection:
+        if copy_layout is not None or any(path is not None for path in
+                (external_snapshot, github_snapshot, observation_snapshot, original_report)):
+            raise MigrationRefused('source_readproof_resources')
+        if inspection_readproof is not None:
+            external_document = wire_json(inspection_readproof)
+            proof = json.loads(external_document)
+    elif external_snapshot is not None:
         if copy_layout is not None or any(path is not None for path in (github_snapshot, observation_snapshot, original_report)):
             raise MigrationRefused('source_readproof_resources')
         proof, proof_sha = _read_document(external_snapshot)
@@ -1332,6 +1068,10 @@ def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
         if copy_layout is None:
             root, common = managed.repository_root, managed.repository_root / '.git'
             final = managed.root / 'worktrees' / run_id / 'run-publication'
+            if inspection:
+                target = managed.state_root / run_id / 'kernel.sqlite3'
+                if target.exists() or target.is_symlink():
+                    raise MigrationRefused('native_original_candidate_exists')
             _verify_completed_git(snapshot, snapshot.path, managed.state_root / run_id / 'kernel.sqlite3', root, final, common,
                 repository=repository, run_id=run_id, observed_default_sha=observed_default_sha,
                 base_sha=base_sha, run_branch=run_branch, integrated_sha=integrated_sha,
@@ -1358,7 +1098,7 @@ def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
             checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
             object_root, object_prefix = store, ('--git-dir', str(store.resolve()))
             base = Commit(base_sha, _git(object_root, *object_prefix, 'rev-parse', base_sha + '^{tree}'))
-        if proof is None:
+        if proof is None and not inspection:
             registrations = report.get('post_close_worktrees', {}).get('registrations')
             original_roots = [Path(row['path']) for row in registrations
                 if isinstance(row, dict) and row.get('repository') is True and isinstance(row.get('path'), str)] if isinstance(registrations, list) else []
@@ -1469,6 +1209,8 @@ def _read_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
             readback = proof['requirements']
             observed_requirements = Requirements.from_wire({**readback,
                 'parent': {**readback['parent'], 'sub_issues': readback['parent']['sub_issue_numbers']}})
+        elif inspection:
+            observed_requirements = requirements
         else:
             observed_requirements = Requirements.from_wire(github)
         return ImportedRunFacts(source=source, spec=spec, requirements=requirements, observed_requirements=observed_requirements,

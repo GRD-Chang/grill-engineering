@@ -8,13 +8,9 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import dataclass, replace
 import hashlib
-import io
 import json
-import os
 from pathlib import Path
 import sqlite3
-import tempfile
-import tarfile
 from typing import Any, Callable, Mapping, TypeVar
 
 from agent_run.managed_workspace import ManagedWorkspace
@@ -22,11 +18,10 @@ from agent_run.managed_workspace import ManagedWorkspace
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _require_no_v6_notification_journal, capture_v6, validate_snapshot)
+                        _require_no_v6_notification_journal, validate_snapshot)
 from .migration_conversion import _git, _one, _policy
-from .migration_checkout import _verify_checkout_archive, seal_checkout
+from .migration_checkout import _verify_checkout_archive
 from .migration_quiescence import CONTROL_TABLES, read_v6_host_exit
-from .migration_records import _preserve_copy
 from .migration_facts import (ImportSource, ImportedAttempt, ImportedBudget, ImportedHistoryEvent,
     ImportedResource, ImportedRunFacts, ImportedSubject, HistoricalExecution, SourceRecord)
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
@@ -74,35 +69,6 @@ class _Call:
     returned: dict[str, Any]
     raw_evidence_id: str
     native_artifact: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _Active:
-    run_id: str
-    repository: str
-    parent_number: int
-    parent_revision: str
-    graph_revision: str
-    created_at: float
-    language: str
-    requirements: Requirements
-    policy: Policy
-    inputs: CreationInputs
-    run_branch: str
-    base_branch: str
-    base_sha: str
-    ticket: int
-    source_ref: str
-    candidate_sha: str | None
-    candidate_tree: str | None
-    integration_target: str | None
-    resync_window: int
-    pending_role: Role
-    candidate_intent: dict[str, Any] | None
-    calls: tuple[_Call, ...]
-    bindings: tuple[dict[str, Any], ...]
-    evidence: tuple[dict[str, Any], ...]
-    timeline: tuple[dict[str, Any], ...]
 
 
 def _wire_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -509,168 +475,105 @@ def _read_returned_source(path: Path, profile: Mapping[str, Any], profile_sha: s
         db.close()
 
 
-def _read_active(path: Path, profile: Mapping[str, Any], profile_sha: str,
-                 source_sha: str, *, original: bool = False) -> _Active:
-    # Retained only for the old writer until unique installation is connected.
-    def legacy(db: sqlite3.Connection, *values: Any) -> _Active:
-        return _Active(*values)
-    return _read_returned_source(path, profile, profile_sha, source_sha, legacy, original=original)
+def _copied_checkout_status(observed: Mapping[str, Any], role: Role) -> tuple[str, ...]:
+    """Normalize the two proved input formats without inventing a clean observation."""
+    if 'ticket_checkout_status' in observed:
+        status = observed['ticket_checkout_status']
+        if not isinstance(status, list) or any(not isinstance(item, str) for item in status):
+            raise MigrationRefused('source_checkout')
+        if 'ticket_checkout_clean' in observed and (
+                type(observed['ticket_checkout_clean']) is not bool or observed['ticket_checkout_clean'] != (not status)):
+            raise MigrationRefused('source_checkout')
+        return tuple(status)
+    if role == Role.PUBLICATION and observed.get('ticket_checkout_clean') is True:
+        return ()
+    raise MigrationRefused('source_checkout')
 
 
-def _build_returned_candidate(
-    snapshot: SourceSnapshot, facts: _Active, candidate: Path, *, repository_root: Path,
-    checkout: Path, final_checkout: Path, profile_sha: str, remote_source_sha: str,
-    remote_target_sha: str, archive_ref: str | None, original_mode: bool = False,
-) -> Kernel:
-    """Map proved role facts; only Kernel later consumes the returned artifact."""
-    subject = f"ticket:{facts.ticket}"
-    common = repository_root / ".git"
-    spec = RunSpec(facts.run_id, facts.repository, facts.parent_number, facts.parent_revision,
-                   facts.graph_revision,
-                   (Delivery(subject, DeliveryKind.TICKET, facts.ticket, "source-verified",
-                             Commit(facts.base_sha, _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
-                             facts.source_ref, f"refs/heads/{facts.run_branch}",
-                             checkout=str(checkout), owned_root=str(checkout.parent),
-                             common_git_dir=str(common)),
-                    Delivery(f"final:{facts.run_id}", DeliveryKind.FINAL_RUN, facts.parent_number,
-                             facts.parent_revision, Commit(facts.base_sha,
-                             _git(repository_root, "rev-parse", f"{facts.base_sha}^{{tree}}")),
-                             f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}",
-                             checkout=str(final_checkout), owned_root=str(final_checkout.parent),
-                             common_git_dir=str(common))), facts.policy, facts.language,
-                   str(repository_root), facts.inputs)
-    kernel = Kernel.create(candidate, spec, requirements=facts.requirements)
-    phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review",
-             Role.PUBLICATION: "publish"}[facts.pending_role]
-    with kernel.storage.transaction() as tx:
-        native = tx.one("SELECT revision,completion_revision FROM subjects WHERE id=?", (subject,))
-        tx.execute("UPDATE runs SET created_at=?", (facts.created_at,))
-        tx.execute("UPDATE subjects SET phase=?,current_attempt=?,review_attempt=?,"
-                   "development_thread=?,candidate_sha=?,candidate_tree=?,workspace_sha=?,"
-                   "expected_tree=?,integrated_sha=?,integrated_tree=?,integration_target=?,gate_mode=? "
-                   "WHERE id=?", (phase, facts.calls[-1].attempt_id,
-                                  facts.calls[1].attempt_id if facts.pending_role == Role.PUBLICATION else None,
-                                  facts.calls[0].thread_id, facts.candidate_sha, facts.candidate_tree,
-                                  facts.candidate_sha or facts.base_sha, facts.candidate_tree,
-                                  facts.candidate_sha if facts.pending_role == Role.PUBLICATION else None,
-                                  facts.candidate_tree if facts.pending_role == Role.PUBLICATION else None,
-                                  facts.integration_target,
-                                  "review" if facts.pending_role == Role.PUBLICATION else None, subject))
-        tx.execute("UPDATE budgets SET developments_used=1,reviews_used=? "
-                   "WHERE subject=? AND purpose='requirements' AND window=1",
-                   (int(facts.pending_role == Role.PUBLICATION), subject))
-        if facts.pending_role == Role.PUBLICATION:
-            tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,0)",
-                       (subject, facts.resync_window, 1, facts.source_ref,
-                        f"refs/heads/{facts.run_branch}", facts.base_sha, facts.integration_target))
-        tx.execute("DELETE FROM history")
-        for event in facts.timeline:
-            at = _created_at_epoch(event["value_at"])
-            payload = {"event_id": event["event_id"], "presence_hex": event["presence"].hex(),
-                       "values": {key: value for key, value in event.items()
-                                  if key.startswith("value_") and value is not None}}
-            material = tx.put(subject, "v6_timeline_event", wire_json(payload))
-            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                       "VALUES (?,?,?,?,1,?)", (subject, f"v6_{event['value_kind']}",
-                                               event["event_id"], material, at))
-        for entry in facts.evidence:
-            tx.put(subject, "v6_evidence", wire_json(entry))
-        if facts.candidate_intent is not None:
-            tx.put(subject, "v6_candidate_commit_intent", wire_json(facts.candidate_intent))
-        for binding in facts.bindings:
-            tx.execute("INSERT INTO threads(id,subject,role,profile_revision,backend_id) VALUES (?,?,?,1,?)",
-                       (binding["thread_id"], subject, binding["role"], binding["thread_id"]))
-            tx.put(subject, "v6_thread_binding", wire_json(binding))
-        for index, call in enumerate(facts.calls, start=1):
-            context_witness: dict[str, Any] = {
-                "old_attempt": call.attempt_id,
-                "old_role_ordinal": call.old_ordinal,
-                "input_fingerprint": call.invocation["input_fingerprint"],
-                "bound_version": _wire_row(call.bound_version),
-                "native_authority": {
-                    "kind": "continuation-boundary",
-                    "parent_revision": facts.parent_revision,
-                    "graph_revision": facts.graph_revision,
-                    "revision": native["revision"],
-                    "completion_revision": native["completion_revision"],
-                    "base_sha": facts.base_sha,
-                    "candidate_sha": facts.candidate_sha,
-                    "candidate_tree": facts.candidate_tree,
-                },
-            }
-            if call.role == Role.REVIEW:
-                # The old review_context evidence binds the exact candidate
-                # but contains no reviewer checkout path.  Preserve that
-                # absence instead of claiming the Ticket checkout was it.
-                # Successor Publication consumes the native review identity;
-                # these revisions identify the verified continuation boundary,
-                # while the original bound input remains above unchanged.
-                context_witness.update(
-                    checkout=None, base_sha=facts.base_sha,
-                    reviewed_commit=facts.candidate_sha, reviewed_tree=facts.candidate_tree,
-                    revision=native["revision"], parent_revision=facts.parent_revision,
-                    graph_revision=facts.graph_revision,
-                    completion_revision=native["completion_revision"],
-                )
-            context = tx.put(subject, "v6_attempt_input_witness", wire_json(context_witness))
-            result = tx.put(subject, "v6_normalized_artifact", wire_json(call.native_artifact))
-            tx.execute("""INSERT INTO attempts(
-                id,subject,generation,ordinal,role,purpose,window,parent_revision,graph_revision,
-                revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,
-                context_id,current_invocation,result_id,status,accounted,outcome)
-                VALUES (?,?,1,?,?,'requirements',1,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)""",
-                       (call.attempt_id, subject, index, call.role.value, facts.parent_revision,
-                        facts.graph_revision, native["revision"],
-                        facts.base_sha, facts.candidate_sha, facts.candidate_tree, facts.candidate_tree,
-                        native["completion_revision"], context, result,
-                        "returned" if index == len(facts.calls) else "consumed",
-                        1 if index == 2 and facts.pending_role == Role.PUBLICATION else 0,
-                        None if index == len(facts.calls) else "pass" if index == 2 else "development"))
-            original = {"attempt_id": call.attempt_id, "old_role_ordinal": call.old_ordinal,
-                        "thread_id": call.thread_id, "raw_evidence_id": call.raw_evidence_id,
-                        "returned": call.returned, "invocation": _wire_row(call.invocation),
-                        "bound_version": _wire_row(call.bound_version),
-                        "current_version": _wire_row(call.current_version)}
-            material = tx.put(subject, "v6_imported_invocation", wire_json(original))
-            original_identity = ":".join((facts.run_id, subject, call.invocation["started_at"]))
-            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) "
-                       "VALUES (?,?,?,?,1,?)", (subject, "imported_invocation", original_identity,
-                                               material, _created_at_epoch(call.invocation["ended_at"])))
-        tx.put(subject, "v6_import_identity", wire_json({
-            "source_sha256": snapshot.sha256, "profile_sha256": profile_sha,
-            "source_ref": facts.source_ref, "candidate_sha": facts.candidate_sha,
-            "candidate_tree": facts.candidate_tree, "remote_source_sha": remote_source_sha,
-            "remote_target_sha": remote_target_sha,
-            "archive_ref": archive_ref if facts.candidate_sha is not None else None,
-            "checkout": str(checkout),
-            "mirror_conversion": "candidate-to-remote-base" if facts.candidate_sha is not None and not original_mode else "none",
-            "source_backend": "original-reaped-local" if original_mode else "completed-synchronous-oracle",
-        }))
-    return kernel
+def _verify_copied_returned_input(source: Mapping[str, Any], observed: Mapping[str, Any], github_snapshot: Path,
+        repository_root: Path, checkout: Path, final_checkout: Path, remote_source_sha: str,
+        remote_target_sha: str, checkout_archive: Path | None) -> tuple[list[str], str]:
+    try:
+        github_bytes = github_snapshot.read_bytes()
+        github = json.loads(github_bytes)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise MigrationRefused("source_github_observation") from error
+    branches = github.get("delivery", {}).get("published_branches") if isinstance(github, dict) else None
+    if (len(github_bytes) > 4 * 1024 * 1024 or not isinstance(branches, dict)
+            or hashlib.sha256(github_bytes).hexdigest() != observed.get("fixture_sha256")
+            or github.get("repository") != source['repository']
+            or github.get("default_branch") != source['base_branch']
+            or github.get("default_head_sha") != remote_target_sha
+            or branches.get(source['run_branch']) != source['base_sha']
+            or branches.get(source['source_ref'].removeprefix("refs/heads/")) != remote_source_sha):
+        raise MigrationRefused("source_github_observation")
+    completed = observed.get("completed_invocation")
+    pending = observed.get("pending_attempt")
+    old_phase = {Role.DEVELOPMENT: "developing", Role.REVIEW: "reviewing",
+                 Role.PUBLICATION: "accepted"}[source['pending_role']]
+    if (observed.get("run_id") != source['run_id'] or not isinstance(completed, dict)
+            or not isinstance(pending, dict)
+            or not isinstance(completed.get("semantic_attempt"), dict)
+            or (source['pending_role'] != Role.PUBLICATION and observed.get("job_phase") != old_phase)
+            or (source['pending_role'] != Role.PUBLICATION
+                and observed.get("role") not in {source['pending_role'].value,
+                                                  "reviewer" if source['pending_role'] == Role.REVIEW else source['pending_role'].value})
+            or pending.get("attempt_id") != source['calls'][-1].attempt_id
+            or completed["semantic_attempt"].get("attempt_id") != source['calls'][-1].attempt_id
+            or completed.get("started_at") != source['calls'][-1].invocation["started_at"]
+            or completed.get("ended_at") != source['calls'][-1].invocation["ended_at"]
+            or completed.get("status") != "completed"
+            or completed.get("execution_segments") != []):
+        raise MigrationRefused("source_quiescence_unproved")
+    if _git(repository_root, "rev-parse", "--show-toplevel") != str(repository_root):
+        raise MigrationRefused("source_git")
+    for ref in (source['source_ref'], f"refs/heads/{source['run_branch']}", f"refs/heads/{source['base_branch']}"):
+        _git(repository_root, "check-ref-format", ref)
+    if (remote_source_sha != source['base_sha']
+            or remote_target_sha != (source['integration_target'] or source['base_sha'])
+            or _git(repository_root, "rev-parse", f"refs/heads/{source['run_branch']}^{{commit}}") != source['base_sha']
+            or _git(repository_root, "rev-parse", f"refs/heads/{source['base_branch']}^{{commit}}") != source['base_sha']
+            or _git(repository_root, "rev-parse", f"{source['source_ref']}^{{commit}}") != (source['candidate_sha'] or source['base_sha'])
+            or (source['candidate_sha'] is not None and
+                _git(repository_root, "rev-parse", f"{source['candidate_sha']}^{{tree}}") != source['candidate_tree'])):
+        raise MigrationRefused("source_git")
+    checkout_head = source['candidate_sha'] or source['base_sha']
+    if (not checkout.is_dir() or _git(checkout, "rev-parse", "--show-toplevel") != str(checkout)
+            or _git(checkout, "rev-parse", "HEAD") != checkout_head
+            or checkout == repository_root):
+        raise MigrationRefused("source_checkout")
+    status = _git(checkout, "status", "--porcelain").splitlines()
+    if (tuple(status) != _copied_checkout_status(observed, source['pending_role'])
+            or observed.get("ticket_checkout_head") != checkout_head):
+        raise MigrationRefused("source_checkout")
+    if checkout_archive is not None:
+        archive_sha = observed.get("checkout_archive_sha256")
+        if not isinstance(archive_sha, str):
+            raise MigrationRefused("source_checkout_archive")
+        _verify_checkout_archive(checkout_archive, checkout, archive_sha)
+    elif source['pending_role'] == Role.DEVELOPMENT:
+        raise MigrationRefused("source_checkout_archive_required")
+    if source['pending_role'] == Role.DEVELOPMENT:
+        if (not status or _git(checkout, "diff", "--cached", "--name-only")
+                or source['candidate_sha'] is not None):
+            raise MigrationRefused("source_checkout")
+    elif status:
+        raise MigrationRefused("source_checkout")
+    common_value = Path(_git(checkout, "rev-parse", "--git-common-dir") or "")
+    common = (common_value if common_value.is_absolute() else checkout / common_value).resolve()
+    if common != (repository_root / ".git").resolve():
+        raise MigrationRefused("source_checkout")
+    if final_checkout.exists() or final_checkout == checkout or final_checkout == repository_root:
+        raise MigrationRefused("new_final_checkout")
+    archive_ref = f"refs/agent-run-kernel-migration/{source['run_id']}/ticket-{source['ticket']}"
+    _git(repository_root, "check-ref-format", archive_ref)
+    if source['candidate_sha'] is not None and _git(repository_root, "for-each-ref", "--format=%(refname)", archive_ref):
+        raise MigrationRefused("migration_archive_exists")
+    return status, archive_ref
 
 
-def convert_returned_role_v6(
-    snapshot: SourceSnapshot, destination: Path, *, repository_root: Path,
-    checkout: Path, final_checkout: Path, profile_snapshot: Path, github_snapshot: Path,
-    observation_snapshot: Path, remote_source_sha: str, remote_target_sha: str,
-    checkout_archive: Path | None = None,
-) -> Kernel:
-    """Import a sealed synchronous-oracle return, never a live Host invocation.
-
-    The observation must come from a completed old-process oracle whose
-    producer has exited.  This limited API is not active-Host admission.
-    """
-    destination = destination.absolute()
-    repository_root, checkout, final_checkout = (repository_root.resolve(), checkout.resolve(),
-                                                  final_checkout.resolve())
-    if (repository_root == destination.parent.resolve()
-            or not repository_root.is_relative_to(destination.parent.resolve())
-            or snapshot.source.resolve().is_relative_to(repository_root)
-            or snapshot.path.resolve().is_relative_to(repository_root)):
-        raise MigrationRefused("copied_repository_required")
-    if destination.exists() or destination.is_symlink():
-        raise MigrationRefused("destination_exists")
-    profile, profile_sha = _read_profile(profile_snapshot)
+def _read_copied_returned_observation(snapshot: SourceSnapshot, profile_sha: str,
+        observation_snapshot: Path) -> tuple[dict[str, Any], str]:
     try:
         observation_bytes = observation_snapshot.read_bytes()
         if len(observation_bytes) > 4 * 1024 * 1024:
@@ -684,153 +587,23 @@ def convert_returned_role_v6(
             or observed.get("source_sha256") != snapshot.sha256
             or observed.get("profile_sha256") != profile_sha):
         raise MigrationRefused("source_quiescence_unproved")
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".v6-active-") as directory:
-        copied = capture_v6(snapshot.path, Path(directory) / "source.sqlite3")
-        if ((copied.sha256, copied.source_protocol, copied.schema_sha256, copied.table_rows)
-                != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
-            raise MigrationRefused("snapshot_changed")
-        facts = _read_active(copied.path, profile, profile_sha, snapshot.sha256)
-        _require_no_v6_notification_journal(snapshot, facts.run_id)
-        try:
-            github_bytes = github_snapshot.read_bytes()
-            github = json.loads(github_bytes)
-        except (OSError, UnicodeError, ValueError) as error:
-            raise MigrationRefused("source_github_observation") from error
-        branches = github.get("delivery", {}).get("published_branches") if isinstance(github, dict) else None
-        if (len(github_bytes) > 4 * 1024 * 1024 or not isinstance(branches, dict)
-                or hashlib.sha256(github_bytes).hexdigest() != observed.get("fixture_sha256")
-                or github.get("repository") != facts.repository
-                or github.get("default_branch") != facts.base_branch
-                or github.get("default_head_sha") != remote_target_sha
-                or branches.get(facts.run_branch) != facts.base_sha
-                or branches.get(facts.source_ref.removeprefix("refs/heads/")) != remote_source_sha):
-            raise MigrationRefused("source_github_observation")
-        completed = observed.get("completed_invocation")
-        pending = observed.get("pending_attempt")
-        old_phase = {Role.DEVELOPMENT: "developing", Role.REVIEW: "reviewing",
-                     Role.PUBLICATION: "accepted"}[facts.pending_role]
-        if (observed.get("run_id") != facts.run_id or not isinstance(completed, dict)
-                or not isinstance(pending, dict)
-                or not isinstance(completed.get("semantic_attempt"), dict)
-                or (facts.pending_role != Role.PUBLICATION and observed.get("job_phase") != old_phase)
-                or (facts.pending_role != Role.PUBLICATION
-                    and observed.get("role") not in {facts.pending_role.value,
-                                                      "reviewer" if facts.pending_role == Role.REVIEW else facts.pending_role.value})
-                or pending.get("attempt_id") != facts.calls[-1].attempt_id
-                or completed["semantic_attempt"].get("attempt_id") != facts.calls[-1].attempt_id
-                or completed.get("started_at") != facts.calls[-1].invocation["started_at"]
-                or completed.get("ended_at") != facts.calls[-1].invocation["ended_at"]
-                or completed.get("status") != "completed"
-                or completed.get("execution_segments") != []):
-            raise MigrationRefused("source_quiescence_unproved")
-        if _git(repository_root, "rev-parse", "--show-toplevel") != str(repository_root):
-            raise MigrationRefused("source_git")
-        for ref in (facts.source_ref, f"refs/heads/{facts.run_branch}", f"refs/heads/{facts.base_branch}"):
-            _git(repository_root, "check-ref-format", ref)
-        if (remote_source_sha != facts.base_sha
-                or remote_target_sha != (facts.integration_target or facts.base_sha)
-                or _git(repository_root, "rev-parse", f"refs/heads/{facts.run_branch}^{{commit}}") != facts.base_sha
-                or _git(repository_root, "rev-parse", f"refs/heads/{facts.base_branch}^{{commit}}") != facts.base_sha
-                or _git(repository_root, "rev-parse", f"{facts.source_ref}^{{commit}}") != (facts.candidate_sha or facts.base_sha)
-                or (facts.candidate_sha is not None and
-                    _git(repository_root, "rev-parse", f"{facts.candidate_sha}^{{tree}}") != facts.candidate_tree)):
-            raise MigrationRefused("source_git")
-        checkout_head = facts.candidate_sha or facts.base_sha
-        if (not checkout.is_dir() or _git(checkout, "rev-parse", "--show-toplevel") != str(checkout)
-                or _git(checkout, "rev-parse", "HEAD") != checkout_head
-                or checkout == repository_root):
-            raise MigrationRefused("source_checkout")
-        status = _git(checkout, "status", "--porcelain").splitlines()
-        if (status != observed.get("ticket_checkout_status", [] if facts.pending_role == Role.PUBLICATION else None)
-                or observed.get("ticket_checkout_head") != checkout_head):
-            raise MigrationRefused("source_checkout")
-        if checkout_archive is not None:
-            archive_sha = observed.get("checkout_archive_sha256")
-            if not isinstance(archive_sha, str):
-                raise MigrationRefused("source_checkout_archive")
-            _verify_checkout_archive(checkout_archive, checkout, archive_sha)
-        elif facts.pending_role == Role.DEVELOPMENT:
-            raise MigrationRefused("source_checkout_archive_required")
-        if facts.pending_role == Role.DEVELOPMENT:
-            if (not status or _git(checkout, "diff", "--cached", "--name-only")
-                    or facts.candidate_sha is not None):
-                raise MigrationRefused("source_checkout")
-        elif status:
-            raise MigrationRefused("source_checkout")
-        common_value = Path(_git(checkout, "rev-parse", "--git-common-dir") or "")
-        common = (common_value if common_value.is_absolute() else checkout / common_value).resolve()
-        if common != (repository_root / ".git").resolve():
-            raise MigrationRefused("source_checkout")
-        if final_checkout.exists() or final_checkout == checkout or final_checkout == repository_root:
-            raise MigrationRefused("new_final_checkout")
-        archive_ref = f"refs/agent-run-kernel-migration/{facts.run_id}/ticket-{facts.ticket}"
-        _git(repository_root, "check-ref-format", archive_ref)
-        if facts.candidate_sha is not None and _git(repository_root, "for-each-ref", "--format=%(refname)", archive_ref):
-            raise MigrationRefused("migration_archive_exists")
-        subject = f"ticket:{facts.ticket}"
-        candidate = Path(directory) / "kernel.sqlite3"
-        kernel = _build_returned_candidate(
-            snapshot, facts, candidate, repository_root=repository_root, checkout=checkout,
-            final_checkout=final_checkout, profile_sha=profile_sha, remote_source_sha=remote_source_sha,
-            remote_target_sha=remote_target_sha, archive_ref=archive_ref)
-        phase = {Role.DEVELOPMENT: "development", Role.REVIEW: "review", Role.PUBLICATION: "publish"}[facts.pending_role]
-        if (kernel.status(subject)["pending_attempt"] != facts.calls[-1].attempt_id
-                or kernel.status(subject)["phase"] != phase):
-            raise MigrationRefused("converted_state")
-        if _read_profile(profile_snapshot)[1] != profile_sha:
-            raise MigrationRefused("source_profile_changed")
-        if hashlib.sha256(observation_snapshot.read_bytes()).hexdigest() != observation_sha:
-            raise MigrationRefused("source_observation_changed")
-        if hashlib.sha256(github_snapshot.read_bytes()).hexdigest() != observed["fixture_sha256"]:
-            raise MigrationRefused("source_github_observation_changed")
-        if checkout_archive is not None:
-            _verify_checkout_archive(checkout_archive, checkout, observed["checkout_archive_sha256"])
-        # This is only the caller's isolated copied repository.  Keep the old
-        # candidate reachable before normalizing the local mirror to the
-        # observed remote parent.  The old source and its ref are untouched.
-        zeros = "0" * len(facts.base_sha)
-        archived = normalized = linked = False
-        try:
-            if facts.candidate_sha is not None:
-                _git(repository_root, "update-ref", archive_ref, facts.candidate_sha, zeros)
-                archived = True
-                _git(repository_root, "update-ref", facts.source_ref, remote_source_sha, facts.candidate_sha)
-                normalized = True
-            if ((facts.candidate_sha is not None and
-                 _git(repository_root, "rev-parse", archive_ref) != facts.candidate_sha)
-                    or _git(repository_root, "rev-parse", facts.source_ref) != remote_source_sha
-                    or _git(checkout, "rev-parse", "HEAD") != checkout_head
-                    or _git(checkout, "status", "--porcelain").splitlines() != status):
-                raise MigrationRefused("mirror_conversion")
-            if any(Path(str(candidate) + suffix).exists() and Path(str(candidate) + suffix).stat().st_size
-                   for suffix in ("-wal", "-journal")):
-                raise MigrationRefused("converted_sidecar")
-            try:
-                os.link(candidate, destination)
-            except FileExistsError as error:
-                raise MigrationRefused("destination_exists") from error
-            linked = True
-            parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        except BaseException:
-            if linked and destination.samefile(candidate):
-                destination.unlink()
-            try:
-                if normalized and facts.candidate_sha is not None:
-                    _git(repository_root, "update-ref", facts.source_ref,
-                         facts.candidate_sha, remote_source_sha)
-                if archived and facts.candidate_sha is not None:
-                    _git(repository_root, "update-ref", "-d", archive_ref, facts.candidate_sha)
-            except MigrationRefused as error:
-                # No target database was activated.  The candidate remains
-                # reachable in this disposable copy; reconstruct from the
-                # immutable bundle instead of retrying this changed copy.
-                raise MigrationRefused("copied_mirror_recovery_required") from error
-            raise
-    return Kernel(destination)
+    return observed, observation_sha
+
+
+def convert_returned_role_v6(
+    snapshot: SourceSnapshot, destination: Path, *, repository_root: Path,
+    checkout: Path, final_checkout: Path, profile_snapshot: Path, github_snapshot: Path,
+    observation_snapshot: Path, remote_source_sha: str, remote_target_sha: str,
+    checkout_archive: Path | None = None,
+) -> Kernel:
+    """Decode the existing private-copy contract and use the sole installer."""
+    from .migration_run_install import install_imported_facts
+    destination = destination.absolute()
+    facts = read_copied_returned_import(snapshot, destination, repository_root=repository_root,
+        checkout=checkout, final_checkout=final_checkout, profile_snapshot=profile_snapshot,
+        github_snapshot=github_snapshot, observation_snapshot=observation_snapshot,
+        remote_source_sha=remote_source_sha, remote_target_sha=remote_target_sha, checkout_archive=checkout_archive)
+    return install_imported_facts(facts, destination, copied_checkout_archive=checkout_archive)
 
 
 def _check_returned_external(proof: Mapping[str, Any], source_sha: str, *,
@@ -854,23 +627,6 @@ def _check_returned_external(proof: Mapping[str, Any], source_sha: str, *,
                 'refs/heads/' + run_branch: base_sha,
                 'refs/heads/' + base_branch: base_sha}):
         raise MigrationRefused('source_returned_external')
-
-
-def _returned_external(facts: _Active, proof: Mapping[str, Any], source_sha: str) -> None:
-    _check_returned_external(proof, source_sha, requirements=facts.requirements,
-        runner_identity=facts.inputs.runner_identity, source_ref=facts.source_ref,
-        base_sha=facts.base_sha, run_branch=facts.run_branch, base_branch=facts.base_branch)
-
-
-def _returned_layout(facts: _Active, origin: Mapping[str, str], archive_sha: str) -> dict[str, Any]:
-    managed = ManagedWorkspace.for_repository(facts.repository)
-    checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
-    return {'version': 1, 'nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
-            'source_uuid': origin['source_uuid'], 'repository_root': str(managed.repository_root),
-            'checkout': str(checkout), 'owned_root': str(checkout.parent),
-            'common_git_dir': str(managed.repository_root / '.git'), 'source_ref': facts.source_ref,
-            'expected_oid': facts.candidate_sha or facts.base_sha,
-            'before_head': 'ref: ' + facts.source_ref + '\n', 'checkout_archive_sha256': archive_sha}
 
 
 def _verify_returned_git(snapshot: SourceSnapshot, destination: Path, archive: Path,
@@ -934,92 +690,40 @@ def _verify_returned_git(snapshot: SourceSnapshot, destination: Path, archive: P
         raise MigrationRefused('source_checkout_index')
 
 
-def _existing_returned_git(snapshot: SourceSnapshot, facts: _Active, destination: Path,
-                           archive: Path, archive_sha: str, index_sha: str, *, detached: bool = False) -> None:
-    _verify_returned_git(snapshot, destination, archive, archive_sha, index_sha,
-        repository=facts.repository, run_id=facts.run_id, ticket=facts.ticket, source_ref=facts.source_ref,
-        candidate_sha=facts.candidate_sha, candidate_tree=facts.candidate_tree,
-        base_sha=facts.base_sha, run_branch=facts.run_branch, base_branch=facts.base_branch, detached=detached)
-
-
-def convert_original_returned_v6(snapshot: SourceSnapshot, destination: Path, *,
-                                  profile_snapshot: Path, external_snapshot: Path,
-                                  checkout_archive: Path, source_origin: Mapping[str, str]) -> Kernel:
-    """Prepare original pending raw facts; no source ref, layout or authority is changed."""
-    from .migration_completed import _read_document
-    from .legacy_admission import read_source_fence, source_fence
-    from .migration_layout import verify_layout
-    origin = read_source_fence(source_fence(dict(source_origin)))
-    profile, profile_sha = _read_profile(profile_snapshot)
-    proof, proof_sha = _read_document(external_snapshot)
-    facts = _read_active(snapshot.path, profile, profile_sha, snapshot.sha256, original=True)
-    _require_no_v6_notification_journal(snapshot, facts.run_id)
-    _returned_external(facts, proof, snapshot.sha256)
-    archive_sha = proof.get('checkout_archive_sha256')
-    index_sha = proof.get('checkout_index_sha256')
-    if not isinstance(archive_sha, str) or not isinstance(index_sha, str):
-        raise MigrationRefused('source_checkout_archive')
-    managed = ManagedWorkspace.for_repository(facts.repository)
-    layout = _returned_layout(facts, origin, archive_sha)
-    _existing_returned_git(snapshot, facts, destination, checkout_archive, archive_sha, index_sha)
-    verify_layout(layout, state='attached')
-    if (destination.exists() or destination.is_symlink() or origin['source_db'] != str(snapshot.source)
-            or origin['source_sha256'] != snapshot.sha256 or origin['run_id'] != facts.run_id
-            or origin['target_db'] != str(destination)):
-        raise MigrationRefused('source_original_identity')
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.v6-returned-original-') as directory:
-        candidate = Path(directory) / 'kernel.sqlite3'
-        kernel = _build_returned_candidate(snapshot, facts, candidate,
-            repository_root=managed.repository_root, checkout=Path(layout['checkout']),
-            final_checkout=managed.root / 'worktrees' / facts.run_id / 'run-publication',
-            profile_sha=profile_sha, remote_source_sha=facts.base_sha,
-            remote_target_sha=facts.base_sha, archive_ref=None, original_mode=True)
-        subject = f'ticket:{facts.ticket}'
-        _preserve_copy(snapshot, kernel, run_id=facts.run_id, subject=subject,
-                       profile_document=profile_snapshot.read_bytes(), whole_source=True)
-        with kernel.storage.transaction() as tx:
-            body = {'source_sha256': snapshot.sha256, 'profile_sha256': profile_sha,
-                    'external_readproof_sha256': proof_sha, 'resource_mode': 'existing-verified',
-                    'original_layout': layout, 'checkout_index_sha256': index_sha,
-                    'source_record': {'table': 'work_jobs', 'key': [facts.run_id, f'ticket:{facts.ticket}:generation:1']},
-                    'run_ref': 'refs/heads/' + facts.run_branch,
-                    'run_ref_ownership': {'source_ref': 'refs/heads/' + facts.run_branch, 'expected_oid': facts.base_sha,
-                                          'source_record': {'table': 'run_root', 'key': [facts.run_id]}}}
-            for kind, identity, payload in (
-                    ('v6_returned_import', snapshot.sha256, body),
-                    ('v6_original_cutover', origin['nonce'], origin),
-                    ('v6_original_layout', origin['nonce'], layout),
-                    ('v6_external_readproof', proof_sha, proof)):
-                material = tx.put(subject, kind, wire_json(payload))
-                tx.execute('INSERT INTO history(subject,kind,identity,material_id,generation,created_at) '
-                           'VALUES (?,?,?,?,1,?)', (subject, kind, identity, material, kernel.clock()))
-        _existing_returned_git(snapshot, facts, destination, checkout_archive, archive_sha, index_sha)
-        if _read_profile(profile_snapshot)[1] != profile_sha or _read_document(external_snapshot)[1] != proof_sha:
-            raise MigrationRefused('source_documents_changed')
-        descriptor = os.open(candidate, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.link(candidate, destination)
-        descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    return Kernel(destination)
-
-
-def _seal_returned_checkout(facts: _Active, archive: Path) -> tuple[str, str]:
-    """Seal the canonical checkout using the common byte-preservation routine."""
-    managed = ManagedWorkspace.for_repository(facts.repository)
-    checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
-    return seal_checkout(checkout, managed.repository_root, archive)
-
-
 def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
         external_snapshot: Path, checkout_archive: Path) -> ImportedRunFacts:
-    """Decode the existing original returned-role family; no writer DTO is built.
+    return _read_returned_import(snapshot, profile_snapshot=profile_snapshot,
+        external_snapshot=external_snapshot, checkout_archive=checkout_archive, copy_input=None)
+
+
+def read_original_returned_inspection(snapshot: SourceSnapshot, *, profile_snapshot: Path,
+        readproof: Mapping[str, Any] | None) -> ImportedRunFacts:
+    """Read canonical facts before the observer seals the original checkout.
+
+    Archive/index digests remain absent until that capture. This view grants
+    no transfer authority; the observer must authenticate physical resources,
+    and the transfer decoder still requires the sealed proof and both digests.
+    """
+    return _read_returned_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=None,
+        checkout_archive=None, copy_input=None, inspection=True, inspection_readproof=readproof)
+
+
+def read_copied_returned_import(snapshot: SourceSnapshot, destination: Path, *, repository_root: Path,
+        checkout: Path, final_checkout: Path, profile_snapshot: Path, github_snapshot: Path,
+        observation_snapshot: Path, remote_source_sha: str, remote_target_sha: str,
+        checkout_archive: Path | None = None) -> ImportedRunFacts:
+    return _read_returned_import(snapshot, profile_snapshot=profile_snapshot, external_snapshot=None,
+        checkout_archive=checkout_archive, copy_input=dict(destination=destination.absolute(),
+            repository_root=repository_root.resolve(), checkout=checkout.resolve(), final_checkout=final_checkout.resolve(),
+            github_snapshot=github_snapshot, observation_snapshot=observation_snapshot,
+            remote_source_sha=remote_source_sha, remote_target_sha=remote_target_sha))
+
+
+def _read_returned_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
+        external_snapshot: Path | None, checkout_archive: Path | None,
+        copy_input: Mapping[str, Any] | None, inspection: bool = False,
+        inspection_readproof: Mapping[str, Any] | None = None) -> ImportedRunFacts:
+    """Decode supported returned sources directly; no writer DTO is built.
 
     This consumes sealed inspection evidence and reuses the exact existing
     SQL, external and physical resource validators. It neither installs Core
@@ -1029,11 +733,34 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
     validate_snapshot(snapshot)
     profile, profile_sha = _read_profile(profile_snapshot)
     profile_document = profile_snapshot.read_bytes()
-    proof, proof_sha = _read_document(external_snapshot)
-    external_document = external_snapshot.read_bytes()
-    if (hashlib.sha256(profile_document).hexdigest() != profile_sha
-            or hashlib.sha256(external_document).hexdigest() != proof_sha):
+    proof: dict[str, Any] = {}
+    proof_sha = None
+    external_document = None
+    observed: dict[str, Any] = {}
+    oracle_documents: tuple[tuple[str, bytes], ...] = ()
+    observed_sha = None
+    if hashlib.sha256(profile_document).hexdigest() != profile_sha:
         raise MigrationRefused('source_documents_changed')
+    if inspection:
+        if copy_input is not None or external_snapshot is not None or checkout_archive is not None:
+            raise MigrationRefused('source_readproof_resources')
+        if inspection_readproof is not None:
+            external_document = wire_json(inspection_readproof)
+            proof = json.loads(external_document)
+    elif copy_input is None:
+        if external_snapshot is None or checkout_archive is None:
+            raise MigrationRefused('source_documents_required')
+        proof, proof_sha = _read_document(external_snapshot)
+        external_document = external_snapshot.read_bytes()
+        if hashlib.sha256(external_document).hexdigest() != proof_sha:
+            raise MigrationRefused('source_documents_changed')
+    else:
+        observed, observed_sha = _read_copied_returned_observation(snapshot, profile_sha, copy_input['observation_snapshot'])
+        oracle_documents = (('oracle:observation', copy_input['observation_snapshot'].read_bytes()),
+                            ('oracle:github', copy_input['github_snapshot'].read_bytes()))
+        if (hashlib.sha256(oracle_documents[0][1]).hexdigest() != observed_sha
+                or hashlib.sha256(oracle_documents[1][1]).hexdigest() != observed['fixture_sha256']):
+            raise MigrationRefused('source_documents_changed')
 
     def decode(db: sqlite3.Connection, run_id: str, repository: str, parent_number: int,
             parent_revision: str, graph_revision: str, created_at: float, language: str,
@@ -1044,19 +771,39 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
             calls: tuple[_Call, ...], bindings: tuple[dict[str, Any], ...],
             evidence: tuple[dict[str, Any], ...], timeline: tuple[dict[str, Any], ...]) -> ImportedRunFacts:
         _require_no_v6_notification_journal(snapshot, run_id)
-        _check_returned_external(proof, snapshot.sha256, requirements=requirements,
-            runner_identity=inputs.runner_identity, source_ref=source_ref, base_sha=base_sha,
-            run_branch=run_branch, base_branch=base_branch)
-        archive_sha, index_sha = proof.get('checkout_archive_sha256'), proof.get('checkout_index_sha256')
-        if not isinstance(archive_sha, str) or not isinstance(index_sha, str):
-            raise MigrationRefused('source_checkout_archive')
-        managed = ManagedWorkspace.for_repository(repository)
-        root, common = managed.repository_root, managed.repository_root / '.git'
-        checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
-        final_checkout = managed.root / 'worktrees' / run_id / 'run-publication'
-        # This descriptor is the sealed source claim. The unique cutover
-        # authenticates current resources after strict prepared validation;
-        # advanced/cleaned native resources must not redefine this baseline.
+        checkout_status = None
+        if copy_input is None:
+            if not inspection or inspection_readproof is not None:
+                _check_returned_external(proof, snapshot.sha256, requirements=requirements,
+                    runner_identity=inputs.runner_identity, source_ref=source_ref, base_sha=base_sha,
+                    run_branch=run_branch, base_branch=base_branch)
+            archive_sha, index_sha = (None, None) if inspection else (
+                proof.get('checkout_archive_sha256'), proof.get('checkout_index_sha256'))
+            if not inspection and (not isinstance(archive_sha, str) or not isinstance(index_sha, str)):
+                raise MigrationRefused('source_checkout_archive')
+            managed = ManagedWorkspace.for_repository(repository)
+            root, common = managed.repository_root, managed.repository_root / '.git'
+            checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
+            final_checkout = managed.root / 'worktrees' / run_id / 'run-publication'
+            # Original descriptors remain sealed claims; the fixed original
+            # cutover authenticates current resources/nonce, including reentry.
+        else:
+            destination, root = copy_input['destination'], copy_input['repository_root']
+            checkout, final_checkout = copy_input['checkout'], copy_input['final_checkout']
+            if (root == destination.parent.resolve() or not root.is_relative_to(destination.parent.resolve())
+                    or snapshot.source.resolve().is_relative_to(root) or snapshot.path.resolve().is_relative_to(root)):
+                raise MigrationRefused('copied_repository_required')
+            if destination.exists() or destination.is_symlink():
+                raise MigrationRefused('destination_exists')
+            status, _ = _verify_copied_returned_input(dict(repository=repository, base_branch=base_branch, base_sha=base_sha,
+                run_branch=run_branch, source_ref=source_ref, pending_role=pending_role, run_id=run_id,
+                calls=calls, integration_target=integration_target, candidate_sha=candidate_sha,
+                candidate_tree=candidate_tree, ticket=ticket), observed, copy_input['github_snapshot'],
+                root, checkout, final_checkout, copy_input['remote_source_sha'], copy_input['remote_target_sha'], checkout_archive)
+            checkout_status = tuple(status)
+            common = root / '.git'
+            archive_sha = observed.get('checkout_archive_sha256') if checkout_archive is not None else None
+            index_sha = None  # The copied contract has no original index transfer claim.
         base = Commit(base_sha, _git(root, 'rev-parse', base_sha + '^{tree}'))
         subject = f'ticket:{ticket}'
         spec = RunSpec(run_id, repository, parent_number, parent_revision, graph_revision,
@@ -1107,8 +854,10 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
             workspace_oid=candidate_sha or base_sha, owned_root=checkout.parent, common_git_dir=common,
             # The sealed source owner/branch is the original attached HEAD
             # witness. Current HEAD may already be detached by this transfer.
-            before_head=('ref: ' + source_ref + '\n').encode('ascii'),
-            checkout_archive_sha256=archive_sha, checkout_index_sha256=index_sha, head_evidence=(owner,), cleanup_pending=False)
+            before_head=(('ref: ' + source_ref + '\n').encode('ascii') if copy_input is None else
+                Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'HEAD')).read_bytes()),
+            checkout_archive_sha256=archive_sha, checkout_index_sha256=index_sha, head_evidence=(owner,), cleanup_pending=False,
+            checkout_status=checkout_status)
         integration = None if job['value_ticket_integration'] is None else _one(db,
             'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m ON m.material_id=e.material_id '
             'WHERE e.run_id=? AND e.evidence_id=?', (run_id, job['value_ticket_integration']))[0].encode('utf-8')
@@ -1121,7 +870,7 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
             candidate=candidate, integration=integration,
             accepted_review=calls[1].attempt_id if pending_role == Role.PUBLICATION else None, completion=None,
             resources=(workspace,))
-        task = read_v6_host_exit(db, run_id, required=True)
+        task = read_v6_host_exit(db, run_id, required=copy_input is None)
         documents = tuple((row[0], row[1].encode('utf-8')) for row in db.execute(
             'SELECT e.evidence_id,m.body FROM work_evidence e JOIN work_evidence_materials m '
             'ON m.material_id=e.material_id WHERE e.run_id=? ORDER BY e.evidence_id', (run_id,)))
@@ -1131,9 +880,9 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
             # This reserved document identity does not grant material purpose
             # or effect authority to arbitrary oracle document names.
             documents += (('source:work_job_candidate_commit_intent', wire_json(candidate_intent)),)
-        source = ImportSource(snapshot=snapshot, mode='original', scope='single-ticket', task=task,
+        source = ImportSource(snapshot=snapshot, mode='original' if copy_input is None else 'copied', scope='single-ticket', task=task,
             checkout_uuid=_one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?', (run_id,))[0],
-            profile_document=profile_document, external_readproof=external_document, oracle_documents=documents)
+            profile_document=profile_document, external_readproof=external_document, oracle_documents=documents + oracle_documents)
         run_resource = ImportedResource(owner=SourceRecord('runs', (run_id,)), kind='run-ref', disposition='existing',
             source_ref='refs/heads/' + run_branch, expected_oid=base_sha, checkout=None, workspace_oid=None,
             owned_root=None, common_git_dir=common, before_head=None, checkout_archive_sha256=None,
@@ -1150,8 +899,11 @@ def read_original_returned_import(snapshot: SourceSnapshot, *, profile_snapshot:
         return ImportedRunFacts(source=source, spec=spec, requirements=requirements, observed_requirements=requirements,
             created_at=created_at, subjects=(imported,), run_resource=run_resource, history=history)
 
-    result = _read_returned_source(snapshot.path, profile, profile_sha, snapshot.sha256, decode, original=True)
+    result = _read_returned_source(snapshot.path, profile, profile_sha, snapshot.sha256, decode, original=copy_input is None)
     validate_snapshot(snapshot)
-    if (_read_profile(profile_snapshot)[1] != profile_sha or _read_document(external_snapshot)[1] != proof_sha):
+    if (_read_profile(profile_snapshot)[1] != profile_sha
+            or (external_snapshot is not None and _read_document(external_snapshot)[1] != proof_sha)
+            or (copy_input is not None and (hashlib.sha256(copy_input['observation_snapshot'].read_bytes()).hexdigest() != observed_sha
+                or hashlib.sha256(copy_input['github_snapshot'].read_bytes()).hexdigest() != observed['fixture_sha256']))):
         raise MigrationRefused('source_documents_changed')
     return result

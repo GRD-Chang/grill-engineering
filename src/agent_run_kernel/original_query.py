@@ -125,16 +125,7 @@ class ImportedRecords(V6RecordReader):
     """Read immutable archive rows through Storage, without a writable Kernel."""
 
     def __init__(self, storage: Storage) -> None:
-        self.storage = storage
-        with storage.transaction(write=False) as tx:
-            record = tx.one("SELECT subject,identity,material_id FROM history WHERE kind='v6_record_import'")
-            self.subject = str(record['subject'])
-            manifest = json.loads(tx.get(record['material_id'], self.subject))
-            if (manifest.get('format') != 'v6-records/1'
-                    or manifest['source']['run_id'] != record['identity']
-                    or record['identity'] != tx.one('SELECT id FROM runs')[0]):
-                raise ValueError('record_import_identity')
-            self._manifest = manifest
+        super().__init__(storage)
 
     def count(self, table: str) -> int:
         return int(self._manifest['tables'][table]['count'])
