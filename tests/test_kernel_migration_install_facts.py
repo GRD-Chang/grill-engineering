@@ -28,7 +28,7 @@ from agent_run_kernel.migration_run_admission import authenticate_run_transfer
 from agent_run_kernel.offline import fixture_inputs
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.migration_conversion import read_initial_import
-from agent_run_kernel.model import Profile, World
+from agent_run_kernel.model import Profile
 from support.frozen_v6_runtime import old_v6_runtime
 from support.v6_returned_source import returned_managed_source, continue_original_returned
 from agent_run_kernel.migration_active import read_original_returned_import
@@ -43,6 +43,9 @@ from test_kernel_migration_completed_history import _completed_source, _assert_o
 from agent_run.managed_workspace import ManagedWorkspace
 from support.v6_whole_run_source import whole_run_managed_source
 from agent_run_kernel.migration_run import read_original_run_import
+from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run_kernel.local_effects import LocalEffects
+from support.core_operations import ReadOnlyPorts
 
 
 @pytest.fixture(scope='module')
@@ -259,12 +262,27 @@ print(wire_json({'states': {str(n): legacy.status(f'ticket:{n}') for n in reques
         assert tx.one('SELECT count(*) FROM subjects')[0] == len(numbers)
         assert tx.one('SELECT count(*) FROM final_barriers')[0] == 0
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
-    current = canonical.status('ticket:2')
-    world = World(current['parent_revision'], current['graph_revision'], current['revision'],
-        decoded.spec.deliveries[0].base, completion_revision=current['completion_revision'])
-    step = canonical.advance('ticket:2', canonical.claim_executor('canonical-idle'), world)
-    assert step.kind == 'effect' and step.effect is not None and step.effect.operation == 'workspace'
-    assert step.effect.source_ref == workspaces[2][0]
+    delivery = canonical.delivery('ticket:2')
+    ports = ReadOnlyPorts(decoded.observed_requirements, delivery.source_ref, delivery.target_ref,
+        DeliveryFacts(git.commit(delivery.target_ref), None))
+    monkeypatch.setattr(ports, 'inspect', LocalEffects(git, owned_root=work).inspect_resources)
+    effects = []
+    class WorkspaceBoundary(Exception):
+        pass
+    def workspace(effect, authorize):
+        authorize()
+        effects.append(effect)
+        raise WorkspaceBoundary
+    monkeypatch.setattr(ports, 'execute', workspace)
+    runner = canonical.operation_runner(canonical.claim_executor('canonical-idle'), lambda binding: ports)
+    # The public runner reaches the actual authorized physical boundary. This
+    # test still stops before any workspace write, as the old returned Effect did.
+    with pytest.raises(WorkspaceBoundary):
+        runner.run_once(agent_capacity=0)
+    assert len(effects) == 1 and effects[0].operation == 'workspace'
+    assert effects[0].source_ref == workspaces[2][0]
+    assert (snapshot.source.read_bytes(), snapshot.path.read_bytes(), git.run('show-ref').stdout,
+        git.run('worktree', 'list', '--porcelain').stdout) == before
 
 
 @pytest.mark.parametrize('role', ['development', 'review', 'publication'])
@@ -369,10 +387,10 @@ def test_canonical_original_executor_transfers_reenters_and_restores_real_return
         assert (snapshot.source.read_bytes(), native.storage.path.read_bytes()) == checked_bytes
         execution = native.claim_executor('canonical-returned-native')
         delivery = native.delivery('ticket:2')
-        world = World(state['parent_revision'], state['graph_revision'], state['revision'],
-            decoded.spec.deliveries[0].base, git.commit(resource.source_ref),
-            completion_revision=state['completion_revision'])
-        step = native.advance(delivery.key, execution, world)
+        ports = ReadOnlyPorts(decoded.observed_requirements, delivery.source_ref, delivery.target_ref,
+            DeliveryFacts(git.commit(delivery.target_ref), git.commit(resource.source_ref)))
+        runner = native.operation_runner(execution, lambda binding: ports)
+        step = runner.run_once(agent_capacity=0)
         assert step.kind == 'progress'
         with native.storage.transaction(write=False) as tx:
             pending = decoded.subjects[0].attempts[-1].record.key[-1]
