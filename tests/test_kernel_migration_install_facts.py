@@ -36,6 +36,9 @@ from agent_run_kernel.migration_run_cutover import _execute_original_import, _im
 from agent_run_kernel.migration_run_resources import authenticate_imported_resources
 from agent_run_kernel.task_location import read_task, task_path
 from agent_run_kernel.legacy_admission import read_source_fence
+from agent_run_kernel.migration_completed import read_original_completed_import
+from test_kernel_migration_completed_history import _completed_source, _assert_original_records
+from agent_run.managed_workspace import ManagedWorkspace
 
 
 @pytest.fixture(scope='module')
@@ -354,3 +357,47 @@ def test_canonical_original_executor_transfers_reenters_and_restores_real_return
         assert tx.one("SELECT count(*) FROM history WHERE kind='v6_original_rollback_complete'")[0] == 1
     # Admission/native execution is a separate gate; this test only proves the
     # fixed transfer/inverse executor on real producer layouts and local refs.
+
+
+@pytest.mark.parametrize('profile_backend', [False, True])
+def test_canonical_completed_install_keeps_cleanup_and_optional_history(
+    tmp_path, git_repo, monkeypatch, profile_backend,
+):
+    import shutil
+    managed = ManagedWorkspace.for_repository('example/project')
+    managed.root.mkdir(parents=True)
+    git_repo.rename(managed.repository_root)
+    managed.state_root.mkdir()
+    LocalGit(managed.repository_root).run('remote', 'add', 'origin', 'https://github.com/example/project.git')
+    (managed.root / '.agent-run-workspace.json').write_text(json.dumps({
+        'repository': managed.repository, 'remote_url': 'https://github.com/example/project.git'}))
+    paths = _completed_source(tmp_path, managed.repository_root, 2, state_root=managed.state_root,
+        controlled=True, actual_github_close=True, profile_backend=profile_backend)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    facts = read_original_completed_import(snapshot, profile_snapshot=evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json')
+    native = install_imported_facts(facts, tmp_path / 'canonical-completed.sqlite3')
+    verify_imported_installation(native, facts)
+    assert native.status('ticket:2')['phase'] == 'complete'
+    assert native.status('ticket:2')['pending_attempt'] is None
+    assert native.status('ticket:2')['budgets']['requirements']['developments_used'] == 2
+    assert native.status('ticket:2')['budgets']['requirements']['reviews_used'] == 2
+    with native.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM subjects')[0] == 1
+        assert tx.one('SELECT count(*) FROM completions')[0] == 1
+        assert tx.one("SELECT count(*) FROM effects WHERE status='confirmed'")[0] == 2
+        assert tx.one("SELECT count(*) FROM resource_cleanup WHERE state='pending'")[0] == 1
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        # Publication reuses Development's real binding; no third Thread.
+        assert tx.one('SELECT count(*) FROM threads')[0] == (2 if profile_backend else 0)
+        assert all(row['thread_id'] is None and row['opening_id'] is None for row in tx.rows('SELECT thread_id,opening_id FROM attempts'))
+    _assert_original_records(snapshot, V6RecordReader(native))
+    assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
+    assert not (managed.state_root / facts.spec.run_id / 'kernel.sqlite3').exists()
