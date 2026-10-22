@@ -24,6 +24,7 @@ from agent_run.runner_transport import runner_git_environment
 from .cleanup_adapter import cleanup_remote_ref, inspect_remote_ref
 
 from .effects import LocalGit
+from .model import ObservationSuperseded as ObservationSuperseded
 from .model import Commit, Effect, EffectResult, KernelError, PullRequest, World
 from .source_reading import (read_remote_heads, read_requirements, read_required_check_facts,
                              normalize_required_checks)
@@ -31,10 +32,6 @@ from .source_reading import (read_remote_heads, read_requirements, read_required
 if TYPE_CHECKING:
     from .kernel import Kernel
 from .storage import MATERIAL_LIMIT, Transaction
-
-
-class ObservationSuperseded(KernelError):
-    """This read lost to an independently committed local authority change."""
 
 
 class EffectReadError(GitHubReadError):

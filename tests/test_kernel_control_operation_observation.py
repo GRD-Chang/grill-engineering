@@ -9,7 +9,7 @@ import pytest
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Kernel, KernelError
 from agent_run_kernel import lifecycle_cli
-from agent_run_kernel.model import DeliveryKind, Execution
+from agent_run_kernel.model import DeliveryKind, Execution, ObservationSuperseded
 from agent_run_kernel.offline import Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.query_cli import _parser
@@ -59,7 +59,7 @@ def test_control_observation_rejects_changes_during_physical_reads(tmp_path, cha
         return facts
 
     ports.delivery = changed
-    with pytest.raises(KernelError, match="automatic_step_superseded"):
+    with pytest.raises(ObservationSuperseded, match="automatic_step_superseded"):
         kernel.observe_control("ticket:3", lambda binding: ports)
 
 

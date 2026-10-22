@@ -25,7 +25,7 @@ from agent_run.prompt_resources import validate_resources
 from agent_run.task_identity import TaskKey
 
 from .model import (
-    AgentCall, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError,
+    AgentCall, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError, ObservationSuperseded,
     Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
@@ -100,7 +100,7 @@ class Kernel:
         if (scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"])
                 or value["source_sequence"] != run["source_sequence"]
                 or execution is None and value["control_version"] != [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]):
-            raise KernelError("automatic_step_superseded")
+            raise ObservationSuperseded("automatic_step_superseded")
 
     def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
         """Use the Attempt's single native-or-Opening facts loader."""
@@ -1905,7 +1905,7 @@ class Kernel:
             run = tx.one("SELECT * FROM runs")
             self._automatic_owned(tx, run, execution)
             if scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"]):
-                raise KernelError("automatic_step_superseded")
+                raise ObservationSuperseded("automatic_step_superseded")
             if run["blocked"] == "supervision_timeout" or (scope["subject"] is not None and any(
                     gate["code"] == "supervision_timeout" for gate in self._gates(tx, scope["subject"]))):
                 return Step("paused", scope["subject"] or "", "supervision_timeout")
