@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import Kernel
+from agent_run_kernel.executor import _make_ports
+from agent_run_kernel.model import Execution
+from support.core_operations import CoreOperations
 from test_kernel_executor_controls import (
     test_native_executor_consumes_the_original_control_action_with_fresh_source_and_resources as _control_case,
 )
@@ -15,28 +18,23 @@ def test_original_executor_abandons_with_its_optional_link_still_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_control = Kernel.control_host
-    original_runner = Kernel.operation_runner
     captured = []
-
-    def runner_with_interrupted_link(kernel, execution, make_ports):
-        def physical_ports(binding):
-            ports = make_ports(binding)
-            execute = ports.execute
-
-            def interrupt_link(effect, authorize):
-                if effect.operation == "issue_link":
-                    authorize()
-                    captured.append((kernel, effect))
-                    raise OSError("Original optional display call interrupted before its write")
-                return execute(effect, authorize)
-
-            ports.execute = interrupt_link
-            return ports
-
-        return original_runner(kernel, execution, physical_ports)
 
     def control_with_original_link(kernel, request, kind, action_id, **arguments):
         if kind == "abandon":
+            execution = Execution(request.run_id, request.owner, request.epoch)
+            operations = CoreOperations(kernel, execution, _make_ports)
+
+            def interrupt_link(effect, authorize):
+                assert effect.operation == "issue_link" and effect.subject == "ticket:3"
+                authorize()
+                captured.append((kernel, effect))
+                raise OSError("Original optional display call interrupted before its write")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(operations.runner.ports, "execute", interrupt_link)
+                interrupted = operations.once(agent_capacity=0)
+            assert interrupted.call is None and interrupted.reason == "original_write_readback_required"
             original_kernel, optional = captured[0]
             assert original_kernel is kernel and len(captured) == 1
             assert kernel.status(optional.subject)["issue_link"]["state"] == "indeterminate"
@@ -48,7 +46,6 @@ def test_original_executor_abandons_with_its_optional_link_still_indeterminate(
                 assert optional.effect_id in receipt["abandonment"]["unsettled"]
         return result
 
-    monkeypatch.setattr(Kernel, "operation_runner", runner_with_interrupted_link)
     monkeypatch.setattr(Kernel, "control_host", control_with_original_link)
     _control_case(tmp_path, monkeypatch, "abandon")
     assert len(captured) == 1
