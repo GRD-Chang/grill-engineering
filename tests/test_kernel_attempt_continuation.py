@@ -10,21 +10,36 @@ from agent_run_kernel.attempt_continuation import (
     AttemptContinuationBasis, ContinuationOpening, bind_attempt_continuation, load_continuation,
 )
 from agent_run_kernel.model import wire_json
+from agent_run_kernel.model import Issue, ParentIssue, Requirements
+from agent_run_kernel.offline import GraphScenario
+from support.core_operations import CoreOperations
 from test_kernel_exploration import ticket_spec
+from test_kernel_operation_runner import Ports
 
 
 def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_path: Path) -> None:
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", ticket_spec())
-    execution = kernel.claim_executor("executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    first = kernel.advance("ticket:2", execution, world).call
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)), (
+        Issue(2, "Ticket", "Implement the original requirement", "OPEN", frozenset({"ready-for-agent"})),
+    ))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, lambda binding: Ports(scenario))
+    first = operations.until(lambda step: step.call is not None).call
     assert first is not None
+    assert first.subject == "ticket:2" and first.role == "development"
+    assert kernel.dispatch_agent(first)
+    operations.runner.authorize_agent(first)
     kernel.bind_thread(first, "backend-first")
+    process = {"pid": 23, "pgid": 23, "start_token": "first", "host_pid": 11, "host_start_token": "host"}
+    kernel.agent_started(first, process)
     kernel.receive(first, wire_json({"result_kind": "human_blocker", "summary": None,
         "human_blockers": ["Choose the original formatting."]}))
-    assert kernel.advance("ticket:2", execution, world).reason == "human_blocker"
+    assert not operations.runner.worker_settled(first)
+    kernel.agent_exited(first, process, 0)
+    assert operations.runner.worker_settled(first)
+    assert operations.once().reason == "human_blocker"
     kernel.control("resume", "answer", subject="ticket:2", message="Keep it.\r\n", new_thread=True)
-    second = kernel.advance("ticket:2", execution, world).call
+    second = operations.until(lambda step: step.call is not None).call
     assert second is not None and second.attempt_id == first.attempt_id
     with kernel.storage.transaction(write=False) as tx:
         facts = load_continuation(tx, first.attempt_id)
