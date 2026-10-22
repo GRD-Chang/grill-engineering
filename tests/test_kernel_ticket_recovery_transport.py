@@ -4,10 +4,10 @@ import json
 
 import pytest
 
-from agent_run.github import GitHubReadError
 from agent_run_kernel import KernelError
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Effect, Execution
+from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.remote_effects import RemoteEffects
 from support.managed_abandon_transport import install_currentness
 from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment
@@ -67,6 +67,7 @@ def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(
         document["lose_operation"] = "close"
     state.write_text(json.dumps(document))
     authorizations = []
+    original_intent = asdict(reopen)
 
     def authorize():
         authorizations.append(reopen.effect_id)
@@ -88,9 +89,18 @@ def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(
             port.execute(reopen, authorize)
         assert authorizations == [reopen.effect_id]
     elif mode in {"missing_event", "missing_comment", "metadata", "missing_timestamp"}:
-        with pytest.raises(GitHubReadError) as pending:
+        with pytest.raises(ReadUnavailable) as pending:
             port.execute(reopen, authorize)
         assert pending.value.code == "github_recovery_observation_pending"
+        assert pending.value.message == {
+            "missing_event": "Original close event is unproven",
+            "missing_comment": "Original close comment is unproven",
+            "metadata": "Issue updated_at does not prove the original recovery transition",
+            "missing_timestamp": "Issue updated_at does not prove the original recovery transition",
+        }[mode]
+        assert pending.value.write_returncode is None and pending.value.write_diagnostic == ""
+        assert asdict(reopen) == original_intent
+        assert json.loads(state.read_text()) == document
         assert authorizations == []
     else:
         result = port.execute(reopen, authorize)
@@ -137,6 +147,7 @@ def test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority(g
             _foreign_transition(document, "closed", "external")
     state.write_text(json.dumps(document))
     authorizations = []
+    original_intent = asdict(effect)
 
     def authorize():
         authorizations.append(effect.effect_id)
@@ -148,9 +159,14 @@ def test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority(g
             state.write_text(json.dumps(changed))
 
     if mode in {"metadata", "changed"}:
-        with pytest.raises(GitHubReadError) as pending:
+        with pytest.raises(ReadUnavailable) as pending:
             port.execute(effect, authorize)
         assert pending.value.code == "github_recovery_observation_pending"
+        assert pending.value.message == "Issue updated_at does not prove the original recovery transition"
+        assert pending.value.write_returncode is None and pending.value.write_diagnostic == ""
+        assert asdict(effect) == original_intent
+        final_issue = json.loads(state.read_text())["source_graph"]["issues"]["2"]
+        assert final_issue["state"] == "OPEN" and final_issue["updated_at"] == "2026-10-21T12:00:00Z"
         assert authorizations == ([effect.effect_id] if mode == "changed" else [])
     elif mode == "stopped":
         with pytest.raises(KernelError, match="executor_fenced"):
