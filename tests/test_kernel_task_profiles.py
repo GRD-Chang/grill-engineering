@@ -9,13 +9,19 @@ from agent_run_kernel import Kernel, KernelError
 from agent_run_kernel.offline import GraphScenario
 from agent_run_kernel.task_location import bind_task, locked_task
 from test_kernel_requirements import independent_source
+from support.core_operations import CoreOperations
+from test_kernel_operation_runner import Ports
 
 
 @pytest.mark.parametrize('binding', ['current', 'unbound', 'foreign'])
 def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threads(
     tmp_path: Path, binding: str,
 ) -> None:
-    scenario = GraphScenario(tmp_path / 'source', independent_source())
+    source = independent_source()
+    # This contract concerns one Task's Thread/Profile binding, not sibling scheduling.
+    source = replace(source, parent=replace(source.parent, sub_issue_numbers=(3,)),
+                     issues=tuple(issue for issue in source.issues if issue.number == 3))
+    scenario = GraphScenario(tmp_path / 'source', source)
     create = Kernel.create if binding == 'unbound' else Kernel.create_task
     kernel = create(tmp_path / 'profile.sqlite3', scenario.spec, requirements=scenario.requirements)
     task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
@@ -34,8 +40,9 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
         return
     scenario.kernel = kernel
     scenario.execution = kernel.claim_executor('profile-executor')
+    operations = CoreOperations(kernel, scenario.execution, lambda binding: Ports(scenario))
     for _ in range(20):
-        step = kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is not None:
             first = step.call
             break
@@ -55,14 +62,14 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
         assert tx.one('SELECT count(*) FROM hosts')[0] == 0
     human = b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Need a decision"]}'
     kernel.receive(first, human)
-    assert kernel.advance(first.subject, scenario.execution, scenario.world()).kind == 'paused'
-    kernel.control('resume', 'keep-existing-thread', subject=first.subject, world=scenario.world())
-    resumed = kernel.advance(first.subject, scenario.execution, scenario.world()).call
+    assert operations.once().kind == 'paused'
+    kernel.control('resume', 'keep-existing-thread', subject=first.subject)
+    resumed = operations.once().call
     assert resumed is not None and resumed.thread_id == first.thread_id
     assert resumed.profile_revision == 1 and resumed.profile == first.profile
     kernel.receive(resumed, human)
-    assert kernel.advance(first.subject, scenario.execution, scenario.world()).kind == 'paused'
-    kernel.control('resume', 'use-new-thread', subject=first.subject, world=scenario.world(), new_thread=True)
-    changed = kernel.advance(first.subject, scenario.execution, scenario.world()).call
+    assert operations.once().kind == 'paused'
+    kernel.control('resume', 'use-new-thread', subject=first.subject, new_thread=True)
+    changed = operations.once().call
     assert changed is not None and changed.thread_id != first.thread_id and changed.attempt_id == first.attempt_id
     assert changed.profile_revision == 2 and changed.profile.model == 'next-thread-model'

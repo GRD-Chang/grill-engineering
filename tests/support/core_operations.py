@@ -4,10 +4,13 @@ Callers supply physical OperationPorts. This helper never supplies a subject,
 constructs a World, executes an Agent, or manufactures process-exit evidence.
 """
 from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
 
 from typing import Any, Mapping
 
-from agent_run_kernel import Effect, EffectResult, Execution, Kernel, Requirements, ResourceInspection, ResourceWitness, Step
+from agent_run_kernel import (Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Kernel,
+                              ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step)
 from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 
 
@@ -43,6 +46,33 @@ class ReadOnlyPorts:
 
     def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]:
         raise AssertionError("This read-only fixture cannot prepare retirement")
+
+
+def native_agent_fixture(path: Path, spec: RunSpec) -> tuple[Kernel, ReadOnlyPorts]:
+    """Create fresh explicit source/input facts for an isolated Agent unit.
+
+    This is fixture setup, never an upgrade or a runtime fallback. It adds the
+    real Completion target required by native Ticket creation; it cannot run
+    that delivery or authorize physical effects through ReadOnlyPorts.
+    """
+    from agent_run_kernel.offline import fixture_inputs
+
+    assert not any(item.kind == DeliveryKind.FINAL_RUN for item in spec.deliveries)
+    first = spec.deliveries[0]
+    tickets = tuple(item for item in spec.deliveries if item.kind == DeliveryKind.TICKET)
+    source = Requirements(ParentIssue(spec.parent_issue, "Parent", "Explicit original requirement",
+        tuple(item.issue for item in tickets)), tuple(Issue(item.issue, "Ticket", item.revision,
+            "OPEN", frozenset({"ready-for-agent"})) for item in tickets))
+    deliveries = spec.deliveries
+    if tickets:
+        assert all(item.base == first.base and item.target_ref == first.target_ref for item in tickets)
+        deliveries += (Delivery('fixture-final', DeliveryKind.FINAL_RUN, spec.parent_issue, 'unread',
+            first.base, first.target_ref, 'refs/heads/fixture-main'),)
+    inputs = spec.inputs if spec.inputs is not None else fixture_inputs()
+    spec = replace(spec, repository_root=spec.repository_root or str(path.parent.resolve()),
+                   language=spec.language or 'zh', inputs=inputs, deliveries=deliveries)
+    return (Kernel.create(path, spec, requirements=source),
+            ReadOnlyPorts(source, first.source_ref, first.target_ref, DeliveryFacts(first.base, None)))
 
 
 class CoreOperations:

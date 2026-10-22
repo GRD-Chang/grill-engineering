@@ -9,6 +9,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec, World
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.offline import Scenario
+from support.core_operations import CoreOperations, native_agent_fixture
 
 
 def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_path: Path) -> None:
@@ -23,9 +24,10 @@ def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_
                "provenance": {"source": "explicit-migration-input", "preset": None, "role": role}}
         for role in ("development", "review", "publication")
     }}
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(spec, inputs=replace(spec.inputs, profiles=profiles)))
+    kernel, ports = native_agent_fixture(tmp_path / "kernel.sqlite3", replace(spec, inputs=replace(spec.inputs, profiles=profiles)))
     execution = kernel.claim_executor("owner")
-    call = kernel.advance(delivery.key, execution, World("parent-v1", "graph-v1", "ticket-v1", base)).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    call = operations.once().call
     assert call is not None and call.profile.model == "development-explicit-model"
     with kernel.storage.transaction(write=False) as tx:
         revision = tx.one("SELECT p.* FROM threads t JOIN profile_revisions p ON p.id=t.profile_revision WHERE t.id=?", (call.thread_id,))
@@ -47,12 +49,13 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
     spec = freeze_creation(RunSpec("run", "example/project", 1, "parent-v1", "graph-v1", (delivery,), repository_root=str(tmp_path)),
                            defaults, prompt_resources=resources)
     path = tmp_path / "kernel.sqlite3"
-    kernel = Kernel.create(path, spec)
+    kernel, ports = native_agent_fixture(path, spec)
     now = [100.0]
     kernel.clock = lambda: now[0]
     execution = kernel.claim_executor("owner")
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
     world = World("parent-v1", "graph-v1", "ticket-v1", base)
-    first = kernel.advance(delivery.key, execution, world).call
+    first = operations.once().call
     assert first is not None and first.profile.model == "first-model" and first.profile_revision == 1
     assert first.context["language"] == "en" and first.context["_prompt_resources"] == resources
     assert first.context["github_identity"] == {"source": "pat", "pat": {"env": "FIXED_WORKER_TOKEN"}}
@@ -71,7 +74,7 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
     diagnostic = {"event": "turn.failed", "codex_error_info": "execution_failure", "message": "Worker turn failed"}
     kernel.agent_exited(first, process, 1, diagnostic=diagnostic)
     now[0] = 102.0
-    recovered = kernel.advance(delivery.key, execution, world).call
+    recovered = operations.once().call
     assert recovered is not None and recovered.thread_id == first.thread_id and recovered.profile_revision == 1
     assert recovered.profile == first.profile and recovered.deadline_at == 109.0
     assert recovered.context["language"] == "en" and recovered.context["_prompt_resources"] == resources
@@ -79,9 +82,9 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
     next_process = {**process, "pid": 22, "pgid": 22, "start_token": "two"}
     kernel.agent_started(recovered, next_process)
     kernel.agent_exited(recovered, next_process, 1)
-    assert kernel.advance(delivery.key, execution, world).kind == "paused"
+    assert operations.once().kind == "paused"
     kernel.control("resume", "new-thread", subject=delivery.key, new_thread=True)
-    changed = kernel.advance(delivery.key, execution, world).call
+    changed = operations.once().call
     assert changed is not None and changed.profile_revision == 2 and changed.thread_id != first.thread_id
     assert changed.profile.model == "explicit-later-model" and changed.context["language"] == "en"
     assert changed.attempt_id == first.attempt_id
