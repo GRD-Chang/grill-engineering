@@ -352,9 +352,9 @@ class Storage:
     def upgrade(cls, path: Path) -> None:
         """Upgrade only canonical v17 native storage, atomically and explicitly.
 
-        Read-only consumers never invoke this. ALTER's official schema text is
-        intentionally not compared with freshly CREATEd v18 text on reopen.
-        Offline prepared classification owns its strict schema variants.
+        Read-only consumers never invoke this. Fresh creation and upgrade use
+        the same official ALTER statements, yielding identical v18 schema text.
+        Offline prepared classification retains its strict schema checks.
         """
         storage = cls(path)
         connection = sqlite3.connect(path.resolve().as_uri() + '?mode=rw', uri=True, isolation_level=None, timeout=1.0)

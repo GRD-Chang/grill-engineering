@@ -3171,8 +3171,8 @@ class Kernel:
         if pending is None:
             bind_attempt_continuation(tx, attempt_id, AttemptContinuationBasis(thread_id, context_id, ContinuationOpening()))
         owned_period = (retain_period and previous is not None and previous.invocation_id is not None
-                        and bool(tx.rows("SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=?",
-                                         (previous.invocation_id, execution.owner, execution.epoch))))
+                        and bool(tx.rows("SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=?",
+                                         (previous.invocation_id, execution.owner, execution.epoch, thread_id))))
         if owned_period:
             assert previous is not None and previous.invocation_id is not None
             invocation_id = previous.invocation_id

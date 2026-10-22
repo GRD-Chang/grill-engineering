@@ -161,6 +161,45 @@ def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_pat
     assert kernel.dispatch_agent(call)
 
 
+def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(tmp_path: Path) -> None:
+    spec = ticket_spec()
+    spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
+    kernel = Kernel.create(tmp_path / 'native.sqlite3', spec)
+    now = [100.0]
+    kernel.clock = lambda: now[0]
+    execution = kernel.claim_executor('executor')
+    world = World('parent-v1', 'graph-v1', 'ticket-v1', Commit('base', 'base-tree'))
+    first = kernel.advance('ticket:2', execution, world).call
+    assert first is not None and kernel.dispatch_agent(first)
+    kernel.bind_thread(first, 'original-backend')
+    process = {'pid': 90, 'pgid': 90, 'start_token': 'original-start', 'host_pid': 11, 'host_start_token': 'host-start'}
+    kernel.agent_started(first, process)
+    kernel.receive(first, b'{"summary":"format incomplete"}')
+    kernel.agent_exited(first, process, 0)
+    kernel.control('stop', 'local-stop', subject='ticket:2')
+    kernel.control('resume', 'local-new-thread', subject='ticket:2', new_thread=True)
+    now[0] = 106.0
+    call = kernel.advance('ticket:2', execution, world).call
+    assert call is not None and call.thread_id != first.thread_id
+    assert kernel.dispatch_agent(call)
+    assert call.invocation_id != first.invocation_id and call.attempt_id == first.attempt_id
+    assert call.deadline_at == first.deadline_at == 107.0 and call.output_ordinal == 1
+    assert call.context['readonly'] is True and call.context['contract_error']
+    with kernel.storage.transaction(write=False) as tx:
+        old = tx.one('SELECT thread,status FROM invocations WHERE id=?', (first.invocation_id,))
+        current = tx.one('SELECT thread,predecessor,action_id FROM invocations WHERE id=?', (call.invocation_id,))
+    assert old['thread'] == first.thread_id and old['status'] == 'returned'
+    assert tuple(current) == (call.thread_id, first.invocation_id, 'local-new-thread')
+    assert kernel.advance('ticket:2', execution, world).reason == 'agent_running'
+    kernel.bind_thread(call, 'replacement-backend')
+    next_process = {**process, 'pid': 91, 'pgid': 91, 'start_token': 'replacement-start'}
+    kernel.agent_started(call, next_process)
+    kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Retained output.', 'human_blockers': None}))
+    kernel.agent_exited(call, next_process, 0)
+    assert kernel.advance('ticket:2', execution, world).kind == 'progress'
+    assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
+
+
 @pytest.mark.parametrize('expired', [False, True])
 def test_first_native_format_step_keeps_its_period_unless_explicitly_resumed(tmp_path: Path, expired: bool) -> None:
     kernel, execution, world, attempt_id = _canonical_boundary(tmp_path, malformed=True)
