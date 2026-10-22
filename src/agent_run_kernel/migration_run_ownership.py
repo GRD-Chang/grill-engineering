@@ -21,6 +21,7 @@ from agent_run.task_identity import TaskKey
 from agent_run.managed_workspace import ManagedWorkspace
 
 from .effects import LocalGit
+from .cleanup_adapter import _read
 from .legacy_admission import read_source_fence
 from .migration import source_identity
 from .migration_records import V6RecordReader
@@ -39,7 +40,7 @@ def _idle_checkout_state(git: LocalGit, checkout: Path, common: Path
         if mode is not None and not stat.S_ISDIR(mode) or checkout.resolve() != checkout:
             raise KernelError('foreign_local_checkout')
         registered = []
-        for entry in git.run('worktree', 'list', '--porcelain', '-z').stdout.split('\0\0'):
+        for entry in _read(git, 'worktree', 'list', '--porcelain', '-z').stdout.split('\0\0'):
             fields = entry.strip('\0').split('\0')
             if fields[0] == 'worktree ' + str(checkout):
                 registered.append(fields)

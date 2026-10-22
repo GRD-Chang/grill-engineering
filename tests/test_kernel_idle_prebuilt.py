@@ -162,12 +162,12 @@ def test_physical_read_error_is_not_an_absent_lazy_checkout(idle_copy, monkeypat
     snapshot, options, git, target, base = idle_copy
     kernel = install_imported_facts(read_initial_import(snapshot, **options), target)
     effect = _effect(kernel, git, 'ticket:2', base)
-    original = git.run
-    def fail(*args, **kwargs):
+    original = LocalGit.run
+    def fail(reader, *args, **kwargs):
         if args[:2] == ('worktree', 'list'):
             raise KernelError('git_operation_failed', 'synthetic read failure')
-        return original(*args, **kwargs)
-    monkeypatch.setattr(git, 'run', fail)
+        return original(reader, *args, **kwargs)
+    monkeypatch.setattr(LocalGit, 'run', fail)
     with pytest.raises(KernelError, match='local_read_failed'):
         authenticate_prebuilt_workspace(git, effect)
 
@@ -205,3 +205,19 @@ def test_single_ticket_uses_its_real_member_without_fabricating_final_or_workjob
     with kernel.storage.transaction(write=False) as tx:
         assert [row['id'] for row in tx.rows('SELECT id FROM subjects')] == ['ticket:2']
     assert authenticate_prebuilt_workspace(git, _effect(kernel, git, 'ticket:2', base)) == binding
+
+
+@pytest.mark.parametrize('prebuilt', [False, True])
+def test_installed_idle_authentication_never_invokes_a_write_authorizer(idle_copy, prebuilt):
+    snapshot, options, git, target, base = idle_copy
+    if prebuilt:
+        git.run('worktree', 'add', '--detach', str(options['checkout']), base)
+    kernel = install_imported_facts(read_initial_import(snapshot, **options), target)
+    effect = _effect(kernel, git, 'ticket:2', base)
+    before = git.run('show-ref').stdout, git.run('worktree', 'list', '--porcelain').stdout
+    calls = []
+    guarded = LocalGit(git.root, lambda: calls.append('write authorization'))
+    guarded.env = git.env.copy()
+    assert authenticate_prebuilt_workspace(guarded, effect) == effect.payload['prebuilt_workspace']
+    assert calls == []
+    assert (git.run('show-ref').stdout, git.run('worktree', 'list', '--porcelain').stdout) == before
