@@ -106,7 +106,7 @@ def observe_operation(kernel: Kernel, binding: OperationBinding, ports: Operatio
             raise ReadWait(waiting)
     source = ports.source(binding.parent_number)
     if execution is not None:
-        waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+        waiting = kernel._finish_operation_read(token, execution)
         if waiting is not None:
             raise ReadWait(waiting)
     with kernel.storage.transaction() as tx:
@@ -133,7 +133,7 @@ def observe_operation(kernel: Kernel, binding: OperationBinding, ports: Operatio
                                subject is not None)
     facts = ports.delivery(request)
     if execution is not None:
-        waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+        waiting = kernel._finish_operation_read(token, execution)
         if waiting is not None:
             raise ReadWait(waiting)
     with kernel.storage.transaction(write=False) as tx:
@@ -286,7 +286,7 @@ class OperationRunner:
                     status = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0]
                 resources = kernel.effect_resources(effect)
                 inspections = None if resources is None else self.ports.inspect(resources)
-                waiting = kernel._guard_automatic_step(token, execution, after_read=True)
+                waiting = kernel._finish_operation_read(token, execution)
                 if waiting is not None:
                     raise ReadWait(waiting)
                 if status == "prepared" and not kernel._dispatch(effect, execution, world, resource_inspections=inspections, token=token):

@@ -1917,18 +1917,29 @@ class Kernel:
                     and not self._automatic_control_read(tx, run, scope["subject"], scope["cleanup"]) and
                     (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
                 raise KernelError("automatic_step_paused")
-            owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-            rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
-                           "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
-                           (owner, wire_json(scope)))
-            if rows:
-                row = rows[0]
-                if self.clock() >= row["deadline"]:
-                    seconds = 2700 if row["kind"] == "required_checks" else 600
-                    return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
-                if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
-                    return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
-            return None
+            return self._operation_read_wait(tx, run, scope, after_read=after_read)
+
+    def _finish_operation_read(self, token: str, execution: Execution) -> Step | None:
+        """A fresh observation grants nothing; only its original read window can expire."""
+        with self.storage.transaction() as tx:
+            self._check_operation(tx, token, execution)
+            scope = self._automatic_token(token)["scope"]
+            return self._operation_read_wait(tx, tx.one("SELECT * FROM runs"), scope, after_read=True)
+
+    def _operation_read_wait(self, tx: Transaction, run: sqlite3.Row, scope: dict[str, Any], *,
+                             after_read: bool) -> Step | None:
+        owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
+                       "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
+                       (owner, wire_json(scope)))
+        if rows:
+            row = rows[0]
+            if self.clock() >= row["deadline"]:
+                seconds = 2700 if row["kind"] == "required_checks" else 600
+                return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
+            if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
+                return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
+        return None
 
     def _finish_automatic_step(self, token: str, execution: Execution, step: Step) -> Step:
         """Validate a whole operation's Progress and retire a completed read wait."""
