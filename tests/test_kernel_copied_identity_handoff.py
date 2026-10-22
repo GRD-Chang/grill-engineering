@@ -4,6 +4,7 @@ from contextlib import closing
 import json
 import os
 import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +21,34 @@ from agent_run_kernel.model import HostObservation, Profile
 from agent_run_kernel.task_location import locked_task, read_task
 from test_kernel_migration import original_v6
 from test_kernel_migration_cutover import _WORKSPACE_CHILD, _continue_with_original_02
+
+
+def _python_environment():
+    project = Path(__file__).resolve().parents[1]
+    return {**os.environ, 'PYTHONPATH': os.pathsep.join(str(project / name) for name in ('src', 'tests')),
+            'PYTHONDONTWRITEBYTECODE': '1'}
+
+
+_HANDOFF_EXIT = r"""
+import os, sys
+from pathlib import Path
+from agent_run_kernel.kernel import Kernel
+from agent_run_kernel.migration import capture_v6
+import agent_run_kernel.migration_cutover as cutover
+assert Path(cutover.__file__).resolve().is_relative_to(Path(sys.argv[8]))
+snapshot = capture_v6(Path(sys.argv[1]), Path(sys.argv[2]))
+actual = cutover._handoff_copy_marker
+def interrupted(*args):
+    if sys.argv[7] == 'before':
+        os._exit(73)
+    actual(*args)
+    os._exit(74)
+cutover._handoff_copy_marker = interrupted
+restore = (cutover.restore_copied_v6_after_workspace if sys.argv[6] == 'workspace'
+           else cutover.restore_idle_copied_v6_without_new_effects)
+restore(snapshot, Path(sys.argv[3]), Kernel(Path(sys.argv[4])), nonce=sys.argv[5])
+raise AssertionError('inverse did not reach the marker handoff interruption')
+"""
 
 
 @pytest.fixture
@@ -65,7 +94,7 @@ def _settled_copy(copied_authority, workspace):
         action_id='copied-handoff', command=command, environment_carrier=carrier, preflight=lambda: None)
     assert kernel.dispatch_host(launch)
     child = subprocess.Popen(launch.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, start_new_session=True)
+                             stderr=subprocess.PIPE, start_new_session=True, env=_python_environment())
     assert child.stdin is not None and child.stdout is not None and child.stderr is not None
     try:
         stat = Path(f'/proc/{child.pid}/stat').read_text()
@@ -113,25 +142,24 @@ def test_copied_marker_handoff_and_reentry_preserve_source_and_original_resume(
     task = TaskKey(git.root, 'example/project', 1)
     if checkpoint is not None:
         fenced = old.read_bytes()
-        process = os.fork()
-        if process == 0:
-            actual = cutover._handoff_copy_marker
-            def interrupted(*args):
-                if checkpoint == 'before':
-                    os._exit(73)
-                actual(*args)
-                os._exit(74)
-            cutover._handoff_copy_marker = interrupted
-            try:
-                restore(snapshot, old, kernel, nonce=nonce)
-            except BaseException:
-                import traceback
-                (tmp_path / 'inverse-child-trace.txt').write_text(traceback.format_exc())
-                os._exit(75)
-            os._exit(76)
-        _, status = os.waitpid(process, 0)
-        assert os.waitstatus_to_exitcode(status) == (73 if checkpoint == 'before' else 74), (
-            (tmp_path / 'inverse-child-trace.txt').read_text() if (tmp_path / 'inverse-child-trace.txt').exists() else status)
+        process = subprocess.Popen([
+            sys.executable, '-c', _HANDOFF_EXIT, str(snapshot.source), str(tmp_path / 'inverse-child-sealed.sqlite3'),
+            str(old), str(kernel.storage.path), nonce, 'workspace' if workspace else 'idle', checkpoint,
+            str(Path(__file__).resolve().parents[1] / 'src'),
+        ], cwd=tmp_path, env=_python_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        finished = False
+        try:
+            output, errors = process.communicate(timeout=15)
+            finished = True
+        finally:
+            if not finished:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate(timeout=5)
+        assert process.returncode == (73 if checkpoint == 'before' else 74), (output + errors).decode()
         assert old.read_bytes() == fenced
         with locked_task(task) as locator:
             assert read_task(locator) == (run_id, old)
