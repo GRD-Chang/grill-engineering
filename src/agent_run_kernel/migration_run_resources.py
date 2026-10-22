@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from agent_run.managed_workspace import ManagedWorkspace
 
 from .effects import LocalGit
-from .migration import MigrationRefused, SourceSnapshot
+from .migration import MigrationRefused, SourceSnapshot, _require_no_v6_notification_journal
 from .migration_checkout import _verify_checkout_archive, seal_checkout
 from .migration_conversion import _git, _one
 from .migration_layout import verify_layout
@@ -30,6 +30,7 @@ def authenticate_imported_resources(facts: ImportedRunFacts, origin: Mapping[str
     enter the original Task retirement executor through this function.
     """
     spec, snapshot = facts.spec, facts.source.snapshot
+    _require_no_v6_notification_journal(snapshot, spec.run_id)
     if facts.source.mode != 'original' or facts.source.task is None or facts.source.checkout_uuid is None:
         raise MigrationRefused('source_existing_identity')
     managed = ManagedWorkspace.for_repository(spec.repository)

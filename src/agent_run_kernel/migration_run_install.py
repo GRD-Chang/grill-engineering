@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
+import tempfile
 from typing import Any, Callable, Mapping
 
 from .kernel import Kernel
@@ -155,27 +157,54 @@ def imported_completion_rows(facts: ImportedRunFacts, subject: ImportedSubject, 
 
 
 def install_imported_facts(facts: ImportedRunFacts, destination: Path, *, origin: Mapping[str, str] | None = None) -> Kernel:
+    """Publish only a completely installed, strictly verified private candidate."""
+    if destination.exists() or destination.is_symlink():
+        raise MigrationRefused('destination_exists')
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.canonical-install-') as directory:
+        candidate = Path(directory) / 'kernel.sqlite3'
+        _install_imported_candidate(facts, candidate, origin=origin)
+        descriptor = os.open(candidate, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(candidate, destination)
+        except FileExistsError as error:
+            raise MigrationRefused('destination_exists') from error
+        descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return Kernel(destination)
+
+
+def _install_imported_candidate(facts: ImportedRunFacts, destination: Path, *, origin: Mapping[str, str] | None) -> Kernel:
     """Install one canonical fact set into an unpublished Core-created file.
 
     Source/Git/external authentication and all cutover locks belong to the
     offline caller. This never publishes a Task, fences a source or allocates
     execution. No old-family installation is retried on failure.
     """
-    from .migration import validate_snapshot
+    from .migration import validate_snapshot, _require_no_v6_notification_journal
     from .model import artifact
     from .migration_run_projection import verify_imported_installation
     from .migration_run_proof import imported_proof_documents
 
     validate_snapshot(facts.source.snapshot)
+    _require_no_v6_notification_journal(facts.source.snapshot, facts.spec.run_id)
     if (destination.exists() or destination.is_symlink() or facts.spec.inputs is None
             or facts.source.mode == 'copied' and origin is not None
             or {s.subject for s in facts.subjects} != {d.key for d in facts.spec.deliveries if d.kind == DeliveryKind.TICKET}
             or len({s.subject for s in facts.subjects}) != len(facts.subjects)):
         raise MigrationRefused('source_import_identity')
     for subject in facts.subjects:
-        if subject.generation != 1 or any(b.window != 1 for b in subject.budgets):
+        if subject.generation != 1 or any(b.window != 1 or not b.current for b in subject.budgets):
             raise MigrationRefused('unsupported_source_generation_or_window')
         for call in subject.attempts:
+            if call.generation != subject.generation or call.window not in (None, 1) or call.purpose.value != 'requirements':
+                raise MigrationRefused('unsupported_source_generation_or_window')
             if call.continuation_basis is not None:
                 raise MigrationRefused('unsupported_source_continuation_basis')
             result = artifact(call.role, call.normalized_artifact)
