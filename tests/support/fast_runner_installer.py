@@ -38,16 +38,17 @@ def build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
     site_packages = candidate / "lib" / f"python{python_version}" / "site-packages"
     package = site_packages / "agent_run"
     site_packages.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
-        source / "src" / "agent_run",
-        package,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
-    )
+    for name in ("agent_run", "agent_run_kernel"):
+        shutil.copytree(
+            source / "src" / name,
+            site_packages / name,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
+        )
 
     entry = candidate / "bin" / "agent-run"
     entry.write_text(
         f"#!{candidate / 'bin' / 'python'}\n"
-        "from agent_run.cli import main\n"
+        "from agent_run_kernel.query_cli import main\n"
         "raise SystemExit(main())\n",
         encoding="utf-8",
     )

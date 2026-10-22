@@ -18,11 +18,8 @@ import pytest
 
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
-from support.seeding import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
-
-from support.state import include_in_state_snapshot, run_refs
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -451,6 +448,15 @@ def _file_tree(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file() and include_in_state_snapshot(path)
     }
+
+
+def include_in_state_snapshot(path: Path) -> bool:
+    """Keep persistent bytes without importing the retired Run object fixture."""
+    if path.name == "state.sqlite3-shm":
+        return not path.is_file()
+    if path.name == "state.sqlite3-wal" and path.is_file():
+        return path.stat().st_size > 0
+    return True
 
 
 def _managed_state_snapshot(
@@ -1627,6 +1633,10 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     offline_install_environment: dict[str, str], capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # The historical delivery setup is local to this scenario, not installer prerequisites.
+    from support.seeding import seed_run, write_fixture
+    from support.state import run_refs
+
     source = _source_tree(tmp_path, real_install=True)
     source = source.rename(tmp_path / "源码 archive with spaces")
     fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
@@ -2527,13 +2537,29 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert second_identity != first_identity
     assert int(count.read_text()) == 2
 
+    entry = home / ".local" / "bin" / "agent-run"
+    settings_environment = {
+        key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    settings_environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"))
+    configured = subprocess.run(
+        [str(entry), "settings", "configure", "--language", "en", "--worker-github-source", "host", "--json"],
+        env=settings_environment,
+        text=True, capture_output=True, timeout=15,
+    )
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert json.loads(configured.stdout)["github"]["worker"] == {"source": "host"}
+    defaults = home / "config" / "agent-run" / "user-defaults.json"
+    defaults_before = defaults.read_bytes()
+
     rollback = _run(source, home, fake_bin, "--rollback")
     assert rollback.returncode == 0, rollback.stderr
     assert _manifest(_active_snapshot(home))["content_identity"] == first_identity
     assert int(count.read_text()) == 2
+    assert defaults.read_bytes() == defaults_before
 
     config = home / "config" / "agent-run"
-    config.mkdir(parents=True)
+    config.mkdir(parents=True, exist_ok=True)
     (config / "github-app.json").write_text("keep", encoding="utf-8")
     locator = home / "state" / "agent-run"
     locator.mkdir(parents=True)
@@ -2572,6 +2598,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (managed_workspace / "state" / "run.json").read_text() == "keep records"
     assert managed_locator.read_text() == "keep index"
     assert profile.read_text(encoding="utf-8") == "before\n"
+    assert defaults.read_bytes() == defaults_before
 
     uninstall = _run(source, home, fake_bin, "--uninstall")
     assert uninstall.returncode == 0, uninstall.stderr
@@ -2584,6 +2611,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (profile.read_text(encoding="utf-8") == "before\n")
     assert (_data_root(home) / "install.lock").exists()
     assert not (home / ".local" / "bin" / "agent-run").exists()
+    assert defaults.read_bytes() == defaults_before
 
 
 def test_non_managed_entry_is_not_overwritten(tmp_path: Path) -> None:
@@ -2723,6 +2751,9 @@ def test_concurrent_management_operations_have_one_winner_and_keep_invariants(
 def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatible_state(
     tmp_path: Path,
 ) -> None:
+    # The historical delivery setup is local to this scenario, not installer prerequisites.
+    from support.seeding import seed_run, write_fixture
+
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
