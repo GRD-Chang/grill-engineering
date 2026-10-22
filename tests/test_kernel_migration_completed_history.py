@@ -407,11 +407,16 @@ def test_record_reader_recovers_original_relations_without_execution_authority(
 
 @pytest.mark.parametrize('boundary', ['missing-run', 'expanded-history'])
 def test_record_reader_checks_source_identity_and_expanded_page_budget(
-    tmp_path: Path, boundary: str,
+    tmp_path: Path, git_repo: Path, boundary: str,
 ) -> None:
-    original = (Path(__file__).resolve().parents[3] / 'results/kernel-completed-ticket-observation/'
-                'completed-ticket-v6.sqlite3')
-    assert hashlib.sha256(original.read_bytes()).hexdigest() == '8acb67257401b081626734ee26c25c50e590847a701c5defd1127df7f3aed3be'
+    # These record-reader boundaries need real v6 relations, not the bytes of
+    # the separate fixed historical oracle. Produce them with unchanged 02.
+    paths = _completed_source(tmp_path, git_repo, 2)
+    original = paths['database']
+    observation = json.loads(paths['observation'].read_text())
+    assert observation['source_runtime_revision'] == BASELINE
+    original_sha = hashlib.sha256(original.read_bytes()).hexdigest()
+    assert original_sha == observation['source_database_sha256']
     copied = tmp_path / 'source.sqlite3'
     copied.write_bytes(original.read_bytes())
     with closing(sqlite3.connect(copied)) as db:
@@ -445,6 +450,7 @@ def test_record_reader_checks_source_identity_and_expanded_page_budget(
         assert first['events'][0]['event']['value_worker'].startswith('original large display text ')
         assert second['events'][0]['slot']['position'] == 2
         assert len(first['events']) + len(second['events']) == reader.tables()['run_timeline_slots']['count']
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == original_sha
 
 
 @pytest.mark.parametrize('rounds', [2, 3])
