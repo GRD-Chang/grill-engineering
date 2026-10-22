@@ -12,6 +12,7 @@ import sys
 import time
 import io
 import tarfile
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,94 @@ from agent_run_kernel.migration_cutover import (cutover_idle_copied_v6,
 from agent_run_kernel.model import HostObservation, Profile
 from agent_run_kernel.offline import OfflinePort
 from agent_run_kernel.task_location import locked_task, read_task
+from test_kernel_migration import original_v6
+
+
+@pytest.mark.parametrize('mode', ['confirmed', 'sent'])
+def test_current_workspace_child_uses_frozen_v6_source_and_real_runner(
+    tmp_path: Path, git_repo: Path, original_v6: Any, mode: str,
+) -> None:
+    """An additional normal producer; never replaces a sealed fixed oracle."""
+    private = tmp_path / 'private'
+    private.mkdir()
+    moved = private / 'repository'
+    git_repo.rename(moved)
+    git_repo = moved
+    old_root = tmp_path / 'original-state'
+    issue = {'number': 2, 'title': 'Ticket 2', 'body': 'Deliver the selected ticket.',
+             'state': 'OPEN', 'labels': ['ready-for-agent'], 'blocked_by': []}
+    fixture = Path(original_v6('fixture', root=old_root, fixture_path=git_repo / 'github.json',
+                               issues={'2': issue}))
+    state = original_v6('start', root=old_root, git=git_repo, fixture=fixture)['state']
+    snapshot = capture_v6(old_root / 'state.sqlite3', tmp_path / 'sealed.sqlite3')
+    work = private / 'work'
+    checkout = work / 'converted-ticket-2'
+    work.mkdir(exist_ok=True)
+    from agent_run_kernel.effects import LocalGit
+    git = LocalGit(git_repo)
+    git.run('worktree', 'add', '--detach', str(checkout), state['base']['sha'])
+    kernel = convert_initial_v6(snapshot, private / 'kernel.sqlite3', repository_root=git_repo,
+        source_ref=f"refs/heads/agent-run/{state['run_id']}/converted-ticket-2", checkout=checkout,
+        final_checkout=work / 'converted-final', development_profile=Profile('fixture-development', 'high'),
+        review_profile=Profile('fixture-review', 'high'), publication_profile=Profile('fixture-publication', 'high'))
+    carrier = private / 'carrier'
+    carrier.write_text('synthetic local Host only')
+    command = (sys.executable, '-u', '-c', _WORKSPACE_CHILD, str(kernel.storage.path),
+               'normal-workspace-child', str(Path(__file__).resolve().parents[1] / 'src'), mode)
+    old = private / 'old/state.sqlite3'
+    nonce, launch = cutover_idle_copied_v6(snapshot, old, kernel, private_root=private,
+        action_id='normal-workspace-child', command=command, environment_carrier=carrier, preflight=lambda: None)
+    assert kernel.dispatch_host(launch)
+    child = subprocess.Popen(launch.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+    try:
+        stat = Path(f'/proc/{child.pid}/stat').read_text()
+        token = stat[stat.rfind(')') + 2:].split()[19]
+        cgroup = Path(f'/proc/{child.pid}/cgroup').read_text().splitlines()[0].split(':', 2)[2]
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        invocation = f'normal-workspace-{child.pid}-{token}'
+        assert kernel.observe_host(launch, HostObservation('running', launch.unit_name, invocation,
+            cgroup, boot, child.pid, token, evidence='actual local child', usage_ready=True)) == 'running'
+        child.stdin.write(b'go\n')
+        child.stdin.flush()
+        import select
+        assert select.select([child.stdout], [], [], 10)[0], 'normal workspace child did not finish'
+        line = child.stdout.readline()
+        assert line, child.stderr.read().decode()
+        observed = json.loads(line)
+        assert observed['head'] == state['base']['sha']
+        assert kernel.status('ticket:2')['phase'] == ('workspace' if mode == 'sent' else 'development')
+        kernel.control('stop', 'stop-normal-workspace-child')
+    finally:
+        child.stdin.close()
+        try:
+            exit_code = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=10)
+            raise
+    assert exit_code == 0, child.stderr.read().decode()
+    assert kernel.observe_host(launch, HostObservation('exited', launch.unit_name, invocation,
+        cgroup, boot, child.pid, token, 0, time.time(), 'local child reaped', usage_released=True)) == 'exited'
+    if mode == 'sent':
+        with kernel.storage.transaction(write=False) as tx:
+            assert tuple(tx.one('SELECT id,status,attempts,receipt_id FROM effects')) == (observed['effect'], 'sent', 1, None)
+        _readback_with_new_host(kernel, carrier, observed['effect'], Path(__file__).resolve().parents[1] / 'src')
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one('SELECT id,status,attempts FROM effects')) == (observed['effect'], 'confirmed', 1)
+        assert not tx.rows('SELECT id FROM attempts')
+        assert not tx.rows('SELECT id FROM invocations')
+    if mode == 'confirmed':
+        assert restore_copied_v6_after_workspace(snapshot, old, kernel, nonce=nonce) == old
+        _continue_with_original_02(tmp_path, git_repo, old, state['run_id'])
+    else:
+        # The existing fixed sent story proves readback, not inverse after a
+        # new Resume action. That action must keep the original inverse guard.
+        fenced = old.read_bytes()
+        with pytest.raises(MigrationRefused, match='workspace_return_progress_unsupported'):
+            restore_copied_v6_after_workspace(snapshot, old, kernel, nonce=nonce)
+        assert old.read_bytes() == fenced
 
 
 def test_fixed_4aba_private_copy_cutover_and_no_effect_return(
@@ -139,31 +228,76 @@ sys.path.insert(0, sys.argv[3])
 from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.local_effects import LocalEffects
-from agent_run_kernel.model import Commit, Execution, World
+from agent_run_kernel.model import Execution, Requirements
+from agent_run_kernel.operation_runner import DeliveryFacts
+sys.path.insert(0, str(Path(sys.argv[3]).parent / 'tests'))
+from support.core_operations import CoreOperations, ReadOnlyPorts
 if sys.stdin.buffer.readline() != b'go\n':
     raise SystemExit(0)
 kernel = Kernel(Path(sys.argv[1]))
 launch = kernel.host_request(sys.argv[2])
 execution = Execution(launch.run_id, launch.owner, launch.epoch)
 delivery = kernel.delivery('ticket:2')
-status = kernel.status(delivery.key)
-world = World(status['parent_revision'], status['graph_revision'], status['revision'],
-              delivery.base, completion_revision=status['completion_revision'])
 mode = sys.argv[4] if len(sys.argv) > 4 else 'confirmed'
-step = kernel.advance(delivery.key, execution, world, allow_agent=False)
-assert step.kind == ('reconcile' if mode == 'readback' else 'effect') and step.effect.operation == 'workspace'
-effect = step.effect
-port = LocalEffects(LocalGit(Path(delivery.common_git_dir).parent), owned_root=Path(delivery.owned_root))
+# The same literal external Issue story used by the frozen original
+# continuation below; never reconstructed from native Core records.
+source = Requirements.from_wire({
+    'parent': {'number': 1, 'title': 'Parent spec', 'body': 'Deliver the ticket set.',
+               'sub_issues': [2], 'sub_issue_order_reliable': True},
+    'issues': {'2': {'number': 2, 'title': 'Ticket 2', 'body': 'Deliver the selected ticket.',
+                      'state': 'OPEN', 'labels': ['ready-for-agent'], 'blocked_by': []}},
+})
+class Ports(ReadOnlyPorts):
+    writes = 0
+    def __init__(self, binding):
+        self.local = LocalEffects(LocalGit(binding.repository_root), owned_root=Path(delivery.owned_root))
+        super().__init__(source, delivery.source_ref, delivery.target_ref,
+                         DeliveryFacts(self.head(delivery.target_ref), self.head(delivery.source_ref)))
+    def head(self, ref):
+        result = self.local.git.run('rev-parse', '--verify', ref, check=False)
+        return None if result.returncode else self.local.git.commit(result.stdout.strip())
+    def delivery(self, request):
+        assert (request.source_ref, request.target_ref) == (self.source_ref, self.target_ref)
+        return DeliveryFacts(self.head(request.target_ref), self.head(request.source_ref))
+    def execute(self, effect, authorize):
+        assert effect.operation == 'workspace' and mode != 'readback'
+        self.effect = effect
+        self.result = self.local.execute(effect, authorize)
+        self.writes += 1
+        if mode == 'sent':
+            # A real authorized local write happened; only its response is
+            # lost. Core must retain the original sent intent for readback.
+            raise OSError('synthetic lost workspace response after actual write')
+        return self.result
+    def reconcile(self, effect):
+        assert effect.operation == 'workspace'
+        self.effect = effect
+        self.result = self.local.reconcile(effect)
+        return self.result
+    def inspect(self, resources):
+        return self.local.inspect_resources(resources)
+ports = []
+def make_ports(binding):
+    port = Ports(binding)
+    ports.append(port)
+    return port
+operations = CoreOperations(kernel, execution, make_ports)
+step = operations.once(agent_capacity=0)
+port = ports[0]
+effect, result = port.effect, port.result
+assert effect.operation == 'workspace'
+assert result.disposition == 'target'
+if mode == 'sent':
+    assert (step.kind, step.reason) == ('waiting', 'original_write_readback_required')
+else:
+    assert step.kind == 'progress'
+    assert operations.until(lambda step: kernel.status(delivery.key)['phase'] == 'development',
+                            agent_capacity=0).kind == 'progress'
 if mode == 'readback':
     assert effect.effect_id == sys.argv[5]
-    result = port.reconcile(effect)
+    assert port.writes == 0
 else:
-    assert kernel.dispatch(effect, execution, world)
-    result = port.execute(effect, authorize=lambda: kernel.guard_effect(effect, execution, world))
-assert result.disposition == 'target'
-if mode != 'sent':
-    kernel.reconcile(effect, result, execution, world)
-    assert kernel.advance(delivery.key, execution, world, allow_agent=False).kind == 'progress'
+    assert port.writes == 1
 assert kernel.status(delivery.key)['phase'] == ('workspace' if mode == 'sent' else 'development')
 print(json.dumps({'effect': effect.effect_id, 'head': result.commit.sha}), flush=True)
 sys.stdin.buffer.readline()
