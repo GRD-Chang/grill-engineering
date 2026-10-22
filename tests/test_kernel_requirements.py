@@ -343,7 +343,12 @@ def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_re
     assert refreshed["budgets"] == before["budgets"]
     # The formal lifecycle entry requires explicit requeue at final_refresh.
     # An automatic operation must retain that gate and the old generation.
-    assert scenario.runner().run_once().reason == "automatic_step_paused"
+    calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
+    blocked = scenario.runner().run_once()
+    assert blocked.kind in {"paused", "quiescent"}
+    assert scenario.kernel.status(scenario.delivery.key) == refreshed
+    assert len(scenario.role_calls) == calls_before
+    assert len(scenario.port.writes()) == writes_before
     assert scenario.kernel.status(scenario.delivery.key)["generation"] == before["generation"]
     assert scenario.kernel.control("requeue", "accept-new-parent-requirements", subject=scenario.delivery.key, world=fresh) == "applied"
     assert scenario.run(cut="publication_pending").kind == "publication_pending"
@@ -533,7 +538,13 @@ def test_final_requirement_refresh_never_reuses_old_generation_human_response(tm
     scenario.kernel.control("resume", "answer-old-generation", subject=final, message="Decision for original Parent requirements only.")
     scenario.requirements = replace(source, parent=replace(source.parent, body="New Parent requirements retire the old response."))
     fresh = scenario.world()
-    assert scenario.runner().run_once().reason == "automatic_step_paused"
+    before = scenario.kernel.status(final)
+    calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
+    blocked = scenario.runner().run_once()
+    assert blocked.kind in {"paused", "quiescent"}
+    assert scenario.kernel.status(final) == before
+    assert len(scenario.role_calls) == calls_before
+    assert len(scenario.port.writes()) == writes_before
     assert scenario.kernel.control("requeue", "accept-new-parent-without-old-response", subject=final, world=fresh) == "applied"
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     step = operations.once()
