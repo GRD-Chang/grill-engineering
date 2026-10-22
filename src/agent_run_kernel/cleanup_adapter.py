@@ -6,7 +6,7 @@ import re
 import selectors
 import signal
 import subprocess
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -96,15 +96,19 @@ def _remote(effect: Effect) -> tuple[str, str, str] | None:
     return remote, *identity
 
 
-def inspect_remote_ref(git: LocalGit, effect: Effect) -> EffectResult:
+def inspect_remote_ref(git: LocalGit, effect: Effect, *,
+                       read_refs: Callable[[], Mapping[str, str]] | None = None) -> EffectResult:
     """Read a remote independently of the local ref or an earlier response."""
     identity = _remote(effect)
     if identity is None:
         return _result("third", "invalid_remote_identity")
     remote, ref, expected = identity
     try:
-        result = _read(git, "ls-remote", "--refs", "--", remote, ref)
-        lines = [line.split("\t") for line in result.stdout.splitlines()]
+        if read_refs is None:
+            result = _read(git, "ls-remote", "--refs", "--", remote, ref)
+            lines = [line.split("\t") for line in result.stdout.splitlines()]
+        else:
+            lines = [[sha, branch] for branch, sha in read_refs().items() if branch == ref]
         if not lines:
             return _result("target", "remote_ref_absent")
         if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref:
@@ -115,21 +119,26 @@ def inspect_remote_ref(git: LocalGit, effect: Effect) -> EffectResult:
         return _result("unknown", "remote_read_failed")
 
 
-def cleanup_remote_ref(git: LocalGit, effect: Effect) -> EffectResult:
+def cleanup_remote_ref(git: LocalGit, effect: Effect, *,
+                       delete: Callable[[str, str], subprocess.CompletedProcess[str]] | None = None,
+                       read_refs: Callable[[], Mapping[str, str]] | None = None) -> EffectResult:
     """Attempt one exact lease deletion; inspect the original ref after any response."""
-    observed = inspect_remote_ref(git, effect)
+    observed = inspect_remote_ref(git, effect, read_refs=read_refs)
     if observed.disposition != "prior":
         return observed
     identity = _remote(effect)
     assert identity is not None
     remote, ref, expected = identity
     _authority(git)
+    response = None
     try:
-        git.run("push", "--porcelain", f"--force-with-lease={ref}:{expected}",
-                "--", remote, f":{ref}", check=False)
+        response = (git.run("push", "--porcelain", f"--force-with-lease={ref}:{expected}",
+                            "--", remote, f":{ref}", check=False) if delete is None else delete(ref, expected))
     except (OSError, subprocess.SubprocessError):
         pass
-    return inspect_remote_ref(git, effect)
+    result = inspect_remote_ref(git, effect, read_refs=read_refs)
+    return result if response is None else replace(result, raw={**result.raw,
+        'write_returncode': response.returncode, 'write_diagnostic': response.stderr[:4096]})
 
 
 def _worktree_paths(values: tuple[object, object, object]) -> tuple[Path, Path, Path] | None:

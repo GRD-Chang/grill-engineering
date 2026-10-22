@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, NoReturn, ParamSpec, TYPE_CHECKING, TypeVar
+from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
 from urllib.parse import urlencode
 
 from agent_run.github import GhGitHubReader, GitHubReadError
@@ -71,6 +71,20 @@ def _operation_errors(method: Callable[_Arguments, _Result]) -> Callable[_Argume
     return invoke
 
 
+class PhysicalAPI(Protocol):
+    """Raw external objects, lists and single writes; no Effect decisions."""
+    def object(self, endpoint: str) -> dict[str, Any]: ...
+    def list(self, endpoint: str) -> list[dict[str, Any]]: ...
+    def write(self, endpoint: str, method: str, body: Mapping[str, Any]) -> subprocess.CompletedProcess[str]: ...
+
+
+class PhysicalGit(Protocol):
+    def refs(self) -> dict[str, str]: ...
+    def fetch(self, sha: str) -> None: ...
+    def push(self, ref: str, before: str | None, after: str) -> subprocess.CompletedProcess[str]: ...
+    def delete(self, ref: str, expected: str) -> subprocess.CompletedProcess[str]: ...
+
+
 class RemoteEffects:
     """A concrete execute/reconcile port; authorize is required for every write.
 
@@ -79,7 +93,8 @@ class RemoteEffects:
     Failed reads are unknown, never absence, prior, success or permission to retry.
     """
     def __init__(self, root: Path, repository: str, *, runner_identity: Mapping[str, Any],
-                 remote: str = "origin") -> None:
+                 remote: str = "origin", api: PhysicalAPI | None = None,
+                 git_writes: PhysicalGit | None = None) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("Expected an exact GitHub owner/repository")
         if not remote or remote.startswith("-") or "\0" in remote:
@@ -87,6 +102,8 @@ class RemoteEffects:
         self.root, self.repository, self.remote = root, repository, remote
         self.identity = validate_identity_snapshot(runner_identity)
         self.git = LocalGit(root)
+        self.api = api
+        self.git_writes = git_writes
 
     def actor(self) -> str:
         """Resolve the selected Runner's actual login, not a fixture identity."""
@@ -107,7 +124,9 @@ class RemoteEffects:
         if effect.operation == "issue_link":
             return self._link_issue(effect, authorize)
         if effect.operation == "cleanup_remote_ref":
-            return cleanup_remote_ref(self._cleanup_git(authorize), effect)
+            return cleanup_remote_ref(self._cleanup_git(authorize), effect,
+                delete=None if self.git_writes is None else self.git_writes.delete,
+                read_refs=None if self.git_writes is None else self.git_writes.refs)
         if effect.operation == "retire_pr":
             return self._retire_pr(effect, authorize)
         if effect.operation == "reopen_ticket":
@@ -140,7 +159,8 @@ class RemoteEffects:
             command = ["git", "push", self.remote, f"{after}:{effect.source_ref}",
                        f"--force-with-lease={effect.source_ref}:{expected or ''}"]
             authorize()
-            response = run_write_command(command, cwd=self.root, runner_identity=self.identity)
+            response = (run_write_command(command, cwd=self.root, runner_identity=self.identity) if self.git_writes is None else
+                        self.git_writes.push(effect.source_ref, expected, after))
         elif operation == "pr_write":
             body = {"title": _text(effect.payload["title"]), "body": _text(effect.payload["body"])}
             if effect.pr_number is None:
@@ -192,7 +212,8 @@ class RemoteEffects:
             if effect.operation == "issue_link":
                 return EffectResult("unknown", raw={"display": "acknowledgement_not_received"})
             if effect.operation == "cleanup_remote_ref":
-                return inspect_remote_ref(self._cleanup_git(), effect)
+                return inspect_remote_ref(self._cleanup_git(), effect,
+                    read_refs=None if self.git_writes is None else self.git_writes.refs)
             if effect.operation == "retire_pr":
                 return self._reconcile_retirement(effect)
             if effect.operation == "reopen_ticket":
@@ -223,6 +244,10 @@ class RemoteEffects:
     def pull_request(self, number: int) -> PullRequest:
         """Original PR identity and actual commit trees, for reads and receipts."""
         return self._pr(self._api(f"repos/{self.repository}/pulls/{number}"))
+
+    def find_pull_request(self, source_ref: str, target_ref: str) -> PullRequest | None:
+        data = self._find_pr(source_ref, target_ref, None)
+        return None if data is None else self._pr(data)
 
     @_operation_errors
     def prepare_retirement(self, effect: Effect) -> dict[str, Any]:
@@ -581,7 +606,10 @@ class RemoteEffects:
         # local refs or FETCH_HEAD; a local tracking ref is never an observation.
         for sha in (before, after):
             if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
-                self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
+                if self.git_writes is None:
+                    self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
+                else:
+                    self.git_writes.fetch(sha)
         return self.git.is_ancestor(before, after)
 
     def _binding(self, effect: Effect) -> None:
@@ -646,6 +674,8 @@ class RemoteEffects:
         return None
 
     def _remote_head(self, ref: str) -> str | None:
+        if self.git_writes is not None:
+            return self.git_writes.refs().get(ref)
         response = self._read(["git", "ls-remote", "--refs", "--", self.remote, ref])
         lines = response.stdout.splitlines()
         if not lines:
@@ -742,8 +772,12 @@ class RemoteEffects:
         if observed.disposition != "target" or observed.pr is None:
             return observed
         try:
-            source, target = read_remote_heads(self.root, effect.source_ref, effect.target_ref,
-                                              runner_identity=self.identity, remote=self.remote)
+            if self.git_writes is None:
+                source, target = read_remote_heads(self.root, effect.source_ref, effect.target_ref,
+                                                  runner_identity=self.identity, remote=self.remote)
+            else:
+                heads = self.git_writes.refs()
+                source, target = heads.get(effect.source_ref), heads.get(effect.target_ref)
             if observed.pr.base != effect.base or source != effect.after_sha or target != effect.base.sha:
                 return replace(observed, disposition="third")
         except GitHubReadError:
@@ -865,12 +899,17 @@ class RemoteEffects:
         return response
 
     def _api(self, endpoint: str) -> dict[str, Any]:
-        data = json.loads(self._read(["gh", "api", endpoint]).stdout)
+        data = self.api.object(endpoint) if self.api is not None else json.loads(self._read(["gh", "api", endpoint]).stdout)
         if not isinstance(data, dict):
             raise ValueError("expected remote object")
         return data
 
     def _pages(self, endpoint: str) -> list[dict[str, Any]]:
+        if self.api is not None:
+            rows = self.api.list(endpoint)
+            if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
+                raise ValueError("invalid or oversized remote collection")
+            return rows
         pages = json.loads(self._read(["gh", "api", endpoint, "--paginate", "--slurp"]).stdout)
         if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
             raise ValueError("expected paginated remote list")
@@ -884,6 +923,9 @@ class RemoteEffects:
         data = json.dumps(dict(body), ensure_ascii=False).encode()
         if len(data) > MATERIAL_LIMIT:
             raise ValueError("remote write material exceeds limit")
+        if self.api is not None:
+            authorize()
+            return self.api.write(endpoint, method, body)
         with NamedTemporaryFile(prefix="agent-run-write-", suffix=".json") as stream:
             stream.write(data)
             stream.flush()
