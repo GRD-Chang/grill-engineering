@@ -71,6 +71,22 @@ def imported_cleanup(tmp_path: Path, *, stage: int = 0, subject: str = "ticket:3
         material = tx.put("ticket:2", "v6_run_import", wire_json(proof))
         tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,0)",
             ("ticket:2", "v6_run_import", origin["nonce"], material))
+        tables = {}
+        for table, names, key, values in (
+            ("run_root", ["run_id", "value_run_branch"], [run_id], [run_id, "original/run"]),
+            ("run_condition_base", ["run_id", "value_sha"], [run_id], [run_id, base.sha]),
+            ("work_jobs", ["run_id", "job_id", "stage", "value_integrated_sha"],
+                [run_id, "ticket:2:generation:1"], [run_id, "ticket:2:generation:1", "completed", "e" * 40]),
+        ):
+            page = tx.put("ticket:2", "v6_record_page", wire_json([{"key": key, "size": 256,
+                "cells": [{"type": "text", "value": value} for value in values]}]))
+            tables[table] = {"columns": [{"name": name} for name in names], "primary_key": names[:len(key)],
+                "count": 1, "pages": [{"start": 0, "count": 1, "first": key, "last": key, "material": page}]}
+        archive = tx.put("ticket:2", "v6_record_manifest", wire_json({"format": "v6-records/1",
+            "source": {"run_id": run_id, "sha256": origin["source_sha256"], "protocol": "sqlite-work-records-v6",
+                "schema_sha256": "56" * 32}, "tables": tables, "documents": {}}))
+        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at) VALUES (?,?,?,?,1,0)",
+            ("ticket:2", "v6_record_import", run_id, archive))
         tx.execute("UPDATE subjects SET phase='complete',source_sha=?,workspace_sha=? WHERE id=?",
             ("d" * 40, "c" * 40, subject))
         closed = tx.put(subject, "imported_close", wire_json({"disposition": "target"}))

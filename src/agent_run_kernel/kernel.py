@@ -1850,6 +1850,31 @@ class Kernel:
         if job["kind"] == DeliveryKind.FINAL_RUN and cleanup["stage"] == 1:
             if run_ref["source_ref"] != cleanup["source_ref"]:
                 raise KernelError("cleanup_marker_unproven")
+            # Resolve ownership through the existing immutable archive reader;
+            # a material label or nonempty witness list is not a resource grant.
+            from .migration_records import V6RecordReader
+
+            try:
+                original = V6RecordReader(self)
+                if (original.source.get("run_id") != run["id"] or original.source.get("sha256") != origin["source_sha256"]
+                        or run_ref["source_ref"] != "refs/heads/" + original.row("run_root", [run["id"]])["value_run_branch"]):
+                    raise ValueError("foreign original Run")
+                for witness in run_ref["head_evidence"]:
+                    if witness == {"table": "run_condition_base", "key": [run["id"]]}:
+                        expected = original.row("run_condition_base", witness["key"])["value_sha"]
+                    elif any(capsule["kind"] == "completed" and capsule.get("source_record") == witness
+                             and witness == {"table": "work_jobs", "key": [run["id"], f"ticket:{native[subject]['issue']}:generation:1"]}
+                             for subject, capsule in capsules.items()):
+                        record = original.row("work_jobs", witness["key"])
+                        if record["stage"] != "completed":
+                            raise ValueError("uncompleted original Ticket")
+                        expected = record["value_integrated_sha"]
+                    else:
+                        raise ValueError("foreign original head witness")
+                    if expected != run_ref["expected_oid"]:
+                        raise ValueError("original head changed")
+            except (KernelError, KeyError, TypeError, ValueError) as error:
+                raise KernelError("cleanup_marker_unproven") from error
             head = run_ref["expected_oid"]
         elif job["kind"] == DeliveryKind.TICKET and cleanup["stage"] in {0, 1}:
             capsule = capsules.get(job["id"], {})
