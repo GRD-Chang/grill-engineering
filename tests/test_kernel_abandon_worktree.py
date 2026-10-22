@@ -1,5 +1,4 @@
 """Abandon retires only the original owned checkout under explicit authority."""
-from dataclasses import asdict
 from pathlib import Path
 import shutil
 
@@ -8,6 +7,7 @@ import pytest
 from agent_run_kernel import Effect, Execution, KernelError, ResourceWitness
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.local_effects import LocalEffects
+from agent_run_kernel.model import resource_wire
 
 
 def _original(git_repo: Path, tmp_path: Path):
@@ -42,14 +42,14 @@ def test_abandon_worktree_preserves_foreign_or_unsaved_work_and_requires_origina
         shutil.rmtree(checkout)
     effect = Effect("abandon-original", resource.subject, "abandon_worktree", "example/project",
                     resource.source_ref, "refs/heads/run", head.sha, None, None, head, None, None,
-                    {"resource": asdict(resource), "control_action": "original-action",
+                    {"resource": resource_wire(resource), "control_action": "original-action",
                      "discard_worktree": case == "discard"}, Execution("run", "executor", 1))
     authorized: list[str] = []
     local = LocalEffects(git, owned_root=Path(resource.owned_root))
     result = local.execute(effect, lambda: authorized.append("original-action"))
     if case in {"clean", "discard", "absent"}:
         assert result.disposition == "target"
-        assert result.raw["resource"] == asdict(resource)
+        assert result.raw["resource"] == resource_wire(resource)
         assert result.raw["reason"] == "worktree_absent"
         assert authorized and not checkout.exists()
         assert local.reconcile(effect) == result
@@ -69,7 +69,7 @@ def test_abandon_absent_checkout_rechecks_after_authorization(git_repo: Path, tm
     git.run("worktree", "remove", str(checkout))
     effect = Effect("abandon-original", resource.subject, "abandon_worktree", "example/project",
                     resource.source_ref, "refs/heads/run", head.sha, None, None, head, None, None,
-                    {"resource": asdict(resource), "control_action": "original-action", "discard_worktree": False},
+                    {"resource": resource_wire(resource), "control_action": "original-action", "discard_worktree": False},
                     Execution("run", "executor", 1))
     authorized: list[str] = []
 

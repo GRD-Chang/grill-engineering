@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -18,7 +18,7 @@ from agent_run.git_publication_commit import (
 
 from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_resource, inspect_worktree
 from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness
+from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness, inspection_wire
 
 
 class LocalEffects:
@@ -43,7 +43,7 @@ class LocalEffects:
             resources = tuple(ResourceWitness(**row) for row in rows)
         except TypeError:
             return EffectResult("third", raw={"reason": "invalid_resource_witnesses"})
-        return EffectResult("target", raw={"resources": [asdict(item) for item in self.inspect_resources(resources)]})
+        return EffectResult("target", raw={"resources": [inspection_wire(item) for item in self.inspect_resources(resources)]})
 
     def _checkout(self, effect: Effect) -> tuple[Path, str | None]:
         values = [effect.payload.get(key) for key in ("checkout", "owned_root", "common_git_dir")]

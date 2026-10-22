@@ -25,11 +25,11 @@ from .cleanup_adapter import _read
 from .legacy_admission import read_source_fence
 from .migration import source_identity
 from .migration_records import V6RecordReader
-from .model import Blocker, Effect, Issue, KernelError, ParentIssue, Requirements, wire_json
+from .model import Blocker, Effect, Issue, KernelError, ParentIssue, Requirements, ResourceWitness, wire_json
 from .storage import Storage, Transaction
 
 
-def _idle_checkout_state(git: LocalGit, checkout: Path, common: Path
+def _idle_checkout_state(git: LocalGit, checkout: Path, common: Path, *, allow_dirty: bool = False
         ) -> tuple[bytes | None, tuple[str, ...] | None]:
     """Read a detached registration, or prove both path and registration absent."""
     try:
@@ -60,7 +60,7 @@ def _idle_checkout_state(git: LocalGit, checkout: Path, common: Path
         head = git.run('rev-parse', '--verify', 'HEAD^{commit}', cwd=checkout).stdout.strip()
         raw = Path(git.run('rev-parse', '--path-format=absolute', '--git-path', 'HEAD', cwd=checkout).stdout.strip()).read_bytes()
         status = tuple(git.run('status', '--porcelain', cwd=checkout).stdout.splitlines())
-        if raw != (head + '\n').encode('ascii') or 'HEAD ' + head not in registered[0] or status:
+        if raw != (head + '\n').encode('ascii') or 'HEAD ' + head not in registered[0] or status and not allow_dirty:
             raise KernelError('foreign_local_checkout')
         return raw, status
     except (OSError, UnicodeError) as error:
@@ -156,26 +156,58 @@ def authenticate_prebuilt_workspace(git: LocalGit, effect: Effect) -> dict[str, 
     """Check current private physical identity; H1 and dispatch belong to the caller."""
     if 'prebuilt_workspace' not in effect.payload:
         return None
+    if effect.operation != 'workspace' or effect.payload.get('create_ref') is not True:
+        raise KernelError('foreign_local_checkout')
     try:
-        value = effect.payload['prebuilt_workspace']
+        resource = ResourceWitness(effect.subject, 1, 'development', effect.payload['checkout'],
+            effect.payload['owned_root'], effect.payload['common_git_dir'], effect.source_ref,
+            effect.before_sha, effect.payload['prebuilt_workspace'])
+    except KeyError as error:
+        raise KernelError('foreign_local_checkout') from error
+    return _authenticate_prebuilt_binding(git, resource, run_id=effect.execution.run_id, require_checkout=True)
+
+
+def authenticate_prebuilt_resource(git: LocalGit, resource: ResourceWitness, *,
+        allow_dirty: bool = False) -> dict[str, Any] | None:
+    """Authenticate an unfinished original binding carried by a Core resource.
+
+    Core revokes this binding after workspace completion or later progress.
+    A removed path is accepted only with no surviving worktree registration;
+    its source ref is checked separately, so absence never proves ref cleanup.
+    """
+    if resource.prebuilt_workspace is None:
+        return None
+    return _authenticate_prebuilt_binding(git, resource, allow_dirty=allow_dirty)
+
+
+def _authenticate_prebuilt_binding(git: LocalGit, resource: ResourceWitness, *,
+        run_id: str | None = None, allow_dirty: bool = False, require_checkout: bool = False) -> dict[str, Any]:
+    """One physical identity reader for workspace dispatch and partial cleanup."""
+    try:
+        value = resource.prebuilt_workspace
         keys = (_IDLE_HEADER_KEYS - {'resources'}) | _IDLE_ENTRY_KEYS
         if not isinstance(value, dict) or set(value) != keys:
             raise ValueError('shape')
         proof = dict(value)
         key = proof['source_record']
-        if (effect.operation != 'workspace' or effect.payload.get('create_ref') is not True
+        if (resource.kind != 'development' or type(resource.generation) is not int or resource.generation != 1
+                or type(allow_dirty) is not bool
                 or proof['format'] != 'copied-idle-workspace/1' or type(proof['generation']) is not int
-                or proof['generation'] != 1 or proof['run_id'] != effect.execution.run_id
-                or proof['subject'] != effect.subject or proof['disposition'] != 'new-unused'
-                or proof['expected_oid'] is not None or proof['source_ref'] != effect.source_ref
-                or not effect.source_ref.startswith('refs/heads/')
+                or proof['generation'] != resource.generation
+                or not isinstance(proof['run_id'], str) or not proof['run_id']
+                or run_id is not None and proof['run_id'] != run_id
+                or proof['subject'] != resource.subject or proof['disposition'] != 'new-unused'
+                or proof['expected_oid'] is not None or proof['source_ref'] != resource.source_ref
+                or not isinstance(resource.source_ref, str) or not resource.source_ref.startswith('refs/heads/')
+                or not isinstance(resource.head_sha, str)
+                or re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', resource.head_sha) is None
                 or proof['repository_root'] != str(git.root)
                 or proof['common_git_dir'] != str(git.root / '.git')
-                or any(proof[k] != effect.payload.get(k) for k in ('checkout', 'owned_root', 'common_git_dir'))
+                or any(proof[k] != getattr(resource, k) for k in ('checkout', 'owned_root', 'common_git_dir'))
                 or not isinstance(key, dict) or set(key) != {'table', 'key'} or key['table'] != 'run_graph_members'
                 or not isinstance(key['key'], list) or len(key['key']) != 3
                 or key['key'][0] != proof['run_id'] or type(key['key'][2]) is not int
-                or effect.subject != f"ticket:{key['key'][2]}"
+                or resource.subject != f"ticket:{key['key'][2]}"
                 or not isinstance(proof['workspace_oid'], str) or re.fullmatch('[0-9a-f]{40,64}', proof['workspace_oid']) is None
                 or not isinstance(proof['copy_uuid'], str) or re.fullmatch('[0-9a-f]{32}', proof['copy_uuid']) is None
                 or not isinstance(proof['source_sha256'], str) or re.fullmatch('[0-9a-f]{64}', proof['source_sha256']) is None
@@ -193,14 +225,15 @@ def authenticate_prebuilt_workspace(git: LocalGit, effect: Effect) -> dict[str, 
             if (not stat.S_ISREG(physical.st_mode) or physical.st_nlink != 1 or physical.st_size != 33
                     or marker.read(34) != proof['copy_uuid'].encode('ascii') + b'\n'):
                 raise ValueError('marker')
-        head, _ = _idle_checkout_state(git, checkout, common)
-        allowed = {effect.before_sha + '\n'}
+        head, _ = _idle_checkout_state(git, checkout, common, allow_dirty=allow_dirty)
+        allowed = {resource.head_sha + '\n'}
         if proof['before_head'] is not None:
             allowed.add(proof['before_head'])
-        if head is not None and head.decode('ascii') not in allowed or head is None and proof['before_head'] is not None:
+        if (head is not None and head.decode('ascii') not in allowed
+                or require_checkout and head is None and proof['before_head'] is not None):
             raise ValueError('head')
-        refs = git.run('for-each-ref', '--format=%(refname) %(objectname)', effect.source_ref).stdout.splitlines()
-        if refs and refs != [effect.source_ref + ' ' + effect.before_sha]:
+        refs = git.run('for-each-ref', '--format=%(refname) %(objectname)', resource.source_ref).stdout.splitlines()
+        if refs and refs != [resource.source_ref + ' ' + resource.head_sha]:
             raise ValueError('ref')
         return proof
     except (OSError, UnicodeError) as error:

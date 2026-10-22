@@ -1,10 +1,10 @@
 """Original managed Git witnesses are inspected without changing their resources."""
-from dataclasses import asdict
 from pathlib import Path
 
 from agent_run_kernel import Effect, Execution, ResourceWitness
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.local_effects import LocalEffects
+from agent_run_kernel.model import resource_wire
 
 
 def test_resource_preflight_distinguishes_owned_dirty_absent_and_foreign_without_writes(
@@ -52,7 +52,7 @@ def test_resource_inspection_effect_authorizes_before_its_fresh_read(git_repo: P
     effect = Effect("inspect-original", resource.subject, "inspect_resources", "example/project",
                     resource.source_ref, "refs/heads/run", head.sha, None, None, head, None, None,
                     {"control_action": "abandon-original", "discard_worktree": False,
-                     "resources": [asdict(resource)]}, Execution("run", "executor", 1))
+                     "resources": [resource_wire(resource)]}, Execution("run", "executor", 1))
     authorized: list[str] = []
 
     def authorize() -> None:
@@ -63,7 +63,7 @@ def test_resource_inspection_effect_authorizes_before_its_fresh_read(git_repo: P
     result = local.execute(effect, authorize)
     assert result.disposition == "target"
     assert authorized == ["original-action"]
-    assert result.raw["resources"] == [{"resource": asdict(resource), "disposition": "dirty",
+    assert result.raw["resources"] == [{"resource": resource_wire(resource), "disposition": "dirty",
                                          "head_sha": head.sha, "reason": "worktree_dirty"}]
     assert local.reconcile(effect) == result
     assert authorized == ["original-action"]

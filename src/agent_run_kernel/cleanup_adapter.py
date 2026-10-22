@@ -13,7 +13,7 @@ from pathlib import Path
 from time import monotonic
 
 from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness
+from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness, resource_wire
 
 
 def _result(disposition: str, reason: str, **facts: object) -> EffectResult:
@@ -184,16 +184,46 @@ def _abandon_resource(effect: Effect) -> ResourceWitness | None:
     return resource
 
 
+def _resource_worktree(git: LocalGit, resource: ResourceWitness, *, allow_dirty: bool = False
+                       ) -> tuple[Path, Path, Path, str, str] | None:
+    paths = _worktree_paths((resource.checkout, resource.owned_root, resource.common_git_dir))
+    if paths is None:
+        return None
+    expected = resource.head_sha
+    if resource.prebuilt_workspace is not None:
+        # Ownership also imports our read helper; keep this dependency local.
+        from .migration_run_ownership import authenticate_prebuilt_resource
+        binding = authenticate_prebuilt_resource(git, resource, allow_dirty=allow_dirty)
+        if binding is None:
+            raise KernelError("foreign_local_checkout")
+        if paths[0].exists():
+            expected = _read(git, "rev-parse", "--verify", "HEAD", cwd=paths[0]).stdout.strip()
+            allowed = {resource.head_sha}
+            if binding["before_head"] is not None:
+                allowed.add(binding["workspace_oid"])
+            if expected not in allowed:
+                raise KernelError("foreign_local_checkout")
+    return (*paths, resource.source_ref, expected)
+
+
 def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
     """Require exact registration, Git identity, HEAD and a clean owned checkout."""
     try:
         discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
-        observed = _inspect_worktree(git, _worktree(effect),
+        resource = _abandon_resource(effect) if effect.operation == "abandon_worktree" else None
+        prebuilt = resource is not None and resource.prebuilt_workspace is not None
+        identity = (_resource_worktree(git, resource, allow_dirty=discard)
+                    if prebuilt and resource is not None else _worktree(effect))
+        observed = _inspect_worktree(git, identity,
                                     check_dirty=effect.operation != "validation_cleanup" and not discard)
-        if effect.operation == "abandon_worktree" and _abandon_resource(effect) is not None:
-            return replace(observed, raw={**observed.raw, "resource": dict(effect.payload["resource"])})
+        if prebuilt and identity is not None and observed.disposition == "prior":
+            observed = replace(observed, raw={**observed.raw, "head": identity[-1]})
+        if resource is not None:
+            return replace(observed, raw={**observed.raw, "resource": resource_wire(resource)})
         return observed
-    except (KernelError, OSError, RuntimeError, subprocess.SubprocessError):
+    except KernelError as error:
+        return _result("third" if error.code == "foreign_local_checkout" else "unknown", error.code)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return _result("unknown", "worktree_read_failed")
 
 
@@ -202,18 +232,19 @@ def inspect_resource(git: LocalGit, resource: ResourceWitness) -> ResourceInspec
     if not _valid_resource(resource):
         return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
     try:
-        paths = _worktree_paths((resource.checkout, resource.owned_root, resource.common_git_dir))
-        if paths is None:
+        identity = _resource_worktree(git, resource, allow_dirty=True)
+        if identity is None:
             return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
-    except (OSError, RuntimeError):
+    except KernelError as error:
+        return ResourceInspection(resource, "foreign" if error.code == "foreign_local_checkout" else "unknown", reason=error.code)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return ResourceInspection(resource, "unknown", reason="worktree_read_failed")
-    observed = _inspect_worktree(git, (*paths, resource.source_ref, resource.head_sha),
-                                 check_dirty=True)
+    observed = _inspect_worktree(git, identity, check_dirty=True)
     reason = str(observed.raw["reason"])
     if observed.disposition == "prior":
-        return ResourceInspection(resource, "clean", resource.head_sha, reason)
+        return ResourceInspection(resource, "clean", identity[-1], reason)
     if reason == "worktree_dirty":
-        return ResourceInspection(resource, "dirty", resource.head_sha, reason)
+        return ResourceInspection(resource, "dirty", identity[-1], reason)
     if observed.disposition == "target":
         return ResourceInspection(resource, "absent", reason=reason)
     return ResourceInspection(resource, "unknown" if observed.disposition == "unknown" else "foreign", reason=reason)
@@ -313,6 +344,8 @@ def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
     identity = _worktree(effect)
     assert identity is not None
     checkout, _owned, _common, ref, expected = identity
+    if "head" in observed.raw:
+        expected = str(observed.raw["head"])
     _authority(git)
     # A stale authorization must propagate; lock contention is only a resource fact.
     try:
@@ -323,6 +356,8 @@ def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
             verified = inspect_worktree(git, effect)
             if verified.disposition != "prior":
                 return verified
+            if "head" in observed.raw and verified.raw.get("head") != expected:
+                return _result("third", "worktree_identity_changed")
             _authority(git)
             discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
             options = ("--force",) if effect.operation == "validation_cleanup" or discard else ()

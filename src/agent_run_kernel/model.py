@@ -6,7 +6,7 @@ this module is a second mutable Run, an executable plan, or a store protocol.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 import json
 from pathlib import Path
@@ -346,6 +346,7 @@ class ResourceWitness:
     common_git_dir: str
     source_ref: str
     head_sha: str
+    prebuilt_workspace: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -354,6 +355,19 @@ class ResourceInspection:
     disposition: Literal["clean", "dirty", "absent", "unknown", "foreign"]
     head_sha: str | None = None
     reason: str = ""
+
+
+def resource_wire(resource: ResourceWitness) -> dict[str, Any]:
+    value = asdict(resource)
+    if resource.prebuilt_workspace is None:
+        del value["prebuilt_workspace"]
+    return value
+
+
+def inspection_wire(inspection: ResourceInspection) -> dict[str, Any]:
+    value = asdict(inspection)
+    value["resource"] = resource_wire(inspection.resource)
+    return value
 
 
 @dataclass(frozen=True)

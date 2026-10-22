@@ -26,7 +26,7 @@ from agent_run.task_identity import TaskKey
 
 from .model import (
     AgentCall, Checks, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError, ObservationSuperseded,
-    Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, artifact, review_outcome, wire_json,
+    Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, artifact, inspection_wire, resource_wire, review_outcome, wire_json,
 )
 from .storage import CURRENT_LIMIT, Storage, Transaction
 from .attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, ContinuationOpening,
@@ -703,9 +703,25 @@ class Kernel:
             for generation in generations:
                 subject = job["id"]
                 if generation["checkout"]:
+                    prebuilt = None
+                    if job["kind"] == DeliveryKind.TICKET and generation["generation"] == 1:
+                        originals = tx.rows("SELECT payload_id,before_sha,source_ref FROM effects WHERE subject=? AND generation=1 "
+                                            "AND operation='workspace' ORDER BY rowid LIMIT 1", (subject,))
+                        completed = tx.rows("SELECT e.id FROM effects e JOIN material m ON m.id=e.receipt_id "
+                            "WHERE e.subject=? AND e.generation=1 AND e.operation IN ('workspace','candidate','integrate','publication_commit') "
+                            "AND json_extract(CAST(m.body AS TEXT),'$.disposition')='target' LIMIT 1", (subject,))
+                        if originals and not completed:
+                            original = originals[0]
+                            payload = json.loads(tx.get(original["payload_id"], subject))
+                            if (original["before_sha"] == generation["workspace_sha"]
+                                    and original["source_ref"] == generation["source_ref"]
+                                    and all(payload.get(key) == generation[key] for key in ("checkout", "owned_root", "common_git_dir"))):
+                                prebuilt = payload.get("prebuilt_workspace")
+                                if "prebuilt_workspace" in payload and not isinstance(prebuilt, dict):
+                                    raise KernelError("prebuilt_workspace_unproven")
                     resources.append(ResourceWitness(subject, generation["generation"], "development", generation["checkout"],
                                                      generation["owned_root"], generation["common_git_dir"], generation["source_ref"],
-                                                     generation["workspace_sha"]))
+                                                     generation["workspace_sha"], prebuilt))
                 for checkout in sorted({generation["validation_checkout"], generation["validation_cleanup"]} - {None}):
                     witnesses = [json.loads(tx.get(row[0], subject)) for row in tx.all(
                         "SELECT payload_id FROM effects WHERE subject=? AND generation=? AND operation='validation_checkout' AND status IN ('confirmed','observed')",
@@ -729,7 +745,10 @@ class Kernel:
             raise KernelError("abandon_resource_boundary")
         for item in inspections:
             if (item.disposition not in {"clean", "dirty", "absent"}
-                    or (item.disposition != "absent" and item.head_sha != item.resource.head_sha)):
+                    or (item.disposition != "absent" and item.head_sha != item.resource.head_sha
+                        and not (item.head_sha is not None and item.resource.prebuilt_workspace is not None
+                                 and item.resource.prebuilt_workspace.get("before_head") is not None
+                                 and item.head_sha == item.resource.prebuilt_workspace["workspace_oid"]))):
                 raise KernelError("abandon_resource_unproven", item.resource.checkout)
             if item.disposition == "dirty" and not discard:
                 raise KernelError("dirty_worktree", item.resource.checkout)
@@ -772,13 +791,13 @@ class Kernel:
         # cannot add another checkout, owner or generation to this Action.
         for effect_id in scope["unsettled"]:
             row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
-            if row["status"] != "confirmed" or row["receipt_id"] is None or row["operation"] not in {"candidate", "integrate", "publication_commit", "validation_checkout"}:
+            if row["status"] != "confirmed" or row["receipt_id"] is None or row["operation"] not in {"workspace", "candidate", "integrate", "publication_commit", "validation_checkout"}:
                 continue
             result = json.loads(tx.get(row["receipt_id"], row["subject"]))
             if result["disposition"] != "target" or result["commit"] is None:
                 continue
             payload = json.loads(tx.get(row["payload_id"], row["subject"]))
-            resources = [replace(item, head_sha=result["commit"]["sha"])
+            resources = [replace(item, head_sha=result["commit"]["sha"], prebuilt_workspace=None)
                          if (item.subject, item.generation, item.checkout) == (row["subject"], row["generation"], payload.get("checkout"))
                          else item for item in resources]
         return tuple(resources)
@@ -825,11 +844,11 @@ class Kernel:
             return False
         discard = self._abandon_discard(tx, action)
         if row["operation"] == "inspect_resources":
-            return bool(payload.get("resources") == [asdict(item) for item in self._abandon_resources(tx, action)]
+            return bool(payload.get("resources") == [resource_wire(item) for item in self._abandon_resources(tx, action)]
                         and type(payload.get("discard_worktree")) is bool and (not payload["discard_worktree"] or discard))
         if row["operation"] == "abandon_worktree":
             resource = payload.get("resource")
-            return bool(resource in [asdict(item) for item in self._abandon_resources(tx, action)]
+            return bool(resource in [resource_wire(item) for item in self._abandon_resources(tx, action)]
                         and type(payload.get("discard_worktree")) is bool and (not payload["discard_worktree"] or discard)
                         and resource["subject"] == row["subject"] and resource["generation"] == row["generation"]
                         and resource["source_ref"] == row["source_ref"] and resource["head_sha"] == row["before_sha"])
@@ -1015,7 +1034,7 @@ class Kernel:
                 return Step("observe", owner)
             return self._prepare_abandon_effect(tx, run, action, owner, self._job(tx, owner)["generation"], execution, world,
                 "inspect_resources", before=self._job(tx, owner)["workspace_sha"],
-                payload={"resources": [asdict(item) for item in self._abandon_resources(tx, action)], "discard_worktree": self._abandon_discard(tx, action)})
+                payload={"resources": [resource_wire(item) for item in self._abandon_resources(tx, action)], "discard_worktree": self._abandon_discard(tx, action)})
         self._check_abandon_inspection(tx, action, inspection)
         for row in effects:
             if row["status"] == "retired" and self._abandon_control_scope(tx, action, row):
@@ -1068,7 +1087,7 @@ class Kernel:
                     "reopen_ticket", before=completion["merge_sha"], payload={"issue": self._job(tx, completion["subject"])["issue"],
                      "completion": value, "close_receipt": json.loads(tx.get(closed["receipt_id"], completion["subject"])), "close_intent": payload["close_intent"]})
         for witness in self._abandon_resources(tx, action):
-            resource = asdict(witness)
+            resource = resource_wire(witness)
             if completed("abandon_worktree", "resource", resource):
                 continue
             if world is None or subject != resource["subject"]:
@@ -1435,7 +1454,7 @@ class Kernel:
         if replacement is not None:
             intent["replacement"] = asdict(replacement)
         if resource_inspections is not None:
-            intent["resource_inspections"] = [asdict(item) for item in resource_inspections]
+            intent["resource_inspections"] = [inspection_wire(item) for item in resource_inspections]
         if discard_worktree:
             intent["discard_worktree"] = True
         if continuation_of is not None:
@@ -2819,7 +2838,7 @@ class Kernel:
         if replacement is not None:
             command["replacement"] = asdict(replacement)
         if resource_inspections is not None:
-            command["resource_inspections"] = [asdict(item) for item in resource_inspections]
+            command["resource_inspections"] = [inspection_wire(item) for item in resource_inspections]
         if discard_worktree:
             command["discard_worktree"] = True
         payload = wire_json(command)
@@ -2863,7 +2882,7 @@ class Kernel:
                 raise KernelError("merged_run_noncancellable")
             if tx.rows("SELECT e.id FROM effects e JOIN subjects s ON s.id=e.subject WHERE s.kind!='ticket' AND e.operation='merge' AND e.status IN ('sent','observed') LIMIT 1"):
                 raise KernelError("final_merge_unsettled")
-            abandonment = {"resources": [asdict(item) for item in resources], "discard_worktree": discard_worktree,
+            abandonment = {"resources": [resource_wire(item) for item in resources], "discard_worktree": discard_worktree,
                            "execution": {"run_id": run["id"], "owner": run["executor"], "epoch": run["epoch"]},
                            "generations": [[row["id"], row["generation"]] for row in tx.all("SELECT id,generation FROM subjects ORDER BY id")],
                            "unsettled": [row[0] for row in tx.all("SELECT id FROM effects WHERE status IN ('prepared','sent','observed')") ]}
