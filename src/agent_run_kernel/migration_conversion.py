@@ -311,7 +311,7 @@ def convert_initial_v6(snapshot: SourceSnapshot, destination: Path, *, repositor
                 != (snapshot.sha256, snapshot.source_protocol, snapshot.schema_sha256, snapshot.table_rows)):
             raise MigrationRefused("snapshot_changed")
         facts = _initial_facts(captured.path)
-        decoded = read_initial_import(captured, repository_root=repository_root,
+        decoded = read_initial_import(replace(captured, source=snapshot.source), repository_root=repository_root,
             source_ref=source_ref, checkout=checkout, final_checkout=final_checkout,
             development_profile=development_profile, review_profile=review_profile,
             publication_profile=publication_profile, additional_workspaces=additional_workspaces)
