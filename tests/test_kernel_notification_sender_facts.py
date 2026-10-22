@@ -9,12 +9,13 @@ import pytest
 
 from agent_run import notification_outbox as outbox
 from agent_run.notification_event_facts import event_copy, event_envelope
+from support.core_operations import CoreOperations, scripted_return
 from agent_run_kernel import DeliveryKind, Kernel, Role
 from agent_run_kernel.model import wire_json
 from agent_run_kernel.notifications import NativeNotifications
 from test_kernel_notification_events import _recorded_agents
 from test_kernel_notification_lifecycle import _enabled_scenario
-from test_kernel_notifications import _kernel
+from test_kernel_notifications import _kernel, _operations
 
 
 def _state(scenario) -> dict[str, Any]:
@@ -57,15 +58,15 @@ def test_sender_merges_actual_resume_result_into_the_original_gate_without_a_sec
     _recorded_agents(scenario, monkeypatch, lambda call: blocked, started)
     assert scenario.run().kind == "paused"
     assert scenario.kernel.control("resume", "resume-original-gate", subject=scenario.delivery.key,
-                                   world=scenario.world(), message="Continue the original target") == "applied"
+                                   message="Continue the original target") == "applied"
     resumed[0] = True
-    continued = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+    continued = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once()
     assert continued.call is not None
     if outcome == "failed":
         assert scenario.kernel.dispatch_agent(continued.call)
         scenario.kernel.agent_unavailable(continued.call, "worker_preparation_failed", {"message": "Original launch failed"})
     else:
-        scenario.handle(continued)
+        scripted_return(scenario.kernel, scenario.runner(), continued.call, scenario.agent)
         actual_start, = [event for event in captured if event.get("resume_id") == "resume-original-gate"]
         assert actual_start["resume_outcome"] == "started"
         assert actual_start["color"] == actual_start["_rendered_color"] == "blue"
@@ -205,9 +206,8 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
 def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_start(tmp_path):
     kernel = _kernel(tmp_path, count=2)
     execution = kernel.claim_executor("executor")
-    from agent_run_kernel import Commit, World
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "tree"))
-    first = kernel.advance("native-ticket-0", execution, world).call
+    operations = _operations(kernel, execution, count=2)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     process = {"pid": 21, "pgid": 21, "start_token": "first", "host_pid": 10, "host_start_token": "host"}
     kernel.agent_started(first, process)
@@ -239,7 +239,7 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
             time.sleep(0.01)
         assert len(failed) == 1 and failed[0]["attempts"] == 1
         deadline = failed[0]["deadline_at"]
-        call = kernel.advance("native-ticket-1", execution, world).call
+        call = operations.once().call
         assert call is not None and kernel.dispatch_agent(call)
         second_call = call
         second[0] = call.attempt_id

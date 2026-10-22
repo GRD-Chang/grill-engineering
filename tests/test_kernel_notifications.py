@@ -16,10 +16,24 @@ from agent_run import process_binding
 from agent_run.process_binding import _process_start_token
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Issue, ParentIssue, Requirements, RunSpec, World
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.notifications import NativeNotifications
 from agent_run_kernel.offline import OfflinePort, Scenario
+from agent_run_kernel.operation_runner import DeliveryFacts
+from support.core_operations import CoreOperations, ReadOnlyPorts
+
+
+def _source(count: int = 1) -> Requirements:
+    return Requirements(ParentIssue(1, "Parent", "Original notification requirement", tuple(range(2, count + 2))),
+        tuple(Issue(number, "Ticket", "ticket-v1", "OPEN", frozenset({"ready-for-agent"}))
+              for number in range(2, count + 2)))
+
+
+def _operations(kernel, execution, *, count: int = 1) -> CoreOperations:
+    ports = ReadOnlyPorts(_source(count), "refs/heads/source", "refs/heads/target",
+                          DeliveryFacts(Commit("base", "tree"), None))
+    return CoreOperations(kernel, execution, lambda binding: ports)
 
 
 def _kernel(root: Path, count: int = 1) -> Kernel:
@@ -36,7 +50,10 @@ def _kernel(root: Path, count: int = 1) -> Kernel:
     assert spec.inputs is not None
     inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
                                                  "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    return Kernel.create(root / "kernel.sqlite3", replace(spec, inputs=inputs))
+    final = Delivery("notification-final", DeliveryKind.FINAL_RUN, 1, "unread", base,
+                     delivery.target_ref, "refs/heads/main")
+    return Kernel.create(root / "kernel.sqlite3", replace(spec, inputs=inputs, deliveries=(*deliveries, final)),
+                         requirements=_source(count))
 
 
 def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_send(tmp_path: Path) -> None:
@@ -134,6 +151,15 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
         patch.setattr(OfflinePort, "prepare", prepare)
         scenario = Scenario(tmp_path, DeliveryKind.TICKET, checks=("fail", "none"))
     scenario.port.lose_response.add("pr_write")
+    issued = []
+    execute = scenario.port.execute
+
+    def recorded_execute(effect, authorize=None):
+        if effect.operation == "pr_write":
+            issued.append(effect)
+        return execute(effect, authorize)
+
+    monkeypatch.setattr(scenario.port, "execute", recorded_execute)
     sent: list[tuple[dict[str, Any], str]] = []
 
     def transport(_config: Any, rendered: dict[str, Any], key: str,
@@ -149,8 +175,8 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
 
     for _ in range(80):
         step = scenario.step()
-        if step.effect is not None and step.effect.operation == "pr_write":
-            assert step.effect.payload["prior"] is None
+        if issued:
+            assert issued[0].payload["prior"] is None
             break
         assert step.kind not in {"paused", "waiting", "complete"}
     else:
@@ -160,8 +186,11 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     assert not any(record["kind"] == "pr_created" for record in observe())
 
     step = scenario.step()
-    assert step.kind == "reconcile" and step.effect is not None
-    assert step.effect.operation == "pr_write"
+    assert step.kind == "progress"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        receipt = tx.one("SELECT operation,status,receipt_id FROM effects WHERE id=?", (issued[0].effect_id,))
+        assert receipt["operation"] == "pr_write" and receipt["status"] == "observed"
+        assert receipt["receipt_id"] is not None
     assert not any(record["kind"] == "pr_created" for record in observe())
     # Reconciliation persists the receipt; only the next real Core advance
     # consumes that original effect and commits the notification's producer fact.
@@ -179,8 +208,8 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     # CI repair updates the same PR through another confirmed real effect.
     for _ in range(100):
         step = scenario.step()
-        if step.effect is not None and step.effect.operation == "pr_write":
-            assert step.effect.payload["prior"] is not None
+        if len(issued) == 2:
+            assert issued[1].payload["prior"] is not None
             break
         assert step.kind not in {"paused", "waiting", "complete"}
     else:
@@ -214,8 +243,7 @@ def test_native_does_not_adopt_an_unmigrated_existing_journal(tmp_path: Path) ->
 def test_native_first_worker_event_uses_committed_start_once(tmp_path: Path) -> None:
     kernel = _kernel(tmp_path)
     execution = kernel.claim_executor("owner")
-    call = kernel.advance("native-ticket", execution, World("parent-v1", "graph-v1", "ticket-v1",
-                                                        Commit("base", "tree"))).call
+    call = _operations(kernel, execution).once().call
     assert call is not None and kernel.dispatch_agent(call)
     kernel.bind_thread(call, "fixture-thread")
     process = {"pid": 21, "pgid": 21, "start_token": "fixture", "host_pid": 10,

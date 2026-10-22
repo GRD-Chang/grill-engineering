@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from support.core_operations import CoreOperations, scripted_return
 from agent_run_kernel import Issue, ParentIssue, Requirements, Role
 from agent_run_kernel.model import KernelError, wire_json
 from agent_run.notification_event_facts import event_envelope
@@ -115,20 +116,20 @@ def test_recovery_keeps_only_the_latest_actual_start_among_independent_live_tick
         tuple(Issue(number, f"Ticket {number}", "Original task", "OPEN", labels=("ready-for-agent",))
               for number in (2, 3))))
     calls = []
-    for subject in ("ticket:2", "ticket:3"):
-        scenario.select(subject)
-        for _ in range(20):
-            step = scenario.kernel.advance(subject, scenario.execution, scenario.world())
-            if step.call is not None:
-                call = step.call
-                assert scenario.kernel.dispatch_agent(call)
-                scenario.kernel.agent_started(call, {"pid": 21 + len(calls), "pgid": 21 + len(calls),
-                    "start_token": subject, "host_pid": 10, "host_start_token": "synthetic-host"})
-                calls.append(call)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    for _ in range(40):
+        step = operations.once()
+        if step.call is not None:
+            call = step.call
+            assert scenario.kernel.dispatch_agent(call)
+            scenario.kernel.agent_started(call, {"pid": 21 + len(calls), "pgid": 21 + len(calls),
+                "start_token": call.subject, "host_pid": 10, "host_start_token": "synthetic-host"})
+            calls.append(call)
+            if len(calls) == 2:
                 break
-            scenario.handle(step)
-        else:
-            raise AssertionError("Independent Ticket did not actually start")
+    else:
+        raise AssertionError("Independent Tickets did not actually start")
+    assert {call.subject for call in calls} == {"ticket:2", "ticket:3"}
     pending = _project(scenario.kernel, "concise")
     assert len(pending) == 2
     older = next(event for event in pending if event["attempt_id"] == calls[0].attempt_id)
@@ -187,9 +188,16 @@ def test_consumed_controller_resume_is_a_historical_result_after_recovery(tmp_pa
     assert scenario.step().kind == "progress"
     assert scenario.kernel.status("ticket:2")["phase"] == "candidate"
     assert scenario.kernel.control("stop", "stop-controller", subject="ticket:2") == "applied"
-    assert scenario.kernel.control("resume", "resume-controller", subject="ticket:2", world=scenario.world()) == "applied"
-    prepared = scenario.step()
-    assert prepared.effect is not None and prepared.effect.operation == "candidate"
+    assert scenario.kernel.control("resume", "resume-controller", subject="ticket:2") == "applied"
+    candidates = []
+    execute = scenario.port.execute
+    def capture(effect, authorize=None):
+        if effect.operation == "candidate":
+            candidates.append(effect)
+        return execute(effect, authorize)
+    monkeypatch.setattr(scenario.port, "execute", capture)
+    scenario.step()
+    assert len(candidates) == 1 and candidates[0].operation == "candidate"
     assert scenario.step().kind == "progress"
     event, = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "resume"]
     assert event["evidence"] == "effect_consumed" and "attempt_id" not in event
@@ -215,7 +223,13 @@ def test_original_repair_and_formal_promotion_follow_current_generation_and_appr
 
     _recorded_agents(scenario, monkeypatch, started=started)
     assert scenario.run().kind == "complete"
-    scenario.select(scenario.activate_final())
+    for _ in range(40):
+        scenario.step()
+        if scenario.kernel.source_status()["final_subject"] is not None:
+            break
+    else:
+        raise AssertionError("Real Ticket Completion did not admit Final")
+    scenario.select("final:1")
     planned = None
     for _ in range(100):
         step = scenario.step()
