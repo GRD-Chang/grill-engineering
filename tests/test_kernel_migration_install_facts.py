@@ -28,6 +28,14 @@ from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.migration_conversion import read_initial_import
 from agent_run_kernel.model import Profile, World
 from support.frozen_v6_runtime import old_v6_runtime
+from support.v6_returned_source import returned_managed_source
+from agent_run_kernel.migration_active import read_original_returned_import
+from agent_run_kernel.migration_cli import _collect_original_v6
+from test_kernel_migration_original_source import _git_bytes
+from agent_run_kernel.migration_run_cutover import _execute_original_import, _import_origin
+from agent_run_kernel.migration_run_resources import authenticate_imported_resources
+from agent_run_kernel.task_location import read_task, task_path
+from agent_run_kernel.legacy_admission import read_source_fence
 
 
 @pytest.fixture(scope='module')
@@ -250,3 +258,99 @@ print(wire_json({'states': {str(n): legacy.status(f'ticket:{n}') for n in reques
     step = canonical.advance('ticket:2', canonical.claim_executor('canonical-idle'), world)
     assert step.kind == 'effect' and step.effect is not None and step.effect.operation == 'workspace'
     assert step.effect.source_ref == workspaces[2][0]
+
+
+@pytest.mark.parametrize('role', ['development', 'review', 'publication'])
+@pytest.mark.parametrize('transfer_intent', [False, True])
+def test_original_returned_decoder_reaches_canonical_prepared_without_retiring_source(tmp_path, git_repo, monkeypatch, role, transfer_intent):
+    import os
+    import shutil
+    managed, paths = returned_managed_source(tmp_path, git_repo, role)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    decoded = read_original_returned_import(snapshot, profile_snapshot=evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json', checkout_archive=evidence / 'checkout.tar')
+    origin = _import_origin(decoded, managed, 'ad' * 16) if transfer_intent else None
+    if origin is not None:
+        authenticate_imported_resources(decoded, origin, evidence)
+    native = install_imported_facts(decoded, tmp_path / 'canonical-returned.sqlite3', origin=origin)
+    verify_imported_installation(native, decoded, origin=origin)
+    state = native.status('ticket:2')
+    assert state['phase'] == {'development': 'development', 'review': 'review', 'publication': 'publish'}[role]
+    assert state['pending_return'] is True
+    assert state['budgets']['requirements']['developments_used'] == 1
+    assert state['budgets']['requirements']['reviews_used'] == int(role == 'publication')
+    assert state['pending_attempt'] == decoded.subjects[0].attempts[-1].record.key[-1]
+    with native.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM subjects')[0] == 1
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        assert all(row['thread_id'] is None and row['opening_id'] is None for row in tx.rows('SELECT thread_id,opening_id FROM attempts'))
+        if role == 'development':
+            assert tx.one("SELECT count(*) FROM material WHERE purpose='v6_candidate_commit_intent'")[0] == 1
+    assert (paths['database'].read_bytes(), _git_bytes(managed.repository_root)) == before
+    assert not (managed.state_root / decoded.spec.run_id / 'kernel.sqlite3').exists()
+
+
+@pytest.mark.parametrize('role', ['development', 'review', 'publication'])
+def test_canonical_original_executor_transfers_reenters_and_restores_real_returned_source(
+    tmp_path, git_repo, monkeypatch, role,
+):
+    import os
+    import shutil
+    managed, paths = returned_managed_source(tmp_path, git_repo, role)
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    decoded = read_original_returned_import(snapshot, profile_snapshot=evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json', checkout_archive=evidence / 'checkout.tar')
+    task = decoded.source.task
+    assert task is not None
+    with closing(sqlite3.connect(snapshot.source)) as db:
+        original_protocol = db.execute("SELECT value FROM schema_meta WHERE key='protocol'").fetchone()[0]
+    resource = decoded.subjects[0].resources[0]
+    assert resource.checkout is not None
+    git = LocalGit(managed.repository_root)
+    original_git = _git_bytes(managed.repository_root)
+    head_log = Path(git.run('rev-parse', '--path-format=absolute', '--git-path', 'logs/HEAD', cwd=resource.checkout).stdout.strip())
+    original_log = head_log.read_bytes()
+    nonce = 'ac' * 16
+    native = _execute_original_import(decoded, nonce=nonce, evidence=evidence)
+    assert isinstance(native, Kernel)
+    assert read_task(task_path(task)) == (decoded.spec.run_id, native.storage.path)
+    assert git.run('symbolic-ref', '-q', 'HEAD', cwd=resource.checkout, check=False).returncode == 1
+    with closing(sqlite3.connect(snapshot.source)) as db:
+        protocol = db.execute("SELECT value FROM schema_meta WHERE key='protocol'").fetchone()[0]
+    assert read_source_fence(protocol) == _import_origin(decoded, managed, nonce)
+    before = native.storage.path.read_bytes(), _git_bytes(managed.repository_root)
+    again = _execute_original_import(decoded, nonce=nonce, evidence=evidence)
+    assert isinstance(again, Kernel) and again.storage.path == native.storage.path
+    assert (native.storage.path.read_bytes(), _git_bytes(managed.repository_root)) == before
+
+    result = _execute_original_import(decoded, nonce=nonce, evidence=evidence, inverse=True)
+    assert isinstance(result, dict) and result['status'] == 'rolled_back'
+    assert read_task(task_path(task)) is None
+    restored_git = _git_bytes(managed.repository_root)
+    log_key = str(head_log.relative_to(managed.repository_root))
+    assert {key: value for key, value in restored_git.items() if key != log_key} == {
+        key: value for key, value in original_git.items() if key != log_key}
+    assert head_log.read_bytes().startswith(original_log)
+    assert git.run('symbolic-ref', 'HEAD', cwd=resource.checkout).stdout.strip() == resource.source_ref
+    with closing(sqlite3.connect(snapshot.source)) as db:
+        assert db.execute("SELECT value FROM schema_meta WHERE key='protocol'").fetchone()[0] == original_protocol
+    assert _execute_original_import(decoded, nonce=nonce, evidence=evidence, inverse=True) == result
+    with native.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM history WHERE kind='v6_original_rollback_started'")[0] == 1
+        assert tx.one("SELECT count(*) FROM history WHERE kind='v6_original_rollback_complete'")[0] == 1
+    # Admission/native execution is a separate gate; this test only proves the
+    # fixed transfer/inverse executor on real producer layouts and local refs.

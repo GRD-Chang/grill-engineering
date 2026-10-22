@@ -53,9 +53,10 @@ class SubjectProof:
 
 def run_import_document(*, origin: Mapping[str, Any], profile_sha256: str,
         external_readproof_sha256: str, run_ref: str, run_head: str,
-        head_evidence: tuple[SourceKey | SourceRecord, ...], entries: list[dict[str, Any]]) -> dict[str, Any]:
+        head_evidence: tuple[SourceKey | SourceRecord, ...], entries: list[dict[str, Any]],
+        source_scope: str | None = None) -> dict[str, Any]:
     run_id = origin['run_id']
-    return {
+    document = {
         'origin_nonce': origin['nonce'], 'source_sha256': origin['source_sha256'],
         'profile_sha256': profile_sha256, 'external_readproof_sha256': external_readproof_sha256,
         'resource_mode': 'existing-verified',
@@ -65,6 +66,11 @@ def run_import_document(*, origin: Mapping[str, Any], profile_sha256: str,
             'head_evidence': [{'table': key.table, 'key': list(key.key)} for key in head_evidence]},
         'subjects': entries,
     }
+    if source_scope is not None:
+        if source_scope not in {'single-ticket', 'whole-run'}:
+            raise MigrationRefused('source_import_scope')
+        document['source_scope'] = source_scope
+    return document
 
 
 def imported_resource_layout(resource: ImportedResource, origin: Mapping[str, str]) -> dict[str, Any]:
@@ -89,14 +95,27 @@ def imported_proof_documents(facts: ImportedRunFacts, origin: Mapping[str, str] 
     or writer is called to derive an expectation.
     """
     anchor = min(item.subject for item in facts.subjects)
+    auxiliary: list[tuple[str, str | None, str, str, bytes]] = []
+    for name, document in facts.source.oracle_documents:
+        if name != 'source:work_job_candidate_commit_intent':
+            continue  # SQL evidence bytes are retained by the complete record archive.
+        import json
+        intent = json.loads(document)
+        owners = [item for item in facts.subjects if item.record.table == 'work_jobs'
+            and item.record.key == (intent['run_id'], intent['job_id'])]
+        if (len(owners) != 1 or intent.get('value_kind') != 'candidate_commit'
+                or owners[0].kind != 'returned' or not owners[0].attempts
+                or owners[0].attempts[-1].role.value != 'development'):
+            raise MigrationRefused('source_candidate_intent')
+        auxiliary.append((owners[0].subject, None, name, 'v6_candidate_commit_intent', document))
     if origin is None:
-        return [(anchor, None, facts.source.snapshot.sha256, 'v6_import_identity', wire_json({
+        return auxiliary + [(anchor, None, facts.source.snapshot.sha256, 'v6_import_identity', wire_json({
             'source_sha256': facts.source.snapshot.sha256, 'source_protocol': facts.source.snapshot.source_protocol,
             'source_mode': facts.source.mode, 'scope': facts.source.scope}))]
     if facts.source.profile_document is None or facts.source.external_readproof is None:
         raise MigrationRefused('source_external_readback_required')
     entries = []
-    documents: list[tuple[str, str | None, str, str, bytes]] = []
+    documents: list[tuple[str, str | None, str, str, bytes]] = auxiliary
     def record(value: SourceRecord) -> dict[str, Any]:
         return {'table': value.table, 'key': list(value.key)}
     for subject in sorted(facts.subjects, key=lambda item: item.subject):
@@ -120,7 +139,8 @@ def imported_proof_documents(facts: ImportedRunFacts, origin: Mapping[str, str] 
     external_sha = hashlib.sha256(facts.source.external_readproof).hexdigest()
     run = run_import_document(origin=origin, profile_sha256=hashlib.sha256(facts.source.profile_document).hexdigest(),
         external_readproof_sha256=external_sha, run_ref=facts.run_resource.source_ref,
-        run_head=facts.run_resource.expected_oid, head_evidence=facts.run_resource.head_evidence, entries=entries)
+        run_head=facts.run_resource.expected_oid, head_evidence=facts.run_resource.head_evidence, entries=entries,
+        source_scope=facts.source.scope)
     documents.extend([(anchor, 'v6_run_import', origin['nonce'], 'v6_run_import', wire_json(run)),
         (anchor, 'v6_external_readproof', external_sha, 'v6_external_readproof', facts.source.external_readproof)])
     return documents
