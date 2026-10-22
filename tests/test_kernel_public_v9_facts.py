@@ -4,23 +4,30 @@ from pathlib import Path
 
 from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, Issue, ParentIssue, Requirements
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.offline import Scenario
 from agent_run_kernel.query import read
 from agent_run_kernel.query_cli import main
+from agent_run_kernel.operation_runner import DeliveryFacts
+from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
-def _kernel(root: Path) -> tuple[Kernel, World]:
+def _kernel(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
     defaults = UserDefaultsStore(root / 'defaults.json')
     defaults.configure(language='en', profile={'development_model': 'frozen-model', 'development_effort': 'high'},
                        github={'worker_source': 'pat', 'pat': {'env': 'FROZEN_TOKEN'}, 'runner_source': 'host'},
                        notifications={'enabled': False, 'mode': 'detailed'})
     base = Commit('base', 'tree')
     job = Delivery('ticket', DeliveryKind.TICKET, 2, 'ticket-v1', base, 'refs/heads/source', 'refs/heads/target')
-    spec = freeze_creation(RunSpec('run', 'example/project', 1, 'parent-v1', 'graph-v1', (job,),
+    final = Delivery('final:1', DeliveryKind.FINAL_RUN, 1, 'unread', base, job.target_ref, 'refs/heads/main')
+    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2,)), (
+        Issue(2, 'Ticket', 'Original behavior', 'OPEN', frozenset({'ready-for-agent'})),
+    ))
+    spec = freeze_creation(RunSpec('run', 'example/project', 1, 'parent-v1', 'graph-v1', (job, final),
         repository_root=str(root)), defaults, prompt_resources={key: 'Original ' + key for key in RESOURCE_KEYS})
-    return Kernel.create(root / 'kernel.sqlite3', spec), World('parent-v1', 'graph-v1', 'ticket-v1', base)
+    return (Kernel.create(root / 'kernel.sqlite3', spec, requirements=source),
+            ReadOnlyPorts(source, job.source_ref, job.target_ref, DeliveryFacts(base, None)))
 
 
 def _durable(root: Path) -> dict[str, bytes]:
@@ -29,9 +36,10 @@ def _durable(root: Path) -> dict[str, bytes]:
 
 
 def test_frozen_settings_and_old_thread_binding_survive_personal_and_run_profile_changes(tmp_path: Path, capsys, monkeypatch) -> None:
-    kernel, world = _kernel(tmp_path)
+    kernel, ports = _kernel(tmp_path)
     execution = kernel.claim_executor('executor')
-    first = kernel.advance('ticket', execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    first = operations.once().call
     assert first is not None
     revision = kernel.configure_profiles('explicit-configure', overrides={'development_model': 'new-thread-only'})
     config = tmp_path / 'personal' / 'agent-run' / 'user-defaults.json'
@@ -54,11 +62,12 @@ def test_frozen_settings_and_old_thread_binding_survive_personal_and_run_profile
 
 
 def test_query_retains_physical_output_raw_and_actual_activity_without_recounting_budget(tmp_path: Path) -> None:
-    kernel, world = _kernel(tmp_path)
+    kernel, ports = _kernel(tmp_path)
     now = [100.0]
     kernel.clock = lambda: now[0]
     execution = kernel.claim_executor('executor')
-    first = kernel.advance('ticket', execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, 'actual-thread')
     process = {'pid': 23, 'pgid': 23, 'start_token': 'first', 'host_pid': 11, 'host_start_token': 'host'}
@@ -68,14 +77,14 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     kernel.receive(first, b'Original invalid output / raw')
     now[0] = 101.0
     kernel.agent_exited(first, process, 0)
-    repair = kernel.advance('ticket', execution, world).call
+    repair = operations.once().call
     assert repair is not None and repair.output_ordinal == 1 and kernel.dispatch_agent(repair)
     next_process = {**process, 'pid': 24, 'pgid': 24, 'start_token': 'second'}
     kernel.agent_started(repair, next_process)
     kernel.receive(repair, b'{"result_kind":"development","summary":"Exact repaired raw","human_blockers":null}')
     now[0] = 103.0
     kernel.agent_exited(repair, next_process, 0)
-    assert kernel.advance('ticket', execution, world).kind == 'progress'
+    assert operations.once().kind == 'progress'
     before = _durable(tmp_path)
     data = read(kernel.storage.path, 'history').data
     invocation = data['agent_invocations'][0]
@@ -100,6 +109,10 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
 def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
     scenario.port.lose_response.add('pr_write')
+    unresolved = scenario.run()
+    assert unresolved.kind == "waiting" and unresolved.reason == "original_write_readback_required"
+    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
+    assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     assert scenario.run().kind == 'approval'
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'history').data
@@ -128,18 +141,19 @@ def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_rene
 
 
 def test_resume_application_receipt_does_not_claim_start_before_the_bound_successor(tmp_path: Path) -> None:
-    kernel, world = _kernel(tmp_path)
+    kernel, ports = _kernel(tmp_path)
     kernel.clock = lambda: 100.0
     executor = kernel.claim_executor('executor')
-    first = kernel.advance('ticket', executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    first = operations.once().call
     assert first is not None
     kernel.receive(first, b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Need original decision"]}')
-    assert kernel.advance('ticket', executor, world).kind == 'paused'
+    assert operations.once().kind == 'paused'
     assert kernel.control('resume', 'exact-response', subject='ticket', message='Original response') == 'applied'
     before_start = read(kernel.storage.path, 'history').data['agent_resumes'][0]
     assert before_start['status'] == 'applied' and before_start['started_at'] is None
     assert before_start['successor_invocations'] == []
-    successor = kernel.advance('ticket', executor, world).call
+    successor = operations.once().call
     assert successor is not None and kernel.dispatch_agent(successor)
     kernel.bind_thread(successor, 'real-resumed-thread')
     process = {'pid': 21, 'pgid': 21, 'start_token': 'successor', 'host_pid': 10, 'host_start_token': 'host'}

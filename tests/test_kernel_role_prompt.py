@@ -7,20 +7,22 @@ import sys
 
 import pytest
 
+from dataclasses import replace
+
 from agent_run.prompt_resources import builtin_resources, personal_method_directory
 from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Role, RunSpec, World
+from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Role, RunSpec
 from agent_run_kernel.codex_execution import execute_codex
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.offline import Scenario, review_result
 from agent_run_kernel.role_prompt import render_role_prompt
+from support.core_operations import CoreOperations, native_agent_fixture, scripted_return, final_scenario
 
 
-def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentCall, World, UserDefaultsStore]:
+def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentCall, CoreOperations, UserDefaultsStore]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     base = Commit("base", "tree")
-    world = World("parent-v1", "graph-v1", "ticket-v1", base)
     delivery = Delivery("ticket", DeliveryKind.TICKET, 2, "ticket-v1", base,
                         "refs/heads/source", "refs/heads/target", checkout=str(checkout))
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
@@ -32,17 +34,18 @@ def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentCall, World, UserDefaultsS
     resources["methods/acceptance"] = "Unrelated acceptance method must not leak\n" + resources["methods/acceptance"]
     spec = freeze_creation(RunSpec("prompt-run", "example/repository", 1, "parent-v1", "graph-v1", (delivery,)),
                            defaults, prompt_resources=resources)
-    kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec)
-    call = kernel.advance(delivery.key, kernel.claim_executor("prompt-owner"), world).call
+    kernel, ports = native_agent_fixture(tmp_path / "state" / "kernel.sqlite3", spec)
+    operations = CoreOperations(kernel, kernel.claim_executor("prompt-owner"), lambda binding: ports)
+    call = operations.once().call
     assert call is not None
-    return kernel, call, world, defaults
+    return kernel, call, operations, defaults
 
 
 def test_frozen_development_body_reaches_cli_and_repair_selects_only_its_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "personal"))
-    kernel, call, world, defaults = frozen_call(tmp_path)
+    kernel, call, operations, defaults = frozen_call(tmp_path)
     defaults.path.write_text("{malformed current settings must not be read")
     personal = personal_method_directory("en")
     personal.mkdir(parents=True)
@@ -67,7 +70,7 @@ print(json.dumps({{'type': 'thread.started', 'thread_id': 'prompt-thread'}}), fl
                            environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
                            hidden_paths=(), authorize_source=lambda: None, timeout=5)
     assert result is not None and result.raw == b"" and result.returncode == 0
-    repair = kernel.advance(call.subject, call.execution, world).call
+    repair = operations.once().call
     assert repair is not None and repair.mode == "output-repair"
     repaired_prompt = render_role_prompt(repair)
     assert repair.context["contract_error"] in repaired_prompt
@@ -80,8 +83,12 @@ print(json.dumps({{'type': 'thread.started', 'thread_id': 'prompt-thread'}}), fl
 def test_call_without_frozen_resources_is_rejected_before_dispatch(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket", DeliveryKind.TICKET, 2, "ticket", base, "source", "target")
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", RunSpec("run", "example/repository", 1, "parent", "graph", (delivery,)))
-    call = kernel.advance("ticket", kernel.claim_executor("owner"), World("parent", "graph", "ticket", base)).call
+    kernel, ports = native_agent_fixture(tmp_path / "kernel.sqlite3", RunSpec("run", "example/repository", 1, "parent", "graph", (delivery,)))
+    call = CoreOperations(kernel, kernel.claim_executor("owner"), lambda binding: ports).once().call
+    # Missing resources is a renderer input contract, not authorization to run
+    # an unconfigured Core. Exercise it on the immutable call before dispatch.
+    assert call is not None
+    call = replace(call, context={key: value for key, value in call.context.items() if key != "_prompt_resources"})
     assert call is not None
     with pytest.raises(KernelError, match="prompt_resources_unavailable"):
         render_role_prompt(call)
@@ -124,15 +131,15 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
     resources = builtin_resources("en")
     resources["methods/repair"] = "Frozen full repair method\n" + resources["methods/repair"]
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
-    scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec)
+    scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("prompt-owner")
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = None
     reviewed = False
     for _ in range(30):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is None:
             assert step.kind in {"effect", "progress"}, step
-            scenario.handle(step)
             continue
         call = step.call
         if call.role == Role.REVIEW:
@@ -161,21 +168,21 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
 
 
 def test_human_continuation_renders_only_the_latest_original_response(tmp_path: Path) -> None:
-    kernel, first, world, _ = frozen_call(tmp_path)
+    kernel, first, operations, _ = frozen_call(tmp_path)
     blocker = b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Provide the external decision."]}'
     run_prompt_call(kernel, first, tmp_path, blocker)
-    assert kernel.advance(first.subject, first.execution, world).reason == "human_blocker"
+    assert operations.once().reason == "human_blocker"
     first_response = "Previous human decision.\r\n"
     kernel.control("resume", "human-one", subject=first.subject, message=first_response)
-    second = kernel.advance(first.subject, first.execution, world).call
+    second = operations.once().call
     assert second is not None and second.context["semantic_continuation"] is True
     second_prompt = run_prompt_call(kernel, second, tmp_path, blocker)
     assert json.dumps(first_response, ensure_ascii=False)[1:-1] in second_prompt
     assert "Frozen development method" not in second_prompt and "Frozen repair method" not in second_prompt
-    assert kernel.advance(first.subject, first.execution, world).reason == "human_blocker"
+    assert operations.once().reason == "human_blocker"
     latest = "Latest human decision: retain exact formatting.\r\n"
     kernel.control("resume", "human-two", subject=first.subject, message=latest)
-    third = kernel.advance(first.subject, first.execution, world).call
+    third = operations.once().call
     assert third is not None and third.attempt_id == first.attempt_id and third.thread_id == first.thread_id
     assert third.context["human_responses"] == [first_response, latest]
     prompt = run_prompt_call(kernel, third, tmp_path,
@@ -191,6 +198,8 @@ def test_human_continuation_renders_only_the_latest_original_response(tmp_path: 
 def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
     tmp_path: Path, kind: DeliveryKind, route: str,
 ) -> None:
+    # The unstarted fixture supplies a creation template only. Final below is
+    # reached through an actual completed Ticket with these frozen inputs.
     scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "none") if route == "ci" else ("none",))
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language="en", profile={"preset": "economy"},
@@ -199,13 +208,17 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
     resources = builtin_resources("en")
     resources["methods/publishing"] = "Frozen publishing method\n" + resources["methods/publishing"]
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
-    scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec)
-    scenario.execution = scenario.kernel.claim_executor("prompt-owner")
+    if kind == DeliveryKind.FINAL_RUN:
+        scenario = final_scenario(tmp_path / 'configured-final', inputs=spec.inputs, language=spec.language)
+    else:
+        scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
+    if kind != DeliveryKind.FINAL_RUN:
+        scenario.execution = scenario.kernel.claim_executor("prompt-owner")
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     for _ in range(80):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
+        step = operations.once()
         if step.call is None:
             assert step.kind in {"effect", "progress"}, step
-            scenario.handle(step)
             continue
         call = step.call
         if call.role == Role.DEVELOPMENT:

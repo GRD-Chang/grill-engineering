@@ -7,6 +7,7 @@ import pytest
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
 from agent_run_kernel.model import EffectResult, Execution, HostLaunch, HostObservation, wire_json
 from agent_run_kernel.offline import Scenario
+from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture, final_scenario
 
 
 def managed(kernel: Kernel, root: Path) -> tuple[HostLaunch, Execution]:
@@ -18,14 +19,25 @@ def managed(kernel: Kernel, root: Path) -> tuple[HostLaunch, Execution]:
     return request, Execution(request.run_id, request.owner, request.epoch)
 
 
-def tickets(root: Path) -> tuple[Kernel, World]:
+def tickets(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
     base = Commit("base", "tree")
     jobs = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "v1", base,
                           f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
-    kernel = Kernel.create(root / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", jobs,
+    kernel, ports = native_agent_fixture(root / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", jobs,
                            Policy(ticket_rounds=1, concurrency=2, development_deadline_seconds=7.0),
                            language="en", repository_root=str(root / "repository")))
-    return kernel, World("parent", "graph", "v1", base)
+    class TicketPorts(ReadOnlyPorts):
+        def delivery(self, request):
+            assert request.source_ref in {item.source_ref for item in jobs}
+            assert request.target_ref == 'refs/heads/run'
+            return self.facts
+
+        def execute(self, effect, authorize):
+            assert effect.operation == 'candidate'
+            authorize()
+            return EffectResult('failure', base, raw={'head': 'base', 'reason': 'candidate_integrity'})
+
+    return kernel, TicketPorts(ports.requirements, ports.source_ref, ports.target_ref, ports.facts)
 
 
 @pytest.mark.parametrize(("kind", "option", "purpose", "limits"), [
@@ -35,8 +47,9 @@ def tickets(root: Path) -> tuple[Kernel, World]:
 def test_parent_checkpoint_freezes_new_limits_without_rewriting_old_invocations(
     tmp_path: Path, kind: DeliveryKind, option: str, purpose: str, limits: tuple[int, int],
 ) -> None:
-    scenario = Scenario(tmp_path / "delivery", kind, reviews=("fail",),
-                        policy=Policy(parent_rounds=1, run_repairs=1, development_deadline_seconds=7.0))
+    factory = final_scenario if kind == DeliveryKind.FINAL_RUN else lambda root, **kwargs: Scenario(root, kind, **kwargs)
+    scenario = factory(tmp_path / "delivery", reviews=("fail",),
+                       policy=Policy(parent_rounds=1, run_repairs=1, development_deadline_seconds=7.0))
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-fixture")
     kernel.confirm_executor_exit(scenario.execution)
@@ -58,37 +71,43 @@ def test_parent_checkpoint_freezes_new_limits_without_rewriting_old_invocations(
     with kernel.storage.transaction(write=False) as tx:
         assert [dict(row) for row in tx.all("SELECT * FROM invocations ORDER BY id")] == old_invocations
         assert dict(tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND window=1", (subject, purpose))) == {**old_budget, "current": 0}
-    call = kernel.advance(subject, scenario.execution, scenario.world()).call
+    call = CoreOperations(kernel, scenario.execution, scenario.make_ports).until(lambda step: step.call is not None).call
     assert call is not None and call.role == "development" and call.deadline_seconds == 13.0
     assert kernel.active_host_action() == "start" and not kernel.dispatch_host(request)
 
 
 def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(tmp_path: Path) -> None:
-    kernel, world = tickets(tmp_path)
+    kernel, ports = tickets(tmp_path)
     request, execution = managed(kernel, tmp_path)
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
     previous = None
-    for _ in range(2):
-        previous = kernel.advance("ticket:2", execution, world).call
-        assert previous is not None
-        kernel.bind_thread(previous, previous.reported_thread or "ticket-two-thread")
-        kernel.receive(previous, b'{"result_kind":"development","summary":"Investigated candidate integrity","human_blockers":null}')
-        assert kernel.advance("ticket:2", execution, world).kind == "progress"
-        effect = kernel.advance("ticket:2", execution, world).effect
-        assert effect is not None and effect.operation == "candidate"
-        assert kernel.dispatch(effect, execution, world)
-        kernel.reconcile(effect, EffectResult("failure", world.target, raw={"head": "base", "reason": "candidate_integrity"}), execution)
-        assert kernel.advance("ticket:2", execution, world).kind == "progress"
-    assert kernel.advance("ticket:2", execution, world).kind == "paused"
+    sibling = None
+    for _ in range(30):
+        step = operations.once()
+        if step.call is not None:
+            if step.call.subject == "ticket:3":
+                assert sibling is None
+                sibling = step.call  # Keep the real FIFO lease; do not run or settle it.
+            else:
+                assert step.call.subject == "ticket:2"
+                previous = step.call
+                kernel.bind_thread(previous, previous.reported_thread or "ticket-two-thread")
+                kernel.receive(previous, b'{"result_kind":"development","summary":"Investigated candidate integrity","human_blockers":null}')
+        if "modification_budget_exhausted" in kernel.status("ticket:2")["gates"]:
+            break
+    else:
+        raise AssertionError("The actual candidate failures did not exhaust Ticket 2")
     assert "modification_budget_exhausted" in kernel.status("ticket:2")["gates"]
-    sibling = kernel.advance("ticket:3", execution, world).call
-    assert sibling is not None and sibling.deadline_seconds == 7.0
+    if sibling is None:
+        sibling = operations.once().call
+    assert sibling is not None and sibling.subject == "ticket:3" and sibling.deadline_seconds == 7.0
     sibling_budget = kernel.status("ticket:3")["budgets"]
     with kernel.storage.transaction(write=False) as tx:
         original_policy = tx.one("SELECT policy FROM runs")[0]
     assert kernel.control_host(request, "resume", "ticket-window", subject="ticket:2", policy_overrides={
         "ticket_review_rounds": 3, "development_deadline": "13s", "development_thread_policy": "new-per-attempt",
     }) == "applied"
-    resumed = kernel.advance("ticket:2", execution, world).call
+    resumed = operations.once().call
     assert resumed is not None and resumed.deadline_seconds == 13.0
     assert previous is not None and resumed.attempt_id != previous.attempt_id and resumed.thread_id != previous.thread_id
     assert kernel.status("ticket:3")["budgets"] == sibling_budget
@@ -103,9 +122,10 @@ def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(t
 
 
 def test_ordinary_resume_cannot_change_policy_or_consume_its_action(tmp_path: Path) -> None:
-    kernel, world = tickets(tmp_path)
+    kernel, ports = tickets(tmp_path)
     request, execution = managed(kernel, tmp_path)
-    call = kernel.advance("ticket:2", execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    call = operations.once().call
     assert call is not None and kernel.dispatch_agent(call)
     kernel.agent_unavailable(call, "worker_preparation_failed", "No child process was created")
     before = kernel.status("ticket:2")
@@ -115,18 +135,19 @@ def test_ordinary_resume_cannot_change_policy_or_consume_its_action(tmp_path: Pa
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM actions WHERE id='ordinary'")
     assert kernel.control_host(request, "resume", "ordinary", subject="ticket:2", message="Fixed the worker setup") == "applied"
-    continued = kernel.advance("ticket:2", execution, world).call
+    continued = operations.once().call
     assert continued is not None and continued.attempt_id == call.attempt_id and continued.deadline_seconds == 7.0
 
 
 def test_whole_run_resume_forwards_feedback_only_to_the_stopped_work(tmp_path: Path) -> None:
-    kernel, world = tickets(tmp_path)
+    kernel, ports = tickets(tmp_path)
     execution = kernel.claim_executor("original-executor")
-    blocked = kernel.advance("ticket:2", execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    blocked = operations.once().call
     assert blocked is not None
     kernel.receive(blocked, wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": ["An independent product decision"]}))
-    assert kernel.advance("ticket:2", execution, world).kind == "paused"
-    first = kernel.advance("ticket:3", execution, world).call
+    assert operations.once(agent_capacity=0).kind == "paused"
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "original-thread")
     process = {"pid": 23, "start_token": "original-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
@@ -141,8 +162,10 @@ def test_whole_run_resume_forwards_feedback_only_to_the_stopped_work(tmp_path: P
     assert kernel.observe_host(request, HostObservation("running", request.unit_name, "resumed", "/host", "boot", 42, "start",
                                                        usage_ready=True)) == "running"
     resumed_execution = Execution(request.run_id, request.owner, request.epoch)
-    assert kernel.advance("ticket:2", resumed_execution, world).kind == "paused"
-    resumed = kernel.advance("ticket:3", resumed_execution, world).call
+    operations = CoreOperations(kernel, resumed_execution, lambda binding: ports)
+    assert kernel.status("ticket:2")["pending_attempt"] == blocked.attempt_id
+    assert kernel.status("ticket:2")["gates"]
+    resumed = operations.once().call
     assert resumed is not None and resumed.attempt_id == first.attempt_id
     assert resumed.thread_id != first.thread_id and resumed.context["human_responses"] == [message]
     assert resumed.context["semantic_continuation"] is True and resumed.deadline_seconds == 7.0
@@ -153,14 +176,15 @@ def test_whole_run_resume_forwards_feedback_only_to_the_stopped_work(tmp_path: P
 
 
 def test_local_human_resume_cannot_take_pending_whole_run_feedback(tmp_path: Path) -> None:
-    kernel, world = tickets(tmp_path)
+    kernel, ports = tickets(tmp_path)
     execution = kernel.claim_executor("original-executor")
-    blocked = kernel.advance("ticket:2", execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    blocked = operations.once().call
     assert blocked is not None
     kernel.receive(blocked, wire_json({"result_kind": "human_blocker", "summary": None,
                                       "human_blockers": ["An independent product decision"]}))
-    assert kernel.advance("ticket:2", execution, world).kind == "paused"
-    first = kernel.advance("ticket:3", execution, world).call
+    assert operations.once(agent_capacity=0).kind == "paused"
+    first = operations.once().call
     assert first is not None
     kernel.control("stop", "whole-stop")
     kernel.confirm_executor_exit(execution, (first.invocation_id,))
@@ -171,19 +195,24 @@ def test_local_human_resume_cannot_take_pending_whole_run_feedback(tmp_path: Pat
     assert kernel.observe_host(request, HostObservation("running", request.unit_name, "resumed", "/host", "boot",
                                                        42, "start", usage_ready=True)) == "running"
     resumed_execution = Execution(request.run_id, request.owner, request.epoch)
+    operations = CoreOperations(kernel, resumed_execution, lambda binding: ports)
     assert kernel.control_host(request, "resume", "local-response", subject="ticket:2",
                                message="Independent product decision is now settled") == "applied"
-    local = kernel.advance("ticket:2", resumed_execution, world).call
+    allocated = [operations.once().call, operations.once().call]
+    assert all(call is not None for call in allocated)
+    by_subject = {call.subject: call for call in allocated}
+    assert set(by_subject) == {"ticket:2", "ticket:3"}
+    local = by_subject["ticket:2"]
     assert local is not None and local.attempt_id == blocked.attempt_id
     assert local.thread_id == blocked.thread_id
     assert local.context["human_responses"] == ["Independent product decision is now settled"]
-    stopped = kernel.advance("ticket:3", resumed_execution, world).call
+    stopped = by_subject["ticket:3"]
     assert stopped is not None and stopped.context["human_responses"] == ["Continue the stopped work"]
     assert stopped.attempt_id == first.attempt_id and stopped.thread_id != first.thread_id
 
 
 def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "delivery", DeliveryKind.FINAL_RUN, reviews=("fail", "pass"),
+    scenario = final_scenario(tmp_path / "delivery", reviews=("fail", "pass"),
                         policy=Policy(run_repairs=2))
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-fixture")
@@ -209,7 +238,7 @@ def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(t
     assert current["pr_number"] == old_pr.number and current["generation"] == before["generation"]
     budget = current["budgets"]["integration"]
     assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (old_budget["window"] + 1, 0, 0)
-    call = kernel.advance(subject, scenario.execution, scenario.world()).call
+    call = CoreOperations(kernel, scenario.execution, scenario.make_ports).until(lambda step: step.call is not None).call
     assert call is not None and call.role == "development"
     assert call.context["repair_source"] == "human_revision" and call.context["human_feedback"] == feedback
     kernel.receive(call, scenario.agent(call))
@@ -223,9 +252,10 @@ def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(t
 
 
 def test_two_accepted_whole_run_responses_reach_the_original_work_in_order(tmp_path: Path) -> None:
-    kernel, world = tickets(tmp_path)
+    kernel, ports = tickets(tmp_path)
     request, execution = managed(kernel, tmp_path)
-    first = kernel.advance("ticket:2", execution, world).call
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    first = operations.once().call
     assert first is not None
     for number in (1, 2):
         assert kernel.control_host(request, "stop", f"stop-{number}") == "applied"
@@ -242,7 +272,7 @@ def test_two_accepted_whole_run_responses_reach_the_original_work_in_order(tmp_p
                                  environment_carrier=tmp_path / "carrier", preflight=lambda: None,
                                  message="Accepted response 2\r\n")
     assert repeated == request and not kernel.dispatch_host(repeated)
-    resumed = kernel.advance("ticket:2", Execution(request.run_id, request.owner, request.epoch), world).call
+    resumed = CoreOperations(kernel, Execution(request.run_id, request.owner, request.epoch), lambda binding: ports).once().call
     assert resumed is not None and resumed.attempt_id == first.attempt_id
     assert resumed.context["human_responses"] == ["Accepted response 1\r\n", "Accepted response 2\r\n"]
     assert resumed.thread_id != first.thread_id

@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
 from agent_run_kernel.offline import Scenario
+from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
 
 
 @pytest.mark.parametrize(("kind", "expected"), [(DeliveryKind.TICKET, 1), (DeliveryKind.PARENT_ONLY, 2), (DeliveryKind.FINAL_RUN, 2)])
@@ -22,11 +23,12 @@ def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: 
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
     policy = Policy(development_deadline_seconds=7.0, review_deadline_seconds=11.0, publication_deadline_seconds=13.0)
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    call = kernel.advance(delivery.key, executor, World("parent", "graph", "requirements", base)).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    call = operations.once().call
     assert call is not None and call.deadline_seconds == 7.0 and call.deadline_at == 107.25
     with pytest.raises(KernelError, match="invocation_binding"):
         kernel.dispatch_agent(replace(call, deadline_at=108.25))
@@ -40,9 +42,9 @@ def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: 
 def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "parent", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            language="en", repository_root=str(tmp_path)))
-    call = kernel.advance(delivery.key, kernel.claim_executor("executor"), World("parent", "graph", "parent", base)).call
+    call = CoreOperations(kernel, kernel.claim_executor("executor"), lambda binding: ports).once().call
     assert call is not None
     assert call.context.get("language") == "en"
     assert call.context.get("repository_root") == str(tmp_path)
@@ -89,21 +91,29 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
 
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN, policy=Policy(resync_limit=0))
+    scenario = final_scenario(tmp_path / "scenario", policy=Policy(resync_limit=0))
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    execute = scenario.port.execute
+    appended = []
+
+    def append_after_integration(effect, authorize=None):
+        result = execute(effect, authorize)
+        if effect.operation == "integrate" and not appended:
+            appended.append(scenario.port.external_remote_append(scenario.delivery.source_ref,
+                {"foreign-source.txt": "Source work\n"}, "open-source"))
+            scenario.port.external_remote_append(scenario.delivery.target_ref,
+                {"foreign-target.txt": "Target work\n"}, "open-target")
+        return result
+
+    scenario.port.execute = append_after_integration
     for _ in range(50):
-        step = scenario.kernel.advance(scenario.delivery.key, scenario.execution, scenario.world())
-        if step.effect is not None and step.effect.operation == "integrate":
+        step = operations.once()
+        assert step.call is None, step
+        if appended:
             break
-        scenario.handle(step)
     else:
         raise AssertionError("Integration was not reached")
-    effect = step.effect
-    assert effect is not None
-    assert scenario.kernel.dispatch(effect, scenario.execution, scenario.world())
-    scenario.port.execute(effect, lambda: scenario.kernel.guard_effect(effect, scenario.execution, scenario.world()))
-    source = scenario.port.external_remote_append(scenario.delivery.source_ref, {"foreign-source.txt": "Source work\n"}, "open-source")
-    scenario.port.external_remote_append(scenario.delivery.target_ref, {"foreign-target.txt": "Target work\n"}, "open-target")
-    scenario.kernel.reconcile(effect, scenario.port.reconcile(effect), scenario.execution, scenario.world())
+    source = appended[0]
     opened = scenario.kernel.status(scenario.delivery.key)["resync"]
     assert (opened["used"], opened["window"], opened["open"]) == (0, 1, True)
     assert scenario.run().kind == "approval"
@@ -120,13 +130,13 @@ def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_pa
 def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path: Path, invalid_output: bytes) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            Policy(development_deadline_seconds=7.0)))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    world = World("parent", "graph", "requirements", base)
-    first = kernel.advance(delivery.key, executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
@@ -134,7 +144,7 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
     kernel.receive(first, invalid_output)
     kernel.agent_exited(first, process, 0)
     now[0] = 102.5
-    repair_step = kernel.advance(delivery.key, executor, world)
+    repair_step = operations.once()
     assert repair_step.kind == "agent"
     repair = repair_step.call
     assert repair is not None and repair.mode == "output-repair"
@@ -148,7 +158,7 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
     kernel.agent_started(repair, next_process)
     kernel.receive(repair, b'{"result_kind":"development","summary":"Valid result","human_blockers":null}')
     kernel.agent_exited(repair, next_process, 0)
-    assert kernel.advance(delivery.key, executor, world).kind == "progress"
+    assert operations.once().kind == "progress"
     assert kernel.status(delivery.key)["phase"] == "candidate"
     returned = [event for event in kernel.history(delivery.key) if event["kind"] == "raw_returned"]
     assert len(returned) == 2 and returned[0]["material_id"] != returned[1]["material_id"]
@@ -158,20 +168,20 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
 def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            Policy(development_deadline_seconds=7.0)))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    world = World("parent", "graph", "requirements", base)
-    first = kernel.advance(delivery.key, executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
     now[0] = 102.5
     kernel.agent_exited(first, process, 1)
-    step = kernel.advance(delivery.key, executor, world)
+    step = operations.once()
     assert step.kind == "agent"
     second = step.call
     assert second is not None and second.invocation_id != first.invocation_id
@@ -181,29 +191,29 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     next_process = {**process, "pid": 24, "pgid": 24, "start_token": "second-start"}
     kernel.agent_started(second, next_process)
     kernel.agent_exited(second, next_process, 1)
-    assert kernel.advance(delivery.key, executor, world).kind == "paused"
+    assert operations.once().kind == "paused"
     kernel.control("resume", "manual-thread-replacement", subject=delivery.key, new_thread=True)
-    third = kernel.advance(delivery.key, executor, world).call
+    third = operations.once().call
     assert third is not None and third.attempt_id == first.attempt_id and third.thread_id != first.thread_id
     assert kernel.dispatch_agent(third)
     kernel.bind_thread(third, "replacement-backend-thread")
     third_process = {**process, "pid": 25, "pgid": 25, "start_token": "third-start"}
     kernel.agent_started(third, third_process)
     kernel.agent_exited(third, third_process, 1)
-    assert kernel.advance(delivery.key, executor, world).kind == "paused"
+    assert operations.once().kind == "paused"
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
 
 
 def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_step(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            Policy(development_deadline_seconds=7.0)))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    world = World("parent", "graph", "requirements", base)
-    first = kernel.advance(delivery.key, executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, "original-backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
@@ -211,11 +221,11 @@ def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_
     kernel.receive(first, b"invalid structured output")
     kernel.agent_exited(first, process, 0)
     now[0] = 108.0
-    assert kernel.advance(delivery.key, executor, world).kind == "paused"
+    assert operations.once().kind == "paused"
     assert kernel.status(delivery.key)["gates"] == ["execution_failed"]
     kernel.control("resume", "manual-format-continuation", subject=delivery.key)
     now[0] = 200.25
-    resumed = kernel.advance(delivery.key, executor, world)
+    resumed = operations.once()
     assert resumed.kind == "agent"
     repair = resumed.call
     assert repair is not None and repair.invocation_id != first.invocation_id
@@ -229,7 +239,7 @@ def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_
     kernel.agent_started(repair, next_process)
     kernel.receive(repair, b'{"result_kind":"development","summary":"Recovered original result","human_blockers":null}')
     kernel.agent_exited(repair, next_process, 0)
-    assert kernel.advance(delivery.key, executor, world).kind == "progress"
+    assert operations.once().kind == "progress"
     assert kernel.status(delivery.key)["phase"] == "candidate"
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
     with kernel.storage.transaction(write=False) as tx:
@@ -240,17 +250,17 @@ def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_
 def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            Policy(development_deadline_seconds=7.0)))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    world = World("parent", "graph", "requirements", base)
-    call = kernel.advance(delivery.key, executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    call = operations.once().call
     assert call is not None
     now[0] = 107.25
-    assert kernel.advance(delivery.key, executor, world).kind == "paused"
-    assert kernel.scheduling()["active"] == []
+    assert operations.once().kind == "paused"
+    assert operations.runner.state().active == ()
     assert kernel.dispatch_agent(call) is False
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
 
@@ -258,13 +268,13 @@ def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: 
 def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp_path: Path) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("ticket:3", DeliveryKind.TICKET, 3, "requirements", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
+    kernel, ports = native_agent_fixture(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,),
                            Policy(development_deadline_seconds=7.0)))
     now = [100.25]
     kernel.clock = lambda: now[0]
     executor = kernel.claim_executor("executor")
-    world = World("parent", "graph", "requirements", base)
-    call = kernel.advance(delivery.key, executor, world).call
+    operations = CoreOperations(kernel, executor, lambda binding: ports)
+    call = operations.once().call
     assert call is not None and kernel.dispatch_agent(call)
     kernel.bind_thread(call, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
@@ -272,10 +282,10 @@ def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp
     now[0] = 101.5
     kernel.agent_exited(call, process, 1, failure="machine:server_overloaded", failure_kind="capacity")
     now[0] = 131.499
-    assert kernel.advance(delivery.key, executor, world).kind == "waiting"
-    assert kernel.scheduling()["active"] == []
+    assert operations.once().kind == "waiting"
+    assert operations.runner.state().active == ()
     now[0] = 131.5
-    recovered = kernel.advance(delivery.key, executor, world).call
+    recovered = operations.once().call
     assert recovered is not None and recovered.invocation_id != call.invocation_id
     assert recovered.thread_id == call.thread_id and recovered.deadline_at == 138.5
     assert kernel.dispatch_agent(recovered)
@@ -283,6 +293,8 @@ def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp
     kernel.agent_started(recovered, second_process)
     kernel.agent_exited(recovered, second_process, 1, failure="machine:server_overloaded", failure_kind="capacity")
     now[0] = 161.5
-    assert kernel.advance(delivery.key, executor, replace(world, revision="changed-requirements")).kind == "paused"
-    assert kernel.scheduling()["active"] == []
+    ports.requirements = replace(ports.requirements, issues=tuple(
+        replace(issue, body="Changed requirement") for issue in ports.requirements.issues))
+    assert operations.once().kind == "paused"
+    assert operations.runner.state().active == ()
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1

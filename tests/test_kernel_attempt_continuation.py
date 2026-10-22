@@ -5,26 +5,41 @@ from dataclasses import replace
 import json
 
 import pytest
-from agent_run_kernel import Commit, Kernel, KernelError, World
+from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError
 from agent_run_kernel.attempt_continuation import (
     AttemptContinuationBasis, ContinuationOpening, bind_attempt_continuation, load_continuation,
 )
 from agent_run_kernel.model import wire_json
+from agent_run_kernel.model import Issue, ParentIssue, Requirements
+from agent_run_kernel.offline import GraphScenario, fixture_inputs
+from support.core_operations import CoreOperations, ReadOnlyPorts
+from agent_run_kernel.operation_runner import DeliveryFacts
 from test_kernel_exploration import ticket_spec
 
 
 def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_path: Path) -> None:
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", ticket_spec())
-    execution = kernel.claim_executor("executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    first = kernel.advance("ticket:2", execution, world).call
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)), (
+        Issue(2, "Ticket", "Implement the original requirement", "OPEN", frozenset({"ready-for-agent"})),
+    ))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    first = operations.until(lambda step: step.call is not None).call
     assert first is not None
+    assert first.subject == "ticket:2" and first.role == "development"
+    assert kernel.dispatch_agent(first)
+    operations.runner.authorize_agent(first)
     kernel.bind_thread(first, "backend-first")
+    process = {"pid": 23, "pgid": 23, "start_token": "first", "host_pid": 11, "host_start_token": "host"}
+    kernel.agent_started(first, process)
     kernel.receive(first, wire_json({"result_kind": "human_blocker", "summary": None,
         "human_blockers": ["Choose the original formatting."]}))
-    assert kernel.advance("ticket:2", execution, world).reason == "human_blocker"
+    assert not operations.runner.worker_settled(first)
+    kernel.agent_exited(first, process, 0)
+    assert operations.runner.worker_settled(first)
+    assert operations.once().reason == "human_blocker"
     kernel.control("resume", "answer", subject="ticket:2", message="Keep it.\r\n", new_thread=True)
-    second = kernel.advance("ticket:2", execution, world).call
+    second = operations.until(lambda step: step.call is not None).call
     assert second is not None and second.attempt_id == first.attempt_id
     with kernel.storage.transaction(write=False) as tx:
         facts = load_continuation(tx, first.attempt_id)
@@ -38,6 +53,25 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
+def _native_spec(root: Path):
+    """Explicit creation inputs and source facts, with no physical write adapter."""
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)), (
+        Issue(2, "Ticket", "Implement original requirement", "OPEN", frozenset({"ready-for-agent"})),
+    ))
+    spec = ticket_spec()
+    final = Delivery('final:1', DeliveryKind.FINAL_RUN, 1, 'unread', spec.deliveries[0].base,
+                     'refs/heads/run', 'refs/heads/main')
+    spec = replace(spec, language='zh', repository_root=str(root.resolve()), inputs=fixture_inputs(),
+                   deliveries=(*spec.deliveries, final))
+    return spec, source
+
+
+def _read_operations(kernel, execution, source):
+    ports = ReadOnlyPorts(source, 'refs/heads/ticket-2', 'refs/heads/run',
+                          DeliveryFacts(Commit('base', 'base-tree'), None))
+    return CoreOperations(kernel, execution, lambda binding: ports)
+
+
 def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: bool = False,
                         failure_kind: str = 'ordinary', exit_proven: bool = True, return_body: bytes | None = None):
     """Install actual native-produced facts in an empty unpublished Core DB.
@@ -45,13 +79,13 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
     Only immutable materials and semantic identity cross the seam. No source
     Invocation, lease, action, gate, or prepared database is manufactured.
     """
-    spec = ticket_spec()
+    spec, requirements = _native_spec(tmp_path)
     spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
-    source = Kernel.create(tmp_path / "source.sqlite3", spec)
+    source = Kernel.create(tmp_path / "source.sqlite3", spec, requirements=requirements)
     source.clock = lambda: 100.0
     owner = source.claim_executor("source-executor")
-    world = World("parent-v1", "graph-v1", "ticket-v1", Commit("base", "base-tree"))
-    call = source.advance("ticket:2", owner, world).call
+    source_operations = _read_operations(source, owner, requirements)
+    call = source_operations.once().call
     assert call is not None
     source.bind_thread(call, "retained-backend")
     for index in range(2 if ordinary_used else 1):
@@ -65,7 +99,7 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
         if exit_proven:
             source.agent_exited(call, process, 0 if body is not None else 1, failure_kind=failure_kind)
         if index == 0 and ordinary_used:
-            call = source.advance("ticket:2", owner, world).call
+            call = source_operations.once().call
             assert call is not None
     with source.storage.transaction(write=False) as tx:
         attempt = dict(tx.one("SELECT * FROM attempts WHERE id=?", (call.attempt_id,)))
@@ -73,7 +107,7 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
         materials = [dict(row) for row in tx.all("SELECT * FROM material")]
         facts = load_continuation(tx, call.attempt_id)
         budget = tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject='ticket:2' AND purpose='requirements'")
-    target = Kernel.create(tmp_path / "target.sqlite3", spec)
+    target = Kernel.create(tmp_path / "target.sqlite3", spec, requirements=requirements)
     target.clock = lambda: 100.0
     with target.storage.transaction() as tx:
         for material in materials:
@@ -97,27 +131,35 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
         basis = AttemptContinuationBasis(call.thread_id, attempt['context_id'], opening)
         bind_attempt_continuation(tx, call.attempt_id, basis)
         bind_attempt_continuation(tx, call.attempt_id, basis)  # Exact retry is idempotent.
-    return target, target.claim_executor('target-executor'), world, call.attempt_id
+    execution = target.claim_executor('target-executor')
+    return target, execution, _read_operations(target, execution, requirements), call.attempt_id
 
 
 @pytest.mark.parametrize('has_raw', [False, True])
 def test_opening_with_unproven_exit_cannot_consume_or_dispatch(tmp_path: Path, has_raw: bool) -> None:
     raw = wire_json({'result_kind': 'development', 'summary': 'Durable before exit.', 'human_blockers': None}) if has_raw else None
-    kernel, execution, world, _ = _canonical_boundary(tmp_path, exit_proven=False, return_body=raw)
-    step = kernel.advance('ticket:2', execution, world)
-    assert (step.kind, step.reason, step.call, step.effect) == ('waiting', 'previous_invocation_exit', None, None)
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, exit_proven=False, return_body=raw)
+    step = operations.once()
+    # The shared selector already sees the Opening exit barrier; it need not
+    # enter a private subject transition to rediscover the same waiting reason.
+    assert (step.kind, step.call, step.effect) == ('waiting', None, None)
+    state = operations.runner.state()
+    assert (state.disposition, state.active, state.wake_at) == ('waiting', (), None)
     assert kernel.status('ticket:2')['phase'] == 'development'
     assert kernel.status('ticket:2')['pending_return'] is has_raw
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        prior = load_continuation(tx, attempt_id).prior
+        assert prior is not None and prior.dispatch_state == 'unknown'
+        assert (prior.raw_id is not None) is has_raw
 
 
 def test_first_native_explicit_continuation_does_not_refund_opening_recovery(tmp_path: Path) -> None:
-    kernel, execution, world, attempt_id = _canonical_boundary(tmp_path, ordinary_used=True)
-    assert kernel.advance('ticket:2', execution, world).reason == 'execution_recovery_unavailable'
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, ordinary_used=True)
+    assert operations.once().reason == 'execution_recovery_unavailable'
     kernel.control('resume', 'continue-exact-attempt', subject='ticket:2')
-    call = kernel.advance('ticket:2', execution, world).call
+    call = operations.once().call
     assert call is not None and call.attempt_id == attempt_id and call.mode == 'resume'
     with kernel.storage.transaction(write=False) as tx:
         invocation = tx.one('SELECT * FROM invocations')
@@ -128,21 +170,23 @@ def test_first_native_explicit_continuation_does_not_refund_opening_recovery(tmp
 
 
 def test_first_native_capacity_continuation_preserves_existing_not_before(tmp_path: Path) -> None:
-    kernel, execution, world, attempt_id = _canonical_boundary(tmp_path, failure_kind='capacity')
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, failure_kind='capacity')
     kernel.clock = lambda: 129.0
-    assert kernel.advance('ticket:2', execution, world).reason == 'capacity_recovery_wait'
+    waiting = operations.once()
+    assert (waiting.kind, waiting.retry_at, waiting.call, waiting.effect) == ('waiting', 130.0, None, None)
+    assert operations.runner.state().wake_at == 130.0
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
     kernel.clock = lambda: 130.0
-    call = kernel.advance('ticket:2', execution, world).call
+    call = operations.once().call
     assert call is not None and call.attempt_id == attempt_id and call.deadline_at == 137.0
     with kernel.storage.transaction(write=False) as tx:
         assert load_continuation(tx, attempt_id).capacity_count == 1
 
 
 def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_path: Path) -> None:
-    kernel, execution, world, attempt_id = _canonical_boundary(tmp_path, malformed=True)
-    first = kernel.advance('ticket:2', execution, world).call
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, malformed=True)
+    first = operations.once().call
     assert first is not None
     assert kernel.dispatch_agent(first)
     process = {'pid': 80, 'pgid': 80, 'start_token': 'format-start', 'host_pid': 11, 'host_start_token': 'host-start'}
@@ -154,7 +198,7 @@ def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_pat
     kernel.control('resume', 'resume-executor')
     replacement = kernel.claim_executor('replacement-executor')
     kernel.clock = lambda: 106.0
-    call = kernel.advance('ticket:2', replacement, world).call
+    call = CoreOperations(kernel, replacement, lambda binding: operations.runner.ports).once().call
     assert call is not None and call.attempt_id == attempt_id
     assert call.invocation_id != first.invocation_id
     assert call.deadline_at == 107.0 and call.output_ordinal == 2
@@ -162,14 +206,14 @@ def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_pat
 
 
 def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(tmp_path: Path) -> None:
-    spec = ticket_spec()
+    spec, requirements = _native_spec(tmp_path)
     spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
-    kernel = Kernel.create(tmp_path / 'native.sqlite3', spec)
+    kernel = Kernel.create(tmp_path / 'native.sqlite3', spec, requirements=requirements)
     now = [100.0]
     kernel.clock = lambda: now[0]
     execution = kernel.claim_executor('executor')
-    world = World('parent-v1', 'graph-v1', 'ticket-v1', Commit('base', 'base-tree'))
-    first = kernel.advance('ticket:2', execution, world).call
+    operations = _read_operations(kernel, execution, requirements)
+    first = operations.once().call
     assert first is not None and kernel.dispatch_agent(first)
     kernel.bind_thread(first, 'original-backend')
     process = {'pid': 90, 'pgid': 90, 'start_token': 'original-start', 'host_pid': 11, 'host_start_token': 'host-start'}
@@ -179,7 +223,7 @@ def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(
     kernel.control('stop', 'local-stop', subject='ticket:2')
     kernel.control('resume', 'local-new-thread', subject='ticket:2', new_thread=True)
     now[0] = 106.0
-    call = kernel.advance('ticket:2', execution, world).call
+    call = operations.once().call
     assert call is not None and call.thread_id != first.thread_id
     assert kernel.dispatch_agent(call)
     assert call.invocation_id != first.invocation_id and call.attempt_id == first.attempt_id
@@ -190,24 +234,28 @@ def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(
         current = tx.one('SELECT thread,predecessor,action_id FROM invocations WHERE id=?', (call.invocation_id,))
     assert old['thread'] == first.thread_id and old['status'] == 'returned'
     assert tuple(current) == (call.thread_id, first.invocation_id, 'local-new-thread')
-    assert kernel.advance('ticket:2', execution, world).reason == 'agent_running'
+    waiting = operations.once()
+    # Global selection waits on the durable lease rather than advancing this
+    # selected subject merely to rediscover its private agent_running reason.
+    assert (waiting.kind, waiting.call, waiting.effect) == ('waiting', None, None)
+    assert operations.runner.state().active == (call.lease_id,)
     kernel.bind_thread(call, 'replacement-backend')
     next_process = {**process, 'pid': 91, 'pgid': 91, 'start_token': 'replacement-start'}
     kernel.agent_started(call, next_process)
     kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Retained output.', 'human_blockers': None}))
     kernel.agent_exited(call, next_process, 0)
-    assert kernel.advance('ticket:2', execution, world).kind == 'progress'
+    assert operations.once().kind == 'progress'
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
 
 
 @pytest.mark.parametrize('expired', [False, True])
 def test_first_native_format_step_keeps_its_period_unless_explicitly_resumed(tmp_path: Path, expired: bool) -> None:
-    kernel, execution, world, attempt_id = _canonical_boundary(tmp_path, malformed=True)
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, malformed=True)
     kernel.clock = lambda: 108.0 if expired else 106.0
     if expired:
-        assert kernel.advance('ticket:2', execution, world).reason == 'invocation_deadline_exceeded'
+        assert operations.once().reason == 'invocation_deadline_exceeded'
         kernel.control('resume', 'new-physical-period', subject='ticket:2')
-    call = kernel.advance('ticket:2', execution, world).call
+    call = operations.once().call
     assert call is not None and call.attempt_id == attempt_id
     assert call.output_ordinal == 1 and call.mode == 'output-repair'
     assert call.deadline_at == (115.0 if expired else 107.0)
@@ -217,9 +265,9 @@ def test_first_native_format_step_keeps_its_period_unless_explicitly_resumed(tmp
 
 
 def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_raw(tmp_path: Path) -> None:
-    kernel, execution, world, attempt_id = _canonical_boundary(tmp_path)
+    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        steps = list(pool.map(lambda _: kernel.advance('ticket:2', execution, world), range(2)))
+        steps = list(pool.map(lambda _: operations.once(), range(2)))
     calls = [step.call for step in steps if step.kind == 'agent']
     assert len(calls) == 1 and calls[0] is not None
     call = calls[0]
@@ -229,7 +277,9 @@ def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_
         assert tx.one('SELECT count(*) FROM leases')[0] == 1
     kernel.control('stop', 'stop-new-native')
     kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Durable late result.', 'human_blockers': None}))
-    with pytest.raises(KernelError, match='executor_fenced'):
-        kernel.advance('ticket:2', execution, world)
+    before = kernel.status('ticket:2')
+    stopped = operations.once()
+    assert (stopped.kind, stopped.reason, stopped.call, stopped.effect) == ('paused', 'executor_fenced', None, None)
+    assert kernel.status('ticket:2') == before
     assert kernel.status('ticket:2')['pending_return'] is True
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
