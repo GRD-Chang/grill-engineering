@@ -132,8 +132,8 @@ def host_exit_current(database: Path, notice: Mapping[str, Any]) -> bool:
                                   systemd_run="systemd-run", environment=os.environ)
             if not manager.exit_identity(request, notice["invocation_id"]):
                 return False
-        scheduling = kernel.scheduling()
-        return not (not scheduling["active"] and scheduling["disposition"] in {"complete", "quiescent"})
+        state = kernel.operation_state()
+        return not (not state.active and state.disposition in {"complete", "quiescent"})
     except (KernelError, OSError, ValueError, HostUnavailable, sqlite3.Error) as error:
         raise HostExitUnavailable("Host exit currentness is unavailable") from error
     except (KeyError, TypeError):

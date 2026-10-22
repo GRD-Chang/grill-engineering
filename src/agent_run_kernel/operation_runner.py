@@ -6,17 +6,27 @@ Agent or waits for a workflow/CI to finish. observe is an explicit operational
 read: it accepts fresh Requirements/audit facts but allocates no work, advances
 no phase and grants no write. User status/history queries do not call observe.
 
-This first commit fixes the adapter contract; the concrete Core runner follows.
 No Receipt, persisted cursor, or alternative current Run crosses this seam.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol
+from dataclasses import asdict
+import json
+
+from agent_run.github import GitHubReadError
+from agent_run.error_safety import bounded_error
+
+from .remote_effects import EffectReadError
 
 from .model import (AgentCall, Checks, Commit, CreationInputs, Effect, EffectResult,
-                    PullRequest, Requirements, ResourceInspection, ResourceWitness, Step, World)
+                    Execution, KernelError, PullRequest, ReadWait, Requirements, ResourceInspection,
+                    ResourceWitness, Step, World, wire_json)
+
+if TYPE_CHECKING:
+    from .kernel import Kernel
 
 
 @dataclass(frozen=True)
@@ -71,18 +81,187 @@ class OperationPorts(Protocol):
     def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]: ...
 
 
-class OperationRunner(Protocol):
+class OperationRunner:
     """Factory: kernel.operation_runner(execution, ports).
 
-    Host runs at most one run_once Future in its independent I/O pool. A
+    Build ports with kernel.operation_binding(execution), a read-only frozen
+    configuration call. Host runs at most one run_once Future in its independent I/O pool. A
     bootstrap authorization reads inline in the Agent thread, never queues back
     into a pool it is waiting on. Native raw/exit/thread/activity hooks remain
     their existing exact-call record interfaces.
     """
-    binding: OperationBinding
+    def __init__(self, kernel: Kernel, execution: Execution, ports: OperationPorts) -> None:
+        self.kernel, self.execution, self.ports = kernel, execution, ports
+        self.binding = kernel.operation_binding(execution)
 
-    def run_once(self, *, agent_capacity: int = 1) -> Step: ...
-    def observe(self, subject: str | None) -> World: ...
-    def authorize_agent(self, call: AgentCall) -> None: ...
-    def worker_settled(self, call: AgentCall) -> bool: ...
-    def state(self) -> OperationState: ...
+    def state(self) -> OperationState:
+        return self.kernel.operation_state()
+
+    def observe(self, subject: str | None) -> World:
+        return self._observe(subject)[0]
+
+    def _observe(self, subject: str | None, *, cleanup: bool = False) -> tuple[World, str]:
+        kernel, execution = self.kernel, self.execution
+        token = kernel._begin_automatic_step(execution, subject, cleanup=cleanup)
+        waiting = kernel._guard_automatic_step(token, execution)
+        if waiting is not None:
+            raise ReadWait(waiting)
+        source = self.ports.source(self.binding.parent_number)
+        with kernel.storage.transaction() as tx:
+            kernel._check_operation(tx, token, execution)
+            kernel._refresh(tx, source)
+            token = kernel._operation_token(tx, subject, cleanup)
+            run = tx.one("SELECT * FROM runs")
+            if subject is None:
+                job = tx.one("SELECT * FROM final_target")
+                records = tx.all("SELECT c.* FROM completions c JOIN subjects s ON s.id=c.subject AND s.generation=c.generation WHERE s.phase='complete' ORDER BY s.issue")
+                anchors = {row["merge_sha"] for row in records}
+            else:
+                job = kernel._job(tx, subject)
+                anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
+                for row in tx.rows("SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,)):
+                    anchors.update(value for value in row if value is not None)
+                if job["review_attempt"] is not None:
+                    review = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))
+                    context = json.loads(tx.get(review[0], subject))
+                    if "review_context" in context:
+                        anchors.add(context["review_context"]["full_range"]["candidate_sha"])
+            request = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if subject is not None else None,
+                                   tuple(sorted(anchors)), job["source_sha"] if subject is not None and job["phase"] == "checks" else None,
+                                   subject is not None)
+        facts = self.ports.delivery(request)
+        with kernel.storage.transaction(write=False) as tx:
+            kernel._check_operation(tx, token, execution)
+            run = tx.one("SELECT * FROM runs")
+            revision, completion = run["observed_parent_revision"], "no-tickets"
+            if subject is not None:
+                job = kernel._job(tx, subject)
+                if job["kind"] == "ticket":
+                    revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
+                completion = job["completion_revision"]
+            if facts.pr is not None and facts.pr.state == "OPEN" and (
+                    facts.source != facts.pr.head or facts.target != facts.pr.base
+                    or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
+                raise GitHubReadError("github_observation_pending", "PR, refs and checks have not converged")
+            return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
+                         facts.source, facts.pr, facts.checks, completion, facts.ancestry,
+                         facts.publisher_actor, facts.publisher_identity), token
+
+    def authorize_agent(self, call: AgentCall) -> None:
+        if call.execution != self.execution:
+            raise KernelError("invocation_binding")
+        world, token = self._observe(call.subject)
+        with self.kernel.storage.transaction() as tx:
+            self.kernel._check_operation(tx, token, self.execution)
+            run, job = self.kernel._owned(tx, call.subject, self.execution)
+            if not self.kernel._current(tx, job, run, world):
+                raise KernelError("agent_authority_changed")
+            self.kernel._agent_authority(tx, call)
+
+    def worker_settled(self, call: AgentCall) -> bool:
+        with self.kernel.storage.transaction(write=False) as tx:
+            row = self.kernel._invocation(tx, call)
+            leased = tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+            return not leased and (row["dispatch_state"] == "exited" and row["exit_code"] is not None
+                                   or row["dispatch_state"] == "unavailable" and row["process_identity"] is None and row["start_evidence"] is not None)
+
+    def run_once(self, *, agent_capacity: int = 1) -> Step:
+        kernel, execution = self.kernel, self.execution
+        with kernel.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            kernel._automatic_owned(tx, run, execution)
+            choice = kernel._operation_choice(tx, run, agent_capacity=agent_capacity)
+            if choice is None:
+                state = kernel.operation_state()
+                return Step(state.disposition, "", retry_at=state.wake_at)
+            subject, cleanup = choice
+            token = kernel._operation_token(tx, subject, cleanup)
+        try:
+            if subject is None:
+                world, observed = self._observe(None)
+                if world.source is None or world.target is None:
+                    raise GitHubReadError("final_source_missing", "The original remote Final refs are absent")
+                final = kernel._activate_final(execution, world.source, world.target, ancestry=world.ancestry, token=observed)
+                return kernel._finish_automatic_step(token, execution, Step("progress", final, "final_activated"))
+            step = (kernel._advance_cleanup(subject, execution, token=token) if cleanup else
+                    kernel._advance(subject, execution, allow_agent=bool(agent_capacity), token=token))
+            if step.kind == "observe":
+                subject = step.subject
+                world, observed = self._observe(subject, cleanup=cleanup)
+                step = (kernel._advance_cleanup(subject, execution, world, token=observed) if cleanup else
+                        kernel._advance(subject, execution, world, allow_agent=bool(agent_capacity), token=observed))
+            # Return a freshly allocated AgentCall before any further slow read.
+            if step.call is not None:
+                return step
+            if step.effect is not None:
+                step = self._effect(step)
+            return kernel._finish_automatic_step(token, execution, step)
+        except ReadWait as waiting:
+            return waiting.step
+        except GitHubReadError as error:
+            return kernel._wait_for_read(token, execution, error.code, error.message)
+        except KernelError as error:
+            if error.code not in {"automatic_step_superseded", "automatic_step_paused"}:
+                raise
+            return Step("paused" if error.code == "automatic_step_paused" else "waiting", subject or "", error.code)
+
+    def _effect(self, step: Step) -> Step:
+        kernel, execution, effect = self.kernel, self.execution, step.effect
+        assert effect is not None
+        read_token = kernel._begin_automatic_step(execution, effect.subject)
+        if step.kind == "reconcile":
+            token = kernel._begin_automatic_step(execution, effect.subject)
+            waiting = kernel._guard_automatic_step(token, execution, readback=effect)
+            if waiting is not None:
+                raise ReadWait(waiting)
+            result = self.ports.reconcile(effect)
+        else:
+            if effect.operation == "publication_commit" and not effect.payload.get("reuse_sha") and not effect.payload.get("publication_commit_intent"):
+                proof = self.ports.prepare_publication(effect)
+                effect = kernel.attach_publication_commit(effect, proof, execution, self.observe(effect.subject))
+            if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
+                proof = self.ports.prepare_retirement(effect)
+                effect = kernel.attach_retirement(effect, proof, execution, self.observe(effect.subject))
+            def authorize() -> None:
+                try:
+                    world, token = self._observe(effect.subject)
+                except GitHubReadError as error:
+                    raise ReadWait(kernel._wait_for_read(read_token, execution, error.code, error.message)) from error
+                with kernel.storage.transaction(write=False) as tx:
+                    kernel._check_operation(tx, token, execution)
+                    status = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0]
+                resources = kernel.effect_resources(effect)
+                inspections = None if resources is None else self.ports.inspect(resources)
+                if status == "prepared" and not kernel._dispatch(effect, execution, world, resource_inspections=inspections, token=token):
+                    raise KernelError("operation_cancelled")
+                kernel._guard_effect(effect, execution, world, resource_inspections=inspections, token=token)
+            try:
+                result = self.ports.execute(effect, authorize)
+            except EffectReadError as error:
+                if error.write_returncode != 0:
+                    kernel.observe_effect_failure(effect, {"returncode": error.write_returncode,
+                        "message": bounded_error(error.write_diagnostic)})
+                raise ReadWait(kernel._wait_for_read(read_token, execution, error.code, error.message)) from error
+            except (OSError, GitHubReadError) as error:
+                # A real adapter failure is not proof that the write was absent.
+                # Keep the durable original sent intent for the next readback.
+                with kernel.storage.transaction(write=False) as tx:
+                    sent = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "sent"
+                if not sent:
+                    raise
+                kernel.observe_effect_failure(effect, {"type": type(error).__name__, "message": bounded_error(str(error))})
+                return Step("waiting", effect.subject, "original_write_readback_required")
+            if effect.operation == "issue_link":
+                kernel.acknowledge_link(effect, result)
+                return Step("progress", effect.subject)
+        with kernel.storage.transaction() as tx:
+            row = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
+            if kernel._effect(tx, row, effect.execution) != effect:
+                raise KernelError("effect_binding")
+            evidence = tx.put(effect.subject, "effect_readback", wire_json({"dispatch_serial": effect.dispatch_serial, "result": asdict(result)}))
+            kernel._event(tx, effect.subject, "effect_readback", effect.effect_id, evidence, generation=row["generation"])
+        settled = kernel._reconcile(effect, result, execution)
+        if settled.kind == "observe":
+            world, token = self._observe(effect.subject)
+            settled = kernel._reconcile(effect, result, execution, world, token=token)
+        return settled
