@@ -3,14 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, KernelError
-from agent_run_kernel.model import Execution, HostObservation
-from agent_run_kernel.offline import Scenario
+from agent_run_kernel import DeliveryKind, EffectResult, KernelError, Policy
+from agent_run_kernel.model import Execution, HostObservation, Issue, ObservationSuperseded, ParentIssue, Requirements
+from agent_run_kernel.offline import GraphScenario, Scenario
 from agent_run_kernel.query import read
+from agent_run_kernel.operation_runner import ReadUnavailable
 
 
 def managed_parent(tmp_path):
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    return admit_scenario(Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY), tmp_path)
+
+
+def admit_scenario(scenario, tmp_path):
     kernel = scenario.kernel
     kernel.control("stop", "retire-fixture")
     kernel.confirm_executor_exit(scenario.execution)
@@ -102,3 +106,234 @@ def test_managed_approval_observation_is_finite_and_passive_afterwards(tmp_path,
     assert runner.state().disposition == "quiescent"
     assert scenario.kernel.status(scenario.delivery.key)["budgets"] == before
     assert calls == ["source", "delivery"]
+
+
+
+def sent_workspaces(tmp_path, *, count=2, execute=True):
+    numbers = tuple(range(2, 2 + count))
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", numbers), tuple(
+        Issue(number, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})) for number in numbers))
+    scenario = admit_scenario(GraphScenario(tmp_path / "graph", source, policy=Policy(concurrency=2)), tmp_path)
+    runner = scenario.runner()
+    physical = runner.ports.execute
+    sent = []
+
+    def uncertain(effect, authorize):
+        if effect.operation != "workspace":
+            return physical(effect, authorize)
+        if execute:
+            assert physical(effect, authorize).disposition == "target"
+        else:
+            authorize()  # The request was admitted; its transport has not applied it.
+        sent.append(effect)
+        return EffectResult("unknown")
+
+    runner.ports.execute = uncertain
+    for _ in range(16):
+        step = runner.run_once()
+        assert step.call is None
+        if len(sent) == count:
+            break
+    assert len(sent) == count
+    runner.ports.execute = lambda *a: pytest.fail("observation cannot issue a new write")
+    return scenario, runner, sent
+
+
+@pytest.mark.parametrize("first_result", ["unknown", "third"])
+def test_each_captured_sent_intent_is_read_once_without_starving_the_next(tmp_path, first_result):
+    scenario, runner, sent = sent_workspaces(tmp_path)
+    reconcile = runner.ports.reconcile
+    reads = []
+
+    def physical(effect):
+        reads.append(effect.effect_id)
+        return EffectResult(first_result) if effect.effect_id == sent[0].effect_id else reconcile(effect)
+
+    runner.ports.reconcile = physical
+    runner.activate_observation()
+    assert runner.run_once().kind == "paused"
+    assert runner.state().disposition == "ready"
+    assert runner.run_once().kind == "progress"
+    assert reads == [effect.effect_id for effect in sent]
+    assert runner.state().disposition == "quiescent"
+    runner.activate_observation()
+    assert runner.state().disposition == "quiescent"
+    assert reads == [effect.effect_id for effect in sent]
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT id FROM attempts")
+        assert [row[0] for row in tx.rows("SELECT attempts FROM effects WHERE operation='workspace'")] == [1, 1]
+
+
+@pytest.mark.parametrize("failure", ["read_wait", "cas"])
+def test_first_failed_observation_defers_to_next_and_keeps_original_deadline(tmp_path, failure):
+    scenario, runner, sent = sent_workspaces(tmp_path)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
+    reconcile = runner.ports.reconcile
+    reads = []
+    fail = [True]
+
+    def physical(effect):
+        reads.append(effect.effect_id)
+        if effect.effect_id == sent[0].effect_id and fail[0]:
+            if failure == "cas":
+                scenario.kernel.refresh(lambda: scenario.requirements)
+                raise ObservationSuperseded("automatic_step_superseded")
+            raise ReadUnavailable("synthetic_read_unavailable", "Original read has no response")
+        return reconcile(effect)
+
+    runner.ports.reconcile = physical
+    runner.activate_observation()
+    first = runner.run_once()
+    assert first.kind == "waiting" and first.retry_at == 105.25
+    assert runner.state().disposition == "ready"
+    assert runner.run_once().kind == "progress"
+    assert reads == [sent[0].effect_id, sent[1].effect_id]
+    assert runner.state().disposition == "waiting" and runner.state().wake_at == 105.25
+    now[0] = 105.25
+    again = runner.run_once()
+    assert again.kind == "waiting" and again.retry_at == 115.25
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT started_at,deadline,retry_count FROM waits WHERE subject=?", (sent[0].subject,))) == (100.25, 700.25, 2)
+        assert tx.one("SELECT status FROM effects WHERE id=?", (sent[0].effect_id,))[0] == "sent"
+    fail[0] = False
+    now[0] = 115.25
+    assert runner.run_once().kind == "progress"
+    assert runner.state().disposition == "quiescent"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT subject FROM waits")
+        assert not tx.rows("SELECT id FROM attempts")
+
+
+def test_prior_readback_never_rearms_the_original_write(tmp_path):
+    scenario, runner, sent = sent_workspaces(tmp_path, count=1, execute=False)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
+    runner.activate_observation()
+    assert runner.run_once().kind == "waiting"
+    assert runner.state().disposition == "waiting" and runner.state().wake_at == 105.25
+    runner.activate_observation()
+    assert runner.state().wake_at == 105.25
+    now[0] = 105.25
+    assert runner.run_once().kind == "waiting"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (sent[0].effect_id,))) == ("sent", 1)
+        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
+        assert not tx.rows("SELECT id FROM attempts")
+    assert not scenario.port.writes()
+
+
+def test_stop_cancels_the_pass_without_reading_or_reactivating(tmp_path, monkeypatch):
+    scenario, runner, sent = sent_workspaces(tmp_path)
+    runner.activate_observation()
+    monkeypatch.setattr(runner.ports, "reconcile", lambda *a: pytest.fail("the old executor is fenced"))
+    scenario.kernel.control("stop", "stop-observation")
+    assert runner.state().disposition == "quiescent"
+    assert runner.run_once().reason == "executor_fenced"
+    runner.activate_observation()
+    assert runner.state().disposition == "quiescent"
+
+
+@pytest.mark.parametrize("kind", ["parent", "final"])
+@pytest.mark.parametrize("change", ["unchanged", "source", "target"])
+def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_path, kind, change):
+    if kind == "parent":
+        scenario = managed_parent(tmp_path)
+    else:
+        source = Requirements(ParentIssue(1, "Parent", "Original", (2,)),
+            (Issue(2, "Ticket", "Task", "OPEN", frozenset({"ready-for-agent"})),))
+        scenario = admit_scenario(GraphScenario(tmp_path / "graph", source), tmp_path)
+        assert scenario.run().kind == "complete"
+        activated = scenario.runner().run_once()
+        assert activated.reason == "final_activated"
+        scenario.select(activated.subject)
+    assert scenario.run().kind == "approval"
+    before = scenario.kernel.status(scenario.delivery.key)
+    runner = scenario.runner()
+    runner.activate_observation()
+    if change == "source":
+        from dataclasses import replace
+        scenario.requirements = replace(scenario.requirements, parent=replace(scenario.requirements.parent, body="Changed actual source"))
+    elif change == "target":
+        scenario.port.external_remote_append(scenario.delivery.target_ref, {"target-advance.txt": "new target"}, "external-target")
+    step = runner.run_once()
+    after = scenario.kernel.status(scenario.delivery.key)
+    assert step.call is None
+    if change == "unchanged":
+        assert step.kind == "approval" and after["phase"] == "approval"
+        assert after["budgets"] == before["budgets"]
+        assert runner.state().disposition == "quiescent"
+    elif change == "source":
+        assert after["gates"] or scenario.kernel.source_status()["blocked"] == "final_refresh"
+        assert after["budgets"] == before["budgets"]
+        assert runner.state().disposition == "quiescent"
+    else:
+        assert step.kind == "progress" and after["resync"]["used"] == before["resync"]["used"] + 1
+        assert after["phase"] != "approval"
+
+
+
+def test_observation_timeout_quiesces_without_consuming_or_renewing_the_intent(tmp_path):
+    scenario, runner, sent = sent_workspaces(tmp_path, count=1)
+    now = [100.25]
+    scenario.kernel.clock = lambda: now[0]
+    reads = []
+
+    def unavailable(effect):
+        reads.append(effect.effect_id)
+        raise ReadUnavailable("synthetic_read_unavailable", "Same original outage")
+
+    runner.ports.reconcile = unavailable
+    runner.activate_observation()
+    assert runner.run_once().retry_at == 105.25
+    now[0] = 700.25
+    assert runner.run_once().reason == "supervision_timeout"
+    assert runner.state().disposition == "quiescent"
+    runner.activate_observation()
+    assert runner.state().disposition == "quiescent"
+    assert reads == [sent[0].effect_id]
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (sent[0].effect_id,))) == ("sent", 1)
+        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
+
+
+def test_reactivation_cannot_capture_an_intent_created_after_the_pass(tmp_path):
+    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2,)),
+        (Issue(2, "Ticket", "Task", "OPEN", frozenset({"ready-for-agent"})),))
+    scenario = admit_scenario(GraphScenario(tmp_path / "graph", source), tmp_path)
+    runner = scenario.runner()
+    runner.activate_observation()
+    execute = runner.ports.execute
+    sent = []
+
+    def uncertain(effect, authorize):
+        if effect.operation == "workspace":
+            assert execute(effect, authorize).disposition == "target"
+            sent.append(effect)
+            return EffectResult("unknown")
+        return execute(effect, authorize)
+
+    runner.ports.execute = uncertain
+    for _ in range(8):
+        step = runner.run_once()
+        assert step.call is None
+        if sent:
+            break
+    assert len(sent) == 1 and runner.state().disposition == "quiescent"
+    runner.ports.reconcile = lambda *a: pytest.fail("activation is a snapshot, not a refill")
+    runner.activate_observation()
+    assert runner.state().disposition == "quiescent"
+    assert runner.run_once().kind == "quiescent"
+
+
+def test_temporary_unknown_host_readiness_does_not_consume_the_pass(tmp_path):
+    scenario, runner, sent = sent_workspaces(tmp_path, count=1)
+    runner.activate_observation()
+    request = scenario.kernel.host_request("start")
+    assert scenario.kernel.observe_host(request, HostObservation("unknown", request.unit_name)) == "unknown"
+    assert runner.state().disposition == "quiescent"
+    assert scenario.kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
+        42, "start", usage_ready=True)) == "running"
+    assert runner.state().disposition == "ready"
+    assert runner.run_once().kind == "progress"
+    assert runner.state().disposition == "quiescent"

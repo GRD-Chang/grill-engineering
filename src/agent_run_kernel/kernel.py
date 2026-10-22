@@ -88,7 +88,8 @@ class Kernel:
 
     @staticmethod
     def _approval_boundary(run: sqlite3.Row, job: sqlite3.Row) -> tuple[str | int | None, ...]:
-        return (run["parent_revision"], run["graph_revision"], *(job[key] for key in (
+        return (run["parent_revision"], run["graph_revision"], run["observed_parent_revision"],
+                run["observed_graph_revision"], *(job[key] for key in (
             "revision", "completion_revision", "publication_sha", "pr_number", "source_ref", "target_ref",
             "review_attempt", "checks_id", "grant_id")))
 
@@ -123,7 +124,9 @@ class Kernel:
             try:
                 self._observation_host(tx, observation.execution, observation.action_id)
             except KernelError as error:
-                if error.code not in {"executor_fenced", "host_usage_unproven", "managed_observation_required"}:
+                if error.code == "host_usage_unproven":
+                    return None  # Unknown readiness is not proof of Host exit.
+                if error.code not in {"executor_fenced", "managed_observation_required"}:
                     raise
                 observation.pending.clear()
                 return None
@@ -134,11 +137,15 @@ class Kernel:
                     valid = bool(rows and (rows[0]["status"], rows[0]["attempts"], rows[0]["subject"], rows[0]["generation"]) ==
                                  ("sent", member.dispatch_serial, member.subject, member.generation))
                 else:
-                    valid = job["phase"] == "approval" and self._approval_boundary(run, job) == member.boundary
+                    valid = (job["phase"] == "approval" and self._approval_boundary(run, job) == member.boundary
+                             and not run["stopped"] and not run["blocked"]
+                             and not any(gate["code"] != "supervision_timeout" for gate in self._gates(tx, member.subject)))
                 if not valid or job["generation"] != member.generation:
                     observation.pending.remove(member)
                     continue
                 if subject is not None and member.subject != subject:
+                    continue
+                if isinstance(member, _ApprovalRead) and self._subject_wait(tx, run, job) is not None:
                     continue
                 if (run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, member.subject))
                         or self._operation_wait(tx, run, member.subject, False) is not None):

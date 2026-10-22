@@ -280,6 +280,7 @@ class OperationRunner:
             token = kernel._operation_token(tx, subject, cleanup)
             original = (kernel._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (member.effect_id,)), execution)
                         if isinstance(member, _SentRead) else None)
+        observed_approval = False
         try:
             if original is not None:
                 return self._observe_sent(member, original, token)
@@ -294,6 +295,7 @@ class OperationRunner:
             if step.kind == "observe":
                 subject = step.subject
                 world, observed = self._observe(subject, cleanup=cleanup)
+                observed_approval = isinstance(member, _ApprovalRead)
                 step = (kernel._advance_cleanup(subject, execution, world, token=observed) if cleanup else
                         kernel._advance(subject, execution, world, allow_agent=bool(agent_capacity), token=observed))
             # Return a freshly allocated AgentCall before any further slow read.
@@ -302,7 +304,7 @@ class OperationRunner:
             if step.effect is not None:
                 step = self._effect(step)
             step = kernel._finish_automatic_step(token, execution, step)
-            if isinstance(member, _ApprovalRead) and self._observation is not None:
+            if observed_approval and member is not None and self._observation is not None:
                 self._observation.complete(member)
             return step
         except ReadWait as waiting:
