@@ -23,14 +23,13 @@ from agent_run_kernel.kernel import Kernel
 from agent_run_kernel.local_effects import LocalEffects
 from agent_run_kernel.legacy_admission import read_source_fence
 from agent_run_kernel.migration import MigrationRefused, capture_v6
-from agent_run_kernel.offline import OfflinePort
 from agent_run_kernel.task_location import read_task, task_path
 
-from test_kernel_migration_completed_history import _continue_final
+from test_kernel_migration_completed_history import _continue_final, _HistoricalPublisherPort
 from test_kernel_migration_original_source import _git_bytes, _managed_source
 
 
-class _ManagedSourcePort(OfflinePort):
+class _ManagedSourcePort(_HistoricalPublisherPort):
     local_root: Path
 
     @property
