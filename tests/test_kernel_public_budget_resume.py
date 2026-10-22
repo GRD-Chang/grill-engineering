@@ -1,6 +1,6 @@
 """Public checkpoint renewal in the same real, still-live managed Host.
 
-The test-only barrier delays the original scheduling read after a committed
+The test-only barrier delays the original runner state read after a committed
 checkpoint. It never changes that read's result or a Host/Run authority fact.
 Restart after a proved old Host exit remains a separate acceptance boundary.
 """
@@ -27,14 +27,14 @@ def _checkpoint_read_hook(directory: Path, address: str, ready: Path) -> Path:
 if '--database' in sys.argv and os.environ.get('ENTRY_BUDGET_CONTROL'):
     import socket, time
     from pathlib import Path
-    from agent_run_kernel import Kernel
-    original_scheduling = Kernel.scheduling
+    from agent_run_kernel.operation_runner import OperationRunner
+    original_state = OperationRunner.state
     selected = Path(sys.argv[sys.argv.index('--database') + 1])
     reached = False
-    def scheduling(self):
+    def state(self):
         global reached
-        if self.storage.path == selected and not reached:
-            with self.storage.transaction(write=False) as tx:
+        if self.kernel.storage.path == selected and not reached:
+            with self.kernel.storage.transaction(write=False) as tx:
                 checkpoint = tx.rows("SELECT subject FROM gates WHERE subject='parent:1' AND code='review_budget_exhausted'")
             if checkpoint:
                 reached = True
@@ -47,8 +47,8 @@ if '--database' in sys.argv and os.environ.get('ENTRY_BUDGET_CONTROL'):
                     channel.connect(chr(0) + {address!r}[1:])
                     channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
                     assert channel.recv(1) == b'1'
-        return original_scheduling(self)
-    Kernel.scheduling = scheduling
+        return original_state(self)
+    OperationRunner.state = state
 ''')
     return directory
 
