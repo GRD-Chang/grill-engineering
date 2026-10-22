@@ -30,26 +30,34 @@ def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
 def _recorded_agents(scenario: GraphScenario, monkeypatch: pytest.MonkeyPatch,
                      result: Callable[[AgentCall], bytes] | None = None,
                      started: Callable[[AgentCall], None] | None = None) -> None:
-    original_handle = scenario.handle
+    original_agent = scenario.agent
+    original_receive = scenario.kernel.receive
+    completed: dict[tuple[str, int], tuple[dict[str, Any], bytes]] = {}
 
-    def handle(step: Step) -> Step:
-        if step.kind != "agent" or step.call is None:
-            return original_handle(step)
-        # The offline Agent normally provides only a result. This projection
-        # test also supplies explicit synthetic process observations through
-        # the real Core producers. It does not claim a real Worker subprocess.
-        call = step.call
+    def agent(call: AgentCall) -> bytes:
+        # These are explicit synthetic observations, never an OS process claim.
+        # Normal Scenario.step and direct fixture consumers share this leaf.
         process = {"pid": 21, "pgid": 21, "start_token": "synthetic-process",
                    "host_pid": 10, "host_start_token": "synthetic-host"}
         assert scenario.kernel.dispatch_agent(call)
+        scenario.runner().authorize_agent(call)
         scenario.kernel.agent_started(call, process)
         if started is not None:
             started(call)
-        scenario.kernel.receive(call, (result or scenario.agent)(call))
-        scenario.kernel.agent_exited(call, process, 0)
-        return step
+        raw = (result or original_agent)(call)
+        # A throwing/interrupted callback supplies no known exit. Only this
+        # exact synchronously returned output may settle its synthetic process.
+        completed[(call.invocation_id, call.output_ordinal)] = (process, raw)
+        return raw
 
-    monkeypatch.setattr(scenario, "handle", handle)
+    def receive(call: AgentCall, raw: bytes) -> None:
+        original_receive(call, raw)
+        known = completed.pop((call.invocation_id, call.output_ordinal), None)
+        if known is not None and known[1] == raw:
+            scenario.kernel.agent_exited(call, known[0], 0)
+
+    monkeypatch.setattr(scenario, "agent", agent)
+    monkeypatch.setattr(scenario.kernel, "receive", receive)
 
 @pytest.mark.parametrize("mode", ["detailed", "concise"])
 def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
