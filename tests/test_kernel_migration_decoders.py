@@ -304,10 +304,26 @@ def test_completed_decoder_keeps_optional_execution_and_real_pending_cleanup(
         capture_output=True, text=True, timeout=30)
     assert formal.returncode == 0, formal.stdout + formal.stderr
     target = Path(json.loads(formal.stdout)['target']['database'])
+    # Conversation bindings are source facts, not native execution periods.
+    # Only D2/R2/P1 support this Completion; Publication reuses D's binding.
+    # Derive identities from the sealed SQL, independently of decoder output.
+    with closing(sqlite3.connect(snapshot.path)) as source:
+        expected_threads = {('v6:' + binding, 'ticket:2', role, 1, thread)
+            for binding, role, thread in source.execute(
+                'SELECT DISTINCT binding_id,binding_role,reported_thread_id FROM work_invocations '
+                "WHERE reported_thread_id IN ('history-development','history-review-2')")}
+    assert {row[-1] for row in expected_threads} == (
+        {'history-development', 'history-review-2'} if profile_backend else set())
     with closing(sqlite3.connect(target)) as db:
         assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == 0
-        assert db.execute('SELECT count(*) FROM threads').fetchone()[0] == 0
+        assert set(db.execute('SELECT id,subject,role,profile_revision,backend_id FROM threads')) == expected_threads
+        assert db.execute('SELECT current_invocation,thread_id,opening_id FROM attempts').fetchall() == [(None, None, None)] * 3
+        assert db.execute("SELECT count(*) FROM history WHERE kind='imported_invocation'").fetchone()[0] == (3 if profile_backend else 0)
         assert db.execute("SELECT count(*) FROM resource_cleanup WHERE state='pending'").fetchone()[0] == 1
+    from agent_run_kernel.kernel import Kernel
+    from agent_run_kernel.migration_records import V6RecordReader
+    from test_kernel_migration_completed_history import _assert_original_records
+    _assert_original_records(snapshot, V6RecordReader(Kernel(target)))
 
 
 @pytest.mark.parametrize('second_returned', [False, True])
