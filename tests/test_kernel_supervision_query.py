@@ -4,11 +4,13 @@ from io import StringIO
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, Kernel
+from agent_run_kernel import DeliveryKind, Kernel, Issue, ParentIssue, Requirements
 from agent_run_kernel import query
-from agent_run_kernel.offline import Scenario
+from agent_run_kernel.offline import GraphScenario, Scenario
+from agent_run_kernel.operation_runner import ReadUnavailable
+from support.core_operations import CoreOperations
 from agent_run_kernel.query_render import render
-from test_kernel_automatic_supervision import delivery_run
+from test_kernel_automatic_supervision import delivery_run, source_operations
 from test_kernel_query_cli import _snapshot
 
 
@@ -16,7 +18,7 @@ def source_run(tmp_path, monkeypatch, language="en"):
     original_create = Kernel.create
 
     def create(path, spec, **kwargs):
-        return original_create(path, replace(spec, language=language, repository_root=str(tmp_path.resolve())), **kwargs)
+        return original_create(path, replace(spec, language=language), **kwargs)
 
     monkeypatch.setattr(Kernel, "create", staticmethod(create))
     return delivery_run(tmp_path / "kernel.sqlite3")[0]
@@ -33,14 +35,18 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
     kernel = source_run(tmp_path, monkeypatch)
     execution = kernel.claim_executor("owner")
     kernel.clock = lambda: 100.25
-    run_step = kernel.begin_automatic_step(execution)
-    kernel.wait_for_read(run_step, execution, "final_source_missing", "Original Run ref outage")
-    ticket_step = kernel.begin_automatic_step(execution, "ticket:2")
-    kernel.wait_for_read(ticket_step, execution, "github_read_failed", "Original Ticket outage")
+    operations = source_operations(kernel, Requirements(ParentIssue(1, "Parent", "Requirement", (2, 3)), (
+        Issue(2, "First", "First work", "OPEN", frozenset({"ready-for-agent"})),
+        Issue(3, "Second", "Second work", "OPEN", frozenset({"ready-for-agent"})),)), execution)
+    def failed(parent):
+        raise ReadUnavailable("github_read_failed", "Original Ticket outage")
+    monkeypatch.setattr(operations.runner.ports, "source", failed)
+    assert operations.once().retry_at == 105.25
+    assert operations.once().retry_at == 105.25
     monkeypatch.setattr(query.time, "time", lambda: 200.5)
     first = read_only(kernel, tmp_path).data
     assert len(first["supervision_windows"]) == 2
-    assert first["supervision"]["subject"] is None
+    assert first["supervision"] is None  # Independent real Ticket scopes have no guessed current window.
     for window in first["supervision_windows"]:
         assert window["started_at"] == 100.25 and window["deadline"] == 700.25
         assert window["remaining_seconds"] == 499 and window["retry_count"] == 1
@@ -57,18 +63,26 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_applies_it(tmp_path, monkeypatch, language):
-    kernel = source_run(tmp_path, monkeypatch, language)
-    execution = kernel.claim_executor("owner")
+    source_run(tmp_path, monkeypatch, language)
+    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2,)), (
+        Issue(2, "Ticket", "Work", "OPEN", frozenset({"ready-for-agent"})),))
+    scenario = GraphScenario(tmp_path / "before-final", source)
+    assert scenario.run().kind == "complete"
+    kernel, execution = scenario.kernel, scenario.execution
+    assert kernel.source_status()["final_subject"] is None
+    operations = CoreOperations(kernel, execution, scenario.make_ports)
+    def failed(parent):
+        raise ReadUnavailable("final_source_missing", "Original failure / 原始问题")
+    monkeypatch.setattr(operations.runner.ports, "source", failed)
     kernel.clock = lambda: 100
-    operation = kernel.begin_automatic_step(execution)
-    kernel.wait_for_read(operation, execution, "final_source_missing", "Original failure / 原始问题")
+    assert operations.once().retry_at == 105
     kernel.clock = lambda: 700
-    assert kernel.guard_automatic_step(operation, execution).reason == "supervision_timeout"
+    assert operations.once().reason == "supervision_timeout"
     monkeypatch.setattr(query.time, "time", lambda: 900)
     document = read_only(kernel, tmp_path)
     data = document.data
     window = data["supervision"]
-    command = "agent-run resume 1 --repo example/repository"
+    command = "agent-run resume 1 --repo example/project"
     assert data["status"] == "supervision_timeout" and data["next_action"] == command
     assert window["timed_out"] and window["remaining_seconds"] == 0
     assert window["timeout"]["scope_id"] == window["scope_id"]
@@ -97,9 +111,9 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     assert kernel.control("resume", "explicit-original-resume") == "applied"
     assert read_only(kernel, tmp_path).data["supervision_windows"] == []
     replacement = kernel.claim_executor("replacement")
-    fresh = kernel.begin_automatic_step(replacement)
+    fresh = kernel.operation_runner(replacement, lambda binding: operations.runner.ports)
     kernel.clock = lambda: 800
-    kernel.wait_for_read(fresh, replacement, "final_source_missing", "Fresh actual failure")
+    assert fresh.run_once().retry_at == 805
     assert read_only(kernel, tmp_path).data["supervision"]["started_at"] == 800
 
 
@@ -107,13 +121,17 @@ def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, mo
     kernel = source_run(tmp_path, monkeypatch)
     execution = kernel.claim_executor("owner")
     kernel.clock = lambda: 100
-    original = kernel.begin_automatic_step(execution, "ticket:2")
-    kernel.wait_for_read(original, execution, "github_read_failed", "Original Ticket error")
+    _, source = delivery_run(tmp_path / "explicit-source.sqlite3")
+    operations = source_operations(kernel, source, execution)
+    def failed(parent):
+        raise ReadUnavailable("github_read_failed", "Original Ticket error" if kernel.clock() == 100 else "Independent sibling")
+    monkeypatch.setattr(operations.runner.ports, "source", failed)
+    assert operations.once().retry_at == 105
     kernel.clock = lambda: 200
-    sibling = kernel.begin_automatic_step(execution, "ticket:3")
-    kernel.wait_for_read(sibling, execution, "github_read_failed", "Independent sibling")
+    assert operations.once().retry_at == 210  # Polling does not renew ticket:2's original deadline.
+    assert operations.once().retry_at == 205
     kernel.clock = lambda: 700
-    assert kernel.guard_automatic_step(original, execution).reason == "supervision_timeout"
+    assert operations.once().reason == "supervision_timeout"
     monkeypatch.setattr(query.time, "time", lambda: 750)
     data = read_only(kernel, tmp_path).data
     windows = {window["subject"]: window for window in data["supervision_windows"]}

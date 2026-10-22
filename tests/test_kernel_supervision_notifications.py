@@ -6,6 +6,8 @@ from agent_run import notification_outbox as outbox
 from agent_run.notification_event_facts import event_copy
 from agent_run_kernel import DeliveryKind
 from agent_run_kernel.notifications import NativeNotifications
+from agent_run_kernel.operation_runner import ReadUnavailable
+from support.core_operations import CoreOperations
 from test_kernel_notification_lifecycle import _enabled_scenario
 from test_kernel_query_cli import _snapshot
 
@@ -17,11 +19,14 @@ def test_before_final_timeout_uses_one_original_global_notification_and_resume(t
     assert len(scenario.kernel.source_status()["completions"]) == 1
     started = time.time()
     scenario.kernel.clock = lambda: started
-    original = scenario.kernel.begin_automatic_step(scenario.execution)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     cause = "Original Run ref unavailable"
-    scenario.kernel.wait_for_read(original, scenario.execution, "final_source_missing", cause)
+    def failed(parent):
+        raise ReadUnavailable("final_source_missing", cause)
+    monkeypatch.setattr(operations.runner.ports, "source", failed)
+    assert operations.once().retry_at == started + 5
     scenario.kernel.clock = lambda: started + 600
-    assert scenario.kernel.guard_automatic_step(original, scenario.execution).reason == "supervision_timeout"
+    assert operations.once().reason == "supervision_timeout"
     assert scenario.kernel.source_status()["final_subject"] is None
     sent = []
 
