@@ -5,9 +5,12 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import lru_cache
 
 from agent_run.messages import error_message
+from agent_run.policy_contract import DeliveryPolicyError as DeliveryPolicyError
+from agent_run.policy_contract import POLICY_VALUE_FIELDS, positive_seconds
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -47,25 +50,6 @@ _DURATION_PATTERN = re.compile(
 _DURATION_MULTIPLIERS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
 
-class DeliveryPolicyError(ValueError):
-    """The Delivery Policy is missing, malformed, or outside its contract."""
-
-
-# Canonical wire keys map once to the native frozen value's stable fields.
-# This is a fixed contract, not a configurable field/schema interpreter.
-_POLICY_VALUE_FIELDS = {
-    "parent_only_paired_rounds": "parent_rounds",
-    "run_repair_rounds": "run_repairs",
-    "ticket_review_rounds": "ticket_rounds",
-    "ticket_development_workers": "concurrency",
-    "integration_resync_limit": "resync_limit",
-    "ticket_integration_development_limit": "integration_developments",
-    "ticket_ci_development_limit": "ticket_ci_developments",
-    "ticket_ci_review": "ticket_ci_review",
-    "parent_ci_development_limit": "parent_ci_developments",
-}
-
-
 def default_delivery_policy() -> Policy:
     from agent_run_kernel.model import Policy
     return Policy()
@@ -76,15 +60,16 @@ def resolve_delivery_policy(
     user_defaults: Mapping[str, Any] | Policy | None = None,
     command_overrides: Mapping[str, Any] | None = None,
 ) -> Policy:
-    """Resolve builtin values, user defaults, then one-shot overrides."""
+    """Resolve sparse defaults, or apply explicit overrides to a frozen owner."""
 
     from agent_run_kernel.model import Policy
 
     if isinstance(user_defaults, Policy):
-        values = user_defaults.snapshot()
-        user_defaults = None  # A complete frozen owner is the baseline, not sparse defaults.
-    else:
-        values = default_delivery_policy().snapshot()
+        overrides = normalize_policy_overrides(
+            {} if command_overrides is None else command_overrides, ignore_none=True,
+        )
+        return replace(user_defaults, **_policy_changes(overrides))
+    values = default_delivery_policy().snapshot()
     values["invocation_deadlines"] = dict(values["invocation_deadlines"])
     for source, raw, ignore_none in (
         ("user defaults", user_defaults, False),
@@ -272,54 +257,41 @@ def _policy_with_deadlines(
     """Construct after the caller has checked its required deadline fields."""
     from agent_run_kernel.model import Policy
 
-    thread_policy = values.get("development_thread_policy", "reuse")
-    if thread_policy not in ("reuse", "new-per-attempt"):
-        raise DeliveryPolicyError(error_message('policy.error.thread_policy', audit="development_thread_policy must be reuse or new-per-attempt"))
-    native_values: dict[str, Any] = {field: values.get(key) for key, field in _POLICY_VALUE_FIELDS.items()}
+    new_thread = _new_thread_per_development(values.get("development_thread_policy", "reuse"))
+    native_values: dict[str, Any] = {field: values.get(key) for key, field in POLICY_VALUE_FIELDS.items()}
     return Policy(
         **native_values,
-        new_thread_per_development=thread_policy == "new-per-attempt",
+        new_thread_per_development=new_thread,
         development_deadline_seconds=_positive_duration(deadlines["development"], "development deadline"),
         review_deadline_seconds=_positive_duration(deadlines["review"], "review deadline"),
         publication_deadline_seconds=_positive_duration(deadlines["publication"], "publication deadline"),
     )
 
 
-def _positive_integer(value: Any, name: str) -> int:
-    if type(value) is not int or value <= 0:
-        raise DeliveryPolicyError(error_message('policy.error.positive_integer', audit=f"{name} must be a positive integer", name=name))
-    return value
+def _policy_changes(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert only explicit, normalized options for an existing frozen owner."""
+    changes = {field: values[key] for key, field in POLICY_VALUE_FIELDS.items() if key in values}
+    if "development_thread_policy" in values:
+        changes["new_thread_per_development"] = _new_thread_per_development(values["development_thread_policy"])
+    deadlines = values.get("invocation_deadlines", {})
+    for role in _DEADLINE_FIELDS:
+        if role in deadlines:
+            changes[role + "_deadline_seconds"] = _positive_duration(deadlines[role], role + " deadline")
+    return changes
 
 
-def _nonnegative_integer(value: Any, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise DeliveryPolicyError(f"{name} must be a non-negative integer")
-    return value
+def _new_thread_per_development(value: object) -> bool:
+    if value not in ("reuse", "new-per-attempt"):
+        raise DeliveryPolicyError(error_message('policy.error.thread_policy', audit="development_thread_policy must be reuse or new-per-attempt"))
+    return value == "new-per-attempt"
 
 
 def _positive_duration(value: Any, name: str) -> float:
-    if isinstance(value, bool):
-        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
-    try:
-        if isinstance(value, (int, float)):
-            seconds = float(value)
-        elif isinstance(value, str):
-            match = _DURATION_PATTERN.fullmatch(value)
-            if match is None:
-                raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
-            seconds = float(match.group(1)) * _DURATION_MULTIPLIERS[
-                match.group(2).lower()
-            ]
-        else:
+    if isinstance(value, str):
+        match = _DURATION_PATTERN.fullmatch(value)
+        if match is None:
             raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
-    except OverflowError as error:
-        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name)) from error
-    if not isinstance(seconds, float):
+        value = float(match.group(1)) * _DURATION_MULTIPLIERS[match.group(2).lower()]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
-    return seconds
-
-
-def _canonical_number(value: float) -> int | float:
-    return int(value) if value.is_integer() else value
+    return positive_seconds(value, name)

@@ -89,3 +89,29 @@ def test_direct_and_configured_values_share_policy_validation(native: str, wire:
         Policy(**{native: invalid})  # type: ignore[arg-type]
     with pytest.raises(DeliveryPolicyError):
         resolve_delivery_policy(command_overrides={wire: invalid})
+
+
+def test_checkpoint_applies_only_explicit_overrides_without_exporting_frozen_values(monkeypatch) -> None:
+    frozen = Policy(ticket_rounds=2, parent_rounds=5, run_repairs=4, resync_limit=0,
+                    ticket_ci_review=True, new_thread_per_development=True,
+                    development_profile=Profile("frozen-development", "high"),
+                    review_profile=Profile("frozen-review", "medium"),
+                    publication_profile=Profile("frozen-publication", "high"))
+
+    def no_snapshot(_policy):
+        raise AssertionError("Applying an override must not export the frozen Policy")
+
+    monkeypatch.setattr(Policy, "snapshot", no_snapshot)
+    overrides = {"ticket_review_rounds": 7, "review_deadline": "1.5s"}
+    expected = replace(frozen, ticket_rounds=7, review_deadline_seconds=1.5)
+    assert checkpoint_policy(frozen, overrides) == expected
+    assert resolve_delivery_policy(user_defaults=frozen, command_overrides=overrides) == expected
+    assert checkpoint_policy(frozen, {}) == frozen
+    assert checkpoint_policy(frozen, {"development_deadline": None}) == frozen
+
+
+@pytest.mark.parametrize("value", [0, 1, 1.0, "true", None, [], {}])
+@pytest.mark.parametrize("field", ["ticket_ci_review", "new_thread_per_development"])
+def test_native_policy_flags_require_actual_booleans(field, value) -> None:
+    with pytest.raises(DeliveryPolicyError, match="must be boolean"):
+        Policy(**{field: value})

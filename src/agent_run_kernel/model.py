@@ -12,9 +12,9 @@ import json
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from agent_run.delivery_policy import (
-    DeliveryPolicyError, _POLICY_VALUE_FIELDS, _canonical_number, _nonnegative_integer,
-    _positive_duration, _positive_integer,
+from agent_run.policy_contract import (
+    DeliveryPolicyError, POLICY_VALUE_FIELDS, canonical_number, nonnegative_integer,
+    positive_seconds, positive_integer,
 )
 
 from .artifact_contract import ArtifactContractError, parse_artifact
@@ -86,22 +86,20 @@ class Policy:
     publication_deadline_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
-        for key, field_name in _POLICY_VALUE_FIELDS.items():
+        for key, field_name in POLICY_VALUE_FIELDS.items():
             value = getattr(self, field_name)
             if key == "ticket_ci_review":
                 if type(value) is not bool:
                     raise DeliveryPolicyError("ticket_ci_review must be boolean")
             else:
-                validate = _nonnegative_integer if key == "integration_resync_limit" else _positive_integer
+                validate = nonnegative_integer if key == "integration_resync_limit" else positive_integer
                 object.__setattr__(self, field_name, validate(value, key))
         if type(self.new_thread_per_development) is not bool:
             raise DeliveryPolicyError("new_thread_per_development must be boolean")
         for role in ("development", "review", "publication"):
             field_name = role + "_deadline_seconds"
             value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise DeliveryPolicyError("invocation deadlines must be positive finite durations")
-            object.__setattr__(self, field_name, _positive_duration(value, role + " deadline"))
+            object.__setattr__(self, field_name, positive_seconds(value, role + " deadline"))
 
     @property
     def invocation_deadlines(self) -> dict[str, float]:
@@ -111,9 +109,9 @@ class Policy:
     def snapshot(self) -> dict[str, Any]:
         """Encode complete public policy values; never resolve future defaults."""
         return {
-            **{key: getattr(self, field_name) for key, field_name in _POLICY_VALUE_FIELDS.items()},
+            **{key: getattr(self, field_name) for key, field_name in POLICY_VALUE_FIELDS.items()},
             "development_thread_policy": "new-per-attempt" if self.new_thread_per_development else "reuse",
-            "invocation_deadlines": {role: _canonical_number(value) for role, value in self.invocation_deadlines.items()},
+            "invocation_deadlines": {role: canonical_number(value) for role, value in self.invocation_deadlines.items()},
         }
 
 

@@ -14,9 +14,7 @@ from .model import CreationInputs, Policy, Profile, RunSpec
 
 def checkpoint_policy(current: Policy, overrides: Mapping[str, Any]) -> Policy:
     """Resolve an explicit new window against this owner's frozen policy."""
-    policy = resolve_delivery_policy(user_defaults=current, command_overrides=overrides)
-    return replace(policy, development_profile=current.development_profile,
-                   review_profile=current.review_profile, publication_profile=current.publication_profile)
+    return resolve_delivery_policy(user_defaults=current, command_overrides=overrides)
 
 
 def freeze_creation(spec: RunSpec, defaults: UserDefaultsStore, *, preset: str | None = None,
