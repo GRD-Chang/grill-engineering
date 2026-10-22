@@ -328,6 +328,9 @@ class OperationRunner:
             raise ReadWait(waiting)
         result = self.ports.reconcile(effect)
         self._record_readback(effect, result)
+        waiting = self.kernel._finish_operation_read(token, self.execution)
+        if waiting is not None:
+            raise ReadWait(waiting)
         if result.disposition not in {"target", "unknown", "third"}:
             if self._observation is not None and member is not None:
                 self._observation.defer(member)
