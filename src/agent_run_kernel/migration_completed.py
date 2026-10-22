@@ -15,20 +15,22 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar
 
 from agent_run.managed_workspace import ManagedWorkspace
 
 from .effects import LocalGit
 from .kernel import Kernel
 from .migration import (MigrationRefused, SourceSnapshot, _created_at_epoch,
-                        _require_no_v6_notification_journal, capture_v6)
+                        _require_no_v6_notification_journal, capture_v6, validate_snapshot)
 from .migration_active import _evidence, _read_profile, _wire_row
 from .migration_conversion import _git, _one, _policy
 from .migration_records import RECORD_TABLES, V6RecordReader, _preserve_copy
 from .migration_quiescence import read_v6_host_exit
+from .migration_facts import (ImportSource, ImportedAttempt, ImportedBudget, ImportedCompletion,
+    ImportedHistoryEvent, ImportedResource, ImportedRunFacts, ImportedSubject, HistoricalExecution, SourceRecord)
 from .model import (Blocker, Commit, CreationInputs, Delivery, DeliveryKind, Issue,
-                    KernelError, ParentIssue, Policy, Profile, Requirements, Role,
+                    KernelError, ParentIssue, Policy, Profile, Purpose, Requirements, Role,
                     RunSpec, artifact, wire_json)
 
 
@@ -259,8 +261,12 @@ def _settled_invocations(db: sqlite3.Connection, run_id: str, calls: list[dict[s
     return int(count)
 
 
-def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
-                    source_sha: str, readproof: Mapping[str, Any] | None = None) -> _Completed:
+_CompletedFacts = TypeVar('_CompletedFacts')
+
+
+def _read_completed_source(path: Path, profile: Mapping[str, Any], profile_sha: str,
+                    source_sha: str, emit: Callable[..., _CompletedFacts],
+                    readproof: Mapping[str, Any] | None) -> _CompletedFacts:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     db.row_factory = sqlite3.Row
     try:
@@ -629,7 +635,7 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         if (not timeline or timeline[-1]["value_phase"] != ('merged' if pending_resources else 'completed')
                 or len({slot["event_id"] for slot in slots}) != counts["run_timeline_events"]):
             raise MigrationRefused("source_history")
-        return _Completed(run["run_id"], run["repository"], run["parent_number"],
+        return emit(db, run["run_id"], run["repository"], run["parent_number"],
                           parent_revision, graph_revision, _created_at_epoch(run["created_at"]),
                           root["value_language"], requirements, policy, inputs,
                           root["value_run_branch"], base["value_branch"], base["value_sha"],
@@ -646,6 +652,14 @@ def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
         raise MigrationRefused("source_corrupt") from error
     finally:
         db.close()
+
+
+def _read_completed(path: Path, profile: Mapping[str, Any], profile_sha: str,
+                    source_sha: str, readproof: Mapping[str, Any] | None = None) -> _Completed:
+    # Temporary writer consumer; canonical source decoding never constructs it.
+    def legacy(db: sqlite3.Connection, *values: Any) -> _Completed:
+        return _Completed(*values)
+    return _read_completed_source(path, profile, profile_sha, source_sha, legacy, readproof)
 
 
 def _read_document(path: Path, *, limit: int = 4 * 1024 * 1024) -> tuple[dict[str, Any], str]:
@@ -713,14 +727,17 @@ def _copy_loose_git(source: Path, target: Path, *, run_ref: str, base: str,
         raise MigrationRefused("copied_git_dirty")
 
 
-def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Completed,
-                            destination: Path, root: Path, final: Path, git_store: Path) -> None:
+def _verify_completed_git(snapshot: SourceSnapshot, copied: Path, destination: Path,
+        root: Path, final: Path, git_store: Path, *, repository: str, run_id: str,
+        observed_default_sha: str | None, base_sha: str, run_branch: str, integrated_sha: str,
+        base_branch: str, ticket_branch: str, ticket: int, pending_resources: bool,
+        publication_sha: str, candidate_sha: str, candidate_tree: str, integrated_tree: str) -> None:
     """Verify original resources without changing a ref, worktree or clone."""
-    managed = ManagedWorkspace.for_repository(facts.repository)
-    expected_final = managed.root / 'worktrees' / facts.run_id / 'run-publication'
+    managed = ManagedWorkspace.for_repository(repository)
+    expected_final = managed.root / 'worktrees' / run_id / 'run-publication'
     if (root != managed.repository_root or managed.open_path() != root
             or snapshot.source.resolve() != managed.state_root / 'state.sqlite3'
-            or destination != managed.state_root / facts.run_id / 'kernel.sqlite3'
+            or destination != managed.state_root / run_id / 'kernel.sqlite3'
             or destination.parent.resolve() != destination.parent
             or final != expected_final or final.exists() or final.is_symlink()
             or git_store != root / '.git' or git_store.resolve() != git_store):
@@ -729,10 +746,10 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
         db.row_factory = sqlite3.Row
         if db.execute('SELECT count(*) FROM runs').fetchone()[0] != 1:
             raise MigrationRefused('source_task_scope')
-        task = read_v6_host_exit(db, facts.run_id, required=True)
+        task = read_v6_host_exit(db, run_id, required=True)
         control = _one(db, 'SELECT run_state_dir FROM control_tasks')
         uuid = _one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?',
-                    (facts.run_id,))[0]
+                    (run_id,))[0]
         if (task is None or task.workspace != root
                 or control['run_state_dir'] != str(managed.state_root)
                 or not isinstance(uuid, str) or re.fullmatch(r'[0-9a-f]{32}', uuid) is None):
@@ -745,49 +762,59 @@ def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Comp
     # The live default observation grants no ownership of a changed local ref.
     # Prove append-only ancestry from existing immutable objects; never fetch or
     # move the historical checkout to make an observation acceptable.
-    if facts.observed_default_sha is not None and facts.observed_default_sha != facts.base_sha:
-        observed = reader.run('cat-file', '-t', facts.observed_default_sha, check=False)
+    if observed_default_sha is not None and observed_default_sha != base_sha:
+        observed = reader.run('cat-file', '-t', observed_default_sha, check=False)
         if observed.returncode != 0 or observed.stdout.strip() != 'commit':
             raise MigrationRefused('source_external_default_object')
-        if reader.run('merge-base', '--is-ancestor', facts.base_sha,
-                      facts.observed_default_sha, check=False).returncode != 0:
+        if reader.run('merge-base', '--is-ancestor', base_sha,
+                      observed_default_sha, check=False).returncode != 0:
             raise MigrationRefused('source_external_default_ancestry')
-    for ref, sha in ((f'refs/heads/{facts.run_branch}', facts.integrated_sha),
-                     (f'refs/heads/{facts.base_branch}', facts.base_sha)):
+    for ref, sha in ((f'refs/heads/{run_branch}', integrated_sha),
+                     (f'refs/heads/{base_branch}', base_sha)):
         if (reader.run('symbolic-ref', '-q', ref, check=False).returncode != 1
                 or _git(root, 'rev-parse', '--verify', ref) != sha):
             raise MigrationRefused('source_existing_ref')
-    ticket_ref = f'refs/heads/{facts.ticket_branch}'
-    ticket_checkout = managed.state_root / 'worktrees' / facts.run_id / f'ticket-{facts.ticket}'
-    if (_git(root, 'rev-parse', 'HEAD') != facts.base_sha or _git(root, 'status', '--porcelain')
-            or (not facts.pending_resources and _git(root, 'for-each-ref', '--format=%(refname)', ticket_ref))):
+    ticket_ref = f'refs/heads/{ticket_branch}'
+    ticket_checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
+    if (_git(root, 'rev-parse', 'HEAD') != base_sha or _git(root, 'status', '--porcelain')
+            or (not pending_resources and _git(root, 'for-each-ref', '--format=%(refname)', ticket_ref))):
         raise MigrationRefused('source_existing_checkout')
     worktrees = _git(root, 'worktree', 'list', '--porcelain').strip().split('\n\n')
     expected_paths = {str(root)}
-    if facts.pending_resources:
+    if pending_resources:
         expected_paths.add(str(ticket_checkout))
         if (ticket_checkout.is_symlink() or not ticket_checkout.is_dir()
                 or ticket_checkout.resolve() != ticket_checkout
                 or reader.run('symbolic-ref', '-q', ticket_ref, check=False).returncode != 1
-                or _git(root, 'rev-parse', '--verify', ticket_ref) != facts.publication_sha
+                or _git(root, 'rev-parse', '--verify', ticket_ref) != publication_sha
                 or _git(ticket_checkout, 'symbolic-ref', '-q', 'HEAD') != ticket_ref
-                or _git(ticket_checkout, 'rev-parse', 'HEAD') != facts.publication_sha
+                or _git(ticket_checkout, 'rev-parse', 'HEAD') != publication_sha
                 or _git(ticket_checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir') != str(git_store)
                 or _git(ticket_checkout, 'status', '--porcelain')):
             raise MigrationRefused('source_existing_ticket_resources')
     if (len(worktrees) != len(expected_paths)
             or {entry.splitlines()[0].removeprefix('worktree ') for entry in worktrees} != expected_paths):
         raise MigrationRefused('source_existing_worktrees')
-    for sha, tree in ((facts.candidate_sha, facts.candidate_tree),
-                      (facts.publication_sha, facts.integrated_tree),
-                      (facts.integrated_sha, facts.integrated_tree)):
+    for sha, tree in ((candidate_sha, candidate_tree),
+                      (publication_sha, integrated_tree),
+                      (integrated_sha, integrated_tree)):
         if (_git(root, 'cat-file', '-t', sha) != 'commit'
                 or _git(root, 'rev-parse', f'{sha}^{{tree}}') != tree):
             raise MigrationRefused('source_git_object')
-    if (_git(root, 'cat-file', '-t', facts.base_sha) != 'commit'
-            or any(_git(root, 'show', '-s', '--format=%P', sha) != facts.base_sha
-                   for sha in (facts.publication_sha, facts.integrated_sha))):
+    if (_git(root, 'cat-file', '-t', base_sha) != 'commit'
+            or any(_git(root, 'show', '-s', '--format=%P', sha) != base_sha
+                   for sha in (publication_sha, integrated_sha))):
         raise MigrationRefused('source_git_ancestry')
+
+
+def _existing_completed_git(snapshot: SourceSnapshot, copied: Path, facts: _Completed,
+                            destination: Path, root: Path, final: Path, git_store: Path) -> None:
+    _verify_completed_git(snapshot, copied, destination, root, final, git_store,
+        repository=facts.repository, run_id=facts.run_id, observed_default_sha=facts.observed_default_sha,
+        base_sha=facts.base_sha, run_branch=facts.run_branch, integrated_sha=facts.integrated_sha,
+        base_branch=facts.base_branch, ticket_branch=facts.ticket_branch, ticket=facts.ticket,
+        pending_resources=facts.pending_resources, publication_sha=facts.publication_sha,
+        candidate_sha=facts.candidate_sha, candidate_tree=facts.candidate_tree, integrated_tree=facts.integrated_tree)
 
 
 def convert_completed_ticket_v6(
@@ -1205,3 +1232,141 @@ def convert_completed_ticket_v6(
                 shutil.rmtree(repository_root)
             raise
     return Kernel(destination)
+
+
+def read_original_completed_import(snapshot: SourceSnapshot, *, profile_snapshot: Path,
+        external_snapshot: Path) -> ImportedRunFacts:
+    """Decode existing original Completion/cleanup facts with external close proof.
+
+    The old writer DTO is not an intermediate. Historical Invocation absence
+    remains absence; neither the returned raw nor the reaped Host proves an
+    unknown worker exited. No native Invocation, Thread or Opening is created.
+    """
+    validate_snapshot(snapshot)
+    profile, profile_sha = _read_profile(profile_snapshot)
+    proof, proof_sha = _read_document(external_snapshot)
+    profile_document, external_document = profile_snapshot.read_bytes(), external_snapshot.read_bytes()
+    if (hashlib.sha256(profile_document).hexdigest() != profile_sha
+            or hashlib.sha256(external_document).hexdigest() != proof_sha):
+        raise MigrationRefused('source_documents_changed')
+
+    def decode(db: sqlite3.Connection, run_id: str, repository: str, parent_number: int,
+            parent_revision: str, graph_revision: str, created_at: float, language: str,
+            requirements: Requirements, policy: Policy, inputs: CreationInputs,
+            run_branch: str, base_branch: str, base_sha: str, ticket: int, ticket_branch: str,
+            candidate_sha: str, candidate_tree: str, publication_sha: str, integrated_sha: str,
+            integrated_tree: str, pr_number: int, old_job_revision: int, old_job: dict[str, Any],
+            old_cleanup: dict[str, Any], calls: tuple[dict[str, Any], ...], timeline: tuple[dict[str, Any], ...],
+            close_intent: dict[str, Any], close_ownership: dict[str, Any], developments_used: int,
+            reviews_used: int, physical_invocations: int, close_readproof: dict[str, Any] | None,
+            pending_resources: bool, observed_default_sha: str | None) -> ImportedRunFacts:
+        _require_no_v6_notification_journal(snapshot, run_id)
+        managed = ManagedWorkspace.for_repository(repository)
+        root, common = managed.repository_root, managed.repository_root / '.git'
+        final = managed.root / 'worktrees' / run_id / 'run-publication'
+        _verify_completed_git(snapshot, snapshot.path, managed.state_root / run_id / 'kernel.sqlite3', root, final, common,
+            repository=repository, run_id=run_id, observed_default_sha=observed_default_sha,
+            base_sha=base_sha, run_branch=run_branch, integrated_sha=integrated_sha,
+            base_branch=base_branch, ticket_branch=ticket_branch, ticket=ticket, pending_resources=pending_resources,
+            publication_sha=publication_sha, candidate_sha=candidate_sha, candidate_tree=candidate_tree,
+            integrated_tree=integrated_tree)
+        checkout = managed.state_root / 'worktrees' / run_id / f'ticket-{ticket}'
+        base = Commit(base_sha, _git(root, 'rev-parse', base_sha + '^{tree}'))
+        subject, source_ref = f'ticket:{ticket}', 'refs/heads/' + ticket_branch
+        spec = RunSpec(run_id, repository, parent_number, parent_revision, graph_revision,
+            (Delivery(subject, DeliveryKind.TICKET, ticket, 'source-verified', base, source_ref,
+                'refs/heads/' + run_branch, checkout=str(checkout) if pending_resources else '',
+                owned_root=str(checkout.parent) if pending_resources else '',
+                common_git_dir=str(common) if pending_resources else ''),
+             Delivery(f'final:{run_id}', DeliveryKind.FINAL_RUN, parent_number, parent_revision, base,
+                'refs/heads/' + run_branch, 'refs/heads/' + base_branch, checkout=str(final),
+                owned_root=str(final.parent), common_git_dir=str(common))), policy, language, str(root), inputs)
+        owner = SourceRecord('work_jobs', (run_id, old_job['job_id']))
+        aliases = tuple(SourceRecord('work_job_slots', (run_id, row['container'], row['slot']))
+            for row in db.execute('SELECT * FROM work_job_slots WHERE run_id=? AND job_id=?', owner.key))
+        aliases += (SourceRecord('work_job_layout', (run_id,)),)
+        budget = _one(db, 'SELECT * FROM work_job_review_budget WHERE run_id=? AND job_id=?', owner.key)
+        budgets = (ImportedBudget(owner=owner, record=SourceRecord('work_job_review_budget', owner.key),
+            purpose=Purpose.REQUIREMENTS, window=budget['value_window'], developments_used=developments_used,
+            reviews_used=reviews_used, current=True),)
+        attempts = []
+        for call in calls:
+            attempt_id = call['attempt_id']
+            attempt = _one(db, 'SELECT * FROM work_attempts WHERE run_id=? AND attempt_id=?', (run_id, attempt_id))
+            raw = _one(db, 'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m '
+                'ON m.material_id=e.material_id WHERE e.run_id=? AND e.evidence_id=?', (run_id, call['raw_evidence_id']))[0]
+            execution = None
+            bound_version = None
+            if physical_invocations:
+                invocation = _one(db, 'SELECT * FROM work_invocations WHERE run_id=? AND attempt_id=?', (run_id, attempt_id))
+                bound = _one(db, 'SELECT * FROM work_attempt_versions WHERE run_id=? AND attempt_id=? AND version_id=?',
+                    (run_id, attempt_id, invocation['attempt_version_id']))
+                binding = next(item for item in profile['bindings'] if item['binding_id'] == invocation['binding_id'])
+                bound_version = wire_json(_wire_row(dict(bound)))
+                execution = HistoricalExecution(record=SourceRecord('work_invocations',
+                    (run_id, invocation['work_subject'], invocation['started_at'])), binding_id=invocation['binding_id'],
+                    thread_id=invocation['reported_thread_id'], binding=wire_json(binding), invocation=wire_json(_wire_row(dict(invocation))))
+            role = Role(call['role'])
+            selected = call['current_version']
+            attempts.append(ImportedAttempt(record=SourceRecord('work_attempts', (run_id, attempt_id)), role=role,
+                role_ordinal=attempt['ordinal'], generation=attempt['generation'], purpose=Purpose.REQUIREMENTS,
+                window=attempt['budget_window'], pending=False,
+                accounted=role == Role.REVIEW and selected['budget_consumed'] == 1, outcome=selected['outcome'],
+                raw_record=SourceRecord('work_evidence', (run_id, call['raw_evidence_id'])), raw_result=raw.encode('utf-8'),
+                normalized_artifact=wire_json(call['artifact']), bound_version=bound_version,
+                selected_version=wire_json(selected), current_version=wire_json(selected),
+                allocation_boundary=wire_json(call['allocation_boundary']) if 'allocation_boundary' in call else None,
+                execution=execution, continuation_basis=None))
+        records = [owner, *(SourceRecord(table, owner.key) for table in (
+            'work_job_ticket_close_intent', 'work_job_merge_intent', 'work_job_acceptance_record'))]
+        if not pending_resources:
+            records += [SourceRecord('work_job_ticket_close_ownership', owner.key),
+                        SourceRecord('run_cleanup_items', (run_id, ticket_branch))]
+        completion = ImportedCompletion(records=tuple(records), publication=Commit(publication_sha, integrated_tree),
+            integrated=Commit(integrated_sha, integrated_tree), pr_number=pr_number,
+            development_attempt=calls[0]['attempt_id'], review_attempt=calls[1]['attempt_id'],
+            close_intent=wire_json(close_intent), close_ownership=None if pending_resources else wire_json(close_ownership),
+            close_readproof=None if close_readproof is None else wire_json(close_readproof))
+        workspace = ImportedResource(owner=owner, kind='ticket-workspace',
+            disposition='existing' if pending_resources else 'absent', source_ref=source_ref,
+            expected_oid=publication_sha if pending_resources else None,
+            checkout=checkout if pending_resources else None, workspace_oid=publication_sha if pending_resources else None,
+            owned_root=checkout.parent if pending_resources else None, common_git_dir=common,
+            before_head=Path(_git(checkout, 'rev-parse', '--path-format=absolute', '--git-path', 'HEAD')).read_bytes()
+                if pending_resources else None,
+            checkout_archive_sha256=None, checkout_index_sha256=None, head_evidence=(owner,), cleanup_pending=pending_resources)
+        integration = _one(db, 'SELECT m.body FROM work_evidence e JOIN work_evidence_materials m '
+            'ON m.material_id=e.material_id WHERE e.run_id=? AND e.evidence_id=?', (run_id, old_job['value_ticket_integration']))[0]
+        imported = ImportedSubject(subject=subject, issue=ticket, generation=1, record=owner, aliases=aliases,
+            kind='completed', historical_base=base, budgets=budgets, attempts=tuple(attempts),
+            candidate=Commit(candidate_sha, candidate_tree), integration=integration.encode('utf-8'),
+            accepted_review=calls[1]['attempt_id'], completion=completion, resources=(workspace,))
+        source = ImportSource(snapshot=snapshot, mode='original', scope='single-ticket',
+            task=read_v6_host_exit(db, run_id, required=True),
+            checkout_uuid=_one(db, 'SELECT value_checkout_identity FROM run_root WHERE run_id=?', (run_id,))[0],
+            profile_document=profile_document, external_readproof=external_document,
+            oracle_documents=tuple((row[0], row[1].encode('utf-8')) for row in db.execute(
+                'SELECT e.evidence_id,m.body FROM work_evidence e JOIN work_evidence_materials m '
+                'ON m.material_id=e.material_id WHERE e.run_id=? ORDER BY e.evidence_id', (run_id,))))
+        run_resource = ImportedResource(owner=SourceRecord('runs', (run_id,)), kind='run-ref', disposition='existing',
+            source_ref='refs/heads/' + run_branch, expected_oid=integrated_sha, checkout=None, workspace_oid=None,
+            owned_root=None, common_git_dir=common, before_head=None, checkout_archive_sha256=None,
+            checkout_index_sha256=None, head_evidence=(owner,), cleanup_pending=False)
+        history = tuple(ImportedHistoryEvent(record=SourceRecord('run_timeline_events', (run_id, event['event_id'])),
+            subject=subject, generation=1, kind=f"v6_{event['value_kind']}", identity=event['event_id'],
+            created_at=_created_at_epoch(event['value_at']), body=wire_json({'event_id': event['event_id'],
+                'presence_hex': event['presence'].hex(), 'values': {key: value for key, value in event.items()
+                    if key.startswith('value_') and value is not None}})) for event in timeline)
+        # The validated live readback closes the selected Issue. Keep it
+        # distinct from the frozen graph's earlier OPEN observation.
+        observed = proof['requirements']
+        observed_requirements = Requirements.from_wire({**observed,
+            'parent': {**observed['parent'], 'sub_issues': observed['parent']['sub_issue_numbers']}})
+        return ImportedRunFacts(source=source, spec=spec, requirements=requirements, observed_requirements=observed_requirements,
+            created_at=created_at, subjects=(imported,), run_resource=run_resource, history=history)
+
+    result = _read_completed_source(snapshot.path, profile, profile_sha, snapshot.sha256, decode, proof)
+    validate_snapshot(snapshot)
+    if (_read_profile(profile_snapshot)[1] != profile_sha or _read_document(external_snapshot)[1] != proof_sha):
+        raise MigrationRefused('source_documents_changed')
+    return result

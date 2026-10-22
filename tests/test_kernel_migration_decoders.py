@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from contextlib import closing
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -230,3 +231,80 @@ def test_original_returned_decoder_preserves_exact_source_and_owned_resources(
         assert 'source:work_job_candidate_commit_intent' not in documents
     assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
     assert not (managed.state_root / report['run_id'] / 'kernel.sqlite3').exists()
+
+
+@pytest.mark.parametrize('profile_backend', [False, True])
+def test_completed_decoder_keeps_optional_execution_and_real_pending_cleanup(
+    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch, profile_backend: bool,
+) -> None:
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from agent_run.managed_workspace import ManagedWorkspace
+    from agent_run_kernel.migration_completed import read_original_completed_import
+    from agent_run_kernel.migration_cli import _collect_original_v6
+    from test_kernel_migration_completed_history import _completed_source
+    from test_kernel_migration_original_source import _git_bytes
+
+    managed = ManagedWorkspace.for_repository('example/project')
+    managed.root.mkdir(parents=True)
+    git_repo.rename(managed.repository_root)
+    managed.state_root.mkdir()
+    LocalGit(managed.repository_root).run('remote', 'add', 'origin', 'https://github.com/example/project.git')
+    (managed.root / '.agent-run-workspace.json').write_text(json.dumps({
+        'repository': managed.repository, 'remote_url': 'https://github.com/example/project.git'}))
+    paths = _completed_source(tmp_path, managed.repository_root, 2, state_root=managed.state_root,
+        controlled=True, actual_github_close=True, profile_backend=profile_backend)
+    before = paths['database'].read_bytes(), _git_bytes(managed.repository_root)
+    with closing(sqlite3.connect(paths['database'])) as db:
+        assert db.execute('SELECT status FROM runs').fetchone()[0] == 'waiting_external'
+        assert db.execute("SELECT stage FROM work_jobs WHERE stage IS NOT NULL").fetchone()[0] == 'merged'
+        assert db.execute('SELECT count(*) FROM work_invocations').fetchone()[0] == (5 if profile_backend else 0)
+        assert db.execute('SELECT count(*) FROM work_job_ticket_close_ownership').fetchone()[0] == 0
+    for key, value in {'PATH': str(tmp_path / 'close-service-bin') + os.pathsep + os.environ['PATH'],
+        'V6_CLOSE_SERVICE': str(tmp_path / 'close-service.json'),
+        'V6_CLOSE_CALLS': str(tmp_path / 'close-service-calls.jsonl'),
+        'V6_CLOSE_REAL_GIT': str(shutil.which('git'))}.items():
+        monkeypatch.setenv(key, value)
+    evidence = tmp_path / 'evidence'
+    _, snapshot = _collect_original_v6('example/project', 1, evidence, external=True)
+    facts = read_original_completed_import(snapshot, profile_snapshot=evidence / 'profile.json',
+        external_snapshot=evidence / 'external-readproof.json')
+    subject = facts.subjects[0]
+    assert subject.kind == 'completed' and subject.completion is not None
+    assert facts.requirements.issues[0].state == 'OPEN'
+    assert facts.observed_requirements.issues[0].state == 'CLOSED'
+    assert facts.observed_requirements.issues[0].body == facts.requirements.issues[0].body
+    assert len(subject.attempts) == 3  # Existing Completion support, not all retained history.
+    assert [attempt.role_ordinal for attempt in subject.attempts] == [2, 2, 1]
+    assert all(not attempt.pending and attempt.continuation_basis is None for attempt in subject.attempts)
+    assert all((attempt.execution is not None) == profile_backend for attempt in subject.attempts)
+    assert all((attempt.bound_version is not None) == profile_backend for attempt in subject.attempts)
+    if not profile_backend:
+        assert json.loads(facts.source.profile_document)['bindings'] == []
+        assert json.loads(subject.attempts[-1].raw_result)['thread_id'] == 'history-development'
+    assert (subject.budgets[0].developments_used, subject.budgets[0].reviews_used) == (2, 2)
+    assert subject.completion.close_ownership is None  # No invented source ownership row.
+    assert subject.completion.close_readproof is not None
+    assert subject.resources[0].disposition == 'existing' and subject.resources[0].cleanup_pending
+    assert subject.resources[0].expected_oid == subject.completion.publication.sha
+    assert subject.resources[0].checkout is not None and subject.resources[0].checkout.is_dir()
+    assert subject.resources[0].checkout_archive_sha256 is None
+    assert facts.run_resource.expected_oid == subject.completion.integrated.sha
+    assert facts.run_resource.head_evidence == (subject.record,)
+    assert before == (paths['database'].read_bytes(), _git_bytes(managed.repository_root))
+    assert not (managed.state_root / facts.spec.run_id / 'kernel.sqlite3').exists()
+    # The same untouched source must also pass the pre-existing formal path.
+    # This is a normal migration countercheck, not decoder self-certification.
+    formal = subprocess.run([sys.executable, '-m', 'agent_run_kernel.migration_cutover',
+        '--repo', 'example/project', '--parent', '1', '--evidence-dir', str(tmp_path / 'formal-countercheck')],
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
+             'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')},
+        capture_output=True, text=True, timeout=30)
+    assert formal.returncode == 0, formal.stdout + formal.stderr
+    target = Path(json.loads(formal.stdout)['target']['database'])
+    with closing(sqlite3.connect(target)) as db:
+        assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM threads').fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM resource_cleanup WHERE state='pending'").fetchone()[0] == 1
