@@ -333,11 +333,13 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
         kernel.control_host(request, "resume", "never-resume-business")
     # The same exact Host has only the original Action's finite cleanup cap.
     scenario.port.lose_response.add("retire_pr")
+    now = [1000.25]
+    kernel.clock = lambda: now[0]
     for _ in range(100):
         step = scenario.runner().run_once()
         assert step.call is None
-        if step.call is not None:
-            scripted_return(kernel, scenario.runner(), step.call, scenario.agent)
+        if step.kind == "waiting" and step.retry_at is not None:
+            now[0] = step.retry_at
         if step.kind == "complete":
             break
     else:

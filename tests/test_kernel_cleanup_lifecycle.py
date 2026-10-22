@@ -240,6 +240,8 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     """75c old actual: external linked once, durable indeterminate, replay zero."""
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     scenario.port.lose_response.add("issue_link")
+    now = [1000.25]
+    scenario.kernel.clock = lambda: now[0]
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
 
@@ -261,7 +263,12 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
 
     monkeypatch.setattr(scenario.port, "execute", execute)
     interrupted = scenario.run()
-    assert interrupted.reason == "original_write_readback_required"
+    assert interrupted.kind == "waiting" and interrupted.reason == "required_checks"
+    assert interrupted.retry_at == 1005.25
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        waiting = tx.one("SELECT evidence FROM waits WHERE subject=?", (scenario.delivery.key,))
+        assert json.loads(tx.get(waiting["evidence"], scenario.delivery.key))["code"] == "write_response_unavailable"
+    now[0] = interrupted.retry_at
     # A separate operation continues business after the optional response loss;
     # the original indeterminate display mutation must never be replayed.
     boundary = scenario.run()
