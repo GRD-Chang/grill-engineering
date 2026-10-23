@@ -1477,6 +1477,30 @@ class Kernel:
     def _recheck_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
                             row: sqlite3.Row, result: EffectResult) -> Step:
         original = json.loads(tx.get(row["receipt_id"], job["id"]))
+        # Anchor later intervention to the confirmed receipt, never to a new write grant.
+        events = result.raw.get("state_events")
+        pr = None if result.pr is None else asdict(result.pr)
+        if (result.disposition == "unknown" and isinstance(events, list) and len(events) > 1
+                and len(events) % 2 == 1 and all(isinstance(event, dict) for event in events)
+                and pr is not None and pr["state"] == "CLOSED"
+                and all(pr[key] == original["pr"][key] for key in
+                        ("number", "repository", "head_repository", "source_ref", "target_ref", "head", "actor"))
+                and result.raw.get("close_intent") == original["raw"].get("close_intent")
+                and events[0] == original["raw"].get("event")):
+            try:
+                times = [datetime.fromisoformat(event["created_at"]) for event in events]
+                intervened = (all(type(event.get("id")) is int and event["id"] > 0
+                                  and event.get("event") == ("closed" if index % 2 == 0 else "reopened")
+                                  and isinstance(event.get("actor"), str) and bool(event["actor"])
+                                  for index, event in enumerate(events))
+                    and all(event["id"] < later["id"] for event, later in zip(events, events[1:]))
+                    and all(instant.utcoffset() is not None for instant in times)
+                    and all(instant <= later for instant, later in zip(times, times[1:]))
+                    and any(event["actor"] != row["actor"] for event in events[1:]))
+            except (KeyError, TypeError, ValueError):
+                intervened = False
+            if intervened:
+                result = replace(result, disposition="third")
         observed = asdict(result)
         if result.disposition == "target":
             self._validate_target(tx, run, job, row, observed)

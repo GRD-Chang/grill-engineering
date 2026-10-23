@@ -360,6 +360,8 @@ class RemoteEffects:
         if pr.state == "OPEN":
             return EffectResult("third" if events else "prior", pr=pr, raw=raw)
         if len(events) != 1 or events[0]["event"] != "closed":
+            raw["state_events"] = [{"id": event["id"], "event": event["event"],
+                "actor": _login(event.get("actor")), "created_at": event.get("created_at")} for event in events]
             return EffectResult("unknown", pr=pr, raw=raw)
         event = events[0]
         actor = _login(event.get("actor"))
