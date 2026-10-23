@@ -181,7 +181,7 @@ def test_supervisor_deadline_works_without_owner_cancellation(
     supervisor = subprocess.Popen(
         [sys.executable, "-c",
          "import sys; from pathlib import Path; from types import SimpleNamespace; "
-         "from agent_run import notification_process as supervisor; "
+         "from agent_run.runtime import command_supervisor as supervisor; "
          f"expiry = Path({str(fake_cli / 'expire')!r}); "
          "supervisor.time = SimpleNamespace(monotonic=lambda: 20.0 if expiry.exists() else 0.0); "
          "sys.argv = ['supervisor', '10', 'lark-cli', 'send']; "

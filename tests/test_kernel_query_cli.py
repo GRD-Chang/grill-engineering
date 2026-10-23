@@ -409,14 +409,14 @@ def test_parser_errors_use_personal_language_stderr_and_exit_two(
 def test_interrupted_read_returns_130_without_advancing_or_writing(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agent_run.cli.main as query_cli
+    import agent_run.cli.selection as cli_selection
     kernel = _create(tmp_path)
     before = _snapshot(tmp_path)
 
     def interrupted(_root, **_kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(query_cli, "discover", interrupted)
+    monkeypatch.setattr(cli_selection, "discover", interrupted)
     assert main(_arguments(kernel, "status", "--json")) == 130
     assert capsys.readouterr().out == ""
     assert _snapshot(tmp_path) == before

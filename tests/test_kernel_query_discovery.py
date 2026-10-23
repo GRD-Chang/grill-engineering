@@ -214,10 +214,32 @@ def test_default_parent_selects_the_exact_published_run_and_retains_terminal_his
     original_create = OfflinePort.create
 
     def managed_port(path, *args, **kwargs):
+        from copy import copy
+        import support.offline as offline
+
         port = original_create(path, *args, **kwargs)
+        physical = port.physical
         # Place the fresh physical Git before prepare freezes its identities.
         port.git.root.rename(workspace.repository_root)
         port.git.root = workspace.repository_root
+        # Keep this test's real remote provider bound to the relocated private
+        # repository. Every operation still performs OfflineGit's ownership
+        # checks; other Scenarios retain the normal authority/remote layout.
+        physical.repository = workspace.repository_root
+        physical.root = workspace.root
+        original_physical = offline.OfflineGit
+
+        def relocated_physical(root, *, environment, written=None):
+            if root != port.root:
+                return original_physical(root, environment=environment, written=written)
+            # The read and audited-write providers use the same real paths;
+            # each retains its own callback and the original ownership checks.
+            provider = copy(physical)
+            provider.written = written
+            provider._owned()
+            return provider
+
+        monkeypatch.setattr(offline, "OfflineGit", relocated_physical)
         return port
 
     with monkeypatch.context() as creation:

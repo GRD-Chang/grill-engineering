@@ -8,6 +8,7 @@ from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.queries.read_facts import QueryError
 from agent_run.queries.run import discover
 from agent_run.cli.main import main
+from agent_run.storage.tasks import read_task_bindings
 
 
 def test_explicit_unsupported_state_keeps_its_location_and_bytes(tmp_path: Path, capsys) -> None:
@@ -37,11 +38,21 @@ def test_default_discovery_reports_encountered_unsupported_state(tmp_path: Path,
     database = state / "state.sqlite3"
     database.write_bytes(b"Not a current native database\n")
     before = {path.name: path.read_bytes() for path in state.iterdir()}
+    assert list(read_task_bindings()) == []
     assert main(["history", "--repo", "example/project", "--parent", "1", "--json"]) == 2
+    output = json.loads(capsys.readouterr().out)
+    # Automatic discovery isolates this unbound file; it is not the selected
+    # Task. Explicitly selecting the same bytes must still report unsupported.
+    assert output["diagnostics"][0]["code"] == "run_locator_missing"
+    assert "timeline" not in output and "runs" not in output
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == before
+    assert list(read_task_bindings()) == []
+    assert main(["history", "--repo", "example/project", "--parent", "1",
+                 "--state-dir", str(state), "--json"]) == 2
     output = json.loads(capsys.readouterr().out)
     assert output["diagnostics"][0]["code"] == "unsupported_state"
     assert output["diagnostics"][0]["path"] == str(database.resolve())
-    assert output["selection"] == {"repo": "example/project", "parent": 1}
+    assert output["selection"] == {"repo": "example/project", "parent": 1, "state_dir": str(state)}
     assert "timeline" not in output and "runs" not in output
     assert {path.name: path.read_bytes() for path in state.iterdir()} == before
 

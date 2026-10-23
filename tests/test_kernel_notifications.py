@@ -184,7 +184,7 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
         assert step.kind not in {"paused", "waiting", "complete"}
     else:
         pytest.fail("Scenario did not reach its first PR write")
-    pr = scenario.port.pull_request(scenario.delivery.key)
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None  # External write succeeded, but its ACK was lost.
     assert not any(record["kind"] == "pr_created" for record in observe())
     assert step.kind == "waiting" and step.retry_at is not None
@@ -224,7 +224,7 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
         assert step.kind not in {"paused", "waiting", "complete"}
     else:
         pytest.fail("Scenario did not reach the CI repair PR edit")
-    assert scenario.port.pull_request(scenario.delivery.key).number == pr.number
+    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref).number == pr.number
     assert len([write for write in scenario.port.writes() if write["operation"] == "pr_write"]) == 2
     assert scenario.step().kind == "progress"  # Consume the edit receipt as well.
     assert [record for record in observe() if record["kind"] == "pr_created"] == created

@@ -250,7 +250,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     from agent_run.cli.host_exit import exit_properties
     properties = exit_properties(kernel.storage.path, "enabled", request, lock, environment)
     command, = [value for value in properties if value.startswith("ExecStopPost=")]
-    assert command.startswith("ExecStopPost=-:") and "host_exit_notifications" in command
+    assert command.startswith("ExecStopPost=-:") and "from agent_run.cli.host_exit import main" in command
     assert environment["PRIVATE_TEST_VALUE"] not in " ".join(properties)
     assert "path%%literal/$library" in command
     assert "TimeoutStopSec=70s" in properties and "TimeoutStopFailureMode=kill" in properties
