@@ -11,9 +11,16 @@ import pytest
 def require_current_installation() -> None:
     instruction = "Run make test-bootstrap in this checkout's dedicated venv."
     spec = find_spec("agent_run")
-    if spec is None or spec.origin is None:
+    if (spec is None or spec.origin is None or spec.submodule_search_locations is None
+            or len(spec.submodule_search_locations) != 1):
         raise pytest.UsageError("Product tests require the installed agent_run package. " + instruction)
-    installed = Path(spec.origin).resolve().parent
+    entry = Path(spec.origin)
+    installed = Path(spec.submodule_search_locations[0])
+    if (not installed.is_absolute() or ".." in installed.parts or entry != installed / "__init__.py"):
+        raise pytest.UsageError("Installed package entry and search location must agree. " + instruction)
+    if any(path.is_symlink() for path in (entry, installed, *installed.parents)):
+        raise pytest.UsageError("Product tests require regular installed runtime paths. " + instruction)
+    installed = installed.resolve()
     source = Path(__file__).resolve().parents[2] / "src" / "agent_run"
     if not installed.is_relative_to(Path(sys.prefix).resolve()) or installed == source.resolve():
         raise pytest.UsageError("Product tests refuse a source/editable agent_run package. " + instruction)

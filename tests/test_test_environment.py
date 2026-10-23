@@ -21,6 +21,53 @@ _GIT_LOCATION_VARIABLES = (
 )
 
 
+@pytest.mark.parametrize("layout", [
+    "regular", "entry-link", "root-link", "ancestor-link", "wrong-entry",
+    "extra-search-root", "child-link", "changed-bytes",
+])
+def test_installed_runtime_checks_the_original_package_paths(tmp_path: Path, monkeypatch, layout: str) -> None:
+    from types import SimpleNamespace
+    from support import installed_runtime
+
+    source = Path(__file__).resolve().parents[1] / "src" / "agent_run"
+    prefix = tmp_path / "venv"
+    package = prefix / "lib" / "site-packages" / "agent_run"
+    shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__"))
+    origin = package / "__init__.py"
+    locations = [str(package)]
+    mirror = prefix / "mirror"
+    if layout in {"entry-link", "wrong-entry", "extra-search-root"}:
+        shutil.copytree(package, mirror)
+        if layout == "entry-link":
+            origin.unlink()
+            origin.symlink_to(mirror / "__init__.py")
+        elif layout == "wrong-entry":
+            origin = mirror / "__init__.py"
+        else:
+            locations.append(str(mirror))
+        if layout != "extra-search-root":
+            (package / "core" / "kernel.py").write_text("# Different submodule; never executed.\n")
+    elif layout == "root-link":
+        package.rename(mirror)
+        package.symlink_to(mirror, target_is_directory=True)
+    elif layout == "ancestor-link":
+        parent = package.parent
+        parent.rename(mirror)
+        parent.symlink_to(mirror, target_is_directory=True)
+    elif layout == "child-link":
+        (package / "source_link.py").symlink_to(source / "__init__.py")
+    elif layout == "changed-bytes":
+        (package / "core" / "kernel.py").write_text("# Stale installed submodule; never executed.\n")
+    monkeypatch.setattr(installed_runtime, "sys", SimpleNamespace(prefix=str(prefix)))
+    monkeypatch.setattr(installed_runtime, "find_spec", lambda _name: SimpleNamespace(
+        origin=str(origin), submodule_search_locations=locations))
+    if layout == "regular":
+        installed_runtime.require_current_installation()
+    else:
+        with pytest.raises(pytest.UsageError):
+            installed_runtime.require_current_installation()
+
+
 @pytest.mark.parametrize("dont_write_bytecode", [False, True])
 def test_importing_installer_build_seam_preserves_interpreter_policy(
     dont_write_bytecode: bool,
