@@ -44,6 +44,8 @@ def allocated(tmp_path: Path) -> tuple[Path, Kernel, AgentCall, ReadOnlyPorts]:
 def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_path: Path) -> None:
     path, kernel, call, ports = allocated(tmp_path)
     canary = tmp_path / "actual-agent-starts"
+    runner = CoreOperations(kernel, call.execution, lambda binding: ports).runner
+    assert not runner.worker_settled(call)
     checks: list[bool] = []
 
     def authorize_source() -> None:
@@ -80,6 +82,8 @@ def test_process_waits_for_final_guard_and_saved_return_survives_reopening(tmp_p
     reopened = Kernel(path)
     status = reopened.status(call.subject)
     assert status["pending_return"] is True
+    assert reopened.worker_settled(call)
+    assert runner.worker_settled(call)
     assert status["phase"] == "development"
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert execute(

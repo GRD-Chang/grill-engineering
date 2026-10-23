@@ -99,11 +99,7 @@ class OperationRunner:
         self.kernel.authorize_agent_observation(call, world, fence)
 
     def worker_settled(self, call: AgentCall) -> bool:
-        with self.kernel.storage.transaction(write=False) as tx:
-            row = self.kernel._invocation(tx, call)
-            leased = tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
-            return not leased and (row["dispatch_state"] == "exited" and row["exit_code"] is not None
-                                   or row["dispatch_state"] == "unavailable" and row["process_identity"] is None and row["start_evidence"] is not None)
+        return self.kernel.worker_settled(call)
 
     def run_once(self, *, agent_capacity: int = 1) -> Step:
         request = self.kernel.next_work(self.execution, agent_capacity=agent_capacity, observation=self._observation)

@@ -2558,6 +2558,14 @@ class Kernel:
             raise KernelError("agent_authority_changed")
         return invocation
 
+    def worker_settled(self, call: AgentCall) -> bool:
+        with self.storage.transaction(write=False) as tx:
+            row = self._invocation(tx, call)
+            leased = tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+            return not leased and (row["dispatch_state"] == "exited" and row["exit_code"] is not None
+                                   or row["dispatch_state"] == "unavailable" and row["process_identity"] is None and row["start_evidence"] is not None)
+
+
     def dispatch_agent(self, call: AgentCall) -> bool:
         """One durable launch claim. A repeated call never authorizes a restart."""
         with self.storage.transaction() as tx:
