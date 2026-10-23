@@ -7,7 +7,7 @@
 用 [Matt Pocock Skills](https://github.com/mattpocock/skills) 拆好 GitHub Tickets 后，
 agent-run 自动调用 Codex 完成开发和验收，减少逐个任务手动推进的工作。
 
-[安装和使用](#安装和使用) · [运行截图](#运行截图) · [飞书通知](#飞书通知) · [Agent 操作指南](docs/agent-guide.md)
+[安装和使用](#安装和使用) · [运行截图](#运行截图) · [飞书通知](#飞书通知) · [Agent 操作指南](docs/agent-guide.md) · [当前架构](docs/architecture.md)
 
 ## 为什么做这个
 

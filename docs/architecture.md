@@ -1,0 +1,86 @@
+# 当前运行架构
+
+本页是现行源码架构概览，基于已合入的 `09d1c88a6445d6ef39e95061ec6e4cbb3a1f69b7`。
+实现职责以本页及链接源码为准；ADR、带日期的研究与 handoff 保留其决策和验证时点，
+其中旧模块名、协议及实验入口不代表当前支持。
+
+## 正式入口与工作流
+
+安装后的 `agent-run`、`python -m agent_run` 和 `python -m agent_run_kernel`
+共同进入 [`query_cli.main`](../src/agent_run_kernel/query_cli.py)。
+生命周期命令由 `lifecycle_cli` 注册，查询、个人设置和 Run Profile 分别分流，
+不通过合成场景启动用户任务。操作步骤见[安装指南](install.md)和[Agent 指南](agent-guide.md)。
+
+```mermaid
+flowchart TD
+    CLI[query_cli] --> Lifecycle[lifecycle_cli]
+    Lifecycle --> Core[Kernel: Task / Action / Host 准入]
+    Lifecycle --> Host[native_host / SystemdHost]
+    Host --> Executor[executor: 进程与并发调用]
+    Executor --> Runner[OperationRunner: 单次物理操作]
+    Runner --> Core
+    Core --> Store[Storage / Transaction: SQLite 事实]
+    Runner --> IO[外部读 / effects / Codex]
+    IO --> Core
+    CLI --> Query[query / query_render]
+    Query --> Store
+```
+
+Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
+开发、独立审核、修复、集成、CI、发布及批准按各自交付对象推进；
+完整 Parent 的修复直接更新 Run Branch，仅最终 Run PR 承担最终发布和人工批准。
+本页的架构归属说明不改变业务流程、角色合同或批准条件。
+
+## 模块责任
+
+| 模块 | 负责什么 | 不承担什么 |
+| --- | --- | --- |
+| [`Kernel`](../src/agent_run_kernel/kernel.py) | 从当前 SQL 事实决定状态迁移、currentness、预算、工作 FIFO、集成单席、控制准入及写入授权 | 不把 Git/GitHub、Agent 调用或等待放进业务写事务 |
+| [`Storage / Transaction`](../src/agent_run_kernel/storage.py) | 事务、关系事实、材料摘要与拥有者核验、有界读取和容量检查 | 不选择后继工作，不重建另一套可变 Run 引擎 |
+| [`OperationRunner`](../src/agent_run_kernel/operation_runner.py) | 获取冻结配置，协调一次观察、Core 请求、实际操作和结果对账 | 不自行制定业务后继、预算或写权限 |
+| [`executor`](../src/agent_run_kernel/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
+| [`native_host`](../src/agent_run_kernel/native_host.py)、[`SystemdHost`](../src/agent_run_kernel/host_adapter.py) | 环境交接、Runner 使用租约、systemd 启动与原 Host 身份观察 | 不把未知启动或未知退出当成重新启动许可 |
+| [`source_reading`](../src/agent_run_kernel/source_reading.py)、[`RemoteEffects`](../src/agent_run_kernel/remote_effects.py)、[`LocalEffects`](../src/agent_run_kernel/local_effects.py)、[`LocalGit`](../src/agent_run_kernel/effects.py) | 真实需求、refs、PR/checks 读取，Git/GitHub 操作、资源检查和准确读回 | 不用读取失败推断不存在，不自行重试未知写入 |
+| [`codex_execution`](../src/agent_run_kernel/codex_execution.py)、[`role_prompt`](../src/agent_run_kernel/role_prompt.py) | 已分配调用的 Prompt、隔离进程、Thread、原始返回及活动事实 | 不从 Agent 自报完成推导业务通过或合并许可 |
+| [`query`](../src/agent_run_kernel/query.py)、[`query_render`](../src/agent_run_kernel/query_render.py)、[`execution_facts`](../src/agent_run_kernel/execution_facts.py) | 同源只读状态、分页历史、冻结设置和显示 | 不恢复执行、不写业务状态、不发送通知 |
+| [`personal_settings`](../src/agent_run_kernel/personal_settings.py)、[`configuration`](../src/agent_run_kernel/configuration.py)、[`run_profile_cli`](../src/agent_run_kernel/run_profile_cli.py) | 个人默认、创建时固定输入和显式 Run Profile 操作 | 不以最新个人默认补造既有 Run 的原配置 |
+
+`agent_run` 包继续承载安装、个人默认、身份、Prompt、Git/进程工具与通知传输等叶模块。
+它们由正式链路使用，不能因包名仍在就解释成另一套交付编排。
+通知由 [`NativeNotifications`](../src/agent_run_kernel/notifications.py) 观察已提交事实，
+使用独立 outbox/transport；查询展示与实际投递分别负责。
+
+## 状态与证据
+
+当前唯一支持的状态协议是 **`independent-delivery-kernel-v19`**。
+新 Run 使用受管目录 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
+Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 Run ID 与数据库路径。
+具体事务和读取范围见[状态存储](agents/state-storage.md)，显示归属见[展示事实](agents/display-facts.md)。
+
+旧 JSON/v6、早期 native v17/v18、来源封印和导入状态不升级、不转换、不兼容推进。
+[`state_preflight`](../src/agent_run_kernel/state_preflight.py) 在读取、写前和写锁内检查支持边界；
+[`legacy_admission`](../src/agent_run_kernel/legacy_admission.py) 只核对旧 Task 占用与拒绝条件。
+这些拒绝检查不提供迁移入口，也不授权删除旧数据库、Candidate 或工作区。
+
+原始 Agent 返回落盘与业务消费分别提交。Attempt、Invocation、物理输出、Thread 绑定、
+预算窗口、effects intent/receipt 和历史证据保留准确归属；恢复优先消费已存返回。
+每次真实外部写入前仍经过 Core 的当下授权检查，未知结果沿同一 intent 读回，
+数据库提交、展示状态和 Agent 报告均不能代替真实外部结果或进程退出证据。
+
+## 测试支撑与尚待会合的候选
+
+合成 GitHub、脚本 Agent 和独立 Git world 已随 Node B `09d1c88` 归位到
+`tests/support`：`offline.py` 组织场景，`offline_api.py` 提供原始合成 API 记录，
+`offline_git.py` 管理私有 bare Git world。入口和用途见
+[合成外部 world 指南](../tests/support/README-offline.md)。
+这些支撑替换物理 I/O，调用生产 Kernel/OperationRunner/RemoteEffects，
+不另算业务后继、预算或授权；它们不是产品的 offline 用户入口。
+此归位不表示整个仓库净删除了同等实现，也不单凭生产目录行数推导整体复杂度或运行预算。
+
+旧 single-policy（`b163`）和旧 Agent（`a324`）退休仍是尚未合入的候选。
+当前创建和显式窗口续期仍经 `configuration` 调用
+`agent_run.delivery_policy.resolve_delivery_policy`，`personal_settings` 仍注册 `policy` 命令；
+相关 `agent_run` 叶模块不在本说明中提前标记为删除。
+集成后以实际源码校准这些配置/类型归属，不由候选报告推断实现已经完成。
+
+以上是源码状态区分，不是运行验收结论；历史通过数不自动成为当前提交的全量验证结果。

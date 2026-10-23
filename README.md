@@ -7,7 +7,7 @@ English | [简体中文](README.zh-CN.md)
 After [Matt Pocock Skills](https://github.com/mattpocock/skills) breaks your work into GitHub tickets,
 grill-engineering runs Codex to implement and verify them, with less manual coordination between tasks.
 
-[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md)
+[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md) · [Current architecture](docs/architecture.md)
 
 ## Why I built this
 

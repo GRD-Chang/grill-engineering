@@ -1,186 +1,113 @@
 # Run 状态存储与提交合同
 
-受管仓库的 Task Control 与新 Run 共用状态根目录的 `state.sqlite3`。
-数据库协议为 `sqlite-work-records-v6`；此前 JSON / SQLite Run 明确拒绝，
-保留原文件、Candidate、工作区和成果，不迁移、不双写，也不直接续接。
-公开命令、机器字段及人工批准含义保持不变。
+整体模块责任见[当前架构](../architecture.md)。本页描述现行 `Storage`、
+`Transaction` 与 Core 保存事实的实现，不定义另一套生命周期或权限策略。
 
-## 工作事实的唯一归属
+## 路径与唯一支持的协议
 
-Change Job 及 Run Acceptance、Run Publication 的拥有者各有明确身份。
-Ticket、Parent-only、Run Repair 复用同一保存边界，Repair 的普通开发审核与
-CI 预算仍归所属 Parent；拥有者关系不授予执行权限。
+数据主目录默认为 `~/.local/share/agent-run/`，或 `$XDG_DATA_HOME/agent-run/`。
+每个新 Run 的控制、Host 与业务关系保存在
+`repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
+数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v19`**。
+`native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
+不复制生命周期状态；替换与占用判断仍由 Core 决定。
 
-- Job 当前阶段、分支代次、Candidate、Thread 继续控制、在途操作身份及预算
-  使用明确列和关系；当前选择只保存 Job 身份，不能保存另一份活动 Job 正文。
-- Job 业务阶段与 gate 分开。暂停保留唯一继续阶段，多个门禁按各自身份保留；
-  定向 resume 只解除获准条件，不能清除兄弟门禁或 Run 全局控制。
-  保存后在同一事务回投影实际剩余条件；仍有暂停时不能准入下一段工作。
-  仅补齐继续阶段不会替换已有的准确外部诊断。
-  `committing_candidate`、`publishing`、`merging`、`merged` 仍保护不同外部副作用
-  与未知结果对账边界。
-- Semantic Attempt 以 `(run_id, attempt_id)` 标识；当前状态指向明确的不可变版本。
-  Invocation 绑定当时的 Attempt 版本、Review Context 和预算事实，不能用后来
-  修改的当前值重建早先审核依据。
-- Invocation 以 `(run_id, work_subject, started_at)` 唯一标识。当前调用、每票调用
-  及 history 都按身份查询同一调用事实，history 保留全局顺序。失败调用获准继续
-  是独立的继续条件；当前视图可显示 `resuming`，原失败退出仍是历史事实。
-- 普通预算窗口、CI、集成开发及 resync 保留原归属与续期规则。预算历史保存计数、
-  当时 policy 和必要证据引用，不再复制整份可变 Job。集成开发续期增加限额而保留
-  已用量；显式续期和恢复不能重复消费同一 Attempt。
+[`state_preflight.py`](../../src/agent_run_kernel/state_preflight.py) 以只读连接检查现有数据库。
+旧 JSON/v6、早期 native v17/v18、来源封印及导入状态明确拒绝，
+保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
+[`legacy_admission.py`](../../src/agent_run_kernel/legacy_admission.py) 只检查旧 Task 占用及拒绝条件，
+不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。
 
-Run 身份、业务状态、调度队列、集成持有者和全局门禁同样使用明确关系。
-`runs` 中的仓库、状态、阶段及时间是各字段的唯一权威，不再从通用节点同步副本。
-全局诊断保留准确 Run 归属和恢复条件，不能复制到当前所选 Ticket 或覆盖兄弟局部门禁。
-工作 FIFO、集成队列、暂停请求和退休代次按准确 Ticket 身份保存；集成仍只有一个席位。
+`Storage.create` 排他创建新文件，拒绝接管已有数据库或遗留 sidecar。
+写事务在打开写连接前、取得写锁后及提交前复核支持边界；查询同样只接受当前 native 状态。
+旧迁移链与 `original_query` 已退出，不存在跨版本查询或原地升级入口。
 
-Parent 输入保存不可变版本，图的固定成员/依赖结构与当前观测分别关联准确版本；
-原始标题、正文和报告使用有明确拥有者的材料引用，不重复存储已关系化的核心字段。
-当前 Run Acceptance、Publication Record 和合并 intent 明确保存需求/图版本、
-default/run/PR head、候选、预期合并树及 Ticket Completion Set 的引用。
-相同完成集合复用一份不可变关系记录，后来的当前 Job 不得改写早先审核或批准依据。
-已有版本的输入域中，明确指定但无法解析的需求/图 revision 必须拒绝，不能降为空引用。
+## 事实的唯一归属
+
+[`storage.py`](../../src/agent_run_kernel/storage.py) 的 `SCHEMA` 是表和列的实现依据：
+
+| 事实 | 当前关系 |
+| --- | --- |
+| Run、交付对象及代次 | `runs`、`subjects`、`retired_generations` |
+| 固定输入与需求观测 | `run_inputs`、`requirement_versions`、`source_observations`、`profile_revisions` |
+| 语义工作与真实调用 | `attempts`、`invocations`、`invocation_outputs`、`threads`、`worker_activity` |
+| 预算、调度与暂停 | `budgets`、`work_queue`、`integration_queue`、`leases`、`gates`、`waits` |
+| 外部操作与适用证据 | `effects`、`effect_failures`、`checks`、`grants`、`completions` |
+| 控制、宿主与审计 | `actions`、`hosts`、`retired_executors`、`history` |
+| 有拥有者和用途的原格式材料 | `material` |
+
+业务阶段与 gate 分开；暂停保留继续工作，定向 resume 只解除获准条件，
+不能清除兄弟门禁或 Run 全局控制。仍有暂停时不能准入下一段工作，
+仅补齐继续阶段不会替换已有的准确外部诊断；拥有者关系不授予执行权限。
+普通预算窗口、CI、集成开发及 resync 保留原归属与续期规则。
+预算保留用途、窗口、累计用量及原证据，显式续期或同次中断续接不能重复记账。
+
+Attempt、Invocation 和 Thread 各有独立 `id`，通过明确外键关联。
+物理输出以 `(invocation, ordinal)` 标识；原始返回、进程身份与活动事实属于准确输出，
+不从后来的当前对象重建早先调用或审核依据。Attempt 的 `thread_id` 和 `opening_id`
+由 continuation 入口绑定，分别引用 Thread 和不可变 Opening 材料。
+
+需求/图版本、候选、预期合并树与 Ticket 完成事实保留准确关联，
+后来的当前对象不得改写早先审核或批准依据。
+明确指定但无法解析的需求/图 revision 必须拒绝，不能降为空引用。
 批准、关闭 intent/receipt 及结果未知时的读回边界继续保留。
 
-Timeline、Continuation、Resume/Human Response Audit、通知配置及 Action application
-receipt 也使用明确列、事件位置和材料引用。Human Response 的当前文字和审计引用准确
-Job 历史中的原始成员；同一回复不再复制正文。application receipt 保留当时已应用的
-事实，不能由后来可变化或被裁剪的 Control Action 重建。
-
-核心状态不再写入通用路径节点、任意字段树或旧 Run 快照。已删除节点闭包、投影索引、
-精确展开 JSON 长度证明、Job 档案的冗余内容证明、专属快照缓存及两套表示的同步责任。
-公开 JSON/字典仍是同一事实的查询输出；本次查询的拥有者、revision、已读范围及明确
-追加后缀仅存在内存中，不是另一份持久权威，也不授予保存权限。
-
-## Final Run PR 的远端内容
-
-新建、更新和恢复 Final Run PR 只保留 PR Narrative 和单条原地更新的 Agent Run Status，
-不再发布 `Run Publication Record` JSON 评论，也不把该 JSON 搬入正文或另一评论。
-历史评论保留原样。缺少该评论不影响待批准、准确合并或恢复；本地验收、发布、批准、
-预期合并树和 Required Checks 校验继续有效。共享评论能力仍服务状态、Parent 关闭和旧 PR 替换的必要对账。
-
-## 固定输入、返回与阶段消费
-
-必要原格式材料保存在有明确拥有者、用途、版本、SHA-256 与实际字节数的不可变
-证据中。相同正文复用材料；Job 或 Attempt 消费的摘要、原 Artifact 可以引用准确
-原始返回的成员，不再次保存正文。关系引用不能借用其他 Run 或其他拥有者的证据。
-
-Review Context、原始 Agent 返回及历史证据各保留当时版本。一次 Human Blocker
-继续可在同一 Attempt 产生新的 Context 和返回；原 Invocation 的绑定不能随之改变。
-已完成 Attempt 清除当前返回缓存时，准确原返回及其 Invocation 归属仍保留。
-单份证据不超过 4 MiB；读取正文前核验 SQL 类型和实际字节界限，读取后核验摘要。
-超限或缺损明确失败，不截断证据、不重置预算。
-Run 和 Job 的有界当前记录上限各为 256 KiB；单份 Ticket Completion Set 的原格式逻辑大小
-不超过 4 MiB，读取核验拥有者、连续位置、实际长度和内容摘要。集合超限明确失败，
-不会删除先前仍适用的集合或批准。
-独立当前记录的固定列与所含字符串列表共同计量，按实际字节加每项 16 字节保守开销核验；
-读取前由 SQL 统计，超限不会加载或截断冲突路径等列表。
-Run 调度集合最多 4096 项且每集合不超过 256 KiB；
-固定图最多 4096 个成员，每张 Ticket 的依赖观测最多 4096 项。单组诊断最多 32 条；
-门禁中的 Ticket/依赖列表各最多 4096 项；关闭集合最多 4096 项且不超过 256 KiB，
-先到的界限生效。查询和实际存储额度见下文；不再限制整份 Run 的累计历史 JSON 为 4 MiB。
-
-各角色通过共同 Agent 执行入口：先检查可复用返回，再调用 Agent，独立保存返回，
-随后由原阶段消费。返回落盘与阶段消费是不同事务边界；重开后优先复用已存结果。
-结果标记与预算变化在阶段消费的同一事务提交，重复返回不能再次执行或记账。
+各角色的原始返回落盘与阶段消费是不同事务边界；重开后优先复用已存结果。
+结果消费和适用预算变化由 Core 在同一业务事务收口，重复返回不能再次执行或记账。
 原始返回尚未落盘的中断仍属于未知结果，不能假定成功。
 
-## 读取与保存范围
+`Transaction.put/get` 按拥有者、用途、SHA-256 和实际字节数保存及核验材料。
+材料不借用其他对象的证据，不以截断正文、删除历史或重置预算处理缺损和超限。
+Final Run PR 的远端内容仍为 PR Narrative 与单条原地更新的 Agent Run Status；
+不再发布完整 `Run Publication Record` JSON 评论，也不把该 JSON 搬入正文或另一评论。
+历史评论保留原样；缺少该评论不影响待批准、准确合并或恢复。
+本地验收、发布、批准、预期合并树和 Required Checks 核验继续有效。
 
-查询入口按消费目的选择范围：
+## 读取与事务
 
-- `load_run` / `load_history_run` 显式展开历史；`load_current_run` 在完整查询上额外核验业务合同。
-- `load_status_run` 读取当前 Job、调用、门禁、最新事件及 status 所需的时间汇总，
-  保留公开字段、Invocation 身份、全局历史时长和按 Ticket 归属的语义。
-- 调度及 `load_work_run` 读取当前 Job、准确在途 Attempt/Invocation 和相关 Resume，
-  不读取旧预算、旧 Attempt 或兄弟历史正文。真正消费旧证据的阶段按准确 Job/revision
-  显式读取，例如预算续期归档、人工回复上下文及最近旧窗口的 Reviewer 记录。
-  Repair 集成额度只按当前 `repair_job.repair_generation` 查询准确代次；没有当前 Repair
-  时不读取旧代次。预算映射携带非持久化的准确额度范围，保存前重载沿用该范围，
-  只更新发生变化的代次关系。新一代保存后返回新的当前范围；未读取的旧代次及其使用量
-  原样保留。已有代次不能通过空映射或缺失字段清除，也不能用局部视图覆盖未读代次。
-  恢复该范围保留阶段持有的父 Job 与预算拥有者引用。`load_history_run` 显式展开全部
-  旧额度，退休归档也显式保存完整代次历史。
-  单字段 Job 历史补读只读取所请求的 Attempt、Review Window 或 Completed Repair，
-  不为该字段重新组装父 Job 或连带展开 Repair 预算。
-  Timeline 和同线程恢复只读取准确 Thread 末项，不展开 Thread 档案或改变已有查询范围。
-- Ticket 调度轮询与租约控制检查使用明确的 dispatch 查询：读取当前输入、FIFO、
-  Ticket 代次、门禁、程序就绪及等待窗口；必要的原始 Agent 返回仍核验拥有者和正文。
-  不读取无关报告、Invocation 或历史。程序就绪是本次查询的派生属性，不是持久化字段，
-  也不是保存或执行凭据。队列变更、领取和释放仍在原写事务完整重读与校验。
-- 通知观察只读取当前事实、有限启动窗口、已知待发和未结束 Attempt 的准确身份；
-  新阶段边界或完成事件才读取其卡片所需的时间与历史事实。投递 receipt 记录已观察位置
-  和待发身份，不能作为工作结果、审核或执行授权的依据。
-  本进程的活动观察还核验同快照中准确的 Task/Action/Executor、Run application receipt、
-  已给定的状态目录及真实 PID/start token；缺少证明保持 unknown，不因 Invocation 仍为 running
-  就推断进程存活。该临时观察不落盘，也不替代独立进程的 Executor Host 核验。
+`Storage.transaction(write=False)` 使用 `read_state` 的 `mode=ro`、`query_only`
+及只读事务；`transaction(write=True)` 使用 `mode=rw`、`BEGIN IMMEDIATE`，
+事务内失败共同回滚，已被调用者捕获的 SQL 失败也会使该事务失效。
+每次边界独立打开并关闭连接，不复用旧 StateStore 的可变 Run 快照或工作作用域缓存。
 
-未读历史保留准确拥有者及查询范围，不能用普通空数组替代、据此判定“不存在”，
-或清空作为提交基线。明确追加只携带新后缀和原计数/字节数；同一事务保留旧前缀。
-档案计数和字节数用于范围及容量核验，不保存第二份正文或冗余内容哈希。
-当前查询核验实际读取的摘要和关联；完整查询逐行核验连续位置、长度与证据。
-Resume 的原业务事件摘要链继续保留；它不为另一套 Run 展开投影提供证明。
+`Transaction.rows` 在搬入正文前由 SQL 统计列长度并累计读取额度；
+`all` 通过物理分页读取集合，`one` 要求唯一事实。材料先检查拥有者、SQL 类型、
+实际长度及额度，再读取并核对摘要。现行接口不包含旧 `load_*`、
+`sqlite_change_job_queries` 或 `sqlite_query_rows` 模块。
 
-查询在同一只读 SQLite 快照组装剩余 Run 字段与工作关系；使用 `mode=ro` 和
-`query_only`，不执行恢复、不写业务事实、不发送通知。完整查询与局部查询同源。
-已关闭通知时不安装通知观察者，不执行通知用 Run 读取。开启通知在提交和解锁后
-观察，通知失败不回滚已保存的工作事实。自定义目录继续只提供查询，不能启动或恢复执行。
-对象保存的 Timeline 只读取计数与末项，追加保留未读前缀。内置当前观察者在解锁后
-读取完整的当前观察快照；自定义保存观察者需要的 Timeline 与其他字段在同一次写快照
-准备，回调在提交并解锁后执行，不能拼接不同提交的字段。
+公开查询由 [`query.read`](../../src/agent_run_kernel/query.py) 在同一只读快照中组织
+status、history 和冻结 settings。history 使用 `after`/`limit`、事件位置和 `has_more`
+显式分页；查询不会把部分结果伪装成完整历史，也不会回填业务事实或通知记录。
+未读取的历史不能因空列表而被清除，查询结果与显示字段不授予保存或执行权限。
+自定义状态目录继续只提供查询，不能启动或恢复执行。
 
-每次保存只处理所属 Job、准确关联的 Attempt/Invocation、预算和必要历史。
-保存从最新 SQL 事实重验身份、需求、代次、版本和适用权限，旧视图不能覆盖兄弟
-进度，也不能因当前选择在 A 而把 B 的失败写到 A。外部操作、Agent 调用和等待均
-在写事务之外。
+外部操作、Agent 调用和等待均在业务写事务之外。
+OperationRunner 将读回证据交给 Core 核验和消费，数据库提交不能替代实际外部结果。
+通知观察已提交事实，投递失败不回滚已提交的业务事实；查询不会发送通知。
 
-## 分层资源额度
+## 实现中的资源界限
 
-额度选取由 `state_limits.py` 及各领域记录的常量共同约束；当前事实与累计历史分开计量。
-保存超过额度时整笔事务失败，已有材料、预算与批准继续保留；没有截断证据、删历史或
-自动增加预算的回退分支。
+界限来自 `storage.py` 的常量及 Core 对准确记录的检查，不从源码行数或测试总耗时推导。
 
-| 层次 | 默认上限 | 核验边界 |
-| --- | --- | --- |
-| 有界当前记录 | 256 KiB | 固定列、引用及所属有界列表；SQL 实际 BLOB 长度在搬入 Python 前核验 |
-| 单份原格式证据 | 4 MiB | 写入实际 UTF-8 字节；读取 SQL 类型、实际长度及 SHA-256 |
-| 查询批次 | 128 行、8 MiB | 先检查实际元数据；窄身份行另受当前记录界限约束 |
-| 一次查询 | 65,536 行、32 MiB 读取，32 MiB 响应 | 按实际读取累计，响应逐段编码计量；嵌套查询共享预算，只能收紧不能续期 |
-| SQLite 主数据库 | 256 MiB | `max_page_count` 限制逻辑页面增长，提交前核验逻辑及实际文件大小 |
-| DB、WAL、SHM 合计 | 1 GiB | 事务前及提交前核验实际文件，并保守预留最终数据库增长及尚未写出的提交帧 |
+| 位置 | 当前界限及检查 |
+| --- | --- |
+| 材料 `MATERIAL_LIMIT` | 单份 4 MiB；核验类型、长度、拥有者和摘要 |
+| Core 当前记录 `CURRENT_LIMIT` | 256 KiB；由 Core 的当前事实/操作 token 检查使用 |
+| `Transaction.rows` | 每次至多 128 行；同一事务累计至多 65,536 行、32 MiB 读取 |
+| 公开响应 | `query.py` 按实际编码结果检查 32 MiB 上限 |
+| 主库 `DATABASE_LIMIT` | 256 MiB；事务边界检查页面数乘页面大小 |
+| 库及 sidecar `PHYSICAL_LIMIT` | DB/WAL/SHM 合计 1 GiB；事务边界检查实际大小 |
 
-Repository 的 `max_bytes` 可进一步收紧单次查询；它不再是累计 Run 的写入 JSON 大小。
-查询超过上限时明确失败，调用者不能把部分查询当成完整 history。下一次独立查询有自己的
-额度，同一查询内的材料补读不能重新计费起点。领域自身更小的条数、集合和诊断限额继续有效。
-
-Job 当前记录按完整存储值核验，局部增加一列仍与其余固定列和字符串列表合计；
-Budget 等独立记录还包含自己的事件、字符串和 Reviewer 材料引用，门禁集合及
-Invocation 的执行段/恢复等待集合分别核验其当前记录界限。准入只在 SQL 内聚合长度，
-不会为检查额度展开旧预算窗口或历史材料。随后实际选中的列、列表行和材料各计一次；
-Run 按字段查询只传输所需列，未选中的大字符串不会因内部读取而漏计或无故消耗额度。
-`sqlite_change_job_queries.py` 负责准确当前/历史查询，`sqlite_change_jobs.py` 负责领域提交；
-Repair 额度的准确代次读取和增量关系更新由 `sqlite_repair_budgets.py` 承担。
-这些模块共用 `sqlite_query_rows.py` 的有界传输与同一查询账本。
-
-材料正文存放于 SQLite，已包含在物理容量内，不另建外部材料副本。主数据库额度为控制
-恢复和查询的绝对工作量；物理合计额外计入被长期读快照保留的 WAL、共享索引及提交余量。
-WAL 的 `journal_size_limit` 只是清理偏好，不能替代容量准入，也不会强迫活跃读者退出。
-容量不足可以在硬上限前保守拒绝；不删除原成果来腾出空间。
-
-SQLite 机制参考官方的 [limits](https://www.sqlite.org/limits.html)、
-[`max_page_count`](https://www.sqlite.org/pragma.html#pragma_max_page_count) 和
-[WAL](https://www.sqlite.org/wal.html)。这些存储额度不能替代准确身份、版本、外键、材料摘要、
-连续历史位置、审批适用性、预算消费、恢复权限或未知外部结果对账等业务核验。
+这些检查不宣称存在旧的每批 8 MiB 门禁、`max_page_count` 设置或跨事务查询缓存。
+超限明确失败，不截断证据，不通过删历史或扩大业务预算回退；
+容量界限也不能替代身份、版本、外键、材料摘要、批准适用性与未知结果对账。
 
 ## 控制、原子性与收口权限
 
-Task、Action、Executor、Worker、application receipt 与业务关系同库；Task 可先于
-Run 存在。生命周期 Action 及相关业务变化在同一短事务重验并提交，异常共同回滚。
-不再用 Control JSON 和业务库之间的补偿恢复授权。
-
-业务保存沿用有界 FIFO：最多 128 个在途或等待请求，等待最多 60 秒，等待发生在
-控制锁和数据库事务外。生命周期 Action 绕过业务 FIFO；Stop/Abandon、冲突拒绝、
-不可取消批准及集成单席合同不变。作用域只选择入口，不能替代准确授权。
+控制关系与业务关系同库；生命周期 Action 及相关业务变化在短事务重验并提交，异常共同回滚。
+持久工作 FIFO 与集成单席由 Core 维护，不是旧的 Store 写请求排队框架。
+Stop/Abandon、冲突拒绝、不可取消批准及集成单席合同不变。
+作用域只选择入口，不能替代准确授权。
 
 正常推进与在途结果、取消、真实退出收口分别核验。Stop 已生效、租约已释放或
 旧 Executor 被替换后，原 Invocation 仍可在准确身份、代次、Thread 与 Attempt
@@ -205,25 +132,6 @@ Python 实际加载的 SQLite 必须包含 WAL-reset 修复：3.51.3 及以上�
 分支 3.50.7–3.50.x / 3.44.6–3.44.x。开发与 CI 的固定源码、哈希及动态库准备
 见[测试指南](testing.md)。版本检查适用于实际解释器，不修改系统运行库。
 
-连接只属于一次边界或明确的本线程工作作用域；每次读取获得新快照，每笔保存
-独立核验并提交，空闲连接不持有事务。数据库文件身份变化、成功、失败和取消后
-关闭本次连接，回收本次线程、进程及临时材料。协议调整不授权操作真实旧 Run。
-
-每个状态连接最多保留 256 条已准备 SQL；工作作用域自有的只读连接在读取边界
-核对实际标志并按需恢复，避免重复赋相同值使 SQL 失效。Executor 推进、Parent
-交付推进、Run 验收/发布门面及 Ticket 工作复用本线程的嵌套工作作用域，返回、失败
-或取消后由最外层作用域关闭连接；作用域不延长事务，也不保留跨事务状态事实。
-有界查询另保留最多 32 种由列名与额度生成的长度/投影模板；模板不缓存查询参数、
-记录、查询结果或 schema 事实。实际读取、长度校验、额度累计及存储协议校验仍在
-每次独立边界执行。
-每个连接还保留最多 256 条显式 SELECT 的列数形状，关闭连接即清除；包含列展开的
-查询每次重新探测。这里只缓存 SQL 的形状，不保留 schema、绑定参数或行事实。
-固定 COUNT/LENGTH 整数汇总可直接读取并累计相同行与字节额度，实际正文仍经过
-SQLite 内部的长度门禁。响应按有界子树精确计量 UTF-8 JSON，不先展开整份输出。
-
-一次业务补读明确列出所需的 Job 档案字段，在同一只读快照内核对准确 Job 修订号，
-共享查询额度后再交给调用方；未请求的档案仍保持未读范围。工作查询在同一快照中
-只解析一次当前 Invocation，当前投影与选定历史保持独立容器，历史选择继续包含
-准确的活动引用与 Resume 关联。材料拥有者、引用及实际正文长度可以联合查询，
-拥有者头、材料头和正文仍分别占用原有行额度；正文须在身份、长度和查询额度准入后
-单独读取并核对摘要。
+连接属于一次事务边界，成功和失败都关闭本次连接；不会缓存跨事务状态事实。
+协议调整不授权操作真实旧 Run。Host、Worker、通知及临时材料仍由其实际拥有者收口，
+不能把 SQLite 连接关闭或数据库提交当作进程退出证明。
