@@ -60,11 +60,12 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
     tmp_path: Path, kind: DeliveryKind, expected_roles: list[str], development_purpose: str,
 ) -> None:
     scenario = Scenario(tmp_path / "scenario", kind, reviews=("fail", "pass"))
-    original_target = scenario.port.git.commit(scenario.delivery.target_ref)
+    original_target = scenario.port.remote_commit(scenario.delivery.target_ref)
+    assert original_target is not None
     boundary = scenario.run()
     assert boundary.kind == ("complete" if kind == DeliveryKind.TICKET else "approval")
     if kind != DeliveryKind.TICKET:
-        assert scenario.port.git.commit(scenario.delivery.target_ref) == original_target
+        assert scenario.port.remote_commit(scenario.delivery.target_ref) == original_target
         scenario.kernel.control("approve", "exact-approval", subject=scenario.delivery.key, world=scenario.world())
         boundary = scenario.run()
     assert boundary.kind == "complete"
@@ -77,7 +78,11 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
         assert scenario.historical_trace is not None
         assert scenario.historical_trace["raw_backend_calls"] == {"development": 1, "review": 1, "publication": 1}
         assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 2
-    target = scenario.port.git.commit(scenario.delivery.target_ref)
+    target = scenario.port.remote_commit(scenario.delivery.target_ref)
+    assert target is not None
+    physical = scenario.port.physical.commit(target.sha)
+    assert physical["sha"] == scenario.port.physical.refs()[scenario.delivery.target_ref] == target.sha
+    assert [parent["sha"] for parent in physical["parents"]] == list(scenario.port.git.parents(target.sha))
     assert len(scenario.port.git.parents(target.sha)) == (1 if kind == DeliveryKind.TICKET else 2)
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     assert scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.find("validation.tmp") == -1
