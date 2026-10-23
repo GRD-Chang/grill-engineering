@@ -1,6 +1,8 @@
 """Managed local Git effects; policy and durable intent attachment belong to Kernel."""
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import WriteAuthority, admit_write
+
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 import json
@@ -248,9 +250,9 @@ class LocalEffects:
             return EffectResult("third" if code == "foreign_local_checkout" or isinstance(error, GitError)
                                 else "unknown", raw={"reason": code})
 
-    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         if effect.operation == "inspect_resources":
-            authorize()
+            admit_write(authorize)
             return self.reconcile(effect)
         observed = self.reconcile(effect)
         no_write = (
@@ -266,22 +268,22 @@ class LocalEffects:
         if observed.disposition == "target" and no_write:
             # Only explicit, verified no-write outcomes may acquire first-dispatch
             # authority here; an arbitrary pre-existing target remains read-only.
-            authorize()
+            final_admission = authorize.prepare()
             fresh = self.reconcile(effect)
             if fresh != observed:
                 raise KernelError("local_effect_boundary_changed")
+            final_admission()
             return fresh
         if observed.disposition != "prior":
             return observed
 
-        def guard() -> None:
-            authorize()
+        def check_boundary() -> None:
             current = self.reconcile(effect)
             if current.disposition not in {"prior", "target"}:
                 raise KernelError("local_effect_boundary_changed")
-            # Reconciliation can wait for Git; retain the original admission
-            # boundary and recheck Core authority after the last physical read.
-            authorize()
+
+        def guard() -> None:
+            admit_write(authorize, check_boundary)
 
         writer = LocalGit(self.git.root, guard)
         writer.env = self.git.env.copy()

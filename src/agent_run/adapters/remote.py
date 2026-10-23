@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
 from urllib.parse import urlencode
 
+from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
 from agent_run.errors import bounded_error
@@ -117,7 +118,7 @@ class RemoteEffects:
         return _text(self._api("user")["login"])
 
     @_operation_errors
-    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         """One original operation, after exact readback and current authorization."""
         if effect.operation in LocalEffects.OPERATIONS:
             return self._local(effect).execute(effect, authorize)
@@ -144,8 +145,9 @@ class RemoteEffects:
                 return observed
             if self.actor() != effect.actor:
                 raise KernelError("remote_actor_changed")
-            authorize()
+            final_admission = authorize.prepare()
             fresh = self._current_pr_edit(effect, self._reconcile(effect))
+            final_admission()
             return replace(fresh, disposition="third") if fresh.disposition == "target" and fresh != observed else fresh
         if observed.disposition != "prior":
             return observed
@@ -165,29 +167,25 @@ class RemoteEffects:
             command = ["git", "push", self.remote, f"{after}:{effect.source_ref}",
                        f"--force-with-lease={effect.source_ref}:{expected or ''}"]
             if self.git_writes is None:
-                response = run_write_command(command, authorize=authorize, cwd=self.root, runner_identity=self.identity)
+                response = run_write_command(command, authorize=lambda: admit_write(authorize), cwd=self.root, runner_identity=self.identity)
             else:
-                authorize()
+                admit_write(authorize)
                 response = self.git_writes.push(effect.source_ref, expected, after)
         elif operation == "pr_write":
             body = {"title": _text(effect.payload["title"]), "body": _text(effect.payload["body"])}
-            write_authority = authorize
+            boundary = None
             if effect.pr_number is None:
                 endpoint, method = f"repos/{self.repository}/pulls", "POST"
                 body.update(head=effect.source_ref.removeprefix("refs/heads/"),
                             base=effect.target_ref.removeprefix("refs/heads/"))
                 def current_create() -> None:
-                    authorize()
                     fresh = self._reconcile(effect)
                     if fresh.disposition != "prior" or fresh.pr is not None or fresh.raw != observed.raw:
                         raise KernelError("pr_boundary_changed")
-                    # No adapter read may follow the final Core check before
-                    # the physical POST; Stop can commit during reconciliation.
-                    authorize()
-                write_authority = current_create
+                boundary = current_create
             else:
                 endpoint, method = f"repos/{self.repository}/pulls/{effect.pr_number}", "PATCH"
-            response = self._write(endpoint, method, body, write_authority)
+            response = self._write(endpoint, method, body, authorize, boundary)
         elif operation == "merge":
             message = _text(effect.payload["commit_message"])
             title, _, message_body = message.partition("\n")
@@ -372,7 +370,7 @@ class RemoteEffects:
         raw["event"] = {"id": event["id"], "event": "closed", "actor": actor, "created_at": event["created_at"]}
         return EffectResult("target", pr=pr, raw=raw)
 
-    def _retire_pr(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def _retire_pr(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         observed = self.reconcile(effect)
         if observed.disposition != "prior":
             return observed
@@ -387,16 +385,15 @@ class RemoteEffects:
             if (fresh.disposition != "prior"
                     or fresh.raw.get("close_intent") != observed.raw.get("close_intent")):
                 raise KernelError("retirement_boundary_changed")
-            authorize()
 
         if observed.raw.get("close_intent") is None:
-            self._write(self._retirement_path(effect) + "/comments", "POST", {"body": intent["comment_body"]}, guard)
+            self._write(self._retirement_path(effect) + "/comments", "POST", {"body": intent["comment_body"]}, authorize, guard)
             observed = self.reconcile(effect)
             if observed.disposition != "prior":
                 return observed
             if observed.raw.get("close_intent") is None:
                 return EffectResult("unknown", pr=observed.pr, raw={"diagnostic": "retirement marker unconfirmed"})
-        response = self._write(f"repos/{self.repository}/pulls/{_number(effect.pr_number)}", "PATCH", {"state": "closed"}, guard)
+        response = self._write(f"repos/{self.repository}/pulls/{_number(effect.pr_number)}", "PATCH", {"state": "closed"}, authorize, guard)
         return self._readback(effect, response)
 
     @staticmethod
@@ -538,7 +535,7 @@ class RemoteEffects:
             self._recovery_pending("Frozen own reopen has not converged")
         return EffectResult("prior", raw=raw)
 
-    def _recovery_comment(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def _recovery_comment(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         observed = self.reconcile(effect)
         if observed.disposition != "prior":
             return observed
@@ -548,13 +545,12 @@ class RemoteEffects:
         def guard() -> None:
             if self.reconcile(effect) != observed:
                 raise KernelError("ticket_recovery_boundary_changed")
-            authorize()
 
         response = self._write(self._issue_path(effect) + "/comments", "POST",
-                               {"body": self._recovery_body(effect)}, guard)
+                               {"body": self._recovery_body(effect)}, authorize, guard)
         return self._readback(effect, response)
 
-    def _reopen_ticket(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def _reopen_ticket(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         observed = self.reconcile(effect)
         if observed.disposition not in {"prior", "target"}:
             return observed
@@ -565,15 +561,14 @@ class RemoteEffects:
                     or (fresh.disposition == "target" and not self._same_recovery_event(
                         fresh.raw["reopened_event"], observed.raw["reopened_event"]))):
                 raise KernelError("ticket_recovery_boundary_changed")
-            authorize()
 
         if observed.disposition == "target":
             # First dispatch still needs authority; sent reconciliation is read-only.
-            guard()
+            admit_write(authorize, guard)
             return observed
         if self.actor() != effect.actor:
             raise KernelError("remote_actor_changed")
-        response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, guard)
+        response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, authorize, guard)
         return self._readback(effect, response)
 
     @_operation_errors
@@ -646,14 +641,14 @@ class RemoteEffects:
         if effect.source_ref == effect.target_ref or not effect.effect_id or not effect.actor:
             raise KernelError("remote_effect_binding")
 
-    def _cleanup_git(self, authorize: Callable[[], None] | None = None) -> LocalGit:
-        git = LocalGit(self.root, authorize)
+    def _cleanup_git(self, authorize: WriteAuthority | None = None) -> LocalGit:
+        git = LocalGit(self.root, None if authorize is None else lambda: admit_write(authorize))
         # Existing retirement verbs keep their exact CAS/inspection behavior;
         # both reads and writes now use the frozen Runner, never offline env.
         git.env = runner_git_environment(self.identity, cwd=self.root)
         return git
 
-    def _link_issue(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def _link_issue(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         # Kernel's durable display-once intent owns whether this call can occur.
         # Readback cannot manufacture a lost acknowledgement or authorize replay.
         if effect.payload["ref"] != effect.source_ref or effect.payload["source_head"] != effect.before_sha:
@@ -667,7 +662,7 @@ class RemoteEffects:
         except (GitHubReadError, OSError, ValueError, KeyError, TypeError) as error:
             # No mutation has been attempted. Record this optional attempt as
             # unavailable under current authority; do not block delivery.
-            authorize()
+            admit_write(authorize)
             return EffectResult("target", raw={"acknowledged_status": "unavailable", "display": "unavailable",
                                                 "diagnostic": str(error)[:4096]})
         branch = effect.source_ref.removeprefix("refs/heads/")
@@ -940,18 +935,18 @@ class RemoteEffects:
         return rows
 
     def _write(self, endpoint: str, method: str, body: Mapping[str, Any],
-               authorize: Callable[[], None]) -> subprocess.CompletedProcess[str]:
+               authorize: WriteAuthority, boundary: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
         data = json.dumps(dict(body), ensure_ascii=False).encode()
         if len(data) > MATERIAL_LIMIT:
             raise ValueError("remote write material exceeds limit")
         if self.api is not None:
-            authorize()
+            admit_write(authorize, boundary)
             return self.api.write(endpoint, method, body)
         with NamedTemporaryFile(prefix="agent-run-write-", suffix=".json") as stream:
             stream.write(data)
             stream.flush()
             return run_write_command(["gh", "api", endpoint, "--method", method, "--input", stream.name],
-                                     authorize=authorize, cwd=self.root, runner_identity=self.identity)
+                                     authorize=lambda: admit_write(authorize, boundary), cwd=self.root, runner_identity=self.identity)
 
 
 def _login(value: Any) -> str | None:

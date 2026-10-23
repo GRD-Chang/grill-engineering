@@ -10,6 +10,8 @@ No Receipt, persisted cursor, or alternative current Run crosses this seam.
 """
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
+
 from threading import RLock
 from typing import TYPE_CHECKING, Callable
 import json
@@ -58,7 +60,7 @@ class OperationRunner:
     exact durable exit/non-start proof plus lease release, never Future.done.
     Source outages retain their existing bounded wait; failed post-write reads
     retain the sent intent, and unknown does not authorize rewriting. Each real
-    write calls authorize immediately beforehand; external I/O holds no SQL tx.
+    write prepares observations, checks its boundary, then admits without I/O; external I/O holds no SQL tx.
     """
     def __init__(self, kernel: Kernel, execution: Execution,
                  make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
@@ -118,7 +120,7 @@ class OperationRunner:
                         result = self.ports.reconcile(current.effect)
                     else:
                         try:
-                            result = self.ports.execute(current.effect, lambda: self._authorize_work(current))
+                            result = self.ports.execute(current.effect, WriteAuthority(lambda: self._prepare_authority(current)))
                         except OSError as error:
                             request = self.kernel.fail_work(current.work, error, request=current)
                             continue
@@ -127,13 +129,14 @@ class OperationRunner:
                 request = self.kernel.fail_work(current.work, error, request=current)
         return request
 
-    def _authorize_work(self, request: EffectIO) -> None:
+    def _prepare_authority(self, request: EffectIO) -> FinalAdmission:
         effect = request.effect
         try:
             world, fence = self._observe(effect.subject)
             prepared = self.kernel.effect_observation_prepared(effect, fence)
             resources = self.kernel.effect_resources(effect)
             inspections = None if resources is None else self.ports.inspect(resources)
-            self.kernel.authorize_effect_observation(effect, world, fence, prepared=prepared, inspections=inspections)
         except ReadUnavailable as error:
             raise ReadWait(self.kernel._wait_for_read(request.token, self.execution, error.code, error.message)) from error
+        return lambda: self.kernel.authorize_effect_observation(
+            effect, world, fence, prepared=prepared, inspections=inspections)
